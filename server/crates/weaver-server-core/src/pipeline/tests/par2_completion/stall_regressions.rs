@@ -190,7 +190,7 @@ async fn placement_closed_cycles_install_bytes_before_rebinding_identity() {
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with(".weaver-placement-")),
+            .starts_with(crate::pipeline::direct_store::plan::PLACEMENT_JOURNAL_PREFIX)),
         "no staging files remain"
     );
 }

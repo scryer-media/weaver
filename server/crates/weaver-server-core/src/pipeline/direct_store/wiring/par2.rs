@@ -3572,8 +3572,8 @@ impl Pipeline {
             // blocks, read through the overlay so what is staged is what was
             // posted rather than the plaintext on disk. A read that refuses —
             // the neighbour has a hole there — simply contributes nothing, and
-            // the span that needed it holds, which `route_repaired` turns into
-            // the whole-set demotion the fallback exists for.
+            // the span that needed it holds, which `finish_repair_transaction`
+            // turns into the whole-set demotion the fallback exists for.
             let edges = match cipher_lead_in {
                 true => self.read_cipher_edges(job_id, set_index, volume_index, lengths),
                 false => Vec::new(),

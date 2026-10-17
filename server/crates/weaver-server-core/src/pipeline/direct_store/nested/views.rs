@@ -18,9 +18,7 @@ impl NestedGraph {
         owner: u32,
     ) -> Option<RepairInventory> {
         let node = self.nodes.get(owner.checked_sub(1)? as usize)?;
-        if !(node.roster_closed || node.whole_sevenz)
-            || node.inputs.values().any(|input| input.length.is_none())
-        {
+        if !node.roster_closed || node.inputs.values().any(|input| input.length.is_none()) {
             return None;
         }
         let parent = self.catalog(root, node.parent);
@@ -77,7 +75,7 @@ impl NestedGraph {
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
-                if node.mode == NodeMode::Direct || !self.has_direct_ancestors(node.parent) {
+                if node.mode != NodeMode::Engine || !self.has_direct_ancestors(node.parent) {
                     return None;
                 }
                 let names: BTreeMap<_, _> = self
@@ -87,27 +85,16 @@ impl NestedGraph {
                     .map(|member| (member.id, member.name.to_owned()))
                     .collect();
                 let node_id = index as u32 + 1;
+                // The gate serves placed bytes only. A node that routed its
+                // input until it refused still holds what it took, and the
+                // materialization copies that into its parent's member first.
                 let parts = self
                     .input_views(root, node_id)
                     .into_iter()
-                    .map(|(volume, mut view)| {
-                        view.retain_placed_only();
-                        let input = &node.inputs[&volume];
-                        let complete = input.length.is_some_and(|length| {
-                            let mut ranges = super::super::ByteRanges::new();
-                            for (start, end) in view.readable_ranges() {
-                                ranges.insert(start, end - start);
-                            }
-                            ranges.missing(0, length).is_empty()
-                        });
-                        (
-                            volume,
-                            crate::pipeline::extraction::input::LivePart {
-                                view,
-                                length: input.length,
-                                complete,
-                            },
-                        )
+                    .map(|(volume, view)| {
+                        let length = node.inputs[&volume].length;
+                        let part = crate::pipeline::extraction::input::LivePart { view, length };
+                        (volume, part)
                     })
                     .collect();
                 Some(super::super::set::LiveChildDescription {
@@ -115,36 +102,38 @@ impl NestedGraph {
                     parent: node.parent,
                     format: node.router.plan().format,
                     set_name: node.router.plan().set_name.clone(),
+                    reason: node.router.demotion(),
                     input_names: node
                         .inputs
                         .iter()
                         .map(|(&volume, input)| (volume, names[&input.parent_member].clone()))
                         .collect(),
                     parts,
-                    roster_closed: node.roster_closed || node.whole_sevenz,
+                    roster_closed: node.roster_closed,
                 })
             })
             .collect()
     }
 
-    pub(crate) fn direct_producer_states(&self) -> Vec<(u32, Option<u32>, u64, bool)> {
+    pub(crate) fn direct_producer_states(
+        &self,
+    ) -> Vec<crate::pipeline::direct_store::set::ProducerState> {
         self.nodes
             .iter()
             .enumerate()
             .filter(|(_, node)| {
                 node.mode == NodeMode::Direct && self.has_direct_ancestors(node.parent)
             })
-            .map(|(index, node)| {
-                (
-                    index as u32 + 1,
-                    Some(node.parent),
-                    node.generation,
-                    node.roster_closed
+            .map(
+                |(index, node)| crate::pipeline::direct_store::set::ProducerState {
+                    node: index as u32 + 1,
+                    parent: Some(node.parent),
+                    verified: node.roster_closed
                         && node.inputs.values().all(|input| input.confirmed)
                         && node.router.all_members_verified()
                         && !node.router.awaits_par3_verdict(),
-                )
-            })
+                },
+            )
             .collect()
     }
 
@@ -300,11 +289,10 @@ mod execution_tests {
                 mode: if parent == 0 {
                     NodeMode::Direct
                 } else {
-                    NodeMode::MaterializationPending(DemotionReason::UnsupportedFormat)
+                    NodeMode::Engine
                 },
                 roster_closed: true,
                 members_closed: false,
-                whole_sevenz: false,
                 discovered_revision: None,
             });
         }
@@ -316,9 +304,13 @@ mod execution_tests {
                 .collect::<Vec<_>>(),
             vec![2]
         );
-        for replacement in [
-            NodeMode::MaterializationPending(DemotionReason::UnsupportedFormat),
-            NodeMode::Materialized,
+        for (replacement, live) in [
+            (NodeMode::Engine, vec![1]),
+            (
+                NodeMode::MaterializationPending(DemotionReason::UnsupportedFormat),
+                vec![],
+            ),
+            (NodeMode::Materialized, vec![]),
         ] {
             graph.node_mut(1).mode = replacement;
             assert!(graph.direct_producer_states().is_empty());
@@ -328,7 +320,8 @@ mod execution_tests {
                     .iter()
                     .map(|child| child.node)
                     .collect::<Vec<_>>(),
-                vec![1]
+                live,
+                "{replacement:?}"
             );
             assert_eq!(
                 graph.nodes.len(),

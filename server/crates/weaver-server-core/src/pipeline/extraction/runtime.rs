@@ -19,7 +19,7 @@ use workers::WorkerSet;
 
 use super::output::channel::StreamOwner;
 use super::session::{ArchiveSessions, InputVersion, SessionError, SessionLease};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,10 +78,27 @@ pub(crate) struct ArchiveRuntime {
     pub(crate) graph_owners: BTreeMap<(String, u32), StreamOwner>,
     sinks: BTreeMap<String, root::PersistentSink>,
     pub(crate) gates: BTreeMap<(String, u32), super::input::LiveArchiveInput>,
+    child_engines: ChildEngines,
     pub(crate) live_inputs: Vec<(StreamOwner, super::input::LiveArchiveInput)>,
     checkpoint_roots: Option<(PathBuf, PathBuf)>,
     staged_replacement: Option<replacement::StagedReplacement>,
     failed: bool,
+}
+
+// The job's child engines by graph key. The job's extraction concurrency
+// bounds the live ones. A child refused a slot keeps its published gate, so
+// its parent still writes its bytes into the member while it waits; only the
+// decode waits.
+#[derive(Default)]
+struct ChildEngines {
+    live: BTreeSet<(String, u32)>,
+    held: BTreeSet<(String, u32)>,
+}
+
+pub(crate) enum ChildSlot {
+    Taken,
+    // `first` is whether the child only now began to wait.
+    Held { first: bool },
 }
 
 // How owners leave the runtime, which decides what their graph slots and
@@ -115,6 +132,7 @@ impl ArchiveRuntime {
             graph_owners: BTreeMap::new(),
             sinks: BTreeMap::new(),
             gates: BTreeMap::new(),
+            child_engines: ChildEngines::default(),
             live_inputs: Vec::new(),
             checkpoint_roots: None,
             staged_replacement: None,
@@ -181,11 +199,118 @@ impl ArchiveRuntime {
             || !self.completed.is_empty()
             || !self.replay.is_empty()
             || self.staged_replacement.is_some()
+            || !self.child_engines.held.is_empty()
+    }
+
+    // Whether the child's engine has been started, so a later description
+    // only republishes its gate. A held child has a gate and no engine.
+    pub(crate) fn child_engine_started(&self, set_name: &str, node: u32) -> bool {
+        let key = (set_name.to_owned(), node);
+        self.gates.contains_key(&key) && !self.child_engines.held.contains(&key)
+    }
+
+    // Takes a slot for the child's engine, or holds the child until a live
+    // engine finishes when `cap` are already running.
+    pub(crate) fn admit_child_engine(
+        &mut self,
+        set_name: &str,
+        node: u32,
+        cap: usize,
+    ) -> ChildSlot {
+        let key = (set_name.to_owned(), node);
+        let engines = &mut self.child_engines;
+        if engines.live.len() >= cap {
+            return ChildSlot::Held {
+                first: engines.held.insert(key),
+            };
+        }
+        engines.held.remove(&key);
+        engines.live.insert(key);
+        ChildSlot::Taken
+    }
+
+    // Frees the slot of the child engine that ran `work`, if it held one.
+    // Repaired work reads a file rather than the gate, and its original
+    // source still names the node the slot was taken for.
+    pub(crate) fn release_child_engine(&mut self, work: &NamespaceWork) {
+        if let Some(source) = &work.original_virtual_source {
+            self.child_engines
+                .live
+                .remove(&(source.root_set.clone(), source.node));
+        }
+    }
+
+    // Forgets the held children of `set_name` its latest description no
+    // longer names: their parent left the graph's direct routing, so the
+    // filesystem scan opens them as files, and their gates would otherwise
+    // pass them off as started.
+    pub(crate) fn retire_undescribed_held(&mut self, set_name: &str, described: &HashSet<u32>) {
+        let Self {
+            gates,
+            child_engines,
+            ..
+        } = self;
+        child_engines.held.retain(|(name, node)| {
+            let keep = name != set_name || described.contains(node);
+            if !keep {
+                gates.remove(&(name.clone(), *node));
+            }
+            keep
+        });
+    }
+
+    pub(crate) fn live_child_engines(&self) -> &BTreeSet<(String, u32)> {
+        &self.child_engines.live
+    }
+
+    // The children of a finished decoder's namespace whose engines have not
+    // started, as the namespace describes them, and the root they publish
+    // under. A decoder still running describes them itself as it progresses.
+    pub(crate) fn unstarted_decoded_children(
+        &self,
+        namespace: &str,
+    ) -> Option<(
+        Vec<crate::pipeline::direct_store::set::LiveChildDescription>,
+        PathBuf,
+    )> {
+        let state = self
+            .decoded
+            .iter()
+            .find(|state| decoded::namespace_name(state.generation.owner()) == namespace)?;
+        let (_, destination) = self.checkpoint_roots.clone()?;
+        let children = state
+            .progress_snapshot()
+            .children
+            .into_iter()
+            .filter(|child| !self.child_engine_started(namespace, child.node))
+            .collect();
+        Some((children, destination))
+    }
+
+    // The namespaces holding a child for a free slot, in name order.
+    pub(crate) fn held_child_namespaces(&self) -> BTreeSet<String> {
+        self.child_engines
+            .held
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_child_engines(&self) -> &BTreeSet<(String, u32)> {
+        &self.child_engines.held
     }
 
     pub(crate) fn fail(&mut self, owner: StreamOwner) {
         self.failed = true;
         self.stop_all("archive runtime failed");
+        // Every engine is revoked and none may start, so no slot is taken and
+        // no child waits. A held child loses its gate too, so a later
+        // description finds it unstarted.
+        let engines = std::mem::take(&mut self.child_engines);
+        for key in &engines.held {
+            self.gates.remove(key);
+        }
         let _ = self.sessions.revoke(owner);
         self.completed.clear();
     }
@@ -217,6 +342,7 @@ impl ArchiveRuntime {
             && self.requests.is_empty()
             && self.replay.is_empty()
             && self.staged_replacement.is_none()
+            && self.child_engines.held.is_empty()
             && self
                 .completed
                 .iter()
@@ -249,6 +375,7 @@ impl ArchiveRuntime {
             // Only revocation closes channels, and it has done so above.
             sinks: _,
             gates,
+            child_engines,
             live_inputs,
             checkpoint_roots: _,
             staged_replacement,
@@ -268,12 +395,18 @@ impl ArchiveRuntime {
                 speculative_namespaces
                     .retain(|namespace| graph_owners.keys().any(|(bound, _)| bound == namespace));
                 gates.retain(|key, _| graph_owners.contains_key(key));
+                // A revoked engine never reports, so its slot goes with its owner.
+                child_engines
+                    .live
+                    .retain(|key| graph_owners.contains_key(key));
+                child_engines.held.retain(|key| gates.contains_key(key));
                 if staged_replacement.as_ref().is_some_and(|staged| {
                     !kept(&staged.selected) || staged.retiring.iter().any(|owner| !kept(owner))
                 }) {
                     staged_replacement.take();
                 }
             }
+            // The replacement decodes the same node, so it keeps the node's slot.
             Departure::Replaced(selected) => {
                 output_owners.retain(|name, owner| {
                     let keep = kept(owner);

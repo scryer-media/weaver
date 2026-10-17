@@ -35,6 +35,29 @@ pub enum ArchiveType {
     Split,
 }
 
+impl ArchiveType {
+    /// The archive a file is a part of, by the role its name and bytes give it.
+    pub(crate) fn from_role(role: &FileRole) -> Option<Self> {
+        Some(match role {
+            FileRole::RarVolume { .. } => Self::Rar,
+            FileRole::SevenZipArchive | FileRole::SevenZipSplit { .. } => Self::SevenZip,
+            FileRole::ZipArchive => Self::Zip,
+            FileRole::TarArchive => Self::Tar,
+            FileRole::TarGzArchive => Self::TarGz,
+            FileRole::TarBz2Archive => Self::TarBz2,
+            FileRole::TarXzArchive => Self::TarXz,
+            FileRole::GzArchive => Self::Gz,
+            FileRole::DeflateArchive => Self::Deflate,
+            FileRole::BrotliArchive => Self::Brotli,
+            FileRole::ZstdArchive => Self::Zstd,
+            FileRole::Bzip2Archive => Self::Bzip2,
+            FileRole::XzArchive => Self::Xz,
+            FileRole::SplitFile { .. } => Self::Split,
+            _ => return None,
+        })
+    }
+}
+
 // Archive topology for extraction readiness.
 #[derive(Debug, Clone)]
 pub struct ArchiveTopology {
@@ -315,29 +338,6 @@ impl JobAssembly {
 
     // Check if streaming extraction can start for any member (RAR only).
     //
-    // Returns `Some((member_name, first_volume))` when the first volume of
-    // a member is complete. This allows extraction to begin immediately,
-    // blocking on subsequent volumes as they arrive.
-    pub fn streaming_extraction_ready(&self) -> Option<(String, u32)> {
-        // Streaming extraction only applies to RAR — find the first RAR topology.
-        for topo in self.archive_topologies.values() {
-            if topo.archive_type != ArchiveType::Rar {
-                continue;
-            }
-            for member in &topo.members {
-                if topo.complete_volumes.contains(&member.first_volume) {
-                    return Some((member.name.clone(), member.first_volume));
-                }
-            }
-        }
-        None
-    }
-
-    // Get the first archive topology (backward-compat convenience for single-set jobs).
-    pub fn archive_topology(&self) -> Option<&ArchiveTopology> {
-        self.archive_topologies.values().next()
-    }
-
     // Get a specific archive set's topology.
     pub fn archive_topology_for(&self, set_name: &str) -> Option<&ArchiveTopology> {
         self.archive_topologies.get(set_name)

@@ -462,8 +462,14 @@ impl Pipeline {
             return false;
         }
 
+        // A member the archive runtime consumed never had a file of its own.
+        let consumed = self
+            .archive_runtime
+            .get(&job_id)
+            .map(|runtime| &runtime.consumed);
         let missing_members: Vec<String> = existing_members
             .iter()
+            .filter(|member| !consumed.is_some_and(|consumed| consumed.contains(*member)))
             .filter(|member| {
                 self.resolve_job_input_path(job_id, member)
                     .is_none_or(|path| !path.exists())
@@ -963,11 +969,7 @@ impl Pipeline {
         let mut removed = 0u32;
         for filename in &volume_files {
             let path = cleanup_dir.join(filename);
-            if self
-                .archive_runtime
-                .get(&job_id)
-                .is_some_and(|runtime| runtime.retains_input_path(&path))
-            {
+            if self.retains_job_input(job_id, &path) {
                 continue;
             }
             match tokio::fs::remove_file(&path).await {

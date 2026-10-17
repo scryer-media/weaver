@@ -5,21 +5,30 @@ use crate::pipeline::extraction::runtime::repair::{
 use crate::pipeline::extraction::{JobExtractionBudget, ProcessMemoryBudget};
 use std::io::{Read, Write};
 
-fn fingerprint(path: &Path, budget: &JobExtractionBudget) -> Result<(u64, blake3::Hash), String> {
-    let parent = ExtractionRoot::open(path.parent().ok_or("recovery input has no parent")?)?;
-    let mut file = parent
-        .open_input(Path::new(
-            path.file_name().ok_or("recovery input has no name")?,
-        ))
-        .map_err(|error| error.to_string())?;
+fn fingerprint(
+    path: &Path,
+    budget: &JobExtractionBudget,
+) -> Result<(u64, blake3::Hash), RuntimeError> {
+    let parent = path
+        .parent()
+        .ok_or(RuntimeError::RecoveryRefused("input has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or(RuntimeError::RecoveryRefused("input has no name"))?;
+    let mut file = ExtractionRoot::open(parent)
+        .map_err(RuntimeError::refused("recovery input root"))?
+        .open_input(Path::new(name))
+        .map_err(RuntimeError::io("recovery input open"))?;
     let mut hash = blake3::Hasher::new();
     let mut length = 0u64;
     let mut buffer = [0; 64 * 1024];
     loop {
         budget
             .check_active_io()
-            .map_err(|error| error.to_string())?;
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+            .map_err(|error| ExtractionError::io(&error))?;
+        let count = file
+            .read(&mut buffer)
+            .map_err(RuntimeError::io("recovery input read"))?;
         if count == 0 {
             break;
         }
@@ -37,9 +46,11 @@ fn recover_inventory(
     budget: Arc<JobExtractionBudget>,
     cancellation: RepairCancellation,
     disk_reserve: u64,
-) -> Result<BTreeMap<String, PathBuf>, String> {
+) -> Result<BTreeMap<String, PathBuf>, RuntimeError> {
     if inventory.len() > weaver_nzb::parser::MAX_NZB_FILES {
-        return Err("recovery inventory exceeds file admission".into());
+        return Err(RuntimeError::RecoveryRefused(
+            "inventory exceeds file admission",
+        ));
     }
     let mut aliases = BTreeMap::new();
     let mut lengths = BTreeMap::new();
@@ -48,77 +59,96 @@ fn recover_inventory(
     // source image. No native engine receives a writable original backing.
     for (name, path) in &inventory {
         crate::pipeline::repair::par3::paths::check_install_path(name)
-            .map_err(|error| error.to_string())?;
-        let relative = ExtractionRoot::parse_relative_path(name)?;
+            .map_err(RuntimeError::refused("recovery inventory path"))?;
+        let relative = ExtractionRoot::parse_relative_path(name)
+            .map_err(RuntimeError::refused("recovery inventory path"))?;
         let alias = name.to_lowercase();
         if relative != Path::new(name) || aliases.insert(alias, name).is_some() {
-            return Err("recovery inventory paths alias".into());
+            return Err(RuntimeError::RecoveryRefused("inventory paths alias"));
         }
-        let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(RuntimeError::io("recovery inventory metadata"))?;
         if !metadata.file_type().is_file() {
-            return Err("recovery input is not an immutable regular file".into());
+            return Err(RuntimeError::RecoveryRefused(
+                "input is not an immutable regular file",
+            ));
         }
         lengths.insert(name.clone(), metadata.len());
         bytes = bytes
             .checked_add(metadata.len())
             .filter(|bytes| *bytes <= budget.job_limit_bytes())
-            .ok_or("recovery inventory exceeds disk admission")?;
+            .ok_or(RuntimeError::RecoveryRefused(
+                "inventory exceeds disk admission",
+            ))?;
     }
     for alias in aliases.keys() {
         if alias
             .match_indices('/')
             .any(|(index, _)| aliases.contains_key(&alias[..index]))
         {
-            return Err("recovery inventory file collides with directory".into());
+            return Err(RuntimeError::RecoveryRefused(
+                "inventory file collides with directory",
+            ));
         }
     }
-    let space =
-        crate::operations::disk::probe_disk_space(&private).map_err(|error| error.to_string())?;
+    let space = crate::operations::disk::probe_disk_space(&private)
+        .map_err(RuntimeError::refused("recovery disk probe"))?;
     if bytes > space.available_bytes.saturating_sub(disk_reserve) {
-        return Err("recovery inventory disk admission unavailable".into());
+        return Err(RuntimeError::RecoveryRefused(
+            "inventory disk admission unavailable",
+        ));
     }
     let source = private.join("sources");
-    std::fs::create_dir(&source).map_err(|error| error.to_string())?;
+    std::fs::create_dir(&source).map_err(RuntimeError::io("recovery source directory"))?;
     let mut effective = BTreeMap::new();
     for (name, path) in inventory {
         let destination = source.join(&name);
         if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(parent)
+                .map_err(RuntimeError::io("recovery source directory"))?;
         }
-        let parent = ExtractionRoot::open(path.parent().ok_or("recovery source has no parent")?)?;
-        let mut input = parent
-            .open_input(Path::new(
-                path.file_name().ok_or("recovery source has no name")?,
-            ))
-            .map_err(|error| error.to_string())?;
+        let parent = path
+            .parent()
+            .ok_or(RuntimeError::RecoveryRefused("source has no parent"))?;
+        let file_name = path
+            .file_name()
+            .ok_or(RuntimeError::RecoveryRefused("source has no name"))?;
+        let mut input = ExtractionRoot::open(parent)
+            .map_err(RuntimeError::refused("recovery source root"))?
+            .open_input(Path::new(file_name))
+            .map_err(RuntimeError::io("recovery source open"))?;
         let mut output = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&destination)
-            .map_err(|error| error.to_string())?;
+            .map_err(RuntimeError::io("recovery source copy"))?;
         let mut buffer = [0; 64 * 1024];
         let mut remaining = lengths[&name];
         while remaining != 0 {
             budget
                 .check_active_io()
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| ExtractionError::io(&error))?;
             let count = remaining.min(buffer.len() as u64) as usize;
             input
                 .read_exact(&mut buffer[..count])
-                .map_err(|error| error.to_string())?;
+                .map_err(RuntimeError::io("recovery source copy"))?;
             output
                 .write_all(&buffer[..count])
-                .map_err(|error| error.to_string())?;
+                .map_err(RuntimeError::io("recovery source copy"))?;
             remaining -= count as u64;
         }
         if input
             .read(&mut buffer[..1])
-            .map_err(|error| error.to_string())?
+            .map_err(RuntimeError::io("recovery source copy"))?
             != 0
         {
-            return Err("recovery input length changed during immutable copy".into());
+            return Err(RuntimeError::RecoveryRefused(
+                "input length changed during immutable copy",
+            ));
         }
-        output.flush().map_err(|error| error.to_string())?;
+        output
+            .flush()
+            .map_err(RuntimeError::io("recovery source copy"))?;
         effective.insert(name, destination);
     }
     let mut authenticated = BTreeMap::new();
@@ -130,11 +160,11 @@ fn recover_inventory(
         {
             budget
                 .check_active_io()
-                .map_err(|error| error.to_string())?;
+                .map_err(RuntimeError::io("namespace recovery"))?;
             let output = private.join(format!("pass-{round}-{format_index}"));
-            std::fs::create_dir(&output).map_err(|error| error.to_string())?;
+            std::fs::create_dir(&output).map_err(RuntimeError::io("recovery pass directory"))?;
             let space = crate::operations::disk::probe_disk_space(&private)
-                .map_err(|error| error.to_string())?;
+                .map_err(RuntimeError::refused("recovery disk probe"))?;
             let limit = budget
                 .job_limit_bytes()
                 .min(space.available_bytes.saturating_sub(disk_reserve) / 3);
@@ -144,12 +174,12 @@ fn recover_inventory(
                 .min(64 * 1024 * 1024);
             let memory = budget
                 .reserve_memory_wait(native_memory)
-                .map_err(|error| error.to_string())?;
+                .map_err(ExtractionError::from)?;
             let inputs = effective
                 .iter()
                 .map(|(name, path)| {
                     let length = std::fs::metadata(path)
-                        .map_err(|error| error.to_string())?
+                        .map_err(RuntimeError::io("recovery output metadata"))?
                         .len();
                     Ok(NamespaceInput {
                         name: name.clone(),
@@ -157,7 +187,7 @@ fn recover_inventory(
                         ranges: std::iter::once(0..length).collect(),
                     })
                 })
-                .collect::<Result<_, String>>()?;
+                .collect::<Result<_, RuntimeError>>()?;
             let outcome = NamespaceRepairRequest {
                 owner,
                 format,
@@ -174,19 +204,19 @@ fn recover_inventory(
                 let name = member
                     .path
                     .to_str()
-                    .ok_or("recovery output path encoding")?
+                    .ok_or(RuntimeError::RecoveryRefused("output path encoding"))?
                     .to_owned();
                 let path = output.join(&member.path);
                 let identity = fingerprint(&path, &budget)?;
                 if identity.0 != member.length {
-                    return Err("recovery output length changed".into());
+                    return Err(RuntimeError::RecoveryRefused("output length changed"));
                 }
                 if let Some(previous) = authenticated.insert(name.clone(), identity)
                     && previous != identity
                 {
-                    return Err(
-                        "authenticated recovery sets disagree about namespace output".into(),
-                    );
+                    return Err(RuntimeError::RecoveryRefused(
+                        "authenticated recovery sets disagree about namespace output",
+                    ));
                 }
                 let same = effective
                     .get(&name)
@@ -199,14 +229,18 @@ fn recover_inventory(
                 }
             }
             if effective.len() > weaver_nzb::parser::MAX_NZB_FILES {
-                return Err("recovered namespace exceeds file admission".into());
+                return Err(RuntimeError::RecoveryRefused(
+                    "recovered namespace exceeds file admission",
+                ));
             }
         }
         if !changed {
             return Ok(effective);
         }
     }
-    Err("namespace recovery exceeded progress admission".into())
+    Err(RuntimeError::RecoveryRefused(
+        "recovery exceeded progress admission",
+    ))
 }
 
 impl Pipeline {
@@ -229,7 +263,7 @@ impl Pipeline {
         } else {
             let state = runtime.decoded.iter().find(|state| {
                 let owner = state.generation.owner();
-                source.root_set == decoded_namespace_name(owner)
+                source.root_set == decoded::namespace_name(owner)
             })?;
             let parent = state
                 .graph
@@ -312,26 +346,18 @@ impl Pipeline {
         self.virtual_repair_inventory(job_id, source)
     }
 
-    pub(super) async fn repair_scoped_failure(
-        &mut self,
-        job_id: JobId,
-        owner: StreamOwner,
-        work: NamespaceWork,
-    ) -> Result<bool, String> {
-        self.repair_scoped_failure_with_inventory(job_id, owner, work, BTreeMap::new())
-            .await
-    }
-
     pub(crate) async fn repair_scoped_failure_with_inventory(
         &mut self,
         job_id: JobId,
         owner: StreamOwner,
         mut work: NamespaceWork,
         mut extra: BTreeMap<String, PathBuf>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, RuntimeError> {
         if let Some(source) = &work.virtual_source {
             let inventory = self.virtual_repair_inventory(job_id, source).ok_or(
-                "virtual repair requires a verified containing namespace and closed inputs",
+                RuntimeError::RecoveryRefused(
+                    "virtual repair requires a verified containing namespace and closed inputs",
+                ),
             )?;
             extra.extend(inventory.siblings);
             work.volumes = inventory.inputs.keys().copied().collect();
@@ -344,22 +370,23 @@ impl Pipeline {
             let base = self
                 .jobs
                 .get(&job_id)
-                .ok_or("missing repair job")?
+                .ok_or(RuntimeError::Invariant("repair job"))?
                 .working_dir
                 .join(crate::pipeline::direct_store::manifest::DIRECTORY);
             let private = tempfile::Builder::new()
                 .prefix("virtual-repair-")
                 .tempdir_in(&base)
-                .map_err(|error| error.to_string())?
+                .map_err(RuntimeError::io("virtual repair directory"))?
                 .keep();
             let budget = self.extraction_budget(job_id, &private)?;
             let memory = budget
                 .try_reserve_memory(256 * 1024)
-                .ok_or("virtual repair memory admission unavailable")?;
-            let root = Arc::new(ExtractionRoot::open(&private)?);
-            let task = budget
-                .task_permit_for_root(root)
-                .map_err(|error| error.to_string())?;
+                .ok_or(RuntimeError::Admission("virtual repair"))?;
+            let root = Arc::new(
+                ExtractionRoot::open(&private)
+                    .map_err(RuntimeError::refused("virtual repair root"))?,
+            );
+            let task = budget.task_permit_for_root(root)?;
             let maximum = budget.job_limit_bytes();
             let sparse = self.direct_store.sparse_marking();
             let reserve = self.direct_store.settings().holds_disk_reserve_bytes;
@@ -385,8 +412,8 @@ impl Pipeline {
                 )
             })
             .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
+            .map_err(RuntimeError::join("virtual repair materialization"))?
+            .map_err(RuntimeError::io("virtual repair materialization"))?;
             work.inputs = inputs;
         }
         let original = work.inputs.clone();
@@ -398,7 +425,8 @@ impl Pipeline {
                 inventory.extend(original.siblings);
             }
         } else if let Some(runtime) = self.archive_runtime.get(&job_id) {
-            let source = ExtractionRoot::open_existing(&work.destination)?;
+            let source = ExtractionRoot::open_existing(&work.destination)
+                .map_err(RuntimeError::refused("recovery sibling root"))?;
             let producer = work
                 .input_names
                 .iter()
@@ -428,29 +456,29 @@ impl Pipeline {
         inventory.retain(|_, path| path.is_file());
         self.archive_runtime
             .get_mut(&job_id)
-            .ok_or("archive runtime disappeared")?
+            .ok_or(RuntimeError::Invariant("archive runtime"))?
             .begin_repair(owner)
             .await?;
         let parent = self
             .jobs
             .get(&job_id)
-            .ok_or("archive job disappeared")?
+            .ok_or(RuntimeError::Invariant("archive job"))?
             .working_dir
             .join(crate::pipeline::direct_store::manifest::DIRECTORY);
-        ExtractionRoot::open(&parent)?;
+        ExtractionRoot::open(&parent).map_err(RuntimeError::refused("recovery parent root"))?;
         let private = tempfile::Builder::new()
             .prefix("repair-")
             .tempdir_in(&parent)
-            .map_err(|error| error.to_string())?
+            .map_err(RuntimeError::io("recovery directory"))?
             .keep();
         let budget = self.extraction_budget(job_id, &private)?;
         let memory = budget
             .try_reserve_memory(64 * 1024)
-            .ok_or("recovery inventory memory admission unavailable")?;
-        let root = Arc::new(ExtractionRoot::open(&private)?);
-        let task = budget
-            .task_permit_for_root(root)
-            .map_err(|error| error.to_string())?;
+            .ok_or(RuntimeError::Admission("recovery inventory"))?;
+        let root = Arc::new(
+            ExtractionRoot::open(&private).map_err(RuntimeError::refused("recovery root"))?,
+        );
+        let task = budget.task_permit_for_root(root)?;
         let cancellation = RepairCancellation::default();
         let (watch_budget, watch_cancel) = (Arc::clone(&budget), cancellation.clone());
         let watch = tokio::spawn(async move {
@@ -475,7 +503,7 @@ impl Pipeline {
             )
         })
         .await
-        .map_err(|error| error.to_string());
+        .map_err(RuntimeError::join("namespace recovery worker"));
         watch.abort();
         let effective = effective??;
         let mut selected: BTreeMap<String, (PathBuf, u32)> = work
@@ -519,17 +547,17 @@ impl Pipeline {
                 // private pathname alone does not justify another decode.
                 let memory = budget
                     .try_reserve_memory(64 * 1024)
-                    .ok_or("recovery comparison memory admission unavailable")?;
+                    .ok_or(RuntimeError::Admission("recovery comparison"))?;
                 let (path, original, budget) =
                     (path.clone(), original.clone(), Arc::clone(&budget));
                 changed |= tokio::task::spawn_blocking(move || {
                     let _memory = memory;
-                    Ok::<_, String>(
+                    Ok::<_, RuntimeError>(
                         fingerprint(&path, &budget)? != fingerprint(&original, &budget)?,
                     )
                 })
                 .await
-                .map_err(|error| error.to_string())??;
+                .map_err(RuntimeError::join("recovery comparison"))??;
             }
             changed
         };
@@ -541,13 +569,13 @@ impl Pipeline {
         let inputs = selected.into_iter().map(|(_, (path, _))| path).collect();
         self.archive_runtime
             .get_mut(&job_id)
-            .ok_or("archive runtime disappeared")?
+            .ok_or(RuntimeError::Invariant("archive runtime"))?
             .stage_repair_replacement(owner, work, inputs, names)?;
         self.commit_archive_graph(job_id).await?;
         let (work, lease) = self
             .archive_runtime
             .get_mut(&job_id)
-            .ok_or("archive runtime disappeared")?
+            .ok_or(RuntimeError::Invariant("archive runtime"))?
             .finish_repair_replacement()?;
         Box::pin(self.spawn_scoped_selected_extraction(job_id, work, lease)).await?;
         Ok(true)

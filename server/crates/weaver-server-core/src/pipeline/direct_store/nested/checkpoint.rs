@@ -2,6 +2,16 @@
 use super::super::manifest::graph::{JobGraph, PhysicalDestination};
 use super::*;
 
+// A node's mode as the record stores it. The record keeps the disposition a
+// refusal chose — engine or file — and drops the refusal itself, which a
+// restart does not rederive from retained bytes.
+const MODE_DIRECT: u8 = 0;
+const MODE_PENDING: u8 = 1;
+const MODE_MATERIALIZED: u8 = 2;
+const MODE_ENGINE: u8 = 3;
+// The highest code the graph manifest accepts.
+pub(in crate::pipeline::direct_store) const LAST_MODE: u8 = MODE_ENGINE;
+
 #[track_caller]
 fn invalid() -> std::io::Error {
     std::io::Error::new(
@@ -81,16 +91,16 @@ impl NestedGraph {
                     depth: node.depth,
                     generation: node.generation,
                     set_name: node.router.plan().set_name.clone(),
-                    format: u8::from(node.router.plan().format == SetFormat::SevenZip),
+                    format: node.router.plan().format.code(),
                     inputs,
                     snapshot: super::super::snapshot::encode(&snapshot).map_err(|_| invalid())?,
                     mode: match node.mode {
-                        NodeMode::Direct => 0,
-                        NodeMode::MaterializationPending(_) => 1,
-                        NodeMode::Materialized => 2,
+                        NodeMode::Direct => MODE_DIRECT,
+                        NodeMode::Engine => MODE_ENGINE,
+                        NodeMode::MaterializationPending(_) => MODE_PENDING,
+                        NodeMode::Materialized => MODE_MATERIALIZED,
                     },
                     roster_closed: node.roster_closed,
-                    whole_sevenz: node.whole_sevenz,
                 })
             })
             .collect()
@@ -122,15 +132,7 @@ impl NestedGraph {
         let mut restored = Self::default();
         restored.bind_root(root).map_err(|_| invalid())?;
         for record in &saved.nodes {
-            let format = if record.format == 0 {
-                SetFormat::Rar
-            } else {
-                SetFormat::SevenZip
-            };
-            let root_name = blake3::hash(root.plan().envelope_relative_path(0).as_bytes()).to_hex();
-            let relative = PathBuf::from(".weaver-nested")
-                .join(root_name.as_str())
-                .join(record.id.to_string());
+            let format = SetFormat::from_code(record.format).ok_or_else(invalid)?;
             let parent_catalog = restored.catalog(root, record.parent);
             let volumes: BTreeMap<_, _> = record
                 .inputs
@@ -150,33 +152,14 @@ impl NestedGraph {
                 })
                 .collect::<std::io::Result<_>>()?;
             let parent_members = volumes.clone();
-            let plan = DirectSetPlan {
-                set_name: record.set_name.clone(),
+            let plan = super::nested_plan(
+                root.plan(),
+                record.id,
+                record.set_name.clone(),
                 format,
-                files: volumes
-                    .iter()
-                    .map(|(&volume, &member)| (member, volume))
-                    .collect(),
                 volumes,
-                identity: Some(IdentityPlanFacts {
-                    kind: if format == SetFormat::Rar {
-                        IdentityKind::Roster
-                    } else {
-                        IdentityKind::SevenZipRoster
-                    },
-                    expected_volumes: if record.whole_sevenz {
-                        Some(1)
-                    } else if record.roster_closed {
-                        Some(record.inputs.len() as u32)
-                    } else {
-                        None
-                    },
-                    discriminator: record.id,
-                }),
-                unposted: Default::default(),
-                working_dir: root.plan().working_dir.join(&relative),
-                destination_dir: root.plan().destination_dir.join(&relative),
-            };
+                record.roster_closed.then_some(record.inputs.len() as u32),
+            );
             let mut router = root.resources().router(plan);
             let facts = record
                 .inputs
@@ -188,7 +171,7 @@ impl NestedGraph {
                         .map(|facts| (input.volume, facts))
                 })
                 .collect();
-            if record.mode == 0 {
+            if record.mode == MODE_DIRECT {
                 router.restore_layout(&facts)
             } else {
                 router.restore_retained_layout(&facts)
@@ -365,6 +348,14 @@ impl NestedGraph {
                 (record.parent, record.set_name.clone(), record.format),
                 record.id,
             );
+            let mode = match record.mode {
+                MODE_DIRECT => NodeMode::Direct,
+                MODE_ENGINE => NodeMode::Engine,
+                MODE_PENDING => {
+                    NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts)
+                }
+                _ => NodeMode::Materialized,
+            };
             restored.nodes.push(NestedNode {
                 parent: record.parent,
                 depth: record.depth,
@@ -372,15 +363,10 @@ impl NestedGraph {
                 backing_lease: std::sync::Arc::new(()),
                 router,
                 inputs,
-                mode: match record.mode {
-                    0 => NodeMode::Direct,
-                    1 => NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts),
-                    _ => NodeMode::Materialized,
-                },
+                mode,
                 roster_closed: record.roster_closed,
                 members_closed: record.roster_closed
                     && record.inputs.iter().all(|input| input.confirmed),
-                whole_sevenz: record.whole_sevenz,
                 discovered_revision: None,
             });
         }

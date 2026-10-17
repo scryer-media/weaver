@@ -18,6 +18,7 @@ pub(in crate::pipeline) mod positional;
 pub(super) mod prepared;
 #[cfg(test)]
 use password_candidates::extract_7z_with_password_candidates;
+pub(in crate::pipeline) use password_candidates::{SevenZipKey, sevenz_key};
 pub(in crate::pipeline) mod sequential;
 
 /// The decoder family an archive type runs on.
@@ -120,26 +121,17 @@ impl RootCompletion {
     }
 }
 
-// The decoder an xz file on disk gets: single-threaded over the whole file,
-// or block-parallel with the job's memory budget charged for exactly what the
+// The block-parallel decoder an xz file on disk gets when its structure
+// allows one, with the job's memory budget charged for exactly what the
 // workers will hold.
-enum FilesystemXzDecoder<R: std::io::Read + std::io::Seek> {
-    Sequential {
-        decoder: Box<lzma_turbo::xz::XzReader<R>>,
-        _memory: MemoryPermit,
-    },
-    Parallel {
-        decoder: Box<lzma_turbo::xz::XzParallelReader<R>>,
-        _memory: MemoryPermit,
-    },
+struct ParallelXzDecoder<R: std::io::Read + std::io::Seek> {
+    decoder: Box<lzma_turbo::xz::XzParallelReader<R>>,
+    _memory: MemoryPermit,
 }
 
-impl<R: std::io::Read + std::io::Seek> std::io::Read for FilesystemXzDecoder<R> {
+impl<R: std::io::Read + std::io::Seek> std::io::Read for ParallelXzDecoder<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Sequential { decoder, .. } => decoder.read(buffer),
-            Self::Parallel { decoder, .. } => decoder.read(buffer),
-        }
+        self.decoder.read(buffer)
     }
 }
 
@@ -1063,7 +1055,16 @@ where
     };
     let archive = archive
         .and_then(|archive| check_sevenz_decoder_memory(&archive, &job_limits).map(|()| archive))
-        .map_err(|e| sevenz_extraction_error(&e))?;
+        .map_err(|error| {
+            let converted = sevenz_extraction_error(&error);
+            if !password.is_empty()
+                && crate::pipeline::extraction::error::sevenz_password_refuted(&error)
+            {
+                converted.refuting_password()
+            } else {
+                converted
+            }
+        })?;
     Ok((archive, permit))
 }
 
@@ -2009,7 +2010,49 @@ const ZSTD_DECODER_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
 // dictionary id and frame content size, all at their widest.
 const ZSTD_FRAME_HEADER_MAX_BYTES: usize = 4 + 1 + 1 + 4 + 8;
 
-// Window the decoder of this frame will hold, read from the frame header.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+// Whether four leading bytes open a skippable frame: sixteen magics share it,
+// and each such frame carries its own length.
+fn zstd_skippable_magic(magic: [u8; 4]) -> bool {
+    u32::from_le_bytes(magic) & 0xFFFF_FFF0 == 0x184D_2A50
+}
+
+// What one zstd frame's header declares its decoder will hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ZstdFrameHeader {
+    // The window libzstd holds the frame to and checks against its window
+    // log: the window descriptor's, or a single-segment frame's content size,
+    // which is what such a frame holds instead.
+    window: u64,
+    // What the decoder buffers for the frame: its window, or its content
+    // where that is smaller, since nothing is gained by holding a window
+    // larger than the content that will ever be written into it. The content
+    // size may shrink this, never the window.
+    held: u64,
+    // Whether the frame ends in a content checksum.
+    checksum: bool,
+}
+
+// How long a frame header is, magic included, from its descriptor byte.
+fn zstd_frame_header_len(descriptor: u8) -> usize {
+    let single_segment = descriptor & 0b0010_0000 != 0;
+    let dictionary_id = match descriptor & 0b0000_0011 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    let content_size = match descriptor >> 6 {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    4 + 1 + usize::from(!single_segment) + dictionary_id + content_size
+}
+
+// Reads one frame header, from its magic on.
 //
 // Sizing a zstd reservation from the header rather than from the process
 // limit is the difference between a reservation that can be granted and one
@@ -2018,188 +2061,93 @@ const ZSTD_FRAME_HEADER_MAX_BYTES: usize = 4 + 1 + 1 + 4 + 8;
 // decoder is what makes every running direct unpack yield its own — so one
 // small archive could evict all of them and then park behind whoever held a
 // few megabytes.
-fn zstd_frame_window_bytes(header: &[u8]) -> Result<u64, String> {
-    const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-    const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
-    const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
-
-    let mut cursor = 0usize;
-    // Skippable frames may precede the real one; each carries its own length.
-    loop {
-        let magic: [u8; 4] = header
-            .get(cursor..cursor + 4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| "zstd frame header is truncated".to_string())?;
-        if magic == MAGIC {
-            cursor += 4;
-            break;
-        }
-        let magic_value = u32::from_le_bytes(magic);
-        if magic_value & SKIPPABLE_MASK != SKIPPABLE_MAGIC {
-            return Err("file does not start with a zstd frame".to_string());
-        }
-        let size: [u8; 4] = header
-            .get(cursor + 4..cursor + 8)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| "zstd skippable frame is truncated".to_string())?;
-        cursor = cursor
-            .checked_add(8)
-            .and_then(|next| next.checked_add(u32::from_le_bytes(size) as usize))
-            .ok_or_else(|| "zstd skippable frame length overflows".to_string())?;
+fn zstd_frame_header(header: &[u8]) -> Result<ZstdFrameHeader, String> {
+    let truncated = || "zstd frame header is truncated".to_string();
+    match header.get(..4) {
+        Some(magic) if magic == ZSTD_MAGIC => {}
+        Some(_) => return Err("file does not start with a zstd frame".to_string()),
+        None => return Err(truncated()),
     }
-
-    let descriptor = *header
-        .get(cursor)
-        .ok_or_else(|| "zstd frame header is truncated".to_string())?;
-    cursor += 1;
+    let descriptor = *header.get(4).ok_or_else(truncated)?;
     if descriptor & 0b0000_1000 != 0 {
         // Bit 3 is reserved and a decoder must refuse a frame that sets it.
         return Err("zstd frame header sets a reserved bit".to_string());
     }
-    let content_size_flag = descriptor >> 6;
+    let header = header
+        .get(..zstd_frame_header_len(descriptor))
+        .ok_or_else(truncated)?;
     let single_segment = descriptor & 0b0010_0000 != 0;
-    let dictionary_id_bytes = match descriptor & 0b0000_0011 {
-        0 => 0usize,
+    let mut fields = &header[5..];
+    let window = if single_segment {
+        None
+    } else {
+        let exponent = u32::from(fields[0] >> 3);
+        let mantissa = u64::from(fields[0] & 0b0000_0111);
+        fields = &fields[1..];
+        let base = 1u64 << (10 + exponent);
+        Some(base + (base / 8) * mantissa)
+    };
+    let dictionary_id = match descriptor & 0b0000_0011 {
+        0 => 0,
         1 => 1,
         2 => 2,
         _ => 4,
     };
-
-    let mut window = None;
-    if !single_segment {
-        let window_descriptor = *header
-            .get(cursor)
-            .ok_or_else(|| "zstd frame header is truncated".to_string())?;
-        cursor += 1;
-        let exponent = u32::from(window_descriptor >> 3);
-        let mantissa = u64::from(window_descriptor & 0b0000_0111);
-        let base = 1u64
-            .checked_shl(10 + exponent)
-            .ok_or_else(|| "zstd window descriptor is out of range".to_string())?;
-        window = Some(base + (base / 8) * mantissa);
-    }
-    cursor += dictionary_id_bytes;
-
-    let content_size_bytes = match content_size_flag {
-        0 => usize::from(single_segment),
-        1 => 2,
-        2 => 4,
-        _ => 8,
-    };
-    let content_size = if content_size_bytes == 0 {
-        None
-    } else {
-        let field = header
-            .get(cursor..cursor + content_size_bytes)
-            .ok_or_else(|| "zstd frame header is truncated".to_string())?;
-        let mut value = 0u64;
-        for (index, byte) in field.iter().enumerate() {
-            value |= u64::from(*byte) << (8 * index);
-        }
+    let field = &fields[dictionary_id..];
+    let content = (!field.is_empty()).then(|| {
+        let value = field
+            .iter()
+            .rev()
+            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
         // The two-byte encoding is offset by 256.
-        Some(if content_size_bytes == 2 {
-            value + 256
-        } else {
-            value
-        })
-    };
+        if field.len() == 2 { value + 256 } else { value }
+    });
 
-    match (window, content_size) {
+    let (window, held) = match (window, content) {
         // A single-segment frame has no window descriptor: the decoder holds
         // the whole content instead, and the format requires the size to say
         // how much that is.
-        (None, Some(content)) => Ok(content),
-        (None, None) => Err("zstd frame declares no window and no content size".to_string()),
-        // Nothing is gained by holding a window larger than the content that
-        // will ever be written into it.
-        (Some(window), Some(content)) => Ok(window.min(content)),
-        (Some(window), None) => Ok(window),
-    }
+        (None, Some(content)) => (content, content),
+        (None, None) => {
+            return Err("zstd frame declares no window and no content size".to_string());
+        }
+        (Some(window), Some(content)) => (window, window.min(content)),
+        (Some(window), None) => (window, window),
+    };
+    Ok(ZstdFrameHeader {
+        window,
+        held,
+        checksum: descriptor & 0b0000_0100 != 0,
+    })
 }
 
-// Decoder memory for one zstd file, measured from its first frame header.
-fn zstd_decoder_memory_bytes(path: &Path, max_memory_bytes: u64) -> Result<u64, String> {
+// The header of a zstd stream's first frame, past any skippable frames ahead
+// of it. pzstd and seekable writers open with one longer than any header, so
+// each is skipped by the length it carries rather than read into a peek.
+fn zstd_first_frame_header(mut source: impl std::io::Read) -> Result<ZstdFrameHeader, String> {
     use std::io::Read;
-
-    let mut header = [0u8; ZSTD_FRAME_HEADER_MAX_BYTES];
-    let read = std::fs::File::open(path)
-        .and_then(|mut file| {
-            let mut filled = 0usize;
-            while filled < header.len() {
-                match file.read(&mut header[filled..])? {
-                    0 => break,
-                    count => filled += count,
-                }
-            }
-            Ok(filled)
-        })
-        .map_err(|error| format!("failed to read zstd frame header: {error}"))?;
-
-    let window = zstd_frame_window_bytes(&header[..read])?;
-    let needed = window.saturating_add(ZSTD_DECODER_OVERHEAD_BYTES);
-    if needed > max_memory_bytes {
-        return Err(format!(
-            "zstd frame needs {needed} bytes of decoder memory, above the {max_memory_bytes} byte limit"
-        ));
-    }
-    Ok(needed)
-}
-
-// Decoder memory for one simple archive, measured from the archive itself
-// where the format says what the decoder will hold.
-pub(in crate::pipeline) fn measured_decoder_memory_bytes(
-    kind: SimpleArchiveKind,
-    path: Option<&Path>,
-    max_memory_bytes: u64,
-) -> Result<u64, String> {
-    match (kind, path) {
-        (SimpleArchiveKind::Zstd, Some(path)) => zstd_decoder_memory_bytes(path, max_memory_bytes),
-        (SimpleArchiveKind::Zstd, None) => {
-            Err("cannot size a zstd decoder without the archive".to_string())
+    let failed = |error: std::io::Error| format!("failed to read zstd frame header: {error}");
+    loop {
+        let mut header = [0u8; ZSTD_FRAME_HEADER_MAX_BYTES];
+        source.read_exact(&mut header[..5]).map_err(failed)?;
+        let magic = [header[0], header[1], header[2], header[3]];
+        if magic == ZSTD_MAGIC {
+            let len = zstd_frame_header_len(header[4]);
+            source.read_exact(&mut header[5..len]).map_err(failed)?;
+            return zstd_frame_header(&header[..len]);
         }
-        _ => Ok(simple_decoder_memory_bytes(kind, max_memory_bytes)),
-    }
-}
-
-// The memory the simple-archive task admits before it opens a decoder.
-//
-// One owner admits a decoder's footprint. `.xz` is opened by
-// [`open_filesystem_xz_decoder`], which measures what the decoder it actually
-// builds will hold and reserves that itself; a ceiling-sized permit taken out
-// here as well would hold the whole job allowance while the inner request
-// waited for room only this permit could release. `tar.xz` keeps its permit:
-// its decoder is opened on the sequential path, which reserves nothing of its
-// own.
-pub(in crate::pipeline) fn simple_archive_task_memory_permit(
-    kind: SimpleArchiveKind,
-    path: Option<&Path>,
-    budget: &Arc<JobExtractionBudget>,
-) -> Result<Option<MemoryPermit>, ExtractionError> {
-    if matches!(kind, SimpleArchiveKind::Xz) {
-        return Ok(None);
-    }
-    let decoder_memory =
-        measured_decoder_memory_bytes(kind, path, budget.max_memory_bytes()).or_terminal()?;
-    Ok(budget.reserve_memory_wait(decoder_memory).map(Some)?)
-}
-
-fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -> u64 {
-    const MIB: u64 = 1024 * 1024;
-    match kind {
-        // Sized from the frame header instead; see
-        // `measured_decoder_memory_bytes`, which is what the reservation
-        // paths call.
-        SimpleArchiveKind::Zstd => max_memory_bytes,
-        SimpleArchiveKind::Xz | SimpleArchiveKind::TarXz => {
-            max_memory_bytes.min(crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES)
+        if !zstd_skippable_magic(magic) {
+            return Err("file does not start with a zstd frame".to_string());
         }
-        SimpleArchiveKind::Brotli => 32 * MIB,
-        SimpleArchiveKind::Zip | SimpleArchiveKind::TarBz2 | SimpleArchiveKind::Bzip2 => 8 * MIB,
-        SimpleArchiveKind::Tar
-        | SimpleArchiveKind::TarGz
-        | SimpleArchiveKind::Gz
-        | SimpleArchiveKind::Deflate
-        | SimpleArchiveKind::Split => MIB,
+        // The fifth byte read is the first of the skippable frame's length.
+        let mut length = [header[4], 0, 0, 0];
+        source.read_exact(&mut length[1..]).map_err(failed)?;
+        let length = u64::from(u32::from_le_bytes(length));
+        let skipped =
+            std::io::copy(&mut (&mut source).take(length), &mut std::io::sink()).map_err(failed)?;
+        if skipped != length {
+            return Err("zstd skippable frame is truncated".to_string());
+        }
     }
 }
 
@@ -2773,83 +2721,6 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
     ))
 }
 
-fn extract_tar(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::Tar,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
-fn extract_tar_gz(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::TarGz,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
-fn extract_tar_bz2(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::TarBz2,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn extract_tar_xz(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::TarXz,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
 fn extract_tar_from_reader<R: std::io::Read>(
     reader: R,
     root: &ExtractionRoot,
@@ -2945,25 +2816,6 @@ fn extract_tar_from_reader<R: std::io::Read>(
     Ok(extracted)
 }
 
-fn extract_gz(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::Gz,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
 fn strip_ascii_case_suffix<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(suffix) {
@@ -2983,197 +2835,53 @@ fn derive_single_file_output_name<'a>(archive_name: &'a str, suffixes: &[&str]) 
         .unwrap_or(archive_name)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn extract_single_stream_to_file<R: std::io::Read>(
-    mut reader: R,
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    suffixes: &[&str],
-    format_name: &str,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    let archive_name = archive_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let output_name = derive_single_file_output_name(&archive_name, suffixes);
-    let safe_path = root
-        .validate_relative_path(output_name)
-        .map_err(|error| budget.reject_unsafe_path(error))?;
-
-    let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
-        job_id,
-        set_name: set_name.to_string(),
-        member: output_name.to_string(),
-    });
-
-    let mut outfile = buffered_extraction_output(root.create_file(&safe_path, budget)?);
-    let copied = std::io::copy(&mut reader, &mut outfile);
-    let bytes_written = copied
-        .and_then(|bytes| outfile.flush().map(|()| bytes))
-        .map_err(|e| {
-            ExtractionError::from_io(format!("failed to decompress {format_name}: {e}"), &e)
-        })?;
-
-    let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
-        job_id,
-        set_name: set_name.to_string(),
-        member: output_name.to_string(),
-    });
-    tracing::info!(job_id = job_id.0, member = %output_name, bytes_written, format = format_name, "compressed file decompressed");
-
-    Ok(vec![output_name.to_string()])
-}
-
-fn extract_brotli(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::Brotli,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
-fn extract_deflate(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::Deflate,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
-fn extract_zstd(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::Zstd,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
-fn extract_bzip2(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
-) -> Result<Vec<String>, ExtractionError> {
-    sequential::extract_file(&sequential::SequentialExtractionContext {
-        kind: SimpleArchiveKind::Bzip2,
-        archive_path,
-        root,
-        budget,
-        event_tx,
-        job_id,
-        set_name,
-    })
-}
-
 fn extract_xz(
-    archive_path: &Path,
-    root: &ExtractionRoot,
-    budget: &Arc<JobExtractionBudget>,
-    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
-    job_id: JobId,
-    set_name: &str,
+    context: &sequential::SequentialExtractionContext<'_>,
     xz_worker_threads: usize,
 ) -> Result<Vec<String>, ExtractionError> {
-    let xz = open_filesystem_xz_decoder(archive_path, budget, xz_worker_threads)?;
-    extract_single_stream_to_file(
-        xz,
-        archive_path,
-        root,
-        budget,
-        &[".xz"],
-        "xz",
-        event_tx,
-        job_id,
-        set_name,
-    )
+    match open_parallel_xz_decoder(context.archive_path, context.budget, xz_worker_threads)? {
+        Some(parallel) => sequential::write_decoded_file(parallel, context),
+        // The sequential decoder is sized from the file's own header and
+        // decoded as any stream file is, so a later block that asks for more
+        // restarts it with a larger reservation.
+        None => sequential::extract_file(context),
+    }
 }
 
-fn open_filesystem_xz_decoder(
+// The block-parallel decoder for an xz file on disk whose structure allows
+// one, or `None` for the sequential decoder.
+fn open_parallel_xz_decoder(
     archive_path: &Path,
     budget: &Arc<JobExtractionBudget>,
     xz_worker_threads: usize,
-) -> Result<FilesystemXzDecoder<BudgetedReader<std::fs::File>>, ExtractionError> {
-    let mut probe = std::fs::File::open(archive_path)
-        .map_err(|error| ExtractionError::from_io(format!("failed to open xz: {error}"), &error))?;
-    let memory_limit = crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES.min(budget.max_memory_bytes());
-
-    if matches!(
-        crate::ingest::xz_filesystem_decoder_kind(&mut probe),
+) -> Result<Option<ParallelXzDecoder<BudgetedReader<std::fs::File>>>, ExtractionError> {
+    let unreadable = |error: std::io::Error| {
+        ExtractionError::from_io(format!("failed to open xz: {error}"), &error)
+    };
+    let mut file = std::fs::File::open(archive_path).map_err(unreadable)?;
+    if !matches!(
+        crate::ingest::xz_filesystem_decoder_kind(&mut file),
         crate::ingest::XzFilesystemDecoderKind::Parallel
     ) {
-        let file = std::fs::File::open(archive_path).map_err(|error| {
-            ExtractionError::from_io(format!("failed to open xz: {error}"), &error)
-        })?;
-        let file = BudgetedReader::new(file, Arc::clone(budget));
-        // The parallel reader plans every block from the index before it
-        // decodes anything, and trims its thread count until the workers fit
-        // under `memory_limit`; what it then reports is what the decode will
-        // hold at its peak, and that is what the job is charged for. A file
-        // whose structure it refuses goes to the sequential decoder, which is
-        // the one that validates it properly.
-        if let Ok(decoder) =
-            crate::ingest::xz_parallel_decoder(file, memory_limit, xz_worker_threads)
-        {
-            let memory = budget.reserve_memory_wait(decoder.memory_estimate())?;
-            return Ok(FilesystemXzDecoder::Parallel {
-                decoder: Box::new(decoder),
-                _memory: memory,
-            });
-        }
+        return Ok(None);
     }
-
-    let file = std::fs::File::open(archive_path)
-        .map_err(|error| ExtractionError::from_io(format!("failed to open xz: {error}"), &error))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    // The sequential decoder's dictionary is bounded by `memory_limit`, and
-    // that is what it is charged for. Reserved before the decoder is built, so
-    // nothing is allocated outside the admission.
-    let memory = budget.reserve_memory_wait(memory_limit)?;
-    crate::ingest::xz_multistream_decoder(file, memory_limit)
-        .map(|decoder| FilesystemXzDecoder::Sequential {
-            decoder: Box::new(decoder),
-            _memory: memory,
-        })
-        .map_err(|error| ExtractionError::terminal(format!("failed to open xz decoder: {error}")))
+    let parallel = BudgetedReader::new(file, Arc::clone(budget));
+    let memory_limit = crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES.min(budget.max_memory_bytes());
+    // The parallel reader plans every block from the index before it decodes
+    // anything, and trims its thread count until the workers fit under
+    // `memory_limit`; what it then reports is what the decode will hold at its
+    // peak, and that is what the job is charged for. A file whose structure it
+    // refuses goes to the sequential decoder, which is the one that validates
+    // it properly.
+    let Ok(decoder) = crate::ingest::xz_parallel_decoder(parallel, memory_limit, xz_worker_threads)
+    else {
+        return Ok(None);
+    };
+    let memory = budget.reserve_memory_wait(decoder.memory_estimate())?;
+    Ok(Some(ParallelXzDecoder {
+        decoder: Box::new(decoder),
+        _memory: memory,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3311,7 +3019,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_name: &str,
-    ) -> Result<u32, ExtractionError> {
+    ) -> Result<(), ExtractionError> {
         let (volume_paths, cached_headers, password_candidates) = {
             let _state = self
                 .jobs
@@ -3349,7 +3057,7 @@ impl Pipeline {
                         "retired a stale archive set — no on-disk volumes and no live file claims its names"
                     );
                     self.schedule_job_completion_check(job_id);
-                    return Ok(0);
+                    return Ok(());
                 }
                 // The reader or topology refresh re-arms completion when it
                 // finishes. Retiring its tombstone and re-queuing ourselves
@@ -3360,7 +3068,7 @@ impl Pipeline {
                     if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
                         inflight.remove(set_name);
                     }
-                    return Ok(0);
+                    return Ok(());
                 }
                 ArchiveSetRetirement::NotRar => {}
                 ArchiveSetRetirement::StillReferenced => {
@@ -3383,7 +3091,7 @@ impl Pipeline {
                                 if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
                                     inflight.remove(set_name);
                                 }
-                                return Ok(0);
+                                return Ok(());
                             }
                             UnmaterializedArchiveSet::ConsumedBy(owner) => {
                                 info!(
@@ -3393,7 +3101,7 @@ impl Pipeline {
                                     "absorbed a claimed archive set with no volumes into the set that already extracted its files"
                                 );
                                 self.absorb_archive_set_into_extracted(job_id, set_name);
-                                return Ok(0);
+                                return Ok(());
                             }
                             UnmaterializedArchiveSet::NeverMaterialized => {
                                 info!(
@@ -3402,7 +3110,7 @@ impl Pipeline {
                                     "absorbed a claimed archive set this job never materialized — no volume facts were ever parsed under its name"
                                 );
                                 self.absorb_archive_set_into_extracted(job_id, set_name);
-                                return Ok(0);
+                                return Ok(());
                             }
                             UnmaterializedArchiveSet::MissingVolumes => {
                                 // Genuinely short of volumes. The task below
@@ -3491,7 +3199,7 @@ impl Pipeline {
                 policy: Some(policy),
             };
             tokio::spawn(chase.resolve(extract_done_tx));
-            return Ok(0);
+            return Ok(());
         }
         self.retire_unusable_root_stream(job_id, set_name).await?;
         let mut dispatch = self.admit_root_stream(
@@ -3563,8 +3271,7 @@ impl Pipeline {
         });
         runtime.track_worker(owner, worker);
 
-        // Extraction runs in background — result comes through extract_done_tx channel.
-        Ok(0)
+        Ok(())
     }
 
     // Spawn extraction for a list of archives, tracking each in `inflight_extractions`.
@@ -3683,7 +3390,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_name: &str,
-    ) -> Result<u32, ExtractionError> {
+    ) -> Result<(), ExtractionError> {
         let part_candidates = self
             .archive_set_indexed_part_paths(job_id, set_name)
             .or_terminal()?;
@@ -3742,7 +3449,7 @@ impl Pipeline {
                 policy: None,
             };
             tokio::spawn(chase.resolve(extract_done_tx));
-            return Ok(0);
+            return Ok(());
         }
         self.retire_unusable_root_stream(job_id, set_name).await?;
         let mut dispatch = self.admit_root_stream(
@@ -3820,8 +3527,7 @@ impl Pipeline {
         });
         runtime.track_worker(owner, worker);
 
-        // Return Ok(0) for now — actual result comes through the channel.
-        Ok(0)
+        Ok(())
     }
 
     // The file a split set's parts join into, when it is already on disk and
@@ -3877,7 +3583,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
         kind: SimpleArchiveKind,
-    ) -> Result<u32, ExtractionError> {
+    ) -> Result<(), ExtractionError> {
         let file_paths = self
             .archive_set_part_paths(job_id, set_name)
             .or_terminal()?;
@@ -3967,14 +3673,38 @@ impl Pipeline {
                 .await;
         });
 
-        Ok(0)
+        Ok(())
     }
 
-    // Persist RAR volume eligibility without deleting source volumes.
+    // The job's archive runtime while a nested archive may still read the
+    // job's source volumes. A chase that streamed no child archive leaves its
+    // finished namespace behind with nothing consumed and nothing decoded, and
+    // that namespace must not keep the set's volumes from eager deletion.
+    fn nested_archive_runtime(
+        &self,
+        job_id: JobId,
+    ) -> Option<&crate::pipeline::extraction::runtime::ArchiveRuntime> {
+        self.archive_runtime.get(&job_id).filter(|runtime| {
+            runtime.pending() || !runtime.consumed.is_empty() || !runtime.decoded.is_empty()
+        })
+    }
+
+    // Whether the job's archive runtime still reads `path`: as an input of a
+    // request, a replay, a finished or retained namespace, a deferred repair
+    // or a staged replacement. Final cleanup asks this of every runtime; the
+    // eager volume deletion above asks only one that may still read nested.
+    pub(crate) fn retains_job_input(&self, job_id: JobId, path: &Path) -> bool {
+        self.archive_runtime
+            .get(&job_id)
+            .is_some_and(|runtime| runtime.retains_input_path(path))
+    }
+
+    // Deletes each of the set's RAR volumes that no member, retry, recovery
+    // verification, or nested reader still needs, and logs why every other
+    // volume is kept.
     pub(crate) fn try_delete_volumes(&mut self, job_id: JobId, set_name: &str) {
         if self
-            .archive_runtime
-            .get(&job_id)
+            .nested_archive_runtime(job_id)
             .is_some_and(|runtime| runtime.retains_archive_set(set_name))
         {
             return;
@@ -4065,8 +3795,7 @@ impl Pipeline {
                     return;
                 };
                 if self
-                    .archive_runtime
-                    .get(&job_id)
+                    .nested_archive_runtime(job_id)
                     .is_some_and(|runtime| runtime.retains_input_path(&path))
                 {
                     continue;
@@ -4137,6 +3866,9 @@ impl Pipeline {
                 }
                 if par2_verification_pending {
                     reasons.push("par2_verification_pending".to_string());
+                }
+                if par3_verification_pending {
+                    reasons.push("par3_verification_pending".to_string());
                 }
                 if already_deleted {
                     reasons.push("already_deleted".to_string());

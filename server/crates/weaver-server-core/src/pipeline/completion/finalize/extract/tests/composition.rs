@@ -597,10 +597,7 @@ fn stored_parent_source_feeds_adaptive_decoder_after_child_direct_refusal() {
         graph.record_placement(&parent, receipt).unwrap();
     }
     assert_eq!(graph.nodes.len(), 1);
-    assert!(matches!(
-        graph.node(1).mode,
-        NodeMode::MaterializationPending(_)
-    ));
+    assert_eq!(graph.node(1).mode, NodeMode::Engine);
     let image = graph.input_views(&parent, 1).remove(&0).unwrap();
     let mut original = VirtualVolumeReader::<true>::new(image.clone(), Arc::default());
     let mut observed = Vec::new();

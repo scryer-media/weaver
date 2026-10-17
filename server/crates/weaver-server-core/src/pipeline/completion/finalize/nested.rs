@@ -4,6 +4,22 @@ use std::path::{Path, PathBuf};
 
 mod worker;
 
+// Whether a directory entry is one of Weaver's own working files rather than
+// job content: everything [`is_direct_working_file`] names, plus the
+// checkpoint and nested-graph directories and the job and output directory
+// markers. A partial holds an archive's bytes with the routed members cut out,
+// so opening one as a nested archive fails the job on data it was never meant
+// to read.
+//
+// [`is_direct_working_file`]: crate::pipeline::direct_store::plan::is_direct_working_file
+fn is_weaver_working_file(name: &str) -> bool {
+    name == crate::jobs::working_dir::WORKING_DIR_MARKER
+        || name == crate::jobs::working_dir::OUTPUT_DIR_MARKER
+        || name == crate::pipeline::direct_store::manifest::DIRECTORY
+        || name == crate::pipeline::direct_store::nested::NESTED_DIR
+        || crate::pipeline::direct_store::plan::is_direct_working_file(name)
+}
+
 fn scan_extraction_directory(
     root: &Path,
     current: &Path,
@@ -26,6 +42,9 @@ fn scan_extraction_children(
     for entry in entries {
         let entry = entry
             .map_err(|error| format!("failed to read entry in {}: {error}", current.display()))?;
+        if is_weaver_working_file(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         let path = entry.path();
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -73,52 +92,7 @@ impl Pipeline {
     fn archive_type_for_role(
         role: &weaver_model::files::FileRole,
     ) -> Option<crate::jobs::assembly::ArchiveType> {
-        match role {
-            weaver_model::files::FileRole::RarVolume { .. } => {
-                Some(crate::jobs::assembly::ArchiveType::Rar)
-            }
-            weaver_model::files::FileRole::SevenZipArchive
-            | weaver_model::files::FileRole::SevenZipSplit { .. } => {
-                Some(crate::jobs::assembly::ArchiveType::SevenZip)
-            }
-            weaver_model::files::FileRole::ZipArchive => {
-                Some(crate::jobs::assembly::ArchiveType::Zip)
-            }
-            weaver_model::files::FileRole::TarArchive => {
-                Some(crate::jobs::assembly::ArchiveType::Tar)
-            }
-            weaver_model::files::FileRole::TarGzArchive => {
-                Some(crate::jobs::assembly::ArchiveType::TarGz)
-            }
-            weaver_model::files::FileRole::TarBz2Archive => {
-                Some(crate::jobs::assembly::ArchiveType::TarBz2)
-            }
-            weaver_model::files::FileRole::TarXzArchive => {
-                Some(crate::jobs::assembly::ArchiveType::TarXz)
-            }
-            weaver_model::files::FileRole::GzArchive => {
-                Some(crate::jobs::assembly::ArchiveType::Gz)
-            }
-            weaver_model::files::FileRole::DeflateArchive => {
-                Some(crate::jobs::assembly::ArchiveType::Deflate)
-            }
-            weaver_model::files::FileRole::BrotliArchive => {
-                Some(crate::jobs::assembly::ArchiveType::Brotli)
-            }
-            weaver_model::files::FileRole::ZstdArchive => {
-                Some(crate::jobs::assembly::ArchiveType::Zstd)
-            }
-            weaver_model::files::FileRole::Bzip2Archive => {
-                Some(crate::jobs::assembly::ArchiveType::Bzip2)
-            }
-            weaver_model::files::FileRole::XzArchive => {
-                Some(crate::jobs::assembly::ArchiveType::Xz)
-            }
-            weaver_model::files::FileRole::SplitFile { .. } => {
-                Some(crate::jobs::assembly::ArchiveType::Split)
-            }
-            _ => None,
-        }
+        crate::jobs::assembly::ArchiveType::from_role(role)
     }
 
     fn archive_volume_number(role: &weaver_model::files::FileRole) -> u32 {
@@ -154,6 +128,22 @@ impl Pipeline {
         for file in files.iter_mut() {
             if file.detected_archive.is_some() {
                 continue;
+            }
+            // A name is a claim the bytes can refute. A 7z without the magic is
+            // no archive at all, so it is judged by its bytes like any unnamed
+            // file: a RAR under a 7z name is found by its own signature below,
+            // and anything else stays the file it is. An unreadable one keeps
+            // its name's claim, and the extraction that opens it reports why.
+            // A split's first volume keeps it too: its siblings still claim
+            // the set, and the engine that opens the set judges them together.
+            if matches!(
+                file.declared_role,
+                weaver_model::files::FileRole::SevenZipArchive
+            ) && !Self::path_has_7z_magic(root.join(&file.relative_path))
+                .await
+                .unwrap_or(true)
+            {
+                file.declared_role = weaver_model::files::FileRole::Unknown;
             }
             if !matches!(
                 file.declared_role,
@@ -231,20 +221,11 @@ impl Pipeline {
     async fn scan_extraction_root(
         root: &Path,
         password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
-        working_root: bool,
     ) -> Result<Vec<ScannedExtractionFile>, String> {
         let mut files = Vec::new();
         if root.exists() {
             let entries = std::fs::read_dir(root)
                 .map_err(|error| format!("failed to read extraction root: {error}"))?;
-            let entries = entries.filter(|entry| {
-                !entry.as_ref().is_ok_and(|entry| {
-                    entry.file_name() == ".weaver-nested"
-                        || (working_root
-                            && entry.file_name()
-                                == crate::pipeline::direct_store::manifest::DIRECTORY)
-                })
-            });
             scan_extraction_children(root, root, &mut files, entries)?;
         }
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -260,7 +241,7 @@ impl Pipeline {
             warn!(
                 job_id = job_id.0,
                 error = %error,
-                "failed to clear persisted extracted members before nested extraction"
+                "failed to clear persisted extracted members before re-extraction"
             );
         }
     }
@@ -274,7 +255,9 @@ impl Pipeline {
             return Ok(NestedExtractionDecision::Deferred);
         }
         self.retire_unconsumed_chase_streams(job_id).await;
-        self.resume_scoped_replay(job_id).await?;
+        self.resume_scoped_replay(job_id)
+            .await
+            .map_err(|error| error.to_string())?;
         if self
             .archive_runtime
             .get(&job_id)
@@ -327,12 +310,7 @@ impl Pipeline {
             .map_err(|error| format!("extraction root link scan task failed: {error}"))??;
         }
         let password_candidates = self.archive_password_candidates_for_job(job_id).candidates;
-        let working_root = self
-            .jobs
-            .get(&job_id)
-            .is_some_and(|state| state.working_dir == scan_root);
-        let scanned_files =
-            Self::scan_extraction_root(&scan_root, password_candidates, working_root).await?;
+        let scanned_files = Self::scan_extraction_root(&scan_root, password_candidates).await?;
         let nested_archives: Vec<NestedArchiveFile> = scanned_files
             .iter()
             .filter_map(|file| {
@@ -380,7 +358,8 @@ impl Pipeline {
         for (set_name, mut files) in groups {
             files.sort_by_key(|file| file.volume_number);
             self.spawn_scoped_filesystem_extraction(job_id, &scan_root, set_name, files)
-                .await?;
+                .await
+                .map_err(|error| error.to_string())?;
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.extraction_depth = state.extraction_depth.saturating_add(1);
@@ -471,6 +450,126 @@ mod cleanup_scan_tests {
         .unwrap_err();
         assert!(error.contains("non-file/non-directory"), "{error}");
         assert!(files.is_empty());
+    }
+
+    // A valid 7z signature header announcing an empty next header.
+    fn sevenz_signature_header() -> Vec<u8> {
+        let mut header = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4, 0, 0, 0, 0];
+        header.extend_from_slice(&[0; 20]);
+        let mut crc = weaver_yenc::crc::Crc32::new();
+        crc.update(&header[12..]);
+        header[8..12].copy_from_slice(&crc.finalize().to_le_bytes());
+        header
+    }
+
+    #[tokio::test]
+    async fn nested_scan_skips_direct_store_partials_with_a_7z_signature() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("inner.7z.f0.direct.partial"),
+            sevenz_signature_header(),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("inner"), sevenz_signature_header()).unwrap();
+
+        let files = Pipeline::scan_extraction_root(root.path(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].relative_path, "inner");
+        assert!(files[0].detected_archive.is_some());
+    }
+
+    #[test]
+    fn weaver_working_files_are_recognised_by_shape_not_extension() {
+        for name in [
+            ".weaver-job-dir",
+            ".weaver-output-dir",
+            ".weaver-checkpoints",
+            crate::pipeline::direct_store::nested::NESTED_DIR,
+            ".weaver-holds.inner.7z.f0",
+            "sample.mkv.f3.direct.partial",
+            "inner.7z.f0.vol00000.envelope",
+            "inner.7z.f2.vol00011.repair",
+            ".weaver-install-a1B2c3",
+            ".weaver-identity-settle.4.show.part02.rar",
+            ".weaver-placement-0",
+        ] {
+            assert!(is_weaver_working_file(name), "{name}");
+        }
+        for name in [
+            "chapter.envelope",
+            "notes.repair",
+            "inner.7z",
+            "sample.mkv",
+            "inner.7z.f0.vol1.envelope",
+            "inner.7z.f+0.vol00001.envelope",
+            "inner.7z.f0.vol+0001.repair",
+            "weaver-install-a1B2c3",
+        ] {
+            assert!(!is_weaver_working_file(name), "{name}");
+        }
+    }
+
+    // The scan and the restart sweep read the name the builders write through
+    // one recogniser, so every built name parses back to the parts it was
+    // built from.
+    #[test]
+    fn weaver_working_files_parse_back_what_the_builders_write() {
+        use crate::pipeline::direct_store::plan::{
+            VolumeScratchKind, envelope_file_name, parse_volume_scratch_name, repair_file_name,
+        };
+        for (set_name, discriminator, volume_index) in [
+            ("inner.7z", 0, 0),
+            ("Silver Horizon", 7, 12),
+            ("x", u32::MAX, 123_456),
+        ] {
+            for (kind, name) in [
+                (
+                    VolumeScratchKind::Envelope,
+                    envelope_file_name(set_name, discriminator, volume_index),
+                ),
+                (
+                    VolumeScratchKind::Repair,
+                    repair_file_name(set_name, discriminator, volume_index),
+                ),
+            ] {
+                let parsed = parse_volume_scratch_name(&name).unwrap_or_else(|| panic!("{name}"));
+                assert_eq!(parsed.kind, kind, "{name}");
+                assert_eq!(parsed.discriminator, discriminator, "{name}");
+                assert_eq!(parsed.volume_index, volume_index, "{name}");
+                assert_eq!(parsed.file_name(set_name), name);
+                assert!(is_weaver_working_file(&name), "{name}");
+            }
+        }
+    }
+
+    // A parked identity-settle source is a real RAR volume mid-move, and an
+    // install temporary holds a hard link to a finished member. Neither is
+    // job content, so the scan never offers either for extraction.
+    #[tokio::test]
+    async fn nested_scan_skips_identity_settle_and_install_temporaries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".weaver-identity-settle.3.inner.7z"),
+            sevenz_signature_header(),
+        )
+        .unwrap();
+        let install = root.path().join(".weaver-install-Zq9x");
+        std::fs::create_dir(&install).unwrap();
+        std::fs::write(install.join("member"), sevenz_signature_header()).unwrap();
+        let placement = root.path().join(".weaver-placement-0");
+        std::fs::create_dir(&placement).unwrap();
+        std::fs::write(placement.join("inner.7z"), sevenz_signature_header()).unwrap();
+        std::fs::write(root.path().join("inner"), sevenz_signature_header()).unwrap();
+
+        let files = Pipeline::scan_extraction_root(root.path(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].relative_path, "inner");
     }
 
     #[test]

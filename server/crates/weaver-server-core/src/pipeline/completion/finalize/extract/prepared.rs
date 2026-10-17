@@ -314,15 +314,27 @@ impl PreparedSimple {
                 "no files found for set '{set_name}'"
             )));
         }
-        let _memory_permit = simple_archive_task_memory_permit(
+        let context = sequential::SequentialExtractionContext {
             kind,
-            file_paths.first().map(PathBuf::as_path),
-            &budget,
-        )?;
-
+            archive_path: &file_paths[0],
+            root: &root,
+            budget: &budget,
+            event_tx: &event_tx,
+            job_id,
+            set_name: &set_name,
+        };
+        // Each arm admits its own decoder's memory: a sequential kind from its
+        // header, an xz file from the decoder it opens, which may be the
+        // parallel one, and a ZIP or a join from their fixed footprints.
+        let fixed_memory = || {
+            sequential::stream_decoder_memory(kind, std::io::empty, budget.max_memory_bytes())
+                .or_terminal()
+                .and_then(|memory| Ok(budget.reserve_memory_wait(memory.reserved)?))
+        };
         let mut selected_password = None;
         let extracted_members = match kind {
             SimpleArchiveKind::Zip => {
+                let _memory = fixed_memory()?;
                 let (members, password) = extract_zip(
                     &file_paths[0],
                     &root,
@@ -336,52 +348,29 @@ impl PreparedSimple {
                 selected_password = password;
                 members
             }
-            SimpleArchiveKind::Tar => {
-                extract_tar(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
+            SimpleArchiveKind::Split => {
+                let _memory = fixed_memory()?;
+                extract_split(
+                    &file_paths,
+                    &root,
+                    &budget,
+                    &event_tx,
+                    job_id,
+                    &set_name,
+                    Some(Arc::clone(&phase_counters)),
+                    joined_output_already_present,
+                )?
             }
-            SimpleArchiveKind::TarGz => {
-                extract_tar_gz(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
-            }
-            SimpleArchiveKind::TarBz2 => {
-                extract_tar_bz2(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
-            }
-            SimpleArchiveKind::TarXz => {
-                extract_tar_xz(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
-            }
-            SimpleArchiveKind::Gz => {
-                extract_gz(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
-            }
-            SimpleArchiveKind::Deflate => {
-                extract_deflate(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
-            }
-            SimpleArchiveKind::Brotli => {
-                extract_brotli(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
-            }
-            SimpleArchiveKind::Zstd => {
-                extract_zstd(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
-            }
-            SimpleArchiveKind::Bzip2 => {
-                extract_bzip2(&file_paths[0], &root, &budget, &event_tx, job_id, &set_name)?
-            }
-            SimpleArchiveKind::Xz => extract_xz(
-                &file_paths[0],
-                &root,
-                &budget,
-                &event_tx,
-                job_id,
-                &set_name,
-                xz_worker_threads,
-            )?,
-            SimpleArchiveKind::Split => extract_split(
-                &file_paths,
-                &root,
-                &budget,
-                &event_tx,
-                job_id,
-                &set_name,
-                Some(Arc::clone(&phase_counters)),
-                joined_output_already_present,
-            )?,
+            SimpleArchiveKind::Xz => extract_xz(&context, xz_worker_threads)?,
+            SimpleArchiveKind::Tar
+            | SimpleArchiveKind::TarGz
+            | SimpleArchiveKind::TarBz2
+            | SimpleArchiveKind::TarXz
+            | SimpleArchiveKind::Gz
+            | SimpleArchiveKind::Deflate
+            | SimpleArchiveKind::Brotli
+            | SimpleArchiveKind::Zstd
+            | SimpleArchiveKind::Bzip2 => sequential::extract_file(&context)?,
         };
 
         Ok(FullSetExtractionOutcome {

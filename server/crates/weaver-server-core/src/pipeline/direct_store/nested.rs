@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 
 use super::ByteRanges;
-use super::plan::{DirectSetPlan, IdentityKind, IdentityPlanFacts, SetFormat};
+use super::plan::{DirectSetPlan, IdentityPlanFacts, SetFormat};
 use super::router::{DemotionReason, DirectDestination, DirectSetRouter, RawChild, RoutedSpan};
 use weaver_model::files::{FileRole, archive_base_name};
 
@@ -14,6 +14,7 @@ pub(crate) mod catalog;
 pub(crate) mod checkpoint;
 pub(crate) mod materialize;
 pub(crate) mod placement;
+pub(crate) mod seek;
 mod views;
 pub(crate) use views::RepairInventory;
 
@@ -23,13 +24,71 @@ use catalog::{MemberCatalog, RoutingNamespace};
 pub(crate) const ROOT_NODE: u32 = 0;
 pub(crate) const MAX_NODES: usize = 4_096;
 pub(crate) const MAX_INPUTS: usize = 65_536;
+// Where a root keeps its nested archives' working and destination trees,
+// under its own: one directory per root, one per node inside it.
+pub(crate) const NESTED_DIR: &str = ".weaver-nested";
 
+// The plan of nested node `id` under `root`: `volumes` maps the node's volumes
+// to the parent members that carry them, and `expected_volumes` is how many
+// the set has once that is known.
+fn nested_plan(
+    root: &DirectSetPlan,
+    id: u32,
+    set_name: String,
+    format: SetFormat,
+    volumes: BTreeMap<u32, u32>,
+    expected_volumes: Option<u32>,
+) -> DirectSetPlan {
+    let root_name = blake3::hash(root.envelope_relative_path(0).as_bytes()).to_hex();
+    let relative = PathBuf::from(NESTED_DIR)
+        .join(root_name.as_str())
+        .join(id.to_string());
+    DirectSetPlan {
+        set_name,
+        format,
+        files: volumes
+            .iter()
+            .map(|(&volume, &member)| (member, volume))
+            .collect(),
+        volumes,
+        identity: Some(IdentityPlanFacts {
+            kind: format.nested_identity(),
+            expected_volumes,
+            discriminator: id,
+        }),
+        unposted: Default::default(),
+        working_dir: root.working_dir.join(&relative),
+        destination_dir: root.destination_dir.join(&relative),
+    }
+}
+
+// How a child archive reaches the disk. A refusal picks one of the two
+// others by what it says about the bytes; see
+// [`DemotionReason::leaves_a_readable_archive`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NodeMode {
+    // The graph routes the node's members itself.
     Direct,
-    // Old outputs must finish placement before this node can be materialized.
+    // The node is an archive the router does not route, so a live engine
+    // extracts it from the bytes its parent delivers. Why is the router's
+    // [`DirectSetRouter::demotion`]: a refusal records its reason there (see
+    // [`NestedNode::refuse`]), a 7z nobody can say the length of is born with
+    // [`DemotionReason::UnseekableParent`], and a stream has none, because
+    // nothing refused it.
+    Engine,
+    // The node lands as its parent's member, once old outputs finish placement.
     MaterializationPending(DemotionReason),
     Materialized,
+}
+
+impl NodeMode {
+    fn refused(reason: DemotionReason) -> Self {
+        if reason.leaves_a_readable_archive() {
+            Self::Engine
+        } else {
+            Self::MaterializationPending(reason)
+        }
+    }
 }
 
 pub(crate) struct NodeInput {
@@ -54,25 +113,49 @@ pub(crate) struct NestedNode {
     // A complete known volume is not proof that no further sibling exists.
     pub(crate) roster_closed: bool,
     members_closed: bool,
-    pub(crate) whole_sevenz: bool,
     discovered_revision: Option<u64>,
 }
 
 impl NestedNode {
+    // The first verdict stands: an engine already reading the node, a copy
+    // already pending and a file already landed are not revisited.
+    //
+    // The reason goes to the node's router too, which routes nothing once
+    // the node leaves direct mode: that is where whoever opens the node's
+    // engine or lands its copy reads why. A router that refused on its own
+    // already holds its reason, and keeps it.
+    fn refuse(&mut self, reason: DemotionReason) {
+        if self.mode == NodeMode::Direct {
+            self.mode = NodeMode::refused(reason);
+            self.router.demote(reason);
+        }
+    }
+
     fn settle_inputs(&mut self, parent: &dyn MemberCatalog) -> Vec<RoutedSpan> {
         let mut emitted = Vec::new();
+        // Every node learns how long its inputs are, because an engine reading
+        // one live cannot find its end otherwise. Only a routed node goes on
+        // to tell its router and confirm the volumes it has in full.
+        let mut learned = Vec::new();
+        for (&volume, input) in &mut self.inputs {
+            if input.length.is_none() {
+                input.length = parent.length(input.parent_member);
+                if input.length.is_some() {
+                    learned.push(volume);
+                }
+            }
+        }
         if self.mode != NodeMode::Direct {
             return emitted;
         }
         for (&volume, input) in &mut self.inputs {
-            if input.length.is_none() {
-                input.length = parent.length(input.parent_member);
-                if let Some(length) = input.length
-                    && let Err(reason) = self.router.note_declared_volume_size(volume, length)
-                {
-                    self.mode = NodeMode::MaterializationPending(reason);
-                    break;
-                }
+            if learned.contains(&volume)
+                && let Err(reason) = self
+                    .router
+                    .note_declared_volume_size(volume, input.length.expect("learned length"))
+            {
+                self.refuse(reason);
+                break;
             }
             let Some(length) = input.length else { continue };
             if input.confirmed || !input.delivered.missing(0, length).is_empty() {
@@ -83,7 +166,7 @@ impl NestedNode {
                 .router
                 .note_volume_complete_into(volume, length, &mut emitted)
             {
-                self.mode = NodeMode::MaterializationPending(reason);
+                self.refuse(reason);
                 break;
             }
         }
@@ -133,6 +216,10 @@ pub(crate) struct NestedGraph {
     root_discovered_revision: Option<u64>,
     root_epoch: Option<catalog::NamespaceEpoch>,
     depth_limit: Option<u32>,
+    // What each engine node's reader is blocked on. A running engine's
+    // observation, so it is never checkpointed: a restarted engine blocks
+    // again and says so.
+    engine_wants: BTreeMap<u32, seek::Seek>,
 }
 
 impl NestedGraph {
@@ -252,30 +339,28 @@ impl NestedGraph {
             if let Some((id, input_volume)) = self.binding(parent, member) {
                 let node = self.node_mut(id);
                 let Some(input) = node.inputs.get_mut(&input_volume) else {
-                    node.mode =
-                        NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts);
+                    node.refuse(DemotionReason::ConflictingVolumeFacts);
                     continue;
                 };
                 if input.length.is_some() && length.is_some() && input.length != length {
-                    node.mode =
-                        NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts);
+                    node.refuse(DemotionReason::ConflictingVolumeFacts);
                 } else if input.length.is_none()
                     && let Some(length) = length
                 {
                     input.length = Some(length);
                     if let Err(reason) = node.router.note_declared_volume_size(input_volume, length)
                     {
-                        node.mode = NodeMode::MaterializationPending(reason);
+                        node.refuse(reason);
                     }
                 }
                 continue;
             }
-            let family = u8::from(format == SetFormat::SevenZip);
+            let family = format.code();
             let key = (parent, name.clone(), family);
             if self.bindings.len() >= MAX_INPUTS {
                 if let Some(&child) = self.groups.get(&key) {
-                    self.node_mut(child).mode =
-                        NodeMode::MaterializationPending(DemotionReason::HoldsBudgetExceeded);
+                    self.node_mut(child)
+                        .refuse(DemotionReason::HoldsBudgetExceeded);
                 }
                 continue;
             }
@@ -288,33 +373,31 @@ impl NestedGraph {
                     continue;
                 }
                 let id = self.nodes.len() as u32 + 1;
-                let root_name =
-                    blake3::hash(root.plan().envelope_relative_path(0).as_bytes()).to_hex();
-                let relative = PathBuf::from(".weaver-nested")
-                    .join(root_name.as_str())
-                    .join(id.to_string());
-                let plan = DirectSetPlan {
-                    set_name: name,
+                let plan = nested_plan(
+                    root.plan(),
+                    id,
+                    name,
                     format,
-                    volumes: BTreeMap::from([(volume, member)]),
-                    files: HashMap::from([(member, volume)]),
-                    identity: Some(IdentityPlanFacts {
-                        kind: if format == SetFormat::Rar {
-                            IdentityKind::Roster
-                        } else {
-                            IdentityKind::SevenZipRoster
-                        },
-                        expected_volumes: whole.then_some(1),
-                        discriminator: id,
-                    }),
-                    unposted: Default::default(),
-                    working_dir: root.plan().working_dir.join(&relative),
-                    destination_dir: root.plan().destination_dir.join(&relative),
-                };
+                    BTreeMap::from([(volume, member)]),
+                    whole.then_some(1),
+                );
                 let mut router = root.resources().router(plan);
                 if whole && !router.close_nested_roster(1) {
                     continue;
                 }
+                // A stream has no layout the router could read, so its bytes
+                // go straight to an engine that decodes them as they land. So
+                // do a 7z container's when nothing can say how long it is: its
+                // map sits at an end nobody can point at, so no parent can
+                // seek to it, and the router records that as the reason.
+                let mode = match format {
+                    SetFormat::Stream(_) => NodeMode::Engine,
+                    SetFormat::SevenZip if length.is_none() => {
+                        router.demote(DemotionReason::UnseekableParent);
+                        NodeMode::Engine
+                    }
+                    SetFormat::Rar | SetFormat::SevenZip => NodeMode::Direct,
+                };
                 self.nodes.push(NestedNode {
                     parent,
                     depth: depth + 1,
@@ -322,19 +405,19 @@ impl NestedGraph {
                     backing_lease: std::sync::Arc::new(()),
                     router,
                     inputs: BTreeMap::new(),
-                    mode: NodeMode::Direct,
+                    mode,
                     roster_closed: whole,
                     members_closed: false,
-                    whole_sevenz: whole,
                     discovered_revision: None,
                 });
                 self.groups.insert(key, id);
                 id
             };
+            // A bare `.7z` and a `.7z.001` fragment both claim volume zero, so
+            // the second of them to arrive fails this binding.
             let node = self.node_mut(id);
-            if node.whole_sevenz != whole || !node.router.bind_identity_volume(volume, member) {
-                node.mode =
-                    NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts);
+            if !node.router.bind_identity_volume(volume, member) {
+                node.refuse(DemotionReason::ConflictingVolumeFacts);
                 // The conflicting member itself never entered this child.
                 continue;
             }
@@ -353,7 +436,7 @@ impl NestedGraph {
             if let Some(length) = length
                 && let Err(reason) = node.router.note_declared_volume_size(volume, length)
             {
-                node.mode = NodeMode::MaterializationPending(reason);
+                node.refuse(reason);
             }
             self.bindings.insert((parent, member), (id, volume));
         }
@@ -389,8 +472,7 @@ impl NestedGraph {
             if node.inputs.keys().copied().ne(0..count)
                 || (!was_closed && !node.router.close_nested_roster(count))
             {
-                node.mode =
-                    NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts);
+                node.refuse(DemotionReason::ConflictingVolumeFacts);
                 continue;
             }
             let emitted = self.settle_child_inputs(root, child);
@@ -450,8 +532,7 @@ impl NestedGraph {
                     continue;
                 }
                 let Some(input) = node.inputs.get_mut(&volume) else {
-                    node.mode =
-                        NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts);
+                    node.refuse(DemotionReason::ConflictingVolumeFacts);
                     continue;
                 };
                 input.delivered.insert(span.destination_offset, span.len());
@@ -463,7 +544,7 @@ impl NestedGraph {
                     &mut emitted,
                 );
                 if let Err(reason) = result {
-                    node.mode = NodeMode::MaterializationPending(reason);
+                    node.refuse(reason);
                 }
                 if !emitted.is_empty() {
                     pending.push_back((child, emitted));
@@ -473,8 +554,7 @@ impl NestedGraph {
             // byte. Completion is a state transition, not a side effect of the
             // next payload arrival (which may never occur).
             for index in 0..self.nodes.len() {
-                let node = &self.nodes[index];
-                if node.parent != owner || node.mode != NodeMode::Direct {
+                if self.nodes[index].parent != owner {
                     continue;
                 }
                 let emitted = self.settle_child_inputs(root, index as u32 + 1);

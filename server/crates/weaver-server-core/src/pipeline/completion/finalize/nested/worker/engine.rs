@@ -2,18 +2,22 @@
 //! drains its bridge and reports the verdict to the actor.
 
 use super::*;
-use crate::pipeline::completion::finalize::extract::prepared;
+use crate::pipeline::completion::finalize::extract::{prepared, sequential};
+use crate::pipeline::direct_store::plan::StreamKind;
 use crate::pipeline::extraction::input::LiveArchiveInput;
 use crate::pipeline::extraction::output::channel::{ChannelOutput, Frame, PrivateTrackedFiles};
 use crate::pipeline::extraction::output::select::SelectOutput;
+use crate::pipeline::extraction::runtime::RuntimeError;
 use crate::pipeline::extraction::runtime::decoded::DecodedState;
 use crate::pipeline::extraction::session::SessionLease;
 
-/// How a scoped decode reaches its outputs. Archive formats stream through a
-/// bridge so nested members can feed child engines; the rest write directly.
+/// How a scoped decode reaches its outputs. Archive formats and live streams
+/// go through a bridge so nested members can feed child engines; the rest
+/// write directly.
 pub(super) enum ScopedDecode {
     Rar(ChannelOutput),
     SevenZip(ChannelOutput),
+    Stream(StreamKind, ChannelOutput),
     Simple(SimpleArchiveKind),
 }
 
@@ -28,6 +32,7 @@ pub(super) struct ScopedEngine {
     pub(super) job_id: JobId,
     pub(super) set_name: String,
     pub(super) volumes: Vec<u32>,
+    pub(super) input_names: Vec<String>,
     pub(super) inputs: Vec<PathBuf>,
     pub(super) live: Option<LiveArchiveInput>,
     pub(super) passwords: Vec<crate::jobs::ArchivePasswordCandidate>,
@@ -49,6 +54,9 @@ impl ScopedEngine {
         match decode {
             ScopedDecode::Rar(channel) => channel.run(|output| self.run_rar(output)),
             ScopedDecode::SevenZip(channel) => channel.run(|output| self.run_sevenz(output)),
+            ScopedDecode::Stream(kind, channel) => {
+                channel.run(|output| self.run_stream(kind.into(), output))
+            }
             ScopedDecode::Simple(kind) => self.run_simple(kind),
         }
     }
@@ -148,6 +156,44 @@ impl ScopedEngine {
         }
     }
 
+    // A stream's one output is named after its input, so an output that is
+    // itself an archive chains to a child engine like any archive member. The
+    // live input's bytes never change once placed, so a decode that outgrows
+    // its header's reservation reads them again from the start.
+    fn run_stream(
+        mut self,
+        kind: SimpleArchiveKind,
+        channel: &ChannelOutput,
+    ) -> Result<FullSetExtractionOutcome, ExtractionError> {
+        let (Some(input), Some(name)) = (self.live.take(), self.input_names.first()) else {
+            return Err(ExtractionError::terminal("a stream decodes one live input"));
+        };
+        let output = SelectOutput::child_archives(
+            channel,
+            PrivateTrackedFiles {
+                output: channel,
+                root: &self.root,
+            },
+        );
+        let extracted = sequential::decode_single_stream_to(
+            || Ok(input.reader()),
+            &output,
+            &sequential::SingleStreamContext {
+                kind,
+                input: Path::new(name),
+                budget: &self.budget,
+                event_tx: &self.event_tx,
+                job_id: self.job_id,
+                set_name: &self.set_name,
+            },
+        )?;
+        Ok(FullSetExtractionOutcome {
+            extracted,
+            failed: Vec::new(),
+            selected_password: None,
+        })
+    }
+
     fn run_simple(
         self,
         kind: SimpleArchiveKind,
@@ -192,9 +238,7 @@ impl ScopedReport {
             None => None,
         };
         let mut result = engine.await.unwrap_or_else(|error| {
-            Err(ExtractionError::terminal(format!(
-                "namespace extraction worker failed: {error}"
-            )))
+            Err(RuntimeError::join("namespace extraction worker")(error).into())
         });
         let engine_succeeded = result
             .as_ref()
@@ -205,10 +249,12 @@ impl ScopedReport {
         {
             stream_error = self.close(&mut stream.decoded).await.err();
         }
+        // A bridge failure is the actor's, not the archive's: no repair of
+        // the input changes it, so it ends the namespace whatever its cause.
         if let Some(error) = stream_error
             && result.is_ok()
         {
-            result = Err(ExtractionError::terminal(error));
+            result = Err(ExtractionError::terminal(error.to_string()));
         }
         let decoded = stream.map(|stream| Box::new(stream.decoded));
         let _ = self
@@ -228,7 +274,7 @@ impl ScopedReport {
 
     // The receiver stays alive after a failure; revocation is what releases
     // a producer blocked on the bridge.
-    async fn drain(&self, stream: &mut ScopedStream) -> Result<(), String> {
+    async fn drain(&self, stream: &mut ScopedStream) -> Result<(), RuntimeError> {
         while let Some(frame) = stream.receiver.recv().await {
             if let Err(error) = self.accept(&mut stream.decoded, frame).await {
                 stream.decoded.generation.revoke();
@@ -238,23 +284,17 @@ impl ScopedReport {
         Ok(())
     }
 
-    async fn accept(&self, decoded: &mut DecodedState, frame: Frame) -> Result<(), String> {
-        decoded
-            .accept(frame)
-            .await
-            .map_err(|error| error.to_string())?;
+    async fn accept(&self, decoded: &mut DecodedState, frame: Frame) -> Result<(), RuntimeError> {
+        decoded.accept(frame).await?;
         self.publish_progress(decoded).await
     }
 
-    async fn close(&self, decoded: &mut DecodedState) -> Result<(), String> {
-        decoded.close().await.map_err(|error| error.to_string())?;
+    async fn close(&self, decoded: &mut DecodedState) -> Result<(), RuntimeError> {
+        decoded.close().await?;
         self.publish_progress(decoded).await
     }
 
-    async fn publish_progress(&self, decoded: &mut DecodedState) -> Result<(), String> {
-        decoded
-            .publish_progress(self.job_id, &self.done, &self.lease)
-            .await
-            .map_err(|error| error.to_string())
+    async fn publish_progress(&self, decoded: &mut DecodedState) -> Result<(), RuntimeError> {
+        decoded.publish_progress(&self.done, &self.lease).await
     }
 }

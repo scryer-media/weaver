@@ -305,14 +305,6 @@ impl Pipeline {
         }
     }
 
-    pub(super) fn primary_archive_password_for_job(&self, job_id: JobId) -> Option<String> {
-        self.archive_password_candidates_for_job(job_id)
-            .candidates
-            .into_iter()
-            .next()
-            .map(|candidate| candidate.value().to_string())
-    }
-
     pub(super) fn archive_password_candidates_for_set(
         &self,
         job_id: JobId,
@@ -1714,7 +1706,7 @@ pub(super) enum ExtractionDone {
         job_id: JobId,
         owner: extraction::output::channel::StreamOwner,
         namespace: String,
-        producers: Vec<(u32, Option<u32>, u64, bool)>,
+        producers: Vec<direct_store::set::ProducerState>,
         children: Vec<direct_store::set::LiveChildDescription>,
     },
     Scoped {

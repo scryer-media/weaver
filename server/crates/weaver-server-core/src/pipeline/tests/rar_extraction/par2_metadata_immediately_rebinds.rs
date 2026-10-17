@@ -4163,7 +4163,9 @@ async fn input_identity_settle_lands_every_part_on_its_described_name() {
         .unwrap()
         .flatten()
         .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-        .filter(|name| name.starts_with(".weaver-identity-settle"))
+        .filter(|name| {
+            name.starts_with(crate::pipeline::direct_store::plan::IDENTITY_SETTLE_PREFIX)
+        })
         .collect();
     assert!(parked.is_empty(), "{parked:?}");
 

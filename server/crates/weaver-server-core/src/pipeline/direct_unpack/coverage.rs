@@ -266,6 +266,7 @@ impl SetCoverage {
     }
 
     // How many times a reader has parked waiting for this coverage.
+    #[cfg(test)]
     pub fn park_count(&self) -> u64 {
         self.parks.load(Ordering::Relaxed)
     }
@@ -570,6 +571,7 @@ impl SetCoverage {
     }
 
     // Whether any part is being held back by known damage.
+    #[cfg(test)]
     pub fn has_damage_cap(&self) -> bool {
         self.lock()
             .parts

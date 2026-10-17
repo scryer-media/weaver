@@ -5,9 +5,13 @@ mod repair;
 
 use super::*;
 use crate::pipeline::completion::finalize::extract::ArchiveEngine;
+use crate::pipeline::direct_store::nested::NodeMode;
+use crate::pipeline::direct_store::plan::StreamKind;
 use crate::pipeline::extraction::output::channel::{ChannelOutput, StreamOwner};
-use crate::pipeline::extraction::runtime::decoded::DecodedState;
-use crate::pipeline::extraction::runtime::{ArchiveRuntime, NamespaceWork, RequestId};
+use crate::pipeline::extraction::runtime::decoded::{self, DecodedState};
+use crate::pipeline::extraction::runtime::{
+    ArchiveRuntime, NamespaceWork, RequestId, RuntimeError,
+};
 use crate::pipeline::extraction::session::{InputVersion, SessionLease};
 use crate::pipeline::extraction::{ExtractionErrorClass, JobExtractionBudget};
 use engine::{ScopedDecode, ScopedEngine, ScopedReport, ScopedStream};
@@ -78,27 +82,17 @@ fn is_recoverable(error: &ExtractionError) -> bool {
     )
 }
 
-fn namespace_output_dir(working: &Path, owner: StreamOwner) -> PathBuf {
-    working
-        .join(crate::pipeline::direct_store::manifest::DIRECTORY)
-        .join(format!(
-            "namespace-{}-{}-{}",
-            owner.root, owner.node, owner.generation
-        ))
-}
-
-fn decoded_namespace_name(owner: StreamOwner) -> String {
-    format!("decoded-{}-{}", owner.node, owner.generation)
-}
-
-// The deepest archive level this publication materializes, counted from the
-// job's own files.
+// The deepest archive level this publication opened, counted from the job's
+// own files. A level counts once something read it: a node the graph routed
+// here, or an engine in its own completion. A node that landed as a file was
+// not read, and the scan that finds the file opens it at its own level.
 fn extracted_depth(runtime: &ArchiveRuntime) -> u32 {
     let decoded = runtime.decoded.iter().map(|state| {
         let local = state
             .graph
             .nodes
             .iter()
+            .filter(|node| node.mode == NodeMode::Direct)
             .map(|node| node.depth)
             .max()
             .unwrap_or(1);
@@ -147,8 +141,10 @@ impl Pipeline {
         scan_root: &Path,
         set_name: String,
         files: Vec<NestedArchiveFile>,
-    ) -> Result<(), String> {
-        let first = files.first().ok_or("empty nested archive set")?;
+    ) -> Result<(), RuntimeError> {
+        let first = files
+            .first()
+            .ok_or(RuntimeError::Invariant("empty nested archive set"))?;
         let kind = first.archive_type;
         let inputs: Vec<PathBuf> = files
             .iter()
@@ -157,7 +153,7 @@ impl Pipeline {
         let working = self
             .jobs
             .get(&job_id)
-            .ok_or("missing nested job")?
+            .ok_or(RuntimeError::Invariant("nested archive job"))?
             .working_dir
             .clone();
         let containing = self
@@ -171,7 +167,7 @@ impl Pipeline {
         runtime.set_roots(working, scan_root.to_owned());
         let lease = runtime
             .admit(containing, InputVersion(0))
-            .map_err(|error| format!("nested archive admission failed: {error:?}"))?;
+            .map_err(RuntimeError::session("nested archive admission"))?;
         let work = NamespaceWork {
             virtual_source: None,
             original_virtual_source: None,
@@ -203,7 +199,7 @@ impl Pipeline {
         job_id: JobId,
         work: NamespaceWork,
         lease: SessionLease,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let input = work
             .virtual_source
             .as_ref()
@@ -212,7 +208,7 @@ impl Pipeline {
                     .get(&job_id)
                     .and_then(|runtime| runtime.gates.get(&(source.root_set.clone(), source.node)))
                     .cloned()
-                    .ok_or("restored virtual source gate absent")
+                    .ok_or(RuntimeError::Invariant("restored virtual source gate"))
             })
             .transpose()?;
         self.spawn_scoped_engine(job_id, work, lease, input).await
@@ -224,7 +220,7 @@ impl Pipeline {
         work: NamespaceWork,
         lease: SessionLease,
         input: crate::pipeline::extraction::input::LiveArchiveInput,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         self.spawn_scoped_engine(job_id, work, lease, Some(input))
             .await
     }
@@ -235,48 +231,56 @@ impl Pipeline {
         mut work: NamespaceWork,
         lease: SessionLease,
         live: Option<crate::pipeline::extraction::input::LiveArchiveInput>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let owner = lease.owner;
         if live.is_none() && (work.inputs.is_empty() || work.inputs.len() != work.volumes.len()) {
-            return Err("invalid selected archive volume roster".into());
+            return Err(RuntimeError::Invariant("selected archive volume roster"));
         }
         let working = &self
             .jobs
             .get(&job_id)
-            .ok_or("missing selected archive job")?
+            .ok_or(RuntimeError::Invariant("selected archive job"))?
             .working_dir;
-        let output = namespace_output_dir(working, owner);
+        let output = decoded::private_root(working, owner);
         work.output = output.clone();
         work.outputs.clear();
         work.ordinary.clear();
         let (kind, set_name) = (work.kind, work.set_name.clone());
-        let (volumes, inputs) = (work.volumes.clone(), work.inputs.clone());
+        let (volumes, input_names, inputs) = (
+            work.volumes.clone(),
+            work.input_names.clone(),
+            work.inputs.clone(),
+        );
         let runtime = self
             .archive_runtime
             .get_mut(&job_id)
-            .ok_or("missing selected archive runtime")?;
+            .ok_or(RuntimeError::Invariant("selected archive runtime"))?;
         if let Some(input) = &live {
             runtime.live_inputs.push((owner, input.clone()));
         }
         let request = runtime
             .dispatch(owner, work)
-            .map_err(|error| format!("selected archive dispatch: {error:?}"))?;
-        let budget = self
-            .extraction_budget(job_id, &output)
-            .map_err(|error| error.to_string())?;
-        let root = Arc::new(ExtractionRoot::open(&output)?);
-        let permit = budget
-            .task_permit_for_root(Arc::clone(&root))
-            .map_err(|error| error.to_string())?;
+            .map_err(RuntimeError::session("selected archive dispatch"))?;
+        let budget = self.extraction_budget(job_id, &output)?;
+        let root = Arc::new(
+            ExtractionRoot::open(&output)
+                .map_err(RuntimeError::refused("namespace output root"))?,
+        );
+        let permit = budget.task_permit_for_root(Arc::clone(&root))?;
         let passwords = self.archive_password_candidates_for_job(job_id).candidates;
-        let policy = self.unacceptable_extension_policy_snapshot(job_id).await?;
+        let policy = self
+            .unacceptable_extension_policy_snapshot(job_id)
+            .await
+            .map_err(RuntimeError::refused("extension policy"))?;
         let counters = self.phase_begin(job_id, JobPhase::Extracting, None);
-        let (decode, stream) = self.prepare_scoped_decode(job_id, owner, kind, &budget, &output)?;
+        let (decode, stream) =
+            self.prepare_scoped_decode(job_id, owner, kind, live.is_some(), &budget, &output)?;
         let pool = self.pp_pool.clone();
         let engine = ScopedEngine {
             job_id,
             set_name,
             volumes,
+            input_names,
             inputs,
             live,
             passwords,
@@ -299,7 +303,7 @@ impl Pipeline {
         let runtime = self
             .archive_runtime
             .get_mut(&job_id)
-            .ok_or("missing selected archive runtime")?;
+            .ok_or(RuntimeError::Invariant("selected archive runtime"))?;
         let task = tokio::task::spawn_blocking(move || {
             pool.install(move || {
                 let _permit = permit;
@@ -316,11 +320,22 @@ impl Pipeline {
         job_id: JobId,
         owner: StreamOwner,
         kind: crate::jobs::assembly::ArchiveType,
+        live: bool,
         budget: &Arc<JobExtractionBudget>,
         output: &Path,
-    ) -> Result<(ScopedDecode, Option<ScopedStream>), String> {
+    ) -> Result<(ScopedDecode, Option<ScopedStream>), RuntimeError> {
         Ok(match ArchiveEngine::of(kind) {
-            ArchiveEngine::Simple(kind) => (ScopedDecode::Simple(kind), None),
+            // A stream decodes as its bytes land only while they are landing;
+            // a whole file on disk keeps the filesystem decoder, whose xz path
+            // decodes its blocks in parallel.
+            ArchiveEngine::Simple(simple) => match StreamKind::of(kind).filter(|_| live) {
+                Some(stream_kind) => {
+                    let (channel, stream) =
+                        self.open_scoped_stream(job_id, owner, budget, output)?;
+                    (ScopedDecode::Stream(stream_kind, channel), Some(stream))
+                }
+                None => (ScopedDecode::Simple(simple), None),
+            },
             ArchiveEngine::Rar => {
                 let (channel, stream) = self.open_scoped_stream(job_id, owner, budget, output)?;
                 (ScopedDecode::Rar(channel), Some(stream))
@@ -338,11 +353,11 @@ impl Pipeline {
         owner: StreamOwner,
         budget: &Arc<JobExtractionBudget>,
         output: &Path,
-    ) -> Result<(ChannelOutput, ScopedStream), String> {
+    ) -> Result<(ChannelOutput, ScopedStream), RuntimeError> {
         let (sender, receiver) = tokio::sync::mpsc::channel(FRAME_CHANNEL_DEPTH);
         let admission = budget
             .try_reserve_memory(BRIDGE_ADMISSION_BYTES)
-            .ok_or("archive bridge memory admission unavailable")?;
+            .ok_or(RuntimeError::Admission("archive bridge"))?;
         let (channel, generation) = ChannelOutput::new(
             owner,
             admission,
@@ -350,29 +365,29 @@ impl Pipeline {
             tokio::runtime::Handle::current(),
             Arc::clone(budget),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(RuntimeError::io("scoped channel"))?;
         let runtime = self
             .archive_runtime
             .get_mut(&job_id)
-            .ok_or("missing selected archive runtime")?;
+            .ok_or(RuntimeError::Invariant("selected archive runtime"))?;
         runtime
             .sessions
             .attach_channel(generation.clone())
-            .map_err(|error| format!("channel admission: {error:?}"))?;
+            .map_err(RuntimeError::session("scoped channel admission"))?;
         let sessions = crate::pipeline::extraction::session::ArchiveSessions::restore_checkpoint(
             &runtime.sessions.capture_checkpoint(),
             owner.root,
         )
-        .map_err(|error| format!("session view: {error:?}"))?;
+        .map_err(RuntimeError::session("scoped session view"))?;
         let decoded = DecodedState::new(
+            job_id,
             generation,
             sessions,
             crate::pipeline::direct_store::plan::DirectSetPlan::namespace(owner, output),
             namespace_router_resources(),
             Arc::clone(budget),
             output.to_owned(),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         Ok((channel, ScopedStream { receiver, decoded }))
     }
 
@@ -444,7 +459,9 @@ impl Pipeline {
             }
             return;
         }
-        let error = match Box::pin(self.repair_scoped_failure(job_id, owner, work)).await {
+        let repaired =
+            self.repair_scoped_failure_with_inventory(job_id, owner, work, BTreeMap::new());
+        let error = match Box::pin(repaired).await {
             Ok(true) => return,
             Ok(false) => {
                 format!("nested archive recovery could not change the failed input: {failure}")
@@ -483,19 +500,27 @@ impl Pipeline {
         {
             work.root_set = Some(work.set_name.clone());
         }
+        runtime.release_child_engine(&work);
         runtime.completed.push((owner, work, members));
-        if let Err(error) = self.drain_scoped_repairs(job_id).await {
-            self.fail_job(job_id, error);
+        // Held children start before publication is considered, which they
+        // fence: either this engine freed a slot or its decoder's namespace
+        // can now describe the children it holds.
+        if let Err(error) = self.start_held_child_engines(job_id).await {
+            self.fail_job(job_id, error.to_string());
+            return;
+        }
+        if let Err(error) = self.drain_repairs(job_id).await {
+            self.fail_job(job_id, error.to_string());
             return;
         }
         self.publish_scoped_completions(job_id).await;
     }
 
-    fn fail_scoped(&mut self, job_id: JobId, owner: StreamOwner, error: String) {
+    fn fail_scoped(&mut self, job_id: JobId, owner: StreamOwner, error: impl std::fmt::Display) {
         if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
             runtime.fail(owner);
         }
-        self.fail_job(job_id, error);
+        self.fail_job(job_id, error.to_string());
     }
 
     pub(crate) async fn publish_scoped_completions(&mut self, job_id: JobId) {
@@ -524,14 +549,14 @@ impl Pipeline {
         let published =
             tokio::task::spawn_blocking(move || publish::publish(&destination, completed, &budget))
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(RuntimeError::join("publication worker"))
                 .and_then(|published| published);
         let published = match published {
             Ok(published) => published,
             Err(error) => {
                 self.fail_job(
                     job_id,
-                    format!("nested archive publication failed: {error}"),
+                    RuntimeError::during("nested archive publication")(error).to_string(),
                 );
                 return;
             }
@@ -564,7 +589,7 @@ fn adopt_decoded(
     work: &mut NamespaceWork,
     decoded: DecodedState,
     extracted: Vec<String>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, RuntimeError> {
     use crate::pipeline::extraction::catalog::MemberCatalog;
     let streamed: HashSet<String> = decoded
         .catalog
@@ -576,9 +601,9 @@ fn adopt_decoded(
         .into_iter()
         .filter(|member| !streamed.contains(member))
         .collect();
-    work.outputs = decoded.publication().map_err(|error| error.to_string())?;
+    work.outputs = decoded.publication()?;
     let members = work.outputs.keys().cloned().collect();
     runtime.decoded.push(decoded);
-    runtime.accept_namespace(&decoded_namespace_name(owner));
+    runtime.accept_namespace(&decoded::namespace_name(owner));
     Ok(members)
 }

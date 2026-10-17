@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 // Bookkeeping directories that never belong to the published tree.
 const UNPUBLISHED: [&str; 5] = [
     ".weaver-checkpoints",
-    ".weaver-nested",
+    crate::pipeline::direct_store::nested::NESTED_DIR,
     ".weaver-chunks",
     ".weaver-staging",
     crate::jobs::working_dir::WORKING_DIR_MARKER,

@@ -1358,23 +1358,12 @@ impl Pipeline {
                     .files()
                     .filter(|file| file.is_complete())
                     .filter_map(|file| {
-                        if !matches!(
-                            self.classified_role_for_file(job_id, file),
-                            weaver_model::files::FileRole::SevenZipArchive
-                                | weaver_model::files::FileRole::SevenZipSplit { .. }
-                                | weaver_model::files::FileRole::ZipArchive
-                                | weaver_model::files::FileRole::TarArchive
-                                | weaver_model::files::FileRole::TarGzArchive
-                                | weaver_model::files::FileRole::TarBz2Archive
-                                | weaver_model::files::FileRole::TarXzArchive
-                                | weaver_model::files::FileRole::GzArchive
-                                | weaver_model::files::FileRole::DeflateArchive
-                                | weaver_model::files::FileRole::BrotliArchive
-                                | weaver_model::files::FileRole::ZstdArchive
-                                | weaver_model::files::FileRole::Bzip2Archive
-                                | weaver_model::files::FileRole::XzArchive
-                                | weaver_model::files::FileRole::SplitFile { .. }
-                        ) {
+                        // Every archive type but RAR: this pass extracts the non-RAR sets.
+                        if !crate::jobs::assembly::ArchiveType::from_role(
+                            &self.classified_role_for_file(job_id, file),
+                        )
+                        .is_some_and(|kind| kind != crate::jobs::assembly::ArchiveType::Rar)
+                        {
                             return None;
                         }
                         let set_name = self.classified_archive_set_name_for_file(job_id, file)?;
@@ -1492,11 +1481,7 @@ impl Pipeline {
                     let Some(path) = self.resolve_job_input_path(job_id, filename) else {
                         continue;
                     };
-                    if self
-                        .archive_runtime
-                        .get(&job_id)
-                        .is_some_and(|runtime| runtime.retains_input_path(&path))
-                    {
+                    if self.retains_job_input(job_id, &path) {
                         continue;
                     }
                     match tokio::fs::remove_file(&path).await {

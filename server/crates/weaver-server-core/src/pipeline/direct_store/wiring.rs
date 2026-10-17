@@ -1984,10 +1984,7 @@ impl Pipeline {
             volumes: BTreeMap::from([(volume_index, file_index)]),
             files: HashMap::from([(file_index, volume_index)]),
             identity: Some(IdentityPlanFacts {
-                kind: match format {
-                    super::plan::SetFormat::Rar => super::plan::IdentityKind::Roster,
-                    super::plan::SetFormat::SevenZip => super::plan::IdentityKind::SevenZipRoster,
-                },
+                kind: format.nested_identity(),
                 expected_volumes: Some(expected_volumes),
                 // The first bound file's index: stable by construction, which
                 // the derived minimum is not while the mapping grows.
@@ -2955,6 +2952,8 @@ impl Pipeline {
                         },
                     );
                 }
+                // A stream lives under an archive's member, never as a posted set.
+                super::plan::IdentityKind::Stream(_) => continue,
                 _ if whole => {}
                 super::plan::IdentityKind::HeaderVolumeSet => header_sets.push(HeaderSet {
                     set_index,

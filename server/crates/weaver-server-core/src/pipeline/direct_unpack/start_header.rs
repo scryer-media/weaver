@@ -22,7 +22,6 @@
 // time there is no complete archive — only these 32 bytes.
 
 use std::fmt;
-use std::ops::Range;
 
 // Byte length of the signature header.
 pub const SIGNATURE_HEADER_LEN: u64 = 32;
@@ -141,11 +140,8 @@ impl StartHeader {
     }
 
     // Absolute byte range occupied by the end header.
-    //
-    // The range a direct-unpack worker has to have on disk before the decoder
-    // can list the archive at all, which is why it is worth prefetching ahead
-    // of the packed streams that precede it.
-    pub fn end_header_range(&self) -> Result<Range<u64>, StartHeaderError> {
+    #[cfg(test)]
+    pub fn end_header_range(&self) -> Result<std::ops::Range<u64>, StartHeaderError> {
         let start = SIGNATURE_HEADER_LEN
             .checked_add(self.next_header_offset)
             .ok_or(StartHeaderError::LengthOverflow {
@@ -157,7 +153,8 @@ impl StartHeader {
 
     // Absolute byte range holding the packed streams, between the signature
     // header and the end header.
-    pub fn packed_range(&self) -> Result<Range<u64>, StartHeaderError> {
+    #[cfg(test)]
+    pub fn packed_range(&self) -> Result<std::ops::Range<u64>, StartHeaderError> {
         Ok(SIGNATURE_HEADER_LEN..self.end_header_range()?.start)
     }
 }

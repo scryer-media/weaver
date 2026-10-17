@@ -1,5 +1,6 @@
 use super::*;
 mod checkpoint;
+mod seeks;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use crate::pipeline::direct_store::nested::{
 use crate::pipeline::direct_store::plan::{DirectSetPlan, SetFormat};
 use crate::pipeline::direct_store::provider::{VirtualVolume, VirtualVolumeReader};
 use crate::pipeline::direct_store::router::{DirectDestination, DirectSetRouter};
+use crate::pipeline::extraction::runtime::limits::MAX_DEPTH;
 
 fn stored(format: SetFormat, member: &'static str, bytes: &[u8]) -> Vec<u8> {
     match format {
@@ -21,12 +23,15 @@ fn stored(format: SetFormat, member: &'static str, bytes: &[u8]) -> Vec<u8> {
             None,
             false,
         ),
+        SetFormat::Stream(_) => unreachable!("the store layers are archives"),
     }
 }
 
 #[test]
 fn decoded_namespace_discovery_uses_remaining_archive_depth() {
-    for (namespace_depth, children) in [(1, 2), (2, 1), (3, 0)] {
+    // Three archives nest below the namespace: each level of depth the
+    // namespace already sits at takes one child away.
+    for (namespace_depth, children) in [(MAX_DEPTH - 2, 2), (MAX_DEPTH - 1, 1), (MAX_DEPTH, 0)] {
         let dir = tempfile::tempdir().unwrap();
         let inner = stored(SetFormat::SevenZip, "leaf.bin", &[37; 1024]);
         let middle = stored(SetFormat::SevenZip, "inner.7z", &inner);
@@ -55,7 +60,7 @@ fn decoded_namespace_discovery_uses_remaining_archive_depth() {
         assert_eq!(graph.nodes.len(), children);
         if children != 0 {
             assert!(
-                graph.set_namespace_depth(3).is_err(),
+                graph.set_namespace_depth(MAX_DEPTH).is_err(),
                 "restored over-depth topology must reject"
             );
         }
@@ -68,6 +73,7 @@ fn containing_roster_closure_reaches_all_three_store_layers() {
     let archive_name = |format| match format {
         SetFormat::Rar => "inner.rar",
         SetFormat::SevenZip => "inner.7z",
+        SetFormat::Stream(_) => unreachable!("the store layers are archives"),
     };
     for outer_format in formats {
         for middle_format in formats {
@@ -209,6 +215,7 @@ fn nested_graph_routes_all_four_store_pairs_and_reconstructs_originals() {
             let inner_name = match inner_format {
                 SetFormat::Rar => "inner.rar",
                 SetFormat::SevenZip => "inner.7z",
+                SetFormat::Stream(_) => unreachable!("the store layers are archives"),
             };
             let outer = stored(outer_format, inner_name, &inner);
             let plan = DirectSetPlan {

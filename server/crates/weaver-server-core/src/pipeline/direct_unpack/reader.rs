@@ -120,11 +120,13 @@ impl GatedSplitReader {
     }
 
     // Current offset in the concatenated archive stream.
+    #[cfg(test)]
     pub fn position(&self) -> u64 {
         self.position
     }
 
     // The coverage this reader is gated by.
+    #[cfg(test)]
     pub fn coverage(&self) -> &Arc<SetCoverage> {
         &self.coverage
     }

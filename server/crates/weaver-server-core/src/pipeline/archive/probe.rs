@@ -1,5 +1,5 @@
 use crate::jobs::assembly::{
-    DetectedArchiveIdentity, DetectedArchiveKind as PersistedDetectedArchiveKind,
+    ArchiveType, DetectedArchiveIdentity, DetectedArchiveKind as PersistedDetectedArchiveKind,
     ExtractionReadiness,
 };
 use crate::jobs::ids::{JobId, NzbFileId};
@@ -268,8 +268,8 @@ impl Pipeline {
             return;
         }
 
-        match self.classified_role_for_file(job_id, file) {
-            FileRole::RarVolume { .. } => {
+        match ArchiveType::from_role(&self.classified_role_for_file(job_id, file)) {
+            Some(ArchiveType::Rar) => {
                 // Before the topology: a volume completing can make the set
                 // ready, and the completion check that follows must already
                 // see any gate the volume's recovery verdicts raise.
@@ -279,27 +279,14 @@ impl Pipeline {
                 // registered for this volume.
                 self.group_nameless_rar_volumes(job_id).await;
             }
-            FileRole::SevenZipArchive
-            | FileRole::SevenZipSplit { .. }
-            | FileRole::SplitFile { .. }
-            | FileRole::ZipArchive
-            | FileRole::TarArchive
-            | FileRole::TarGzArchive
-            | FileRole::TarBz2Archive
-            | FileRole::GzArchive
-            | FileRole::DeflateArchive
-            | FileRole::BrotliArchive
-            | FileRole::ZstdArchive
-            | FileRole::Bzip2Archive
-            | FileRole::XzArchive
-            | FileRole::TarXzArchive => {
+            Some(_) => {
                 self.try_update_7z_topology(job_id, file_id);
                 // Retried on every part completion rather than attempted once:
                 // the topology may only just have appeared, and the first
                 // part's opening bytes may only just have landed.
                 self.try_arm_direct_unpack_for_file(job_id, file_id);
             }
-            _ => {}
+            None => {}
         }
     }
 
@@ -893,19 +880,39 @@ impl Pipeline {
     }
 
     pub(crate) async fn path_has_7z_signature(path: PathBuf) -> Result<bool, String> {
+        Ok(Self::read_7z_signature_header(path)
+            .await?
+            .is_some_and(|header| {
+                let mut crc = weaver_yenc::crc::Crc32::new();
+                crc.update(&header[12..]);
+                header[..6] == SEVEN_Z_SIGNATURE
+                    && header[6] == 0
+                    && crc.finalize() == u32::from_le_bytes(header[8..12].try_into().unwrap())
+            }))
+    }
+
+    // Does the file open with the 7z magic?
+    //
+    // Narrower than [`Self::path_has_7z_signature`] on purpose, and the same
+    // line the direct-store router draws: the magic with a bad version or
+    // checksum is a 7z whose first bytes were damaged, while a file without it
+    // was never a 7z at all.
+    pub(crate) async fn path_has_7z_magic(path: PathBuf) -> Result<bool, String> {
+        Ok(Self::read_7z_signature_header(path)
+            .await?
+            .is_some_and(|header| header[..6] == SEVEN_Z_SIGNATURE))
+    }
+
+    // The file's first 32 bytes, or `None` for a file shorter than a 7z
+    // signature header.
+    async fn read_7z_signature_header(path: PathBuf) -> Result<Option<[u8; 32]>, String> {
         tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::open(&path)
                 .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
             let mut header = [0u8; 32];
             match file.read_exact(&mut header) {
-                Ok(()) => {
-                    let mut crc = weaver_yenc::crc::Crc32::new();
-                    crc.update(&header[12..]);
-                    Ok(header[..6] == SEVEN_Z_SIGNATURE
-                        && header[6] == 0
-                        && crc.finalize() == u32::from_le_bytes(header[8..12].try_into().unwrap()))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+                Ok(()) => Ok(Some(header)),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
                 Err(error) => Err(format!("failed to read {}: {error}", path.display())),
             }
         })

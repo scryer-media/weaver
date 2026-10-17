@@ -61,8 +61,9 @@
 // - **The member tolerance.** A set whose ineligible members are unencrypted
 //   non-solid regular files still routes, *whatever those members weigh*:
 //   their packed ranges land in the envelope, and at finalization *only* those
-//   member indices are extracted through
-//   `unrar_rs::RarArchive::extract_member_streaming` over the hybrid provider.
+//   members are extracted, each as one `unrar_rs` entry read
+//   (`RarArchive::by_index_via`) over the set's own virtual volumes from the
+//   hybrid provider, unless the set's chase already streamed them.
 //   Direct `Store` outputs are never re-extracted or overwritten. Member shape
 //   is therefore a **member** verdict and never a set one: a store video
 //   beside a compressed subtitle pack, or a season pack with one compressed

@@ -526,3 +526,25 @@ fn min_queued_byte_estimate_tracks_every_add_and_removal_path() {
     q.drain_all();
     assert_eq!(q.min_queued_byte_estimate_for_file(file(1)), None);
 }
+
+// Each holder lets go only of what it holds: releasing the nested wants
+// leaves an article the job holds, and one both hold, where the holds put it.
+#[test]
+fn a_release_lets_go_only_of_its_owners_holds() {
+    let mut q = DownloadQueue::new();
+    for seg in 0..3 {
+        q.push(make_work(1, 0, seg, 10));
+    }
+    let id = |seg| make_work(1, 0, seg, 10).segment_id;
+    assert_eq!(q.hold(HoldOwner::Job, [id(0), id(2)], 2), 2);
+    assert_eq!(q.hold(HoldOwner::NestedWants, [id(1), id(2)], 2), 1);
+
+    assert_eq!(q.release_held(HoldOwner::NestedWants, |_| false), 1);
+    assert!(q.holds_queued(id(0)));
+    assert!(!q.holds_queued(id(1)));
+    assert!(q.holds_queued(id(2)));
+    let order: Vec<_> = std::iter::from_fn(|| q.pop())
+        .map(|work| (work.segment_id.segment_number, work.priority))
+        .collect();
+    assert_eq!(order, [(0, 2), (2, 2), (1, 10)]);
+}

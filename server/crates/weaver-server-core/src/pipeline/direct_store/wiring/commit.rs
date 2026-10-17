@@ -4,7 +4,13 @@ mod nested;
 
 use super::*;
 use crate::pipeline::direct_store::barrier::{BarrierError, CoveragePersist};
+use crate::pipeline::extraction::runtime::RuntimeError;
 use crate::pipeline::{DirectBarrierDone, DirectBarrierFlight, DirectRearmDone};
+
+// The sentence a job fails with when a phase of its archive graph work fails.
+fn failed(phase: &'static str, error: RuntimeError) -> String {
+    RuntimeError::during(phase)(error).to_string()
+}
 
 fn installed_tolerated_members(
     targets: &[ToleratedTarget],
@@ -52,53 +58,57 @@ fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
 // `produced` is every other output finalization left in place, as
 // [`produced_outputs`] found it on disk.
 //
-// `None` when there is nothing to re-check at restore. A set with no committed
-// byte-bearing member would be trusted on the marker's word alone, and a path
-// that is not UTF-8 or not under the staging root cannot be recorded in the
-// form restore probes. Either way the set redownloads after a restart, which
-// is what it did before the marker existed.
+// The marker lists every output the set itself put in the staging root, and
+// that list may be empty: a root whose every member was handed to a child
+// engine installs nothing of its own, and restore has nothing of it to probe
+// because the archive graph holds those members.
+//
+// An error when a path is not UTF-8 or not under the staging root, so it
+// cannot be recorded in the form restore probes; the error names the path and
+// which of the two it is.
 fn installed_marker(
     plan: &DirectSetPlan,
     members: &[(String, u64, PathBuf, PathBuf)],
     produced: ProducedOutputs,
     extracted: Vec<String>,
-) -> Option<Vec<u8>> {
-    use crate::pipeline::direct_store::snapshot::{
-        InstalledMember, InstalledSet, encode_installed,
-    };
+) -> Result<crate::pipeline::direct_store::snapshot::InstalledSet, String> {
+    use crate::pipeline::direct_store::snapshot::{InstalledMember, InstalledSet};
 
-    if members.is_empty() {
-        return None;
-    }
+    let relative = |path: &std::path::Path| -> Result<String, String> {
+        let relative = path.strip_prefix(&plan.destination_dir).map_err(|_| {
+            format!(
+                "output {} is not under the staging root {}",
+                path.display(),
+                plan.destination_dir.display()
+            )
+        })?;
+        relative
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("output {} is not a UTF-8 path", path.display()))
+    };
     // Keyed by path, later entries replacing earlier ones: the commit walks
     // members in archive order and two whose names sanitize to one destination
     // overwrite each other, so the last one's length is the one on disk.
     let mut committed: BTreeMap<String, u64> = BTreeMap::new();
     for (_, len, _, destination) in members {
-        let relative = destination.strip_prefix(&plan.destination_dir).ok()?;
-        committed.insert(relative.to_str()?.to_string(), *len);
+        committed.insert(relative(destination)?, *len);
     }
     // A stored member's length is the one the commit verified, so it wins over
     // a probe of the same path.
     for (path, len) in produced.files {
-        let relative = path.strip_prefix(&plan.destination_dir).ok()?;
-        committed
-            .entry(relative.to_str()?.to_string())
-            .or_insert(len);
+        committed.entry(relative(&path)?).or_insert(len);
     }
     let directories = produced
         .directories
         .iter()
-        .map(|path| {
-            let relative = path.strip_prefix(&plan.destination_dir).ok()?;
-            Some(relative.to_str()?.to_string())
-        })
-        .collect::<Option<Vec<_>>>()?;
+        .map(|path| relative(path))
+        .collect::<Result<Vec<_>, _>>()?;
     let members = committed
         .into_iter()
         .map(|(relative_path, len)| InstalledMember { relative_path, len })
         .collect();
-    let installed = InstalledSet {
+    Ok(InstalledSet {
         volumes: plan
             .volumes
             .iter()
@@ -107,8 +117,7 @@ fn installed_marker(
         members,
         directories,
         extracted,
-    };
-    encode_installed(&installed).ok()
+    })
 }
 
 // The outputs of a finalized set that the commit loop did not rename into
@@ -121,23 +130,27 @@ struct ProducedOutputs {
 
 // Probes each recorded output the stored members do not account for.
 //
-// `None` when one of them cannot be probed or is neither a file nor a
-// directory: a marker that left it out would restore the set without
-// noticing it is gone, so the set gets no marker and redownloads after a
-// restart instead.
-async fn produced_outputs(paths: Vec<PathBuf>) -> Option<ProducedOutputs> {
+// An error naming the output when one of them cannot be probed or is neither
+// a file nor a directory: a marker that left it out would restore the set
+// without noticing it is gone, so the set gets no marker instead.
+async fn produced_outputs(paths: Vec<PathBuf>) -> Result<ProducedOutputs, String> {
     let mut produced = ProducedOutputs::default();
     for path in paths {
-        let metadata = tokio::fs::symlink_metadata(&path).await.ok()?;
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|error| format!("could not probe output {}: {error}", path.display()))?;
         if metadata.is_file() {
             produced.files.push((path, metadata.len()));
         } else if metadata.is_dir() {
             produced.directories.push(path);
         } else {
-            return None;
+            return Err(format!(
+                "output {} is neither a file nor a directory",
+                path.display()
+            ));
         }
     }
-    Some(produced)
+    Ok(produced)
 }
 
 // An archive's recorded times put on an entry weaver has just created.
@@ -187,7 +200,7 @@ impl Pipeline {
         let decoded_size = segment.decoded_size;
         let part_crc = segment.part_crc;
         if let Err(error) = Box::pin(self.promote_direct_archive_graph(job_id)).await {
-            self.fail_job(job_id, format!("archive graph promotion failed: {error}"));
+            self.fail_job(job_id, failed("archive graph promotion", error));
             return DirectRouteOutcome::Routed;
         }
         // The dual-CRC grid's half of the article, carried past routing to the
@@ -1207,7 +1220,7 @@ impl Pipeline {
             return;
         }
         if let Err(error) = Box::pin(self.promote_direct_archive_graph(job_id)).await {
-            self.fail_job(job_id, format!("archive graph promotion failed: {error}"));
+            self.fail_job(job_id, failed("archive graph promotion", error));
             return;
         }
         let graph_roots: Vec<_> = self
@@ -1222,35 +1235,25 @@ impl Pipeline {
                     && !set.is_finalized()
                     && !set.is_demoted()
             })
-            .map(|(index, _)| index)
+            .map(|(index, set)| (index, set.plan().set_name.clone()))
             .collect();
-        for index in graph_roots {
-            let name = self
-                .direct_store
-                .set(job_id, index)
-                .expect("selected root")
-                .plan()
-                .set_name
-                .clone();
-            if let Err(error) = Box::pin(self.refresh_direct_live_inputs(job_id, &name)).await {
-                self.fail_job(job_id, error);
+        for (index, name) in graph_roots {
+            if let Err(error) = Box::pin(self.refresh_live_inputs(job_id, &name)).await {
+                self.fail_job(job_id, error.to_string());
                 return;
             }
             if let Err(error) =
                 Box::pin(self.settle_direct_nested_materialization(job_id, index)).await
             {
-                self.fail_job(job_id, format!("nested materialization failed: {error}"));
+                self.fail_job(job_id, failed("nested materialization", error));
                 return;
             }
             if let Err(error) = Box::pin(self.rearm_direct_graph(job_id, index)).await {
-                self.fail_job(
-                    job_id,
-                    format!("nested archive integrity rearm failed: {error}"),
-                );
+                self.fail_job(job_id, failed("nested archive integrity rearm", error));
                 return;
             }
-            if let Err(error) = Box::pin(self.refresh_direct_live_inputs(job_id, &name)).await {
-                self.fail_job(job_id, error);
+            if let Err(error) = Box::pin(self.refresh_live_inputs(job_id, &name)).await {
+                self.fail_job(job_id, error.to_string());
                 return;
             }
         }
@@ -1261,7 +1264,7 @@ impl Pipeline {
             .any(|set| set.has_nested_checkpoint_authority() && set.due(Instant::now()).is_some())
             && let Err(error) = self.commit_archive_graph(job_id).await
         {
-            self.fail_job(job_id, format!("archive checkpoint failed: {error}"));
+            self.fail_job(job_id, failed("archive checkpoint", error));
             return;
         }
         // The gate re-arm, and deliberately **before** the PAR2 wait: the
@@ -1803,7 +1806,7 @@ impl Pipeline {
                 self.await_direct_placement_io(job_id, index).await;
             }
             if let Err(error) = self.commit_archive_graph(job_id).await {
-                self.fail_job(job_id, format!("archive checkpoint failed: {error}"));
+                self.fail_job(job_id, failed("archive checkpoint", error));
             }
             return;
         }
@@ -2030,7 +2033,7 @@ impl Pipeline {
                         .parent()
                         .ok_or_else(|| std::io::Error::other("installed member has no parent"))?;
                     let temporary = tempfile::Builder::new()
-                        .prefix(".weaver-install-")
+                        .prefix(crate::pipeline::direct_store::plan::INSTALL_TEMP_PREFIX)
                         .tempdir_in(parent)?;
                     let link = temporary.path().join("member");
                     std::fs::hard_link(&partial, &link)?;
@@ -2207,20 +2210,30 @@ impl Pipeline {
         }
 
         let stored: HashSet<&str> = members.iter().map(|(name, ..)| name.as_str()).collect();
-        let produced_paths = self.direct_store.set(job_id, set_index).and_then(|set| {
-            recorded
-                .iter()
-                .filter(|name| !stored.contains(name.as_str()))
-                .map(|name| set.plan().member_output_path(name).ok())
-                .collect::<Option<Vec<_>>>()
-        });
+        let set_gone = || format!("direct set {set_name} is gone");
+        let produced_paths = self
+            .direct_store
+            .set(job_id, set_index)
+            .ok_or_else(set_gone)
+            .and_then(|set| {
+                recorded
+                    .iter()
+                    .filter(|name| !stored.contains(name.as_str()))
+                    .map(|name| {
+                        set.plan().member_output_path(name).map_err(|()| {
+                            format!("member {name} has no output path under the staging root")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            });
         let produced = match produced_paths {
-            Some(paths) => produced_outputs(paths).await,
-            None => None,
+            Ok(paths) => produced_outputs(paths).await,
+            Err(error) => Err(error),
         };
         let installed = produced.and_then(|produced| {
             self.direct_store
                 .set(job_id, set_index)
+                .ok_or_else(set_gone)
                 .and_then(|set| installed_marker(set.plan(), &members, produced, recorded))
         });
         let graph_authority = self
@@ -2228,24 +2241,21 @@ impl Pipeline {
             .set(job_id, set_index)
             .is_some_and(|set| set.has_nested_checkpoint_authority());
         if graph_authority {
-            let marker = installed
-                .as_deref()
-                .and_then(|blob| super::super::snapshot::decode_installed(blob).ok());
-            let Some(marker) = marker else {
-                self.fail_job(
-                    job_id,
-                    "failed to capture finalized archive installation".into(),
-                );
-                return;
+            let marker = match installed {
+                Ok(marker) => marker,
+                Err(error) => {
+                    self.fail_job(
+                        job_id,
+                        format!("failed to capture finalized archive installation: {error}"),
+                    );
+                    return;
+                }
             };
             if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
                 set.set_installed_snapshot(marker);
             }
             if let Err(error) = self.commit_archive_graph(job_id).await {
-                self.fail_job(
-                    job_id,
-                    format!("failed to commit finalized archive graph: {error}"),
-                );
+                self.fail_job(job_id, failed("finalized archive graph commit", error));
                 return;
             }
         } else if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
@@ -2259,9 +2269,12 @@ impl Pipeline {
             // before the job is archived installs the set fresh and refetches
             // every volume of output already committed above. A failed write
             // costs exactly that redownload, which is the most it can cost.
-            if let Some(blob) = installed
-                && let Err(error) = persist.write(job_id, &set_name, &blob)
-            {
+            let written = installed.and_then(|installed| {
+                super::super::snapshot::encode_installed(&installed)
+                    .map_err(|error| format!("could not encode the installation marker: {error}"))
+            });
+            let written = written.and_then(|blob| persist.write(job_id, &set_name, &blob));
+            if let Err(error) = written {
                 warn!(
                     job_id = job_id.0,
                     set_name = %set_name,
@@ -2320,10 +2333,7 @@ impl Pipeline {
             .is_some_and(|runtime| runtime.graph_owners.contains_key(&(set_name.clone(), 0)))
             && let Err(error) = self.close_scoped_graph_owner(job_id, &set_name, 0).await
         {
-            self.fail_job(
-                job_id,
-                format!("direct source verification close failed: {error}"),
-            );
+            self.fail_job(job_id, failed("direct source verification close", error));
             return;
         }
         crate::runtime::perf_probe::record(
@@ -2339,6 +2349,24 @@ impl Pipeline {
             members = members.len(),
             "direct-store set finalized without materializing a volume"
         );
+        // A child the graph routes lands its members without an engine, so
+        // this line is the only evidence outside the process that it was
+        // nested at all.
+        if let Some(graph) = self
+            .direct_store
+            .set(job_id, set_index)
+            .and_then(|set| set.nested_graph())
+        {
+            for producer in graph.direct_producer_states() {
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    child = %graph.node(producer.node).router.plan().set_name,
+                    node = producer.node,
+                    "direct-store child archive routed by the graph"
+                );
+            }
+        }
     }
 
     // Keeps a finalizing set's virtual volume image alive past its own commit,
@@ -2842,16 +2870,10 @@ impl Pipeline {
                     password: password.clone(),
                     restore_owners: false,
                 };
-                // Every target goes through the sandboxed root now, files included,
-                // so it is opened unconditionally. It used to be opened only for a
-                // set with a directory entry, and the file arm wrote through a bare
-                // `File::create` with `create_dir_all` parents: that skipped the
-                // path validator, the entry accounting, and — the reason it can no
-                // longer stand — the *byte* budget. While the tolerance carried at
-                // most 256 MiB of declared unpacked size, an unbudgeted write was
-                // bounded by that ceiling; with the ceiling gone, the only thing
-                // that may bound a tolerated decode is the same
-                // `JobExtractionBudget` the conventional extractor writes through.
+                // Every target, files included, is written through the sandboxed
+                // root: its path validator and entry accounting apply, and the
+                // `JobExtractionBudget` the conventional extractor writes through
+                // is the only bound on a tolerated decode's bytes.
                 let root = crate::pipeline::extraction::ExtractionRoot::open(&extraction_root)?;
                 let mut produced = Vec::with_capacity(targets.len());
                 let mut directories = Vec::new();

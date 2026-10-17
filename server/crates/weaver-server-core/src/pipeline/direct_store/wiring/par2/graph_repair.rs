@@ -136,14 +136,7 @@ impl Pipeline {
                 .graph_lease(&plan.set_name, 0, None, InputVersion(0))
                 .map_err(|error| format!("repair root session: {error:?}"))?;
             let work = NamespaceWork {
-                kind: match plan.format {
-                    crate::pipeline::direct_store::plan::SetFormat::Rar => {
-                        crate::jobs::assembly::ArchiveType::Rar
-                    }
-                    crate::pipeline::direct_store::plan::SetFormat::SevenZip => {
-                        crate::jobs::assembly::ArchiveType::SevenZip
-                    }
-                },
+                kind: plan.format.archive_type(),
                 set_name: plan.set_name.clone(),
                 volumes,
                 output: working.join("unused-repair-output"),

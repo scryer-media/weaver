@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 use weaver_model::files::{FileRole, archive_base_name};
 
+use crate::jobs::assembly::ArchiveType;
 use crate::security::RuntimeSecurityConfig;
 
 const MAX_NZB_MEMBERS_PER_INPUT: usize = 256;
@@ -164,20 +165,31 @@ pub(super) fn read_nzbs_from_path_with_name(
         }));
     }
 
-    match FileRole::from_filename(name) {
-        FileRole::ZipArchive => extract_zip_nzbs(path, limit),
-        FileRole::TarArchive => extract_tar_nzbs(File::open(path).map_err(transient_io)?, limit),
-        FileRole::TarGzArchive => {
+    let role = FileRole::from_filename(name);
+    // Only a set's first volume opens it; a later one waits for the first.
+    let later_volume = matches!(
+        role,
+        FileRole::RarVolume { volume_number: 1.. }
+            | FileRole::SevenZipSplit { number: 1.. }
+            | FileRole::SplitFile { number: 1.. }
+    );
+    match ArchiveType::from_role(&role) {
+        Some(_) if later_volume => Err(IntakeError::Transient(
+            "waiting for first archive volume".to_string(),
+        )),
+        Some(ArchiveType::Zip) => extract_zip_nzbs(path, limit),
+        Some(ArchiveType::Tar) => extract_tar_nzbs(File::open(path).map_err(transient_io)?, limit),
+        Some(ArchiveType::TarGz) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = flate2::read::GzDecoder::new(file);
             extract_tar_nzbs(reader, limit)
         }
-        FileRole::TarBz2Archive => {
+        Some(ArchiveType::TarBz2) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = bzip2::read::BzDecoder::new(file);
             extract_tar_nzbs(reader, limit)
         }
-        FileRole::TarXzArchive => {
+        Some(ArchiveType::TarXz) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = crate::ingest::xz_multistream_decoder(
                 file,
@@ -188,12 +200,12 @@ pub(super) fn read_nzbs_from_path_with_name(
             })?;
             extract_tar_nzbs(reader, limit)
         }
-        FileRole::GzArchive => {
+        Some(ArchiveType::Gz) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = flate2::read::GzDecoder::new(file);
             IntakeOutput::one_checked(single_stream_nzb(name, &[".gz"], reader, limit)?, limit)
         }
-        FileRole::DeflateArchive => {
+        Some(ArchiveType::Deflate) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = flate2::read::DeflateDecoder::new(file);
             IntakeOutput::one_checked(
@@ -201,12 +213,12 @@ pub(super) fn read_nzbs_from_path_with_name(
                 limit,
             )
         }
-        FileRole::BrotliArchive => {
+        Some(ArchiveType::Brotli) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = brotli::Decompressor::new(file, 4096);
             IntakeOutput::one_checked(single_stream_nzb(name, &[".br"], reader, limit)?, limit)
         }
-        FileRole::ZstdArchive => {
+        Some(ArchiveType::Zstd) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = zstd::stream::read::Decoder::new(file)
                 .map_err(|error| IntakeError::Permanent(format!("failed to open zstd: {error}")))?;
@@ -215,12 +227,12 @@ pub(super) fn read_nzbs_from_path_with_name(
                 limit,
             )
         }
-        FileRole::Bzip2Archive => {
+        Some(ArchiveType::Bzip2) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = bzip2::read::BzDecoder::new(file);
             IntakeOutput::one_checked(single_stream_nzb(name, &[".bz2"], reader, limit)?, limit)
         }
-        FileRole::XzArchive => {
+        Some(ArchiveType::Xz) => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = crate::ingest::xz_multistream_decoder(
                 file,
@@ -231,17 +243,10 @@ pub(super) fn read_nzbs_from_path_with_name(
             })?;
             IntakeOutput::one_checked(single_stream_nzb(name, &[".xz"], reader, limit)?, limit)
         }
-        FileRole::SevenZipArchive | FileRole::SevenZipSplit { number: 0 } => {
-            extract_7z_nzbs(path, name, limit)
-        }
-        FileRole::RarVolume { volume_number: 0 } => extract_rar_nzbs(path, name, limit),
-        FileRole::SplitFile { number: 0 } => extract_split_nzb(path, name, limit),
-        FileRole::RarVolume { .. }
-        | FileRole::SevenZipSplit { .. }
-        | FileRole::SplitFile { .. } => Err(IntakeError::Transient(
-            "waiting for first archive volume".to_string(),
-        )),
-        _ => Err(IntakeError::Permanent(format!(
+        Some(ArchiveType::SevenZip) => extract_7z_nzbs(path, name, limit),
+        Some(ArchiveType::Rar) => extract_rar_nzbs(path, name, limit),
+        Some(ArchiveType::Split) => extract_split_nzb(path, name, limit),
+        None => Err(IntakeError::Permanent(format!(
             "unsupported watched-folder input: {name}"
         ))),
     }

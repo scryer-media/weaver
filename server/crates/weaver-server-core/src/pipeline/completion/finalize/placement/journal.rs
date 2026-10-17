@@ -5,7 +5,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-const PREFIX: &str = ".weaver-placement-";
+use crate::pipeline::direct_store::plan::PLACEMENT_JOURNAL_PREFIX;
+
 const JOURNAL: &str = "journal.json";
 const NEXT_JOURNAL: &str = ".journal-next";
 
@@ -86,7 +87,7 @@ fn valid_name(name: &str) -> bool {
     matches!(parts.next(), Some(Component::Normal(_)))
         && parts.next().is_none()
         && !name.contains(['/', '\\', ':'])
-        && !name.starts_with(PREFIX)
+        && !name.starts_with(PLACEMENT_JOURNAL_PREFIX)
 }
 
 // Only copied paths need a content comparison during recovery. Ordinary
@@ -190,7 +191,7 @@ pub(super) fn prepare(
                 staging: entry.current_name.clone(),
                 destination: entry.correct_name.clone(),
                 size,
-                reference: format!("{PREFIX}{index}"),
+                reference: format!("{PLACEMENT_JOURNAL_PREFIX}{index}"),
                 location: Location::Original,
             })
         })
@@ -204,7 +205,7 @@ pub(super) fn prepare(
     };
     validate_journal(&journal)?;
     let staging = tempfile::Builder::new()
-        .prefix(PREFIX)
+        .prefix(PLACEMENT_JOURNAL_PREFIX)
         .tempdir_in(dir)?
         .keep();
     let transaction = Transaction {
@@ -234,7 +235,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
         return Err(invalid("unsupported placement journal"));
     }
     for (index, entry) in journal.entries.iter().enumerate() {
-        if entry.reference != format!("{PREFIX}{index}") {
+        if entry.reference != format!("{PLACEMENT_JOURNAL_PREFIX}{index}") {
             return Err(invalid("invalid placement witness name"));
         }
         let valid_location = match journal.phase {
@@ -307,7 +308,11 @@ pub(crate) fn recover(dir: &Path) -> io::Result<RecoveryReport> {
     let mut replayed = false;
     for item in listing {
         let item = item?;
-        if !item.file_name().to_string_lossy().starts_with(PREFIX) {
+        if !item
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PLACEMENT_JOURNAL_PREFIX)
+        {
             continue;
         }
         if !item.file_type()?.is_dir() {

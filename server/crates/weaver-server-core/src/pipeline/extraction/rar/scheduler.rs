@@ -146,10 +146,9 @@ impl Pipeline {
     // declaration would latch a failed member out while waiting for a verdict
     // that can never come.
     //
-    // A clean verdict releases it. 0.7.9 drops that clause so a member that
-    // fails *after* verification stays latched; 0.8 does not need to, because
-    // it already re-opens the completion gate for that job by another route,
-    // and holding the latch as well would keep the member out with no verdict
+    // A clean verdict releases it, and a member that fails *after*
+    // verification re-opens the completion gate for its job by another route,
+    // so holding the latch as well would only keep it out with no verdict
     // left to come.
     pub(crate) fn par2_is_authoritative_for_extraction(&self, job_id: JobId) -> bool {
         self.par2_set(job_id).is_some() && !self.par2_bypassed.contains(&job_id)
@@ -1193,7 +1192,23 @@ impl Pipeline {
             .await;
         let result = match verdict {
             NativeChaseVerdict::Superseded | NativeChaseVerdict::Stale => return,
-            NativeChaseVerdict::Accepted(outcome) => Ok(outcome),
+            NativeChaseVerdict::Accepted(outcome) => {
+                // The accepted chase streamed its child archives into the
+                // archive runtime under the set's root owner, and the runtime
+                // extracts them; its outcome names only the ordinary members.
+                // Counting the streamed ones as extracted, as a streamed batch
+                // does, keeps the scheduler from opening a second root stream
+                // for a member the chase already handed over.
+                let streamed = self.chase_stream_manifest(job_id, &set_name).streamed();
+                if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
+                    runtime.consumed.extend(streamed.iter().cloned());
+                }
+                self.extracted_members
+                    .entry(job_id)
+                    .or_default()
+                    .extend(streamed);
+                Ok(outcome)
+            }
             NativeChaseVerdict::Failed(error) => Err(error),
             NativeChaseVerdict::Restart => {
                 self.restart_native_chase(job_id, &set_name, kind).await;
@@ -1430,8 +1445,8 @@ impl Pipeline {
                     return;
                 }
 
-                // Each lookup walks the stream's retained catalogs, so every
-                // name this batch touched is resolved once.
+                // A member the archive runtime consumed left its archive into
+                // the runtime, so no file of its name is expected on disk.
                 let streamed_names: HashSet<String> = self
                     .archive_runtime
                     .get(&job_id)
@@ -1439,7 +1454,7 @@ impl Pipeline {
                         current_attempted
                             .iter()
                             .chain(result.iter().flat_map(|outcome| &outcome.extracted))
-                            .filter(|name| runtime.scoped_streamed_member(&set_name, name))
+                            .filter(|name| runtime.consumed.contains(*name))
                             .cloned()
                             .collect()
                     })

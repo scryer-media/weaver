@@ -1,9 +1,11 @@
+use super::seek::Seek;
 use super::*;
 pub(super) use crate::pipeline::extraction::catalog::MemberCatalog;
 use crate::pipeline::extraction::catalog::MemberFact;
 use crate::pipeline::extraction::catalog::{
     InputProjection, InputRange, MemberProjection, MemberRange, ProjectionError,
 };
+use std::ops::Range;
 
 impl MemberProjection for DirectSetRouter {
     fn project_member(
@@ -90,12 +92,7 @@ pub(crate) fn archive_candidates(
         .filter(|member| member.routable)
         .filter_map(|member| {
             let role = FileRole::from_filename(member.name);
-            let (format, volume, whole) = match role {
-                FileRole::RarVolume { volume_number } => (SetFormat::Rar, volume_number, false),
-                FileRole::SevenZipArchive => (SetFormat::SevenZip, 0, true),
-                FileRole::SevenZipSplit { number } => (SetFormat::SevenZip, number, false),
-                _ => return None,
-            };
+            let (format, volume, whole) = SetFormat::of_role(&role)?;
             Some((
                 member.id,
                 archive_base_name(member.name, &role)?,
@@ -124,6 +121,11 @@ pub(crate) trait RoutingNamespace: MemberProjection {
     fn validate_input(&self, source: InputRange) -> Result<(), ProjectionError>;
     fn project_write(&self, receipt: NodePlacement) -> Result<InputProjection, ProjectionError>;
     fn member_destination(&self, member: u32) -> Option<PathBuf>;
+    // Where this namespace's source carries `range` of one member, in the
+    // source's own volumes, or why it cannot say. A stored namespace that has
+    // not read the headers placing the range asks for them as well. See
+    // [`super::seek`].
+    fn lift_seek(&self, member: u32, range: Range<u64>) -> Result<Vec<Seek>, DemotionReason>;
 }
 
 impl RoutingNamespace for DirectSetRouter {
@@ -175,6 +177,10 @@ impl RoutingNamespace for DirectSetRouter {
         };
         self.validate_input(source)?;
         Ok(InputProjection::Mapped(vec![source]))
+    }
+
+    fn lift_seek(&self, member: u32, range: Range<u64>) -> Result<Vec<Seek>, DemotionReason> {
+        Ok(super::seek::member_seeks(self, member, range))
     }
 }
 
@@ -246,5 +252,11 @@ impl RoutingNamespace for DecodedNamespace<'_> {
                 write_offset: 0,
             },
         )
+    }
+
+    // Decoded bytes exist only once the decoder has produced everything
+    // before them.
+    fn lift_seek(&self, _member: u32, _range: Range<u64>) -> Result<Vec<Seek>, DemotionReason> {
+        Err(DemotionReason::UnseekableParent)
     }
 }

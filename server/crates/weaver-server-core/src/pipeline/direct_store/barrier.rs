@@ -526,13 +526,15 @@ impl CoverageBarrier {
     // Drops a destination the set no longer owns, so the next snapshot carries
     // no claim for it.
     //
-    // The reachable caller is the split-BLAKE2sp migration, which moves a
-    // member's routed bytes into the envelope and **unlinks its partial**. A
-    // claim on a file that no longer exists is refused at restart as a missing
-    // destination, taking the whole row down to a redownload. Keeping it in the
-    // sync set is worse than useless besides: the write pool opens for sync with
-    // `create(true)`, so the barrier either fsyncs an unlinked inode or puts an
-    // empty `.direct.partial` back beside the member it just migrated.
+    // The caller is the set's registration, retiring the partials the router's
+    // envelope migration parked: a member found ineligible after it routed
+    // bytes has those bytes moved into the envelope and **its partial
+    // unlinked**. A claim on a file that no longer exists is refused at restart
+    // as a missing destination, taking the whole row down to a redownload.
+    // Keeping it in the sync set is worse than useless besides: the write pool
+    // opens for sync with `create(true)`, so the barrier either fsyncs an
+    // unlinked inode or puts an empty `.direct.partial` back beside the member
+    // it just migrated.
     //
     // The entry is **removed**, not emptied. The rule is that a claim over
     // zero bytes is not a claim and is omitted from the blob, and a
@@ -542,8 +544,8 @@ impl CoverageBarrier {
     // The path is checked, not just the key: member ids are in-run counters,
     // and retiring a live destination because an id was reused would drop
     // claims on bytes that really are on disk. A mismatch keeps the claim,
-    // which is the safe direction — the row is refused and the set redownloads,
-    // exactly as it did before this existed.
+    // which is the safe direction: the row is refused at restart and the set
+    // redownloads.
     pub(crate) fn retire_destination(&mut self, member_index: u32, relative_path: &str) -> bool {
         let matches = self
             .destinations

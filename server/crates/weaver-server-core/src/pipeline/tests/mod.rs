@@ -2068,10 +2068,20 @@ fn sevenz_fixture_bytes(prefix: &str) -> Vec<(String, Vec<u8>)> {
 }
 
 async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId) {
+    drive_extractions_observing(pipeline, job_id, |_| {}).await;
+}
+
+// The terminal drive, showing `observe` each extraction verdict before the
+// pipeline handles it.
+async fn drive_extractions_observing(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    mut observe: impl FnMut(&ExtractionDone),
+) {
     // Progress and child completion events do not correspond to archive depth.
     // Wait for this job's terminal condition; the test runner bounds a stall.
     loop {
-        pump_pipeline_runtime_queues(pipeline).await;
+        pump_pipeline_runtime_queues_observing(pipeline, &mut observe).await;
         if matches!(
             job_status_for_assert(pipeline, job_id),
             Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
@@ -2089,7 +2099,7 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId) {
                 .await
                 .expect("move channel should stay open");
             pipeline.handle_move_to_complete_done(done).await;
-            pump_pipeline_runtime_queues(pipeline).await;
+            pump_pipeline_runtime_queues_observing(pipeline, &mut observe).await;
             continue;
         }
 
@@ -2098,8 +2108,9 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId) {
             .recv()
             .await
             .expect("extraction channel should stay open");
+        observe(&done);
         pipeline.handle_extraction_done(done).await;
-        pump_pipeline_runtime_queues(pipeline).await;
+        pump_pipeline_runtime_queues_observing(pipeline, &mut observe).await;
     }
 }
 
@@ -3074,11 +3085,19 @@ async fn park_direct_verification_verdict(pipeline: &mut Pipeline, job_id: JobId
 }
 
 async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
+    pump_pipeline_runtime_queues_observing(pipeline, &mut |_| {}).await;
+}
+
+async fn pump_pipeline_runtime_queues_observing(
+    pipeline: &mut Pipeline,
+    observe: &mut impl FnMut(&ExtractionDone),
+) {
     settle_direct_post_repair_work(pipeline).await;
 
     settle_inflight_moves(pipeline).await;
 
     while let Ok(done) = pipeline.extract_done_rx.try_recv() {
+        observe(&done);
         pipeline.handle_extraction_done(done).await;
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {

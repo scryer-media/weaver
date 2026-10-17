@@ -7,18 +7,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::pipeline::extraction::output::channel::StreamOwner;
-use crate::pipeline::extraction::runtime::NamespaceWork;
+use crate::pipeline::extraction::runtime::{NamespaceWork, RuntimeError};
 use crate::pipeline::extraction::{ExtractionRoot, JobExtractionBudget};
 
 pub(super) type Completion = (StreamOwner, NamespaceWork, Vec<String>);
 
 /// How a member's private backing reaches its published name.
+///
+/// A decoded namespace is retained after publication, and three readers still
+/// open its member backings by their private paths: the restart probe that
+/// re-verifies a direct-store graph, the rearm of a restored graph, and the
+/// repair inventory that offers members as recovery siblings. Such a backing
+/// is hardlinked rather than moved. A hardlink shares its inode, so a write in
+/// place to the published file changes the backing those readers see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Placement {
     /// Nothing reads the private backing after publication.
     Move,
-    /// A retained decoded namespace still owns the backing: restart probes
-    /// and re-verifies it, and nested repair reads it as a sibling.
+    /// A retained decoded namespace still reads the backing.
     Share,
 }
 
@@ -41,8 +47,9 @@ pub(super) fn publish(
     destination: &Path,
     completed: Vec<Completion>,
     budget: &Arc<JobExtractionBudget>,
-) -> Result<Vec<(String, StreamOwner)>, String> {
-    let destination = ExtractionRoot::open(destination)?;
+) -> Result<Vec<(String, StreamOwner)>, RuntimeError> {
+    let destination =
+        ExtractionRoot::open(destination).map_err(RuntimeError::refused("publication root"))?;
     let namespaces = validate(&destination, completed)?;
     let mut published = Vec::new();
     let mut directories = Vec::new();
@@ -50,9 +57,7 @@ pub(super) fn publish(
         for member in namespace.members {
             let relative = Path::new(&member.name);
             if member.metadata.is_dir() {
-                destination
-                    .create_dir(relative, budget)
-                    .map_err(|error| error.to_string())?;
+                destination.create_dir(relative, budget)?;
                 directories.push((member.name.clone(), member.metadata));
             } else {
                 place_file(
@@ -79,7 +84,7 @@ pub(super) fn publish(
 fn validate(
     destination: &ExtractionRoot,
     completed: Vec<Completion>,
-) -> Result<Vec<Namespace>, String> {
+) -> Result<Vec<Namespace>, RuntimeError> {
     let mut names = HashSet::new();
     for ordinary in completed.iter().flat_map(|(_, work, _)| &work.ordinary) {
         claim(&mut names, ordinary)?;
@@ -99,11 +104,12 @@ fn validate_namespace(
     owner: StreamOwner,
     work: &NamespaceWork,
     members: Vec<String>,
-) -> Result<Namespace, String> {
-    let source = ExtractionRoot::open_existing(&work.output)?;
+) -> Result<Namespace, RuntimeError> {
+    let source = ExtractionRoot::open_existing(&work.output)
+        .map_err(RuntimeError::refused("namespace backing root"))?;
     let inventory: BTreeMap<_, _> = source
         .list_entries_no_links(&[])
-        .map_err(|error| error.to_string())?
+        .map_err(RuntimeError::io("namespace inventory"))?
         .into_iter()
         .collect();
     let members = members
@@ -111,20 +117,20 @@ fn validate_namespace(
         .map(|name| {
             claim(names, &name)?;
             if destination.open_input(Path::new(&name)).is_ok() {
-                return Err(collision(&name));
+                return Err(RuntimeError::OutputCollision(name));
             }
             let backing = backing(work, &name)?;
             let metadata = inventory
                 .get(&backing)
                 .cloned()
-                .ok_or_else(|| format!("nested output missing: {name}"))?;
+                .ok_or_else(|| RuntimeError::MissingOutput(name.clone()))?;
             Ok(Member {
                 name,
                 backing,
                 metadata,
             })
         })
-        .collect::<Result<_, String>>()?;
+        .collect::<Result<_, RuntimeError>>()?;
     Ok(Namespace {
         owner,
         source,
@@ -137,26 +143,22 @@ fn validate_namespace(
     })
 }
 
-fn claim(names: &mut HashSet<String>, name: &str) -> Result<(), String> {
+fn claim(names: &mut HashSet<String>, name: &str) -> Result<(), RuntimeError> {
     if names.insert(name.to_owned()) {
         Ok(())
     } else {
-        Err(collision(name))
+        Err(RuntimeError::OutputCollision(name.to_owned()))
     }
-}
-
-fn collision(name: &str) -> String {
-    format!("nested archive output collision: {name}")
 }
 
 // A decoded namespace stores members under private names; an engine that
 // wrote straight into the namespace used the member's own name.
-fn backing(work: &NamespaceWork, member: &str) -> Result<PathBuf, String> {
+fn backing(work: &NamespaceWork, member: &str) -> Result<PathBuf, RuntimeError> {
     match work.outputs.get(member) {
         Some(path) => path
             .strip_prefix(&work.output)
             .map(Path::to_owned)
-            .map_err(|_| "namespace backing escaped root".into()),
+            .map_err(|_| RuntimeError::Invariant("namespace backing escaped root")),
         None => Ok(PathBuf::from(member)),
     }
 }
@@ -168,21 +170,15 @@ fn place_file(
     relative: &Path,
     placement: Placement,
     budget: &Arc<JobExtractionBudget>,
-) -> Result<(), String> {
-    destination
-        .create_parents(relative, budget)
-        .map_err(|error| error.to_string())?;
+) -> Result<(), RuntimeError> {
+    destination.create_parents(relative, budget)?;
     let placed = match placement {
         Placement::Move => source.rename_input_to(backing, destination, relative),
         Placement::Share => source.link_input_to(backing, destination, relative),
     };
     or_copy_across_devices(
         placed,
-        || {
-            budget
-                .note_entry(relative)
-                .map_err(|error| error.to_string())
-        },
+        || budget.note_entry(relative).map_err(RuntimeError::from),
         || copy_file(source, backing, destination, relative, budget),
     )
 }
@@ -191,13 +187,13 @@ fn place_file(
 // other refusal is a real publication failure.
 fn or_copy_across_devices(
     placed: io::Result<()>,
-    account: impl FnOnce() -> Result<(), String>,
-    copy: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
+    account: impl FnOnce() -> Result<(), RuntimeError>,
+    copy: impl FnOnce() -> Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
     match placed {
         Ok(()) => account(),
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => copy(),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(RuntimeError::io("publication placement")(error)),
     }
 }
 
@@ -207,22 +203,20 @@ fn copy_file(
     destination: &ExtractionRoot,
     relative: &Path,
     budget: &Arc<JobExtractionBudget>,
-) -> Result<(), String> {
+) -> Result<(), RuntimeError> {
     let mut input = source
         .open_input(backing)
-        .map_err(|error| error.to_string())?;
-    let mut output = destination
-        .create_file(relative, budget)
-        .map_err(|error| error.to_string())?;
-    io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
-    io::Write::flush(&mut output).map_err(|error| error.to_string())
+        .map_err(RuntimeError::io("publication copy source"))?;
+    let mut output = destination.create_file(relative, budget)?;
+    io::copy(&mut input, &mut output).map_err(RuntimeError::io("publication copy"))?;
+    io::Write::flush(&mut output).map_err(RuntimeError::io("publication copy"))
 }
 
 fn apply_metadata(
     destination: &ExtractionRoot,
     relative: &Path,
     metadata: &cap_std::fs::Metadata,
-) -> Result<(), String> {
+) -> Result<(), RuntimeError> {
     #[cfg(unix)]
     let mode = {
         use cap_std::fs::PermissionsExt;
@@ -237,7 +231,7 @@ fn apply_metadata(
             metadata.accessed().ok().map(|time| time.into_std()),
             mode,
         )
-        .map_err(|error| error.to_string())
+        .map_err(RuntimeError::io("published metadata"))
 }
 
 #[cfg(test)]

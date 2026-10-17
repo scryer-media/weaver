@@ -993,9 +993,10 @@ async fn a_solid_ineligible_member_demotes_rather_than_riding_the_tolerance() {
     let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
 
     // Identical to a tolerated member in every budget dimension; only the
-    // per-member solid flag differs. `extract_member_streaming` can only decode
-    // a solid member against the rest of its solid run, so the tolerance must
-    // not take it however small it is.
+    // per-member solid flag differs. The tolerated extraction reads each member
+    // as one `unrar_rs` entry over the set's virtual volumes, and a solid member
+    // decodes only against the rest of its solid run, so the tolerance must not
+    // take it however small it is.
     let volumes = store_set_with_extra_member(
         store_name,
         &store_payload,

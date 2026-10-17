@@ -2570,13 +2570,23 @@ async fn nested_rar_three_deep_extracts_through_inner_7z() {
         "{}",
         debug_job_state(&pipeline, job_id)
     );
-    assert!(dest.join("sample.mkv").exists());
+    assert!(
+        dest.join("sample.mkv").exists(),
+        "dest entries: {:?}; job state: {}",
+        std::fs::read_dir(&dest)
+            .map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+            .unwrap_or_default(),
+        debug_job_state(&pipeline, job_id)
+    );
     assert!(!dest.join("middle.rar").exists());
     assert!(!dest.join("inner.7z").exists());
 }
 
 #[tokio::test]
-async fn nested_rar_five_deep_stops_at_depth_limit() {
+async fn nested_rar_five_deep_extracts_final_media() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(10071);
@@ -2603,8 +2613,10 @@ async fn nested_rar_five_deep_stops_at_depth_limit() {
         "{}",
         debug_job_state(&pipeline, job_id)
     );
-    assert!(dest.join("level2.rar").exists());
-    assert!(!dest.join("sample.mkv").exists());
+    assert!(dest.join("sample.mkv").exists());
+    for level in 1..=5 {
+        assert!(!dest.join(format!("level{level}.rar")).exists());
+    }
 }
 
 #[tokio::test]
@@ -3790,5 +3802,289 @@ async fn swapped_rar_volume_arrival_uses_parsed_volume_identity_for_claims() {
     assert_eq!(
         member_span(&pipeline, job_id, "show", "E02.mkv"),
         Some((2, 3))
+    );
+}
+
+// A single-volume RAR5 archive storing `members` uncompressed, in order.
+fn store_rar(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TEST_RAR5_SIG);
+    bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+    for (name, payload) in members {
+        bytes.extend_from_slice(&build_test_rar_file_header(
+            name,
+            0,
+            payload.len() as u64,
+            payload.len() as u64,
+            Some(checksum::crc32(payload)),
+        ));
+        bytes.extend_from_slice(payload);
+    }
+    bytes.extend_from_slice(&build_test_rar_end_header(false));
+    bytes
+}
+
+// `levels` stored archives nested one inside the next. The innermost stores
+// `sample.mkv`; the returned posted archive stores `level1.rar`.
+fn nested_store_tower(levels: u32, payload: &[u8]) -> Vec<u8> {
+    (1..=levels)
+        .rev()
+        .fold(store_rar(&[("sample.mkv", payload)]), |inner, level| {
+            store_rar(&[(format!("level{level}.rar").as_str(), inner.as_slice())])
+        })
+}
+
+// Deterministic member bytes that no RAR header could be mistaken for.
+fn tower_payload() -> Vec<u8> {
+    (0..65_536u32)
+        .map(|index| (index * 7 % 251) as u8)
+        .collect()
+}
+
+fn dest_entries(dest: &std::path::Path) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(dest)
+        .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+        .unwrap_or_default()
+}
+
+// Posts one archive as a complete job and drives it to a terminal status,
+// returning the pipeline and the job's complete directory.
+async fn complete_posted_archive(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    title: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+) -> (Pipeline, PathBuf) {
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(temp_dir).await;
+    let spec = rar_job_spec(title, &[(file_name.to_string(), bytes.clone())]);
+    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, file_name, &bytes).await;
+    pipeline.check_job_completion(job_id).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(title));
+    (pipeline, dest)
+}
+
+#[tokio::test]
+async fn nested_rar_ten_deep_extracts_final_media() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let payload = tower_payload();
+    let (_pipeline, dest) = complete_posted_archive(
+        &temp_dir,
+        JobId(10072),
+        "Nested RAR Ten Deep",
+        "tower.rar",
+        nested_store_tower(10, &payload),
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(dest.join("sample.mkv")).unwrap(),
+        payload,
+        "dest entries: {:?}",
+        dest_entries(&dest)
+    );
+    for level in 1..=10 {
+        assert!(!dest.join(format!("level{level}.rar")).exists());
+    }
+}
+
+#[tokio::test]
+async fn nested_rar_eleven_deep_stops_at_the_depth_limit() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (_pipeline, dest) = complete_posted_archive(
+        &temp_dir,
+        JobId(10073),
+        "Nested RAR Eleven Deep",
+        "tower.rar",
+        nested_store_tower(11, &tower_payload()),
+    )
+    .await;
+
+    // Ten archives open below the posted set; the eleventh stays a file.
+    assert!(
+        dest.join("level11.rar").exists(),
+        "dest entries: {:?}",
+        dest_entries(&dest)
+    );
+    assert!(!dest.join("sample.mkv").exists());
+    for level in 1..=10 {
+        assert!(!dest.join(format!("level{level}.rar")).exists());
+    }
+}
+
+// One stored outer archive carrying an xz stream, a compressed 7z and a stored
+// RAR: the stream is decompressed and both archives are extracted.
+#[tokio::test]
+async fn nested_rar_extracts_xz_7z_and_rar_members() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let notes = b"release notes".repeat(512);
+    let notes_xz = xz_stream(&notes);
+    let extra = tower_payload();
+    let sevenz = compressed_7z("extra.bin", &extra);
+
+    let clip: Vec<u8> = tower_payload().into_iter().rev().collect();
+    let inner_rar = store_rar(&[("clip.mkv", &clip)]);
+
+    let (_pipeline, dest) = complete_posted_archive(
+        &temp_dir,
+        JobId(10074),
+        "Nested Mixed Members",
+        "bundle.rar",
+        store_rar(&[
+            ("release.nfo.xz", &notes_xz),
+            ("inner.7z", &sevenz),
+            ("inner.rar", &inner_rar),
+        ]),
+    )
+    .await;
+
+    let entries = dest_entries(&dest);
+    assert_eq!(
+        std::fs::read(dest.join("release.nfo")).unwrap(),
+        notes,
+        "dest entries: {entries:?}"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("extra.bin")).unwrap(),
+        extra,
+        "dest entries: {entries:?}"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("clip.mkv")).unwrap(),
+        clip,
+        "dest entries: {entries:?}"
+    );
+    for name in ["release.nfo.xz", "inner.7z", "inner.rar"] {
+        assert!(!dest.join(name).exists(), "dest entries: {entries:?}");
+    }
+}
+
+// One xz stream holding `bytes`.
+fn xz_stream(bytes: &[u8]) -> Vec<u8> {
+    let props = lzma_turbo::LzmaEncProps::xz_preset(0, false).unwrap();
+    let mut xz = lzma_turbo::XzWriter::new(Vec::new(), &props).unwrap();
+    std::io::Write::write_all(&mut xz, bytes).unwrap();
+    xz.finish().unwrap()
+}
+
+// A one-member 7z archive, compressed with the writer's default method.
+fn compressed_7z(name: &str, bytes: &[u8]) -> Vec<u8> {
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter};
+    let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    let mut entry = ArchiveEntry::new_file(name);
+    entry.size = bytes.len() as u64;
+    writer
+        .push_archive_entry(entry, Some(std::io::Cursor::new(bytes.to_vec())))
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+// A one-member 7z archive that stores `bytes` uncompressed.
+fn stored_7z(name: &str, bytes: &[u8]) -> Vec<u8> {
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderMethod};
+    let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![EncoderMethod::COPY.into()]);
+    let mut entry = ArchiveEntry::new_file(name);
+    entry.size = bytes.len() as u64;
+    writer
+        .push_archive_entry(entry, Some(std::io::Cursor::new(bytes.to_vec())))
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+// A stored RAR carrying an xz stream whose bytes are another stored RAR: the
+// stream is decoded as it lands and the archive inside it is routed from the
+// decoded bytes, with nothing to seek anywhere on the way.
+#[tokio::test]
+async fn nested_rar_routes_a_stored_rar_out_of_an_xz_stream() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let clip = tower_payload();
+    let inner_rar = store_rar(&[("clip.mkv", &clip)]);
+    let (_pipeline, dest) = complete_posted_archive(
+        &temp_dir,
+        JobId(10075),
+        "Nested Rar Through Xz",
+        "bundle.rar",
+        store_rar(&[("inner.rar.xz", &xz_stream(&inner_rar))]),
+    )
+    .await;
+    let entries = dest_entries(&dest);
+    assert_eq!(
+        std::fs::read(dest.join("clip.mkv")).unwrap(),
+        clip,
+        "dest entries: {entries:?}"
+    );
+    for name in ["inner.rar.xz", "inner.rar"] {
+        assert!(!dest.join(name).exists(), "dest entries: {entries:?}");
+    }
+}
+
+// A stored RAR carrying an xz stream whose bytes are a stored 7z: the 7z's map
+// sits at an end the stream cannot seek to, so an engine reads the container
+// once the stream has delivered all of it, and the member still lands.
+#[tokio::test]
+async fn nested_rar_extracts_a_stored_7z_out_of_an_xz_stream() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let clip = tower_payload();
+    let (_pipeline, dest) = complete_posted_archive(
+        &temp_dir,
+        JobId(10076),
+        "Nested 7z Through Xz",
+        "bundle.rar",
+        store_rar(&[("inner.7z.xz", &xz_stream(&stored_7z("clip.mkv", &clip)))]),
+    )
+    .await;
+    let entries = dest_entries(&dest);
+    assert_eq!(
+        std::fs::read(dest.join("clip.mkv")).unwrap(),
+        clip,
+        "dest entries: {entries:?}"
+    );
+    for name in ["inner.7z.xz", "inner.7z"] {
+        assert!(!dest.join(name).exists(), "dest entries: {entries:?}");
+    }
+}
+
+// A stored RAR carrying a RAR whose members are compressed: a posted set keeps
+// such members for the extractor that runs at its end, but a nested node has
+// no such extractor, so the whole child is read by an engine and every member
+// still lands.
+#[tokio::test]
+async fn nested_rar_with_compressed_members_is_extracted_by_an_engine() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let inner: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/rar5_multifile_lz.rar"
+    ));
+    let (_pipeline, dest) = complete_posted_archive(
+        &temp_dir,
+        JobId(10077),
+        "Nested Compressed Members",
+        "bundle.rar",
+        store_rar(&[("inner.rar", inner)]),
+    )
+    .await;
+    let entries = dest_entries(&dest);
+    assert_eq!(
+        std::fs::read(dest.join("zeros_64k.bin")).unwrap(),
+        vec![0u8; 65_536],
+        "dest entries: {entries:?}"
+    );
+    for name in ["hello.txt", "second.txt"] {
+        assert!(dest.join(name).is_file(), "dest entries: {entries:?}");
+    }
+    assert!(
+        !dest.join("inner.rar").exists(),
+        "dest entries: {entries:?}"
     );
 }

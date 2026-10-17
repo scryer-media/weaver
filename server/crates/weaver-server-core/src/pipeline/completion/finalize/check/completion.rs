@@ -3261,11 +3261,7 @@ impl Pipeline {
                             let Some(path) = self.resolve_job_input_path(job_id, filename) else {
                                 continue;
                             };
-                            if self
-                                .archive_runtime
-                                .get(&job_id)
-                                .is_some_and(|runtime| runtime.retains_input_path(&path))
-                            {
+                            if self.retains_job_input(job_id, &path) {
                                 continue;
                             }
                             match tokio::fs::remove_file(&path).await {

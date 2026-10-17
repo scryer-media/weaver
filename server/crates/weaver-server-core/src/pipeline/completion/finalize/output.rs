@@ -76,7 +76,7 @@ impl TerminalArchiveCleanup {
             }
             for private in [
                 crate::pipeline::direct_store::manifest::DIRECTORY,
-                ".weaver-nested",
+                crate::pipeline::direct_store::nested::NESTED_DIR,
                 ".weaver-chunks",
             ] {
                 match root.remove_owned_backing(Path::new(private), true) {

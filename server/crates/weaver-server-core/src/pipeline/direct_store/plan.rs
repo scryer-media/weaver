@@ -50,16 +50,133 @@ pub(crate) enum AdmissionRefusal {
 // The router reads this to pick a layout engine: RAR's headers are a
 // front-to-back walk per volume, where a 7z container states its whole map
 // once, in an end header at the tail.
+//
+// A stream is the third shape: one member that decompresses to exactly one
+// output. It has no layout to read and nothing to route, so a stream node is
+// born an engine child that decodes its parent's bytes as they land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SetFormat {
     #[default]
     Rar,
     SevenZip,
+    Stream(StreamKind),
 }
+
+impl SetFormat {
+    // The manifest's one-byte record of the format, stable across releases:
+    // RAR and 7z keep the two values shipped checkpoints hold, and each
+    // stream kind takes the next.
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Self::Rar => 0,
+            Self::SevenZip => 1,
+            Self::Stream(kind) => 2 + kind as u8,
+        }
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Rar),
+            1 => Some(Self::SevenZip),
+            _ => StreamKind::from_code(code - 2).map(Self::Stream),
+        }
+    }
+
+    // The set shape a file of `role` belongs to: its family, which volume of
+    // the set the file is, and whether the file is the whole set. A single
+    // compressed file is its own whole, one-volume set.
+    pub(crate) fn of_role(role: &FileRole) -> Option<(Self, u32, bool)> {
+        Some(match *role {
+            FileRole::RarVolume { volume_number } => (Self::Rar, volume_number, false),
+            FileRole::SevenZipArchive => (Self::SevenZip, 0, true),
+            FileRole::SevenZipSplit { number } => (Self::SevenZip, number, false),
+            _ => (Self::Stream(StreamKind::from_role(role)?), 0, true),
+        })
+    }
+
+    // The identity a nested node admitted by its parent's catalog carries: a
+    // described roster for an archive family, the kind itself for a stream.
+    pub(crate) fn nested_identity(self) -> IdentityKind {
+        match self {
+            Self::Rar => IdentityKind::Roster,
+            Self::SevenZip => IdentityKind::SevenZipRoster,
+            Self::Stream(kind) => IdentityKind::Stream(kind),
+        }
+    }
+
+    pub(crate) fn archive_type(self) -> crate::jobs::assembly::ArchiveType {
+        use crate::jobs::assembly::ArchiveType;
+        match self {
+            Self::Rar => ArchiveType::Rar,
+            Self::SevenZip => ArchiveType::SevenZip,
+            Self::Stream(kind) => kind.archive_type(),
+        }
+    }
+}
+
+// A single-stream compression wrapper around one file. Container formats
+// that hold several entries (tar, zip) are not streams: they are extracted
+// whole once their bytes are on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub(crate) enum StreamKind {
+    Xz,
+    Gz,
+    Bzip2,
+    Zstd,
+    Brotli,
+    Deflate,
+}
+
+impl StreamKind {
+    const ALL: [Self; 6] = [
+        Self::Xz,
+        Self::Gz,
+        Self::Bzip2,
+        Self::Zstd,
+        Self::Brotli,
+        Self::Deflate,
+    ];
+
+    pub(crate) fn from_role(role: &FileRole) -> Option<Self> {
+        crate::jobs::assembly::ArchiveType::from_role(role).and_then(Self::of)
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code)).copied()
+    }
+
+    pub(crate) fn of(kind: crate::jobs::assembly::ArchiveType) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|stream| stream.archive_type() == kind)
+    }
+
+    pub(crate) fn archive_type(self) -> crate::jobs::assembly::ArchiveType {
+        use crate::jobs::assembly::ArchiveType;
+        match self {
+            Self::Xz => ArchiveType::Xz,
+            Self::Gz => ArchiveType::Gz,
+            Self::Bzip2 => ArchiveType::Bzip2,
+            Self::Zstd => ArchiveType::Zstd,
+            Self::Brotli => ArchiveType::Brotli,
+            Self::Deflate => ArchiveType::Deflate,
+        }
+    }
+}
+
+// Extension of a set volume's envelope.
+pub(crate) const ENVELOPE_SUFFIX: &str = ".envelope";
 
 // Extension of a damaged volume's repair scratch. Matched as a
 // suffix by the restart sweep, exactly as `.envelope` is.
 pub(crate) const REPAIR_SUFFIX: &str = ".repair";
+
+// Separators between a set's stem and the two numbers its volume scratch
+// names carry, and the minimum width the volume number is written at.
+const DISCRIMINATOR_SEPARATOR: &str = ".f";
+const VOLUME_SEPARATOR: &str = ".vol";
+const VOLUME_DIGITS: usize = 5;
 
 // A set's envelope filename from its name, discriminator and volume alone.
 //
@@ -67,18 +184,121 @@ pub(crate) const REPAIR_SUFFIX: &str = ".repair";
 // current plan produces — an identity-admitted set is never rediscovered from
 // the spec, yet its envelopes are in the working directory all the same.
 pub(crate) fn envelope_file_name(set_name: &str, discriminator: u32, volume_index: u32) -> String {
-    weaver_model::files::path_component_with_suffix(
-        &crate::jobs::working_dir::sanitize_dirname(set_name),
-        &format!(".f{discriminator}.vol{volume_index:05}.envelope"),
+    volume_scratch_file_name(
+        VolumeScratchKind::Envelope,
+        set_name,
+        discriminator,
+        volume_index,
     )
 }
 
 // The repair-scratch counterpart of [`envelope_file_name`].
 pub(crate) fn repair_file_name(set_name: &str, discriminator: u32, volume_index: u32) -> String {
+    volume_scratch_file_name(
+        VolumeScratchKind::Repair,
+        set_name,
+        discriminator,
+        volume_index,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VolumeScratchKind {
+    Envelope,
+    Repair,
+}
+
+impl VolumeScratchKind {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Envelope => ENVELOPE_SUFFIX,
+            Self::Repair => REPAIR_SUFFIX,
+        }
+    }
+}
+
+// The parts of a `<set>.f<N>.vol<NNNNN>.envelope|.repair` name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VolumeScratchName {
+    pub kind: VolumeScratchKind,
+    pub discriminator: u32,
+    pub volume_index: u32,
+}
+
+impl VolumeScratchName {
+    // The name this scratch file would carry under `set_name`.
+    pub(crate) fn file_name(self, set_name: &str) -> String {
+        volume_scratch_file_name(self.kind, set_name, self.discriminator, self.volume_index)
+    }
+}
+
+fn volume_scratch_file_name(
+    kind: VolumeScratchKind,
+    set_name: &str,
+    discriminator: u32,
+    volume_index: u32,
+) -> String {
     weaver_model::files::path_component_with_suffix(
         &crate::jobs::working_dir::sanitize_dirname(set_name),
-        &format!(".f{discriminator}.vol{volume_index:05}{REPAIR_SUFFIX}"),
+        &format!(
+            "{DISCRIMINATOR_SEPARATOR}{discriminator}{VOLUME_SEPARATOR}{volume_index:0width$}{}",
+            kind.suffix(),
+            width = VOLUME_DIGITS,
+        ),
     )
+}
+
+// The one recogniser of the shape [`envelope_file_name`] and
+// [`repair_file_name`] write. Only plain ASCII digits that fit a `u32` count,
+// and the volume must carry at least the width the builders pad it to. The
+// shape rather than the extension decides, because `.envelope` and `.repair`
+// are extensions an extracted member can carry; whether the stem belongs to a
+// set is the caller's question.
+pub(crate) fn parse_volume_scratch_name(name: &str) -> Option<VolumeScratchName> {
+    let (stem, kind) = if let Some(stem) = name.strip_suffix(ENVELOPE_SUFFIX) {
+        (stem, VolumeScratchKind::Envelope)
+    } else {
+        (name.strip_suffix(REPAIR_SUFFIX)?, VolumeScratchKind::Repair)
+    };
+    let number = |digits: &str| {
+        (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| digits.parse::<u32>().ok())
+            .flatten()
+    };
+    let (stem, volume) = stem.rsplit_once(VOLUME_SEPARATOR)?;
+    if volume.len() < VOLUME_DIGITS {
+        return None;
+    }
+    let (_, discriminator) = stem.rsplit_once(DISCRIMINATOR_SEPARATOR)?;
+    Some(VolumeScratchName {
+        kind,
+        discriminator: number(discriminator)?,
+        volume_index: number(volume)?,
+    })
+}
+
+// Prefixes of the working entries other subsystems create beside job content:
+// an install's per-member temporary directory, a PAR2 identity settle's parked
+// source file (which can be a real archive volume mid-move), and a placement
+// journal. Their creators name them from these constants, and
+// `is_direct_working_file` reads the same constants to keep them out of scans.
+pub(crate) const INSTALL_TEMP_PREFIX: &str = ".weaver-install-";
+pub(crate) const IDENTITY_SETTLE_PREFIX: &str = ".weaver-identity-settle.";
+pub(crate) const PLACEMENT_JOURNAL_PREFIX: &str = ".weaver-placement-";
+
+// Whether `name` is a file or directory Weaver's direct-store, install,
+// identity-settle or placement machinery writes beside job content: member
+// partials and volume backings, holds scratch, envelopes and repair scratch,
+// install temporaries, parked identity-settle sources, and placement journals.
+// None of them is job content, and a scan that opens one as an archive reads
+// bytes it was never meant to read, or extracts a volume twice.
+pub(crate) fn is_direct_working_file(name: &str) -> bool {
+    name.ends_with(super::restart::DIRECT_PARTIAL_SUFFIX)
+        || name.starts_with(super::restart::HOLDS_SCRATCH_PREFIX)
+        || name.starts_with(INSTALL_TEMP_PREFIX)
+        || name.starts_with(IDENTITY_SETTLE_PREFIX)
+        || name.starts_with(PLACEMENT_JOURNAL_PREFIX)
+        || parse_volume_scratch_name(name).is_some()
 }
 
 // Appends `suffix` to the final component of a root-relative
@@ -163,6 +383,9 @@ pub(crate) enum IdentityKind {
     // matched like [`Self::Roster`]. The parts carry nothing that says which
     // part they are, so the descriptions are the only evidence there is.
     SevenZipRoster,
+    // A nested member whose suffix names a single-stream wrapper. It is one
+    // volume by definition, so the suffix is the whole identity.
+    Stream(StreamKind),
 }
 
 impl IdentityKind {
@@ -171,6 +394,7 @@ impl IdentityKind {
         match self {
             Self::Roster | Self::HeaderVolumeSet | Self::Standalone => SetFormat::Rar,
             Self::SevenZipStandalone | Self::SevenZipRoster => SetFormat::SevenZip,
+            Self::Stream(kind) => SetFormat::Stream(kind),
         }
     }
 }
@@ -293,11 +517,11 @@ impl DirectSetPlan {
         // time the entries are sorted.
         let mut shapes: BTreeMap<String, (SetFormat, bool, bool)> = BTreeMap::new();
         for (file_index, file) in spec.files.iter().enumerate() {
-            let (format, volume_number, whole) = match file.role {
-                FileRole::RarVolume { volume_number } => (SetFormat::Rar, volume_number, false),
-                FileRole::SevenZipArchive => (SetFormat::SevenZip, 0, true),
-                FileRole::SevenZipSplit { number } => (SetFormat::SevenZip, number, false),
-                _ => continue,
+            // A posted stream is a file, not a set; see `from_identity_binding`.
+            let Some((format @ (SetFormat::Rar | SetFormat::SevenZip), volume_number, whole)) =
+                SetFormat::of_role(&file.role)
+            else {
+                continue;
             };
             let Some(set_name) = archive_base_name(&file.filename, &file.role) else {
                 continue;
@@ -402,9 +626,6 @@ impl DirectSetPlan {
             .collect()
     }
 
-    // What a checkpoint records about an identity-admitted plan so a restart
-    // can rebuild it exactly. `None` for a name-admitted plan, which the spec
-    // rediscovers on its own.
     // Every volume the set will ever have is bound. A set its file names
     // admitted is whole once every volume the post left out has a file of its
     // own, which for most sets is from the start; an identity set is whole
@@ -417,6 +638,9 @@ impl DirectSetPlan {
                 .is_none_or(|expected| self.volumes.len() as u32 == expected)
     }
 
+    // What a checkpoint records about an identity-admitted plan so a restart
+    // can rebuild it exactly. `None` for a name-admitted plan, which the spec
+    // rediscovers on its own.
     pub(crate) fn identity_binding(&self) -> Option<super::snapshot::IdentityBinding> {
         let identity = self.identity?;
         Some(super::snapshot::IdentityBinding {
@@ -525,6 +749,9 @@ impl DirectSetPlan {
                     return Err("a standalone archive that is not one volume under its own name");
                 }
             }
+            IdentityKind::Stream(_) => {
+                return Err("a stream is a nested member, never a posted set");
+            }
         }
         Ok(Self {
             set_name: set_name.to_string(),
@@ -542,25 +769,6 @@ impl DirectSetPlan {
         })
     }
 
-    // Working-directory-relative envelope file for **one source volume**
-    // (envelope v2 — "sparse envelope files", plural).
-    //
-    // The first shape packed every volume's envelope into fixed 64 KiB
-    // half-slots of a single per-set file. That ceiling is what demoted every
-    // `-rr` and `-qo` set, and it was a phase-4 narrowing, not a design.
-    // Envelope v2 gives each volume its own file holding every non-member byte
-    // **at its true physical offset**, with holes where member data was routed
-    // away:
-    //
-    // - unbounded by construction — recovery records, quick-open blocks and
-    //   ineligible members' packed ranges fit because the file *is* the volume;
-    // - restart-stable by construction — an offset is physical, never
-    //   append-order, so the same byte lands in the same place every time;
-    // - and it is the natural backing store for the hybrid virtual-volume
-    //   provider, which overlays member partials onto exactly this image.
-    //
-    // Zero-padded so a lexical listing of a 2 000-volume set sorts in volume
-    // order.
     // The set's stable per-job discriminator: its lowest NZB file index.
     //
     // Unique across a job by construction — a file belongs to exactly one set —
@@ -685,6 +893,19 @@ impl DirectSetPlan {
         }
     }
 
+    // Working-directory-relative envelope file for **one source volume**
+    // holding every non-member byte **at its true physical offset**, with
+    // holes where member data was routed away:
+    //
+    // - unbounded by construction — recovery records, quick-open blocks and
+    //   ineligible members' packed ranges fit because the file *is* the volume;
+    // - restart-stable by construction — an offset is physical, never
+    //   append-order, so the same byte lands in the same place every time;
+    // - and it is the natural backing store for the hybrid virtual-volume
+    //   provider, which overlays member partials onto exactly this image.
+    //
+    // Zero-padded so a lexical listing of a 2 000-volume set sorts in volume
+    // order.
     pub(crate) fn envelope_relative_path(&self, volume_index: u32) -> String {
         // Clamped as one component rather than formatted (nit): the suffix is 18
         // bytes and a set name is an NZB-supplied string, so a long one produced
@@ -775,23 +996,14 @@ impl DirectSetPlan {
             .collect()
     }
 
-    // A raw header name resolved the way the incremental extractor resolves it
-    // (reuse, don't invent) — `unrar_rs::sanitize_path` first, then the
-    // validator that refuses anything escaping the directory it is joined
-    // onto.
-    //
-    // Both steps matter, and the first shape only had the second:
-    // `sanitize_path` normalizes separators and strips a drive or root prefix,
-    // so a name the extractor would have written to
-    // `Silver.Horizon/S01E01.mkv` and one that direct routing would otherwise
-    // have refused now resolve identically. With several members per set that
-    // difference is reachable, where a single-member set could only ever have
-    // demoted on it.
     // The member name as it exists *relative to the job's staging root* once
-    // written — the same sanitization the destination path is derived through,
-    // so a caller recording what direct finalization produced records a name
-    // completion can resolve back to a file. `Err` for a name that sanitizes
-    // away entirely, which never reaches a destination either.
+    // written: `unrar_rs::sanitize_path` first, which normalizes separators
+    // and strips a drive or root prefix, then the validator that refuses
+    // anything escaping the directory it is joined onto. The destination path
+    // is derived through the same two steps, so a caller recording what direct
+    // finalization produced records a name completion can resolve back to a
+    // file. `Err` for a name that sanitizes away entirely, which never reaches
+    // a destination either.
     //
     // This is exactly the name the incremental extractor records for a member
     // it wrote into the same root, which is what lets completion treat the two
@@ -916,8 +1128,14 @@ impl DirectSetPlan {
         // sequence v3 rows on disk were written under. Bumping the domain would
         // refuse every shipped checkpoint into a full redownload to record a
         // fact that, for those rows, has exactly one possible value.
-        if self.format != SetFormat::Rar {
-            hasher.update(b"7z\0");
+        match self.format {
+            SetFormat::Rar => {}
+            SetFormat::SevenZip => {
+                hasher.update(b"7z\0");
+            }
+            SetFormat::Stream(_) => {
+                hasher.update(&[b's', self.format.code(), 0]);
+            }
         }
         hasher.update(self.set_name.as_bytes());
         hasher.update(&[0]);

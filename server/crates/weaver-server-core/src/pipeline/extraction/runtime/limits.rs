@@ -7,9 +7,11 @@ use crate::pipeline::direct_store::router::RouterResources;
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 
-// Archives nest at most this deep below the posted set, which bounds the
-// session tree, the routing graph and the extraction recursion alike.
-pub(crate) const MAX_DEPTH: u32 = 3;
+// Archives nest at most this deep, the posted set included, which bounds the
+// session tree, the routing graph and the extraction recursion alike. Deeper
+// than anything posted in earnest, so the limit only ever stops a tower built
+// to exhaust it.
+pub(crate) const MAX_DEPTH: u32 = 11;
 
 // Routed bytes a namespace may hold while it waits for a member boundary.
 pub(crate) const ROUTER_HOLDS_BUDGET: u64 = 4 * MIB;

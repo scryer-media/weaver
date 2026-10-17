@@ -351,6 +351,7 @@ macro_rules! direct_demotions {
             member_checksum_mismatch Forced::Direct(DemotionReason::MemberChecksumMismatch),
             format_mismatch Forced::Direct(DemotionReason::FormatMismatch),
             unsupported_format Forced::Direct(DemotionReason::UnsupportedFormat),
+            not_an_archive Forced::Direct(DemotionReason::NotAnArchive),
             unsafe_destination Forced::Direct(DemotionReason::UnsafeDestination),
             colliding_destinations Forced::Direct(DemotionReason::CollidingDestinations),
             volume_crc_mismatch Forced::Direct(DemotionReason::VolumeCrcMismatch),
@@ -389,7 +390,7 @@ macro_rules! forced_list {
     };
 }
 
-const DIRECT_DEMOTIONS: [Forced; 35] = direct_demotions!(forced_list!());
+const DIRECT_DEMOTIONS: [Forced; 36] = direct_demotions!(forced_list!());
 const CHASE_DEMOTIONS: [Forced; 10] = chase_demotions!(forced_list!());
 
 // Each direct-store reason's variant, in declaration order. Exhaustive, so
@@ -432,7 +433,9 @@ fn direct_variant(reason: DemotionReason) -> usize {
         R::IdentityRosterUnfillable => 32,
         R::IdentityVolumeMismatch => 33,
         R::SevenZip(_) => 34,
-        R::SevenZipAesChecksumMismatch => 35,
+        R::NotAnArchive => 35,
+        R::SevenZipAesChecksumMismatch => 36,
+        R::UnseekableParent => 37,
     }
 }
 
@@ -459,7 +462,7 @@ fn every_demotion_reason_is_forced() {
             Forced::Chase(..) => unreachable!(),
         })
         .collect();
-    assert_eq!(direct, (0..35).collect());
+    assert_eq!(direct, (0..36).collect());
     let chase: BTreeSet<_> = CHASE_DEMOTIONS
         .iter()
         .map(|forced| match forced {

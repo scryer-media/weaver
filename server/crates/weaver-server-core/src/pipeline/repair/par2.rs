@@ -6,6 +6,7 @@ pub(in crate::pipeline) mod namespace;
 use super::backend::RepairBackend;
 use super::*;
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
+use crate::pipeline::direct_store::plan::IDENTITY_SETTLE_PREFIX;
 use crate::runtime::fs as runtime_fs;
 use weaver_model::files::{
     allocate_unique_download_filename, forget_reserved_download_filename,
@@ -1219,7 +1220,7 @@ impl Pipeline {
                 lifted.push((file_id, identity, target, None));
                 continue;
             }
-            let parked = format!(".weaver-identity-settle.{}.{}", file_id.file_index, target);
+            let parked = format!("{IDENTITY_SETTLE_PREFIX}{}.{target}", file_id.file_index);
             match runtime_fs::rename_no_overwrite(&old_path, &working_dir.join(&parked)) {
                 Ok(()) => lifted.push((file_id, identity, target, Some(parked))),
                 Err(error) => warn!(

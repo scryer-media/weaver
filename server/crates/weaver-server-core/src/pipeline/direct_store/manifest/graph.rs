@@ -79,7 +79,6 @@ pub(crate) struct NodeRecord {
     pub(crate) snapshot: Vec<u8>,
     pub(crate) mode: u8,
     pub(crate) roster_closed: bool,
-    pub(crate) whole_sevenz: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,8 +322,8 @@ impl JobGraph {
                     || node.depth != depth
                     || depth > MAX_DEPTH
                     || node.generation == 0
-                    || node.format > 1
-                    || node.mode > 2
+                    || super::super::plan::SetFormat::from_code(node.format).is_none()
+                    || node.mode > super::super::nested::checkpoint::LAST_MODE
                     || node.inputs.len() > MAX_ITEMS
                 {
                     return Err(invalid("invalid graph topology"));
@@ -868,7 +867,6 @@ mod tests {
             snapshot,
             mode: 0,
             roster_closed: true,
-            whole_sevenz: false,
         });
         saved.validate().unwrap();
         saved.images[2].claims[0].backing = Backing::Image {

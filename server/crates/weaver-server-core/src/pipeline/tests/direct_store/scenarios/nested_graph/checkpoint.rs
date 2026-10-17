@@ -291,3 +291,108 @@ async fn graph_checkpoint_restores_holes_raw_overlays_and_rekeys_parent_members(
         assert_eq!(bytes, inner[start as usize..end as usize]);
     }
 }
+
+// A refusal sends a child to an engine or to a file, and a checkpoint keeps
+// which. A member named like an archive that is not one is refused by its
+// first bytes and lands as a file: pending, then materialized, a restart
+// never opens it in an engine. An engine's node comes back an engine's.
+#[tokio::test]
+async fn a_child_s_disposition_survives_a_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let job_id = JobId(41985);
+    // Non-uniform bytes with no archive signature.
+    let notes: Vec<u8> = (0..16_385u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 11) as u8 | 0x80)
+        .collect();
+    let volumes = single_member_store_set("notes.7z", &notes, 1);
+    let outer = &volumes[0].1;
+    let spec = direct_store_job_spec("no archive checkpoint", &volumes);
+    let (mut pipeline, _, _) = new_direct_pipeline(&directory).await;
+    let working = directory.path().join("working");
+    let destination = pipeline.deterministic_extraction_staging_dir(job_id);
+    let plan = DirectSetPlan::discover(&spec, &working, &destination)
+        .0
+        .remove(0);
+    // Neither the router nor the graph clones, so each round routes afresh.
+    let route_outer = || {
+        let mut root = DirectSetRouter::new(plan.clone());
+        root.note_declared_volume_size(0, outer.len() as u64)
+            .unwrap();
+        let mut graph = NestedGraph::default();
+        let mut placements = Vec::new();
+        let mut covered = ByteRanges::new();
+        let writes = root
+            .route(0, 0, &[bytes::Bytes::copy_from_slice(outer)])
+            .unwrap();
+        for write in graph.forward(&root, ROOT_NODE, writes).unwrap() {
+            record_write(&root, &mut graph, &write, &mut placements, &mut covered);
+        }
+        let tail = root.note_volume_complete(0, outer.len() as u64).unwrap();
+        for write in graph.forward(&root, ROOT_NODE, tail).unwrap() {
+            record_write(&root, &mut graph, &write, &mut placements, &mut covered);
+        }
+        assert_eq!(
+            graph.node(1).mode,
+            NodeMode::MaterializationPending(DemotionReason::NotAnArchive)
+        );
+        (root, graph, placements, covered)
+    };
+
+    let rounds = [
+        (None, false),
+        (Some(NodeMode::Materialized), false),
+        (Some(NodeMode::Engine), true),
+    ];
+    for (replacement, streamed) in rounds {
+        let (root, mut graph, placements, covered) = route_outer();
+        if let Some(mode) = replacement {
+            graph.node_mut(1).mode = mode;
+        }
+        let mut set = DirectSet::new(job_id, plan.clone());
+        set.router = root;
+        set.install_restored_nested(graph);
+        for (receipt, path) in placements {
+            set.seed_qualified_placement(
+                receipt.owner,
+                receipt.destination,
+                path,
+                vec![(
+                    receipt.destination_offset,
+                    receipt.destination_offset + receipt.len,
+                )],
+            );
+        }
+        set.seed_root_source_coverage(0, covered.ranges().to_vec());
+        let mut saved = JobGraph::empty(1);
+        crate::pipeline::direct_store::graph_checkpoint::capture_direct_root(&mut saved, &set)
+            .unwrap();
+        let saved = JobGraph::decode(&saved.encode().unwrap()).unwrap();
+        let mut restored = pipeline
+            .restore_direct_store_coverage(
+                job_id,
+                &spec,
+                &working,
+                &HashMap::new(),
+                ArchiveRestoreRows::Graph(Box::new(saved)),
+            )
+            .await
+            .unwrap();
+        let set = restored.sets.remove(0);
+        let graph = set.nested_graph().unwrap();
+        let mode = graph.node(1).mode;
+        match replacement {
+            // The record keeps the disposition, not the verdict.
+            None => assert!(
+                matches!(mode, NodeMode::MaterializationPending(_)),
+                "{mode:?}"
+            ),
+            Some(expected) => assert_eq!(mode, expected),
+        }
+        let live: Vec<_> = graph
+            .live_child_descriptions(&set.router)
+            .iter()
+            .map(|child| child.node)
+            .collect();
+        assert_eq!(live, if streamed { vec![1] } else { vec![] }, "{mode:?}");
+    }
+}

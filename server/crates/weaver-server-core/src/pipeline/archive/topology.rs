@@ -3070,19 +3070,9 @@ impl Pipeline {
                     return;
                 }
 
-                let archive_type = match role {
-                    weaver_model::files::FileRole::ZipArchive => ArchiveType::Zip,
-                    weaver_model::files::FileRole::TarArchive => ArchiveType::Tar,
-                    weaver_model::files::FileRole::TarGzArchive => ArchiveType::TarGz,
-                    weaver_model::files::FileRole::TarBz2Archive => ArchiveType::TarBz2,
-                    weaver_model::files::FileRole::TarXzArchive => ArchiveType::TarXz,
-                    weaver_model::files::FileRole::GzArchive => ArchiveType::Gz,
-                    weaver_model::files::FileRole::DeflateArchive => ArchiveType::Deflate,
-                    weaver_model::files::FileRole::BrotliArchive => ArchiveType::Brotli,
-                    weaver_model::files::FileRole::ZstdArchive => ArchiveType::Zstd,
-                    weaver_model::files::FileRole::Bzip2Archive => ArchiveType::Bzip2,
-                    weaver_model::files::FileRole::XzArchive => ArchiveType::Xz,
-                    _ => unreachable!(),
+                // Every role this arm matches is a single-file archive type.
+                let Some(archive_type) = ArchiveType::from_role(&role) else {
+                    unreachable!()
                 };
 
                 let mut volume_map = std::collections::HashMap::new();

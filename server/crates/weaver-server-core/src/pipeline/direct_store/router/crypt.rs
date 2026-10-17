@@ -38,7 +38,7 @@
 //
 // Everything above is the write side. The read side adds the inverse — every
 // consumer that needs the bytes as they were **posted** gets cipher, which
-// nothing on disk holds any more. AES-CBC encryption is deterministic given
+// nothing on disk holds: the destinations hold plaintext. AES-CBC encryption is deterministic given
 // key, IV and plaintext, so the posted stream is always reproducible: the
 // provider overlay reads a member's plaintext back out of its
 // `.direct.partial` and re-encrypts it. [`MemberCipher`] is the read-side
@@ -139,8 +139,7 @@ pub(crate) fn block_ceil(offset: u64) -> u64 {
 }
 
 // Why an encrypted set may not route. Every variant is its own metric bucket
-// and every one of them demotes to the conventional path, which is the same
-// path the set would have taken before this plan existed.
+// and every one of them demotes the set to the conventional extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CryptRefusal {
     // No password reached the set. The conventional extractor will ask the
@@ -152,15 +151,15 @@ pub(crate) enum CryptRefusal {
     // the set demotes and the conventional path fails the same way, which is
     // the parity this refusal exists to keep.
     WrongPassword,
-    // The headers state key material this build cannot derive from: a RAR5 KDF
-    // count over `unrar-rs`'s ceiling.
+    // The headers state key material this build cannot derive a key from: a
+    // RAR5 KDF count over `unrar-rs`'s ceiling, or 7z AES properties
+    // `sevenz-turbo` refuses.
     //
-    // **Not** a RAR4 member any more. RAR4 file encryption is keyed here now,
-    // and a RAR4 member the *library* cannot key — one of the three pre-AES
-    // ciphers — never reaches admission at all: it classifies as
-    // `Ineligible(Encrypted)` and demotes under `MemberIneligible` instead,
-    // which is the honest place for it, since nothing about it is a crypt
-    // decision this router made.
+    // RAR4 AES file encryption is keyed here. A RAR4 member the *library*
+    // cannot key — one of the three pre-AES ciphers — never reaches admission:
+    // it classifies as `Ineligible(Encrypted)` and demotes under
+    // `MemberIneligible`, since nothing about it is a crypt decision this
+    // router made.
     Unkeyable,
 }
 
@@ -174,9 +173,9 @@ impl CryptRefusal {
     }
 }
 
-// Why a **header-encrypted** (`-hp`) set may not route. Every variant demotes,
-// and demoting is the older floor: the volume materializes byte-exactly and
-// the conventional extractor opens it with a password prompt.
+// Why a **header-encrypted** (`-hp`) set may not route. Every variant demotes:
+// the volumes materialize byte-exactly and the conventional extractor opens
+// them with the job's password candidates.
 //
 // Deliberately separate from [`CryptRefusal`], which is about a *member's*
 // file-data key. These are about the *archive's* header key, and the two fail
@@ -677,9 +676,11 @@ impl KeyRing {
         self.admitted
     }
 
-    // The password this ring is deriving from, for the one consumer that needs
-    // the string rather than a key: the tolerated-member extraction, which
-    // hands it to `unrar-rs` instead of decrypting anything itself.
+    // The password this ring is deriving from, for the readers that need the
+    // string rather than a key: [`super::DirectSetRouter::archive_password`],
+    // which hands an admitted set's password to the tolerated-member
+    // extraction for `unrar-rs`, and the 7z container parse and its restore,
+    // which add it to the header candidates when the job's harvest lacks it.
     //
     // Every other reader wants [`Self::keys_for`]. Nothing may persist or log
     // this — see the type docs.
@@ -694,12 +695,11 @@ impl KeyRing {
     // The routing decision for one encrypted member, made **before any byte of
     // it routes**.
     //
-    // A PAR2-bearing job used to be refused outright here, because an
-    // encrypted set's destinations hold plaintext where PAR2 describes the
-    // posted cipher and nothing could turn one back into the other. The
-    // re-encrypting overlay is what retires that refusal: the authoritative
-    // pass, live verification, repair and reconstruction all read posted bytes
-    // through it now, so a recovery set is no longer a reason to leave direct
+    // A PAR2-bearing job is admitted like any other. An encrypted set's
+    // destinations hold plaintext where PAR2 describes the posted cipher, and
+    // the re-encrypting overlay turns one back into the other: the
+    // authoritative pass, live verification, repair and reconstruction all read
+    // posted bytes through it, so a recovery set is no reason to leave direct
     // mode.
     //
     // - No password: refuse. An encrypted set routes only with one.
@@ -724,8 +724,8 @@ impl KeyRing {
     // **`WrongPassword` can never fire for one**. That is not a weakening of
     // this gate; it is the format stating that the member's checksum is the
     // only wrong-password detector it has, and [`MemberCrypt::fold_member_crc`]
-    // is where it fires. RAR5's absent-check case has always been in exactly
-    // this position, which is why the machinery needed nothing new for it.
+    // is where it fires. RAR5's absent-check case sits in exactly this
+    // position and takes the same path.
     pub(crate) fn admit(&mut self, keying: &MemberKeying) -> Result<MemberKeys, CryptRefusal> {
         if let Some(refusal) = self.refusal {
             return Err(refusal);

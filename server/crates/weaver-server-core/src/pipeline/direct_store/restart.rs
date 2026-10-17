@@ -525,9 +525,8 @@ pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
 // [`CoverageRejection::ProbeFailed`] is.
 async fn installed_set_still_present(
     plan: &DirectSetPlan,
-    blob: &[u8],
-) -> Result<super::snapshot::InstalledSet, String> {
-    let marker = super::snapshot::decode_installed(blob).map_err(|error| error.to_string())?;
+    marker: &super::snapshot::InstalledSet,
+) -> Result<(), String> {
     let volumes: Vec<(u32, u32)> = plan
         .volumes
         .iter()
@@ -535,9 +534,6 @@ async fn installed_set_still_present(
         .collect();
     if marker.volumes != volumes {
         return Err("the set's volumes no longer match the marker".to_string());
-    }
-    if marker.members.is_empty() {
-        return Err("the marker names no committed member".to_string());
     }
     for member in &marker.members {
         let path = plan.destination_path(&member.relative_path);
@@ -575,7 +571,7 @@ async fn installed_set_still_present(
             }
         }
     }
-    Ok(marker)
+    Ok(())
 }
 
 // Per-NZB-file refetch floors derived from a checkpoint.
@@ -699,7 +695,7 @@ pub(crate) struct DirectRestore {
 // by name, from the plans that produce them, because `.envelope` is an extension
 // an extracted member can legitimately carry. See
 // [`sweep_orphan_direct_files`].
-const DIRECT_PARTIAL_SUFFIX: &str = ".direct.partial";
+pub(crate) const DIRECT_PARTIAL_SUFFIX: &str = ".direct.partial";
 // Prefix of the holds scratch files. Matched as a prefix rather than a suffix
 // because the set name is the tail of the component.
 pub(crate) const HOLDS_SCRATCH_PREFIX: &str = ".weaver-holds.";
@@ -1133,9 +1129,7 @@ impl Pipeline {
                 .iter()
                 .find(|plan| plan.set_name == installed.set_name)
                 .ok_or("installed graph root no longer matches job specification")?;
-            let marker = super::snapshot::encode_installed(&installed.marker)
-                .map_err(|error| error.to_string())?;
-            let marker = installed_set_still_present(plan, &marker).await?;
+            installed_set_still_present(plan, &installed.marker).await?;
             let complete: HashSet<_> = plan.files.keys().copied().collect();
             let floors = complete.iter().map(|&file| (file, 0)).collect();
             let skip = coverage_skip_plan(job_id, spec, &floors, &complete);
@@ -1150,14 +1144,19 @@ impl Pipeline {
                     return Err("retained installed graph is not fully reconstructible".into());
                 }
                 set.mark_finalized();
+                // The marker is what keeps a finalized root in the graph the
+                // next commit captures; without it the root's retained image
+                // drops out while the runtime still reads through it.
+                set.set_installed_snapshot(installed.marker.clone());
             } else {
                 let mut set = DirectSet::new(job_id, plan.clone());
                 set.mark_finalized();
                 result.sets.push(set);
             }
-            result
-                .installed
-                .push((installed.set_name.clone(), marker.extracted));
+            result.installed.push((
+                installed.set_name.clone(),
+                installed.marker.extracted.clone(),
+            ));
         }
         result.accepted = result.sets.len();
         let mut runtime = if let Some(saved) = &graph.runtime {
@@ -1372,7 +1371,12 @@ impl Pipeline {
             marker_rows.sort();
             for (set_name, blob) in marker_rows {
                 let verdict = match admitted.iter().find(|plan| plan.set_name == set_name) {
-                    Some(plan) => installed_set_still_present(plan, &blob).await,
+                    Some(plan) => match super::snapshot::decode_installed(&blob) {
+                        Ok(marker) => installed_set_still_present(plan, &marker)
+                            .await
+                            .map(|()| marker),
+                        Err(error) => Err(error.to_string()),
+                    },
                     None => Err("the set is not admitted from this spec".to_string()),
                 };
                 match verdict {
@@ -1965,31 +1969,12 @@ fn names_durable_set_scratch(name: &str, set_names: &BTreeSet<String>) -> bool {
     if set_names.is_empty() {
         return false;
     }
-    let (stem, repair) = if let Some(stem) = name.strip_suffix(".envelope") {
-        (stem, false)
-    } else if let Some(stem) = name.strip_suffix(super::plan::REPAIR_SUFFIX) {
-        (stem, true)
-    } else {
+    let Some(scratch) = super::plan::parse_volume_scratch_name(name) else {
         return false;
     };
-    let Some((stem, volume)) = stem.rsplit_once(".vol") else {
-        return false;
-    };
-    let Some((_, discriminator)) = stem.rsplit_once(".f") else {
-        return false;
-    };
-    let (Ok(volume), Ok(discriminator)) = (volume.parse::<u32>(), discriminator.parse::<u32>())
-    else {
-        return false;
-    };
-    set_names.iter().any(|set_name| {
-        let rebuilt = if repair {
-            super::plan::repair_file_name(set_name, discriminator, volume)
-        } else {
-            super::plan::envelope_file_name(set_name, discriminator, volume)
-        };
-        rebuilt == name
-    })
+    set_names
+        .iter()
+        .any(|set_name| scratch.file_name(set_name) == name)
 }
 
 fn sweep_orphan_direct_files_blocking(

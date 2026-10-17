@@ -1,7 +1,9 @@
 use super::*;
 
 impl ArchiveRuntime {
-    pub(crate) fn retained_input_paths(&self) -> Vec<PathBuf> {
+    // Every namespace's work the runtime still holds, in any state, so each
+    // of its input paths stays on disk until that work is released.
+    fn held_works(&self) -> impl Iterator<Item = &NamespaceWork> {
         self.requests
             .values()
             .map(|request| &request.work)
@@ -10,8 +12,15 @@ impl ArchiveRuntime {
             .chain(self.retained_work.iter().map(|(_, work)| work))
             .chain(self.deferred_repairs.iter().map(|(_, work)| work))
             .chain(self.staged_replacement.iter().map(|staged| &staged.work))
-            .flat_map(|work| work.inputs.iter().chain(&work.original_inputs).cloned())
-            .collect()
+    }
+
+    fn held_input_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.held_works()
+            .flat_map(|work| work.inputs.iter().chain(&work.original_inputs))
+    }
+
+    pub(crate) fn retained_input_paths(&self) -> Vec<PathBuf> {
+        self.held_input_paths().cloned().collect()
     }
 
     pub(crate) async fn join_finished_workers(&mut self) -> Result<(), RuntimeError> {
@@ -29,20 +38,7 @@ impl ArchiveRuntime {
     }
 
     pub(crate) fn retains_input_path(&self, path: &std::path::Path) -> bool {
-        self.requests
-            .values()
-            .map(|request| &request.work)
-            .chain(self.replay.iter().map(|(_, work)| work))
-            .chain(self.completed.iter().map(|(_, work, _)| work))
-            .chain(self.retained_work.iter().map(|(_, work)| work))
-            .chain(self.deferred_repairs.iter().map(|(_, work)| work))
-            .chain(self.staged_replacement.iter().map(|staged| &staged.work))
-            .any(|work| {
-                work.inputs
-                    .iter()
-                    .chain(&work.original_inputs)
-                    .any(|input| input == path)
-            })
+        self.held_input_paths().any(|input| input == path)
     }
 
     pub(crate) fn selected_graph_files(

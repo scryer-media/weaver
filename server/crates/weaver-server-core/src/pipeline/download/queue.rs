@@ -158,6 +158,41 @@ pub struct DownloadQueue {
     // back, including a requeue after a lane gave one up, lands it in the
     // leading class again without having to know it was a first article.
     first_articles: std::collections::HashSet<SegmentId>,
+    // Articles held ahead of their place for someone who needs their bytes
+    // early. Held here rather than on the work item for the same reason as
+    // `first_articles`: an article given back by a lane is pushed again at
+    // the held priority, whether or not it was queued when the hold began.
+    held: HashMap<SegmentId, Held>,
+}
+
+// Who holds an article ahead of its place. Each holder lets go only of what
+// it holds itself, and an article stays held while any holder keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldOwner {
+    // Held while the job runs, as a direct-unpack chase's archive tail is.
+    Job,
+    // Held while a direct-store set's nested archives want it.
+    NestedWants,
+}
+
+impl HoldOwner {
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+// One article held ahead of its place in the queue.
+struct Held {
+    // The most urgent priority any of its holders asked for.
+    priority: u32,
+    // A bit per [`HoldOwner`] that holds it.
+    owners: u8,
+    // The priority the article had when the hold first found it queued,
+    // which is where it goes back to on release.
+    returns_to: Option<u32>,
+    // Whether the article is queued now, so a release walks the queue only
+    // when there is something in it to move.
+    queued: bool,
 }
 
 impl DownloadQueue {
@@ -174,6 +209,7 @@ impl DownloadQueue {
             file_priority_plan_protected: 0,
             file_priority_plan_stale: false,
             first_articles: std::collections::HashSet::new(),
+            held: HashMap::new(),
         }
     }
 
@@ -204,6 +240,14 @@ impl DownloadQueue {
         {
             work.priority = priority;
             rank = plan_rank;
+        }
+        if let Some(held) = self.held.get_mut(&work.segment_id) {
+            held.queued = true;
+            held.returns_to.get_or_insert(work.priority);
+            if work.priority > held.priority {
+                work.priority = held.priority;
+                rank = None;
+            }
         }
         let priority = work.priority;
         let sequence = self.next_sequence;
@@ -296,6 +340,18 @@ impl DownloadQueue {
         }
         self.queued_by_file = queued_by_file;
         self.queued_estimates_by_file = queued_estimates_by_file;
+        for held in self.held.values_mut() {
+            held.queued = false;
+        }
+        for work in self
+            .completion_critical_work
+            .values()
+            .chain(self.ordinary_work.values())
+        {
+            if let Some(held) = self.held.get_mut(&work.segment_id) {
+                held.queued = true;
+            }
+        }
     }
 
     // Queued items for one file, in O(1).
@@ -389,6 +445,11 @@ impl DownloadQueue {
     }
 
     fn note_removed(&mut self, work: &DownloadWork) {
+        if !self.held.is_empty()
+            && let Some(held) = self.held.get_mut(&work.segment_id)
+        {
+            held.queued = false;
+        }
         if !work.exclude_servers.is_empty() {
             self.excluded_work = self.excluded_work.saturating_sub(1);
         }
@@ -573,6 +634,9 @@ impl DownloadQueue {
         self.recovery_work = 0;
         self.queued_by_file.clear();
         self.queued_estimates_by_file.clear();
+        for held in self.held.values_mut() {
+            held.queued = false;
+        }
         std::mem::take(&mut self.completion_critical_work)
             .into_values()
             .chain(std::mem::take(&mut self.ordinary_work).into_values())
@@ -609,12 +673,16 @@ impl DownloadQueue {
         }
         let protected = self.file_priority_plan_protected;
         let plan = std::mem::take(&mut self.file_priority_plan);
+        let held = std::mem::take(&mut self.held);
+        // A held article is someone's bytes wanted early, and the plan is
+        // only a guess at what is wanted next: it never overrides a hold.
         let changed = self.reprioritize_matching_with_rank(|work| {
-            if work.priority <= protected {
+            if work.priority <= protected || held.contains_key(&work.segment_id) {
                 return None;
             }
             plan.get(&work.segment_id.file_id).copied()
         });
+        self.held = held;
         self.file_priority_plan = plan;
         self.file_priority_plan_stale = false;
         changed
@@ -635,9 +703,109 @@ impl DownloadQueue {
     // work. Unranked equal-priority work remains ordered by original insertion.
     pub fn reprioritize_matching_with_rank(
         &mut self,
-        mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
+        priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
     ) -> usize {
         self.file_priority_plan_stale = true;
+        self.rekey_matching(priority_for)
+    }
+
+    // Holds `segments` for `owner` at `priority` until `owner` releases them
+    // through [`Self::release_held`], and returns how many queued articles
+    // moved. One already more urgent keeps its place; one out of the queue
+    // now takes the held priority when it is pushed back.
+    //
+    // The classes have no index by article, so finding a queued one is a
+    // walk of the queue. Only articles not yet held at least this urgently
+    // are looked for, which makes asking again for the same articles free.
+    pub fn hold(
+        &mut self,
+        owner: HoldOwner,
+        segments: impl IntoIterator<Item = SegmentId>,
+        priority: u32,
+    ) -> usize {
+        let mut fresh = std::collections::HashSet::new();
+        for segment in segments {
+            let held = self.held.entry(segment).or_insert(Held {
+                priority,
+                owners: 0,
+                returns_to: None,
+                queued: false,
+            });
+            if held.owners == 0 || priority < held.priority {
+                held.priority = priority;
+                fresh.insert(segment);
+            }
+            held.owners |= owner.bit();
+        }
+        if !fresh
+            .iter()
+            .any(|segment| self.queued_count_for_file(segment.file_id) != 0)
+        {
+            return 0;
+        }
+        let mut held = std::mem::take(&mut self.held);
+        let moved = self.rekey_matching(|work| {
+            if !fresh.contains(&work.segment_id) {
+                return None;
+            }
+            let entry = held.get_mut(&work.segment_id)?;
+            entry.queued = true;
+            entry.returns_to.get_or_insert(work.priority);
+            (work.priority > priority).then_some((priority, None))
+        });
+        self.held = held;
+        moved
+    }
+
+    // Lets go of every article `owner` holds that `keep` turns down, and
+    // returns how many queued articles moved. One no holder keeps any longer
+    // goes back to the key a push would give it now, under the plan in force
+    // rather than the one it was held from.
+    pub fn release_held(
+        &mut self,
+        owner: HoldOwner,
+        mut keep: impl FnMut(SegmentId) -> bool,
+    ) -> usize {
+        let returning: HashMap<SegmentId, u32> = self
+            .held
+            .extract_if(|segment, held| {
+                if held.owners & owner.bit() == 0 || keep(*segment) {
+                    return false;
+                }
+                held.owners &= !owner.bit();
+                held.owners == 0
+            })
+            .filter_map(|(segment, held)| {
+                held.returns_to
+                    .filter(|_| held.queued)
+                    .map(|priority| (segment, priority))
+            })
+            .collect();
+        if returning.is_empty() {
+            return 0;
+        }
+        let protected = self.file_priority_plan_protected;
+        let plan = std::mem::take(&mut self.file_priority_plan);
+        let moved = self.rekey_matching(|work| {
+            let &priority = returning.get(&work.segment_id)?;
+            Some(match plan.get(&work.segment_id.file_id) {
+                Some(&planned) if priority > protected => planned,
+                _ => (priority, None),
+            })
+        });
+        self.file_priority_plan = plan;
+        moved
+    }
+
+    // Whether `segment` is held and queued now, in O(1).
+    pub fn holds_queued(&self, segment: SegmentId) -> bool {
+        self.held.get(&segment).is_some_and(|held| held.queued)
+    }
+
+    fn rekey_matching(
+        &mut self,
+        mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
+    ) -> usize {
         let mut changed = 0;
         for class in [&mut self.completion_critical_work, &mut self.ordinary_work] {
             // Only the items whose key changes move; each keeps its sequence,

@@ -622,15 +622,15 @@ impl ArchiveRuntime {
                     } => PhysicalDestination::Envelope {
                         volume: volume_index,
                     },
-                    crate::pipeline::direct_store::router::DirectDestination::Member {
-                        member_id,
-                    } => {
-                        if let Some((child, volume)) =
-                            state.graph.binding(destination.owner.node, member_id)
-                            && state.graph.node(child).mode
-                                == crate::pipeline::direct_store::nested::NodeMode::Materialized
-                        {
-                            PhysicalDestination::RawInput { child, volume }
+                    crate::pipeline::direct_store::router::DirectDestination::Member { .. } => {
+                        // Bytes written for a child that stopped routing, whether
+                        // it landed as a file or an engine reads them, restore as
+                        // that child's raw input.
+                        if let Some(raw) = destination.owner.raw_child {
+                            PhysicalDestination::RawInput {
+                                child: raw.node,
+                                volume: raw.volume,
+                            }
                         } else {
                             let relative_path = if destination.owner.node == 0 {
                                 relative.to_string_lossy().into_owned()
@@ -754,7 +754,7 @@ impl ArchiveRuntime {
             }
             saved.dataless = created;
             job.roots.push(RootGraph {
-                set_name: format!("decoded-{}-{}", owner.node, owner.generation),
+                set_name: super::decoded::namespace_name(owner),
                 snapshot: crate::pipeline::direct_store::snapshot::encode(&snapshot)
                     .map_err(|_| invalid("decoded snapshot"))?,
                 nodes,
@@ -1026,6 +1026,7 @@ impl crate::pipeline::Pipeline {
                 .map_err(RuntimeError::refused("decoded namespace root"))?,
         );
         let mut state = decoded::DecodedState {
+            job_id,
             graph,
             catalog,
             registry,
@@ -1152,7 +1153,7 @@ impl decoded::DecodedState {
             .graph
             .direct_producer_states()
             .into_iter()
-            .map(|state| state.0)
+            .map(|producer| producer.node)
             .collect();
         for node in nodes {
             let runs = self.graph.node(node).router.restart_read_plan();

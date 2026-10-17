@@ -46,7 +46,7 @@ use super::{SparseImage, StagedChunk};
 
 // The signature header: magic, version, start-header CRC32, and the three
 // fields naming the end header.
-pub(super) const SIGNATURE_HEADER_LEN: u64 = 32;
+pub(crate) const SIGNATURE_HEADER_LEN: u64 = 32;
 
 const SEVEN_Z_MAGIC: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 
@@ -65,17 +65,14 @@ pub(crate) enum SevenZipRefusal {
     // packed length equals its unpacked length. Anything else — LZMA, LZMA2,
     // BCJ, a filter chain — means the packed bytes are not the output bytes.
     Coder,
-    // A block's coder chain includes AES.
-    //
-    // An encrypted `Copy` member is routable in principle: the cipher is CBC
-    // over the whole stream, so cipher offset and member offset coincide
-    // exactly as they do for an encrypted stored RAR member. It is reported
-    // rather than routed because the decrypting half of that — the key ring,
-    // the block-boundary holds, the re-encrypting overlay the provider needs
-    // so PAR2 still sees the posted bytes — is the encrypted-member path, and
-    // pointing the 7z layout at it is a separate piece of work.
+    // A block that includes an AES coder but is not AES over one `Copy` coder,
+    // each with one input and one output stream: AES over compression, or a
+    // longer chain. An AES-over-`Copy` block that fails a later check (several
+    // members, several pack streams, a length mismatch) is [`Self::Coder`].
     EncryptedContent,
-    // The end header is itself encrypted, so nothing names the members.
+    // The end header is encrypted (`-mhe`) and no password the job offers opens
+    // it, so nothing names the members. A restored set is refused the same way
+    // when no candidate reopens its recorded header replay.
     EncryptedHeader,
     // An anti-item: a deletion marker carried by an incremental archive, which
     // names a file the archive does not contain.
@@ -192,12 +189,21 @@ pub(super) struct StartHeader {
 }
 
 impl StartHeader {
+    // Does the prefix open with the 7z magic?
+    //
+    // Narrower than [`Self::parse`] on purpose: a prefix with the magic and a
+    // bad version or checksum is a 7z whose first bytes were damaged, while one
+    // without it was never a 7z at all.
+    pub(super) fn has_magic(prefix: &[u8; SIGNATURE_HEADER_LEN as usize]) -> bool {
+        prefix[..6] == SEVEN_Z_MAGIC
+    }
+
     // Reads the signature header out of the container's first 32 bytes.
     //
     // `None` for a prefix that is not a 7z signature at all, which the caller
-    // reports as an unsupported format rather than as a shortage of bytes: the
-    // magic is in the first six bytes of the first volume, so a set that has
-    // those and does not match is not a container this layout can read.
+    // reports as no archive rather than as a shortage of bytes: the magic is
+    // in the first six bytes of the first volume, so a set that has those and
+    // does not match is not a container this layout can read.
     pub(super) fn parse(prefix: &[u8; SIGNATURE_HEADER_LEN as usize]) -> Option<Self> {
         if prefix[..6] != SEVEN_Z_MAGIC {
             return None;
@@ -1000,12 +1006,9 @@ pub(super) fn container_facts(
     })
 }
 
-// Which refusal a non-`Copy` block earns.
-//
-// AES is separated from the rest because it is the one refusal that says
-// "routable, not yet implemented" rather than "not routable", and a metric
-// that cannot tell those apart cannot say how much of the field would benefit
-// from building the decrypting half.
+// Which refusal a block that is neither one `Copy` coder nor AES over one
+// `Copy` coder earns: `EncryptedContent` when any of its coders is AES, `Coder`
+// otherwise.
 fn coder_refusal(block: &sevenz_turbo::Block) -> SevenZipRefusal {
     if block
         .coders

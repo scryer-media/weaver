@@ -47,6 +47,17 @@ async fn root_dispatch_with_child_completions(
     (pipeline, job_id, done, path)
 }
 
+// Handles extraction verdicts until the job has a terminal status.
+async fn drain_until_terminal(pipeline: &mut Pipeline, job: JobId) {
+    while !matches!(
+        job_status_for_assert(pipeline, job),
+        Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+    ) {
+        let done = next_extraction_done(pipeline).await;
+        pipeline.handle_extraction_done(done).await;
+    }
+}
+
 #[tokio::test]
 async fn ordinary_root_keeps_file_output_and_never_builds_decoded_graph() {
     let bytes = vec![71; 32769];
@@ -69,8 +80,12 @@ async fn ordinary_root_keeps_file_output_and_never_builds_decoded_graph() {
     std::fs::remove_dir_all(path).unwrap();
 }
 
+// A stored 7z inside a compressed root: the root's decoder yields the child
+// in order and cannot seek to its map, so the child is read by an engine
+// rather than routed, and the root's own files are untouched by it.
 #[tokio::test]
-async fn compressed_root_streams_store_child_and_retains_original_graph() {
+async fn compressed_root_hands_a_stored_child_to_an_engine_and_retains_original_graph() {
+    use crate::pipeline::direct_store::nested::NodeMode;
     let leaf = vec![37; 131073];
     let inner = build_7z(
         &[Entry::file("leaf.bin", leaf.clone())],
@@ -93,9 +108,9 @@ async fn compressed_root_streams_store_child_and_retains_original_graph() {
     };
     assert!(outcome.failed.is_empty());
     assert_eq!(decoded.graph.nodes.len(), 1);
-    let selected = decoded.publication().unwrap();
-    assert_eq!(selected.len(), 1);
-    assert_eq!(std::fs::read(&selected["leaf.bin"]).unwrap(), leaf);
+    assert_eq!(decoded.graph.node(1).mode, NodeMode::Engine);
+    // The engine owns the child's member, so the root's namespace routes none.
+    assert!(decoded.publication().unwrap().is_empty());
     let staging = pipeline.extraction_staging_dir(job_id);
     assert_eq!(
         std::fs::read(staging.join("ordinary.bin")).unwrap(),
@@ -116,8 +131,13 @@ async fn compressed_root_streams_store_child_and_retains_original_graph() {
             .collect::<Vec<_>>(),
         root_files
     );
+    // The child's engine reports after the root's decoder; its verdict is
+    // what publishes the leaf.
+    while !staging.join("leaf.bin").exists() {
+        let done = next_extraction_done(&mut pipeline).await;
+        pipeline.handle_extraction_done(done).await;
+    }
     assert_eq!(std::fs::read(staging.join("leaf.bin")).unwrap(), leaf);
-    assert_eq!(pipeline.archive_runtime[&job_id].decoded.len(), 1);
     drop(pipeline);
     std::fs::remove_dir_all(path).unwrap();
 }
@@ -238,128 +258,6 @@ async fn persistent_sink_failure_before_first_frame_preserves_error() {
             .complete(owner, request)
             .is_some()
     );
-}
-
-#[tokio::test]
-async fn decoded_virtual_repair_waits_for_ancestor_and_scopes_sibling_inventory() {
-    use crate::pipeline::extraction::runtime::{NamespaceWork, VirtualInputSource};
-    let compressed = build_7z(
-        &[Entry::file("leaf.bin", vec![39; 4096])],
-        EncoderMethod::LZMA2,
-        None,
-    );
-    let stored = build_7z(
-        &[
-            Entry::file("compressed.7z", compressed),
-            Entry::file("local.par2", vec![53; 128]),
-        ],
-        EncoderMethod::COPY,
-        None,
-    );
-    let unrelated = build_7z(
-        &[Entry::file("unrelated.par2", vec![71; 128])],
-        EncoderMethod::COPY,
-        None,
-    );
-    let (mut pipeline, job, done, path) = root_dispatch(&[
-        Entry::file("stored.7z", stored),
-        Entry::file("unrelated.7z", unrelated),
-    ])
-    .await;
-    let ExtractionDone::Scoped {
-        owner,
-        request,
-        decoded: Some(decoded),
-        result: Ok(outcome),
-        ..
-    } = done
-    else {
-        panic!("expected decoded parent completion");
-    };
-    assert!(outcome.failed.is_empty());
-    let child = decoded
-        .graph
-        .nodes
-        .iter()
-        .position(|node| node.router.plan().set_name == "compressed.7z")
-        .unwrap_or_else(|| {
-            panic!(
-                "compressed child absent from {:?}",
-                decoded
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|node| (&node.router.plan().set_name, node.mode))
-                    .collect::<Vec<_>>()
-            )
-        }) as u32
-        + 1;
-    let parent = decoded.graph.node(child).parent;
-    let inventory = decoded
-        .graph
-        .repair_inventory(&decoded.namespace(), child)
-        .unwrap();
-    assert_eq!(
-        inventory
-            .inputs
-            .values()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>(),
-        ["compressed.7z"]
-    );
-    assert_eq!(
-        inventory
-            .siblings
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["local.par2"]
-    );
-    assert_eq!(
-        std::fs::read(&inventory.siblings["local.par2"]).unwrap(),
-        vec![53; 128]
-    );
-    let namespace = format!("decoded-{}-{}", owner.node, owner.generation);
-    let work = NamespaceWork {
-        kind: crate::jobs::assembly::ArchiveType::SevenZip,
-        set_name: "compressed.7z".into(),
-        volumes: vec![0],
-        output: PathBuf::new(),
-        inputs: Vec::new(),
-        original_inputs: Vec::new(),
-        input_names: vec!["compressed.7z".into()],
-        virtual_source: Some(VirtualInputSource {
-            root_set: namespace.clone(),
-            node: child,
-        }),
-        original_virtual_source: None,
-        destination: pipeline.extraction_staging_dir(job),
-        outputs: Default::default(),
-        root_set: None,
-        ordinary: Vec::new(),
-        selected_password: None,
-    };
-    let runtime = pipeline.archive_runtime.get_mut(&job).unwrap();
-    assert!(runtime.complete(owner, request).is_some());
-    runtime.decoded.push(*decoded);
-    assert!(!pipeline.virtual_repair_ready(job, &work));
-    let runtime = pipeline.archive_runtime.get_mut(&job).unwrap();
-    runtime.sessions.close(owner).unwrap();
-    runtime.close_graph_owner(&namespace, parent).unwrap();
-    assert!(pipeline.virtual_repair_ready(job, &work));
-    let inventory = pipeline
-        .virtual_repair_inventory_for_test(job, work.virtual_source.as_ref().unwrap())
-        .unwrap();
-    assert_eq!(
-        inventory
-            .siblings
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["local.par2"]
-    );
-    drop(pipeline);
-    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[tokio::test]
@@ -554,149 +452,6 @@ async fn decoded_mixed_graph_restart_replays_child_and_publishes_leaf() {
 }
 
 #[tokio::test]
-async fn decoded_store_graph_restart_preserves_partial_member_hole() {
-    use crate::pipeline::direct_store::manifest::graph::{JobGraph, PhysicalDestination};
-    use crate::pipeline::direct_store::restart::ArchiveRestoreRows;
-    let leaf = vec![47; 65539];
-    let stored = build_7z(
-        &[Entry::file("leaf.bin", leaf.clone())],
-        EncoderMethod::COPY,
-        None,
-    );
-    let (mut pipeline, job, done, path) = root_dispatch(&[Entry::file("stored.7z", stored)]).await;
-    let ExtractionDone::Scoped {
-        owner,
-        request,
-        decoded: Some(decoded),
-        result: Ok(_),
-        ..
-    } = done
-    else {
-        panic!("expected decoded parent");
-    };
-    let working = pipeline.jobs[&job].working_dir.clone();
-    let spec = pipeline.jobs[&job].spec.clone();
-    let staging = pipeline.extraction_staging_dir(job);
-    let runtime = pipeline.archive_runtime.get_mut(&job).unwrap();
-    let work = runtime.complete(owner, request).unwrap();
-    runtime.sessions.close(owner).unwrap();
-    runtime.accept_namespace(&format!("decoded-{}-{}", owner.node, owner.generation));
-    runtime.retained_work.push((owner, work));
-    runtime.decoded.push(*decoded);
-    let mut graph = JobGraph::empty(1);
-    runtime.append_checkpoint(&mut graph).unwrap();
-    // Model a durable prefix: the suffix exists physically but neither saved
-    // authority may claim it. Restore must not infer coverage from file length.
-    let prefix = 32768_u64;
-    let file = graph
-        .files
-        .iter_mut()
-        .find(|file| {
-            file.node() != 0
-                && file.length == leaf.len() as u64
-                && matches!(file.destination, PhysicalDestination::Member { .. })
-        })
-        .unwrap();
-    file.extents = vec![(0, prefix)];
-    let cropped_file = file.id;
-    let mut image_coverage: Vec<Vec<(u64, u64)>> = Vec::new();
-    for image in &mut graph.images {
-        let mut claims = Vec::new();
-        for mut claim in std::mem::take(&mut image.claims) {
-            use crate::pipeline::direct_store::manifest::graph::Backing;
-            match claim.backing {
-                Backing::Member { file, offset } | Backing::Physical { file, offset }
-                    if file == cropped_file =>
-                {
-                    claim.end =
-                        claim.start + (claim.end - claim.start).min(prefix.saturating_sub(offset));
-                    if claim.start < claim.end {
-                        claims.push(claim);
-                    }
-                }
-                Backing::Image { image, offset } => {
-                    for &(start, end) in &image_coverage[image as usize] {
-                        let a = start.max(offset);
-                        let b = end.min(offset + claim.end - claim.start);
-                        if a < b {
-                            let mut part = claim.clone();
-                            part.start = claim.start + a - offset;
-                            part.end = claim.start + b - offset;
-                            part.backing = Backing::Image { image, offset: a };
-                            claims.push(part);
-                        }
-                    }
-                }
-                _ => claims.push(claim),
-            }
-        }
-        image.claims = claims;
-        image_coverage.push(
-            image
-                .claims
-                .iter()
-                .map(|claim| (claim.start, claim.end))
-                .collect(),
-        );
-    }
-    for root in &mut graph.roots {
-        for node in &mut root.nodes {
-            let mut snapshot =
-                crate::pipeline::direct_store::snapshot::decode(&node.snapshot).unwrap();
-            for input in &mut node.inputs {
-                let image = &graph.images[input.original as usize];
-                let mut coverage = crate::pipeline::direct_store::ByteRanges::new();
-                for claim in &image.claims {
-                    coverage.insert(claim.start, claim.end - claim.start);
-                }
-                if !coverage.missing(0, image.length).is_empty() {
-                    input.confirmed = false;
-                }
-                for floor in snapshot
-                    .floors
-                    .iter_mut()
-                    .filter(|floor| floor.volume_index == input.volume)
-                {
-                    floor.floor = floor.floor.min(coverage.contiguous_from(0));
-                    floor.complete = floor.complete && input.confirmed;
-                }
-            }
-            node.snapshot = crate::pipeline::direct_store::snapshot::encode(&snapshot).unwrap();
-        }
-    }
-    let saved = graph.roots[0].decoded.as_mut().unwrap();
-    let mut registry = serde_json::to_value(&saved.registry).unwrap();
-    let records = registry["files"].as_array_mut().unwrap();
-    let record = records
-        .iter_mut()
-        .find(|record| record["placed"] == serde_json::json!([[0, leaf.len() as u64]]))
-        .unwrap();
-    record["length"] = serde_json::json!(leaf.len() as u64);
-    record["placed"] = serde_json::json!([[0, prefix]]);
-    record["sealed"] = serde_json::json!(false);
-    saved.registry = serde_json::from_value(registry).unwrap();
-    let graph = JobGraph::decode(&graph.encode().unwrap()).unwrap();
-    pipeline.archive_runtime.remove(&job);
-    pipeline
-        .restore_direct_store_coverage(
-            job,
-            &spec,
-            &working,
-            &HashMap::new(),
-            ArchiveRestoreRows::Graph(Box::new(graph)),
-        )
-        .await
-        .unwrap();
-    let decoded = &pipeline.archive_runtime[&job].decoded[0];
-    assert!(!decoded.graph.node(1).router.all_members_verified());
-    assert!(decoded.graph.node(1).router.restart_read_plan().is_empty());
-    assert!(decoded.publication().is_err());
-    assert!(!staging.join("leaf.bin").exists());
-    drop(pipeline);
-    std::fs::remove_dir_all(path).unwrap();
-}
-
-#[tokio::test]
 async fn scoped_publication_preserves_empty_directory_and_member_metadata() {
     use crate::pipeline::extraction::output::{ArchiveOutput, Integrity, Metadata};
     use std::io::Write;
@@ -873,6 +628,8 @@ async fn scoped_publication_reserves_ordinary_names_before_their_installation() 
     // Model the native handoff window before ordinary output installation.
     std::fs::remove_file(staging.join("leaf.bin")).unwrap();
     pipeline.handle_extraction_done(done).await;
+    // The child is an engine, and its output is what collides.
+    drain_until_terminal(&mut pipeline, job).await;
     assert!(matches!(
         job_status_for_assert(&pipeline, job),
         Some(JobStatus::Failed { .. })
@@ -902,16 +659,16 @@ fn store_archive_with_dataless_outputs() -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
+// A stored child under a compressed root is read by an engine, and the
+// engine's dataless outputs land exactly as a routed child's would.
 #[tokio::test]
-async fn store_child_dataless_outputs_survive_publication_and_graph_restore() {
-    use crate::pipeline::direct_store::manifest::graph::JobGraph;
-    use crate::pipeline::direct_store::restart::ArchiveRestoreRows;
+async fn store_child_dataless_outputs_land_through_its_engine() {
     let later = build_7z(
         &[Entry::file("later.bin", vec![61; 1024])],
         EncoderMethod::COPY,
         None,
     );
-    let (mut pipeline, job, mut done, path) = root_dispatch(&[
+    let (mut pipeline, job, done, path) = root_dispatch(&[
         Entry::file("inner.7z", store_archive_with_dataless_outputs()),
         Entry::file("later.7z", later),
     ])
@@ -920,73 +677,35 @@ async fn store_child_dataless_outputs_survive_publication_and_graph_restore() {
         decoded: Some(decoded),
         result: Ok(outcome),
         ..
-    } = &mut done
+    } = &done
     else {
         panic!("expected decoded parent");
     };
     assert!(outcome.failed.is_empty());
-    assert_eq!(
-        decoded.graph.node(1).mode,
-        crate::pipeline::direct_store::nested::NodeMode::Direct
+    assert!(
+        decoded
+            .graph
+            .nodes
+            .iter()
+            .all(|node| { node.mode == crate::pipeline::direct_store::nested::NodeMode::Engine })
     );
-    let selected = decoded.publication().unwrap();
-    assert!(selected["empty-directory"].is_dir());
-    assert_eq!(std::fs::metadata(&selected["empty.bin"]).unwrap().len(), 0);
-    let before = std::fs::metadata(&selected["empty.bin"]).unwrap();
-    decoded.close().await.unwrap();
-    let after = std::fs::metadata(&selected["empty.bin"]).unwrap();
-    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        assert_eq!(before.ino(), after.ino());
-    }
+    assert!(decoded.publication().unwrap().is_empty());
     pipeline.handle_extraction_done(done).await;
     let staging = pipeline.extraction_staging_dir(job);
+    while !(staging.join("leaf.bin").exists() && staging.join("later.bin").exists()) {
+        let done = next_extraction_done(&mut pipeline).await;
+        pipeline.handle_extraction_done(done).await;
+    }
     assert!(staging.join("empty-directory").is_dir());
     assert_eq!(std::fs::read(staging.join("empty.bin")).unwrap(), b"");
     assert_eq!(
         std::fs::read(staging.join("leaf.bin")).unwrap(),
         vec![47; 1024]
     );
-    let working = pipeline.jobs[&job].working_dir.clone();
-    let spec = pipeline.jobs[&job].spec.clone();
-    let mut graph = JobGraph::empty(1);
-    pipeline.archive_runtime[&job]
-        .append_checkpoint(&mut graph)
-        .unwrap();
-    let graph = JobGraph::decode(&graph.encode().unwrap()).unwrap();
-    graph.probe(&working, &staging).unwrap();
-    pipeline.archive_runtime.remove(&job);
-    pipeline
-        .restore_direct_store_coverage(
-            job,
-            &spec,
-            &working,
-            &HashMap::new(),
-            ArchiveRestoreRows::Graph(Box::new(graph)),
-        )
-        .await
-        .unwrap();
-    let selected = pipeline.archive_runtime[&job]
-        .decoded
-        .iter()
-        .find_map(|state| {
-            let selected = state.publication().unwrap();
-            selected.contains_key("empty-directory").then_some(selected)
-        })
-        .unwrap();
-    assert!(selected["empty-directory"].is_dir());
-    assert_eq!(std::fs::metadata(&selected["empty.bin"]).unwrap().len(), 0);
-    std::fs::remove_dir(&selected["empty-directory"]).unwrap();
-    let mut missing_output = JobGraph::empty(2);
-    pipeline.archive_runtime[&job]
-        .append_checkpoint(&mut missing_output)
-        .unwrap();
-    // A completed namespace must not acquire directory authority from its
-    // intrinsic entry after the authenticated private output is absent.
-    assert!(missing_output.encode().is_err());
-    assert!(!selected["empty-directory"].exists());
+    assert_eq!(
+        std::fs::read(staging.join("later.bin")).unwrap(),
+        vec![61; 1024]
+    );
     drop(pipeline);
     std::fs::remove_dir_all(path).unwrap();
 }
@@ -1000,6 +719,8 @@ async fn store_child_empty_file_cannot_replace_ordinary_payload() {
     .await;
     let staging = pipeline.extraction_staging_dir(job);
     pipeline.handle_extraction_done(done).await;
+    // The child is an engine, and its output is what collides.
+    drain_until_terminal(&mut pipeline, job).await;
     assert!(matches!(
         job_status_for_assert(&pipeline, job),
         Some(JobStatus::Failed { .. })

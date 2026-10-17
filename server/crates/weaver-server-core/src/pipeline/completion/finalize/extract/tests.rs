@@ -641,57 +641,53 @@ fn write_tar_octal_field(field: &mut [u8], value: u64) {
     field.copy_from_slice(text.as_bytes());
 }
 
-fn extract_with_weaver_tar_result(
+// Decodes `archive_path` the way the simple-archive task does for `kind`.
+fn extract_with_weaver_file_result(
+    kind: SimpleArchiveKind,
     archive_path: &Path,
     output_dir: &Path,
 ) -> Result<Vec<String>, String> {
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
     let (root, budget) = test_extraction_security(output_dir);
-    extract_tar(
+    let set_name = archive_path.file_name().unwrap().to_string_lossy();
+    let context = sequential::SequentialExtractionContext {
+        kind,
         archive_path,
-        &root,
-        &budget,
-        &event_tx,
-        JobId(1),
-        archive_path.file_name().unwrap().to_string_lossy().as_ref(),
-    )
+        root: &root,
+        budget: &budget,
+        event_tx: &event_tx,
+        job_id: JobId(1),
+        set_name: &set_name,
+    };
+    match kind {
+        SimpleArchiveKind::Xz => {
+            let _test_guard = lock_xz_mt_decoder_test();
+            extract_xz(&context, 2)
+        }
+        _ => sequential::extract_file(&context),
+    }
     .map_err(String::from)
+}
+
+fn extract_with_weaver_tar_result(
+    archive_path: &Path,
+    output_dir: &Path,
+) -> Result<Vec<String>, String> {
+    extract_with_weaver_file_result(SimpleArchiveKind::Tar, archive_path, output_dir)
 }
 
 fn extract_with_weaver_xz_result(
     archive_path: &Path,
     output_dir: &Path,
 ) -> Result<Vec<String>, String> {
-    let _test_guard = lock_xz_mt_decoder_test();
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
-    let (root, budget) = test_extraction_security(output_dir);
-    extract_xz(
-        archive_path,
-        &root,
-        &budget,
-        &event_tx,
-        JobId(1),
-        archive_path.file_name().unwrap().to_string_lossy().as_ref(),
-        2,
-    )
-    .map_err(String::from)
+    extract_with_weaver_file_result(SimpleArchiveKind::Xz, archive_path, output_dir)
 }
 
 fn extract_with_weaver_tar_xz_result(
     archive_path: &Path,
     output_dir: &Path,
 ) -> Result<Vec<String>, String> {
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
-    let (root, budget) = test_extraction_security(output_dir);
-    extract_tar_xz(
-        archive_path,
-        &root,
-        &budget,
-        &event_tx,
-        JobId(1),
-        archive_path.file_name().unwrap().to_string_lossy().as_ref(),
-    )
-    .map_err(String::from)
+    extract_with_weaver_file_result(SimpleArchiveKind::TarXz, archive_path, output_dir)
 }
 
 fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
@@ -741,14 +737,13 @@ fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
 #[test]
 fn simple_decoder_reservations_use_realistic_codec_bounds() {
     let large_limit = 48_u64 * 1024 * 1024 * 1024;
-    assert_eq!(
-        simple_decoder_memory_bytes(SimpleArchiveKind::Brotli, large_limit),
-        32 * 1024 * 1024
-    );
-    assert_eq!(
-        simple_decoder_memory_bytes(SimpleArchiveKind::Tar, large_limit),
-        1024 * 1024
-    );
+    let reserved = |kind| {
+        sequential::stream_decoder_memory(kind, std::io::empty, large_limit)
+            .unwrap()
+            .reserved
+    };
+    assert_eq!(reserved(SimpleArchiveKind::Brotli), 32 * 1024 * 1024);
+    assert_eq!(reserved(SimpleArchiveKind::Tar), 1024 * 1024);
 }
 
 #[test]
@@ -1057,23 +1052,20 @@ fn xz_extraction_admits_its_decoder_footprint_once() {
     );
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
 
-    // What the simple-archive task admits before it opens the decoder.
-    let _task_memory = simple_archive_task_memory_permit(
-        SimpleArchiveKind::Xz,
-        Some(archive_path.as_path()),
-        &budget,
-    )
-    .unwrap();
-
-    extract_xz(
-        &archive_path,
-        &root,
-        &budget,
-        &event_tx,
-        JobId(1),
-        "payload.bin.xz",
-        2,
-    )
+    prepared::PreparedSimple {
+        job_id: JobId(1),
+        set_name: "payload.bin.xz".to_string(),
+        kind: SimpleArchiveKind::Xz,
+        file_paths: vec![archive_path],
+        passwords: Vec::new(),
+        joined_output_already_present: None,
+        root: Arc::new(root),
+        budget,
+        event_tx,
+        phase_counters: Arc::new(PhaseCounters::default()),
+        xz_worker_threads: 2,
+    }
+    .run()
     .unwrap();
 
     assert_eq!(fs::read(output_dir.join("payload.bin")).unwrap(), payload);
@@ -1092,8 +1084,9 @@ fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
     fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
 
     let (_root, budget) = test_extraction_security(&output_dir);
-    let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 2).unwrap();
-    assert!(matches!(&decoder, FilesystemXzDecoder::Parallel { .. }));
+    let mut decoder = open_parallel_xz_decoder(&archive_path, &budget, 2)
+        .unwrap()
+        .expect("a multi-block single stream decodes in parallel");
 
     let mut output = Vec::new();
     decoder.read_to_end(&mut output).unwrap();
@@ -1101,8 +1094,9 @@ fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
 }
 
 // The parallel decoder is only taken when the job's memory budget can hold
-// one worker; a budget one byte short of that goes to the sequential decoder,
-// whose dictionary is bounded by the block it decodes and still fits.
+// one worker. A budget one byte short of that goes to the sequential decoder,
+// which is admitted only when the block's dictionary and its own overhead
+// fit, so the same budget refuses it before any output is made.
 #[test]
 fn filesystem_xz_decoder_falls_back_to_sequential_when_a_worker_does_not_fit() {
     let _test_guard = lock_xz_mt_decoder_test();
@@ -1122,13 +1116,33 @@ fn filesystem_xz_decoder_falls_back_to_sequential_when_a_worker_does_not_fit() {
     .unwrap()
     .memory_estimate();
 
-    let (_root, budget) = test_extraction_security_with_memory(&output_dir, one_worker - 1);
-    let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 2).unwrap();
-    assert!(matches!(&decoder, FilesystemXzDecoder::Sequential { .. }));
+    let (root, budget) = test_extraction_security_with_memory(&output_dir, one_worker - 1);
+    assert!(
+        open_parallel_xz_decoder(&archive_path, &budget, 2)
+            .unwrap()
+            .is_none()
+    );
 
-    let mut output = Vec::new();
-    decoder.read_to_end(&mut output).unwrap();
-    assert_eq!(output, payload);
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let error = extract_xz(
+        &sequential::SequentialExtractionContext {
+            kind: SimpleArchiveKind::Xz,
+            archive_path: &archive_path,
+            root: &root,
+            budget: &budget,
+            event_tx: &event_tx,
+            job_id: JobId(1),
+            set_name: "payload.bin.xz",
+        },
+        2,
+    )
+    .unwrap_err();
+    assert_eq!(error.class(), ExtractionErrorClass::Terminal, "{error}");
+    assert!(
+        error.message().contains("bytes of decoder memory, above"),
+        "{error}"
+    );
+    assert!(!output_dir.join("payload.bin").exists());
 }
 
 // A budget that holds exactly one worker gets the parallel decoder with its
@@ -1153,11 +1167,10 @@ fn filesystem_xz_decoder_trims_its_threads_to_the_memory_budget() {
     .memory_estimate();
 
     let (_root, budget) = test_extraction_security_with_memory(&output_dir, one_worker);
-    let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 4).unwrap();
-    match &decoder {
-        FilesystemXzDecoder::Parallel { decoder, .. } => assert_eq!(decoder.threads(), 1),
-        FilesystemXzDecoder::Sequential { .. } => panic!("expected the parallel decoder"),
-    }
+    let mut decoder = open_parallel_xz_decoder(&archive_path, &budget, 4)
+        .unwrap()
+        .expect("expected the parallel decoder");
+    assert_eq!(decoder.decoder.threads(), 1);
 
     let mut output = Vec::new();
     decoder.read_to_end(&mut output).unwrap();
@@ -2489,40 +2502,43 @@ fn zstd_window_is_read_from_the_frame_header() {
     // dictionary id. Window descriptor 0x00: exponent 0, mantissa 0 — the
     // format's smallest window, 1 KiB.
     let smallest = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
-    assert_eq!(zstd_frame_window_bytes(&smallest).unwrap(), 1024);
+    assert_eq!(zstd_frame_header(&smallest).unwrap().window, 1024);
 
     // Exponent 10, mantissa 3: base 1 MiB plus three eighths of it.
     let window_descriptor = (10u8 << 3) | 3;
     let mid = [0x28, 0xB5, 0x2F, 0xFD, 0x00, window_descriptor];
     let base = 1024 * 1024u64;
     assert_eq!(
-        zstd_frame_window_bytes(&mid).unwrap(),
+        zstd_frame_header(&mid).unwrap().window,
         base + (base / 8) * 3
     );
 
     // Single-segment frame: no window descriptor, and the one-byte content
     // size is what the decoder holds.
     let single = [0x28, 0xB5, 0x2F, 0xFD, 0b0010_0000, 42];
-    assert_eq!(zstd_frame_window_bytes(&single).unwrap(), 42);
+    let header = zstd_frame_header(&single).unwrap();
+    assert_eq!((header.window, header.held), (42, 42));
 
-    // A window larger than the content it can ever hold is not held.
+    // A window larger than the content it can ever hold is not held, though
+    // the decoder is still held to the window its descriptor declares.
     let content_size_flag = 0b0100_0000u8;
     let mut capped = vec![0x28, 0xB5, 0x2F, 0xFD, content_size_flag, window_descriptor];
     // Two-byte content size is stored offset by 256.
     capped.extend_from_slice(&(1024u16 - 256).to_le_bytes());
-    assert_eq!(zstd_frame_window_bytes(&capped).unwrap(), 1024);
+    let header = zstd_frame_header(&capped).unwrap();
+    assert_eq!((header.window, header.held), (base + (base / 8) * 3, 1024));
 
     // Anything that is not a zstd frame, or a header that stops early, is an
     // error rather than a reservation.
-    assert!(zstd_frame_window_bytes(&[0x00, 0x01, 0x02, 0x03]).is_err());
-    assert!(zstd_frame_window_bytes(&[0x28, 0xB5, 0x2F]).is_err());
-    assert!(zstd_frame_window_bytes(&[0x28, 0xB5, 0x2F, 0xFD, 0b0000_1000, 0]).is_err());
+    assert!(zstd_frame_header(&[0x00, 0x01, 0x02, 0x03]).is_err());
+    assert!(zstd_frame_header(&[0x28, 0xB5, 0x2F]).is_err());
+    assert!(zstd_frame_header(&[0x28, 0xB5, 0x2F, 0xFD, 0b0000_1000, 0]).is_err());
 }
 
 // A real frame's reservation has to be small enough to be granted while the
-// rest of the process is working. The old sizing asked for the entire
-// allowance, which registers as a waiter and makes every running direct
-// unpack yield its decoder before this one can even start.
+// rest of the process is working. A reservation of the entire allowance
+// registers as a waiter and makes every running direct unpack yield its
+// decoder before this one can even start.
 #[test]
 fn a_zstd_reservation_is_a_fraction_of_the_process_allowance() {
     let temp = TempDir::new().unwrap();
@@ -2535,9 +2551,14 @@ fn a_zstd_reservation_is_a_fraction_of_the_process_allowance() {
     .unwrap();
 
     let limit = 64_u64 * 1024 * 1024 * 1024;
-    let reserved =
-        measured_decoder_memory_bytes(SimpleArchiveKind::Zstd, Some(archive.as_path()), limit)
-            .unwrap();
+    let sized = |path: &Path| {
+        sequential::stream_decoder_memory(
+            SimpleArchiveKind::Zstd,
+            || fs::File::open(path).unwrap(),
+            limit,
+        )
+    };
+    let reserved = sized(&archive).unwrap().reserved;
     assert!(
         reserved < 64 * 1024 * 1024,
         "a half-megabyte payload must not reserve {reserved} bytes"
@@ -2551,10 +2572,7 @@ fn a_zstd_reservation_is_a_fraction_of_the_process_allowance() {
     // reserving the allowance and waiting for it.
     let bogus = temp.path().join("not-really.zst");
     fs::write(&bogus, b"this is not a frame").unwrap();
-    assert!(
-        measured_decoder_memory_bytes(SimpleArchiveKind::Zstd, Some(bogus.as_path()), limit)
-            .is_err()
-    );
+    assert!(sized(&bogus).is_err());
 }
 
 // A frame whose window is larger than the whole allowance cannot be decoded
@@ -2566,7 +2584,7 @@ fn a_zstd_window_above_the_limit_is_refused() {
     // the exponent).
     let huge = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 21u8 << 3];
     assert_eq!(
-        zstd_frame_window_bytes(&huge).unwrap(),
+        zstd_frame_header(&huge).unwrap().held,
         2 * 1024 * 1024 * 1024
     );
 
@@ -2574,9 +2592,9 @@ fn a_zstd_window_above_the_limit_is_refused() {
     let archive = temp.path().join("wide.zst");
     fs::write(&archive, huge).unwrap();
     assert!(
-        measured_decoder_memory_bytes(
+        sequential::stream_decoder_memory(
             SimpleArchiveKind::Zstd,
-            Some(archive.as_path()),
+            || fs::File::open(&archive).unwrap(),
             32 * 1024 * 1024,
         )
         .is_err()

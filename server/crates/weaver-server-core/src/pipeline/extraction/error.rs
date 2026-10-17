@@ -49,6 +49,10 @@ pub(crate) struct ExtractionError {
     class: ExtractionErrorClass,
     message: String,
     rejection: Option<ExtractionFailure>,
+    // A supplied password was tried and the archive did not open with it.
+    // 7z AES carries no key check, so a wrong key fails as the data error
+    // damaged bytes would, and the class says which that would have been.
+    refuted_password: bool,
 }
 
 impl ExtractionError {
@@ -57,7 +61,28 @@ impl ExtractionError {
             class,
             message: message.into(),
             rejection: None,
+            refuted_password: false,
         }
+    }
+
+    // Marks a failure met under a supplied password as that password's. A
+    // stop, a capacity refusal or a stale topology is never a key's verdict,
+    // so those keep saying what they are.
+    pub(crate) fn refuting_password(self) -> Self {
+        let verdict = matches!(
+            self.class,
+            ExtractionErrorClass::PasswordRequired
+                | ExtractionErrorClass::Recoverable
+                | ExtractionErrorClass::Terminal
+        );
+        Self {
+            refuted_password: verdict,
+            ..self
+        }
+    }
+
+    pub(crate) fn refuted_password(&self) -> bool {
+        self.refuted_password || self.class == ExtractionErrorClass::PasswordRequired
     }
 
     pub(crate) fn terminal(message: impl Into<String>) -> Self {
@@ -89,6 +114,7 @@ impl ExtractionError {
             class: ExtractionErrorClass::Rejected,
             message: failure.to_string(),
             rejection: Some(failure),
+            refuted_password: false,
         }
     }
 
@@ -143,6 +169,7 @@ impl ExtractionError {
         if let Some(failure) = budget.stopped_failure() {
             self.class = ExtractionErrorClass::Rejected;
             self.rejection = Some(failure);
+            self.refuted_password = false;
         }
         self
     }
@@ -280,6 +307,44 @@ pub(crate) fn rar_error_class(error: &unrar_rs::RarError) -> ExtractionErrorClas
         // data cut short; both have always been terminal here, and stay so
         // until the routing is ruled on.
         _ => ExtractionErrorClass::Terminal,
+    }
+}
+
+// Whether the password the reader was given is what stopped it: no password
+// where one is needed, an encrypted header that did not decrypt, or a block
+// whose AES coder produced bytes that failed their check. The last two are
+// what a wrong key looks like, and also what damage behind a right key looks
+// like, which is why the caller keeps trying candidates and only then treats
+// the failure as the data error it was classed as.
+//
+// The reader wraps every read failure behind an encrypted header as a bad
+// password, so a typed failure inside it (a budget stop, a source that would
+// not open, descriptor exhaustion) is reported as itself, not refuted. The
+// one typed failure that is the key's is the header's own CRC refusing what
+// the key decrypted.
+//
+// A block's data failure carries no typed cause, so a source fault inside an
+// AES block looks the same as a wrong key here; the caller that decodes a
+// block under a candidate watches its source for that.
+pub(crate) fn sevenz_password_refuted(error: &sevenz_turbo::Error) -> bool {
+    match error {
+        sevenz_turbo::Error::PasswordRequired
+        | sevenz_turbo::Error::BlockDecode {
+            kind: sevenz_turbo::BlockErrorKind::Password,
+            ..
+        } => true,
+        sevenz_turbo::Error::MaybeBadPassword(inner) => {
+            let header_crc = inner
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<sevenz_turbo::Error>())
+                .is_some_and(|cause| {
+                    matches!(cause, sevenz_turbo::Error::ChecksumVerificationFailed)
+                });
+            header_crc
+                || (typed_io_error_class(inner).is_none()
+                    && !crate::pipeline::capacity::is_fd_capacity_io_error(inner))
+        }
+        _ => false,
     }
 }
 

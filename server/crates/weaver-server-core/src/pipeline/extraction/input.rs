@@ -11,7 +11,6 @@ use crate::pipeline::direct_store::provider::{VirtualVolume, VirtualVolumeReader
 pub(crate) struct LivePart {
     pub(crate) view: VirtualVolume,
     pub(crate) length: Option<u64>,
-    pub(crate) complete: bool,
 }
 
 struct Part {
@@ -29,6 +28,9 @@ struct Snapshot {
 struct State {
     snapshot: Option<Arc<Snapshot>>,
     aborted: Option<String>,
+    // The `(part, position)` a reader is blocked on, so the owner can ask for
+    // those bytes ahead of the in-order flow.
+    wanted: Option<(u32, u64)>,
     #[cfg(test)]
     waiters: usize,
 }
@@ -86,7 +88,6 @@ impl LiveArchiveInput {
         let mut retained = 0u64;
         for (index, mut part) in parts {
             if part.view.volume_index != index
-                || (part.complete && part.length.is_none())
                 || part.length.is_some_and(|length| part.view.len > length)
             {
                 return Err("invalid live archive input bounds".into());
@@ -140,7 +141,6 @@ impl LiveArchiveInput {
                     .length
                     .is_some_and(|length| next.value.length != Some(length))
                     || old.value.view.len > next.value.view.len
-                    || (old.value.complete && !next.value.complete)
                     || old
                         .ranges
                         .iter()
@@ -321,6 +321,11 @@ impl LiveArchiveInput {
         }
     }
 
+    // What a reader is blocked on, as `(part, position)`, if anything.
+    pub(crate) fn wanted(&self) -> Option<(u32, u64)> {
+        self.lock().ok()?.wanted
+    }
+
     pub(crate) fn reader(&self) -> LiveArchiveReader {
         LiveArchiveReader {
             input: self.clone(),
@@ -388,11 +393,16 @@ impl PartReader {
 
     // Waits until the byte at the current position is placed, or returns
     // `None` at the part's end. A reader over the same snapshot is reused.
+    //
+    // While it waits, the position is published as the input's want.
     fn locate(&self, previous: Option<PlacedRange>) -> io::Result<Option<PlacedRange>> {
+        let want = Some((self.index, self.position));
         let (snapshot, start, end) = {
             let mut state = self.input.lock()?;
-            loop {
-                LiveArchiveInput::check(&state)?;
+            let found = loop {
+                if let Err(error) = LiveArchiveInput::check(&state) {
+                    break Err(error);
+                }
                 if let Some(snapshot) = &state.snapshot
                     && let Some(part) = snapshot.parts.get(&self.index)
                 {
@@ -401,23 +411,26 @@ impl PartReader {
                         .length
                         .is_some_and(|length| self.position >= length)
                     {
-                        return Ok(None);
+                        break Ok(None);
                     }
                     if let Some(&(start, end)) = part
                         .ranges
                         .iter()
                         .find(|&&(start, end)| start <= self.position && self.position < end)
                     {
-                        break (Arc::clone(snapshot), start, end);
-                    }
-                    if part.value.complete {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "completed archive input contains a hole",
-                        ));
+                        break Ok(Some((Arc::clone(snapshot), start, end)));
                     }
                 }
+                state.wanted = want;
                 state = self.input.wait(state)?;
+            };
+            // Another reader may have published its own want meanwhile.
+            if state.wanted == want {
+                state.wanted = None;
+            }
+            match found? {
+                Some(found) => found,
+                None => return Ok(None),
             }
         };
         let (reader, cursor) = match previous {
@@ -564,7 +577,6 @@ mod tests {
         path: &std::path::Path,
         index: u32,
         length: Option<u64>,
-        complete: bool,
         ranges: &[(u64, u64)],
     ) -> LivePart {
         let mut covered = ByteRanges::new();
@@ -573,7 +585,6 @@ mod tests {
         }
         LivePart {
             length,
-            complete,
             view: VirtualVolume {
                 backing_leases: None,
                 volume_index: index,
@@ -606,7 +617,7 @@ mod tests {
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
         input
             .publish(
-                BTreeMap::from([(0, part(&path, 0, None, false, &[(0, 3)]))]),
+                BTreeMap::from([(0, part(&path, 0, None, &[(0, 3)]))]),
                 false,
                 &memory,
             )
@@ -620,7 +631,7 @@ mod tests {
         blocked(&input);
         input
             .publish(
-                BTreeMap::from([(0, part(&path, 0, Some(8), true, &[(0, 8)]))]),
+                BTreeMap::from([(0, part(&path, 0, Some(8), &[(0, 8)]))]),
                 true,
                 &memory,
             )
@@ -632,6 +643,41 @@ mod tests {
         reader.read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, *b"bcd");
         assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), 6);
+    }
+
+    #[test]
+    fn a_blocked_reader_publishes_the_position_it_waits_for_until_it_lands() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let input = LiveArchiveInput::new();
+        let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
+        input
+            .publish(
+                BTreeMap::from([(0, part(&path, 0, Some(8), &[(0, 3)]))]),
+                false,
+                &memory,
+            )
+            .unwrap();
+        assert_eq!(input.wanted(), None);
+        let mut reader = input.reader();
+        let worker = std::thread::spawn(move || {
+            reader.seek(SeekFrom::Start(6)).unwrap();
+            let mut bytes = [0; 2];
+            reader.read_exact(&mut bytes).unwrap();
+            bytes
+        });
+        blocked(&input);
+        assert_eq!(input.wanted(), Some((0, 6)));
+        input
+            .publish(
+                BTreeMap::from([(0, part(&path, 0, Some(8), &[(0, 8)]))]),
+                true,
+                &memory,
+            )
+            .unwrap();
+        assert_eq!(worker.join().unwrap(), *b"gh");
+        assert_eq!(input.wanted(), None);
     }
 
     #[test]
@@ -659,7 +705,7 @@ mod tests {
         let input = LiveArchiveInput::new();
         input
             .publish(
-                BTreeMap::from([(0, part(&first, 0, None, false, &[(0, 4)]))]),
+                BTreeMap::from([(0, part(&first, 0, None, &[(0, 4)]))]),
                 false,
                 &memory,
             )
@@ -675,8 +721,8 @@ mod tests {
         input
             .publish(
                 BTreeMap::from([
-                    (0, part(&first, 0, Some(4), true, &[(0, 4)])),
-                    (1, part(&second, 1, Some(4), true, &[(0, 4)])),
+                    (0, part(&first, 0, Some(4), &[(0, 4)])),
+                    (1, part(&second, 1, Some(4), &[(0, 4)])),
                 ]),
                 true,
                 &memory,
@@ -686,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_holes_and_regressing_publications_are_refused() {
+    fn regressing_coverage_and_vanishing_rosters_are_refused() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source");
         std::fs::write(&path, b"abcdefgh").unwrap();
@@ -694,21 +740,15 @@ mod tests {
         let input = LiveArchiveInput::new();
         input
             .publish(
-                BTreeMap::from([(0, part(&path, 0, Some(8), true, &[(0, 3), (5, 8)]))]),
+                BTreeMap::from([(0, part(&path, 0, Some(8), &[(0, 3), (5, 8)]))]),
                 true,
                 &memory,
             )
             .unwrap();
-        let mut reader = input.reader();
-        reader.seek(SeekFrom::Start(3)).unwrap();
-        assert_eq!(
-            reader.read(&mut [0; 1]).unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
         assert!(
             input
                 .publish(
-                    BTreeMap::from([(0, part(&path, 0, Some(8), true, &[(0, 2)]))]),
+                    BTreeMap::from([(0, part(&path, 0, Some(8), &[(0, 2)]))]),
                     true,
                     &memory
                 )

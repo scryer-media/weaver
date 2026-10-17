@@ -1178,11 +1178,7 @@ impl Pipeline {
             let Some(path) = self.resolve_job_input_path(job_id, filename) else {
                 continue;
             };
-            if self
-                .archive_runtime
-                .get(&job_id)
-                .is_some_and(|runtime| runtime.retains_input_path(&path))
-            {
+            if self.retains_job_input(job_id, &path) {
                 continue;
             }
             match tokio::fs::remove_file(&path).await {
@@ -1724,24 +1720,7 @@ impl Pipeline {
     }
 
     pub(super) fn role_refreshes_archive_topology(role: &weaver_model::files::FileRole) -> bool {
-        matches!(
-            role,
-            weaver_model::files::FileRole::RarVolume { .. }
-                | weaver_model::files::FileRole::SevenZipArchive
-                | weaver_model::files::FileRole::SevenZipSplit { .. }
-                | weaver_model::files::FileRole::SplitFile { .. }
-                | weaver_model::files::FileRole::ZipArchive
-                | weaver_model::files::FileRole::TarArchive
-                | weaver_model::files::FileRole::TarGzArchive
-                | weaver_model::files::FileRole::TarBz2Archive
-                | weaver_model::files::FileRole::TarXzArchive
-                | weaver_model::files::FileRole::GzArchive
-                | weaver_model::files::FileRole::DeflateArchive
-                | weaver_model::files::FileRole::BrotliArchive
-                | weaver_model::files::FileRole::ZstdArchive
-                | weaver_model::files::FileRole::Bzip2Archive
-                | weaver_model::files::FileRole::XzArchive
-        )
+        crate::jobs::assembly::ArchiveType::from_role(role).is_some()
     }
 
     pub(super) fn archive_topology_needs_refresh(

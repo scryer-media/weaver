@@ -1058,7 +1058,10 @@ async fn a_chase_still_running_at_extraction_is_awaited_and_installed() {
 // segment, which is all the birth-time boost can reach.
 //
 // The distinguishing assertion is the second-to-last segment of the last part:
-// birth-time never touches it, and the tail window does.
+// birth-time never touches it, and the tail window does. Until an article of
+// the set lands, an article's place is only an estimate, so the pull reaches
+// one article further back than the window; the article before that one is
+// the window's edge.
 #[tokio::test]
 async fn arming_pulls_the_tail_window_forward_in_a_deep_queue() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1068,7 +1071,7 @@ async fn arming_pulls_the_tail_window_forward_in_a_deep_queue() {
     let set_name = "silver_horizon.7z";
 
     const SEGMENT_BYTES: u32 = 1024 * 1024;
-    const SEGMENTS_PER_TAIL_PART: u32 = 4;
+    const SEGMENTS_PER_TAIL_PART: u32 = 5;
     let head_bytes = 4_096u64;
     let tail_part_bytes = SEGMENT_BYTES as u64 * SEGMENTS_PER_TAIL_PART as u64;
     let total_len = head_bytes + tail_part_bytes * 2;
@@ -1150,9 +1153,11 @@ async fn arming_pulls_the_tail_window_forward_in_a_deep_queue() {
     write_and_complete_file(&mut pipeline, job_id, 0, "silver_horizon.7z.001", &head).await;
     let armed = pipeline.direct_unpack.is_armed(job_id, set_name);
     let tail_window_segment = priority_of(&pipeline, 2, SEGMENTS_PER_TAIL_PART - 2);
+    let estimate_neighbour = priority_of(&pipeline, 2, SEGMENTS_PER_TAIL_PART - 3);
     // Segment 0 of every part is already boosted at birth, so the segment that
     // proves the window's *edge* is the one neither reaches: the last part's
-    // second segment, ahead of the window and behind the head.
+    // second segment, ahead of the window's estimated reach and behind the
+    // head.
     let last_part_middle = priority_of(&pipeline, 2, 1);
     let middle_part = priority_of(&pipeline, 1, 1);
 
@@ -1168,6 +1173,10 @@ async fn arming_pulls_the_tail_window_forward_in_a_deep_queue() {
     assert_eq!(
         tail_window_segment, 2,
         "the tail window must pull the last part's closing segments forward"
+    );
+    assert_eq!(
+        estimate_neighbour, 2,
+        "an estimated place reaches one article further back"
     );
     assert_ne!(
         last_part_middle, 2,

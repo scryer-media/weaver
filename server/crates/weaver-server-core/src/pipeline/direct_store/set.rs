@@ -64,11 +64,26 @@ pub(crate) enum DirectSetStatus {
     Demoted(DemotionReason),
 }
 
+// A node that writes its own members, as the coordinator binds its owner and
+// closes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProducerState {
+    pub(crate) node: u32,
+    // The namespace root alone has no containing node.
+    pub(crate) parent: Option<u32>,
+    // Every input arrived and every member passed its gate, so nothing can
+    // still change what the node produced and its owner may close.
+    pub(crate) verified: bool,
+}
+
 pub(crate) struct LiveChildDescription {
     pub(crate) node: u32,
     pub(crate) parent: u32,
     pub(crate) format: super::plan::SetFormat,
     pub(crate) set_name: String,
+    // The verdict that sent the node to an engine. A checkpoint keeps the
+    // mode and not the verdict, so a restored node has none.
+    pub(crate) reason: Option<DemotionReason>,
     pub(crate) input_names: BTreeMap<u32, String>,
     pub(crate) parts: BTreeMap<u32, crate::pipeline::extraction::input::LivePart>,
     pub(crate) roster_closed: bool,
@@ -281,18 +296,24 @@ impl DirectSet {
         true
     }
 
-    pub(crate) fn direct_producer_states(&self) -> Vec<(u32, Option<u32>, u64, bool)> {
+    // Makes the next live refresh describe the set's children again though
+    // nothing new was placed: a finished child engine freed the slot a held
+    // sibling waits for.
+    pub(crate) fn request_live_refresh(&mut self) {
+        self.live_metadata = None;
+    }
+
+    pub(crate) fn direct_producer_states(&self) -> Vec<ProducerState> {
         if !self.nested_authority {
             return Vec::new();
         }
-        let mut result = vec![(
-            0,
-            None,
-            0,
-            self.all_volumes_complete()
+        let mut result = vec![ProducerState {
+            node: 0,
+            parent: None,
+            verified: self.all_volumes_complete()
                 && self.router.all_members_verified()
                 && !self.router.awaits_par3_verdict(),
-        )];
+        }];
         result.extend(
             self.nested
                 .as_ref()
@@ -310,6 +331,26 @@ impl DirectSet {
             .as_ref()
             .expect("active graph")
             .live_child_descriptions(&self.router)
+    }
+
+    // What the set's nested archives want of its volumes ahead of the in-order
+    // flow. A child whose parents cannot seek is refused here, which turns it
+    // into an engine the next live refresh opens.
+    pub(crate) fn nested_seeks(&mut self) -> Vec<super::nested::seek::Seek> {
+        // A set that no longer routes has no child left to ask for.
+        if !self.nested_authority || self.delegated || self.is_demoted() || self.is_finalized() {
+            return Vec::new();
+        }
+        let graph = self.nested.as_mut().expect("active graph");
+        graph.refuse_unseekable(&self.router);
+        graph.seeks(&self.router)
+    }
+
+    // See [`super::nested::NestedGraph::note_engine_want`].
+    pub(crate) fn note_engine_want(&mut self, node: u32, want: Option<(u32, u64)>) {
+        if let Some(graph) = self.nested.as_mut() {
+            graph.note_engine_want(node, want);
+        }
     }
 
     pub(crate) fn graph_rearm_plans(&self) -> Vec<GraphRearmPlan> {
@@ -596,6 +637,7 @@ impl DirectSet {
                         super::nested::NodeMode::Direct => 0,
                         super::nested::NodeMode::MaterializationPending(_) => 1,
                         super::nested::NodeMode::Materialized => 2,
+                        super::nested::NodeMode::Engine => 3,
                     },
                 ]);
                 for (&volume, input) in &node.inputs {
@@ -734,12 +776,20 @@ impl DirectSet {
                 if set.nested_authority
                     && let Some(graph) = set.nested.as_ref()
                     && let Some((child, _)) = graph.binding(owner, member)
-                    && graph.node(child).mode != super::nested::NodeMode::Materialized
                 {
-                    if visited.insert(child) {
-                        append(set, child, visited, output);
+                    match graph.node(child).mode {
+                        // The file it landed as is this member.
+                        super::nested::NodeMode::Materialized => {}
+                        // Its engine delivers what it holds.
+                        super::nested::NodeMode::Engine => continue,
+                        super::nested::NodeMode::Direct
+                        | super::nested::NodeMode::MaterializationPending(_) => {
+                            if visited.insert(child) {
+                                append(set, child, visited, output);
+                            }
+                            continue;
+                        }
                     }
-                    continue;
                 }
                 if let Ok(destination) = set.plan().member_output_path(name) {
                     output.push((
@@ -778,13 +828,8 @@ impl DirectSet {
             return None;
         }
         let graph = self.nested.as_ref()?;
-        let node = graph.nodes.iter().position(|node| {
-            matches!(
-                node.mode,
-                super::nested::NodeMode::MaterializationPending(_)
-            )
-        })?;
-        graph.prepare_materialization(&self.router, node as u32 + 1)
+        (1..=graph.nodes.len() as u32)
+            .find_map(|node| graph.prepare_materialization(&self.router, node))
     }
 
     pub(crate) fn apply_nested_materialization(
@@ -796,6 +841,7 @@ impl DirectSet {
             .as_mut()
             .ok_or(DemotionReason::ConflictingVolumeFacts)?
             .apply_materialization(&self.router, materialized)?;
+        let now = Instant::now();
         for (receipt, sources) in receipts {
             let destination = DirectDestination::Member {
                 member_id: receipt.member,
@@ -814,7 +860,8 @@ impl DirectSet {
                 receipt.member,
                 raw,
             );
-            self.qualified_placements
+            let fresh = self
+                .qualified_placements
                 .entry(key)
                 .or_insert_with(|| QualifiedPlacement {
                     owner: receipt.owner,
@@ -824,6 +871,7 @@ impl DirectSet {
                 })
                 .ranges
                 .insert(receipt.offset, receipt.len);
+            self.note_fresh_placement(fresh, now);
             for source in sources {
                 self.placed
                     .entry(source.volume)
@@ -832,6 +880,16 @@ impl DirectSet {
             }
         }
         Ok(())
+    }
+
+    // Bytes the live view serves that it did not before: the next refresh
+    // describes the set's children again, and the checkpoint owes them.
+    fn note_fresh_placement(&mut self, fresh: u64, now: Instant) {
+        self.graph_dirty_bytes = self.graph_dirty_bytes.saturating_add(fresh);
+        if fresh > 0 {
+            self.live_placement_revision = self.live_placement_revision.saturating_add(1);
+            self.graph_dirty_since.get_or_insert(now);
+        }
     }
 
     pub(crate) fn placement_path(
@@ -1337,10 +1395,10 @@ impl DirectSet {
 
     // Routes one volume's complete rewrite inside an open repair transaction.
     //
-    // Unlike [`Self::route_repaired`] this does not settle: a repaired byte
-    // that needs another volume's rewrite — an encrypted block straddling the
-    // seam, a trailing region awaiting confirmation — stays staged until
-    // [`Self::finish_repair_transaction`] answers for it.
+    // The volume's rewrite closes here, but the transaction does not settle: a
+    // repaired byte that needs another volume's rewrite — an encrypted block
+    // straddling the seam, a trailing region awaiting confirmation — stays
+    // staged until [`Self::finish_repair_transaction`] answers for it.
     pub(crate) fn route_repaired_volume(
         &mut self,
         volume_index: u32,
@@ -1494,12 +1552,17 @@ impl DirectSet {
             && (!self.nested_authority
                 || self.nested.as_ref().is_some_and(|graph| {
                     graph.nodes.iter().all(|node| {
-                        node.mode == super::nested::NodeMode::Materialized
-                            || (node.mode == super::nested::NodeMode::Direct
-                                && node.roster_closed
-                                && node.inputs.values().all(|input| input.confirmed)
-                                && node.router.all_members_verified()
-                                && !node.router.awaits_par3_verdict())
+                        // An engine's node is complete with the parent that
+                        // delivers it; the engine itself answers to the
+                        // archive sessions, not to this set.
+                        matches!(
+                            node.mode,
+                            super::nested::NodeMode::Materialized | super::nested::NodeMode::Engine
+                        ) || (node.mode == super::nested::NodeMode::Direct
+                            && node.roster_closed
+                            && node.inputs.values().all(|input| input.confirmed)
+                            && node.router.all_members_verified()
+                            && !node.router.awaits_par3_verdict())
                     })
                 }))
     }
@@ -1795,11 +1858,7 @@ impl DirectSet {
                     })
                     .ranges
                     .insert(receipt.destination_offset, receipt.len);
-                self.graph_dirty_bytes = self.graph_dirty_bytes.saturating_add(fresh);
-                if fresh > 0 {
-                    self.live_placement_revision = self.live_placement_revision.saturating_add(1);
-                    self.graph_dirty_since.get_or_insert(now);
-                }
+                self.note_fresh_placement(fresh, now);
                 for source in sources {
                     self.placed
                         .entry(source.volume)

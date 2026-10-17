@@ -1,6 +1,6 @@
-// Continuation of the `impl DirectSetRouter` block from `direct_store/router.rs`.
-// Split out mechanically to keep the parent file readable; no behavior lives here
-// that is not simply a method of the same type.
+// The router's encrypted-member path and its member gates: decrypting each
+// slice of an encrypted member on the way in, and the part and member checks
+// that decide whether what landed is the member the archive describes.
 
 use super::*;
 

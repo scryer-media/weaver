@@ -1,8 +1,9 @@
 use super::*;
+use crate::pipeline::direct_store::plan::SetFormat;
 use crate::pipeline::extraction::runtime::decoded::NamespaceProgress;
 use crate::pipeline::extraction::runtime::rearm::RearmRead;
 use crate::pipeline::extraction::runtime::{
-    ArchiveRuntime, NamespaceWork, RuntimeError, VirtualInputSource, limits,
+    ArchiveRuntime, ChildSlot, NamespaceWork, RuntimeError, VirtualInputSource, limits,
 };
 use crate::pipeline::extraction::session::InputVersion;
 use std::sync::Arc;
@@ -35,14 +36,7 @@ fn child_work(
         node: child.node,
     };
     NamespaceWork {
-        kind: match child.format {
-            crate::pipeline::direct_store::plan::SetFormat::Rar => {
-                crate::jobs::assembly::ArchiveType::Rar
-            }
-            crate::pipeline::direct_store::plan::SetFormat::SevenZip => {
-                crate::jobs::assembly::ArchiveType::SevenZip
-            }
-        },
+        kind: child.format.archive_type(),
         set_name: child.set_name,
         volumes: child.input_names.keys().copied().collect(),
         input_names: child.input_names.into_values().collect(),
@@ -60,7 +54,7 @@ fn child_work(
 }
 
 impl Pipeline {
-    // Reports the failure as the sentence the job fails with.
+    // For a caller that fails the job with the sentence.
     pub(crate) async fn refresh_direct_live_inputs(
         &mut self,
         job_id: JobId,
@@ -68,14 +62,18 @@ impl Pipeline {
     ) -> Result<(), String> {
         self.refresh_live_inputs(job_id, set_name)
             .await
-            .map_err(String::from)
+            .map_err(|error| error.to_string())
     }
 
-    async fn refresh_live_inputs(
+    pub(super) async fn refresh_live_inputs(
         &mut self,
         job_id: JobId,
         set_name: &str,
     ) -> Result<(), RuntimeError> {
+        // Seeks run first: a child refused for a parent that cannot seek is an
+        // engine by the time this refresh opens gates.
+        self.note_engine_wants(job_id, set_name);
+        self.pull_nested_seeks(job_id, set_name);
         let Some(set) = self
             .direct_store
             .sets_mut(job_id)
@@ -87,49 +85,89 @@ impl Pipeline {
         if set.is_delegated() || !set.take_live_refresh() {
             return Ok(());
         }
-        let mut retired = std::collections::HashSet::new();
-        if let (Some(graph), Some(runtime)) =
-            (set.nested_graph(), self.archive_runtime.get(&job_id))
+        let Some((progress, working, destination)) = self.describe_namespace(job_id, set_name)
+        else {
+            return Ok(());
+        };
+        self.publish_scoped_namespace(job_id, set_name, progress, working, destination, None)
+            .await
+    }
+
+    // What a namespace's graph describes of its live producers and children
+    // now, with the roots its gates publish under: a direct-store root from
+    // its set, a decoded namespace from its state. A node under a replaced
+    // source no longer belongs to the namespace, so neither it nor anything
+    // beneath it is described.
+    pub(crate) fn describe_namespace(
+        &self,
+        job_id: JobId,
+        name: &str,
+    ) -> Option<(NamespaceProgress, PathBuf, PathBuf)> {
+        let runtime = self.archive_runtime.get(&job_id);
+        let (graph, progress, working, destination) = if let Some(set) = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .find(|set| set.plan().set_name == name)
         {
+            // Without nested authority the set has no graph to describe, and a
+            // demoted set's children are files again, opened by the scan.
+            if !set.has_nested_checkpoint_authority() || set.is_delegated() || set.is_demoted() {
+                return None;
+            }
+            let progress = NamespaceProgress {
+                producers: set.direct_producer_states(),
+                children: set.live_child_descriptions(),
+            };
+            let working = self.jobs.get(&job_id)?.working_dir.clone();
+            let destination = set.plan().destination_dir.clone();
+            (set.nested_graph(), progress, working, destination)
+        } else {
+            let (graph, progress, working, destination) = runtime?.describe_decoded(name)?;
+            (Some(graph), progress, working, destination)
+        };
+        let mut retired = std::collections::HashSet::new();
+        if let (Some(graph), Some(runtime)) = (graph, runtime) {
             for (index, node) in graph.nodes.iter().enumerate() {
                 let id = index as u32 + 1;
-                if retired.contains(&node.parent) || runtime.graph_source_replaced(set_name, id) {
+                if retired.contains(&node.parent) || runtime.graph_source_replaced(name, id) {
                     retired.insert(id);
                 }
             }
         }
-        let producers: Vec<_> = set
-            .direct_producer_states()
-            .into_iter()
-            .filter(|(node, _, _, _)| !retired.contains(node))
-            .collect();
-        if producers.is_empty() {
-            return Ok(());
-        }
-        let children: Vec<_> = set
-            .live_child_descriptions()
-            .into_iter()
-            .filter(|child| !retired.contains(&child.node))
-            .collect();
-        let destination = set.plan().destination_dir.clone();
-        let working = self
-            .jobs
-            .get(&job_id)
-            .ok_or(RuntimeError::Invariant("direct job"))?
-            .working_dir
-            .clone();
-        self.publish_scoped_namespace(
-            job_id,
-            set_name,
+        let NamespaceProgress {
+            mut producers,
+            mut children,
+        } = progress;
+        producers.retain(|producer| !retired.contains(&producer.node));
+        children.retain(|child| !retired.contains(&child.node));
+        Some((
             NamespaceProgress {
                 producers,
                 children,
             },
             working,
             destination,
-            None,
-        )
-        .await
+        ))
+    }
+
+    // Hands the set what each of its live child engines is blocked on, so the
+    // set can ask the engine's parents for those bytes.
+    fn note_engine_wants(&mut self, job_id: JobId, set_name: &str) {
+        let (Some(runtime), Some(set)) = (
+            self.archive_runtime.get(&job_id),
+            self.direct_store
+                .sets_mut(job_id)
+                .iter_mut()
+                .find(|set| set.plan().set_name == set_name),
+        ) else {
+            return;
+        };
+        for ((name, node), gate) in &runtime.gates {
+            if name == set_name {
+                set.note_engine_want(*node, gate.wanted());
+            }
+        }
     }
 
     pub(crate) async fn publish_scoped_namespace(
@@ -153,22 +191,72 @@ impl Pipeline {
         runtime
             .bind_namespace(set_name, &producers, &children)
             .await?;
+        let described: std::collections::HashSet<u32> =
+            children.iter().map(|child| child.node).collect();
         for child in children {
             self.open_child_gate(job_id, set_name, child, &destination, speculative)
                 .await?;
         }
+        self.archive_runtime
+            .get_mut(&job_id)
+            .ok_or(RuntimeError::Invariant("admitted archive runtime"))?
+            .retire_undescribed_held(set_name, &described);
         Box::pin(self.resume_scoped_replay(job_id)).await?;
-        for (node, _, _, verified) in producers {
-            if verified && !(speculative.is_some() && node == 0) {
-                self.close_scoped_graph_owner(job_id, set_name, node)
+        for producer in producers {
+            if producer.verified && !(speculative.is_some() && producer.node == 0) {
+                self.close_scoped_graph_owner(job_id, set_name, producer.node)
                     .await?;
             }
         }
         self.drain_repairs(job_id).await
     }
 
+    // A finished engine frees a slot no placement announces, so each
+    // namespace still holding a child is described again, which starts its
+    // held children in node order while slots remain.
+    pub(crate) async fn start_held_child_engines(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), RuntimeError> {
+        let cap = self.tuner.max_concurrent_extractions();
+        let Some(namespaces) = self
+            .archive_runtime
+            .get(&job_id)
+            .map(ArchiveRuntime::held_child_namespaces)
+        else {
+            return Ok(());
+        };
+        for namespace in namespaces {
+            let Some(runtime) = self.archive_runtime.get(&job_id) else {
+                return Ok(());
+            };
+            if runtime.live_child_engines().len() >= cap {
+                return Ok(());
+            }
+            if let Some(set) = self
+                .direct_store
+                .sets_mut(job_id)
+                .iter_mut()
+                .find(|set| set.plan().set_name == namespace)
+            {
+                set.request_live_refresh();
+                self.refresh_live_inputs(job_id, &namespace).await?;
+                continue;
+            }
+            let Some((children, destination)) = runtime.unstarted_decoded_children(&namespace)
+            else {
+                continue;
+            };
+            for child in children {
+                self.open_child_gate(job_id, &namespace, child, &destination, None)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     // Publishes the child's parts to its gate, and starts its extraction the
-    // first time the gate opens.
+    // first time the gate opens with a slot free.
     async fn open_child_gate(
         &mut self,
         job_id: JobId,
@@ -185,7 +273,7 @@ impl Pipeline {
             return Ok(());
         }
         let key = (set_name.to_owned(), child.node);
-        let fresh = !runtime.gates.contains_key(&key);
+        let fresh = !runtime.child_engine_started(set_name, child.node);
         let input = runtime.gates.entry(key).or_default().clone();
         input
             .publish(
@@ -197,14 +285,48 @@ impl Pipeline {
         if !fresh || runtime.has_replay_source(set_name, child.node) {
             return Ok(());
         }
+        // Only the decode waits for a slot: the parent writes a held child's
+        // bytes into its member all the same, so the download never slows.
+        let cap = self.tuner.max_concurrent_extractions();
+        if let ChildSlot::Held { first } = runtime.admit_child_engine(set_name, child.node, cap) {
+            if first {
+                tracing::debug!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    child = %child.set_name,
+                    node = child.node,
+                    live = runtime.live_child_engines().len(),
+                    "direct-store child archive held until a live engine finishes"
+                );
+            }
+            return Ok(());
+        }
         let lease = runtime
             .graph_lease(set_name, child.node, Some(child.parent), InputVersion(0))
             .map_err(RuntimeError::session("direct child admission"))?;
+        let child_node = child.node;
+        let child_set_name = child.set_name.clone();
+        // A stream node is an engine by its format, not by a verdict.
+        let child_reason = match (child.reason, child.format) {
+            (Some(reason), _) => reason.metric(),
+            (None, SetFormat::Stream(_)) => "stream",
+            (None, _) => "restored",
+        };
         let work = child_work(set_name, child, destination.to_owned());
         runtime.consumed.extend(work.input_names.iter().cloned());
         self.spawn_scoped_live_extraction(job_id, work, lease, input)
             .await
-            .map_err(RuntimeError::refused("child extraction spawn"))?;
+            .map_err(RuntimeError::during("child extraction spawn"))?;
+        // A streamed child and a materialized one deliver identical bytes, so
+        // this line is the only evidence outside the process of which it was.
+        tracing::info!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            child = %child_set_name,
+            node = child_node,
+            reason = child_reason,
+            "direct-store child archive streamed into a live engine"
+        );
         if let Some(parent) = speculative
             && let Some(runtime) = self.archive_runtime.get_mut(&job_id)
         {
@@ -213,12 +335,14 @@ impl Pipeline {
         Ok(())
     }
 
-    // Reports the failure as the sentence the job fails with.
+    // For a caller that fails the job with the sentence.
     pub(crate) async fn drain_scoped_repairs(&mut self, job_id: JobId) -> Result<(), String> {
-        self.drain_repairs(job_id).await.map_err(String::from)
+        self.drain_repairs(job_id)
+            .await
+            .map_err(|error| error.to_string())
     }
 
-    async fn drain_repairs(&mut self, job_id: JobId) -> Result<(), RuntimeError> {
+    pub(crate) async fn drain_repairs(&mut self, job_id: JobId) -> Result<(), RuntimeError> {
         let Some(runtime) = self.archive_runtime.get_mut(&job_id) else {
             return Ok(());
         };
@@ -239,13 +363,13 @@ impl Pipeline {
                 Default::default(),
             ))
             .await
-            .map_err(RuntimeError::refused("nested archive recovery"))?;
+            .map_err(RuntimeError::during("nested archive recovery"))?;
             if !changed {
                 if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
                     runtime.fail(owner);
                 }
-                return Err(RuntimeError::Invariant(
-                    "nested archive recovery could not change the failed input",
+                return Err(RuntimeError::RecoveryRefused(
+                    "could not change the failed input",
                 ));
             }
         }
@@ -339,14 +463,14 @@ impl Pipeline {
         self.commit_archive_graph(job_id).await
     }
 
-    // Reports the failure as the sentence the job fails with.
+    // For a caller that fails the job with the sentence.
     pub(crate) async fn replay_direct_archive_prefixes(
         &mut self,
         job_id: JobId,
     ) -> Result<(), String> {
         self.replay_archive_prefixes(job_id)
             .await
-            .map_err(String::from)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn replay_archive_prefixes(
@@ -428,6 +552,8 @@ impl Pipeline {
             let Some(plan) = set.prepare_nested_materialization() else {
                 return Ok(());
             };
+            let (node, reason) = (plan.node(), plan.materializes());
+            let set_name = set.plan().set_name.clone();
             let staging = set.plan().destination_dir.clone();
             let need = plan
                 .writes()
@@ -473,6 +599,16 @@ impl Pipeline {
                 ))?
                 .apply_nested_materialization(copied)
                 .map_err(RuntimeError::routing("nested materialization generation"))?;
+            // The decoded namespace logs the same line; see its materialization.
+            if let Some(reason) = reason {
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    node,
+                    reason = reason.metric(),
+                    "direct-store child archive materialized as a file"
+                );
+            }
             // Old descendant backings remain until a later retirement pass.
             self.commit_archive_graph(job_id).await?;
         }

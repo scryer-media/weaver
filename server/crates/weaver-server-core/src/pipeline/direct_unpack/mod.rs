@@ -57,31 +57,6 @@
 // cost is the decode done so far, not correctness. If pauses turn out to be
 // common on jobs large enough to chase, the fix is a quiesce-and-resume
 // barrier of the kind direct-store keeps, not a longer park.
-//
-// # Admission, when the controller arrives
-//
-// The controller that decides whether a set may be chased does not exist yet
-// (nothing outside this module reads [`DirectUnpackSettings`]). Three
-// constraints it has to honour, recorded here while the reasons are fresh:
-//
-// - **`next_header_size == 0` refuses admission.** A zero-length end header
-//   describes an archive with no entry table, so there is nothing to chase and
-//   the total length computed from the signature header would be the payload
-//   alone. Refuse and let the conventional path deal with whatever it is.
-//
-// - **The declared end-header size must be bounded against the extraction
-//   memory budget *before* `ArchiveReader::new` is called.** That size is
-//   attacker-controlled — it is a `u64` read straight out of the first 32 bytes
-//   of a file weaver fetched from a stranger — and the decoder buffers the end
-//   header to parse it. Checking it after the constructor has already
-//   allocated is checking nothing.
-//
-// - **The tail-prefetch target is a window, not
-//   [`StartHeader::end_header_range`].** The read-pattern tests show the
-//   decoder's first move is a probe near the end of the *packed* region: when a
-//   header is encoded or encrypted it is a packed stream of its own, sitting
-//   inside `packed_range()` rather than behind it. Prefetching only the plain
-//   end-header range would still leave that probe parked.
 
 pub mod coverage;
 pub(crate) mod decode_memory;
@@ -95,9 +70,9 @@ pub mod start_header;
 mod stream;
 pub(crate) mod wiring;
 
-pub use coverage::{PartProgress, PositionInPart, SetCoverage};
+pub use coverage::SetCoverage;
 pub use reader::GatedSplitReader;
-pub use settings::{DIRECT_UNPACK_ENV, DirectUnpackGate, DirectUnpackSettings};
+pub use settings::{DirectUnpackGate, DirectUnpackSettings};
 pub use start_header::{StartHeader, StartHeaderError};
 pub(crate) use stream::ChaseExpectedMembers;
 

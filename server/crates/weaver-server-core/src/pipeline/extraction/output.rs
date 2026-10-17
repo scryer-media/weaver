@@ -16,13 +16,15 @@ pub(crate) mod select;
 mod tests;
 
 /// Whether a member is itself an archive that a child engine decodes, rather
-/// than a leaf written straight to its destination.
+/// than a leaf written straight to its destination. A single-stream wrapper
+/// counts: its decoded output may be an archive in turn.
 pub(crate) fn routes_to_child_engine(path: &Path) -> bool {
     use weaver_model::files::FileRole;
+    let role = FileRole::from_filename(&path.to_string_lossy());
     matches!(
-        FileRole::from_filename(&path.to_string_lossy()),
+        role,
         FileRole::RarVolume { .. } | FileRole::SevenZipArchive | FileRole::SevenZipSplit { .. }
-    )
+    ) || crate::pipeline::direct_store::plan::StreamKind::from_role(&role).is_some()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

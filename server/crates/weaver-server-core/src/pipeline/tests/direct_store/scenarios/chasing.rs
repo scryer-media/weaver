@@ -456,6 +456,9 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
             "{name}"
         );
     }
+    // The installed chase leaves no nested archive behind it, so nothing may
+    // hold the source volume back from deletion and out of the delivery.
+    assert!(!output_root.join("mixed.rar").exists());
     assert_eq!(
         pipeline.direct_unpack.counters().consumed,
         u64::from(!invalidate_for_repair)

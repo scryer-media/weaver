@@ -2220,6 +2220,8 @@ fn every_demotion_reason_states_what_its_consumers_need() {
         // A refused *destination*, over a truthful image.
         DemotionReason::UnsafeDestination,
         DemotionReason::CollidingDestinations,
+        // A refused *source* order, over a truthful image.
+        DemotionReason::UnseekableParent,
     ];
     let real_files = [
         // Sealed headers: there is no layout to overlay.
@@ -2235,6 +2237,7 @@ fn every_demotion_reason_states_what_its_consumers_need() {
         DemotionReason::FormatMismatch,
         DemotionReason::UnparsableVolume,
         DemotionReason::UnsupportedFormat,
+        DemotionReason::NotAnArchive,
         DemotionReason::IdentityVolumeMismatch,
         // The overlay cannot answer for a range it claims.
         DemotionReason::EncryptedPostedBytesUnavailable,
@@ -2293,7 +2296,7 @@ fn every_demotion_reason_states_what_its_consumers_need() {
         "two demotion reasons in this table share a metric label"
     );
     assert_eq!(
-        total, 45,
+        total, 47,
         "a demotion reason was added or retired; classify it above and update this count"
     );
 }

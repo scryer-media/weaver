@@ -85,7 +85,7 @@ impl ArchiveRuntime {
     pub(crate) async fn bind_namespace(
         &mut self,
         set_name: &str,
-        producers: &[(u32, Option<u32>, u64, bool)],
+        producers: &[crate::pipeline::direct_store::set::ProducerState],
         children: &[crate::pipeline::direct_store::set::LiveChildDescription],
     ) -> Result<(), RuntimeError> {
         for child in children {
@@ -95,7 +95,7 @@ impl ArchiveRuntime {
         }
         let mut bindings: Vec<_> = producers
             .iter()
-            .map(|&(node, parent, _, _)| (node, parent))
+            .map(|producer| (producer.node, producer.parent))
             .chain(
                 children
                     .iter()
@@ -137,29 +137,6 @@ impl crate::pipeline::Pipeline {
 }
 
 impl ArchiveRuntime {
-    #[cfg(test)]
-    pub(crate) fn protects_input(&self, path: &std::path::Path) -> bool {
-        self.requests
-            .values()
-            .map(|request| &request.work)
-            .chain(self.completed.iter().map(|(_, work, _)| work))
-            .chain(self.retained_work.iter().map(|(_, work)| work))
-            .chain(self.replay.iter().map(|(_, work)| work))
-            .any(|work| {
-                work.original_inputs
-                    .iter()
-                    .chain(work.inputs.iter())
-                    .any(|input| input == path)
-            })
-            || self.staged_replacement.as_ref().is_some_and(|staged| {
-                staged
-                    .work
-                    .original_inputs
-                    .iter()
-                    .chain(staged.work.inputs.iter())
-                    .any(|input| input == path)
-            })
-    }
     pub(crate) fn retains_archive_set(&self, set_name: &str) -> bool {
         self.graph_owners.contains_key(&(set_name.to_owned(), 0))
             || self
@@ -178,46 +155,41 @@ impl crate::pipeline::Pipeline {
         &mut self,
         job_id: crate::jobs::ids::JobId,
     ) -> Result<(), RuntimeError> {
-        let restored: Vec<_> = self
-            .archive_runtime
-            .get(&job_id)
-            .map(|runtime| {
+        // A namespace describing a child its runtime has no gate for has not
+        // been published since the runtime was restored; publishing it opens
+        // the gate a parked replay reads through.
+        let Some(runtime) = self.archive_runtime.get(&job_id) else {
+            return Ok(());
+        };
+        let names: Vec<String> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .map(|set| set.plan().set_name.clone())
+            .chain(
                 runtime
                     .decoded
                     .iter()
-                    .filter_map(|state| {
-                        let decoded::NamespaceProgress {
-                            producers,
-                            children,
-                        } = state.progress_snapshot();
-                        let namespace = format!(
-                            "decoded-{}-{}",
-                            state.generation.owner().node,
-                            state.generation.owner().generation
-                        );
-                        children
-                            .iter()
-                            .any(|child| {
-                                !runtime.gates.contains_key(&(namespace.clone(), child.node))
-                            })
-                            .then_some((namespace, producers, children))
-                    })
-                    .collect()
+                    .map(|state| decoded::namespace_name(state.generation.owner())),
+            )
+            .collect();
+        let unpublished: Vec<_> = names
+            .into_iter()
+            .filter_map(|name| {
+                let described = self.describe_namespace(job_id, &name)?;
+                described
+                    .0
+                    .children
+                    .iter()
+                    .any(|child| !runtime.gates.contains_key(&(name.clone(), child.node)))
+                    .then_some((name, described))
             })
-            .unwrap_or_default();
-        for (namespace, producers, children) in restored {
-            let (working, destination) = self
-                .archive_runtime
-                .get(&job_id)
-                .and_then(|runtime| runtime.checkpoint_roots.clone())
-                .ok_or(RuntimeError::Invariant("restored namespace roots"))?;
+            .collect();
+        for (name, (progress, working, destination)) in unpublished {
             Box::pin(self.publish_scoped_namespace(
                 job_id,
-                &namespace,
-                decoded::NamespaceProgress {
-                    producers,
-                    children,
-                },
+                &name,
+                progress,
                 working,
                 destination,
                 None,
@@ -246,7 +218,7 @@ impl crate::pipeline::Pipeline {
         for (work, lease) in ready {
             self.spawn_scoped_selected_extraction(job_id, work, lease)
                 .await
-                .map_err(RuntimeError::refused("archive replay spawn"))?;
+                .map_err(RuntimeError::during("archive replay spawn"))?;
         }
         Ok(())
     }
@@ -395,7 +367,7 @@ impl crate::pipeline::Pipeline {
         job_id: crate::jobs::ids::JobId,
         owner: StreamOwner,
         namespace: String,
-        producers: Vec<(u32, Option<u32>, u64, bool)>,
+        producers: Vec<crate::pipeline::direct_store::set::ProducerState>,
         children: Vec<crate::pipeline::direct_store::set::LiveChildDescription>,
     ) {
         let Some(runtime) = self.archive_runtime.get_mut(&job_id) else {
@@ -434,13 +406,36 @@ impl crate::pipeline::Pipeline {
             }
             self.fail_job(
                 job_id,
-                format!("archive namespace streaming failed: {error}"),
+                RuntimeError::during("archive namespace streaming")(error).to_string(),
             );
         }
     }
 }
 
 impl ArchiveRuntime {
+    // A decoded namespace's graph, what it describes now, and the roots its
+    // gates publish under.
+    pub(crate) fn describe_decoded(
+        &self,
+        name: &str,
+    ) -> Option<(
+        &crate::pipeline::direct_store::nested::NestedGraph,
+        decoded::NamespaceProgress,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        let state = self
+            .decoded
+            .iter()
+            .find(|state| decoded::namespace_name(state.generation.owner()) == name)?;
+        let (working, destination) = self.checkpoint_roots.clone()?;
+        Some((
+            &state.graph,
+            state.progress_snapshot(),
+            working,
+            destination,
+        ))
+    }
     pub(crate) fn has_replay_source(&self, namespace: &str, node: u32) -> bool {
         self.replay.iter().any(|(_, work)| {
             work.virtual_source

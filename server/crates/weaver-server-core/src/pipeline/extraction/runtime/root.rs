@@ -113,12 +113,7 @@ impl Pipeline {
         runtime.set_roots(working.clone(), destination.clone());
         let lease = runtime.stream_lease(set_name, input.virtual_source())?;
         let owner = lease.owner;
-        let private = working
-            .join(crate::pipeline::direct_store::manifest::DIRECTORY)
-            .join(format!(
-                "namespace-{}-{}-{}",
-                owner.root, owner.node, owner.generation
-            ));
+        let private = decoded::private_root(&working, owner);
         let (sender, receiver) = tokio::sync::mpsc::channel(limits::FRAME_CHANNEL_DEPTH);
         let (channel, generation) = ChannelOutput::new(
             owner,
@@ -214,6 +209,8 @@ impl StreamInput {
                     .collect();
                 (kind, volumes, inputs, names, None)
             }
+            // Only a RAR volume run is ever virtual: the chase streams it from
+            // the direct store's routed bytes, and no other format has one.
             Self::Virtual { source, names } => (
                 crate::jobs::assembly::ArchiveType::Rar,
                 names.keys().copied().collect(),
@@ -271,7 +268,7 @@ impl RootDispatch {
             && stream_error.is_none()
             && let Some(state) = &mut state
         {
-            stream_error = Self::finish_stream(state, self.job_id, &self.event_tx, &self._lease)
+            stream_error = Self::finish_stream(state, &self.event_tx, &self._lease)
                 .await
                 .err();
         }
@@ -305,7 +302,7 @@ impl RootDispatch {
             };
             decoded.accept(frame).await?;
             decoded
-                .publish_progress(self.job_id, &self.event_tx, &self._lease)
+                .publish_progress(&self.event_tx, &self._lease)
                 .await?;
         }
     }
@@ -316,6 +313,7 @@ impl RootDispatch {
             .take()
             .ok_or(RuntimeError::Invariant("root session view"))?;
         decoded::DecodedState::new(
+            self.job_id,
             self.generation.clone(),
             sessions,
             self.plan.clone(),
@@ -327,12 +325,11 @@ impl RootDispatch {
 
     async fn finish_stream(
         state: &mut decoded::DecodedState,
-        job_id: JobId,
         event_tx: &tokio::sync::mpsc::Sender<ExtractionDone>,
         lease: &SessionLease,
     ) -> Result<(), RuntimeError> {
         state.close().await?;
-        state.publish_progress(job_id, event_tx, lease).await
+        state.publish_progress(event_tx, lease).await
     }
 }
 
@@ -389,10 +386,8 @@ impl Pipeline {
         kind: crate::jobs::assembly::ArchiveType,
     ) -> Result<ScopedMemberOutput, ExtractionError> {
         self.retire_unusable_root_stream(job_id, set_name).await?;
-        if let Some(sink) = self
-            .archive_runtime
-            .get_mut(&job_id)
-            .and_then(|runtime| runtime.sinks.get_mut(set_name))
+        if let Some(runtime) = self.archive_runtime.get_mut(&job_id)
+            && let Some(sink) = runtime.sinks.get_mut(set_name)
         {
             let occurrence = if let Some(index) = sink.members.get(member) {
                 *index
@@ -401,8 +396,10 @@ impl Pipeline {
                 sink.members.insert(member.to_owned(), index);
                 index
             };
+            let channel = sink.output.clone();
+            runtime.consumed.insert(member.to_owned());
             return Ok(ScopedMemberOutput {
-                channel: sink.output.clone(),
+                channel,
                 occurrence,
             });
         }
@@ -428,8 +425,11 @@ impl Pipeline {
             .ok_or(RuntimeError::Invariant("persistent archive request"))?
             .work
             .root_set = None;
+        // The member leaves its archive into this runtime, not onto disk:
+        // consumed, like every other archive input the runtime reads.
         let mut members = BTreeMap::new();
         members.insert(member.to_owned(), 0);
+        runtime.consumed.insert(member.to_owned());
         let (finish, finished) = tokio::sync::oneshot::channel();
         runtime.sinks.insert(
             set_name.to_owned(),
@@ -521,6 +521,9 @@ impl Pipeline {
                     extracted.remove(member);
                 }
             }
+            for member in sink.members.keys() {
+                runtime.consumed.remove(member);
+            }
             if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.to_owned())) {
                 for member in sink.members.keys() {
                     state.in_flight_members.remove(member);
@@ -560,22 +563,6 @@ impl ArchiveRuntime {
                 true
             }
         });
-    }
-    pub(crate) fn scoped_streamed_member(&self, set_name: &str, member: &str) -> bool {
-        self.sinks
-            .get(set_name)
-            .is_some_and(|sink| sink.members.contains_key(member))
-            || self.retained_work.iter().any(|(_, work)| {
-                work.set_name == set_name
-                    && self.decoded.iter().any(|state| {
-                        use crate::pipeline::extraction::catalog::MemberCatalog;
-                        state
-                            .catalog
-                            .members()
-                            .iter()
-                            .any(|fact| fact.name == member)
-                    })
-            })
     }
 }
 
@@ -725,5 +712,51 @@ mod tests {
         ));
         assert!(event_rx.try_recv().is_err());
         drop(output);
+    }
+
+    // A demoted set's conventional extractor streams the set again as a root.
+    // Retiring the direct namespace must leave nothing a later lease resumes.
+    #[tokio::test]
+    async fn root_stream_after_namespace_retirement_attaches_a_fresh_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = JobExtractionBudget::new(
+            Arc::new(crate::pipeline::extraction::ExtractionLimits {
+                max_job_bytes: 8192,
+                max_member_bytes: 8192,
+                max_entries: 32,
+                max_ratio: 100,
+                max_seconds: 60,
+                min_free_bytes: 1,
+                max_memory_bytes: 64 * 1024 * 1024,
+            }),
+            directory.path().to_owned(),
+            8192,
+            0,
+            0,
+            crate::operations::metrics::PipelineMetrics::new(),
+        )
+        .unwrap();
+        let mut runtime = ArchiveRuntime::new();
+        let direct = runtime
+            .graph_lease("archive", 0, None, InputVersion(0))
+            .unwrap()
+            .owner;
+        runtime
+            .graph_lease("archive", 1, Some(0), InputVersion(0))
+            .unwrap();
+        runtime.retire_graph_namespace("archive").await.unwrap();
+        let lease = runtime.stream_lease("archive", None).unwrap();
+        assert_ne!(lease.owner, direct);
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let (_output, generation) = ChannelOutput::new(
+            lease.owner,
+            budget.try_reserve_memory(4096).unwrap(),
+            sender,
+            tokio::runtime::Handle::current(),
+            Arc::clone(&budget),
+        )
+        .unwrap();
+        runtime.sessions.attach_channel(generation).unwrap();
+        assert_eq!(runtime.graph_owners[&("archive".into(), 0)], lease.owner);
     }
 }

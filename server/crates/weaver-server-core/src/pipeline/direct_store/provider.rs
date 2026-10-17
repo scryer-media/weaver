@@ -1,8 +1,8 @@
 // The hybrid virtual-volume provider.
 //
 // A direct set has no volume files, and several things downstream of routing
-// insist on reading one: PAR2 verification and repair, `extract_member_streaming`
-// for a tolerated member, and demotion's byte-exact reconstruction. This module
+// insist on reading one: PAR2 verification and repair, the tolerated-member
+// extraction, and demotion's byte-exact reconstruction. This module
 // is what gives them a volume to read.
 //
 // A virtual volume is an **overlay of two on-disk images in one coordinate

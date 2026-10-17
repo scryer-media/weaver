@@ -167,7 +167,7 @@ const READ_BACK_CHUNK_BYTES: usize = 256 * 1024;
 //
 // The bytes are carried as bounded, already reference-counted chunks rather
 // than one owned buffer, so handing them to
-// [`super::router::DirectSetRouter::route_repaired`] is a move into staging
+// [`super::router::DirectSetRouter::route_repaired_batch`] is a move into staging
 // rather than a second copy of the whole span. The `crc32` is still the whole
 // span's — the volume's yEnc composition is article-shaped and must be
 // rewritten at that granularity or [`super::set::DirectSet::note_repaired_volume_crcs`]
@@ -417,9 +417,9 @@ pub(crate) fn widen_to_articles(
 // block its first byte lands in **and** the 16 bytes before that block. During
 // a download both belong to the previous article and are staged beside it; a
 // repair runs long after that article's bytes were routed and dropped, so
-// without a lead-in the span has no predecessor at all — it holds, and
-// `route_repaired`'s "every repaired byte must find a destination" rule demotes
-// the whole set under `RepairRerouteFailed`.
+// without a lead-in the span has no predecessor at all — it holds, and the
+// router's "every repaired byte must find a destination" rule, checked when the
+// repair transaction finishes, demotes the whole set under `RepairRerouteFailed`.
 //
 // Two blocks is exactly enough for any alignment: the span's first byte sits at
 // most 15 bytes into its block, and that block's own predecessor is 16 more.
@@ -607,9 +607,10 @@ fn create_absent_repair_targets(
 // Called per volume rather than for the whole set, and its result routed and
 // dropped before the next volume is read, so a repair's resident cost is one
 // volume's rewrite plus one chunk — never the whole set's, and never twice
-// over. Taking a *whole volume* at a time is not incidental either: the router
-// needs all of one volume's spans in a single `route_repaired` call, or a span
-// staged before its volume's end record would be held rather than routed.
+// over. Taking a *whole volume* at a time is not incidental either: the repair
+// transaction takes each volume's rewrite as one closing `route_repaired_batch`
+// and then moves on to the next volume, so all of one volume's spans must go in
+// that single call.
 pub(crate) fn read_repaired_spans(
     volume: &DamagedDirectVolume,
     cipher_lead_in: bool,

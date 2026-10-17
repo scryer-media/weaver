@@ -96,7 +96,7 @@ async fn retained_placement_fixture(
             entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".weaver-placement-")
+                .starts_with(crate::pipeline::direct_store::plan::PLACEMENT_JOURNAL_PREFIX)
         })
         .unwrap()
         .path();

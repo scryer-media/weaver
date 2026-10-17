@@ -97,6 +97,7 @@ impl DirectSetRouter {
         let have = match self.plan.format {
             SetFormat::Rar => self.volume_facts.contains_key(&volume_index),
             SetFormat::SevenZip => self.declared_volume_sizes.contains_key(&volume_index),
+            SetFormat::Stream(_) => false,
         };
         if have {
             self.dirty_facts.insert(volume_index);
@@ -130,8 +131,13 @@ impl DirectSetRouter {
         facts: &BTreeMap<u32, DirectVolumeFacts>,
         retained: bool,
     ) -> Result<(), DemotionReason> {
-        if self.plan.format == SetFormat::SevenZip {
-            return self.restore_sevenz_layout(facts);
+        match self.plan.format {
+            SetFormat::SevenZip => return self.restore_sevenz_layout(facts),
+            // A stream has no layout, so a cached row under one describes
+            // some other archive.
+            SetFormat::Stream(_) if facts.is_empty() => return Ok(()),
+            SetFormat::Stream(_) => return Err(self.fail(DemotionReason::ConflictingVolumeFacts)),
+            SetFormat::Rar => {}
         }
         self.rekey_restored_header_encryption(facts)?;
         for (volume_index, volume_facts) in facts {
@@ -459,6 +465,8 @@ impl DirectSetRouter {
         // volumes stay unconfirmed until the refetched tail parses.
         let confirmed = match self.plan.format {
             SetFormat::SevenZip => self.layout.is_some(),
+            // A stream is never routed, so there is nothing to confirm.
+            SetFormat::Stream(_) => false,
             SetFormat::Rar => restored_volume_is_confirmed(
                 covered,
                 decoded_len,
@@ -645,6 +653,8 @@ impl DirectSetRouter {
         match self.plan.format {
             SetFormat::Rar => self.volume_facts.keys().copied().collect(),
             SetFormat::SevenZip => self.declared_volume_sizes.keys().copied().collect(),
+            // A stream has no layout and therefore no facts.
+            SetFormat::Stream(_) => Default::default(),
         }
     }
 

@@ -49,6 +49,8 @@ pub(crate) enum RuntimeError {
     CoordinatorClosed,
     // Two namespaces claimed one output path.
     OutputCollision(String),
+    // A namespace catalogued an output whose backing is not on disk.
+    MissingOutput(String),
     // A piece of runtime state the step depends on is absent or contradicts
     // the step. Names the state.
     Invariant(&'static str),
@@ -57,6 +59,15 @@ pub(crate) enum RuntimeError {
     Refused {
         step: &'static str,
         reason: String,
+    },
+    // Namespace recovery would not trust or could not afford an input or an
+    // output. Names the check that refused.
+    RecoveryRefused(&'static str),
+    // A phase of the job owner's work failed; the cause names the step inside
+    // it that met the failure.
+    Phase {
+        phase: &'static str,
+        source: Box<RuntimeError>,
     },
 }
 
@@ -88,6 +99,13 @@ impl RuntimeError {
         }
     }
 
+    pub(crate) fn during(phase: &'static str) -> impl FnOnce(RuntimeError) -> Self {
+        move |source| Self::Phase {
+            phase,
+            source: Box::new(source),
+        }
+    }
+
     // The class the pipeline routes this failure by.
     pub(crate) fn class(&self) -> ExtractionErrorClass {
         match self {
@@ -97,6 +115,7 @@ impl RuntimeError {
                 ..
             } => ExtractionErrorClass::StaleTopology,
             Self::Extraction(error) => error.class(),
+            Self::Phase { source, .. } => source.class(),
             Self::Session { .. }
             | Self::Routing { .. }
             | Self::Io { .. }
@@ -105,8 +124,10 @@ impl RuntimeError {
             | Self::Admission(_)
             | Self::CoordinatorClosed
             | Self::OutputCollision(_)
+            | Self::MissingOutput(_)
             | Self::Invariant(_)
-            | Self::Refused { .. } => ExtractionErrorClass::Terminal,
+            | Self::Refused { .. }
+            | Self::RecoveryRefused(_) => ExtractionErrorClass::Terminal,
         }
     }
 }
@@ -131,8 +152,13 @@ impl fmt::Display for RuntimeError {
                     "archive output collides with another namespace: {path}"
                 )
             }
+            Self::MissingOutput(path) => write!(formatter, "archive output has no backing: {path}"),
             Self::Invariant(state) => write!(formatter, "archive runtime invariant: {state}"),
             Self::Refused { step, reason } => write!(formatter, "{step}: {reason}"),
+            Self::RecoveryRefused(check) => {
+                write!(formatter, "namespace recovery refused: {check}")
+            }
+            Self::Phase { phase, source } => write!(formatter, "{phase} failed: {source}"),
         }
     }
 }
@@ -145,13 +171,16 @@ impl std::error::Error for RuntimeError {
             Self::Join { source, .. } => Some(source),
             Self::Checkpoint { source, .. } => Some(source),
             Self::Extraction(error) => Some(error),
+            Self::Phase { source, .. } => Some(source.as_ref()),
             Self::Routing { .. }
             | Self::Revoked
             | Self::Admission(_)
             | Self::CoordinatorClosed
             | Self::OutputCollision(_)
+            | Self::MissingOutput(_)
             | Self::Invariant(_)
-            | Self::Refused { .. } => None,
+            | Self::Refused { .. }
+            | Self::RecoveryRefused(_) => None,
         }
     }
 }
@@ -208,6 +237,16 @@ mod tests {
         ] {
             assert!(ExtractionError::from(error).is(ExtractionErrorClass::Terminal));
         }
+    }
+
+    #[test]
+    fn a_phase_keeps_its_cause_class_and_names_both_steps() {
+        let error = RuntimeError::during("archive checkpoint")(RuntimeError::Revoked);
+        assert_eq!(
+            error.to_string(),
+            "archive checkpoint failed: archive owner revoked"
+        );
+        assert!(ExtractionError::from(error).is(ExtractionErrorClass::StaleTopology));
     }
 
     #[test]

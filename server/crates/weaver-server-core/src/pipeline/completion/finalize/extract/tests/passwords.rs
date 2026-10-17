@@ -125,13 +125,6 @@ async fn prepared_sevenz_password_selection_streams_only_the_validated_attempt()
         }
         let result = worker.await.unwrap();
         assert!(!out.join("synthetic.mkv").exists());
-        if password.is_some() && wrong_first {
-            assert!(result.is_err());
-            assert!(generation.is_revoked());
-            assert_eq!(declarations, 0);
-            assert!(bytes.is_empty());
-            continue;
-        }
         let result = result.unwrap();
         catalog.close().unwrap();
         assert!(!generation.is_revoked());
@@ -312,8 +305,11 @@ fn sevenzip_stream_records_only_a_validated_password() {
     }
 }
 
+// A 7z key is never checked on its own, so a wrong first candidate fails
+// as damage would. It must still yield to the next candidate, and the only
+// output written is the one the winning key produced.
 #[test]
-fn sevenzip_ambiguous_integrity_stops_before_output() {
+fn sevenzip_wrong_first_candidate_yields_to_the_right_one() {
     for header in [false, true] {
         let bytes = sevenzip(Some("synthetic-right"), header);
         let output = TempDir::new().unwrap();
@@ -323,10 +319,87 @@ fn sevenzip_ambiguous_integrity_stops_before_output() {
             context,
             &candidates(["synthetic-wrong".into(), "synthetic-right".into()]),
             || Ok(Cursor::new(bytes.clone())),
+        )
+        .unwrap_or_else(|error| panic!("header={header}: {error}"));
+        assert_eq!(result.selected_password.as_deref(), Some("synthetic-right"));
+        assert_eq!(
+            fs::read(output.path().join("synthetic.mkv")).unwrap(),
+            b"synthetic archive member"
         );
-        assert!(result.is_err());
+    }
+}
+
+#[test]
+fn sevenzip_every_candidate_wrong_stops_before_output() {
+    for header in [false, true] {
+        let bytes = sevenzip(Some("synthetic-right"), header);
+        let output = TempDir::new().unwrap();
+        let (root, budget) = test_extraction_security(output.path());
+        let context = conventional_7z_context(output.path(), root, budget, &bytes, 1);
+        let error = extract_7z_with_password_candidates(
+            context,
+            &candidates(["synthetic-wrong".into(), "synthetic-worse".into()]),
+            || Ok(Cursor::new(bytes.clone())),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("header={header}: wrong keys opened the archive"));
+        // A wrong key fails as damage would, listing an encrypted header or
+        // decoding under a clear one. Whether that garbage reads as a data
+        // error or as nothing in particular depends on the bytes, so either
+        // verdict is honest; a terminal one is not.
+        assert!(
+            error.is(ExtractionErrorClass::PasswordRequired)
+                || error.is(ExtractionErrorClass::Recoverable),
+            "header={header}: {error}"
+        );
+        // Either way the verdict says the passwords were tried and refuted,
+        // so a data error is never reported as damage alone. The phrase must
+        // reach the job's failure reason whichever class the garbage
+        // produced, since that reason is all a job's reader sees.
+        assert!(error.refuted_password(), "header={header}: {error}");
+        for reported in [error.to_string(), error.job_failure_reason()] {
+            assert!(
+                reported.contains("no supplied password could decrypt"),
+                "header={header}: {reported}"
+            );
+        }
         assert!(!output.path().join("synthetic.mkv").exists());
     }
+}
+
+// Damage behind the right key of an encrypted header. The key lists the
+// header, so it is proven, and its decode failure is the data's: the verdict
+// is a data error whichever way the candidates are ordered, and never a
+// password one.
+#[test]
+fn sevenzip_damage_behind_a_listed_key_is_the_datas() {
+    let mut bytes = sevenzip(Some("synthetic-right"), true);
+    // Past the 32-byte signature header lies the member's packed stream.
+    bytes[40] ^= 0xFF;
+    let mut verdicts = Vec::new();
+    for order in [
+        ["synthetic-right", "synthetic-wrong"],
+        ["synthetic-wrong", "synthetic-right"],
+    ] {
+        let output = TempDir::new().unwrap();
+        let (root, budget) = test_extraction_security(output.path());
+        let context = conventional_7z_context(output.path(), root, budget, &bytes, 1);
+        let error = extract_7z_with_password_candidates(
+            context,
+            &candidates(order.iter().map(|value| value.to_string())),
+            || Ok(Cursor::new(bytes.clone())),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{order:?}: damaged data decoded"));
+        assert!(
+            error.is(ExtractionErrorClass::Recoverable),
+            "{order:?}: {error}"
+        );
+        assert!(!error.refuted_password(), "{order:?}: {error}");
+        assert!(!output.path().join("synthetic.mkv").exists());
+        verdicts.push(error.class());
+    }
+    assert_eq!(verdicts[0], verdicts[1]);
 }
 
 #[test]

@@ -121,7 +121,7 @@ async fn a_stale_alias_set_with_no_live_claimants_retires_instead_of_failing() {
     let extracted = pipeline.extract_rar_set(job_id, alias).await;
     assert_eq!(
         extracted.map_err(String::from),
-        Ok(0),
+        Ok(()),
         "retirement is not a failure"
     );
     assert!(
@@ -242,7 +242,7 @@ async fn a_claimed_alias_set_the_job_already_extracted_is_absorbed_not_reschedul
             .extract_rar_set(job_id, alias)
             .await
             .map_err(String::from),
-        Ok(0),
+        Ok(()),
         "a job whose content is already delivered is not failed over a second name for it"
     );
     assert!(
@@ -318,7 +318,7 @@ async fn a_claimed_alias_set_this_job_never_materialized_is_absorbed() {
             .extract_rar_set(job_id, alias)
             .await
             .map_err(String::from),
-        Ok(0)
+        Ok(())
     );
     assert!(
         pipeline
@@ -375,7 +375,7 @@ async fn a_claimed_alias_set_is_absorbed_on_persisted_facts_after_a_restart() {
             .extract_rar_set(job_id, alias)
             .await
             .map_err(String::from),
-        Ok(0)
+        Ok(())
     );
     assert!(
         pipeline
@@ -554,7 +554,7 @@ async fn a_claimed_set_with_genuinely_missing_volumes_fails_once_instead_of_loop
             .extract_rar_set(job_id, alias)
             .await
             .map_err(String::from),
-        Ok(0)
+        Ok(())
     );
     assert!(
         !pipeline

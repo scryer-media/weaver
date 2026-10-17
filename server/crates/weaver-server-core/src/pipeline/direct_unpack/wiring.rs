@@ -54,9 +54,12 @@ use super::settings::{DirectUnpackGate, DirectUnpackSettings};
 use super::start_header::{SIGNATURE_HEADER_LEN, StartHeader};
 use crate::jobs::ids::JobId;
 use crate::pipeline::Pipeline;
+use crate::pipeline::completion::finalize::extract::sequential::{
+    SequentialExtractionContext, extract_sequential,
+};
 use crate::pipeline::completion::finalize::extract::{
-    SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream, extract_7z_to,
-    extract_zip_stream_candidates,
+    SevenZipDecodeMemory, SevenZipExtractionContext, SevenZipKey, extract_7z_stream, extract_7z_to,
+    extract_zip_stream_candidates, sevenz_key,
 };
 use crate::pipeline::extraction::ExtractionRoot;
 use crate::pipeline::{ExtractionError, FullSetExtractionOutcome};
@@ -1328,7 +1331,7 @@ impl Pipeline {
             }
         }
 
-        let password = self.primary_archive_password_for_job(job_id);
+        let passwords = self.archive_password_candidates_for_job(job_id).candidates;
         let boost_paths = paths.clone();
         let counters = Arc::new(crate::jobs::PhaseCounters::default());
         let positional = Arc::new(std::sync::Mutex::new(None));
@@ -1402,7 +1405,7 @@ impl Pipeline {
             Arc::clone(&coverage),
             output_dir.clone(),
             Arc::clone(&budget),
-            password,
+            passwords,
             Arc::clone(&counters),
             format,
             channel,
@@ -1513,13 +1516,16 @@ impl Pipeline {
             .min(TAIL_WINDOW_MAX);
         let window_start = total_len.saturating_sub(window);
 
-        let mut targets: HashSet<crate::jobs::ids::SegmentId> = HashSet::new();
+        // Each part is one volume of the archive, and the window's share of a
+        // part runs from wherever the window opens in it to the part's end.
+        let mut files = std::collections::BTreeMap::new();
+        let mut seeks = Vec::new();
         {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
             let mut part_start = 0u64;
-            for path in paths {
+            for (volume, path) in (0u32..).zip(paths) {
                 let Some(file_id) = self.direct_unpack_file_id_for_part(job_id, path) else {
                     return;
                 };
@@ -1527,33 +1533,18 @@ impl Pipeline {
                     return;
                 };
                 let part_end = part_start.saturating_add(file.total_bytes());
-
                 if part_end > window_start {
-                    let local_from = window_start.saturating_sub(part_start);
-                    for segment_number in 0..file.total_segments() {
-                        if let Some((_, to)) = file.segment_bounds(segment_number)
-                            && to > local_from
-                        {
-                            targets.insert(crate::jobs::ids::SegmentId {
-                                file_id,
-                                segment_number,
-                            });
-                        }
-                    }
+                    files.insert(volume, file_id.file_index);
+                    seeks.push(crate::pipeline::direct_store::nested::seek::Seek {
+                        volume,
+                        range: window_start.saturating_sub(part_start)..u64::MAX,
+                    });
                 }
                 part_start = part_end;
             }
         }
 
-        if targets.is_empty() {
-            return;
-        }
-        let Some(state) = self.jobs.get_mut(&job_id) else {
-            return;
-        };
-        let boosted = state
-            .download_queue
-            .reprioritize_matching(|work| targets.contains(&work.segment_id).then_some(2));
+        let boosted = self.pull_seeks(job_id, &files, &seeks);
         if boosted > 0 {
             debug!(
                 job_id = job_id.0,
@@ -2000,7 +1991,7 @@ impl Pipeline {
         coverage: Arc<SetCoverage>,
         output_dir: PathBuf,
         budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
-        password: Option<String>,
+        passwords: Vec<crate::jobs::ArchivePasswordCandidate>,
         counters: Arc<crate::jobs::PhaseCounters>,
         format: ChaseFormat,
         channel: Option<crate::pipeline::extraction::output::channel::ChannelOutput>,
@@ -2062,18 +2053,25 @@ impl Pipeline {
                     coverage
                         .resolve_position(0, 0)
                         .map_err(|error| error.to_string())?;
-                    let pw = password
-                        .as_ref()
-                        .map_or_else(sevenz_turbo::Password::empty, |value| {
-                            sevenz_turbo::Password::new(value)
-                        });
+                    let mut open_reader = || {
+                        GatedSplitReader::open(&paths, Arc::clone(&coverage))
+                            .map(|reader| {
+                                std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader)
+                            })
+                            .map_err(|error| {
+                                ExtractionError::from_io(
+                                    format!("failed to open 7z direct-unpack reader: {error}"),
+                                    &error,
+                                )
+                            })
+                    };
                     let (silent_events, _) = tokio::sync::broadcast::channel(1);
-                    let context = SevenZipExtractionContext {
+                    let mut context = SevenZipExtractionContext {
                         job_id,
                         set_name,
                         root,
                         budget: Arc::clone(&budget),
-                        password: pw,
+                        password: sevenz_turbo::Password::empty(),
                         event_tx: silent_events,
                         phase_counters: counters,
                         decode_memory: SevenZipDecodeMemory::ReservedPerPass {
@@ -2081,6 +2079,23 @@ impl Pipeline {
                             widening,
                         },
                         decode_threads,
+                    };
+                    // An encrypted header lists only under its key, so the
+                    // candidate that lists it is the one to chase with. A
+                    // clear header lists under any key and only decoding the
+                    // data could refute one, which a chase cannot do before
+                    // it writes, so it takes the first candidate and leaves
+                    // the rest to the full-set path.
+                    context.password = match sevenz_key(&context, &passwords, &mut open_reader)? {
+                        SevenZipKey::Unneeded => sevenz_turbo::Password::empty(),
+                        SevenZipKey::Proven { candidate, .. } => {
+                            sevenz_turbo::Password::new(candidate.value())
+                        }
+                        SevenZipKey::Unproven(candidates) => candidates
+                            .first()
+                            .map_or_else(sevenz_turbo::Password::empty, |candidate| {
+                                sevenz_turbo::Password::new(candidate.value())
+                            }),
                     };
                     // A positional chase writes every member in place. With a
                     // stream attached, child archives belong to it instead, so
@@ -2105,18 +2120,6 @@ impl Pipeline {
                     )? {
                         return Ok(outcome);
                     }
-                    let open_reader = || {
-                        GatedSplitReader::open(&paths, Arc::clone(&coverage))
-                            .map(|reader| {
-                                std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader)
-                            })
-                            .map_err(|error| {
-                                ExtractionError::from_io(
-                                    format!("failed to open 7z direct-unpack reader: {error}"),
-                                    &error,
-                                )
-                            })
-                    };
                     pp_pool.install(|| {
                         if let Some(channel) = &channel {
                             let output = manifest.select(
@@ -2147,6 +2150,9 @@ impl Pipeline {
                 }
                 return outcome;
             }
+            let password = passwords
+                .first()
+                .map(|candidate| candidate.value().to_owned());
             let queued_at = Instant::now();
             let log_job = job_id;
             let log_set = set_name.clone();
@@ -2249,22 +2255,6 @@ impl Pipeline {
                         );
                     }
                     if let ChaseFormat::Sequential(kind) = format {
-                        use crate::pipeline::completion::finalize::extract::sequential::{
-                            SequentialExtractionContext, decoder_memory_bytes,
-                            extract_sequential_stream,
-                        };
-                        let _memory_permit = budget.reserve_memory_wait(decoder_memory_bytes(
-                            kind,
-                            paths.first().map(|path| path.as_path()),
-                            budget.max_memory_bytes(),
-                        )?)?;
-                        let reader =
-                            GatedSplitReader::open_sequential(&paths, Arc::clone(&coverage))
-                                .map_err(|error| {
-                                    format!(
-                                        "failed to open sequential direct-unpack reader: {error}"
-                                    )
-                                })?;
                         let (silent_events, _) = tokio::sync::broadcast::channel(1);
                         let context = SequentialExtractionContext {
                             kind,
@@ -2275,10 +2265,7 @@ impl Pipeline {
                             job_id,
                             set_name: &set_name,
                         };
-                        let extracted = extract_sequential_stream(
-                            std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader),
-                            &context,
-                        )?;
+                        let extracted = extract_gated_sequential(&paths, &coverage, &context)?;
                         let mut bytes = 0u64;
                         for name in &extracted {
                             let metadata =
@@ -2475,7 +2462,6 @@ impl Pipeline {
     // Every path that ends a download reaches this: without it a worker parks
     // on bytes that are never coming and the thread leaks for the life of the
     // process.
-    // End every chase belonging to `job_id`.
     //
     // Synchronous on purpose. Most of the paths that end a download are
     // themselves synchronous — the job-removal seam, the per-file breaker —
@@ -4341,6 +4327,29 @@ fn read_signature_header(path: &std::path::Path) -> std::io::Result<Option<[u8; 
     Ok(Some(bytes))
 }
 
+// Decodes a sequential set through the gated reader. A single stream that
+// outgrows its reservation decodes again over a reader opened from the start,
+// which parks where the first one did until the download commits more.
+fn extract_gated_sequential(
+    paths: &[PathBuf],
+    coverage: &Arc<SetCoverage>,
+    context: &SequentialExtractionContext<'_>,
+) -> Result<Vec<String>, ExtractionError> {
+    extract_sequential(
+        || {
+            GatedSplitReader::open_sequential(paths, Arc::clone(coverage))
+                .map(|reader| std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader))
+                .map_err(|error| {
+                    ExtractionError::from_io(
+                        format!("failed to open sequential direct-unpack reader: {error}"),
+                        &error,
+                    )
+                })
+        },
+        context,
+    )
+}
+
 // A set name is archive-derived, so it is not trusted as a path component.
 fn sanitize_set_dir_name(set_name: &str) -> String {
     let cleaned: String = set_name
@@ -4431,5 +4440,91 @@ mod opening_tests {
         commit(&mut file, 0, 0, 20);
         commit(&mut file, 1, 24, 96);
         assert_eq!(committed_opening_len(&file, 32), 20);
+    }
+}
+
+#[cfg(test)]
+mod sequential_chase_tests {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::{SequentialExtractionContext, SetCoverage, extract_gated_sequential};
+    use crate::jobs::ids::JobId;
+    use crate::pipeline::PipelineMetrics;
+    use crate::pipeline::completion::finalize::SimpleArchiveKind;
+    use crate::pipeline::extraction::{ExtractionLimits, ExtractionRoot, JobExtractionBudget};
+
+    fn patterned(len: usize, seed: u32) -> Vec<u8> {
+        (0..len as u32)
+            .map(|index| (index.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect()
+    }
+
+    fn zstd_frame(bytes: &[u8], window_log: u32) -> Vec<u8> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.window_log(window_log).unwrap();
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    // A chased zstd whose second frame asks for a wider window than its first
+    // header declared decodes again from the start through a fresh gated
+    // reader, and what the first decode wrote is written once.
+    #[test]
+    fn a_chased_zstd_frame_past_the_first_frames_window_decodes_again_under_its_own() {
+        let first = patterned(4096, 1);
+        let second = patterned(1 << 21, 2);
+        let stream = [zstd_frame(&first, 10), zstd_frame(&second, 24)].concat();
+        let directory = tempfile::tempdir().unwrap();
+        let part = directory.path().join("payload.bin.zst");
+        std::fs::write(&part, &stream).unwrap();
+        let output = directory.path().join("out");
+        std::fs::create_dir(&output).unwrap();
+
+        let coverage = Arc::new(SetCoverage::new(1));
+        coverage.set_total_len(stream.len() as u64);
+        coverage.note_part_len(0, stream.len() as u64);
+        coverage.mark_part_complete(0);
+        let budget = JobExtractionBudget::new(
+            Arc::new(ExtractionLimits {
+                max_job_bytes: 1 << 40,
+                max_member_bytes: 1 << 40,
+                max_entries: 1000,
+                max_ratio: 1_000_000,
+                max_seconds: 43_200,
+                min_free_bytes: 1,
+                max_memory_bytes: 1 << 30,
+            }),
+            output.clone(),
+            1 << 30,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let root = ExtractionRoot::open(&output).unwrap();
+        let (event_tx, _) = tokio::sync::broadcast::channel(1);
+        let paths: Vec<PathBuf> = vec![part.clone()];
+
+        let extracted = extract_gated_sequential(
+            &paths,
+            &coverage,
+            &SequentialExtractionContext {
+                kind: SimpleArchiveKind::Zstd,
+                archive_path: &part,
+                root: &root,
+                budget: &budget,
+                event_tx: &event_tx,
+                job_id: JobId(1),
+                set_name: "payload",
+            },
+        )
+        .expect("the second frame's window is within the ceiling");
+
+        assert_eq!(extracted, ["payload.bin"]);
+        let decoded = [first, second].concat();
+        assert_eq!(std::fs::read(output.join("payload.bin")).unwrap(), decoded);
+        assert_eq!(budget.total_written(), decoded.len() as u64);
     }
 }

@@ -10,8 +10,18 @@ use super::super::sparse::{SparseMarker, SparseMarking};
 use super::placement::MemberPlacement;
 use crate::pipeline::extraction::runtime::limits::MATERIALIZATION_PERMIT_BYTES;
 
+// The bytes a node that left direct mode owes its parent's member file.
+//
+// A direct child reads its parent member's bytes off the stream instead of
+// letting them land, so when it stops routing, the bytes it holds exist
+// nowhere its successor can read: a pending node's file is incomplete, and an
+// engine's gate serves only placed bytes. Copying them into the parent member
+// settles both. The pending node then *is* that file; the engine keeps
+// reading what its parent member holds.
 pub(crate) struct Materialization {
     node: u32,
+    // Why the node becomes a file, or `None` when its engine keeps reading.
+    reason: Option<DemotionReason>,
     generation: u64,
     root_epoch: catalog::NamespaceEpoch,
     lineage: Vec<(u32, u64)>,
@@ -29,6 +39,15 @@ struct InputCopy {
 }
 
 impl Materialization {
+    pub(crate) fn node(&self) -> u32 {
+        self.node
+    }
+
+    // The reason the node lands as a file, or `None` when an engine reads it.
+    pub(crate) fn materializes(&self) -> Option<DemotionReason> {
+        self.reason
+    }
+
     // Admit every physical write before dispatching the blocking copy. The
     // worker consumes this exact frozen range plan, never a later live view.
     pub(crate) fn writes(&self) -> impl Iterator<Item = (&std::path::Path, MemberPlacement)> {
@@ -87,9 +106,11 @@ impl NestedGraph {
     ) -> Option<Materialization> {
         self.validate_root(root).ok()?;
         let node = self.checked_node(id).ok()?;
-        if !matches!(node.mode, NodeMode::MaterializationPending(_)) {
-            return None;
-        }
+        let reason = match node.mode {
+            NodeMode::MaterializationPending(reason) => Some(reason),
+            NodeMode::Engine => None,
+            NodeMode::Direct | NodeMode::Materialized => return None,
+        };
         let parent = self.catalog(root, node.parent);
         let inputs = self
             .input_views(root, id)
@@ -110,8 +131,14 @@ impl NestedGraph {
                 })
             })
             .collect::<Option<Vec<_>>>()?;
+        // An engine's node owes nothing once its holds have landed; a pending
+        // node still becomes a file.
+        if reason.is_none() && inputs.iter().all(|input| input.ranges.is_empty()) {
+            return None;
+        }
         Some(Materialization {
             node: id,
+            reason,
             generation: node.generation,
             root_epoch: self.root_epoch?,
             lineage: self.materialization_lineage(id).ok()?,
@@ -140,9 +167,14 @@ impl NestedGraph {
             return Err(DemotionReason::ConflictingVolumeFacts);
         }
         let node = self.checked_node(result.node)?;
-        if node.generation != result.generation
-            || !matches!(node.mode, NodeMode::MaterializationPending(_))
-        {
+        let becomes_file = match node.mode {
+            NodeMode::MaterializationPending(_) => true,
+            NodeMode::Engine => false,
+            NodeMode::Direct | NodeMode::Materialized => {
+                return Err(DemotionReason::ConflictingVolumeFacts);
+            }
+        };
+        if node.generation != result.generation {
             return Err(DemotionReason::ConflictingVolumeFacts);
         }
         let parent = node.parent;
@@ -197,9 +229,12 @@ impl NestedGraph {
                     .map(|sources| (receipt, sources))
             })
             .collect::<Result<_, _>>()?;
-        let node = self.node_mut(result.node);
-        node.generation = next_generation;
-        node.mode = NodeMode::Materialized;
+        // An engine keeps its generation: the gate it reads was opened on it.
+        if becomes_file {
+            let node = self.node_mut(result.node);
+            node.generation = next_generation;
+            node.mode = NodeMode::Materialized;
+        }
         Ok(applied)
     }
 }
