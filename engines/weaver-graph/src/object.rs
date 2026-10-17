@@ -41,7 +41,6 @@ impl Kind {
     pub fn engine_for(self) -> Option<Kind> {
         match self {
             Kind::RarStore => Some(Kind::RarEngine),
-            Kind::SevenZipStore => Some(Kind::SevenZipEngine),
             _ => None,
         }
     }

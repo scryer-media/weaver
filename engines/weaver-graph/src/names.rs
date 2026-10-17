@@ -28,6 +28,7 @@ impl NameLedger {
     // again for the same member returns the same name. A member that asks
     // for a different name moves to it and releases the old one.
     pub fn allocate(&mut self, member: MemberId, wanted: &str) -> String {
+        let wanted = &confined(wanted);
         if let Some(held) = self.given.get(&member)
             && held.eq_ignore_ascii_case(wanted)
         {
@@ -65,6 +66,25 @@ impl NameLedger {
             .find(|candidate| free(candidate))
             .expect("an unbounded counter finds a free name")
     }
+}
+
+// A name an archive gave, kept inside the folder it is written under: either
+// separator splits it, and empty, `.` and `..` parts are dropped, so a path
+// can neither climb out nor start at the root. A trailing separator, which
+// names a directory, is kept.
+fn confined(wanted: &str) -> String {
+    let parts: Vec<&str> = wanted
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+        .collect();
+    if parts.is_empty() {
+        return "_".to_owned();
+    }
+    let mut name = parts.join("/");
+    if wanted.ends_with(['/', '\\']) {
+        name.push('/');
+    }
+    name
 }
 
 // "subs.srt" -> ("subs", ".srt"); "archive.tar.gz" -> ("archive.tar", ".gz");
@@ -106,6 +126,16 @@ mod tests {
             "show.part01.rar"
         );
         assert_eq!(ledger.allocate(MemberId(2), "3f9a.bin"), "3f9a.bin");
+    }
+
+    #[test]
+    fn a_name_cannot_climb_out_or_start_at_the_root() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(ledger.allocate(MemberId(1), "../../etc/a.bin"), "etc/a.bin");
+        assert_eq!(ledger.allocate(MemberId(2), "/abs\\b.bin"), "abs/b.bin");
+        assert_eq!(ledger.allocate(MemberId(3), "deep/./dir\\"), "deep/dir/");
+        assert_eq!(ledger.allocate(MemberId(4), ".."), "_");
+        assert_eq!(ledger.allocate(MemberId(5), "plain.bin"), "plain.bin");
     }
 
     #[test]

@@ -477,25 +477,14 @@ fn directory_members_and_empty_members_exist_once_announced() {
     assert_eq!(job.file("extras/inner.txt"), b"hi");
 }
 
+// The ledger confines every name to the working dir: a name that would
+// climb out is written under the part of it that stays inside.
 #[test]
-fn a_name_that_would_escape_the_working_dir_is_refused() {
+fn a_name_that_would_escape_the_working_dir_is_confined() {
     let mut job = Job::new(PLENTY);
     let member = job.tree.announce_root("../escape.txt", Some(2));
-    let arrival = Arrival {
-        node: NodeId::ROOT,
-        member,
-        offset: 0,
-        bytes: Bytes::from_static(b"no"),
-        provenance: Provenance::Fresh,
-    };
-    let mut build = job.build();
-    let result = job
-        .writer
-        .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out);
-    assert!(matches!(
-        result,
-        Err(WriteError::Leaf(LeafError::UnsafeName(_)))
-    ));
+    job.send(member, 0, b"no", Provenance::Fresh);
+    assert_eq!(job.file("escape.txt"), b"no");
 }
 
 #[test]

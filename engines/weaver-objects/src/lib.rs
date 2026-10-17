@@ -6,13 +6,18 @@
 // faces; nothing outside a format's own module knows its fields. The graph
 // asks for an object by kind through `build`.
 
+pub mod crypt;
 pub mod engine;
 mod grid;
+pub mod keys;
 pub mod par2;
 pub mod par3;
 pub mod rar_engine;
 pub mod sevenz_engine;
+pub mod sevenz_store;
 pub mod sfv;
+pub mod zip;
+pub mod zip_engine;
 
 #[cfg(test)]
 mod testing;
@@ -26,7 +31,10 @@ pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         Kind::Par3 => Some(Box::new(par3::Par3::new(id))),
         Kind::RarEngine => Some(Box::new(rar_engine::RarEngine::new())),
         Kind::SevenZipEngine => Some(Box::new(sevenz_engine::SevenZipEngine::new())),
+        Kind::SevenZipStore => Some(Box::new(sevenz_store::SevenZipStore::new())),
         Kind::Sfv => Some(Box::new(sfv::Sfv::new(id))),
+        Kind::Zip => Some(Box::new(zip::Zip::new())),
+        Kind::ZipEngine => Some(Box::new(zip_engine::ZipEngine::new())),
         _ => None,
     }
 }

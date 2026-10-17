@@ -200,9 +200,10 @@ fn the_stand_in_builds_the_engine_for_each_store() {
     for kind in [Kind::RarStore, Kind::SevenZipStore, Kind::Par2] {
         assert!(builder.build(kind, ObjectId(1)).is_none());
     }
+    // The 7z store streams, so it is built as itself.
     assert_eq!(
         builder.0.0,
-        vec![Kind::RarEngine, Kind::SevenZipEngine, Kind::Par2]
+        vec![Kind::RarEngine, Kind::SevenZipStore, Kind::Par2]
     );
 }
 

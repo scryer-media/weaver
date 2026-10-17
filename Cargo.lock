@@ -6066,6 +6066,7 @@ dependencies = [
 name = "weaver-objects"
 version = "0.15.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "crc-fast",
  "par2-rs",
@@ -6075,6 +6076,7 @@ dependencies = [
  "thiserror 2.0.21",
  "unrar-rs",
  "weaver-graph",
+ "zeroize",
 ]
 
 [[package]]
