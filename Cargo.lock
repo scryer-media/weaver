@@ -6100,6 +6100,7 @@ dependencies = [
  "bytes",
  "bzip2",
  "cap-fs-ext",
+ "cap-primitives",
  "cap-std",
  "chrono",
  "crc-fast",
