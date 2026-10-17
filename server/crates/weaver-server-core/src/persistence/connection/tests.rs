@@ -58,6 +58,7 @@ fn current_schema_version() -> i64 {
 
 fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
     ActiveJob {
+        engine: crate::pipeline::graph::Engine::Classic,
         job_id,
         nzb_hash: [0xA5; 32],
         nzb_path: PathBuf::from(format!("/tmp/postgres-{}.nzb", job_id.0)),
@@ -2812,6 +2813,7 @@ async fn postgres_runtime_smoke_when_configured() {
 
     let job_id = crate::jobs::ids::JobId(42);
     db.create_active_job(&ActiveJob {
+        engine: crate::pipeline::graph::Engine::Classic,
         job_id,
         nzb_hash: [0xA5; 32],
         nzb_path: PathBuf::from("/tmp/postgres-smoke.nzb"),
@@ -3206,4 +3208,69 @@ async fn execute_schema_ddl(pool: &sqlx::PgPool, sql: String) {
 fn postgres_url_for_schema(base_url: &str, schema: &str) -> String {
     let separator = if base_url.contains('?') { '&' } else { '?' };
     format!("{base_url}{separator}options=-csearch_path%3D{schema}")
+}
+
+// Every job row carries the engine it was admitted under, and a finished job
+// keeps it in history. Shared by the sqlite and Postgres tests so both
+// datastores are held to the same three statements.
+fn assert_engine_stamp_round_trips(db: &Database) {
+    use crate::pipeline::graph::Engine;
+
+    let classic = crate::jobs::ids::JobId(6501);
+    let graph = crate::jobs::ids::JobId(6502);
+    db.create_active_job(&postgres_sample_job(classic)).unwrap();
+    db.create_active_job(&ActiveJob {
+        engine: Engine::Graph,
+        ..postgres_sample_job(graph)
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.load_active_job_engine(classic).unwrap(),
+        Some(Engine::Classic)
+    );
+    assert_eq!(
+        db.load_active_job_engine(graph).unwrap(),
+        Some(Engine::Graph)
+    );
+    assert_eq!(
+        db.load_active_job_engine(crate::jobs::ids::JobId(6599))
+            .unwrap(),
+        None
+    );
+
+    db.archive_job(classic, &postgres_sample_history(classic))
+        .unwrap();
+    db.archive_job(graph, &postgres_sample_history(graph))
+        .unwrap();
+    assert_eq!(db.load_active_job_engine(graph).unwrap(), None);
+    assert_eq!(
+        db.load_job_history_engine(classic).unwrap(),
+        Some(Engine::Classic)
+    );
+    assert_eq!(
+        db.load_job_history_engine(graph).unwrap(),
+        Some(Engine::Graph)
+    );
+}
+
+#[test]
+fn engine_stamp_round_trips_on_sqlite() {
+    let db = Database::open_in_memory().unwrap();
+    assert_engine_stamp_round_trips(&db);
+}
+
+#[tokio::test]
+async fn engine_stamp_round_trips_on_postgres_when_configured() {
+    let Some((admin_pool, schema, target_url)) = create_postgres_test_schema("engine_stamp").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    assert_engine_stamp_round_trips(&db);
+
+    drop(db);
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
+    admin_pool.close().await;
 }

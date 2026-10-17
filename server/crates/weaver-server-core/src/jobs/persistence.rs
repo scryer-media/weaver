@@ -596,6 +596,7 @@ impl Database {
                 self.encryption_key(),
                 &job.supplied_password_candidates,
             )?),
+            SqlArg::Text(job.engine.as_str().to_string()),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_active_job", |tx| {
@@ -603,8 +604,8 @@ impl Database {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO active_jobs
-                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates, engine)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                         &args,
                     )
                     .await?;
@@ -648,6 +649,7 @@ impl Database {
                 self.encryption_key(),
                 &job.supplied_password_candidates,
             )?),
+            SqlArg::Text(job.engine.as_str().to_string()),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -659,8 +661,8 @@ impl Database {
                     Box::pin(async move {
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates, engine)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -766,6 +768,7 @@ impl Database {
                 self.encryption_key(),
                 &job.supplied_password_candidates,
             )?),
+            SqlArg::Text(job.engine.as_str().to_string()),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -881,8 +884,8 @@ impl Database {
                         .await?;
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates, engine)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -3399,6 +3402,7 @@ mod tests {
 
     fn sample_active_job(id: u64) -> ActiveJob {
         ActiveJob {
+            engine: crate::pipeline::graph::Engine::Classic,
             job_id: JobId(id),
             nzb_hash: [0xAA; 32],
             nzb_path: PathBuf::from(format!("/tmp/queue_order_test_{id}.nzb")),

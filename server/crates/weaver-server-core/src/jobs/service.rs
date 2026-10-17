@@ -715,6 +715,7 @@ impl Pipeline {
 
         stage_start = std::time::Instant::now();
         let active_job = crate::ActiveJob {
+            engine: crate::pipeline::graph::Engine::Classic,
             job_id,
             nzb_hash,
             nzb_path,
@@ -1236,6 +1237,7 @@ impl Pipeline {
 
             self.db
                 .create_active_job(&crate::ActiveJob {
+                    engine: crate::pipeline::graph::Engine::Classic,
                     job_id,
                     nzb_hash,
                     nzb_path,

@@ -89,6 +89,7 @@ fn execute_sql(db: &Database, sql: &'static str) {
 
 fn sample_active_job(id: u64) -> ActiveJob {
     ActiveJob {
+        engine: crate::pipeline::graph::Engine::Classic,
         job_id: JobId(id),
         nzb_hash: [0xBC; 32],
         nzb_path: PathBuf::from(format!("/tmp/job-{id}.nzb")),

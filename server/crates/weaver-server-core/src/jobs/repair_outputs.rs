@@ -199,6 +199,7 @@ mod tests {
 
     fn job() -> ActiveJob {
         ActiveJob {
+            engine: crate::pipeline::graph::Engine::Classic,
             job_id: JobId(1),
             nzb_hash: [3; 32],
             nzb_path: "input.nzb".into(),

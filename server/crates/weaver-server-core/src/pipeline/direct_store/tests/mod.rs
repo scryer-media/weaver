@@ -382,6 +382,7 @@ fn segment(segment_number: u32) -> SegmentId {
 
 fn direct_active_job() -> crate::ActiveJob {
     crate::ActiveJob {
+        engine: crate::pipeline::graph::Engine::Classic,
         job_id: JOB,
         nzb_hash: [0xAA; 32],
         nzb_path: std::path::PathBuf::from("/tmp/silver-horizon.nzb"),

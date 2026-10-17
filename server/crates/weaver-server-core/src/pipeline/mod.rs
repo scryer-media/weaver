@@ -13,6 +13,7 @@ mod direct_store;
 pub mod direct_unpack;
 pub mod download;
 mod extraction;
+pub mod graph;
 mod health;
 mod infrastructure_retry;
 pub(crate) mod integrity;

@@ -49,6 +49,7 @@ fn sentinel_nzb() -> Vec<u8> {
 
 fn active_job(id: u64) -> ActiveJob {
     ActiveJob {
+        engine: crate::pipeline::graph::Engine::Classic,
         job_id: JobId(id),
         nzb_hash: [0x11; 32],
         nzb_path: PathBuf::from(format!("/srv/{SENTINEL}/{id}.nzb")),

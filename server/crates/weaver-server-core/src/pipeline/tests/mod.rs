@@ -1928,6 +1928,7 @@ async fn insert_active_job_with_persisted_nzb_named(
     pipeline
         .db
         .create_active_job(&crate::ActiveJob {
+            engine: crate::pipeline::graph::Engine::Classic,
             job_id,
             nzb_hash: [0; 32],
             nzb_path: working_dir.join(&nzb_file_name),

@@ -488,6 +488,7 @@ mod tests {
 
     fn sample_active_job(id: u64, nzb_path: PathBuf, output_dir: PathBuf) -> ActiveJob {
         ActiveJob {
+            engine: crate::pipeline::graph::Engine::Classic,
             job_id: JobId(id),
             nzb_hash: [0xAA; 32],
             nzb_path,

@@ -282,6 +282,7 @@ impl Database {
                 }
             };
             self.create_active_job(&ActiveJob {
+                engine: crate::pipeline::graph::Engine::Classic,
                 job_id: job.job_id,
                 nzb_hash: [0; 32], // hash not stored in journal entries after creation
                 nzb_path: job.nzb_path.clone(),

@@ -265,6 +265,15 @@ async fn archive_job_sql(
                     ],
                 )
                 .await?;
+                // History keeps the engine the job ran on. A job with no
+                // active row left keeps the engine its history row has.
+                tx.execute(
+                    "UPDATE job_history
+                        SET engine = COALESCE((SELECT engine FROM active_jobs WHERE job_id = {}), engine)
+                      WHERE job_id = {}",
+                    &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(job_id.0 as i64)],
+                )
+                .await?;
                 replace_job_history_attributes_tx(tx, row).await?;
                 crate::jobs::duplicate_persistence::transition_duplicate_snapshot_for_history_tx(
                     tx,

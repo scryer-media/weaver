@@ -79,6 +79,7 @@ fn sample_nzb_zstd() -> Vec<u8> {
 
 fn sample_job(id: u64) -> ActiveJob {
     ActiveJob {
+        engine: crate::pipeline::graph::Engine::Classic,
         job_id: JobId(id),
         nzb_hash: [0xAA; 32],
         nzb_path: PathBuf::from(format!("/tmp/test_{id}.nzb")),

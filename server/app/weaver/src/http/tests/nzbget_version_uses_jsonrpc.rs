@@ -2625,6 +2625,7 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         vec![],
     );
     db.create_active_job(&weaver_server_core::ActiveJob {
+        engine: weaver_server_core::pipeline::graph::Engine::Classic,
         job_id: JobId(55),
         nzb_hash: [7u8; 32],
         nzb_path: "/tmp/weaver/nzb/55.nzb".into(),
@@ -4112,6 +4113,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
     let xml = minimal_nzb("Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR");
     let nzb_zstd = weaver_server_core::ingest::compress_nzb_bytes(xml.as_bytes()).unwrap();
     db.create_active_job(&weaver_server_core::ActiveJob {
+        engine: weaver_server_core::pipeline::graph::Engine::Classic,
         job_id: JobId(10_000),
         nzb_hash: weaver_server_core::ingest::hash_persisted_nzb_bytes(&nzb_zstd),
         nzb_path: std::path::PathBuf::from("Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR.nzb"),
