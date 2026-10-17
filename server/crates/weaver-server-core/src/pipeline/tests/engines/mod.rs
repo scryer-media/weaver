@@ -23,6 +23,7 @@
 //     .damaged(file, ordinal)     that article arrives with a checksum
 //                                 mismatch and corrupted bytes
 //     .lost(file, ordinal)        every server lacks that article
+//     .password(secret)           the password the job is submitted with
 //   run_both(&scenario)           -> (classic Outcome, graph Outcome)
 //   run(&scenario, engine)        -> Outcome, for divergence tests
 //   assert_same(&classic, &graph) the same status, failure kind, delivered
@@ -55,4 +56,7 @@ mod divergence;
 mod harness;
 mod plain_par2;
 mod sets;
+mod sevenz;
 mod sfv;
+mod streams;
+mod zip;

@@ -31,7 +31,6 @@ use super::root::phase::{self, RootPhase};
 use super::root::sample;
 use super::root::source::Move;
 use super::root::{ArticleRoot, Ask};
-use super::stand_in::EnginesForStores;
 use crate::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
@@ -99,20 +98,20 @@ impl GraphJob {
         storage: Storage,
     ) -> Option<Self> {
         (engine == Engine::Graph).then(|| {
+            let runs = Runs::new(
+                scope,
+                storage.slots,
+                storage.mail,
+                Arc::clone(&storage.accountant),
+            );
             let writer = NamespaceWriter::new(
                 scope,
                 storage.working_dir,
                 storage.accountant,
                 storage.free_disk,
             );
-            let runs = Runs::new(scope, storage.slots, storage.mail);
-            Self::new(
-                files,
-                Box::new(EnginesForStores(weaver_objects::Objects)),
-                writer,
-                runs,
-            )
-            .offering(storage.passwords)
+            Self::new(files, Box::new(weaver_objects::Objects), writer, runs)
+                .offering(storage.passwords)
         })
     }
 
@@ -256,7 +255,9 @@ impl GraphJob {
         self.root.map.take_moves()
     }
 
-    pub(crate) fn intake(&mut self, decoded: Decoded) -> Result<(), GraphError> {
+    // `limit` is the slot limit the pipeline reads now, which every step
+    // that asks or frees a run follows.
+    pub(crate) fn intake(&mut self, decoded: Decoded, limit: usize) -> Result<(), GraphError> {
         let volume = decoded.volume;
         let member = MemberId(volume.0);
         let length = decoded.length;
@@ -276,15 +277,20 @@ impl GraphJob {
         self.heard(out)?;
         self.mark_damage()?;
         self.after_member(volume)?;
-        self.step_runs()
+        self.step_runs(Vec::new(), limit)
     }
 
     // Every server failed the article; nothing will fetch it again.
-    pub(crate) fn lost(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
+    pub(crate) fn lost(
+        &mut self,
+        volume: VolumeIndex,
+        ordinal: u32,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         self.root.map.lost(volume, ordinal);
         self.mark_damage()?;
         self.after_member(volume)?;
-        self.step_runs()
+        self.step_runs(Vec::new(), limit)
     }
 
     // After an article of `volume` was settled: a member with nothing left
@@ -419,6 +425,18 @@ impl GraphJob {
         sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
         let mut wants = Vec::new();
         self.tree.collect_wants(&mut wants);
+        let mut held = Vec::new();
+        for (node, seek) in &wants {
+            self.writer.seek_held(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                *node,
+                *seek,
+                &mut held,
+            )?;
+        }
+        self.heard(held)?;
         let mut asks = Vec::new();
         let mut lifted = Vec::with_capacity(wants.len());
         for (node, seek) in wants {

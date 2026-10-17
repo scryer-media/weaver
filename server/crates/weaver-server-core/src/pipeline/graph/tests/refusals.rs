@@ -70,19 +70,20 @@ fn refusing(mode: Mode, count: u32, candidates: &[&str]) -> Refusing {
     };
     let (offers, starts) = (Arc::clone(&fakes.offers), Arc::clone(&fakes.starts));
     let dir = tempfile::tempdir().unwrap();
+    let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit: u64::MAX,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    }));
     let writer = NamespaceWriter::new(
         1,
         dir.path().to_path_buf(),
-        Arc::new(HoldsAccountant::new(HoldBudgets {
-            resident_limit: u64::MAX,
-            scratch_total: u64::MAX,
-            scratch_ceiling: u64::MAX,
-            disk_reserve: 0,
-        })),
+        Arc::clone(&accountant),
         CapacityReader::unknown(),
     );
     let mail = RunMail::default();
-    let runs = Runs::new(1, 1, mail.sender());
+    let runs = Runs::new(1, 1, mail.sender(), accountant);
     let job = GraphJob::new(&files, Box::new(fakes), writer, runs).offering(
         candidates
             .iter()
@@ -103,16 +104,19 @@ impl Refusing {
     fn deliver(&mut self, volume: u32) {
         let bytes = &self.volumes[volume as usize];
         self.job
-            .intake(Decoded {
-                volume: VolumeIndex(volume),
-                ordinal: 0,
-                offset: 0,
-                bytes: Bytes::copy_from_slice(bytes),
-                intact: true,
-                positioned: true,
-                length: Some(bytes.len() as u64),
-                segments: Vec::new(),
-            })
+            .intake(
+                Decoded {
+                    volume: VolumeIndex(volume),
+                    ordinal: 0,
+                    offset: 0,
+                    bytes: Bytes::copy_from_slice(bytes),
+                    intact: true,
+                    positioned: true,
+                    length: Some(bytes.len() as u64),
+                    segments: Vec::new(),
+                },
+                1,
+            )
             .unwrap();
     }
 
@@ -128,7 +132,7 @@ impl Refusing {
             let said = self.mail.recv().await.unwrap();
             let ended = matches!(said.heard, Heard::Ended)
                 && self.job.runs().current(said.node, said.generation);
-            self.job.run_said(said).unwrap();
+            self.job.run_said(said, 1).unwrap();
             if ended {
                 return;
             }
@@ -139,7 +143,7 @@ impl Refusing {
     async fn until_refused(&mut self, member: u32) {
         while self.refused(member).is_none() {
             let said = self.mail.recv().await.unwrap();
-            self.job.run_said(said).unwrap();
+            self.job.run_said(said, 1).unwrap();
         }
     }
 

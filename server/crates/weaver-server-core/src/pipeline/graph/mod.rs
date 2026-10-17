@@ -13,7 +13,6 @@ pub(crate) mod leaf;
 pub(crate) mod limits;
 pub(crate) mod namespace;
 pub(crate) mod root;
-pub(crate) mod stand_in;
 pub(crate) mod status;
 
 use std::fmt;

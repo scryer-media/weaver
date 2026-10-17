@@ -6,22 +6,21 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+use weaver_graph::holds::{HoldBudgets, HoldsAccountant, HoldsNamespace};
 use weaver_graph::{
-    Builder, ByteRange, Extraction, Kind, MemberId, NodeId, Object, ObjectId, Provenance, Seek,
-    Sink, VolumeIndex, Volumes, Weight,
+    ByteRange, Extraction, MemberId, NodeId, Provenance, Seek, Sink, VolumeIndex, Volumes, Weight,
+    Why,
 };
 
 use super::echo::{Echoes, HEADER, SIGNATURE};
 use super::volumes::{RunVolumes, Unreadable};
-use super::{Heard, RunMail, Runs};
+use super::{Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::envelope::{Envelopes, Shelf};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::graph::stand_in::EnginesForStores;
 
 const NODE: NodeId = NodeId(7);
 const FIRST: VolumeIndex = VolumeIndex(0);
@@ -161,60 +160,163 @@ impl Extraction for Quiet {
     fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>) {}
 }
 
+fn unbounded() -> Arc<HoldsAccountant> {
+    bounded(u64::MAX)
+}
+
+fn bounded(resident_limit: u64) -> Arc<HoldsAccountant> {
+    Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    }))
+}
+
 #[tokio::test]
 async fn a_run_takes_a_slot_and_the_next_queues_behind_the_limit() {
     let dir = tempfile::tempdir().unwrap();
     let mut envelopes = Envelopes::new(dir.path().to_path_buf());
     let mut mail = RunMail::default();
-    let mut runs = Runs::new(1, 1, mail.sender());
+    let mut runs = Runs::new(1, 1, mail.sender(), unbounded());
     let (first, second) = (NodeId(1), NodeId(2));
-    assert!(runs.ask(first));
-    assert!(!runs.ask(second), "one slot, and the first holds it");
+    assert_eq!(runs.ask(first, 1), vec![first]);
+    assert!(
+        runs.ask(second, 1).is_empty(),
+        "one slot, and the first holds it"
+    );
     runs.start(first, Box::new(Quiet), envelopes.shelf(first));
     assert!(runs.live());
 
     let said = mail.recv().await.unwrap();
     assert_eq!(said.node, first);
     assert!(matches!(said.heard, Heard::Ended));
-    assert_eq!(runs.ended(first, said.generation), vec![second]);
+    assert_eq!(runs.ended(first, said.generation, 1), vec![second]);
     assert!(runs.live(), "the second holds the slot and has yet to run");
 
     runs.start(second, Box::new(Quiet), envelopes.shelf(second));
     let said = mail.recv().await.unwrap();
     assert_eq!(said.node, second);
-    assert!(runs.ended(second, said.generation).is_empty());
+    assert!(runs.ended(second, said.generation, 1).is_empty());
     assert!(!runs.live());
 }
 
+// Three runs hold the three slots and a fourth waits. The limit falls to
+// one: no holder is stopped, the first two to end admit no one, and the
+// third to end admits the waiter, so the job is never left holding fewer
+// runs than the limit allows while one waits.
 #[test]
-fn the_stand_in_builds_the_engine_for_each_store() {
-    #[derive(Default)]
-    struct Asked(Vec<Kind>);
-    impl Builder for Asked {
-        fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
-            self.0.push(kind);
-            None
-        }
+fn lowering_the_limit_wakes_the_next_waiter_with_no_held_child_left_behind() {
+    let mut runs = Runs::new(1, 3, RunMail::default().sender(), unbounded());
+    let nodes: Vec<NodeId> = (1..=4).map(NodeId).collect();
+    for node in &nodes[..3] {
+        assert_eq!(runs.ask(*node, 3), vec![*node]);
     }
-    let mut builder = EnginesForStores(Asked::default());
-    for kind in [Kind::RarStore, Kind::SevenZipStore, Kind::Par2] {
-        assert!(builder.build(kind, ObjectId(1)).is_none());
-    }
-    // The 7z store streams, so it is built as itself.
+    assert!(runs.ask(nodes[3], 3).is_empty(), "the fourth waits");
+
+    assert!(runs.ended(nodes[0], 0, 1).is_empty(), "two still hold");
+    assert!(runs.ended(nodes[1], 0, 1).is_empty(), "one still holds");
     assert_eq!(
-        builder.0.0,
-        vec![Kind::RarEngine, Kind::SevenZipStore, Kind::Par2]
+        runs.ended(nodes[2], 0, 1),
+        vec![nodes[3]],
+        "the last holder's release is the first under the new limit"
     );
+    assert_eq!(runs.holding(), vec![nodes[3]]);
+    assert!(runs.ended(nodes[3], 0, 1).is_empty());
+    assert!(runs.holding().is_empty());
+    assert!(!runs.live());
 }
 
-// A graph job of echo volumes, one article each, read by echo engines
-// through the stand-in.
+// A raised limit admits the waiters at once, handed back with the asker's
+// own admission so the pipeline starts them in the same step.
+#[test]
+fn raising_the_limit_admits_the_waiters_in_the_same_step() {
+    let mut runs = Runs::new(1, 1, RunMail::default().sender(), unbounded());
+    let nodes: Vec<NodeId> = (1..=4).map(NodeId).collect();
+    assert_eq!(runs.ask(nodes[0], 1), vec![nodes[0]]);
+    assert!(runs.ask(nodes[1], 1).is_empty());
+    assert!(runs.ask(nodes[2], 1).is_empty());
+    assert_eq!(runs.ask(nodes[3], 4), vec![nodes[1], nodes[2], nodes[3]]);
+    assert_eq!(runs.holding(), nodes);
+}
+
+// The reservation is the declared window and the fixed overhead, exactly,
+// both on the run and against the accountant. Asking again with a wider
+// window, as a restart would, takes nothing more; the end gives back all
+// of it.
+#[test]
+fn memory_reserved_is_the_declared_window_plus_the_fixed_overhead_and_never_grows() {
+    const WINDOW: u64 = 3 << 20;
+    let accountant = unbounded();
+    let mut runs = Runs::new(1, 1, RunMail::default().sender(), Arc::clone(&accountant));
+    let node = NodeId(5);
+    let namespace = HoldsNamespace { scope: 1, node };
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(runs.reserve(node, WINDOW), Reservation::Granted);
+    assert_eq!(runs.reserved(node), WINDOW + RUN_OVERHEAD);
+    assert_eq!(
+        accountant.namespace_usage(namespace).resident,
+        WINDOW + RUN_OVERHEAD
+    );
+
+    assert_eq!(runs.reserve(node, 4 * WINDOW), Reservation::Granted);
+    assert_eq!(runs.reserved(node), WINDOW + RUN_OVERHEAD, "it never grows");
+    assert_eq!(accountant.usage().resident, WINDOW + RUN_OVERHEAD);
+
+    runs.ended(node, 0, 1);
+    assert_eq!(runs.reserved(node), 0);
+    assert_eq!(accountant.usage().resident, 0);
+    assert_eq!(accountant.usage().namespaces, 0);
+}
+
+// A reservation that does not fit beside what is resident gives the slot
+// to the next waiter and waits; once resident bytes are released it asks
+// again, through the same release that frees a slot.
+#[test]
+fn a_window_that_does_not_fit_yields_its_slot_and_asks_again_once_memory_is_released() {
+    const WINDOW: u64 = 1 << 20;
+    let accountant = bounded(2 * (WINDOW + RUN_OVERHEAD));
+    let mut runs = Runs::new(1, 2, RunMail::default().sender(), Arc::clone(&accountant));
+    let (first, second, third) = (NodeId(1), NodeId(2), NodeId(3));
+    assert_eq!(runs.ask(first, 2), vec![first]);
+    assert_eq!(runs.reserve(first, WINDOW), Reservation::Granted);
+    assert_eq!(runs.ask(second, 2), vec![second]);
+    assert!(runs.ask(third, 2).is_empty(), "the third waits for a slot");
+    // The second wants a byte more than is left.
+    assert_eq!(
+        runs.reserve(second, WINDOW + 1),
+        Reservation::Starved(vec![third]),
+        "the second's slot goes to the third"
+    );
+    assert_eq!(runs.holding(), vec![first, third]);
+    assert_eq!(runs.reserved(second), 0);
+    assert!(runs.live(), "a starved run is still the job's to finish");
+
+    // The first's end releases its reservation: the second asks again and
+    // takes the slot the first held.
+    assert_eq!(runs.ended(first, 0, 2), vec![second]);
+    assert_eq!(runs.reserve(second, WINDOW + 1), Reservation::Granted);
+    assert_eq!(runs.reserved(second), WINDOW + 1 + RUN_OVERHEAD);
+}
+
+// A reservation larger than the resident limit itself can never fit.
+#[test]
+fn a_window_larger_than_the_resident_limit_is_refused() {
+    let mut runs = Runs::new(1, 1, RunMail::default().sender(), bounded(RUN_OVERHEAD));
+    let node = NodeId(1);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(runs.reserve(node, 1), Reservation::Refused);
+    assert_eq!(runs.reserved(node), 0);
+}
+
+// A graph job of echo volumes, one article each, read by echo engines.
 struct Echoing {
     job: GraphJob,
     mail: RunMail,
     bids: Arc<Mutex<Vec<Seek>>>,
     volumes: Vec<Vec<u8>>,
     dir: tempfile::TempDir,
+    accountant: Arc<HoldsAccountant>,
 }
 
 // The body of volume `index`: bytes no format sniffs as its own, a length
@@ -226,6 +328,11 @@ fn body(index: u32) -> Vec<u8> {
 }
 
 fn echoing(count: u32) -> Echoing {
+    echoing_within(count, 0, unbounded())
+}
+
+// Echo volumes whose engine declares `window`, reserved against `accountant`.
+fn echoing_within(count: u32, window: u64, accountant: Arc<HoldsAccountant>) -> Echoing {
     let volumes: Vec<Vec<u8>> = (0..count)
         .map(|index| {
             let mut volume = if index == 0 {
@@ -248,29 +355,26 @@ fn echoing(count: u32) -> Echoing {
     let echoes = Echoes {
         volumes: count,
         bids: Arc::default(),
+        window,
     };
     let bids = Arc::clone(&echoes.bids);
     let dir = tempfile::tempdir().unwrap();
     let writer = NamespaceWriter::new(
         1,
         dir.path().to_path_buf(),
-        Arc::new(HoldsAccountant::new(HoldBudgets {
-            resident_limit: u64::MAX,
-            scratch_total: u64::MAX,
-            scratch_ceiling: u64::MAX,
-            disk_reserve: 0,
-        })),
+        Arc::clone(&accountant),
         CapacityReader::unknown(),
     );
     let mail = RunMail::default();
-    let runs = Runs::new(1, 1, mail.sender());
-    let job = GraphJob::new(&files, Box::new(EnginesForStores(echoes)), writer, runs);
+    let runs = Runs::new(1, 1, mail.sender(), Arc::clone(&accountant));
+    let job = GraphJob::new(&files, Box::new(echoes), writer, runs);
     Echoing {
         job,
         mail,
         bids,
         volumes,
         dir,
+        accountant,
     }
 }
 
@@ -278,16 +382,19 @@ impl Echoing {
     fn deliver(&mut self, volume: u32) {
         let bytes = &self.volumes[volume as usize];
         self.job
-            .intake(Decoded {
-                volume: VolumeIndex(volume),
-                ordinal: 0,
-                offset: 0,
-                bytes: Bytes::copy_from_slice(bytes),
-                intact: true,
-                positioned: true,
-                length: Some(bytes.len() as u64),
-                segments: Vec::new(),
-            })
+            .intake(
+                Decoded {
+                    volume: VolumeIndex(volume),
+                    ordinal: 0,
+                    offset: 0,
+                    bytes: Bytes::copy_from_slice(bytes),
+                    intact: true,
+                    positioned: true,
+                    length: Some(bytes.len() as u64),
+                    segments: Vec::new(),
+                },
+                1,
+            )
             .unwrap();
     }
 
@@ -311,7 +418,7 @@ impl Echoing {
         let said = self.mail.recv().await.unwrap();
         let ended = matches!(said.heard, Heard::Ended)
             && self.job.runs().current(said.node, said.generation);
-        self.job.run_said(said).unwrap();
+        self.job.run_said(said, 1).unwrap();
         ended
     }
 
@@ -349,7 +456,7 @@ async fn the_job_reports_extracting_while_a_run_is_live_and_done_after() {
         let said = echoing.mail.recv().await.unwrap();
         let ended = matches!(said.heard, Heard::Ended);
         assert_eq!(echoing.job.phase(), RootPhase::Extracting);
-        echoing.job.run_said(said).unwrap();
+        echoing.job.run_said(said, 1).unwrap();
         if ended {
             break;
         }
@@ -376,4 +483,76 @@ async fn the_engine_bids_for_the_volumes_after_the_one_its_run_reached() {
         assert_eq!(echoing.echoed(member), body(member));
     }
     assert_eq!(echoing.job.phase(), RootPhase::Done);
+}
+
+// The job reserves the engine's declared window and the overhead before
+// its run starts, holds exactly that while it runs, and gives it back when
+// the pipeline hears the run end.
+#[tokio::test]
+async fn a_job_holds_its_engines_window_while_the_run_is_live() {
+    const WINDOW: u64 = 5 << 20;
+    let mut echoing = echoing_within(1, WINDOW, unbounded());
+    echoing.deliver(0);
+    let engine = echoing.engine();
+    assert_eq!(echoing.job.runs().reserved(engine), WINDOW + RUN_OVERHEAD);
+    assert_eq!(
+        echoing
+            .accountant
+            .namespace_usage(HoldsNamespace {
+                scope: 1,
+                node: engine
+            })
+            .resident,
+        WINDOW + RUN_OVERHEAD
+    );
+    while !echoing.hear().await {}
+    assert_eq!(echoing.echoed(0), body(0));
+    assert_eq!(echoing.accountant.usage().resident, 0);
+}
+
+// An engine whose window can never fit is refused to the tree, and its
+// volume is a leaf that says why.
+#[tokio::test]
+async fn an_engine_whose_window_can_never_fit_is_refused_unsupported() {
+    let mut echoing = echoing_within(1, 1 << 30, bounded(64 << 20));
+    echoing.deliver(0);
+    assert!(echoing.job.tree().engines().is_empty());
+    assert_eq!(
+        echoing.job.writer().refused(NodeId::ROOT, MemberId(0)),
+        Some(Why::Unsupported)
+    );
+    assert!(!echoing.job.runs().live());
+    assert_eq!(echoing.accountant.usage().resident, 0);
+}
+
+// Another namespace holds most of the resident limit when the engine wants
+// to start, so its run waits; the next step after those bytes are released
+// starts it.
+#[tokio::test]
+async fn an_engine_turned_away_for_memory_starts_once_resident_bytes_are_released() {
+    const WINDOW: u64 = 1 << 20;
+    let accountant = bounded(WINDOW + RUN_OVERHEAD);
+    let other = HoldsNamespace {
+        scope: 2,
+        node: NodeId::ROOT,
+    };
+    assert_eq!(
+        accountant.reserve_resident(other, WINDOW),
+        weaver_graph::holds::Reserve::Granted
+    );
+    let mut echoing = echoing_within(2, WINDOW, Arc::clone(&accountant));
+    echoing.deliver(0);
+    let engine = echoing.engine();
+    assert_eq!(echoing.job.runs().reserved(engine), 0, "it did not fit");
+    assert!(echoing.job.runs().holding().is_empty(), "nor holds a slot");
+    assert!(echoing.job.runs().live(), "it waits for memory");
+
+    accountant.release_resident(other, WINDOW);
+    echoing.deliver(1);
+    assert_eq!(echoing.job.runs().reserved(engine), WINDOW + RUN_OVERHEAD);
+    while !echoing.hear().await {}
+    for member in 0..2 {
+        assert_eq!(echoing.echoed(member), body(member));
+    }
+    assert_eq!(accountant.usage().resident, 0);
 }

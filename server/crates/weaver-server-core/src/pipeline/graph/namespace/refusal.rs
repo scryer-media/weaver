@@ -39,7 +39,7 @@ impl NamespaceWriter {
             return Ok(());
         };
         if tree.child_of(node, member).is_some() {
-            self.replay(tree, builder, segments, node, member, out)?;
+            self.replay(tree, builder, segments, node, member, super::ALL, out)?;
         } else {
             self.release_to_leaf(tree, node, member)?;
         }

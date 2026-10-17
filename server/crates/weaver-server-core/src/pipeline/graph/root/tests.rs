@@ -112,18 +112,19 @@ fn job_with(
         answers: Arc::clone(&answers),
     };
     let dir = tempfile::tempdir().unwrap();
+    let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit: u64::MAX,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    }));
     let writer = NamespaceWriter::new(
         1,
         dir.path().to_path_buf(),
-        Arc::new(HoldsAccountant::new(HoldBudgets {
-            resident_limit: u64::MAX,
-            scratch_total: u64::MAX,
-            scratch_ceiling: u64::MAX,
-            disk_reserve: 0,
-        })),
+        Arc::clone(&accountant),
         CapacityReader::unknown(),
     );
-    let runs = Runs::new(1, 1, RunMail::default().sender());
+    let runs = Runs::new(1, 1, RunMail::default().sender(), accountant);
     let job = GraphJob::new(files, Box::new(builder), writer, runs);
     (job, dir, answers)
 }
@@ -290,16 +291,18 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
     assert_eq!(job.phase_change(), Some(RootPhase::Downloading));
     assert_eq!(job.phase_change(), None);
 
-    job.intake(decoded(1, 0, 0, &[7; 90], Some(90))).unwrap();
+    job.intake(decoded(1, 0, 0, &[7; 90], Some(90)), 1).unwrap();
     assert_eq!(job.phase(), RootPhase::Downloading);
 
-    job.intake(decoded(0, 0, 0, &zip_front(90), Some(90)))
+    job.intake(decoded(0, 0, 0, &zip_front(90), Some(90)), 1)
         .unwrap();
     // Nothing recovers, and the zip object has a member it has not closed.
     assert_eq!(job.phase(), RootPhase::Extracting);
 
     let (mut plain, _plain_dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
-    plain.intake(decoded(0, 0, 0, &[7; 90], Some(90))).unwrap();
+    plain
+        .intake(decoded(0, 0, 0, &[7; 90], Some(90)), 1)
+        .unwrap();
     assert_eq!(plain.phase(), RootPhase::Done);
 }
 
@@ -313,7 +316,7 @@ fn a_data_seek_moves_the_articles_that_cover_it_into_the_window() {
     let (mut job, _dir, answers) = job_with(&[file("inner.zip", &[100, 100, 100])], wants);
     // The first article binds the zip object and says how long the file is,
     // which pins where the second article's bytes can lie.
-    job.intake(decoded(0, 0, 0, &zip_front(90), Some(270)))
+    job.intake(decoded(0, 0, 0, &zip_front(90), Some(270)), 1)
         .unwrap();
 
     let moves = job.seek_round(|_| true).unwrap();
@@ -390,7 +393,7 @@ async fn a_recovery_seek_lands_in_the_promoted_class() {
         &[file("inner.zip", &[64, 64]), file("blocks.par2", &[64])],
         wants,
     );
-    job.intake(decoded(0, 0, 0, &zip_front(60), Some(120)))
+    job.intake(decoded(0, 0, 0, &zip_front(60), Some(120)), 1)
         .unwrap();
     let moves = job.seek_round(|_| true).unwrap();
     assert_eq!(*answers.lock().unwrap(), vec![Pull::Moved(1)]);
@@ -507,15 +510,17 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
 async fn a_lost_article_marks_its_range_damaged() {
     // Both edges known: the range is exact.
     let (mut job, _dir, _) = job_with(&[file("plain.bin", &[100, 100, 100])], Vec::new());
-    job.intake(decoded(0, 0, 0, &[7; 90], Some(270))).unwrap();
-    job.intake(decoded(0, 2, 180, &[7; 90], Some(270))).unwrap();
-    job.lost(VolumeIndex(0), 1).unwrap();
+    job.intake(decoded(0, 0, 0, &[7; 90], Some(270)), 1)
+        .unwrap();
+    job.intake(decoded(0, 2, 180, &[7; 90], Some(270)), 1)
+        .unwrap();
+    job.lost(VolumeIndex(0), 1, 1).unwrap();
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 180)]);
 
     // An unknown end: once nothing else can arrive, the widest bound.
     let (mut job, _dir, _) = job_with(&[file("plain.bin", &[100, 100])], Vec::new());
-    job.intake(decoded(0, 0, 0, &[7; 90], None)).unwrap();
-    job.lost(VolumeIndex(0), 1).unwrap();
+    job.intake(decoded(0, 0, 0, &[7; 90], None), 1).unwrap();
+    job.lost(VolumeIndex(0), 1, 1).unwrap();
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 190)]);
 
     // A seek into a lost range is answered Lost.
@@ -558,7 +563,7 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
     let (mut job, dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
     let mut article = decoded(0, 0, 0, &[7; 90], Some(90));
     article.intact = false;
-    job.intake(article).unwrap();
+    job.intake(article, 1).unwrap();
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(0, 90)]);
     assert_eq!(
         std::fs::read(dir.path().join("plain.bin")).unwrap(),

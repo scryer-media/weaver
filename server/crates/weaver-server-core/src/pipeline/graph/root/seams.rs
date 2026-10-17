@@ -47,6 +47,7 @@ impl Pipeline {
         } else {
             Vec::new()
         };
+        let slots = self.graph_slot_limit();
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -69,7 +70,7 @@ impl Pipeline {
             free_disk: self
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
-            slots: limits::budgets(&self.direct_store.settings(), &self.tuner).1,
+            slots,
             mail: self.graph_runs.sender(),
             passwords,
         };
@@ -101,6 +102,7 @@ impl Pipeline {
         segments: &[weaver_yenc::Segment],
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
+        let limit = self.graph_slot_limit();
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return false;
         };
@@ -121,7 +123,7 @@ impl Pipeline {
                 })
                 .collect(),
         };
-        let result = graph.intake(decoded);
+        let result = graph.intake(decoded, limit);
         self.after_graph_result(job_id, result);
         true
     }
@@ -129,12 +131,14 @@ impl Pipeline {
     // Every server failed an article of a graph job.
     pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
+        let limit = self.graph_slot_limit();
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return;
         };
         let result = graph.lost(
             VolumeIndex(segment_id.file_id.file_index),
             segment_id.segment_number,
+            limit,
         );
         self.after_graph_result(job_id, result);
     }
@@ -143,15 +147,22 @@ impl Pipeline {
     // thing the job waited on, so the completion gate looks again.
     pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
         let job_id = JobId(said.scope);
+        let limit = self.graph_slot_limit();
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return;
         };
         let ended = matches!(said.heard, Heard::Ended);
-        let result = graph.run_said(said);
+        let result = graph.run_said(said, limit);
         self.after_graph_result(job_id, result);
         if ended {
             self.schedule_job_completion_check(job_id);
         }
+    }
+
+    // How many runs a graph job may hold now: the extraction concurrency the
+    // tuner allows at this moment, the limit the repair slots follow too.
+    fn graph_slot_limit(&self) -> usize {
+        limits::budgets(&self.direct_store.settings(), &self.tuner).1
     }
 
     fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {

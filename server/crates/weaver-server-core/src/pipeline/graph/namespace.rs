@@ -29,7 +29,7 @@ use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location,
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, Segment, Tree,
+    Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, Seek, Segment, Tree,
     VolumeIndex, Why,
 };
 
@@ -486,17 +486,20 @@ impl NamespaceWriter {
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        let (node, member) = (arrival.node, arrival.member);
+        // The object the bytes reach keeps what it placed even when they
+        // make it give up: its refusal reads them back from it.
+        let reached = tree.child_of(node, member);
         let mut effects = Vec::new();
         tree.deliver(
-            arrival.node,
-            arrival.member,
+            node,
+            member,
             arrival.offset,
             arrival.bytes.clone(),
             arrival.provenance,
             builder,
             &mut effects,
         );
-        let (node, member) = (arrival.node, arrival.member);
         let recovery_volume = tree
             .child_of(node, member)
             .is_some_and(|(child, _)| tree.recovers(child));
@@ -504,8 +507,8 @@ impl NamespaceWriter {
             // A recovery object's volume stays in its member's own file,
             // where a repair reads its blocks back.
             self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
-        } else {
-            self.capture(tree, builder, &arrival, &mut effects)?;
+        } else if let Some(owner) = reached.or_else(|| tree.child_of(node, member)) {
+            self.capture(tree, builder, owner, &arrival, &mut effects)?;
         }
         for effect in effects {
             self.apply(tree, builder, segments, effect, out)?;
@@ -534,12 +537,10 @@ impl NamespaceWriter {
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
+        (child, volume): (NodeId, VolumeIndex),
         arrival: &Arrival,
         effects: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let Some((child, volume)) = tree.child_of(arrival.node, arrival.member) else {
-            return Ok(());
-        };
         let mut placements = std::mem::take(&mut self.placements);
         placements.clear();
         tree.locate(child, volume, arrival.range(), &mut placements);
@@ -637,7 +638,7 @@ impl NamespaceWriter {
                 child,
                 ..
             } => {
-                self.replay(tree, builder, segments, *node, *member, out)?;
+                self.replay(tree, builder, segments, *node, *member, ALL, out)?;
                 if tree.recovers(*child) {
                     self.bind_recoveries(tree, segments, *node)?;
                 }
@@ -731,14 +732,16 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {
-        for (offset, bytes) in self.take_held(node, member)? {
+        for (offset, bytes) in self.take_held(node, member, ALL)? {
             self.write_file(tree, node, member, offset, &bytes)?;
         }
         Ok(())
     }
 
-    // The member was bound: what was held goes down to its object, each
-    // run with the provenance the coverage recorded when it arrived.
+    // What was held of `range` of the member goes down to its object, each
+    // run with the provenance the coverage recorded when it arrived: all of
+    // it once the member is bound, and what an object asks for again.
+    #[allow(clippy::too_many_arguments)]
     fn replay(
         &mut self,
         tree: &mut Tree,
@@ -746,9 +749,10 @@ impl NamespaceWriter {
         segments: &dyn Segments,
         node: NodeId,
         member: MemberId,
+        range: ByteRange,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        for (offset, bytes) in self.take_held(node, member)? {
+        for (offset, bytes) in self.take_held(node, member, range)? {
             let range = ByteRange::at(offset, bytes.len() as u64);
             let runs: Vec<(ByteRange, Provenance)> = tree
                 .namespace(node)
@@ -793,24 +797,44 @@ impl NamespaceWriter {
         };
         let members: Vec<MemberId> = volumes.values().copied().collect();
         for member in members {
-            self.replay(tree, builder, segments, parent, member, out)?;
+            self.replay(tree, builder, segments, parent, member, ALL, out)?;
         }
         Ok(())
     }
 
-    // Everything held for the member, in offset order, read back from
-    // scratch where it was paged.
+    // An object asks for bytes of its volume that may have arrived before it
+    // knew it wanted them, and been held because it could place them
+    // nowhere then: the seek is answered from the holds first.
+    pub(crate) fn seek_held(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        node: NodeId,
+        seek: Seek,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Some((parent, member)) = tree
+            .volumes(node)
+            .and_then(|(parent, volumes)| Some((parent, *volumes.get(&seek.volume)?)))
+        else {
+            return Ok(());
+        };
+        self.replay(tree, builder, segments, parent, member, seek.range, out)
+    }
+
+    // What is held of `range` of the member, in offset order, read back
+    // from scratch where it was paged.
     fn take_held(
         &mut self,
         node: NodeId,
         member: MemberId,
+        range: ByteRange,
     ) -> Result<Vec<(u64, Bytes)>, WriteError> {
         let Some(files) = self.files.get_mut(&node) else {
             return Ok(Vec::new());
         };
-        let taken = files
-            .holds
-            .take(held_volume(member), ByteRange::new(0, u64::MAX));
+        let taken = files.holds.take(held_volume(member), range);
         let mut held = Vec::with_capacity(taken.len());
         for piece in taken {
             let bytes = match piece.location {
@@ -864,7 +888,7 @@ impl NamespaceWriter {
     }
 
     fn retract(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
-        self.take_held(node, member)?;
+        self.take_held(node, member, ALL)?;
         if let Some(leaf) = self
             .files
             .get_mut(&node)
@@ -1047,6 +1071,12 @@ impl MemberAccess for Access<'_> {
 
 // Holds are kept per namespace, keyed by member, which the ledger calls a
 // volume: the member is the volume of whatever will own it.
+// Every byte of a member.
+const ALL: ByteRange = ByteRange {
+    start: 0,
+    end: u64::MAX,
+};
+
 fn held_volume(member: MemberId) -> VolumeIndex {
     VolumeIndex(member.0)
 }

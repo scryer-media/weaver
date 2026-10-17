@@ -8,26 +8,27 @@
 // next. What a run says is applied here, at the node it speaks for.
 
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{Emit, Engine, MemberId, NodeId};
+use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
-use crate::pipeline::graph::engine::{Heard, Said};
+use crate::pipeline::graph::engine::{Heard, Reservation, Said};
 use crate::pipeline::graph::namespace::WriteError;
 
 impl GraphJob {
     // What a run said. A stopped run's words carry an old generation and
     // are not heard.
-    pub(crate) fn run_said(&mut self, said: Said) -> Result<(), GraphError> {
+    pub(crate) fn run_said(&mut self, said: Said, limit: usize) -> Result<(), GraphError> {
         let node = said.node;
         if !self.runs.current(node, said.generation) {
             return Ok(());
         }
-        match said.heard {
+        let admitted = match said.heard {
             Heard::Emit(emit) => {
                 let mut effects = Vec::new();
                 self.tree
                     .emitted(node, vec![emit], &mut *self.builder, &mut effects);
                 self.settle(effects)?;
+                Vec::new()
             }
             Heard::Ended => {
                 // The run was the only producer of its members, so nothing
@@ -49,51 +50,81 @@ impl GraphJob {
                     )?;
                     self.heard(out)?;
                 }
-                for admitted in self.runs.ended(node, said.generation) {
-                    self.start_run(admitted);
-                }
+                self.runs.ended(node, said.generation, limit)
             }
-        }
-        self.step_runs()
-    }
-
-    pub(super) fn step_runs(&mut self) -> Result<(), GraphError> {
-        let engines = self.tree.engines();
-        for admitted in self.runs.forget_gone(&engines) {
-            self.start_run(admitted);
-        }
-        for node in engines {
-            let shelf = self.writer.shelf(node);
-            self.feed(node)?;
-            match self.runs.generation(node) {
-                Some(generation) if generation != shelf.generation() => {
-                    self.retract_run(node)?;
-                    if self.runs.ask(node) {
-                        self.start_run(node);
-                    }
-                }
-                None if !self.runs.has(node) && shelf.has_bytes() => {
-                    if self.runs.ask(node) {
-                        self.start_run(node);
-                    }
-                }
-                _ => {}
-            }
-            if let (Some((volume, offset)), Some(engine)) =
-                (shelf.reached(), self.tree.engine_mut(node))
-            {
-                engine.reached(volume, offset);
-            }
-        }
-        Ok(())
-    }
-
-    fn start_run(&mut self, node: NodeId) {
-        let Some(extraction) = self.tree.engine(node).map(Engine::start) else {
-            return;
         };
-        let shelf = self.writer.shelf(node);
-        self.runs.start(node, extraction, shelf);
+        self.step_runs(admitted, limit)
+    }
+
+    // Bring every engine's run up to the tree, under the slot limit the
+    // pipeline reads now, and start every run that may: those `admitted`
+    // already, and those each step admits in turn. A start can free a slot
+    // (a run refused, or turned away for memory), and whoever that admits
+    // starts in the same step, so nothing waits beside a free slot.
+    pub(super) fn step_runs(
+        &mut self,
+        mut admitted: Vec<NodeId>,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        loop {
+            let engines = self.tree.engines();
+            admitted.extend(self.runs.forget_gone(&engines, limit));
+            for node in engines {
+                let shelf = self.writer.shelf(node);
+                self.feed(node)?;
+                let asks = match self.runs.generation(node) {
+                    Some(generation) if generation != shelf.generation() => {
+                        self.retract_run(node)?;
+                        true
+                    }
+                    None => !self.runs.has(node) && shelf.has_bytes(),
+                    Some(_) => false,
+                };
+                if asks {
+                    admitted.extend(self.runs.ask(node, limit));
+                }
+                if let (Some((volume, offset)), Some(engine)) =
+                    (shelf.reached(), self.tree.engine_mut(node))
+                {
+                    engine.reached(volume, offset);
+                }
+            }
+            if admitted.is_empty() {
+                return Ok(());
+            }
+            for node in std::mem::take(&mut admitted) {
+                admitted.extend(self.start_run(node)?);
+            }
+        }
+    }
+
+    // Start the node's run once its memory is reserved. A run whose memory
+    // can never fit is refused to the tree as a run's own refusal is; one
+    // that does not fit now hands back the nodes its slot admitted.
+    fn start_run(&mut self, node: NodeId) -> Result<Vec<NodeId>, GraphError> {
+        let Some(window) = self.tree.engine(node).map(Engine::reserve) else {
+            return Ok(Vec::new());
+        };
+        match self.runs.reserve(node, window) {
+            Reservation::Granted => {}
+            Reservation::Starved(admitted) => return Ok(admitted),
+            Reservation::Refused => {
+                let mut effects = Vec::new();
+                self.tree.emitted(
+                    node,
+                    vec![Emit::Refuse(Why::Unsupported)],
+                    &mut *self.builder,
+                    &mut effects,
+                );
+                self.settle(effects)?;
+                return Ok(Vec::new());
+            }
+        }
+        if let Some(extraction) = self.tree.engine(node).map(Engine::start) {
+            let shelf = self.writer.shelf(node);
+            self.runs.start(node, extraction, shelf);
+        }
+        Ok(Vec::new())
     }
 
     // Everything the run built was built on bytes a repair replaced. The

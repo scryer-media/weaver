@@ -4,8 +4,8 @@
 // A pretend engine for tests: every volume is an eight-byte header and a
 // body, and a run echoes each body, read through its volumes in order, as a
 // member of its own named `echo-<volume>.bin`. Its first volume carries a
-// store's signature so the sniffer names it a store and the stand-in builds
-// this engine instead; the volumes after it are claimed by their `.partN`
+// store's signature so the sniffer names it a store, which the echoes build
+// as this engine; the volumes after it are claimed by their `.partN`
 // names. It bids for the volumes after the one its run reached, nearest
 // first, and logs the bids it made.
 
@@ -26,19 +26,22 @@ pub(crate) struct Echoes {
     // How many volumes each run reads.
     pub(crate) volumes: u32,
     pub(crate) bids: Arc<Mutex<Vec<Seek>>>,
+    // The window each engine declares it holds resident while it runs.
+    pub(crate) window: u64,
 }
 
 impl Builder for Echoes {
     // Every other kind is the real objects' to build, so a PAR2 set beside
     // the echo volumes still recovers them.
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
-        if kind != Kind::RarEngine {
+        if !matches!(kind, Kind::RarStore | Kind::RarEngine) {
             return weaver_objects::Objects.build(kind, id);
         }
         Some(Box::new(Echo {
             volumes: self.volumes,
             reached: None,
             bids: Arc::clone(&self.bids),
+            window: self.window,
         }))
     }
 }
@@ -47,6 +50,7 @@ struct Echo {
     volumes: u32,
     reached: Option<VolumeIndex>,
     bids: Arc<Mutex<Vec<Seek>>>,
+    window: u64,
 }
 
 impl Object for Echo {
@@ -105,6 +109,9 @@ impl Engine for Echo {
     }
     fn reached(&mut self, volume: VolumeIndex, _: u64) {
         self.reached = Some(volume);
+    }
+    fn reserve(&self) -> u64 {
+        self.window
     }
 }
 

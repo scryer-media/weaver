@@ -69,7 +69,7 @@ impl Builder for Fakes {
             })),
             (Kind::RarEngine, Mode::NeedsEngine) => Echoes {
                 volumes: self.volumes,
-                bids: Arc::default(),
+                ..Echoes::default()
             }
             .build(kind, id),
             _ => None,

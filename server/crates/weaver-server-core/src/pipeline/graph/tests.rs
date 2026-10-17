@@ -17,7 +17,6 @@ use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
 use crate::pipeline::graph::engine::Heard;
 use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::graph::stand_in::EnginesForStores;
 use crate::pipeline::tests::{insert_active_job, new_direct_pipeline, retire_pipeline_database};
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -462,17 +461,17 @@ fn echo_volume(index: u32, body: &[u8]) -> Post {
     Post::plain(&format!("lantern.part{}.rar", index + 1), bytes)
 }
 
-// Read the job's archives as echo engines, through the stand-in.
+// Read the job's archives as echo engines.
 fn echo_engines(pipeline: &mut Pipeline, job_id: JobId, volumes: u32) {
     let echoes = Echoes {
         volumes,
-        bids: Default::default(),
+        ..Echoes::default()
     };
     pipeline
         .graph_jobs
         .get_mut(&job_id)
         .unwrap()
-        .set_builder(Box::new(EnginesForStores(echoes)));
+        .set_builder(Box::new(echoes));
 }
 
 // Hear the job's runs until the current one returned and none is waiting.
@@ -489,7 +488,7 @@ async fn drain_runs(pipeline: &mut Pipeline, job_id: JobId) {
 }
 
 #[tokio::test]
-async fn an_archive_built_as_its_engine_through_the_stand_in_writes_what_the_engine_read() {
+async fn an_archive_handed_to_its_engine_writes_what_the_engine_read() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_007);
     let bodies = [payload(2 * ARTICLE + 9, 8), payload(ARTICLE - 3, 9)];

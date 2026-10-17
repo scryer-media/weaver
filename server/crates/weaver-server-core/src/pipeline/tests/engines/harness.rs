@@ -143,6 +143,7 @@ pub(super) struct Scenario {
     pub(super) posts: Vec<Post>,
     pub(super) damage: Vec<(u32, u32)>,
     pub(super) lost: Vec<(u32, u32)>,
+    pub(super) password: Option<String>,
 }
 
 impl Scenario {
@@ -151,7 +152,14 @@ impl Scenario {
             posts,
             damage: Vec::new(),
             lost: Vec::new(),
+            password: None,
         }
+    }
+
+    // The password the job is submitted with.
+    pub(super) fn password(mut self, password: &str) -> Self {
+        self.password = Some(password.to_string());
+        self
     }
 
     pub(super) fn damaged(mut self, file: u32, ordinal: u32) -> Self {
@@ -167,7 +175,7 @@ impl Scenario {
     fn spec(&self) -> JobSpec {
         JobSpec {
             name: JOB_NAME.to_string(),
-            password: None,
+            password: self.password.clone(),
             total_bytes: self.posts.iter().map(|post| post.bytes.len() as u64).sum(),
             category: None,
             metadata: vec![],
@@ -358,6 +366,21 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
+            continue;
+        }
+        // Classic's extraction runs out on a task too, and says it is done
+        // the same way.
+        if pipeline
+            .inflight_extractions
+            .get(&JOB)
+            .is_some_and(|sets| !sets.is_empty())
+        {
+            let done = pipeline
+                .extract_done_rx
+                .recv()
+                .await
+                .expect("an extraction in flight reports");
+            pipeline.handle_extraction_done(done).await;
             continue;
         }
         let after = fingerprint(&pipeline, &requests);
