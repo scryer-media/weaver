@@ -427,6 +427,21 @@ impl Tree {
         }
     }
 
+    // The bytes posted for this range of the volume of the object at
+    // `node`, rebuilt as the object says from what `read` hands back per
+    // placement. `false` for the root, and for anything that cannot be read.
+    pub fn posted(
+        &self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.object(node)
+            .is_some_and(|object| object.posted(volume, range, read, into))
+    }
+
     // Announce a member of the root namespace: the source's files.
     pub fn announce_root(&mut self, name: &str, length: Option<u64>) -> MemberId {
         self.announce(NodeId::ROOT, name, length)

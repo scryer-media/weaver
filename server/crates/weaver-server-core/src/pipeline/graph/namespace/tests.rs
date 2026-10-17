@@ -77,6 +77,87 @@ impl Object for Store {
     }
 }
 
+const SEVEN_Z: &[u8] = b"7z\xbc\xaf\x27\x1c";
+const MAP: &[u8] = b"MAP";
+// The pretend 7z lays out as signature, body, map: the map at the end says
+// where the body's member lies.
+fn body() -> ByteRange {
+    ByteRange::at(SEVEN_Z.len() as u64, 5)
+}
+
+fn map_at() -> ByteRange {
+    ByteRange::at(body().end, MAP.len() as u64)
+}
+
+// A pretend store whose map comes last: until the map arrives the body has
+// no place and is held; once it has, the body is "inner.bin".
+struct Late {
+    mapped: bool,
+}
+
+impl Object for Late {
+    fn kind(&self) -> Kind {
+        Kind::SevenZipStore
+    }
+
+    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+        let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);
+        if !self.mapped && range.intersect(map_at()) == Some(map_at()) {
+            self.mapped = true;
+            out.push(Emit::Member {
+                member: MemberId(0),
+                name: "inner.bin".into(),
+                length: Some(body().len()),
+            });
+        }
+        if let Some(part) = range.intersect(body()).filter(|_| self.mapped) {
+            let start = (part.start - delivery.offset) as usize;
+            out.push(Emit::Bytes {
+                member: MemberId(0),
+                offset: part.start - body().start,
+                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize]),
+                provenance: delivery.provenance,
+            });
+        }
+    }
+
+    fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+    fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+
+    fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+        if let Some(header) = range.intersect(ByteRange::new(0, body().start)) {
+            out.push(Placement::Envelope {
+                envelope: 0,
+                range: header,
+            });
+        }
+        if let Some(part) = range.intersect(body()) {
+            out.push(if self.mapped {
+                Placement::Member {
+                    member: MemberId(0),
+                    range: part.shift(-(body().start as i64)),
+                }
+            } else {
+                Placement::Held { range: part }
+            });
+        }
+        if let Some(map) = range.intersect(ByteRange::new(body().end, u64::MAX)) {
+            out.push(Placement::Envelope {
+                envelope: 0,
+                range: map,
+            });
+        }
+    }
+
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+
+    fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
+        None
+    }
+}
+
 // Builds the pretend store, and the pretend recovery set with the job's
 // record of what it was fed and the fix it makes when asked to repair.
 struct Build {
@@ -88,6 +169,7 @@ impl Builder for Build {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
         match kind {
             Kind::RarStore => Some(Box::new(Store { announced: false })),
+            Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
             Kind::Par2 => Some(Box::new(Par {
                 volume: None,
                 others: Vec::new(),
@@ -475,6 +557,39 @@ fn directory_members_and_empty_members_exist_once_announced() {
     assert!(job.dir.path().join("extras").is_dir());
     assert_eq!(job.file("empty.txt"), b"");
     assert_eq!(job.file("extras/inner.txt"), b"hi");
+}
+
+// A store that learns its map last: the body arrives first and has no
+// place, so it is held for the volume; the map announces the member, and
+// what was held goes down again to reach it.
+#[test]
+fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("a.7z", Some(map_at().end));
+    let mut front = SEVEN_Z.to_vec();
+    front.extend_from_slice(b"hello");
+    job.send(member, 0, &front, Provenance::Fresh);
+    assert!(!job.tree.is_undecided(NodeId::ROOT, member));
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    assert!(!job.dir.path().join("inner.bin").exists());
+
+    job.send(member, map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+    assert_eq!(job.accountant.usage().resident, 0);
+    assert_eq!(job.file("inner.bin"), b"hello");
+
+    // The volume reads back whole through the object's placements.
+    let access = job.writer.access(&job.tree, NodeId::ROOT);
+    let mut posted = Vec::new();
+    assert!(access.read_at(
+        NodeId::ROOT,
+        member,
+        ByteRange::new(0, map_at().end),
+        &mut posted
+    ));
+    let mut whole = front;
+    whole.extend_from_slice(MAP);
+    assert_eq!(posted, whole);
 }
 
 // The ledger confines every name to the working dir: a name that would

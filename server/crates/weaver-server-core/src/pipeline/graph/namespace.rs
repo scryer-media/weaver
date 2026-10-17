@@ -611,6 +611,7 @@ impl NamespaceWriter {
             }
             Effect::Announced { node, member } => {
                 self.announced(tree, builder, segments, *node, *member, out)?;
+                self.replay_volumes(tree, builder, segments, *node, out)?;
             }
             Effect::Closed { node, member } => {
                 // A member that ended before its front could say what it is
@@ -772,6 +773,27 @@ impl NamespaceWriter {
                 };
                 self.route(tree, builder, segments, arrival, out)?;
             }
+        }
+        Ok(())
+    }
+
+    // The object at `node` announced a member, so bytes of its volumes it
+    // could not place before may have a place now: everything held for
+    // them goes down again, and what still has no place is held again.
+    fn replay_volumes(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        node: NodeId,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Some((parent, volumes)) = tree.volumes(node) else {
+            return Ok(());
+        };
+        let members: Vec<MemberId> = volumes.values().copied().collect();
+        for member in members {
+            self.replay(tree, builder, segments, parent, member, out)?;
         }
         Ok(())
     }
@@ -944,12 +966,9 @@ impl Access<'_> {
         else {
             return self.read_leaf(node, member, range, into);
         };
-        let mut placements = Vec::new();
-        self.tree.locate(child, volume, range, &mut placements);
-        if placements.iter().map(Placement::len).sum::<u64>() != range.len() {
-            return false;
-        }
-        placements.iter().all(|placement| match placement {
+        // The object rebuilds its volume's bytes from its placements: one
+        // that deciphers puts the cipher back.
+        let mut read = |placement: &Placement, into: &mut Vec<u8>| match placement {
             Placement::Member { member, range } => self.read_at(child, *member, *range, into),
             Placement::Envelope { envelope, range } => {
                 self.writer.envelopes.read(child, *envelope, *range, into)
@@ -957,7 +976,8 @@ impl Access<'_> {
             // What the object could not place was held for the member, and
             // once released it is in the member's own file.
             Placement::Held { range } => self.read_leaf(node, member, *range, into),
-        })
+        };
+        self.tree.posted(child, volume, range, &mut read, into)
     }
 
     fn read_leaf(

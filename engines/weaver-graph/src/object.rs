@@ -161,7 +161,8 @@ pub trait Object: Send + Sync {
     ) -> bool {
         let mut placements = Vec::new();
         self.locate(volume, range, &mut placements);
-        placements.iter().all(|placement| read(placement, into))
+        placements.iter().map(Placement::len).sum::<u64>() == range.len()
+            && placements.iter().all(|placement| read(placement, into))
     }
 
     // My volume's length is known: its member declared one, or it closed at
