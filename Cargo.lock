@@ -6006,6 +6006,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-graph"
+version = "0.15.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "weaver-model"
 version = "0.15.0"
 dependencies = [

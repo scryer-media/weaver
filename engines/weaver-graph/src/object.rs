@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// The smart object. One per format, each knowing only its own. Every object
+// has the same two faces: it receives bytes from its parent and says what
+// they were, and it asks its parent for bytes out of order. It also answers
+// two questions about where bytes are, which is what makes repair, refusal,
+// restart and seeding possible without ever writing the archive itself.
+
+use std::fmt;
+
+use crate::deliver::{Delivery, Emit};
+use crate::member::MemberId;
+use crate::seek::Seek;
+use crate::volume::{ByteRange, VolumeIndex};
+
+// A format the sniffer can name and an object can own. The list is closed on
+// purpose: adding a format means adding an object, and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    RarStore,
+    SevenZipStore,
+    Zip,
+    Tar,
+    Xz,
+    Gzip,
+    Bzip2,
+    Zstd,
+    Brotli,
+    Deflate,
+    RarEngine,
+    SevenZipEngine,
+    Par2,
+    Par3,
+    Sfv,
+}
+
+impl Kind {
+    pub fn is_recovery(self) -> bool {
+        matches!(self, Kind::Par2 | Kind::Par3 | Kind::Sfv)
+    }
+
+    pub fn is_stream(self) -> bool {
+        matches!(
+            self,
+            Kind::Xz | Kind::Gzip | Kind::Bzip2 | Kind::Zstd | Kind::Brotli | Kind::Deflate
+        )
+    }
+
+    pub fn is_engine(self) -> bool {
+        matches!(self, Kind::RarEngine | Kind::SevenZipEngine)
+    }
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Kind::RarStore => "rar_store",
+            Kind::SevenZipStore => "sevenz_store",
+            Kind::Zip => "zip",
+            Kind::Tar => "tar",
+            Kind::Xz => "stream_xz",
+            Kind::Gzip => "stream_gz",
+            Kind::Bzip2 => "stream_bzip2",
+            Kind::Zstd => "stream_zstd",
+            Kind::Brotli => "stream_brotli",
+            Kind::Deflate => "stream_deflate",
+            Kind::RarEngine => "rar_engine",
+            Kind::SevenZipEngine => "sevenz_engine",
+            Kind::Par2 => "par2",
+            Kind::Par3 => "par3",
+            Kind::Sfv => "sfv",
+        };
+        formatter.write_str(name)
+    }
+}
+
+// An object's identity within its job, stable across restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectId(pub u32);
+
+// Where a range of an object's volume went: the inverse map, one entry per
+// contiguous piece.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Placement {
+    // Into a member of this object's namespace, at this member offset. The
+    // bytes are in that member's partial, or wherever the member's own
+    // owner put them.
+    Member { member: MemberId, range: ByteRange },
+    // Into this object's envelope: header and padding bytes that belong to
+    // no member. The object keeps them and can hand them back.
+    Envelope { envelope: u32, range: ByteRange },
+    // Nowhere yet: the bytes are held, waiting for the headers that say
+    // where they go.
+    Held,
+}
+
+// Where a range of a member lies in the object's own volumes: the forward
+// map, one entry per contiguous piece, in member order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    pub volume: VolumeIndex,
+    pub range: ByteRange,
+}
+
+pub trait Object {
+    fn kind(&self) -> Kind;
+
+    // Bytes of one of my volumes. Say what they were into `out`, which the
+    // caller reuses between calls.
+    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>);
+
+    // My volume has no more bytes coming: everything that could arrive has.
+    fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>);
+
+    // This range of my volume will never arrive and no recovery covers it.
+    fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>);
+
+    // What I want ahead of the normal order, right now. The namespace lifts
+    // each one to the parent and answers through `pulled`.
+    fn wants(&mut self, out: &mut Vec<Seek>);
+
+    // The answer to a seek I made.
+    fn pulled(&mut self, seek: Seek, pull: crate::seek::Pull, out: &mut Vec<Emit>);
+
+    // The inverse map: where did this range of my volume go?
+    fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>);
+
+    // The forward map: where does this range of my member lie in my volumes?
+    // Empty when the member's layout is not known yet.
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>);
+
+    // A password the job offers. The object checks it against its own
+    // header and, if it opens, carries on.
+    fn offer_password(&mut self, _secret: &str, _out: &mut Vec<Emit>) {}
+
+    // Bytes of my envelope, for the inverse map's remainder.
+    fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes>;
+
+    // A new member appeared beside the one I am bound to. Is it one of my
+    // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z
+    // store claims `.7z.002`, which has no signature of its own. Only an
+    // object can say, because only it knows how its volumes chain. Answer
+    // with the volume index the member becomes, or `None` to let the
+    // sniffer decide.
+    fn claim(&mut self, _name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
+        None
+    }
+}

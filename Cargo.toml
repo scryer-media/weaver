@@ -9,6 +9,7 @@ members = [
     "engines/weaver-tunnel",
     "engines/weaver-nzb",
     "engines/weaver-yenc",
+    "engines/weaver-graph",
 ]
 exclude = ["fuzz"]
 resolver = "2"
