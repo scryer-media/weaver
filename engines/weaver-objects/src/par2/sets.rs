@@ -10,8 +10,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use par2_rs::{FileId, Packet, Par2FileSet};
-use weaver_graph::{ByteRange, Coverage, MemberId, VolumeIndex};
+use weaver_graph::recovery::RepairOutcome;
+use weaver_graph::{ByteRange, Coverage, MemberId, Seek, VolumeIndex, Weight};
 
+use super::repair::SetRepair;
 use super::walker::Walker;
 
 // Where one recovery packet sits, header included.
@@ -34,7 +36,9 @@ pub(super) struct SetState {
     // Recovery packets by exponent: the first copy found is the one kept.
     pub(super) recovery: BTreeMap<u32, Location>,
     // Which member each described file is bound to.
-    pub(super) members: BTreeMap<FileId, MemberId>,
+    members: BTreeMap<FileId, MemberId>,
+    // What the set's last repair came to, over the members bound then.
+    pub(super) last: Option<SetRepair>,
 }
 
 impl SetState {
@@ -46,6 +50,7 @@ impl SetState {
             index: None,
             recovery: BTreeMap::new(),
             members: BTreeMap::new(),
+            last: None,
         }
     }
 
@@ -75,6 +80,32 @@ impl SetState {
             .then_some(index)
     }
 
+    pub(super) fn members(&self) -> &BTreeMap<FileId, MemberId> {
+        &self.members
+    }
+
+    // A verdict was on the members bound then; other members void it.
+    pub(super) fn bind(&mut self, members: BTreeMap<FileId, MemberId>) {
+        if members != self.members {
+            self.members = members;
+            self.last = None;
+        }
+    }
+
+    // Damaged slices the last repair found while it waited for blocks.
+    pub(super) fn needed(&self) -> u64 {
+        self.last
+            .filter(|last| last.outcome == RepairOutcome::Waiting)
+            .map_or(0, |last| last.damaged)
+    }
+
+    // Whether the last repair settled the set: only a wait is tried again.
+    pub(super) fn concluded(&self) -> Option<RepairOutcome> {
+        self.last
+            .map(|last| last.outcome)
+            .filter(|outcome| *outcome != RepairOutcome::Waiting)
+    }
+
     pub(super) fn bound(&self, member: MemberId) -> Option<FileId> {
         self.members
             .iter()
@@ -92,6 +123,8 @@ pub(super) struct Volume {
     // The recovery blocks the volume's name says it carries.
     pub(super) named_blocks: Option<u64>,
     pub(super) walked_blocks: u64,
+    // The sets whose packets the walk has found in it.
+    pub(super) sets: BTreeSet<[u8; 16]>,
     // A recovery seek for it is outstanding.
     pub(super) asked: bool,
 }
@@ -102,6 +135,38 @@ impl Volume {
             named_blocks: named_blocks(name),
             ..Self::default()
         }
+    }
+
+    // Whether the volume can bring the set blocks: it carries the set's
+    // packets, or nothing of it has been walked to say whose it is.
+    pub(super) fn serves(&self, set: &[u8; 16]) -> bool {
+        self.sets.is_empty() || self.sets.contains(set)
+    }
+
+    // Ask for every byte of the volume not yet in hand, once.
+    pub(super) fn ask(&mut self, index: VolumeIndex, out: &mut Vec<Seek>) {
+        if self.asked {
+            return;
+        }
+        self.asked = true;
+        let mut cursor = 0;
+        for run in self.arrived.runs() {
+            if run.range.start > cursor {
+                out.push(Seek::recovery(
+                    index,
+                    ByteRange::new(cursor, run.range.start),
+                    Weight::FIRST,
+                ));
+            }
+            cursor = run.range.end;
+        }
+        // The volume's length is the parent's to know; the root clamps an
+        // open end to it.
+        out.push(Seek::recovery(
+            index,
+            ByteRange::new(cursor, u64::MAX),
+            Weight::FIRST,
+        ));
     }
 
     pub(super) fn is_spoiled(&self, range: ByteRange) -> bool {

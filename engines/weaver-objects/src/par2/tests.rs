@@ -352,3 +352,103 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
     assert!(clear >= 2, "the fixture keeps packets past the loss");
     assert_eq!(job.object.blocks_reachable(), clear);
 }
+
+// A set's volume named but not yet arrived: claimed from its front, so
+// nothing of it is walked and it may be any set's.
+fn named_volume(job: &mut Job<Par2>, file: &(String, Vec<u8>)) -> weaver_graph::VolumeIndex {
+    let volume = job.object.claim(&file.0, &file.1[..64]).expect("claimed");
+    job.store.volumes.insert(volume, file.1.clone());
+    volume
+}
+
+fn wanted(job: &mut Job<Par2>) -> Vec<weaver_graph::VolumeIndex> {
+    let mut seeks = Vec::new();
+    Recovery::wants(&mut job.object, &mut seeks);
+    let mut volumes: Vec<_> = seeks.iter().map(|seek| seek.volume).collect();
+    volumes.dedup();
+    volumes
+}
+
+// The first set's blocks in hand do not cover the second set's damage.
+#[test]
+fn two_sets_each_ask_for_their_own_shortfall() {
+    let one = payload(18, 5000);
+    let two = payload(19, 5000);
+    let first = par2_set("first", &[("one.bin", &one)], BLOCK, 2, 1);
+    let second = par2_set("second", &[("two.bin", &two)], BLOCK, 2, 1);
+    let mut job = job(&[first[0].clone(), first[1].clone(), second[0].clone()]);
+    let later = named_volume(&mut job, &second[1]);
+    let (left, left_bad) = damaged_member(&mut job, "one.bin", &one, 600);
+    let (right, right_bad) = damaged_member(&mut job, "two.bin", &two, 3000);
+    bind(&mut job);
+    let wrong = job.store.members[&left].clone();
+    feed(&mut job, left, &wrong, Some(left_bad));
+    let wrong = job.store.members[&right].clone();
+    feed(&mut job, right, &wrong, Some(right_bad));
+    assert_eq!(wanted(&mut job), vec![later]);
+}
+
+// One damaged slice of a member both sets describe is one slice short, the
+// first set's, and the first set's block covers it.
+#[test]
+fn a_shared_members_damage_counts_once() {
+    let shared = payload(20, 5000);
+    let first = par2_set("first", &[("shared.bin", &shared)], BLOCK, 1, 1);
+    let second = par2_set("second", &[("shared.bin", &shared)], BLOCK, 2, 1);
+    let mut job = job(&[first[0].clone(), first[1].clone(), second[0].clone()]);
+    named_volume(&mut job, &second[1]);
+    let (member, bad) = damaged_member(&mut job, "shared.bin", &shared, 1300);
+    bind(&mut job);
+    assert!(
+        job.object
+            .sets
+            .values()
+            .all(|state| state.bound(member).is_some()),
+        "described alike, the member is bound in both sets"
+    );
+    let wrong = job.store.members[&member].clone();
+    feed(&mut job, member, &wrong, Some(bad));
+    assert!(wanted(&mut job).is_empty());
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&member] == shared);
+}
+
+// The member is the first set's file to the byte; the second set describes
+// other bytes under its name, so its bind by name gives way.
+#[test]
+fn a_name_another_set_describes_differently_is_not_bound_by_name() {
+    let quill = payload(21, 5000);
+    let other = payload(22, 5000);
+    let mut files = par2_set("first", &[("quill.bin", &quill)], BLOCK, 2, 1);
+    files.extend(par2_set("second", &[("quill.bin", &other)], BLOCK, 2, 1));
+    let mut job = job(&files);
+    let member = job.member("quill.bin", &quill);
+    bind(&mut job);
+    let bound: Vec<bool> = job
+        .object
+        .ordered()
+        .iter()
+        .map(|key| job.object.sets[key].bound(member).is_some())
+        .collect();
+    assert_eq!(bound, [true, false]);
+    feed(&mut job, member, &quill, None);
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(job.store.writes, 0);
+}
+
+// An index whose files no member answers to yet: nothing to repair, and no
+// blocks to ask for.
+#[test]
+fn a_set_covering_nothing_asks_for_nothing() {
+    let data = payload(23, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1);
+    let mut job = job(&files[..1]);
+    named_volume(&mut job, &files[1]);
+    bind(&mut job);
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert!(wanted(&mut job).is_empty());
+    assert_eq!(job.store.volume_reads, 0);
+}

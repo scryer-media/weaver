@@ -26,10 +26,9 @@ use super::sets::{SetState, Volume};
 use crate::grid::Grid;
 
 // What one set's repair came to.
+#[derive(Clone, Copy, Debug)]
 pub(super) struct SetRepair {
     pub(super) outcome: RepairOutcome,
-    // Members whose slices it rewrote.
-    pub(super) repaired: Vec<MemberId>,
     // Damaged slices it found, for the recovery it asks for while waiting.
     pub(super) damaged: u64,
 }
@@ -38,18 +37,47 @@ impl SetRepair {
     fn clean() -> Self {
         Self {
             outcome: RepairOutcome::Clean,
-            repaired: Vec::new(),
             damaged: 0,
         }
     }
 }
 
+// What the sets taken before this one came to. A member two sets bind is
+// the first one's to rule on.
+#[derive(Default)]
+pub(super) struct Earlier {
+    ruled: BTreeSet<MemberId>,
+    // Of the ruled members, those their set left good: found clean or
+    // repaired. The rest are still damaged, and count so here.
+    settled: BTreeSet<MemberId>,
+}
+
+impl Earlier {
+    // A set settles only the members it rules on.
+    pub(super) fn after(&mut self, state: &SetState, outcome: RepairOutcome) {
+        let good = matches!(
+            outcome,
+            RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+        );
+        for member in state.members().values() {
+            if self.ruled.insert(*member) && good {
+                self.settled.insert(*member);
+            }
+        }
+    }
+}
+
+// A set repairs only for damage of its own: slices of a member it binds
+// that no earlier set binds. Damage in a member an earlier set rules on is
+// that set's, and a described file no member is bound to has nowhere to be
+// written, so neither starts a repair; both still count as missing in the
+// arithmetic of one that does.
 pub(super) fn repair_set(
     state: &mut SetState,
     grid: &Grid,
     volumes: &[Volume],
     coming: u64,
-    settled: &BTreeSet<MemberId>,
+    earlier: &Earlier,
     access: &mut dyn MemberAccess,
 ) -> SetRepair {
     let Some(index) = state.usable() else {
@@ -62,25 +90,31 @@ pub(super) fn repair_set(
         .map(|file| {
             (
                 *file,
-                slice_validity(index, state, grid, *file, settled, access),
+                slice_validity(index, state, grid, *file, &earlier.settled, access),
             )
         })
         .collect();
-    let damaged = validity
+    let invalid = |valid: &Vec<bool>| valid.iter().filter(|valid| !**valid).count() as u64;
+    let own: u64 = validity
         .iter()
-        .flat_map(|(_, valid)| valid.iter())
-        .filter(|valid| !**valid)
-        .count() as u64;
-    if damaged == 0 {
+        .filter(|(file, _)| {
+            state
+                .members()
+                .get(file)
+                .is_some_and(|member| !earlier.ruled.contains(member))
+        })
+        .map(|(_, valid)| invalid(valid))
+        .sum();
+    if own == 0 {
         return SetRepair::clean();
     }
+    let damaged = validity.iter().map(|(_, valid)| invalid(valid)).sum();
     let short = |reachable: u64| SetRepair {
         outcome: if coming > 0 {
             RepairOutcome::Waiting
         } else {
             RepairOutcome::Impossible { damaged, reachable }
         },
-        repaired: Vec::new(),
         damaged,
     };
     let slices = spend(state, slice_size, damaged as usize, volumes, access);
@@ -97,7 +131,7 @@ pub(super) fn repair_set(
     let Ok(plan) = plan_repair(&set, &verification) else {
         return short(available);
     };
-    let members: BTreeMap<FileId, MemberId> = state.members.clone();
+    let members: BTreeMap<FileId, MemberId> = state.members().clone();
     let mut files = Files {
         access: RefCell::new(access),
         members: &members,
@@ -106,20 +140,14 @@ pub(super) fn repair_set(
     if execute_repair_with_options(&plan, &set, &mut files, &RepairOptions::default()).is_err() {
         return short(available);
     }
-    let repaired = validity
-        .iter()
-        .filter(|(_, valid)| valid.contains(&false))
-        .filter_map(|(file, _)| members.get(file).copied())
-        .collect();
     SetRepair {
         outcome: RepairOutcome::Repaired { slices: damaged },
-        repaired,
         damaged,
     }
 }
 
 // Which slices of a described file are good, reading back only the ones the
-// evidence did not settle. A member an earlier set repaired is settled.
+// evidence did not settle. A member an earlier set left good is good here.
 fn slice_validity(
     index: &Par2FileSet,
     state: &SetState,
@@ -131,7 +159,7 @@ fn slice_validity(
     let count = index.file_description(&file).map_or(0, |description| {
         index.slice_count_for_file(description.length)
     }) as usize;
-    let Some(member) = state.members.get(&file).copied() else {
+    let Some(member) = state.members().get(&file).copied() else {
         return vec![false; count];
     };
     if settled.contains(&member) {

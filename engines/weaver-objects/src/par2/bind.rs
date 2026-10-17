@@ -7,7 +7,8 @@
 // two descriptions binds nothing, and two members that answer to one
 // description both go unbound. A member bound by its content alone takes the
 // described name. Each set binds on its own, so a member two sets describe
-// is bound in both.
+// alike is bound in both; a name is the weakest rule, and a bind by name
+// gives way when another set describes that name as a different file.
 
 use std::collections::BTreeMap;
 
@@ -67,8 +68,10 @@ pub(super) enum Matched {
 }
 
 // The bindings of one set over the namespace, and which were by content.
+// `others` are the other sets in the namespace.
 pub(super) fn bind_set(
     index: &Par2FileSet,
+    others: &[&Par2FileSet],
     namespace: &Namespace,
     own: ObjectId,
 ) -> BTreeMap<FileId, (MemberId, Matched)> {
@@ -78,7 +81,7 @@ pub(super) fn bind_set(
             continue;
         }
         let candidate = Candidate::of(member, namespace.first_bytes(member.id));
-        if let Some((file, matched)) = match_member(index, &candidate) {
+        if let Some((file, matched)) = match_member(index, others, &candidate) {
             claims.entry(file).or_default().push((member.id, matched));
         }
     }
@@ -91,15 +94,30 @@ pub(super) fn bind_set(
         .collect()
 }
 
-fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<(FileId, Matched)> {
+fn match_member(
+    index: &Par2FileSet,
+    others: &[&Par2FileSet],
+    candidate: &Candidate<'_>,
+) -> Option<(FileId, Matched)> {
     if let Some(file) = by_id(index, candidate) {
         return Some((file, Matched::Id));
     }
     match by_name(index, candidate) {
-        Named::One(file) => Some((file, Matched::Name)),
-        Named::Ambiguous => None,
+        Named::One(file) if !disputed(others, candidate, file) => Some((file, Matched::Name)),
         Named::Nothing => by_content(index, candidate).map(|file| (file, Matched::Content)),
+        _ => None,
     }
+}
+
+// Another set answers the member's name with some other file. A file id is
+// the same in every set that describes the file, so a different one is a
+// different file under the same name.
+fn disputed(others: &[&Par2FileSet], candidate: &Candidate<'_>, file: FileId) -> bool {
+    others.iter().any(|other| match by_name(other, candidate) {
+        Named::One(theirs) => theirs != file,
+        Named::Ambiguous => true,
+        Named::Nothing => false,
+    })
 }
 
 // The file id is the MD5 of the 16 KiB hash, the length and the name, so a
