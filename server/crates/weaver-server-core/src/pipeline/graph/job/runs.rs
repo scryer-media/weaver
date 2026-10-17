@@ -38,14 +38,16 @@ impl GraphJob {
                     .filter(|member| !self.closed_in(node, *member))
                     .collect();
                 for member in open {
+                    let mut out = Vec::new();
                     self.writer.close(
                         &mut self.tree,
                         &mut *self.builder,
                         &self.root,
                         node,
                         member,
-                        &mut Vec::new(),
+                        &mut out,
                     )?;
+                    self.heard(out)?;
                 }
                 for admitted in self.runs.ended(node, said.generation) {
                     self.start_run(admitted);

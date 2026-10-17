@@ -7,6 +7,7 @@
 // what the download and decode paths learn; nothing else of the pipeline
 // reaches into the tree, and nothing else writes the job's files.
 
+mod passwords;
 mod runs;
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use weaver_graph::{
     VolumeIndex,
 };
 
+use self::passwords::Passwords;
 use super::Engine;
 use super::engine::{Runs, Said};
 use super::namespace::{NamespaceWriter, WriteError};
@@ -48,6 +50,8 @@ pub(crate) struct Storage {
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
     pub(crate) mail: mpsc::Sender<Said>,
+    // The job's password candidates, in the order they are tried.
+    pub(crate) passwords: Vec<String>,
 }
 
 // What one recovery object says of the members it covers.
@@ -72,6 +76,7 @@ pub(crate) struct GraphJob {
     builder: Box<dyn Builder + Send + Sync>,
     writer: NamespaceWriter,
     runs: Runs,
+    passwords: Passwords,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
 }
@@ -107,6 +112,7 @@ impl GraphJob {
                 writer,
                 runs,
             )
+            .offering(storage.passwords)
         })
     }
 
@@ -141,8 +147,15 @@ impl GraphJob {
             builder,
             writer,
             runs,
+            passwords: Passwords::default(),
             reported: None,
         }
+    }
+
+    // The candidates offered to an object that asks for a password.
+    pub(crate) fn offering(mut self, candidates: Vec<String>) -> Self {
+        self.passwords = Passwords::new(candidates);
+        self
     }
 
     #[cfg(test)]
@@ -252,13 +265,15 @@ impl GraphJob {
             self.writer
                 .length_learned(&mut self.tree, &self.root, NodeId::ROOT, member, length)?;
         }
+        let mut out = Vec::new();
         self.writer.deliver(
             &mut self.tree,
             &mut *self.builder,
             &self.root,
             arrival,
-            &mut Vec::new(),
+            &mut out,
         )?;
+        self.heard(out)?;
         self.mark_damage()?;
         self.after_member(volume)?;
         self.step_runs()
@@ -278,14 +293,16 @@ impl GraphJob {
     fn after_member(&mut self, volume: VolumeIndex) -> Result<(), GraphError> {
         let member = MemberId(volume.0);
         if !self.root.map.volume_waiting(volume) && !self.closed(member) {
+            let mut out = Vec::new();
             self.writer.close(
                 &mut self.tree,
                 &mut *self.builder,
                 &self.root,
                 NodeId::ROOT,
                 member,
-                &mut Vec::new(),
+                &mut out,
             )?;
+            self.heard(out)?;
         }
         self.repair(member)
     }
@@ -345,14 +362,15 @@ impl GraphJob {
         if !due {
             return Ok(());
         }
+        let mut out = Vec::new();
         self.writer.repair(
             &mut self.tree,
             &mut *self.builder,
             &self.root,
             NodeId::ROOT,
-            &mut Vec::new(),
+            &mut out,
         )?;
-        Ok(())
+        self.heard(out)
     }
 
     // Ranges of lost articles become damage in the tree as soon as they can
@@ -439,14 +457,39 @@ impl GraphJob {
         if effects.is_empty() {
             return Ok(());
         }
+        let mut out = Vec::new();
         self.writer.apply_all(
             &mut self.tree,
             &mut *self.builder,
             &self.root,
             effects,
-            &mut Vec::new(),
+            &mut out,
         )?;
-        Ok(())
+        self.heard(out)
+    }
+
+    // What the writer passed on that is the job's to answer: an object that
+    // asks for a password is offered one, and what it says back is applied
+    // and answered the same way.
+    fn heard(&mut self, mut out: Vec<Effect>) -> Result<(), GraphError> {
+        loop {
+            let mut effects = Vec::new();
+            for effect in out.drain(..) {
+                if let Effect::NeedsPassword { node } = effect {
+                    self.offer_password(node, &mut effects);
+                }
+            }
+            if effects.is_empty() {
+                return Ok(());
+            }
+            self.writer.apply_all(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                effects,
+                &mut out,
+            )?;
+        }
     }
 }
 

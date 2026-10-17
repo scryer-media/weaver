@@ -505,7 +505,7 @@ impl NamespaceWriter {
             // where a repair reads its blocks back.
             self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
         } else {
-            self.capture_envelopes(tree, &arrival)?;
+            self.capture(tree, builder, &arrival, &mut effects)?;
         }
         for effect in effects {
             self.apply(tree, builder, segments, effect, out)?;
@@ -524,15 +524,57 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    // The bytes a bound member's object kept for no member of its own.
-    fn capture_envelopes(&mut self, tree: &Tree, arrival: &Arrival) -> Result<(), WriteError> {
+    // The bytes a bound member's object kept for no member of its own: its
+    // envelopes, and what it could not place yet, which the namespace holds
+    // for the member as it holds any bytes whose place is not known. A
+    // breach of the holds budgets refuses the object, as it would refuse an
+    // undecided member, and the bytes that breached go to the member's own
+    // file, which it is now.
+    fn capture(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        arrival: &Arrival,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
         let Some((child, volume)) = tree.child_of(arrival.node, arrival.member) else {
             return Ok(());
         };
-        self.placements.clear();
-        tree.locate(child, volume, arrival.range(), &mut self.placements);
-        self.envelopes
-            .capture(child, &self.placements, &arrival.bytes, arrival.provenance)?;
+        let mut placements = std::mem::take(&mut self.placements);
+        placements.clear();
+        tree.locate(child, volume, arrival.range(), &mut placements);
+        let kept = self
+            .envelopes
+            .capture(child, &placements, &arrival.bytes, arrival.provenance);
+        let mut breached = Vec::new();
+        for placement in &placements {
+            let Placement::Held { range } = placement else {
+                continue;
+            };
+            let Some(piece) = range.intersect(arrival.range()) else {
+                continue;
+            };
+            let bytes = arrival
+                .bytes
+                .slice(index(piece.start - arrival.offset)..index(piece.end - arrival.offset));
+            if self.keep_held(arrival.node, arrival.member, piece.start, bytes.clone())? {
+                breached.push((piece.start, bytes));
+            }
+        }
+        self.placements = placements;
+        kept?;
+        if breached.is_empty() {
+            return Ok(());
+        }
+        tree.emitted(
+            child,
+            vec![weaver_graph::Emit::Refuse(Why::HoldsBreached)],
+            builder,
+            effects,
+        );
+        for (offset, bytes) in breached {
+            self.write_file(tree, arrival.node, arrival.member, offset, &bytes)?;
+        }
         Ok(())
     }
 
@@ -601,6 +643,8 @@ impl NamespaceWriter {
             }
             Effect::Refused { node, member, why } | Effect::NeedsEngine { node, member, why } => {
                 self.files_mut(*node).refused.insert(*member, *why);
+                self.materialise(tree, builder, segments, *node, *member, out)?;
+                tree.bury(*node, *member);
                 self.prune(tree)?;
             }
             Effect::Retracted { node, member } => {
@@ -636,22 +680,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
-        let free_disk = self
-            .free_disk
-            .current()
-            .best_available_bytes()
-            .unwrap_or(u64::MAX);
-        let outcome = self.files_mut(node).holds.hold(
-            held_volume(member),
-            arrival.offset,
-            arrival.bytes.clone(),
-            free_disk,
-        );
-        for page_out in &outcome.page_outs {
-            self.scratch(node)?
-                .write(page_out.scratch_offset, &page_out.bytes, None)?;
-        }
-        if let Placed::Breached(_) = outcome.placed {
+        if self.keep_held(node, member, arrival.offset, arrival.bytes.clone())? {
             tree.settle_leaf(node, member);
             self.files_mut(node)
                 .refused
@@ -665,6 +694,32 @@ impl NamespaceWriter {
             });
         }
         Ok(())
+    }
+
+    // Hold bytes of the member in its namespace's ledger, paging to scratch
+    // as the ledger says. True when they breached the budgets and were not
+    // held.
+    fn keep_held(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        offset: u64,
+        bytes: Bytes,
+    ) -> Result<bool, WriteError> {
+        let free_disk = self
+            .free_disk
+            .current()
+            .best_available_bytes()
+            .unwrap_or(u64::MAX);
+        let outcome =
+            self.files_mut(node)
+                .holds
+                .hold(held_volume(member), offset, bytes, free_disk);
+        for page_out in &outcome.page_outs {
+            self.scratch(node)?
+                .write(page_out.scratch_offset, &page_out.bytes, None)?;
+        }
+        Ok(matches!(outcome.placed, Placed::Breached(_)))
     }
 
     // The member was decided as a leaf: what was held is written first, so
@@ -899,7 +954,9 @@ impl Access<'_> {
             Placement::Envelope { envelope, range } => {
                 self.writer.envelopes.read(child, *envelope, *range, into)
             }
-            Placement::Held { .. } => false,
+            // What the object could not place was held for the member, and
+            // once released it is in the member's own file.
+            Placement::Held { range } => self.read_leaf(node, member, *range, into),
         })
     }
 
@@ -982,5 +1039,6 @@ fn index(offset: u64) -> usize {
     usize::try_from(offset).expect("an offset fits the address space")
 }
 
+mod refusal;
 #[cfg(test)]
 mod tests;

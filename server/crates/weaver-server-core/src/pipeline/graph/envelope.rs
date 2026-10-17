@@ -257,6 +257,13 @@ impl Shelf {
         self.lock().generation
     }
 
+    // The bytes the run read are good, but the object now knows something
+    // the run was started without, a password: the run stops, and its owner
+    // starts one over the same bytes.
+    pub(crate) fn restart(&self) {
+        self.update(|state| state.generation += 1);
+    }
+
     // A fresh run reads from the start: what an earlier one read is
     // forgotten, and the generation it reads under is the shelf's.
     pub(crate) fn begin(&self) -> u64 {

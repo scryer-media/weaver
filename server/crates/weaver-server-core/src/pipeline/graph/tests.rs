@@ -614,3 +614,5 @@ fn classic_switches_apply_only_to_classic() {
     assert!(Engine::Classic.classic_switches_apply());
     assert!(!Engine::Graph.classic_switches_apply());
 }
+
+mod refusals;

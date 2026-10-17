@@ -35,6 +35,18 @@ pub enum Kind {
     Sfv,
 }
 
+impl Kind {
+    // The engine that reads a store's volumes as files when the store cannot
+    // stream them. The one place a store kind names its engine kind.
+    pub fn engine_for(self) -> Option<Kind> {
+        match self {
+            Kind::RarStore => Some(Kind::RarEngine),
+            Kind::SevenZipStore => Some(Kind::SevenZipEngine),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for Kind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -133,6 +145,29 @@ pub trait Object: Send + Sync {
     // The forward map: where does this range of my member lie in my volumes?
     // Empty when the member's layout is not known yet.
     fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>);
+
+    // The bytes posted for this range of my volume, rebuilt through the
+    // inverse map: `read` hands back what one placement holds. An object
+    // whose members are not its volume's bytes, one that deciphers, rebuilds
+    // them itself. `false` when any of it cannot be read.
+    fn posted(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let mut placements = Vec::new();
+        self.locate(volume, range, &mut placements);
+        placements.iter().all(|placement| read(placement, into))
+    }
+
+    // My volume's length is known: its member declared one, or it closed at
+    // the length it reached. Said ahead of every delivery while it is known
+    // and once more at the close, so an object acts on it once and ignores
+    // the repeats. A store that splits its container into volumes by size
+    // learns its geometry here.
+    fn sized(&mut self, _volume: VolumeIndex, _length: u64, _out: &mut Vec<Emit>) {}
 
     // A password the job offers. The object checks it against its own
     // header and, if it opens, carries on.

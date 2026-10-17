@@ -15,14 +15,6 @@ pub(crate) struct EnginesForStores<B>(pub(crate) B);
 
 impl<B: Builder> Builder for EnginesForStores<B> {
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
-        self.0.build(engine_for(kind), id)
-    }
-}
-
-pub(crate) fn engine_for(kind: Kind) -> Kind {
-    match kind {
-        Kind::RarStore => Kind::RarEngine,
-        Kind::SevenZipStore => Kind::SevenZipEngine,
-        other => other,
+        self.0.build(kind.engine_for().unwrap_or(kind), id)
     }
 }

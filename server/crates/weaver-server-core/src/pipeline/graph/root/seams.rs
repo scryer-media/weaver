@@ -37,6 +37,16 @@ impl Pipeline {
     // job's state must already be in place: what its queues hold says which
     // articles this run still has to fetch.
     pub(crate) fn admit_graph_job(&mut self, job_id: JobId, engine: Engine) {
+        // Read before the job is borrowed, in the order they are tried.
+        let passwords: Vec<String> = if engine == Engine::Graph {
+            self.archive_password_candidates_for_job(job_id)
+                .candidates
+                .iter()
+                .map(|candidate| candidate.value().to_owned())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -61,6 +71,7 @@ impl Pipeline {
                 .reader(crate::operations::StorageRoot::Intermediate),
             slots: limits::budgets(&self.direct_store.settings(), &self.tuner).1,
             mail: self.graph_runs.sender(),
+            passwords,
         };
         let Some(mut graph) = GraphJob::for_engine(engine, job_id.0, &files, storage) else {
             return;
