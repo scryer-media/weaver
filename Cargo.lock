@@ -2946,9 +2946,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f44421ed0da63609e8c736362bb809a09dc1ab855686b5694dbf5c2fa8477f10"
+checksum = "53fb40ce177d0fd92480e8a17b469ee3688cc9f64c615b6457635a661398bde6"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -4573,9 +4573,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.0"
+version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ace3a7183e51dfe1c063434b794b8d31d8853d7d953aa9eff21a11f88eb49f2"
+checksum = "5dd107b58f5db033006234ef50d51eb99a9b7ef0f4a90a463a911023bda06436"
 dependencies = [
  "aws-lc-rs",
  "brotli 9.0.0",
