@@ -91,8 +91,25 @@ pub enum Placement {
     // no member. The object keeps them and can hand them back.
     Envelope { envelope: u32, range: ByteRange },
     // Nowhere yet: the bytes are held, waiting for the headers that say
-    // where they go.
-    Held,
+    // where they go. The range is the volume's own, the only coordinates
+    // held bytes have, so a caller walking the pieces in order keeps its
+    // place across them.
+    Held { range: ByteRange },
+}
+
+impl Placement {
+    // How many bytes of the located volume range this piece accounts for.
+    pub fn len(&self) -> u64 {
+        match self {
+            Placement::Member { range, .. }
+            | Placement::Envelope { range, .. }
+            | Placement::Held { range } => range.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // Where a range of a member lies in the object's own volumes: the forward
@@ -103,7 +120,10 @@ pub struct Extent {
     pub range: ByteRange,
 }
 
-pub trait Object {
+// Send and Sync because a job's tree lives in the pipeline, which runs on a
+// multi-threaded runtime and is shared by reference across its awaits. An
+// object is plain state with no interior mutability, so both come free.
+pub trait Object: Send + Sync {
     fn kind(&self) -> Kind;
 
     // Bytes of one of my volumes. Say what they were into `out`, which the
@@ -123,7 +143,8 @@ pub trait Object {
     // The answer to a seek I made.
     fn pulled(&mut self, seek: Seek, pull: crate::seek::Pull, out: &mut Vec<Emit>);
 
-    // The inverse map: where did this range of my volume go?
+    // The inverse map: where did this range of my volume go? One piece per
+    // contiguous run, in volume order, together covering the whole range.
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>);
 
     // The forward map: where does this range of my member lie in my volumes?
@@ -144,6 +165,12 @@ pub trait Object {
     // with the volume index the member becomes, or `None` to let the
     // sniffer decide.
     fn claim(&mut self, _name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
+        None
+    }
+
+    // My recovery face, if I am a recovery object: the namespace I live in
+    // feeds, binds and repairs through it.
+    fn recovery(&mut self) -> Option<&mut dyn crate::recovery::Recovery> {
         None
     }
 }

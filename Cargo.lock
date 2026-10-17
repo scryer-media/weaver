@@ -6063,6 +6063,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-objects"
+version = "0.15.0"
+dependencies = [
+ "bytes",
+ "crc-fast",
+ "par2-rs",
+ "par3-rs",
+ "tempfile",
+ "thiserror 2.0.21",
+ "weaver-graph",
+]
+
+[[package]]
 name = "weaver-server-api"
 version = "0.15.0"
 dependencies = [
@@ -6157,6 +6170,7 @@ dependencies = [
  "unicode-normalization",
  "unrar-rs",
  "url",
+ "weaver-graph",
  "weaver-model",
  "weaver-nntp",
  "weaver-nzb",

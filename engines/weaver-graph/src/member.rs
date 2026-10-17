@@ -187,7 +187,15 @@ pub struct Namespace {
     members: BTreeMap<MemberId, Member>,
     names: NameLedger,
     next: u32,
+    // The front of each member, up to FIRST_BYTES: what a recovery object
+    // recognises an obfuscated member by. Kept apart from the members so a
+    // member record stays a plain value.
+    first_bytes: BTreeMap<MemberId, Vec<u8>>,
 }
+
+// How much of a member's front the namespace keeps. PAR2 identifies a file
+// by the MD5 of its first 16 KiB, and nothing needs more.
+pub const FIRST_BYTES: usize = 16 * 1024;
 
 impl Namespace {
     pub fn new() -> Self {
@@ -272,16 +280,63 @@ impl Namespace {
             found.bound_to = None;
             found.length = None;
         }
+        self.first_bytes.remove(&member);
     }
 
     // The member is gone for good, with its name.
     pub fn remove(&mut self, member: MemberId) -> Option<Member> {
         self.names.release(member);
+        self.first_bytes.remove(&member);
         self.members.remove(&member)
+    }
+
+    // Keep the part of a delivered range that lies in the member's front.
+    // Only bytes contiguous from offset zero count, because a front with a
+    // hole in it identifies nothing; bytes over what is kept replace it, the
+    // way a repair replaces a damaged first article.
+    pub fn keep_first_bytes(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+        if !self.members.contains_key(&member) {
+            return;
+        }
+        let front = self.first_bytes.entry(member).or_default();
+        let Ok(start) = usize::try_from(offset) else {
+            return;
+        };
+        if start > front.len() || start >= FIRST_BYTES {
+            return;
+        }
+        let end = start.saturating_add(bytes.len()).min(FIRST_BYTES);
+        if end > front.len() {
+            front.resize(end, 0);
+        }
+        front[start..end].copy_from_slice(&bytes[..end - start]);
+    }
+
+    // The member's front as far as it arrived, at most FIRST_BYTES.
+    pub fn first_bytes(&self, member: MemberId) -> &[u8] {
+        self.first_bytes.get(&member).map_or(&[], Vec::as_slice)
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<&Member> {
         self.members.values().find(|member| member.name == name)
+    }
+
+    // Whether every byte that arrived for every member arrived verified.
+    // Coverage is the one record of damage; completion reads it here.
+    pub fn is_clean(&self) -> bool {
+        self.members
+            .values()
+            .all(|member| member.coverage.is_clean())
+    }
+
+    // Every damaged range of every member, in member order.
+    pub fn damaged_ranges(&self) -> impl Iterator<Item = (MemberId, ByteRange)> + '_ {
+        self.members.values().flat_map(|member| {
+            member
+                .coverage
+                .damaged_ranges()
+                .map(move |range| (member.id, range))
+        })
     }
 }
 

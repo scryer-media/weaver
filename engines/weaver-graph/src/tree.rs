@@ -16,6 +16,7 @@ use bytes::Bytes;
 use crate::deliver::{Delivery, Emit, Provenance, Why};
 use crate::member::{MemberId, Namespace};
 use crate::object::{Extent, Kind, Object, ObjectId, Placement};
+use crate::recovery::Recovery;
 use crate::seek::{Pull, Seek, SeekUp};
 use crate::sniff::{Sniff, sniff};
 use crate::volume::{ByteRange, VolumeIndex};
@@ -169,12 +170,70 @@ impl Tree {
         self.nodes.get(&node).map(|found| &found.namespace)
     }
 
+    // Run `act` on the recovery object at `node` together with the namespace
+    // it lives in, its parent's, where the members it covers are. `None`
+    // when the node is the root or its object recovers nothing.
+    pub fn with_recovery<R>(
+        &mut self,
+        node: NodeId,
+        act: impl FnOnce(&mut dyn Recovery, &mut Namespace) -> R,
+    ) -> Option<R> {
+        let found = self.nodes.get_mut(&node)?;
+        let parent = found.binding.as_ref()?.parent;
+        // The object steps out of its node for the call, so the parent's
+        // namespace can be borrowed beside it; it steps back in after.
+        let mut object = found.object.take()?;
+        let result = match (object.recovery(), self.nodes.get_mut(&parent)) {
+            (Some(recovery), Some(parent)) => Some(act(recovery, &mut parent.namespace)),
+            _ => None,
+        };
+        if let Some(found) = self.nodes.get_mut(&node) {
+            found.object = Some(object);
+        }
+        result
+    }
+
     pub fn namespace_mut(&mut self, node: NodeId) -> Option<&mut Namespace> {
         self.nodes.get_mut(&node).map(|found| &mut found.namespace)
     }
 
     pub fn child_of(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
         self.nodes.get(&node)?.children.get(&member).copied()
+    }
+
+    // Whether the member's first bytes have not yet decided its owner. Its
+    // bytes have nowhere final to go, so the owner holds them.
+    pub fn is_undecided(&self, node: NodeId, member: MemberId) -> bool {
+        self.nodes
+            .get(&node)
+            .is_some_and(|found| found.undecided.contains_key(&member))
+    }
+
+    // Decide an undecided member as a leaf without waiting for its bytes: the
+    // owner could not hold them any longer, or the member ended before its
+    // front could say what it is.
+    pub fn settle_leaf(&mut self, node: NodeId, member: MemberId) {
+        if let Some(found) = self.nodes.get_mut(&node) {
+            found.undecided.remove(&member);
+        }
+    }
+
+    // The inverse map of the object at `node`: where this range of its volume
+    // went. Empty for the root, whose volumes are its members.
+    pub fn locate(
+        &self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<Placement>,
+    ) {
+        if let Some(object) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.object.as_ref())
+        {
+            object.locate(volume, range, out);
+        }
     }
 
     // Announce a member of the root namespace: the source's files.
@@ -210,6 +269,7 @@ impl Tree {
         if let Some(record) = found.namespace.get_mut(member) {
             record.coverage.write(range, provenance);
         }
+        found.namespace.keep_first_bytes(member, offset, &bytes);
         if found.undecided.contains_key(&member) {
             self.decide(node, member, offset, &bytes, builder, effects);
         }

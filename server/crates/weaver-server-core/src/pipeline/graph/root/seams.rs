@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// The pipeline's hooks into a graph job. The download and decode paths call
+// these when the job has a graph runtime and know nothing more about it; a
+// classic job has no runtime, so every hook is a lookup that finds nothing.
+//
+// The root works in volumes and ordinals; the queues work in segment ids.
+// This file is where the two meet, and the only place the root's classes
+// touch the queue's work items.
+
+use std::collections::HashMap;
+
+use bytes::{Bytes, BytesMut};
+use tracing::warn;
+use weaver_graph::{ByteRange, Segment, VolumeIndex};
+
+use super::intake::Decoded;
+use super::source::{Class, Move};
+use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::model::JobState;
+use crate::pipeline::download::queue::DownloadWork;
+use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile};
+use crate::pipeline::graph::root::phase::RootPhase;
+use crate::pipeline::{DecodedChunk, Pipeline};
+
+// The best priority a window volume is raised to: ahead of every ordinary
+// file, behind the index and first volumes a post leads with.
+const WINDOW_PRIORITY: u32 = 3;
+
+impl Pipeline {
+    // Give a job admitted or restored under `engine` its graph runtime. The
+    // job's state must already be in place: what its queues hold says which
+    // articles this run still has to fetch.
+    pub(crate) fn admit_graph_job(&mut self, job_id: JobId, engine: Engine) {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let files: Vec<RootFile> = state
+            .spec
+            .files
+            .iter()
+            .map(|file| RootFile {
+                name: file.filename.clone(),
+                articles: file
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.ordinal, segment.bytes))
+                    .collect(),
+            })
+            .collect();
+        let Some(mut graph) = GraphJob::for_engine(engine, &files) else {
+            return;
+        };
+        let mut queued = std::collections::HashSet::new();
+        state.download_queue.extend_segment_ids(&mut queued);
+        state.recovery_queue.extend_segment_ids(&mut queued);
+        graph.arrived_before(|volume, ordinal| queued.contains(&segment(job_id, volume, ordinal)));
+        let moves = graph.sample();
+        apply_moves(state, &moves);
+        self.graph_jobs.insert(job_id, graph);
+        self.after_graph_step(job_id);
+    }
+
+    // A decoded article of a graph job, as the decoder placed it.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::pipeline) fn graph_article_decoded(
+        &mut self,
+        segment_id: SegmentId,
+        offset: u64,
+        data: &DecodedChunk,
+        intact: bool,
+        positioned: bool,
+        length: u64,
+        segments: &[weaver_yenc::Segment],
+    ) {
+        let job_id = segment_id.file_id.job_id;
+        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+            return;
+        };
+        let decoded = Decoded {
+            volume: VolumeIndex(segment_id.file_id.file_index),
+            ordinal: segment_id.segment_number,
+            offset,
+            bytes: copy(data),
+            intact,
+            positioned,
+            length: (positioned && length > 0).then_some(length),
+            segments: segments
+                .iter()
+                .map(|segment| Segment {
+                    range: ByteRange::at(segment.file_offset, segment.len),
+                    crc32: segment.crc32,
+                    verified: intact,
+                })
+                .collect(),
+        };
+        let result = graph.intake(decoded);
+        self.after_graph_result(job_id, result);
+    }
+
+    // Every server failed an article of a graph job.
+    pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+            return;
+        };
+        let result = graph.lost(
+            VolumeIndex(segment_id.file_id.file_index),
+            segment_id.segment_number,
+        );
+        self.after_graph_result(job_id, result);
+    }
+
+    fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {
+        if let Err(error) = result {
+            warn!(job_id = job_id.0, error = %error, "graph job step failed");
+        }
+        self.after_graph_step(job_id);
+    }
+
+    // After anything reached the tree: answer the objects' seeks, move the
+    // articles they moved, and report the phase if it changed.
+    fn after_graph_step(&mut self, job_id: JobId) {
+        let (Some(graph), Some(state)) =
+            (self.graph_jobs.get_mut(&job_id), self.jobs.get_mut(&job_id))
+        else {
+            return;
+        };
+        let round = {
+            let (download, recovery) = (&state.download_queue, &state.recovery_queue);
+            graph.seek_round(|volume| {
+                let file_id = file(job_id, volume);
+                download.queued_count_for_file(file_id) + recovery.queued_count_for_file(file_id)
+                    > 0
+            })
+        };
+        match round {
+            Ok(moves) => apply_moves(state, &moves),
+            Err(error) => warn!(job_id = job_id.0, error = %error, "graph seek round failed"),
+        }
+        let Some(phase) = graph.phase_change() else {
+            return;
+        };
+        if let Some(status) = phase.job_status()
+            && RootPhase::may_replace(&state.status)
+            && state.status != status
+        {
+            state.status = status;
+            state.refresh_runtime_lanes_from_status();
+        }
+        if let Err(error) =
+            self.db
+                .try_queue_job_write(job_id, "save_active_job_root_phase", move |db| {
+                    db.save_active_job_root_phase(job_id, phase.as_str())
+                })
+        {
+            warn!(job_id = job_id.0, error = %error, "could not queue the root phase write");
+        }
+    }
+}
+
+// Put each moved article in its new class. Parked recovery work joins the
+// main queue, since a moved article is wanted ahead of something. A class
+// change re-queues the work under its new flags; a window rank re-keys it in
+// place, ranked ahead of everything else at its priority.
+pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
+    if moves.is_empty() {
+        return;
+    }
+    let job_id = state.job_id;
+    let classes: HashMap<SegmentId, Class> = moves
+        .iter()
+        .map(|found| (segment(job_id, found.volume, found.ordinal), found.class))
+        .collect();
+    for (id, class) in &classes {
+        if *class == Class::FirstArticle {
+            state.download_queue.note_first_article(*id);
+        }
+    }
+    let ranked =
+        |work: &DownloadWork| matches!(classes.get(&work.segment_id), Some(Class::Window(_)));
+    let mut taken = state
+        .recovery_queue
+        .extract_matching(|work| classes.contains_key(&work.segment_id));
+    taken.extend(
+        state
+            .download_queue
+            .extract_matching(|work| classes.contains_key(&work.segment_id) && !ranked(work)),
+    );
+    taken.sort_by_key(|work| classes.get(&work.segment_id).copied());
+    for mut work in taken {
+        match classes.get(&work.segment_id) {
+            Some(Class::Critical) => work.completion_critical = true,
+            Some(Class::Recovery) => {
+                work.completion_critical = true;
+                work.is_recovery = true;
+            }
+            _ => {}
+        }
+        state.download_queue.push(work);
+    }
+    state
+        .download_queue
+        .reprioritize_matching_with_rank(|work| match classes.get(&work.segment_id) {
+            Some(Class::Window(rank)) => Some((work.priority.min(WINDOW_PRIORITY), Some(*rank))),
+            _ => None,
+        });
+}
+
+fn file(job_id: JobId, volume: VolumeIndex) -> NzbFileId {
+    NzbFileId {
+        job_id,
+        file_index: volume.0,
+    }
+}
+
+fn segment(job_id: JobId, volume: VolumeIndex, ordinal: u32) -> SegmentId {
+    SegmentId {
+        file_id: file(job_id, volume),
+        segment_number: ordinal,
+    }
+}
+
+fn copy(data: &DecodedChunk) -> Bytes {
+    let mut bytes = BytesMut::with_capacity(data.len_bytes());
+    data.for_each_slice(|slice| bytes.extend_from_slice(slice));
+    bytes.freeze()
+}

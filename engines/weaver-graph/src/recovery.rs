@@ -6,9 +6,9 @@
 // beside it; it verifies them from evidence the namespace hands it as bytes
 // pass, and repairs them by asking up for its recovery data.
 
-use crate::member::MemberId;
+use crate::member::{MemberId, Namespace};
 use crate::seek::Seek;
-use crate::volume::ByteRange;
+use crate::volume::{ByteRange, VolumeIndex};
 
 // One block-aligned piece of a delivered range with its checksum, computed by
 // the namespace from bytes it had in hand. The grid folds these into slice
@@ -50,9 +50,29 @@ pub trait MemberAccess {
     fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]);
     fn length(&self, member: MemberId) -> Option<u64>;
+    // Bytes of the recovery object's own volume, which the namespace kept
+    // where the object's inverse map placed them. This is where the
+    // recovery data a repair spends is read from. A namespace that keeps
+    // nothing for its recovery objects answers no, and they cannot repair.
+    fn read_volume(
+        &mut self,
+        _volume: VolumeIndex,
+        _range: ByteRange,
+        _into: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
 }
 
 pub trait Recovery {
+    // Match the namespace's members to what this object describes, by id,
+    // name or content. A member recognised by content alone is renamed
+    // through the namespace and listed in `renamed`. Called whenever the
+    // namespace's members, their lengths or their first bytes change, and
+    // after the object learned more of what it describes. An object handed
+    // its members when it was made has nothing to match.
+    fn bind(&mut self, _namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {}
+
     // Whether this object describes the member, by id, name or content.
     fn covers(&self, member: MemberId) -> bool;
 

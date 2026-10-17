@@ -1879,6 +1879,17 @@ impl Pipeline {
                 return;
             }
 
+            // A graph job's root takes the article as placed, damaged or not;
+            // a classic job has no root and this finds nothing.
+            self.graph_article_decoded(
+                segment_id,
+                file_offset,
+                &data,
+                !retain_damage,
+                !encoding.is_uu(),
+                yenc_layout.file_size,
+                &segments,
+            );
             if retain_damage {
                 if !crc_valid {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);

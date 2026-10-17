@@ -138,6 +138,9 @@ impl Pipeline {
                 slot.insert(terminal_state);
             }
         }
+        // A graph job's root marks the article's range damaged; a classic job
+        // has no root and this finds nothing.
+        self.graph_article_lost(seg_id);
         // A container set whose map this article closed cannot read it now.
         self.note_direct_article_terminal(seg_id);
         self.note_gap_support_fact(seg_id, terminal_state);

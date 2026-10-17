@@ -2549,6 +2549,9 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     // Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    // The graph runtime of each job admitted under the graph engine. A job
+    // without one is a classic job.
+    pub(super) graph_jobs: HashMap<JobId, graph::job::GraphJob>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,

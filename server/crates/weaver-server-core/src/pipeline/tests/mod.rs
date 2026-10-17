@@ -214,7 +214,7 @@ fn sample_nzb_bytes() -> Vec<u8> {
         .to_vec()
 }
 
-fn sample_nzb_zstd() -> Vec<u8> {
+pub(in crate::pipeline) fn sample_nzb_zstd() -> Vec<u8> {
     crate::ingest::compress_nzb_bytes(&sample_nzb_bytes()).unwrap()
 }
 
@@ -601,7 +601,9 @@ async fn new_direct_pipeline_on_machine(
     (pipeline, intermediate_dir, complete_dir)
 }
 
-async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+pub(in crate::pipeline) async fn new_direct_pipeline(
+    temp_dir: &TempDir,
+) -> (Pipeline, PathBuf, PathBuf) {
     new_direct_pipeline_with_buffers(
         temp_dir,
         BufferPoolConfig {
@@ -635,7 +637,7 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
 // after the drop — so the flush moves those writes ahead of the reopen
 // instead of racing it, and loses nothing a plain drop would have kept. What
 // a crash does lose is the state that was never queued, and that stays lost.
-async fn retire_pipeline_database(pipeline: Pipeline) {
+pub(in crate::pipeline) async fn retire_pipeline_database(pipeline: Pipeline) {
     let db = pipeline.db.clone();
     drop(pipeline);
     db.flush_write_queue().await.unwrap();
@@ -1879,7 +1881,11 @@ fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
     spec
 }
 
-async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
+pub(in crate::pipeline) async fn insert_active_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+) -> PathBuf {
     insert_active_job_with_persisted_nzb(pipeline, job_id, spec, sample_nzb_zstd()).await
 }
 

@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// Weaver's format objects. Every format-specific object lives here, one
+// module per format, behind the graph's format-blind `Object` and `Recovery`
+// faces; nothing outside a format's own module knows its fields. The graph
+// asks for an object by kind through `build`.
+
+mod grid;
+pub mod par2;
+pub mod par3;
+pub mod sfv;
+
+#[cfg(test)]
+mod testing;
+
+use weaver_graph::{Builder, Kind, Object, ObjectId};
+
+// The object for a kind this crate has, or `None` for one it has not.
+pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
+    match kind {
+        Kind::Par2 => Some(Box::new(par2::Par2::new(id))),
+        Kind::Par3 => Some(Box::new(par3::Par3::new(id))),
+        Kind::Sfv => Some(Box::new(sfv::Sfv::new(id))),
+        _ => None,
+    }
+}
+
+// The graph's builder over `build`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Objects;
+
+impl Builder for Objects {
+    fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
+        build(kind, id)
+    }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "weaver-objects"
+description = "Weaver's format objects: one per format, behind the graph's format-blind interfaces"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+crc-fast = { workspace = true }
+par2-rs = { workspace = true }
+par3-rs = { workspace = true }
+thiserror = { workspace = true }
+weaver-graph = { path = "../weaver-graph" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

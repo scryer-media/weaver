@@ -6,6 +6,13 @@
 // the classic one, so every job is stamped with the engine it was admitted
 // under and a restart keeps that engine whatever the switch says now.
 
+pub(crate) mod envelope;
+pub(crate) mod job;
+pub(crate) mod leaf;
+pub(crate) mod limits;
+pub(crate) mod namespace;
+pub(crate) mod root;
+
 use std::fmt;
 use std::str::FromStr;
 use std::sync::OnceLock;

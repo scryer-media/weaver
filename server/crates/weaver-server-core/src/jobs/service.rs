@@ -714,8 +714,11 @@ impl Pipeline {
         );
 
         stage_start = std::time::Instant::now();
+        // The engine is decided once, here, and stamped on the row: a restart
+        // resumes the job on it whatever the switch says by then.
+        let engine = crate::pipeline::graph::Engine::from_environment();
         let active_job = crate::ActiveJob {
-            engine: crate::pipeline::graph::Engine::Classic,
+            engine,
             job_id,
             nzb_hash,
             nzb_path,
@@ -880,6 +883,7 @@ impl Pipeline {
         self.install_repeated_articles(&state)?;
         self.job_scheduling_memory.insert(job_id, scheduling_memory);
         self.jobs.insert(job_id, state);
+        self.admit_graph_job(job_id, engine);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
         self.raise_added_script_event(job_id);
@@ -1841,6 +1845,7 @@ impl Pipeline {
                 .position(|id| *id == job_id)
                 .unwrap_or(self.job_order.len());
             self.jobs.remove(&job_id);
+            self.graph_jobs.remove(&job_id);
             self.job_order.retain(|id| *id != job_id);
             self.restore_job(request).await?;
             self.job_order.retain(|id| *id != job_id);
@@ -2049,6 +2054,12 @@ impl Pipeline {
                 .then_some(staging_dir)
         };
 
+        // The engine the row was stamped with at admission, never the switch's
+        // answer now: a job resumes on the engine it started on.
+        let engine = self
+            .db_blocking(move |db| db.load_active_job_engine(job_id))
+            .await?
+            .unwrap_or_default();
         let server_attribution = self
             .db_blocking(move |db| db.load_active_server_attribution(job_id))
             .await?;
@@ -2198,6 +2209,7 @@ impl Pipeline {
         self.install_repeated_articles(&state)?;
         self.job_scheduling_memory.insert(job_id, scheduling_memory);
         self.jobs.insert(job_id, state);
+        self.admit_graph_job(job_id, engine);
         // After the job state exists, and before anything can decode a segment
         // for it: `install_restored` marks the job examined, so the lazy
         // admission seam does not rediscover the same sets from the spec and
