@@ -5,27 +5,38 @@
 // linked to: a stored file's bytes are its member's, an open AES file's go
 // through its cipher, a locked one's stay held. Two checksums are folded as
 // the bytes pass: every part but the last carries the CRC of its own packed
-// bytes, and the last carries the whole file's. A part that fails its own is
-// damaged at its range; a file that fails as a whole is damaged at the parts
-// that failed, or, when none did, at the parts nothing proved.
+// bytes, and the last carries the whole file's, keyed when the header says.
+// A part that fails its own is damaged at its range; a file that fails as a
+// whole is damaged at every part.
 
 use bytes::Bytes;
+use unrar_rs::convert_crc32_to_mac;
 use weaver_graph::{ByteRange, Emit, MemberId, Provenance, Segment, VolumeIndex};
 
-use super::kdf::keyed_crc;
-use super::{Entry, Lock, Proof, RarStore};
+use super::{Lock, RarStore};
 use crate::grid::{Folded, WHOLE, crc32};
 
-// A fold against the CRC a header wrote, keyed when the file's checksums
-// are: `None` while unfolded or while the key is not known.
-fn holds(entry: &Entry, folded: Option<Folded>, expected: u32) -> Option<bool> {
+// The composed CRC32, folded with the hash key when the header keys it;
+// `None` while the key it needs is not known.
+fn fold_member_crc(composed: u32, uses_mac: bool, hash_key: Option<&[u8; 32]>) -> Option<u32> {
+    match (uses_mac, hash_key) {
+        (true, Some(hash_key)) => Some(convert_crc32_to_mac(composed, hash_key)),
+        (false, _) => Some(composed),
+        (true, None) => None,
+    }
+}
+
+// A fold against the CRC a header wrote: `None` while unfolded or unkeyed,
+// else the folded CRC and whether it holds.
+fn holds(
+    folded: Option<Folded>,
+    uses_mac: bool,
+    hash_key: Option<&[u8; 32]>,
+    expected: u32,
+) -> Option<(u32, bool)> {
     let folded = folded?;
-    let crc = match (entry.keyed(), &entry.hash_key) {
-        (false, _) => folded.crc32,
-        (true, Some(key)) => keyed_crc(key, folded.crc32),
-        (true, None) => return None,
-    };
-    Some(crc == expected)
+    let crc = fold_member_crc(folded.crc32, uses_mac, hash_key)?;
+    Some((folded.crc32, crc == expected))
 }
 
 impl RarStore {
@@ -37,40 +48,36 @@ impl RarStore {
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
-        let Some(found) = self.volumes.get(&volume) else {
-            return;
-        };
-        let linked: Vec<(usize, usize, ByteRange)> = found
-            .walk
-            .blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, block)| {
-                let part = block.data.intersect(range)?;
-                let (entry, piece) = self.links.get(&(volume, index))?;
-                Some((*entry, *piece, part))
-            })
-            .collect();
-        for (id, piece, part) in linked {
+        for (id, part, stream) in self.linked(volume, range) {
+            // The layout cuts a member's runs at its parts, so one run lies
+            // in one piece; a part the entry has not taken yet routes nothing.
+            let Some(pieces) = self.entries.get(id).map(|entry| &entry.pieces) else {
+                continue;
+            };
+            let piece = pieces.partition_point(|piece| piece.at <= stream.start);
+            let Some(piece) = piece.checked_sub(1) else {
+                continue;
+            };
+            if stream.end > pieces[piece].at + pieces[piece].data.len() {
+                continue;
+            }
             let slice =
                 &bytes[(part.start - range.start) as usize..(part.end - range.start) as usize];
             self.check_part(id, piece, part, slice, provenance, out);
             let entry = &mut self.entries[id];
-            let data = entry.pieces[piece].data;
-            let stream = entry.pieces[piece].at + (part.start - data.start);
             let mut plains = Vec::new();
             match &mut entry.lock {
                 Lock::Locked => continue,
                 Lock::Plain => {}
                 Lock::Open(cbc) => {
-                    cbc.deliver(stream, slice, provenance, &mut plains);
+                    cbc.deliver(stream.start, slice, provenance, &mut plains);
                     for plain in plains {
                         self.record(id, plain.offset, &plain.bytes, plain.provenance, out);
                     }
                     continue;
                 }
             }
-            self.record(id, stream, slice, provenance, out);
+            self.record(id, stream.start, slice, provenance, out);
         }
     }
 
@@ -85,10 +92,12 @@ impl RarStore {
         out: &mut Vec<Emit>,
     ) {
         let entry = &mut self.entries[id];
-        let Some(expected) = entry.pieces[piece].crc else {
+        let found = &entry.pieces[piece];
+        let (Some(expected), data, volume, uses_mac) =
+            (found.crc, found.data, found.volume, found.uses_mac)
+        else {
             return;
         };
-        let data = entry.pieces[piece].data;
         let key = MemberId(piece as u32);
         entry.parts.offer(
             key,
@@ -102,17 +111,8 @@ impl RarStore {
         let folded = entry
             .parts
             .fold(key, WHOLE, 0, ByteRange::new(0, data.len()));
-        let proof = match (holds(entry, folded, expected), folded) {
-            (Some(false), _) => Proof::Damaged,
-            (Some(true), Some(folded)) if folded.verified => Proof::Intact,
-            _ => Proof::Unknown,
-        };
-        let was = std::mem::replace(&mut entry.pieces[piece].proof, proof);
-        if proof == Proof::Damaged && was != Proof::Damaged {
-            out.push(Emit::Damaged {
-                volume: entry.pieces[piece].volume,
-                range: data,
-            });
+        if let Some((crc, false)) = holds(folded, uses_mac, entry.hash_key.as_deref(), expected) {
+            self.say_damaged(volume, data, crc, out);
         }
     }
 
@@ -153,30 +153,18 @@ impl RarStore {
         }
         let verdict = entry.crc.and_then(|expected| {
             let folded = entry.grid.fold(member, WHOLE, 0, whole);
-            holds(entry, folded, expected)
+            holds(folded, entry.uses_mac, entry.hash_key.as_deref(), expected)
         });
-        match verdict {
-            Some(false) if !entry.out.damaged => {
-                entry.out.damaged = true;
-                let failed: Vec<usize> = (0..entry.pieces.len())
-                    .filter(|piece| entry.pieces[*piece].proof == Proof::Damaged)
-                    .collect();
-                let suspects: Vec<usize> = match failed.is_empty() {
-                    true => (0..entry.pieces.len())
-                        .filter(|piece| entry.pieces[*piece].proof != Proof::Intact)
-                        .collect(),
-                    false => failed,
-                };
-                for piece in suspects {
-                    let piece = &entry.pieces[piece];
-                    out.push(Emit::Damaged {
-                        volume: piece.volume,
-                        range: piece.data,
-                    });
-                }
-            }
-            Some(true) => entry.out.damaged = false,
-            _ => {}
+        let Some((crc, false)) = verdict else {
+            return;
+        };
+        let parts: Vec<(VolumeIndex, ByteRange)> = entry
+            .pieces
+            .iter()
+            .map(|piece| (piece.volume, piece.data))
+            .collect();
+        for (volume, data) in parts {
+            self.say_damaged(volume, data, crc, out);
         }
     }
 }

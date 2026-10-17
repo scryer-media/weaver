@@ -2,27 +2,27 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Repairing one set through the namespace. Slices the grid proved are taken
-// as they are; slices it could not prove are read back and checked against
-// their CRC32 and MD5; recovery packets are read from the volumes the
-// namespace kept, their hashes checked, and spent through par2-rs. Nothing
-// here touches a file: every byte goes through the namespace's access.
+// as they are; slices it could not prove are read back one at a time and
+// checked against their CRC32 and MD5; recovery packets are read from the
+// volumes the namespace kept, their hashes checked again, and spent through
+// par2-rs under the repair memory limit. Nothing here touches a file: every
+// byte goes through the namespace's access.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io;
 
-use par2_rs::packet::{HEADER_SIZE, PacketHeader};
 use par2_rs::verify::FileAccess;
 use par2_rs::{
-    FileId, FileStatus, FileVerification, Par2FileSet, RecoverySlice, RecoverySlicePacket,
-    RepairOptions, Repairability, SliceChecksumState, VerificationResult,
-    execute_repair_with_options, plan_repair,
+    FileId, FileStatus, FileVerification, Packet, Par2FileSet, RecoverySlice, RepairOptions,
+    Repairability, SliceChecksumState, VerificationResult, execute_repair_with_options,
+    parse_packet, plan_repair_with_memory_limit,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{ByteRange, MemberId, SliceVerdict};
 
 use super::evidence::Evidence;
-use super::sets::{SetState, Volume};
+use super::sets::SetState;
 use crate::grid::Grid;
 
 // What one set's repair came to.
@@ -42,42 +42,14 @@ impl SetRepair {
     }
 }
 
-// What the sets taken before this one came to. A member two sets bind is
-// the first one's to rule on.
-#[derive(Default)]
-pub(super) struct Earlier {
-    ruled: BTreeSet<MemberId>,
-    // Of the ruled members, those their set left good: found clean or
-    // repaired. The rest are still damaged, and count so here.
-    settled: BTreeSet<MemberId>,
-}
-
-impl Earlier {
-    // A set settles only the members it rules on.
-    pub(super) fn after(&mut self, state: &SetState, outcome: RepairOutcome) {
-        let good = matches!(
-            outcome,
-            RepairOutcome::Clean | RepairOutcome::Repaired { .. }
-        );
-        for member in state.members().values() {
-            if self.ruled.insert(*member) && good {
-                self.settled.insert(*member);
-            }
-        }
-    }
-}
-
-// A set repairs only for damage of its own: slices of a member it binds
-// that no earlier set binds. Damage in a member an earlier set rules on is
-// that set's, and a described file no member is bound to has nowhere to be
-// written, so neither starts a repair; both still count as missing in the
-// arithmetic of one that does.
+// A described file no post carries is announced by the namespace before the
+// repair, so it is a member here with every slice missing, and the rebuild
+// writes it whole.
 pub(super) fn repair_set(
     state: &mut SetState,
     grid: &Grid,
-    volumes: &[Volume],
     coming: u64,
-    earlier: &Earlier,
+    memory_limit: usize,
     access: &mut dyn MemberAccess,
 ) -> SetRepair {
     let Some(index) = state.usable() else {
@@ -87,22 +59,14 @@ pub(super) fn repair_set(
     let validity: Vec<(FileId, Vec<bool>)> = index
         .recovery_file_ids
         .iter()
-        .map(|file| {
-            (
-                *file,
-                slice_validity(index, state, grid, *file, &earlier.settled, access),
-            )
-        })
+        .map(|file| (*file, slice_validity(index, state, grid, *file, access)))
         .collect();
     let invalid = |valid: &Vec<bool>| valid.iter().filter(|valid| !**valid).count() as u64;
+    // Only damage in a bound member starts a repair; a described file no
+    // member is bound to yet is missing in the arithmetic of one that does.
     let own: u64 = validity
         .iter()
-        .filter(|(file, _)| {
-            state
-                .members()
-                .get(file)
-                .is_some_and(|member| !earlier.ruled.contains(member))
-        })
+        .filter(|(file, _)| state.members().contains_key(file))
         .map(|(_, valid)| invalid(valid))
         .sum();
     if own == 0 {
@@ -117,7 +81,7 @@ pub(super) fn repair_set(
         },
         damaged,
     };
-    let slices = spend(state, slice_size, damaged as usize, volumes, access);
+    let slices = spend(state, slice_size, damaged as usize, access);
     if (slices.len() as u64) < damaged {
         return short(slices.len() as u64);
     }
@@ -128,7 +92,7 @@ pub(super) fn repair_set(
     set.recovery_slices = slices;
     let verification = verification(&set, &validity, damaged);
     let available = set.recovery_slices.len() as u64;
-    let Ok(plan) = plan_repair(&set, &verification) else {
+    let Ok(plan) = plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) else {
         return short(available);
     };
     let members: BTreeMap<FileId, MemberId> = state.members().clone();
@@ -137,7 +101,11 @@ pub(super) fn repair_set(
         members: &members,
         set: &set,
     };
-    if execute_repair_with_options(&plan, &set, &mut files, &RepairOptions::default()).is_err() {
+    let options = RepairOptions {
+        memory_limit: Some(memory_limit),
+        ..Default::default()
+    };
+    if execute_repair_with_options(&plan, &set, &mut files, &options).is_err() {
         return short(available);
     }
     SetRepair {
@@ -147,13 +115,12 @@ pub(super) fn repair_set(
 }
 
 // Which slices of a described file are good, reading back only the ones the
-// evidence did not settle. A member an earlier set left good is good here.
+// evidence did not settle.
 fn slice_validity(
     index: &Par2FileSet,
     state: &SetState,
     grid: &Grid,
     file: FileId,
-    settled: &BTreeSet<MemberId>,
     access: &mut dyn MemberAccess,
 ) -> Vec<bool> {
     let count = index.file_description(&file).map_or(0, |description| {
@@ -162,9 +129,6 @@ fn slice_validity(
     let Some(member) = state.members().get(&file).copied() else {
         return vec![false; count];
     };
-    if settled.contains(&member) {
-        return vec![true; count];
-    }
     let evidence = Evidence::of(grid, index, file, member, access.length(member));
     if evidence.is_proven() {
         return vec![true; count];
@@ -216,12 +180,12 @@ fn read_slice(
 }
 
 // Read recovery packets back from the volumes, in exponent order, until
-// `wanted` pass their hash. One that fails is forgotten.
+// `wanted` pass their hash. The scan checked it; the volume is read again
+// here, so it is checked again. One that fails is forgotten.
 fn spend(
     state: &mut SetState,
     slice_size: u64,
     wanted: usize,
-    volumes: &[Volume],
     access: &mut dyn MemberAccess,
 ) -> BTreeMap<u32, RecoverySlice> {
     let mut slices = BTreeMap::new();
@@ -230,12 +194,6 @@ fn spend(
     for (&exponent, location) in &state.recovery {
         if slices.len() >= wanted {
             break;
-        }
-        let spoiled = volumes
-            .get(location.volume.0 as usize)
-            .is_none_or(|volume| volume.is_spoiled(location.range));
-        if spoiled {
-            continue;
         }
         buffer.clear();
         let read = access.read_volume(location.volume, location.range, &mut buffer);
@@ -253,11 +211,12 @@ fn spend(
 }
 
 fn recovery_slice(packet: &[u8], slice_size: u64) -> Option<par2_rs::RecoverySliceData> {
-    let header = PacketHeader::parse(packet, 0).ok()?;
-    header.validate_hash(packet, 0).ok()?;
-    let body = packet.get(HEADER_SIZE..usize::try_from(header.length).ok()?)?;
-    let parsed = RecoverySlicePacket::parse(body).ok()?;
-    (parsed.data.len() as u64 == slice_size).then_some(parsed.data)
+    match parse_packet(packet, 0).ok()?.0 {
+        Packet::RecoverySlice(parsed) if parsed.data.len() as u64 == slice_size => {
+            Some(parsed.data)
+        }
+        _ => None,
+    }
 }
 
 fn verification(
@@ -298,8 +257,8 @@ fn verification(
 }
 
 // par2-rs's view of the members: files by id, read and written through the
-// namespace. A described file no member is bound to has nowhere to go, so
-// what is rebuilt for it is dropped.
+// namespace. A file no member is bound to was not announced, as when the
+// namespace refused to, so what is rebuilt for it is dropped.
 struct Files<'a> {
     access: RefCell<&'a mut dyn MemberAccess>,
     members: &'a BTreeMap<FileId, MemberId>,
@@ -349,8 +308,11 @@ impl FileAccess for Files<'_> {
         self.length(file)
     }
 
-    fn read_file(&self, file: &FileId) -> io::Result<Vec<u8>> {
-        self.read_file_range(file, 0, self.length(file).unwrap_or(0))
+    // A repair reads slices, never a whole member.
+    fn read_file(&self, _file: &FileId) -> io::Result<Vec<u8>> {
+        Err(io::Error::other(
+            "a repair reads members one slice at a time",
+        ))
     }
 
     fn write_file_range(&mut self, file: &FileId, offset: u64, data: &[u8]) -> io::Result<()> {

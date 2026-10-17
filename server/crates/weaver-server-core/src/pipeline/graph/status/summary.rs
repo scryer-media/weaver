@@ -7,18 +7,23 @@
 // and the script-facing PAR status all read this one record, so they cannot
 // disagree.
 
-use weaver_graph::Kind;
 use weaver_graph::recovery::RepairOutcome;
+use weaver_graph::{Kind, NodeId};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RecoverySummary {
     pub(crate) sets: Vec<SetSummary>,
+    // Members that carry recovery data nothing here reads, by name: it is
+    // there, and no repair counts on it.
+    pub(crate) unusable: Vec<String>,
 }
 
 // One recovery object of the namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SetSummary {
     pub(crate) kind: Kind,
+    // The namespace it lives in, at whatever depth.
+    pub(crate) namespace: NodeId,
     // What the object is called where it lives, for the operator.
     pub(crate) name: String,
     pub(crate) blocks_reachable: u64,

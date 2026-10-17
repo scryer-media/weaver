@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Which member each described file is. Within one set a member is matched by
-// file id, then by name, then by its first 16 KiB and its length, and the
-// first rule that answers decides. Ambiguity refuses: a name that answers to
-// two descriptions binds nothing, and two members that answer to one
-// description both go unbound. A member bound by its content alone takes the
-// described name. Each set binds on its own, so a member two sets describe
-// alike is bound in both; a name is the weakest rule, and a bind by name
-// gives way when another set describes that name as a different file.
+// Which member each described file is. Within one set a member is matched
+// by the described name, then by its first 16 KiB and its length. A name that
+// answers to two descriptions binds nothing, unless the member's length rules
+// out all but one, and two members that answer to one description both go
+// unbound. A member that answers in two sets is ambiguous, so neither binds
+// it. A member bound by its content alone takes the described name.
 
 use std::collections::BTreeMap;
 
@@ -59,133 +57,97 @@ impl<'a> Candidate<'a> {
     }
 }
 
-// How a member matched a description.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Matched {
-    Id,
-    Name,
-    Content,
-}
-
-// The bindings of one set over the namespace, and which were by content.
-// `others` are the other sets in the namespace.
-pub(super) fn bind_set(
-    index: &Par2FileSet,
-    others: &[&Par2FileSet],
+// The bindings of each set over the namespace, and the described name of
+// each member bound by its content alone.
+pub(super) fn bind_sets(
+    indexes: &[&Par2FileSet],
     namespace: &Namespace,
     own: ObjectId,
-) -> BTreeMap<FileId, (MemberId, Matched)> {
-    let mut claims: BTreeMap<FileId, Vec<(MemberId, Matched)>> = BTreeMap::new();
+) -> (Vec<BTreeMap<FileId, MemberId>>, Vec<(MemberId, String)>) {
+    let mut claims: Vec<BTreeMap<FileId, Vec<(MemberId, bool)>>> =
+        vec![BTreeMap::new(); indexes.len()];
     for member in namespace.members() {
         if member.bound_to == Some(own) {
             continue;
         }
         let candidate = Candidate::of(member, namespace.first_bytes(member.id));
-        if let Some((file, matched)) = match_member(index, others, &candidate) {
-            claims.entry(file).or_default().push((member.id, matched));
+        let mut matches = indexes
+            .iter()
+            .enumerate()
+            .filter_map(|(at, index)| Some((at, match_member(index, &candidate)?)));
+        if let (Some((at, (file, by_content))), None) = (matches.next(), matches.next()) {
+            claims[at]
+                .entry(file)
+                .or_default()
+                .push((member.id, by_content));
         }
     }
-    claims
+    let mut names = Vec::new();
+    let bound = claims
         .into_iter()
-        .filter_map(|(file, claimants)| match claimants.as_slice() {
-            [only] => Some((file, *only)),
-            _ => None,
+        .zip(indexes)
+        .map(|(claims, index)| {
+            claims
+                .into_iter()
+                .filter_map(|(file, claimants)| {
+                    let [(member, by_content)] = claimants.as_slice() else {
+                        return None;
+                    };
+                    if *by_content && let Some(description) = index.file_description(&file) {
+                        names.push((*member, description.filename.clone()));
+                    }
+                    Some((file, *member))
+                })
+                .collect()
         })
-        .collect()
+        .collect();
+    (bound, names)
 }
 
-fn match_member(
-    index: &Par2FileSet,
-    others: &[&Par2FileSet],
-    candidate: &Candidate<'_>,
-) -> Option<(FileId, Matched)> {
-    if let Some(file) = by_id(index, candidate) {
-        return Some((file, Matched::Id));
-    }
-    match by_name(index, candidate) {
-        Named::One(file) if !disputed(others, candidate, file) => Some((file, Matched::Name)),
-        Named::Nothing => by_content(index, candidate).map(|file| (file, Matched::Content)),
-        _ => None,
-    }
-}
-
-// Another set answers the member's name with some other file. A file id is
-// the same in every set that describes the file, so a different one is a
-// different file under the same name.
-fn disputed(others: &[&Par2FileSet], candidate: &Candidate<'_>, file: FileId) -> bool {
-    others.iter().any(|other| match by_name(other, candidate) {
-        Named::One(theirs) => theirs != file,
-        Named::Ambiguous => true,
-        Named::Nothing => false,
-    })
-}
-
-// The file id is the MD5 of the 16 KiB hash, the length and the name, so a
-// member that computes to a described id is that file beyond doubt.
-fn by_id(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId> {
-    let length = candidate.complete?;
-    let mut input = Vec::with_capacity(24 + candidate.name.len());
-    input.extend_from_slice(
-        &candidate
-            .window_hash(length)
-            .or_else(|| (length == 0).then(|| md5(&[])))?,
-    );
-    input.extend_from_slice(&length.to_le_bytes());
-    input.extend_from_slice(candidate.name.as_bytes());
-    let id = FileId::from_bytes(md5(&input));
-    index.files.contains_key(&id).then_some(id)
-}
-
-enum Named {
-    One(FileId),
-    Ambiguous,
-    Nothing,
-}
-
-fn by_name(index: &Par2FileSet, candidate: &Candidate<'_>) -> Named {
-    let exact = described(index, |description| {
-        names(description).any(|name| name == candidate.name)
-    });
-    let matches = if exact.is_empty() {
-        // Posted names change case without changing identity, but only a
-        // unique folded match is one; length never settles a folded tie.
-        let folded = described(index, |description| {
-            names(description).any(|name| name.eq_ignore_ascii_case(candidate.name))
+// A file and whether the member matched it by content alone.
+fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<(FileId, bool)> {
+    let mut matches = described(index, |description| description.filename == candidate.name);
+    if matches.is_empty() {
+        // Posted subjects can change case without changing file identity.
+        // Only a unique folded match is usable; length must not resolve a
+        // collision between distinct case-sensitive recovery names.
+        matches = described(index, |description| {
+            description.filename.eq_ignore_ascii_case(candidate.name)
         });
-        if folded.len() > 1 {
-            return Named::Ambiguous;
+        if matches.len() > 1 {
+            return None;
         }
-        folded
-    } else {
-        exact
-    };
-    // Two descriptions under one name: a swapped pair. The one the member's
-    // length has not contradicted is it, if exactly one is left.
-    let matches = if matches.len() > 1 {
+    }
+    // Two names, two descriptions: the posted name of a swapped pair answers
+    // to the partner's description. Length breaks that tie whenever the pair
+    // differ in it. Only a tie is broken this way: a lone name match keeps
+    // its binding whatever the lengths say, because a short file at its own
+    // name is damage.
+    if matches.len() > 1 {
         let possible: Vec<_> = matches
             .iter()
             .copied()
             .filter(|(_, length)| !candidate.contradicts(*length))
             .collect();
         if possible.len() == 1 {
-            possible
-        } else {
-            matches
+            matches = possible;
         }
-    } else {
-        matches
-    };
+    }
     match matches.as_slice() {
-        [] => Named::Nothing,
-        [(file, _)] => Named::One(*file),
-        _ => Named::Ambiguous,
+        [(file, _)] => Some((*file, false)),
+        // An obfuscated post lies in its subject, not in its bytes.
+        [] => by_content(index, candidate).map(|file| (file, true)),
+        _ => None,
     }
 }
 
-// An obfuscated name lies; the front does not.
+// A zero-length description has no content to be identified by, and a
+// window the front does not reach cannot be tested. A split fragment begins
+// with the whole described file, so its front matches though it is not it.
 fn by_content(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId> {
     let matches = described(index, |description| {
         !candidate.contradicts(description.length)
+            && !is_split_fragment_of(candidate.name, &description.filename)
             && candidate.window_hash(description.length) == Some(description.hash_16k)
     });
     match matches.as_slice() {
@@ -205,10 +167,12 @@ fn described(index: &Par2FileSet, test: impl Fn(&FileDescription) -> bool) -> Ve
     found
 }
 
-fn names(description: &FileDescription) -> impl Iterator<Item = &str> {
-    [
-        description.filename.as_str(),
-        description.par2_name.as_str(),
-    ]
-    .into_iter()
+// Whether a name is a numeric split fragment of the described name.
+fn is_split_fragment_of(candidate_name: &str, described_name: &str) -> bool {
+    candidate_name
+        .strip_prefix(described_name)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .is_some_and(|extension| {
+            !extension.is_empty() && extension.as_bytes().iter().all(u8::is_ascii_digit)
+        })
 }

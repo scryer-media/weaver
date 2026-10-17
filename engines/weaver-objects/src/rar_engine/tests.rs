@@ -232,6 +232,7 @@ enum Said {
     Retract(u32),
     NeedsPassword,
     Refuse(Why),
+    Damaged(u32, u64, u64),
 }
 
 fn said(emits: &[Emit]) -> Vec<Said> {
@@ -265,6 +266,9 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::Retract(member) => out.push(Said::Retract(member.0)),
             Emit::NeedsPassword => out.push(Said::NeedsPassword),
             Emit::Refuse(why) => out.push(Said::Refuse(*why)),
+            Emit::Damaged { volume, range } => {
+                out.push(Said::Damaged(volume.0, range.start, range.end))
+            }
             other => panic!("an engine run does not say {other:?}"),
         }
     }
@@ -334,7 +338,8 @@ fn claim_names_the_volumes_of_its_own_set_only() {
     let mut old = named(&["set.rar"]);
     assert_eq!(old.claim("set.r00", b""), Some(VolumeIndex(1)));
     assert_eq!(old.claim("SET.R41", b""), Some(VolumeIndex(42)));
-    assert_eq!(old.claim("set.s00", b""), Some(VolumeIndex(101)));
+    // `.sNN` is numbered as `.rNN` is.
+    assert_eq!(old.claim("set.s00", b""), Some(VolumeIndex(1)));
     assert_eq!(old.claim("set.part2.rar", b""), None);
     assert_eq!(old.claim("set.rar", b""), None);
 }
@@ -451,17 +456,19 @@ fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
 }
 
 #[test]
-fn a_member_whose_checksum_fails_is_retracted_and_refused() {
+fn a_member_whose_checksum_fails_is_retracted_and_its_volume_damaged() {
     let mut volume = one_volume();
     let at = volume
         .windows(NOTES.len())
         .position(|window| window == NOTES)
         .unwrap();
     volume[at + 3] ^= 0x20;
+    let length = volume.len() as u64;
     let said = run(&RarEngine::new(), vec![volume]);
+    // A checksum failure is damage a repair can mend, not a refusal.
     assert_eq!(
         said[said.len() - 2..],
-        [Said::Retract(0), Said::Refuse(Why::Unrepairable)]
+        [Said::Retract(0), Said::Damaged(0, 0, length)]
     );
     assert!(!said.contains(&Said::Closed(0)));
 }

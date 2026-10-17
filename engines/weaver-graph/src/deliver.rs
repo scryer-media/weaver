@@ -7,6 +7,7 @@
 use bytes::Bytes;
 
 use crate::member::MemberId;
+use crate::object::Kind;
 use crate::volume::{ByteRange, VolumeIndex};
 
 // Where the bytes came from and whether they can be trusted.
@@ -51,6 +52,19 @@ pub enum RecoveryKind {
     // A RAR recovery record: Reed-Solomon over the volume's own bytes, which
     // only a RAR engine can apply.
     Rar,
+}
+
+impl RecoveryKind {
+    // The recovery object built over the range. A RAR recovery record has
+    // none: nothing in the build decodes one, so it is only known to be
+    // there.
+    pub fn object(self) -> Option<Kind> {
+        match self {
+            RecoveryKind::Par2 => Some(Kind::Par2),
+            RecoveryKind::Par3 => Some(Kind::Par3),
+            RecoveryKind::Rar => None,
+        }
+    }
 }
 
 // Why an object cannot stream a member. The reason travels with the refusal

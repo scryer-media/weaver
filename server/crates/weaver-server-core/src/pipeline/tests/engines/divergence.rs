@@ -111,3 +111,40 @@ async fn colliding_member_names_are_numbered_under_graph_and_share_one_path_unde
     assert!(graph.files[&delivered("quill.bin")] == first);
     assert!(graph.files[&delivered("quill (1).bin")] == second);
 }
+
+// Divergence: a post and a file inside a RAR volume of one name. Graph's
+// one ledger keeps the name for the post, which sits higher in the job, and
+// numbers the RAR's file ` (1)`; both are delivered. Classic extracts the
+// RAR's file over the post, and only the RAR's bytes remain.
+#[tokio::test]
+async fn a_post_and_a_rar_member_of_one_name_are_both_delivered_under_graph_and_one_under_classic()
+{
+    let posted = payload(2 * ARTICLE + 5, 36);
+    let inner = payload(4 * ARTICLE - 9, 37);
+    let scenario = Scenario::new(vec![
+        Post::plain("lantern.rar", stored_rar("subs.srt", &inner)),
+        Post::plain("subs.srt", posted.clone()),
+    ]);
+    let classic = run(&scenario, Engine::Classic).await;
+    let graph = run(&scenario, Engine::Graph).await;
+    for outcome in [&classic, &graph] {
+        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
+        assert!(
+            outcome.completed(),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.failure
+        );
+    }
+    assert_eq!(
+        classic.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered("subs.srt")]
+    );
+    assert!(classic.files[&delivered("subs.srt")] == inner);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered("subs (1).srt"), delivered("subs.srt")]
+    );
+    assert!(graph.files[&delivered("subs.srt")] == posted);
+    assert!(graph.files[&delivered("subs (1).srt")] == inner);
+}

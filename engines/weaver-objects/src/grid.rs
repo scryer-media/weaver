@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, MemberId, Segment, SliceVerdict};
 
 // The old engine's bounds, kept as the object's own: a run is folded eagerly
@@ -69,7 +70,7 @@ pub(crate) fn crc32_of_zeros(len: u64) -> u32 {
 }
 
 // A contiguous run inside one block, folded from the segments that made it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Run {
     range: ByteRange,
     crc32: u32,
@@ -110,7 +111,7 @@ fn fold_tiling<'a>(runs: impl Iterator<Item = &'a Run>, range: ByteRange) -> Opt
 
 // What one block holds against the bounds: a block closed by one run over
 // its full extent counts as derived, anything else as pending runs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Load {
     pending: usize,
     derived: usize,
@@ -145,7 +146,7 @@ impl Load {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct FileGrid {
     // Runs per block index, keyed by their start.
     blocks: BTreeMap<u64, BTreeMap<u64, Run>>,
@@ -153,7 +154,7 @@ struct FileGrid {
 }
 
 // Every grid of every member one recovery object watches, under one budget.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Grid {
     files: BTreeMap<(MemberId, u64), FileGrid>,
     load: Load,

@@ -10,10 +10,11 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Delivery, Emit, Extent, Kind, MemberId, Namespace, Object, ObjectId, Placement,
-    Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
+    ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Namespace, Object, ObjectId,
+    Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
 };
 
 use crate::grid::{self, Grid, WHOLE};
@@ -23,6 +24,9 @@ const TEXT_CAP: usize = 4 * 1024 * 1024;
 // A readback is checked in pieces of this size.
 const READ_CHUNK: u64 = 4 * 1024 * 1024;
 
+// Its facts are the whole of it: the text, the checksums bound and what
+// the last check came to.
+#[derive(Serialize, Deserialize)]
 pub struct Sfv {
     id: ObjectId,
     // The text as far as it arrived contiguously.
@@ -34,6 +38,18 @@ pub struct Sfv {
     grid: Grid,
     // What the last check came to, for the members bound then.
     outcome: Option<RepairOutcome>,
+}
+
+impl Durable for Sfv {
+    const VERSION: u16 = 1;
+
+    fn impossible(&self) -> Option<&'static str> {
+        let sized = self
+            .lengths
+            .keys()
+            .all(|member| self.bound.contains_key(member));
+        (self.text.len() > TEXT_CAP || !sized).then_some("an overlong text or an unbound length")
+    }
 }
 
 impl Sfv {
@@ -148,6 +164,9 @@ impl Object for Sfv {
 
     fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {
         Some(self)
+    }
+    fn facts(&self) -> Facts {
+        Facts::of(Kind::Sfv, self)
     }
 }
 

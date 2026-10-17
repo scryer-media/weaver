@@ -3,7 +3,7 @@
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
-use weaver_graph::{ByteRange, Kind, Member, MemberId, Namespace, Provenance};
+use weaver_graph::{ByteRange, Kind, Member, MemberId, Namespace, NodeId, Provenance};
 
 use super::claims::{Claim, ClaimedMember, refused};
 use super::seams::settle;
@@ -66,7 +66,7 @@ impl RootJob for Prepared {
         RootPhase::derive(false, activity, self.extracting)
     }
 
-    fn namespace(&self) -> Option<&Namespace> {
+    fn namespace(&self, _: NodeId) -> Option<&Namespace> {
         Some(&self.namespace)
     }
 
@@ -103,6 +103,7 @@ fn namespace(members: &[(&str, u64, &[(u64, u64, Provenance)])]) -> Namespace {
 fn set(kind: Kind, name: &str, reachable: u64, damaged: u64) -> SetSummary {
     SetSummary {
         kind,
+        namespace: NodeId::ROOT,
         name: name.to_string(),
         blocks_reachable: reachable,
         damaged_slices: damaged,
@@ -116,7 +117,10 @@ fn ruled(mut set: SetSummary, outcome: RepairOutcome) -> SetSummary {
 }
 
 fn summary(sets: Vec<SetSummary>) -> RecoverySummary {
-    RecoverySummary { sets }
+    RecoverySummary {
+        sets,
+        unusable: Vec::new(),
+    }
 }
 
 fn member(namespace: &Namespace, id: u32) -> &Member {

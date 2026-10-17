@@ -25,9 +25,10 @@ use std::io::{self, Read};
 use std::marker::PhantomData;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, MemberId, Object, Placement, Pull,
-    Seek, VolumeIndex,
+    ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, MemberId, Object,
+    Placement, Pull, Seek, VolumeIndex,
 };
 
 pub use self::brotli::Brotli;
@@ -68,7 +69,12 @@ pub type DeflateStream = Stream<Deflate>;
 // header up to the field that sizes its window.
 const FIRST: usize = 64;
 
+// Its facts are its name and front: how far the run read is the run's, and
+// a restored stream is one whose run has not started.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct Stream<D> {
+    #[serde(skip)]
     decoder: PhantomData<fn() -> D>,
     name: String,
     first: Vec<u8>,
@@ -87,6 +93,14 @@ impl<D: Decoder> Default for Stream<D> {
 impl<D: Decoder> Stream<D> {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl<D: Decoder> Durable for Stream<D> {
+    const VERSION: u16 = 1;
+
+    fn impossible(&self) -> Option<&'static str> {
+        (self.first.len() > FIRST).then_some("a front longer than a stream keeps")
     }
 }
 
@@ -146,6 +160,10 @@ impl<D: Decoder> Object for Stream<D> {
 
     fn engine_mut(&mut self) -> Option<&mut dyn Engine> {
         Some(self)
+    }
+
+    fn facts(&self) -> Facts {
+        Facts::of(D::KIND, self)
     }
 }
 

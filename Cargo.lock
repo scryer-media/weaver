@@ -6010,6 +6010,8 @@ name = "weaver-graph"
 version = "0.15.0"
 dependencies = [
  "bytes",
+ "rmp-serde",
+ "serde",
  "thiserror 2.0.21",
 ]
 
@@ -6075,6 +6077,8 @@ dependencies = [
  "lzma-turbo",
  "par2-rs",
  "par3-rs",
+ "rmp-serde",
+ "serde",
  "sevenz-turbo",
  "tempfile",
  "thiserror 2.0.21",

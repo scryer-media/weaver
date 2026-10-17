@@ -25,6 +25,7 @@ use aws_lc_rs::cipher::{
     UnboundCipherKey,
 };
 use aws_lc_rs::iv::FixedLength;
+use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, Coverage, Provenance};
 
 pub const BLOCK: u64 = 16;
@@ -45,6 +46,8 @@ pub enum CryptError {
     Overlong { plain: u64, cipher: u64 },
     #[error("the cipher failed")]
     Cipher,
+    #[error("a kept chain no cipher could have kept")]
+    Chain,
 }
 
 // Plaintext that came out, at its offset, as trustworthy as the worse of its
@@ -117,7 +120,7 @@ impl Keys {
 const FULL: u16 = u16::MAX;
 
 // One cipher block as far as it arrived, byte by byte.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Block {
     cipher: [u8; 16],
     have: u16,
@@ -187,6 +190,19 @@ pub struct Cbc {
     padded: Coverage,
 }
 
+// A cipher's state without its key: the blocks it keeps and what came out.
+// A restart keeps this, and the key comes back from the password.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Chain {
+    iv: [u8; 16],
+    cipher_len: u64,
+    plain_len: u64,
+    blocks: BTreeMap<u64, Block>,
+    done: Coverage,
+    padding: Vec<u8>,
+    padded: Coverage,
+}
+
 impl fmt::Debug for Cbc {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -235,6 +251,38 @@ impl Cbc {
             done: Coverage::new(),
             padding: vec![0; (cipher_len - plain_len) as usize],
             padded: Coverage::new(),
+        })
+    }
+
+    pub fn chain(&self) -> Chain {
+        Chain {
+            iv: self.iv,
+            cipher_len: self.cipher_len,
+            plain_len: self.plain_len,
+            blocks: self.blocks.clone(),
+            done: self.done.clone(),
+            padding: self.padding.clone(),
+            padded: self.padded.clone(),
+        }
+    }
+
+    // The cipher again, keyed, at the state it was kept in. A chain no cipher
+    // could have kept is refused.
+    pub fn unseal(key: &[u8], chain: Chain) -> Result<Self, CryptError> {
+        let fresh = Self::new(key, chain.iv, chain.cipher_len, chain.plain_len)?;
+        let aligned = chain
+            .blocks
+            .keys()
+            .all(|start| start.is_multiple_of(BLOCK) && *start < chain.cipher_len);
+        if !aligned || chain.padding.len() != fresh.padding.len() {
+            return Err(CryptError::Chain);
+        }
+        Ok(Self {
+            blocks: chain.blocks,
+            done: chain.done,
+            padding: chain.padding,
+            padded: chain.padded,
+            ..fresh
         })
     }
 

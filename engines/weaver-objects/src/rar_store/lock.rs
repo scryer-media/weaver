@@ -1,128 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Passwords. Enciphered headers are opened by the candidate RAR5's check
-// value proves, or, without one, by the first header's CRC after
-// deciphering it, which is RAR4's only proof. An AES file is opened by the
-// candidate its own check value proves; a file with none, every RAR4 file
-// among them, is opened by the first candidate, unproven, and its CRC at the
-// close is the backstop. Every key goes through the process's cache, so a
-// tuple is derived once and a wrong one is tried once.
+// Passwords, through unrar-rs and the set's one KDF cache. Enciphered
+// headers open only on a candidate the archive's own check verifies: a
+// header CRC is no proof, and RAR4 headers carry no check, so they go to an
+// engine. An AES file opens on the first candidate its check does not
+// refute; a file with no check, every RAR4 file among them, opens on the
+// first candidate, and its CRC at the close is the backstop.
 
-use std::sync::Arc;
-
+use unrar_rs::{
+    KdfCache, MemberKeying, PasswordCheck, RarVolumeHeaderEncryption, check_member_password,
+};
 use weaver_graph::{Emit, Why};
 use zeroize::Zeroizing;
 
-use super::header::FileCrypt;
-use super::kdf;
-use super::walk::{Cipher, HeaderKey, KeyFor, Step};
 use super::{Lock, RarStore};
-use crate::crypt::{BLOCK, Cbc};
-use crate::keys::{Derived, Keys, Tuple};
-
-const RAR5_TAG: &str = "rar5";
-const RAR4_TAG: &str = "rar4";
-
-enum Derive {
-    Key(Zeroizing<Vec<u8>>),
-    Wrong,
-    // A derivation the store cannot run: an exponent past RAR's bound, or a
-    // RAR4 password long enough to need RAR's own SHA-1.
-    Unsupported,
-}
-
-enum Fail {
-    Wrong,
-    Unsupported,
-}
-
-// The AES-256 key and the hash key, as one cached entry. A tuple with a
-// check value is cached only once the check passed.
-fn rar5_key(
-    keys: &Keys,
-    secret: &str,
-    salt: &[u8; 16],
-    count: u8,
-    check: Option<[u8; 8]>,
-) -> Derive {
-    let mut params = vec![count];
-    params.extend(check.iter().flatten());
-    let tuple = Tuple {
-        format: RAR5_TAG,
-        password: secret,
-        salt,
-        params: &params,
-    };
-    let derived = keys.derive(&tuple, || {
-        let derived = kdf::rar5(secret, salt, count).ok_or(Fail::Unsupported)?;
-        if check.is_some_and(|check| check != derived.check) {
-            return Err(Fail::Wrong);
-        }
-        let mut both = Zeroizing::new(Vec::with_capacity(64));
-        both.extend_from_slice(derived.key.as_slice());
-        both.extend_from_slice(derived.hash_key.as_slice());
-        Ok(both)
-    });
-    match derived {
-        Ok(Derived::Key(key)) => Derive::Key(key),
-        Ok(Derived::Wrong) => Derive::Wrong,
-        Err(Fail::Wrong) => {
-            keys.mark_wrong(&tuple);
-            Derive::Wrong
-        }
-        Err(Fail::Unsupported) => Derive::Unsupported,
-    }
-}
-
-// The AES-128 key and the IV, as one cached entry.
-fn rar4_key(keys: &Keys, secret: &str, salt: &[u8; 8]) -> Derive {
-    let tuple = Tuple {
-        format: RAR4_TAG,
-        password: secret,
-        salt,
-        params: &[],
-    };
-    let derived = keys.derive(&tuple, || {
-        let derived = kdf::rar4(secret, salt).ok_or(())?;
-        let mut both = Zeroizing::new(Vec::with_capacity(32));
-        both.extend_from_slice(derived.key.as_slice());
-        both.extend_from_slice(&derived.iv);
-        Ok(both)
-    });
-    match derived {
-        Ok(Derived::Key(key)) => Derive::Key(key),
-        Ok(Derived::Wrong) => Derive::Wrong,
-        Err(()) => Derive::Unsupported,
-    }
-}
-
-pub(super) type Keyring = Box<dyn Fn(KeyFor<'_>) -> Option<HeaderKey>>;
-
-fn keyring(keys: Arc<Keys>, secret: Zeroizing<String>) -> Keyring {
-    Box::new(move |what| match what {
-        KeyFor::Rar5(crypt) => {
-            match rar5_key(&keys, &secret, &crypt.salt, crypt.count, crypt.check) {
-                Derive::Key(both) => Some(HeaderKey {
-                    key: Zeroizing::new(both[..32].to_vec()),
-                    iv: None,
-                }),
-                Derive::Wrong | Derive::Unsupported => None,
-            }
-        }
-        KeyFor::Rar4(salt) => match rar4_key(&keys, &secret, salt) {
-            Derive::Key(both) => {
-                let mut iv = [0; 16];
-                iv.copy_from_slice(&both[16..32]);
-                Some(HeaderKey {
-                    key: Zeroizing::new(both[..16].to_vec()),
-                    iv: Some(iv),
-                })
-            }
-            Derive::Wrong | Derive::Unsupported => None,
-        },
-    })
-}
+use crate::crypt::Cbc;
 
 // A file's key, IV and hash key.
 struct FileKey {
@@ -131,47 +24,47 @@ struct FileKey {
     hash_key: Option<Zeroizing<[u8; 32]>>,
 }
 
-enum Opened {
+enum Derived {
     Key(FileKey),
     Wrong,
-    Unsupported,
+    // A KDF count the crate refuses: nothing can decipher the member.
+    Unkeyable,
 }
 
-fn file_key(keys: &Keys, secret: &str, crypt: &FileCrypt) -> Opened {
-    match crypt {
-        FileCrypt::Rar5 {
-            count,
-            salt,
-            iv,
-            check,
-            ..
-        } => match rar5_key(keys, secret, salt, *count, *check) {
-            Derive::Key(both) => {
-                let mut hash_key = Zeroizing::new([0u8; 32]);
-                hash_key.copy_from_slice(&both[32..64]);
-                Opened::Key(FileKey {
-                    key: Zeroizing::new(both[..32].to_vec()),
-                    iv: *iv,
-                    hash_key: Some(hash_key),
-                })
+// The derivation for one candidate, through the cache, so the check and the
+// key derive the tuple once.
+fn derive(cache: &KdfCache, password: &str, keying: &MemberKeying) -> Derived {
+    match keying {
+        MemberKeying::Rar5(facts) => {
+            match check_member_password(
+                cache,
+                password,
+                &facts.salt,
+                facts.kdf_count_lg2,
+                facts.psw_check.as_ref(),
+            ) {
+                PasswordCheck::Wrong => return Derived::Wrong,
+                PasswordCheck::Verified | PasswordCheck::Unverifiable => {}
             }
-            Derive::Wrong => Opened::Wrong,
-            Derive::Unsupported => Opened::Unsupported,
-        },
-        FileCrypt::Rar4 { salt } => match rar4_key(keys, secret, salt) {
-            Derive::Key(both) => {
-                let mut iv = [0; 16];
-                iv.copy_from_slice(&both[16..32]);
-                Opened::Key(FileKey {
-                    key: Zeroizing::new(both[..16].to_vec()),
-                    iv,
-                    hash_key: None,
-                })
-            }
-            Derive::Wrong => Opened::Wrong,
-            Derive::Unsupported => Opened::Unsupported,
-        },
-        FileCrypt::Other => Opened::Unsupported,
+            let Ok(material) =
+                cache.derive_material_rar5(password, &facts.salt, facts.kdf_count_lg2)
+            else {
+                return Derived::Unkeyable;
+            };
+            Derived::Key(FileKey {
+                key: Zeroizing::new(material.key.to_vec()),
+                iv: facts.iv,
+                hash_key: Some(Zeroizing::new(material.hash_key)),
+            })
+        }
+        MemberKeying::Rar4 { salt } => {
+            let (key, iv) = cache.derive_key_rar4(password, salt.as_ref());
+            Derived::Key(FileKey {
+                key: Zeroizing::new(key.to_vec()),
+                iv,
+                hash_key: None,
+            })
+        }
     }
 }
 
@@ -185,64 +78,55 @@ impl RarStore {
         }
     }
 
-    pub(super) fn header_keyring(&self) -> Option<Keyring> {
-        let index = self.headers_open?;
-        Some(keyring(
-            self.keys.clone(),
-            self.candidates[index].secret.clone(),
-        ))
+    // The password the archive's check proved, for every header walk.
+    pub(super) fn header_password(&self) -> Option<Zeroizing<String>> {
+        self.headers_open
+            .map(|index| self.candidates[index].secret.clone())
     }
 
-    // A volume whose next header is enciphered and not yet opened.
-    fn locked_headers(&self) -> Option<super::VolumeIndex> {
-        self.volumes
-            .iter()
-            .find(|(_, volume)| volume.walk.cipher.is_some() && !volume.walk.ended)
-            .map(|(index, _)| *index)
-    }
-
-    pub(super) fn open_headers(&mut self, out: &mut Vec<Emit>) {
+    // The header-encryption decision, made before any header is deciphered.
+    pub(super) fn open_headers(
+        &mut self,
+        encryption: &RarVolumeHeaderEncryption,
+        out: &mut Vec<Emit>,
+    ) {
+        // A proved password that will not open this volume: the volumes
+        // disagree about their archive key.
         if self.headers_open.is_some() {
-            return;
+            return self.give_up(Emit::NeedsEngine(Why::EncryptedHeader), out);
         }
-        let Some(volume) = self.locked_headers() else {
-            return;
+        let facts = match encryption {
+            RarVolumeHeaderEncryption::Rar5(facts) => facts,
+            RarVolumeHeaderEncryption::Rar4 | RarVolumeHeaderEncryption::None => {
+                return self.give_up(Emit::NeedsEngine(Why::EncryptedHeader), out);
+            }
+        };
+        let Some(check) = facts.psw_check.as_ref() else {
+            return self.give_up(Emit::NeedsEngine(Why::EncryptedHeader), out);
         };
         for index in 0..self.candidates.len() {
             if self.candidates[index].headers_wrong {
                 continue;
             }
-            let secret = self.candidates[index].secret.clone();
-            let found = self.volumes.get_mut(&volume).expect("volume is known");
-            if let Some(Cipher::Rar5(crypt)) = found.walk.cipher
-                && crypt.check.is_some()
-            {
-                match rar5_key(&self.keys, &secret, &crypt.salt, crypt.count, crypt.check) {
-                    Derive::Key(_) => {
-                        self.headers_open = Some(index);
-                        self.stale = true;
-                        return;
-                    }
-                    Derive::Wrong => {
-                        self.candidates[index].headers_wrong = true;
-                        continue;
-                    }
-                    Derive::Unsupported => {
-                        return self.give_up(Emit::NeedsEngine(Why::Encrypted), out);
-                    }
-                }
-            }
-            let ring = keyring(self.keys.clone(), secret);
-            let mut trial = found.walk.clone();
-            match trial.step(&mut found.kept, found.length, Some(&*ring)) {
-                Step::Moved => {
+            match check_member_password(
+                &self.kdf,
+                &self.candidates[index].secret,
+                &facts.salt,
+                facts.kdf_count_lg2,
+                Some(check),
+            ) {
+                PasswordCheck::Verified => {
                     self.headers_open = Some(index);
+                    for volume in self.volumes.values_mut() {
+                        volume.walk.touch();
+                    }
                     self.stale = true;
                     return;
                 }
-                Step::Wait => return,
-                Step::Damaged(range, _) if !found.kept.verified(range) => return,
-                _ => self.candidates[index].headers_wrong = true,
+                PasswordCheck::Unverifiable => {
+                    return self.give_up(Emit::NeedsEngine(Why::EncryptedHeader), out);
+                }
+                PasswordCheck::Wrong => self.candidates[index].headers_wrong = true,
             }
         }
         self.ask(out);
@@ -261,20 +145,24 @@ impl RarStore {
         let mut asks = false;
         for index in 0..self.entries.len() {
             let entry = &self.entries[index];
-            let (Lock::Locked, Some(crypt), Some(length)) =
-                (&entry.lock, &entry.crypt, entry.length)
+            let (Lock::Locked, Some(store), Some(length)) =
+                (&entry.lock, &entry.store, entry.length)
             else {
                 continue;
             };
+            let Some(cipher_len) = store.cipher_size else {
+                continue;
+            };
+            let keying = store.keying();
             let mut opened = None;
             for candidate in &order {
-                match file_key(&self.keys, &self.candidates[*candidate].secret, crypt) {
-                    Opened::Key(key) => {
+                match derive(&self.kdf, &self.candidates[*candidate].secret, &keying) {
+                    Derived::Key(key) => {
                         opened = Some(key);
                         break;
                     }
-                    Opened::Wrong => {}
-                    Opened::Unsupported => {
+                    Derived::Wrong => {}
+                    Derived::Unkeyable => {
                         return self.give_up(Emit::NeedsEngine(Why::Encrypted), out);
                     }
                 }
@@ -283,7 +171,6 @@ impl RarStore {
                 asks = true;
                 continue;
             };
-            let cipher_len = length.div_ceil(BLOCK) * BLOCK;
             let Ok(cbc) = Cbc::new(&key.key, key.iv, cipher_len, length) else {
                 return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
             };
@@ -304,7 +191,10 @@ impl RarStore {
             return;
         }
         let headers_shut = self.headers_open.is_none()
-            && self.locked_headers().is_some()
+            && self
+                .volumes
+                .values()
+                .any(|volume| volume.walk.locked.is_some())
             && self
                 .candidates
                 .iter()

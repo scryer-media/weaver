@@ -5,8 +5,8 @@
 // of these first and keeps its own path when the job has no graph runtime.
 
 use tracing::{info, warn};
-use weaver_graph::MemberId;
 use weaver_graph::slots::AskerId;
+use weaver_graph::{MemberId, NodeId};
 
 use super::claims::{self, Claim, ClaimedMember};
 use super::{RecoverySummary, RootJob, Step, drive, metrics, shown_status};
@@ -142,7 +142,8 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Option<Result<(), String>> {
-        let namespace = self.graph_jobs.get(&job_id)?.namespace();
+        let job = self.graph_jobs.get(&job_id)?;
+        let (namespace, tree) = (job.namespace(), job.tree());
         let state = self.jobs.get(&job_id)?;
         let ignore = self.par2_ignore_extensions();
         let census: Vec<ClaimedMember> = state
@@ -168,6 +169,7 @@ impl Pipeline {
                     .count();
                 row.lost_bytes = self.file_terminal_failed_bytes(file_id);
                 row.declared_bytes = file.segments.iter().map(|s| u64::from(s.bytes)).sum();
+                row.evidence |= claims::delivered_below(tree, NodeId::ROOT, MemberId(index));
                 Some(row)
             })
             .collect();

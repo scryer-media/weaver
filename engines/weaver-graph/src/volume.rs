@@ -9,7 +9,9 @@
 use std::fmt;
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VolumeIndex(pub u32);
 
 impl fmt::Display for VolumeIndex {
@@ -20,7 +22,9 @@ impl fmt::Display for VolumeIndex {
 
 // A half-open byte range `[start, end)`. Empty ranges are allowed and compare
 // equal by their bounds, so a caller that needs "nothing" says so explicitly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// Encoded as its two bounds; an inverted pair does not decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "[u64; 2]", into = "[u64; 2]")]
 pub struct ByteRange {
     pub start: u64,
     pub end: u64,
@@ -79,6 +83,23 @@ impl ByteRange {
 
     pub fn as_range(&self) -> Range<u64> {
         self.start..self.end
+    }
+}
+
+impl TryFrom<[u64; 2]> for ByteRange {
+    type Error = &'static str;
+
+    fn try_from([start, end]: [u64; 2]) -> Result<Self, Self::Error> {
+        if start > end {
+            return Err("inverted byte range");
+        }
+        Ok(Self { start, end })
+    }
+}
+
+impl From<ByteRange> for [u64; 2] {
+    fn from(range: ByteRange) -> Self {
+        [range.start, range.end]
     }
 }
 

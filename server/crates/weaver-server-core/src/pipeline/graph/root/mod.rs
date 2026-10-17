@@ -126,8 +126,14 @@ impl ArticleRoot {
 // namespace write path, which calls this with every delivery it feeds to a
 // recovery object. Root coordinates: member M is volume M.
 impl Segments for ArticleRoot {
-    fn segments_for(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Segment>) {
-        self.checksums.segments_for(volume, range, out);
+    fn segments_for(
+        &self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<Segment>,
+    ) {
+        self.checksums.segments_for(node, volume, range, out);
     }
 }
 

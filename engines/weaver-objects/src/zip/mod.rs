@@ -26,9 +26,10 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Pull, Seek, VolumeIndex,
-    Weight, Why,
+    ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement, Pull,
+    Seek, VolumeIndex, Weight, Why,
 };
 
 use crate::engine::{Format, SetName};
@@ -42,7 +43,9 @@ use map::{Map, Out};
 // member.
 const ENVELOPE: u32 = 0;
 
-#[derive(Default)]
+// Its facts are all of it but its bids, which a restart makes again: the
+// directory or how far the walk got, the bytes it kept and what it said.
+#[derive(Default, Serialize, Deserialize)]
 pub struct Zip {
     // The names bound that name a volume of a set, and every volume bound.
     names: BTreeMap<u32, VolumeName>,
@@ -62,12 +65,31 @@ pub struct Zip {
     // Container ranges wanted ahead of the normal order, and the volume
     // ranges already bid for them.
     bids: Vec<(ByteRange, Weight)>,
+    #[serde(skip)]
     bid: BTreeSet<(u32, u64, u64)>,
     damage_said: HashSet<(u64, u64, u32)>,
     // Something changed since the object last looked.
     stale: bool,
     // The object gave its container up; it says nothing more.
     gone: bool,
+}
+
+impl Durable for Zip {
+    const VERSION: u16 = 1;
+
+    // A member said is an entry of the map, and every entry's member is one.
+    fn impossible(&self) -> Option<&'static str> {
+        let mapped = self.map.as_ref().map_or(self.members.is_empty(), |map| {
+            map.members.len() == self.members.len()
+                && map.members.iter().all(|entry| *entry < map.entries.len())
+                && map
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.member)
+                    .all(|member| map.members.get(member.0 as usize).is_some())
+        });
+        (!mapped || !self.kept.sound()).then_some("members no map gives")
+    }
 }
 
 impl Zip {
@@ -326,6 +348,10 @@ impl Object for Zip {
             .same_set(&candidate)
             .then(|| candidate.slot(&self.names))??;
         (!self.bound.contains(&index)).then_some(VolumeIndex(index))
+    }
+
+    fn facts(&self) -> Facts {
+        Facts::of(Kind::Zip, self)
     }
 }
 

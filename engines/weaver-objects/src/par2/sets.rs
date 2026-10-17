@@ -16,6 +16,8 @@ use weaver_graph::{ByteRange, Coverage, MemberId, Seek, VolumeIndex, Weight};
 use super::repair::SetRepair;
 use super::walker::Walker;
 
+const MAX_PAR2_INPUT_SLICES: u64 = 32_768;
+
 // Where one recovery packet sits, header included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Location {
@@ -56,13 +58,16 @@ impl SetState {
 
     // Take a metadata packet; the index is rebuilt when it is new. A set's
     // metadata is a few packets per file, so rebuilding is cheaper than
-    // keeping two ways of growing it.
-    pub(super) fn take_metadata(&mut self, hash: [u8; 16], packet: Packet) {
+    // keeping two ways of growing it. A set whose geometry is past the
+    // limits has no index.
+    pub(super) fn take_metadata(&mut self, hash: [u8; 16], packet: Packet, output_limit: u64) {
         if !self.hashes.insert(hash) {
             return;
         }
         self.packets.push(packet);
-        self.index = Par2FileSet::from_packets(self.packets.clone()).ok();
+        self.index = Par2FileSet::from_packets(self.packets.clone())
+            .ok()
+            .filter(|set| validate_par2_geometry(set, output_limit).is_ok());
     }
 
     // An index that can verify every file it protects: each has its
@@ -114,7 +119,7 @@ impl SetState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct Volume {
     pub(super) walker: Walker,
     pub(super) arrived: Coverage,
@@ -169,11 +174,6 @@ impl Volume {
         ));
     }
 
-    pub(super) fn is_spoiled(&self, range: ByteRange) -> bool {
-        self.walker.is_damaged(range)
-            || self.lost.iter().any(|lost| lost.intersect(range).is_some())
-    }
-
     // Recovery blocks still to come, by the volume's name, less what was
     // walked and what a lost range could have held. `packet` is the smallest
     // recovery packet any known set writes, so a loss is never undercounted.
@@ -194,6 +194,50 @@ impl Volume {
         named
             .saturating_sub(self.walked_blocks)
             .saturating_sub(lost)
+    }
+}
+
+// Admit declared geometry before anything is built on it.
+fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Result<()> {
+    if set.slice_size == 0 {
+        return Err(par2_resource_error("zero slice size"));
+    }
+    if set.slice_size > output_limit {
+        return Err(par2_resource_error("slice size exceeds the output budget"));
+    }
+    let mut described_bytes = 0u64;
+    let mut tracked_slices = 0u64;
+    for description in set.files.values() {
+        described_bytes = described_bytes
+            .checked_add(description.length)
+            .filter(|bytes| *bytes <= output_limit)
+            .ok_or_else(|| par2_resource_error("described output exceeds the admitted job size"))?;
+        // Non-recovery descriptions also reach verification bitmaps. Bound
+        // those allocations independently of PAR2's repair-input cap.
+        tracked_slices = tracked_slices
+            .checked_add(description.length.div_ceil(set.slice_size))
+            .filter(|slices| *slices <= 1_048_576)
+            .ok_or_else(|| {
+                par2_resource_error("verification bitmap exceeds the metadata budget")
+            })?;
+    }
+    let mut input_slices = 0u64;
+    for description in set
+        .recovery_file_ids
+        .iter()
+        .filter_map(|id| set.files.get(id))
+    {
+        input_slices = input_slices
+            .checked_add(description.length.div_ceil(set.slice_size))
+            .filter(|slices| *slices <= MAX_PAR2_INPUT_SLICES)
+            .ok_or_else(|| par2_resource_error("input slice count exceeds the repair limit"))?;
+    }
+    Ok(())
+}
+
+fn par2_resource_error(reason: &str) -> par2_rs::Par2Error {
+    par2_rs::Par2Error::ResourceLimitExceeded {
+        reason: format!("WEAVER_RESOURCE_LIMIT[par2_metadata]: {reason}"),
     }
 }
 

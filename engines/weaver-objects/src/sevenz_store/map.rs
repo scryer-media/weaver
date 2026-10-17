@@ -6,6 +6,7 @@
 // bytes are. A folder whose coders do anything but copy or decipher is not
 // streamable, and one is enough to hand the whole container to an engine.
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::{AesProperties, Archive, EncoderMethod};
 use weaver_graph::{ByteRange, MemberId};
 
@@ -21,18 +22,19 @@ pub(super) enum Shape {
     Unsupported,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Folder {
     // Where its one pack stream lies in the container.
     pub(super) pack: ByteRange,
     // How many bytes its files hold between them.
     pub(super) plain_len: u64,
+    #[serde(with = "aes")]
     pub(super) aes: Option<AesProperties>,
     // Its streamed entries, by index, in offset order.
     pub(super) entries: Vec<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Entry {
     pub(super) name: String,
     // `None` for an entry the object skips: an anti-item or a link. A skipped
@@ -51,12 +53,63 @@ impl Entry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Map {
     pub(super) folders: Vec<Folder>,
     pub(super) entries: Vec<Entry>,
     // Entry index per member id.
     pub(super) members: Vec<usize>,
+}
+
+impl Map {
+    // Whether every index it holds lands inside it, as a restored map's must.
+    pub(super) fn is_sound(&self) -> bool {
+        let entries = self.entries.len();
+        self.members.iter().all(|entry| *entry < entries)
+            && self
+                .folders
+                .iter()
+                .all(|folder| folder.entries.iter().all(|entry| *entry < entries))
+            && self.entries.iter().all(|entry| {
+                entry
+                    .folder
+                    .is_none_or(|folder| folder < self.folders.len())
+            })
+    }
+}
+
+// A folder's AES properties as the coder's own property bytes, which is all
+// they are: a work factor, a salt and an IV, read back by the same parse.
+mod aes {
+    use super::*;
+
+    pub(super) fn serialize<S: Serializer>(
+        aes: &Option<AesProperties>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        aes.as_ref().map(encode).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<AesProperties>, D::Error> {
+        Option::<Vec<u8>>::deserialize(deserializer)?
+            .map(|bytes| AesProperties::parse(&bytes).map_err(serde::de::Error::custom))
+            .transpose()
+    }
+
+    // The first byte holds the work factor and the high bits of the salt
+    // and IV sizes, the second the rest of them, less one each.
+    fn encode(aes: &AesProperties) -> Vec<u8> {
+        let salt = aes.salt();
+        let mut bytes = match salt.len() {
+            0 => vec![aes.cycles_power() | 0x40, 0x0f],
+            len => vec![aes.cycles_power() | 0xc0, ((len as u8 - 1) << 4) | 0x0f],
+        };
+        bytes.extend_from_slice(salt);
+        bytes.extend_from_slice(aes.iv());
+        bytes
+    }
 }
 
 fn copies(id: &[u8]) -> bool {

@@ -9,8 +9,11 @@
 // fingerprint, not a CRC32, so the segment checksums fold into nothing it
 // can compare; it reads members back to verify them instead. It keeps the
 // front of each volume to learn early which members it describes, and reads
-// whole volumes back when it repairs.
+// every arrived run of each volume back when it repairs. Only packets that
+// lie wholly in a volume's readable ranges count: one a hole cuts is
+// dropped, and the scan carries on past it.
 
+pub(crate) mod facts;
 mod rebuild;
 
 #[cfg(test)]
@@ -31,12 +34,16 @@ use crate::par2::combine;
 // How much of each volume's front is kept to read the index from. An index
 // file is metadata only; a recovery volume repeats it ahead of its blocks.
 const FRONT_CAP: usize = 1024 * 1024;
+// What one job may carry.
+const MAX_CARRIERS: usize = 4096;
+const MAX_SETS: usize = 256;
 
 #[derive(Debug, Default)]
 struct Volume {
     front: Vec<u8>,
     arrived: Coverage,
     closed: bool,
+    // Nothing more of the volume will come.
     lost: bool,
     asked: bool,
 }
@@ -73,7 +80,11 @@ impl Par3 {
 
     // The sets as far as the kept fronts describe them.
     fn front_sets(&self) -> Vec<Par3Set> {
-        sets(self.volumes.iter().map(|volume| volume.front.as_slice()))
+        sets(
+            self.volumes
+                .iter()
+                .map(|volume| (volume.front.as_slice(), &volume.arrived)),
+        )
     }
 
     fn coming(&self) -> bool {
@@ -83,15 +94,27 @@ impl Par3 {
     }
 }
 
-// Every set the volumes' packets describe; a volume that fails to scan
-// contributes nothing.
-fn sets<'a>(volumes: impl Iterator<Item = &'a [u8]>) -> Vec<Par3Set> {
-    let packets: Vec<Packet> = volumes
-        .filter_map(|bytes| par3_rs::scan_packets(bytes).ok())
-        .flatten()
-        .map(|(_, packet)| packet)
-        .collect();
-    Par3Set::from_packets(packets).unwrap_or_default()
+// Every set the volumes' packets describe, from the packets that lie wholly
+// in a readable range; a volume that fails to scan contributes nothing, and
+// a job of more sets than the limit has none.
+fn sets<'a>(volumes: impl Iterator<Item = (&'a [u8], &'a Coverage)>) -> Vec<Par3Set> {
+    let mut packets: Vec<Packet> = Vec::new();
+    for (bytes, readable) in volumes {
+        let Ok(found) = par3_rs::scan_packets(bytes) else {
+            continue;
+        };
+        packets.extend(
+            found
+                .into_iter()
+                .filter(|(at, packet)| readable.covered(ByteRange::at(*at, packet.len())))
+                .map(|(_, packet)| packet),
+        );
+    }
+    let sets = Par3Set::from_packets(packets).unwrap_or_default();
+    if sets.len() > MAX_SETS {
+        return Vec::new();
+    }
+    sets
 }
 
 impl Object for Par3 {
@@ -105,7 +128,9 @@ impl Object for Par3 {
         let Ok(offset) = usize::try_from(delivery.offset) else {
             return;
         };
-        if offset > volume.front.len() || offset >= FRONT_CAP {
+        // Bytes past a hole are kept past zeroes, which no packet hash
+        // passes.
+        if offset >= FRONT_CAP {
             return;
         }
         let end = offset.saturating_add(delivery.bytes.len()).min(FRONT_CAP);
@@ -119,8 +144,12 @@ impl Object for Par3 {
         self.volume(volume).closed = true;
     }
 
-    fn volume_lost(&mut self, volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {
-        self.volume(volume).lost = true;
+    // A loss that runs to the end of the volume ends it; any other leaves a
+    // hole in what arrived.
+    fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, _out: &mut Vec<Emit>) {
+        if range.end == u64::MAX {
+            self.volume(volume).lost = true;
+        }
     }
 
     fn wants(&mut self, out: &mut Vec<Seek>) {
@@ -147,7 +176,9 @@ impl Object for Par3 {
     }
 
     fn claim(&mut self, _name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        if first_bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
+        if first_bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice())
+            || self.volumes.len() >= MAX_CARRIERS
+        {
             return None;
         }
         self.volumes.push(Volume::default());
@@ -218,27 +249,30 @@ impl Recovery for Par3 {
     }
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+        // Each volume as it arrived, and the runs of it that read back.
         let mut volumes = Vec::with_capacity(self.volumes.len());
         for (index, volume) in self.volumes.iter().enumerate() {
-            let end = volume
-                .arrived
-                .runs()
-                .map(|run| run.range.end)
-                .max()
-                .unwrap_or(0);
-            let mut bytes = Vec::new();
-            if access.read_volume(
-                VolumeIndex(index as u32),
-                ByteRange::new(0, end),
-                &mut bytes,
-            ) {
-                volumes.push(bytes);
+            let end = volume.arrived.runs().map(|run| run.range.end).max();
+            let mut bytes = vec![0; usize::try_from(end.unwrap_or(0)).unwrap_or(0)];
+            let mut read = Vec::new();
+            let mut kept = Coverage::new();
+            for run in volume.arrived.runs() {
+                read.clear();
+                if access.read_volume(VolumeIndex(index as u32), run.range, &mut read)
+                    && let Some(into) =
+                        bytes.get_mut(run.range.start as usize..run.range.end as usize)
+                    && into.len() == read.len()
+                {
+                    into.copy_from_slice(&read);
+                    kept.write(run.range, run.provenance);
+                }
             }
+            volumes.push((bytes, kept));
         }
         let coming = self.coming();
         let mut outcome = RepairOutcome::Clean;
         let mut waiting = 0;
-        for set in sets(volumes.iter().map(Vec::as_slice)) {
+        for set in sets(volumes.iter().map(|(bytes, kept)| (bytes.as_slice(), kept))) {
             let result = rebuild::repair_set(&set, &self.bound, coming, access);
             if result.outcome == RepairOutcome::Waiting {
                 waiting += result.lost;
@@ -254,16 +288,11 @@ impl Recovery for Par3 {
         self.outcome
     }
 
-    // What the kept fronts of volumes still reachable carry.
+    // What the kept fronts carry, past any hole in them.
     fn blocks_reachable(&self) -> u64 {
-        sets(
-            self.volumes
-                .iter()
-                .filter(|volume| !volume.lost)
-                .map(|volume| volume.front.as_slice()),
-        )
-        .iter()
-        .map(|set| rebuild::usable_recovery(set).len() as u64)
-        .sum()
+        self.front_sets()
+            .iter()
+            .map(|set| rebuild::usable_recovery(set).len() as u64)
+            .sum()
     }
 }

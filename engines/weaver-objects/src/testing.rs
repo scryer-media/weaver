@@ -5,6 +5,8 @@
 // in-memory namespace face that counts its reads, and segment cutting the
 // way a namespace cuts them.
 
+pub(crate) mod replay;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

@@ -50,7 +50,8 @@ pub(crate) struct GraphStatus {
 // What status reads of a graph job and the one thing it asks of it.
 pub(crate) trait RootJob {
     fn phase(&self) -> RootPhase;
-    fn namespace(&self) -> Option<&Namespace>;
+    // A namespace of the tree, at any depth: where a recovery object lives.
+    fn namespace(&self, node: NodeId) -> Option<&Namespace>;
     // In the order `repair` reports outcomes.
     fn recovery_summary(&self) -> RecoverySummary;
     // Run every recovery object of the root namespace.
@@ -70,21 +71,25 @@ impl RootJob for GraphJob {
         GraphJob::phase(self)
     }
 
-    fn namespace(&self) -> Option<&Namespace> {
-        Some(GraphJob::namespace(self))
+    fn namespace(&self, node: NodeId) -> Option<&Namespace> {
+        self.tree().namespace(node)
     }
 
     fn recovery_summary(&self) -> RecoverySummary {
         let objects = GraphJob::recovery_summary(self);
-        let (tree, root) = (self.tree(), GraphJob::namespace(self));
+        let tree = self.tree();
         let sets = objects
             .into_iter()
             .map(|object| SetSummary {
                 kind: object.kind,
-                // The object is called what its first volume is.
+                namespace: object.namespace,
+                // The object is called what its first volume is, in the
+                // namespace it lives in.
                 name: tree
                     .volumes(object.node)
-                    .and_then(|(_, volumes)| root.get(*volumes.values().next()?))
+                    .and_then(|(parent, volumes)| {
+                        tree.namespace(parent)?.get(*volumes.values().next()?)
+                    })
                     .map_or_else(
                         || object.kind.to_string(),
                         |member| member.output_name.clone(),
@@ -94,7 +99,14 @@ impl RootJob for GraphJob {
                 outcome: object.outcome,
             })
             .collect();
-        RecoverySummary { sets }
+        let unusable = self
+            .writer()
+            .unusable_recovery()
+            .iter()
+            .filter_map(|(node, member)| tree.namespace(*node)?.get(*member))
+            .map(|member| member.output_name.clone())
+            .collect();
+        RecoverySummary { sets, unusable }
     }
 
     fn repair(&mut self) -> Vec<RepairOutcome> {
@@ -140,7 +152,7 @@ pub(crate) fn drive(
         };
         let outcomes = job.repair();
         metrics::repaired(&summary, &outcomes);
-        if let Some(message) = failure(&summary, &outcomes, job.namespace()) {
+        if let Some(message) = failure(&summary, &outcomes, &*job) {
             slots.release(ticket);
             return Step::Fail(message);
         }
@@ -157,40 +169,46 @@ pub(crate) fn drive(
 }
 
 // The job fails, worded as a recovery failure reads today, when an object
-// could not rebuild what it found, unless another object vouched for the
-// namespace and left no damage in it: an object that only checks never
-// overrules one that repaired, but a repair of one set never excuses
-// another's.
+// could not rebuild what it found, unless another object of its namespace
+// vouched for that namespace and left no damage in it: an object that only
+// checks never overrules one that repaired, but a repair of one set never
+// excuses another's. Each set is judged in the namespace it lives in, at
+// whatever depth.
 fn failure(
     summary: &RecoverySummary,
     outcomes: &[RepairOutcome],
-    namespace: Option<&Namespace>,
+    job: &dyn RootJob,
 ) -> Option<String> {
-    let failed: Vec<(&SetSummary, u64, u64)> = summary
-        .sets
+    let ruled: Vec<(&SetSummary, RepairOutcome)> =
+        summary.sets.iter().zip(outcomes.iter().copied()).collect();
+    let excused = |set: &SetSummary| {
+        ruled.iter().any(|(other, outcome)| {
+            other.namespace == set.namespace && summary::vouches(Some(*outcome))
+        }) && job.namespace(set.namespace).is_none_or(Namespace::is_clean)
+    };
+    let failed: Vec<(&SetSummary, u64, u64)> = ruled
         .iter()
-        .zip(outcomes)
         .filter_map(|(set, outcome)| match outcome {
-            RepairOutcome::Impossible { damaged, reachable } => Some((set, *damaged, *reachable)),
+            RepairOutcome::Impossible { damaged, reachable } if !excused(set) => {
+                Some((*set, *damaged, *reachable))
+            }
             _ => None,
         })
         .collect();
-    let vouched = outcomes
-        .iter()
-        .any(|outcome| summary::vouches(Some(*outcome)));
-    if failed.is_empty() || (vouched && namespace.is_none_or(Namespace::is_clean)) {
+    if failed.is_empty() {
         return None;
     }
     let kinds: BTreeSet<String> = failed.iter().map(|(set, _, _)| label(set.kind)).collect();
-    // The members still damaged, when the namespace marks any; a check that
-    // failed on bytes that arrived whole leaves none to name.
-    let damaged = Some(damaged_names(namespace))
-        .filter(|names| !names.is_empty())
-        .map(|names| format!(" ({names})"))
-        .unwrap_or_default();
     let described = failed
         .iter()
         .map(|(set, slices, reachable)| {
+            // The members still damaged where the set lives, when its
+            // namespace marks any; a check that failed on bytes that
+            // arrived whole leaves none to name.
+            let damaged = Some(damaged_names(job.namespace(set.namespace)))
+                .filter(|names| !names.is_empty())
+                .map(|names| format!(" ({names})"))
+                .unwrap_or_default();
             format!(
                 "{}{damaged}: not repairable: {slices} damaged slices, only {reachable} recovery blocks reachable",
                 set.name

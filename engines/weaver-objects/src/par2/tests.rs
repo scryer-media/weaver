@@ -65,7 +65,7 @@ fn damaged_member(
 }
 
 #[test]
-fn binds_by_id_without_renaming() {
+fn binds_by_its_described_name_without_renaming() {
     let data = payload(1, 5000);
     let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
     let member = job.member("payload.bin", &data);
@@ -74,10 +74,9 @@ fn binds_by_id_without_renaming() {
 }
 
 #[test]
-fn binds_by_name_when_the_id_does_not_match() {
+fn binds_by_a_folded_name_and_keeps_its_own() {
     let data = payload(2, 5000);
     let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
-    // Case changes the id; the name still finds it, and it keeps its name.
     let member = job.member("PAYLOAD.BIN", &data);
     assert!(bind(&mut job).is_empty());
     assert!(job.object.covers(member));
@@ -416,10 +415,11 @@ fn a_shared_members_damage_counts_once() {
     assert!(job.store.members[&member] == shared);
 }
 
-// The member is the first set's file to the byte; the second set describes
-// other bytes under its name, so its bind by name gives way.
+// The member is the first set's file to the byte, but the second set
+// describes other bytes under its name: it answers in both, so neither
+// binds it.
 #[test]
-fn a_name_another_set_describes_differently_is_not_bound_by_name() {
+fn a_name_two_sets_describe_binds_in_neither() {
     let quill = payload(21, 5000);
     let other = payload(22, 5000);
     let mut files = par2_set("first", &[("quill.bin", &quill)], BLOCK, 2, 1);
@@ -433,7 +433,7 @@ fn a_name_another_set_describes_differently_is_not_bound_by_name() {
         .iter()
         .map(|key| job.object.sets[key].bound(member).is_some())
         .collect();
-    assert_eq!(bound, [true, false]);
+    assert_eq!(bound, [false, false]);
     feed(&mut job, member, &quill, None);
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
     assert_eq!(job.store.writes, 0);
@@ -451,4 +451,142 @@ fn a_set_covering_nothing_asks_for_nothing() {
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
     assert!(wanted(&mut job).is_empty());
     assert_eq!(job.store.volume_reads, 0);
+}
+
+// A described file no member carries is named once, by name and length,
+// until the namespace announces it; bound then with every slice missing,
+// the repair writes it whole.
+#[test]
+fn a_described_file_no_member_carries_is_named_and_rebuilt_whole() {
+    let carried = payload(31, 5000);
+    let absent = payload(32, 3 * BLOCK as usize - 12);
+    let files = par2_set(
+        "set",
+        &[("carried.bin", &carried), ("absent.bin", &absent)],
+        BLOCK,
+        4,
+        1,
+    );
+    let mut job = job(&files);
+    let member = job.member("carried.bin", &carried);
+    bind(&mut job);
+    feed(&mut job, member, &carried, None);
+    let mut named = Vec::new();
+    job.object.absent(&mut named);
+    assert_eq!(named, vec![("absent.bin".to_string(), absent.len() as u64)]);
+
+    // Announced and closed with nothing written, as the namespace does.
+    let rebuilt = job
+        .namespace
+        .announce("absent.bin", Some(absent.len() as u64));
+    job.store.members.insert(rebuilt, vec![0; absent.len()]);
+    bind(&mut job);
+    assert!(job.object.covers(rebuilt));
+    named.clear();
+    job.object.absent(&mut named);
+    assert!(named.is_empty(), "{named:?}");
+
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 3 }
+    );
+    assert!(job.store.members[&rebuilt] == absent);
+    assert!(job.store.members[&member] == carried);
+}
+
+// A recovery packet whose payload fails its hash is dropped at the scan, so
+// it is never counted as a block in hand.
+#[test]
+fn a_recovery_packet_failing_its_hash_is_dropped_at_the_scan() {
+    let data = payload(33, 5000);
+    let mut files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 1);
+    let volume = &mut files[1].1;
+    let at = volume
+        .windows(16)
+        .position(|window| window == b"PAR 2.0\0RecvSlic")
+        .expect("a recovery packet");
+    // Past the type and the exponent, inside the payload.
+    volume[at + 16 + 4 + 10] ^= 0x01;
+    let mut job = job(&files);
+    job.member("payload.bin", &data);
+    bind(&mut job);
+    assert_eq!(job.object.blocks_reachable(), 3);
+}
+
+// A set describing more than a job may hold is refused: it binds nothing
+// and names nothing to rebuild.
+#[test]
+fn a_set_past_the_output_limit_is_refused() {
+    let data = payload(34, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1);
+    for (limit, admitted) in [(data.len() as u64 - 1, false), (data.len() as u64, true)] {
+        let mut object = Par2::new(OWN);
+        object.output_limit = limit;
+        let mut job = Job::new(object, OWN);
+        for (name, bytes) in &files {
+            job.volume(name, bytes, ARTICLE as usize, false);
+        }
+        let member = job.member("payload.bin", &data);
+        bind(&mut job);
+        assert_eq!(job.object.covers(member), admitted);
+        let mut named = Vec::new();
+        job.object.absent(&mut named);
+        assert!(named.is_empty());
+    }
+}
+
+// The namespace face with the largest single read it was asked for.
+struct Widest<'a> {
+    store: &'a mut crate::testing::Store,
+    widest: u64,
+}
+
+impl weaver_graph::recovery::MemberAccess for Widest<'_> {
+    fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        self.widest = self.widest.max(range.len());
+        self.store.read(member, range, into)
+    }
+
+    fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+        self.store.write_repaired(member, offset, bytes);
+    }
+
+    fn length(&self, member: MemberId) -> Option<u64> {
+        self.store.length(member)
+    }
+
+    fn read_volume(
+        &mut self,
+        volume: weaver_graph::VolumeIndex,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.store.read_volume(volume, range, into)
+    }
+}
+
+// A member several times the repair memory limit is repaired reading one
+// slice at a time.
+#[test]
+fn a_repair_larger_than_the_memory_limit_reads_one_slice_at_a_time() {
+    const SLICE: u64 = 4096;
+    const LIMIT: usize = 64 * 1024;
+    let data = payload(35, 64 * SLICE as usize);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], SLICE, 2, 1));
+    job.object.memory_limit = LIMIT;
+    let (member, bad) = damaged_member(&mut job, "payload.bin", &data, 100_000);
+    bind(&mut job);
+    let wrong = job.store.members[&member].clone();
+    feed(&mut job, member, &wrong, Some(bad));
+    let mut access = Widest {
+        store: &mut job.store,
+        widest: 0,
+    };
+    let outcome = job.object.repair(&mut access);
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
+        "{outcome:?}"
+    );
+    assert!(access.widest <= SLICE, "{}", access.widest);
+    assert!(job.store.members[&member] == data);
 }

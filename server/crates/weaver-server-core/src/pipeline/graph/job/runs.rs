@@ -53,6 +53,8 @@ impl GraphJob {
                 self.runs.ended(node, said.generation, limit)
             }
         };
+        // What the run said may have closed what a recovery object covers.
+        self.repair()?;
         self.step_runs(admitted, limit)
     }
 
@@ -89,7 +91,9 @@ impl GraphJob {
                     engine.reached(volume, offset);
                 }
             }
-            if admitted.is_empty() {
+            // With every run started, a damaged namespace nothing will
+            // repair is refused, and what that frees is stepped again.
+            if admitted.is_empty() && !self.refuse_unrepaired()? {
                 return Ok(());
             }
             for node in std::mem::take(&mut admitted) {

@@ -9,7 +9,6 @@
 use aws_lc_rs::cipher::{AES_128, AES_256, EncryptingKey, EncryptionContext, UnboundCipherKey};
 use aws_lc_rs::iv::FixedLength;
 
-use super::super::kdf;
 use crate::grid::crc32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,7 +285,7 @@ impl Layout for Rar5<'_> {
 
     fn keyed(&self, crc: u32) -> u32 {
         match (&self.keys, self.options.hash_key) {
-            (Some(keys), true) => kdf::keyed_crc(&keys.hash_key, crc),
+            (Some(keys), true) => unrar_rs::convert_crc32_to_mac(crc, &keys.hash_key),
             _ => crc,
         }
     }
@@ -342,8 +341,9 @@ impl Rar4<'_> {
         Self::block(kind, flags, &body)
     }
 
-    fn keys(&self, salt: &[u8; 8]) -> kdf::Rar4 {
-        kdf::rar4(self.options.password.unwrap(), salt).unwrap()
+    // The AES-128 key and the IV.
+    fn keys(&self, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
+        unrar_rs::KdfCache::new().derive_key_rar4(self.options.password.unwrap(), Some(salt))
     }
 }
 
@@ -398,17 +398,17 @@ impl Layout for Rar4<'_> {
     }
 
     fn seal_header(&self, header: Vec<u8>, _index: usize) -> Vec<u8> {
-        let keys = self.keys(&SALT4);
+        let (key, iv) = self.keys(&SALT4);
         let mut out = SALT4.to_vec();
-        out.extend(encipher(keys.key.as_slice(), keys.iv, &header));
+        out.extend(encipher(&key, iv, &header));
         out
     }
 
     fn cipher(&self, plain: &[u8]) -> Vec<u8> {
         match self.options.password {
             Some(_) => {
-                let keys = self.keys(&SALT4);
-                encipher(keys.key.as_slice(), keys.iv, plain)
+                let (key, iv) = self.keys(&SALT4);
+                encipher(&key, iv, plain)
             }
             None => plain.to_vec(),
         }
@@ -486,11 +486,13 @@ pub(crate) fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
     let layout: &dyn Layout = match options.version {
         Version::Rar5 => {
             let keys = options.password.map(|password| {
-                let derived = kdf::rar5(password, &SALT5, COUNT).unwrap();
+                let derived = unrar_rs::KdfCache::new()
+                    .derive_material_rar5(password, &SALT5, COUNT)
+                    .unwrap();
                 Keys5 {
-                    key: *derived.key,
-                    hash_key: *derived.hash_key,
-                    check: derived.check,
+                    key: derived.key,
+                    hash_key: derived.hash_key,
+                    check: derived.psw_check,
                 }
             });
             rar5 = Rar5 { options, keys };

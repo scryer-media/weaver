@@ -8,16 +8,17 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, Coverage, Provenance};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Piece {
     range: ByteRange,
     bytes: Vec<u8>,
     coverage: Coverage,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Kept {
     // Disjoint, keyed by start.
     pieces: BTreeMap<u64, Piece>,
@@ -27,6 +28,23 @@ pub(crate) struct Kept {
 }
 
 impl Kept {
+    // Whether restored pieces are ones it could have kept: each under its
+    // own start, disjoint, as long as its range, covered only inside it.
+    pub(crate) fn sound(&self) -> bool {
+        let mut end = 0;
+        self.pieces.iter().all(|(start, piece)| {
+            let fits = *start == piece.range.start
+                && piece.range.start >= end
+                && piece.bytes.len() as u64 == piece.range.len()
+                && piece
+                    .coverage
+                    .runs()
+                    .all(|run| piece.range.covers(run.range));
+            end = piece.range.end;
+            fits
+        })
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -181,6 +199,20 @@ impl Kept {
         let at = (offset - piece.range.start) as usize;
         let end = (run.range.end - piece.range.start) as usize;
         &piece.bytes[at..end]
+    }
+
+    // Every run in hand, in order, with its bytes and how they arrived.
+    pub(crate) fn runs(&self) -> Vec<(ByteRange, &[u8], Provenance)> {
+        self.pieces
+            .values()
+            .flat_map(|piece| {
+                piece.coverage.runs().map(move |run| {
+                    let at = (run.range.start - piece.range.start) as usize;
+                    let bytes = &piece.bytes[at..at + run.range.len() as usize];
+                    (run.range, bytes, run.provenance)
+                })
+            })
+            .collect()
     }
 
     // Where the next byte in hand at or after `offset` is, if any.

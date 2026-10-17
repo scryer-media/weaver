@@ -225,5 +225,4 @@ async fn a_clean_par2_job_reads_none_of_its_files_back_under_graph() {
     assert_eq!(graph.reads, 0, "the graph read a member back");
     assert_eq!(graph.volume_samples(&classic), vec![(3, 0)]);
     assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
-    eprintln!("classic PAR2 read-back passes: {}", classic.reads);
 }

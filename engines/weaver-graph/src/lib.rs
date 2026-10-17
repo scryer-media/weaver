@@ -28,22 +28,29 @@
 
 pub mod deliver;
 pub mod engine;
+pub mod facts;
 pub mod holds;
 pub mod member;
 pub mod names;
 pub mod object;
+pub mod records;
 pub mod recovery;
 pub mod seek;
 pub mod slots;
 pub mod sniff;
 pub mod tree;
 pub mod volume;
+mod wire;
 
 pub use deliver::{Delivery, Emit, Provenance, RecoveryKind, Why};
 pub use engine::{Engine, Extraction, Sink, Volumes};
+pub use facts::{Durable, Facts, Restore, RestoreError};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{Extent, Kind, Object, ObjectId, Placement};
+pub use records::{
+    CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
+};
 pub use recovery::{Recovery, Segment, SliceVerdict};
 pub use seek::{Pull, Purpose, Seek, SeekUp, Weight};
 pub use sniff::{Sniff, sniff};

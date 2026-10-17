@@ -22,7 +22,7 @@ pub(super) const MAGIC: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 // so one bid per chunk would be a round trip per chunk.
 const BID_AHEAD: u64 = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Start {
     pub(super) end_header: ByteRange,
     pub(super) crc: u32,

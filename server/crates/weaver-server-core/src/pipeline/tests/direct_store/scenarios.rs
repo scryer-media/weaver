@@ -200,7 +200,7 @@ fn misaligned_parts(total: usize, count: usize) -> Vec<usize> {
 //   alone** and folds the whole-member CRC32 with that password's hash key,
 //   which is the shape RARLAB `rar` 7.20 writes: only the last part's checksum
 //   is the whole member's, so only that one is keyed.
-fn encrypted_store_set(
+pub(in crate::pipeline::tests) fn encrypted_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -363,7 +363,7 @@ async fn encrypted_routing_outcome(
 // The corpus-wide RAR4 fixture salt. RAR salts each *file* rather than the
 // archive, which is why the KDF tuple is per member here where RAR5's is per
 // archive.
-const TEST_RAR4_SALT: [u8; 8] = [0x9B; 8];
+pub(in crate::pipeline::tests) const TEST_RAR4_SALT: [u8; 8] = [0x9B; 8];
 
 // A stored, encrypted RAR4 file header: [`build_test_rar4_file_header`] plus
 // the `ENCRYPTED`/`SALT` flags and the 8-byte salt the format appends after the
@@ -419,7 +419,7 @@ fn build_test_rar4_encrypted_file_header(
 // - **no keyed checksum.** RAR4 has no hash-MAC flag, so the whole-member
 //   CRC32 below is the bare plaintext CRC32 and `convert_crc32_to_mac` is not
 //   applied to it. That is that finding stated as a fixture.
-fn encrypted_rar4_store_set(
+pub(in crate::pipeline::tests) fn encrypted_rar4_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,

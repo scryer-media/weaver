@@ -162,7 +162,7 @@ impl SevenZipStore {
             let local = part.shift(-(folder.pack.start as i64));
             match &self.folders[index] {
                 // The proof file is kept to try passwords against.
-                Lock::Locked => self.held_or_kept(part, out),
+                Lock::Locked | Lock::Sealed(_) => self.held_or_kept(part, out),
                 Lock::Plain => classify_plain(map, index, local, folder.pack.start, out),
                 Lock::Open(_) => {
                     let payload = ByteRange::new(

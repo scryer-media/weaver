@@ -5,12 +5,12 @@
 // are the files of the job; a RAR object's are the files inside the RAR.
 // Each member is a leaf, or is bound to the object that owns it. The
 // namespace records what has arrived for each member, by range and by
-// provenance, and allocates the name each one is written under.
+// provenance, and the name the tree's ledger gave each one to be written
+// under.
 
 use std::collections::BTreeMap;
 
 use crate::deliver::Provenance;
-use crate::names::NameLedger;
 use crate::object::ObjectId;
 use crate::volume::ByteRange;
 
@@ -23,7 +23,8 @@ pub struct Member {
     // What the producer called it. Changes at most once, when a recovery
     // object recognises an obfuscated member and renames it.
     pub name: String,
-    // The name it is written under, allocated by the namespace.
+    // The name it is written under: the wanted name until the tree's one
+    // ledger places it, and what that ledger gave it after.
     pub output_name: String,
     pub length: Option<u64>,
     // The object that owns it, or `None` for a leaf. Decided once, at the
@@ -187,7 +188,6 @@ impl Coverage {
 #[derive(Debug, Default)]
 pub struct Namespace {
     members: BTreeMap<MemberId, Member>,
-    names: NameLedger,
     next: u32,
     // The front of each member, up to FIRST_BYTES: what a recovery object
     // recognises an obfuscated member by. Kept apart from the members so a
@@ -204,18 +204,17 @@ impl Namespace {
         Self::default()
     }
 
-    // A member the producer announced. Its output name is allocated here
-    // and nowhere else.
+    // A member the producer announced. Its output name is the tree's to
+    // give; until it does, the member wants the name it was announced by.
     pub fn announce(&mut self, name: &str, length: Option<u64>) -> MemberId {
         let id = MemberId(self.next);
         self.next += 1;
-        let output_name = self.names.allocate(id, name);
         self.members.insert(
             id,
             Member {
                 id,
                 name: name.to_owned(),
-                output_name,
+                output_name: name.to_owned(),
                 length,
                 bound_to: None,
                 coverage: Coverage::new(),
@@ -225,11 +224,11 @@ impl Namespace {
         id
     }
 
-    // Restore a member with the identity and name it had before. The next
-    // announced member comes after every restored one.
+    // Restore a member with the identity and names it had before. The next
+    // announced member comes after every restored one; the tree's ledger
+    // takes the names back with `Tree::rebuild_names`.
     pub fn restore(&mut self, member: Member) {
         self.next = self.next.max(member.id.0 + 1);
-        self.names.allocate(member.id, &member.output_name);
         self.members.insert(member.id, member);
     }
 
@@ -266,13 +265,12 @@ impl Namespace {
     }
 
     // The one identity revision after the first bytes: a recovery object
-    // recognised the member. The output name follows.
-    pub fn rename(&mut self, member: MemberId, name: &str) -> Option<String> {
-        let output_name = self.names.allocate(member, name);
+    // recognised the member. The name it now wants goes up to the tree,
+    // whose ledger moves its output name, in `Tree::rename`.
+    pub fn rename(&mut self, member: MemberId, name: &str) -> Option<&Member> {
         let found = self.members.get_mut(&member)?;
         found.name = name.to_owned();
-        found.output_name = output_name.clone();
-        Some(output_name)
+        Some(found)
     }
 
     // The member starts over: its bytes are forgotten and it is unbound. Its
@@ -287,9 +285,8 @@ impl Namespace {
         self.first_bytes.remove(&member);
     }
 
-    // The member is gone for good, with its name.
+    // The member is gone for good. Its name is the tree's to release.
     pub fn remove(&mut self, member: MemberId) -> Option<Member> {
-        self.names.release(member);
         self.first_bytes.remove(&member);
         self.members.remove(&member)
     }
@@ -403,17 +400,16 @@ mod tests {
     }
 
     #[test]
-    fn announced_members_get_distinct_output_names_and_a_rename_follows() {
+    fn a_rename_changes_the_wanted_name_and_leaves_the_output_name_to_the_tree() {
         let mut namespace = Namespace::new();
-        let first = namespace.announce("subs.srt", Some(10));
-        let second = namespace.announce("subs.srt", None);
-        assert_eq!(namespace.get(first).unwrap().output_name, "subs.srt");
-        assert_eq!(namespace.get(second).unwrap().output_name, "subs (1).srt");
+        let member = namespace.announce("3f9a.bin", Some(10));
+        assert_eq!(namespace.get(member).unwrap().output_name, "3f9a.bin");
+        assert!(namespace.rename(member, "other.srt").is_some());
+        let record = namespace.get(member).unwrap();
         assert_eq!(
-            namespace.rename(second, "other.srt").as_deref(),
-            Some("other.srt")
+            (record.name.as_str(), record.output_name.as_str()),
+            ("other.srt", "3f9a.bin")
         );
-        assert_eq!(namespace.get(second).unwrap().name, "other.srt");
     }
 
     #[test]

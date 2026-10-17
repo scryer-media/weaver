@@ -3,24 +3,21 @@
 
 // The RAR store: a RAR4 or RAR5 set, one volume or many, streamed into its
 // members as its bytes arrive, in any order, with no engine and no file of
-// its own. Every volume's headers are read from its front, in order, so
-// nothing is ever wanted from a tail. The headers are linked in archive
-// order into entries: a stored file maps straight to its member, piece by
+// its own. Every volume's headers are walked by unrar-rs from its front, so
+// nothing is ever wanted from a tail, and unrar-rs's stored layout links
+// them into members: a stored file maps straight to its member, piece by
 // piece across the volumes it spans; an AES file maps through the cipher
-// once a password is proved. Anything compressed or solid goes to an engine.
+// once a password opens it. Anything compressed or solid goes to an engine.
 //
 // The object is pure: no I/O, no threads, no files. Bytes it cannot place yet
 // are held by its owner, who hands them back once the headers place them.
 
-mod chain;
 mod claim;
-mod header;
-mod kdf;
+pub(crate) mod facts;
+mod image;
+mod layout;
 mod lock;
 mod place;
-mod rar4;
-mod rar5;
-mod reader;
 mod record;
 mod walk;
 
@@ -30,17 +27,16 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
+use unrar_rs::{EncryptedStore, KdfCache, StoredLayoutBuilder};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Pull, Seek,
-    VolumeIndex, Weight, Why,
+    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Provenance,
+    Pull, Seek, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
 use crate::crypt::Cbc;
-use crate::grid::Grid;
+use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
-use crate::keys::Keys;
-use header::FileCrypt;
 use walk::{Step, Walk};
 
 // How many volumes past the one being read are bid for. A solid set never
@@ -67,13 +63,6 @@ impl Volume {
     }
 }
 
-// The next block to link, in archive order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Chain {
-    volume: VolumeIndex,
-    block: usize,
-}
-
 // A file's cipher, by what the object knows of its key.
 enum Lock {
     Plain,
@@ -81,25 +70,17 @@ enum Lock {
     Open(Box<Cbc>),
 }
 
-// What one part's own checksum says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Proof {
-    Unknown,
-    Intact,
-    Damaged,
-}
-
 // One volume's part of a file: its data area there and where it starts in
 // the file's packed stream.
 struct Piece {
     volume: VolumeIndex,
-    block: usize,
     data: ByteRange,
     at: u64,
     // The CRC of this part's packed bytes, which every part but the last
-    // carries in place of the file's.
+    // carries in place of the file's, and whether it is keyed.
     crc: Option<u32>,
-    proof: Proof,
+    uses_mac: bool,
+    after: bool,
 }
 
 // What has been said for one member.
@@ -107,15 +88,15 @@ struct Piece {
 struct Out {
     coverage: Coverage,
     closed: bool,
-    damaged: bool,
 }
 
 struct Entry {
     // The name as the headers spell it, which every part repeats.
-    raw: String,
+    name: String,
     length: Option<u64>,
     crc: Option<u32>,
-    crypt: Option<FileCrypt>,
+    uses_mac: bool,
+    store: Option<EncryptedStore>,
     pieces: Vec<Piece>,
     complete: bool,
     lock: Lock,
@@ -136,10 +117,6 @@ impl Entry {
     fn plain_len(&self) -> Option<u64> {
         self.length.or_else(|| self.complete.then(|| self.packed()))
     }
-
-    fn keyed(&self) -> bool {
-        matches!(self.crypt, Some(FileCrypt::Rar5 { hash_key: true, .. }))
-    }
 }
 
 // A password offered.
@@ -149,21 +126,18 @@ struct Candidate {
 }
 
 pub struct RarStore {
-    keys: Arc<Keys>,
+    // The set's derivations, shared by every walk, check and key.
+    kdf: Arc<KdfCache>,
     volumes: BTreeMap<VolumeIndex, Volume>,
+    layout: Option<StoredLayoutBuilder>,
     entries: Vec<Entry>,
-    // Where each linked file block went: its entry and its piece there.
-    links: BTreeMap<(VolumeIndex, usize), (usize, usize)>,
-    chain: Chain,
-    // An entry whose next part opens the next volume.
-    open: Option<usize>,
     candidates: Vec<Candidate>,
     // The candidate that opened the headers.
     headers_open: Option<usize>,
     asked: bool,
     bid: BTreeSet<VolumeIndex>,
     damage_said: HashSet<(VolumeIndex, u64, u64, u32)>,
-    recovery_said: BTreeSet<(VolumeIndex, usize)>,
+    recovery_said: BTreeSet<(VolumeIndex, u64)>,
     gaps_said: BTreeSet<VolumeIndex>,
     stale: bool,
     // The object gave its set up; it says nothing more.
@@ -178,21 +152,11 @@ impl Default for RarStore {
 
 impl RarStore {
     pub fn new() -> Self {
-        Self::with_keys(Keys::global())
-    }
-
-    // With a key cache of its own, so a test counts its own derivations.
-    pub fn with_keys(keys: Arc<Keys>) -> Self {
         Self {
-            keys,
+            kdf: Arc::new(KdfCache::new()),
             volumes: BTreeMap::new(),
+            layout: None,
             entries: Vec::new(),
-            links: BTreeMap::new(),
-            chain: Chain {
-                volume: VolumeIndex(0),
-                block: 0,
-            },
-            open: None,
             candidates: Vec::new(),
             headers_open: None,
             asked: false,
@@ -238,8 +202,7 @@ impl RarStore {
             if self.gone {
                 return;
             }
-            self.open_headers(out);
-            self.link(out);
+            self.sync(out);
             if self.gone {
                 return;
             }
@@ -247,78 +210,43 @@ impl RarStore {
         }
     }
 
-    // Read every volume's headers as far as its bytes go.
+    // Walk every volume's headers as far as its bytes go.
     fn walk_all(&mut self, out: &mut Vec<Emit>) {
         let indices: Vec<VolumeIndex> = self.volumes.keys().copied().collect();
         for volume in indices {
-            loop {
-                let keyring = self.header_keyring();
-                let found = self.volumes.get_mut(&volume).expect("volume is known");
-                let step = found
-                    .walk
-                    .step(&mut found.kept, found.length, keyring.as_deref());
-                match step {
-                    Step::Moved => self.stale = true,
-                    Step::Wait | Step::Locked => break,
-                    Step::Damaged(range, crc) => {
-                        self.say_damaged(volume, range, crc, out);
-                        break;
-                    }
-                    Step::Short(range) => {
-                        self.say_damaged(volume, range, 0, out);
-                        break;
-                    }
-                    Step::Foreign => {
-                        let range = ByteRange::new(0, found.walk_signature_end());
-                        if volume == VolumeIndex(0) && found.kept.verified(range) {
-                            return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
-                        }
-                        let crc = found.kept.read(range).map_or(0, crate::grid::crc32);
-                        self.say_damaged(volume, range, crc, out);
-                        break;
-                    }
-                    Step::Broken => return self.give_up(Emit::NeedsEngine(Why::Unsupported), out),
-                }
-            }
-        }
-    }
-
-    // Repaired bytes changed a header already read: everything said about
-    // the entries from there on was built on wrong bytes.
-    fn rebuild_if_changed(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
-        let Some(found) = self.volumes.get_mut(&volume) else {
-            return;
-        };
-        let Some(index) = found.walk.changed(&found.kept, range) else {
-            return;
-        };
-        found.walk.rewind(index);
-        let from = Chain {
-            volume,
-            block: index,
-        };
-        let first = self
-            .links
-            .range((volume, index)..)
-            .map(|(_, (entry, _))| *entry)
-            .min();
-        if let Some(first) = first {
-            let start = &self.entries[first].pieces[0];
-            self.chain = Chain {
-                volume: start.volume,
-                block: start.block,
+            let password = self.header_password();
+            let Some(found) = self.volumes.get_mut(&volume) else {
+                continue;
             };
-            for id in (first..self.entries.len()).rev() {
-                out.push(Emit::Retract(MemberId(id as u32)));
+            let step = found.walk.step(
+                &mut found.kept,
+                found.length,
+                password.as_deref().map(String::as_str),
+                &self.kdf,
+                found.closed,
+            );
+            match step {
+                Step::Walked { moved, damaged } => {
+                    self.stale |= moved;
+                    if let Some(range) = damaged {
+                        let crc = found.kept.read(range).map_or(0, crc32);
+                        self.say_damaged(volume, range, crc, out);
+                    }
+                }
+                Step::Locked(encryption) => self.open_headers(&encryption, out),
+                Step::Broken(range) => {
+                    if found.kept.verified(range) {
+                        return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+                    }
+                    let crc = found.kept.read(range).map_or(0, crc32);
+                    self.say_damaged(volume, range, crc, out);
+                }
+                Step::Refuse(emit) => return self.give_up(emit, out),
             }
-            self.entries.truncate(first);
-            self.links.retain(|_, (entry, _)| *entry < first);
-            self.open = None;
-        } else if self.chain > from {
-            self.chain = from;
+            if self.gone {
+                return;
+            }
         }
-        self.recovery_said.retain(|at| *at < (volume, index));
-        self.stale = true;
     }
 
     // Everything bound has closed: nothing more will arrive.
@@ -367,14 +295,6 @@ impl RarStore {
     }
 }
 
-impl Volume {
-    fn walk_signature_end(&self) -> u64 {
-        self.length.map_or(header::RAR5.len() as u64, |length| {
-            length.min(header::RAR5.len() as u64)
-        })
-    }
-}
-
 impl Object for RarStore {
     fn kind(&self) -> Kind {
         Kind::RarStore
@@ -395,14 +315,23 @@ impl Object for RarStore {
                 .kept
                 .absorb(range, delivery.bytes, delivery.provenance)
             {
+                found.walk.touch();
                 self.stale = true;
-                self.rebuild_if_changed(volume, range, out);
             }
             self.settle(out);
             if self.gone {
                 return;
             }
-            if self.volume(volume).kept.generation() == generation {
+            // A damaged delivery over the walk's next bytes is kept whole, so
+            // it is said once and its repair is seen.
+            let found = self.volume(volume);
+            if delivery.provenance == Provenance::Damaged && !found.closed {
+                let hole = found.walk.hole(&found.kept, false);
+                if range.contains(hole) {
+                    found.kept.want(ByteRange::new(hole, range.end));
+                }
+            }
+            if found.kept.generation() == generation {
                 break;
             }
         }
@@ -413,7 +342,9 @@ impl Object for RarStore {
         if self.gone {
             return;
         }
-        self.volume(volume).closed = true;
+        let found = self.volume(volume);
+        found.closed = true;
+        found.walk.touch();
         self.stale = true;
         self.settle(out);
         if self.gone {
@@ -430,12 +361,12 @@ impl Object for RarStore {
         let Some(found) = self.volumes.get(&volume) else {
             return;
         };
-        let next = ByteRange::at(found.walk.cursor, 1);
+        let next = ByteRange::at(found.walk.hole(&found.kept, found.closed), 1);
         if found.walk.ended || range.intersect(next).is_none() {
             return;
         }
         // The next header will never come, and nothing past it can be read.
-        let why = match volume == VolumeIndex(0) && found.walk.main().is_none() {
+        let why = match volume == VolumeIndex(0) && found.walk.facts.is_none() {
             true => Why::FirstBytesLost,
             false => Why::Unrepairable,
         };
@@ -446,7 +377,14 @@ impl Object for RarStore {
         if self.gone {
             return;
         }
-        let reading = self.chain.volume.0;
+        // The first volume not read to its end.
+        let reading = (0..)
+            .find(|index| {
+                self.volumes
+                    .get(&VolumeIndex(*index))
+                    .is_none_or(|found| !found.walk.ended)
+            })
+            .unwrap_or(0);
         for distance in 1..=WINDOW {
             let volume = VolumeIndex(reading + distance);
             let Some(found) = self.volumes.get(&volume) else {
@@ -495,6 +433,7 @@ impl Object for RarStore {
             return;
         }
         found.length = Some(length);
+        found.walk.touch();
         self.stale = true;
         self.settle(out);
     }
@@ -512,6 +451,9 @@ impl Object for RarStore {
             secret: Zeroizing::new(secret.to_owned()),
             headers_wrong: false,
         });
+        for volume in self.volumes.values_mut() {
+            volume.walk.touch();
+        }
         self.stale = true;
         self.settle(out);
     }

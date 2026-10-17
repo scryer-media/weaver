@@ -9,14 +9,17 @@ use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, Seek};
 
 use super::*;
 
+mod windows;
+
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
 const HEADER: u64 = SIGNATURE.len() as u64;
 
 // A pretend store with one volume: a seven-byte header kept as envelope 0,
-// then one member, "inner.bin", to the end. The word RETRACT anywhere in a
-// delivery takes the member back.
+// then one member, "inner.bin", of the length it is built with, to the end.
+// The word RETRACT anywhere in a delivery takes the member back.
 struct Store {
     announced: bool,
+    length: u64,
 }
 
 impl Object for Store {
@@ -34,7 +37,7 @@ impl Object for Store {
             out.push(Emit::Member {
                 member: MemberId(0),
                 name: "inner.bin".into(),
-                length: Some(5),
+                length: Some(self.length),
             });
         }
         let skip = HEADER
@@ -163,12 +166,16 @@ impl Object for Late {
 struct Build {
     par: Arc<Mutex<Seen>>,
     fix: Option<Fix>,
+    inner: u64,
 }
 
 impl Builder for Build {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
         match kind {
-            Kind::RarStore => Some(Box::new(Store { announced: false })),
+            Kind::RarStore => Some(Box::new(Store {
+                announced: false,
+                length: self.inner,
+            })),
             Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
             Kind::Par2 => Some(Box::new(Par {
                 volume: None,
@@ -189,7 +196,11 @@ const SOURCE_CRC: u32 = 0x5eed_c0de;
 struct Source;
 
 impl Segments for Source {
-    fn segments_for(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Segment>) {
+    fn segments_for(&self, node: NodeId, _: VolumeIndex, range: ByteRange, out: &mut Vec<Segment>) {
+        // As the article root: its checksums are of the root's bytes only.
+        if node != NodeId::ROOT {
+            return;
+        }
         out.push(Segment {
             range,
             crc32: SOURCE_CRC,
@@ -333,6 +344,8 @@ struct Job {
     accountant: Arc<HoldsAccountant>,
     par: Arc<Mutex<Seen>>,
     fix: Option<Fix>,
+    // The length of the member the pretend store holds.
+    inner: u64,
     out: Vec<Effect>,
 }
 
@@ -353,6 +366,7 @@ impl Job {
             accountant,
             par: Arc::new(Mutex::new(Seen::default())),
             fix: None,
+            inner: 5,
             out: Vec::new(),
         }
     }
@@ -366,7 +380,7 @@ impl Job {
     }
 
     fn member(&mut self, name: &str, length: Option<u64>) -> MemberId {
-        let member = self.tree.announce_root(name, length);
+        let member = self.tree.announce_root(name, length, &mut Vec::new());
         let mut build = self.build();
         self.writer
             .announced(
@@ -424,6 +438,7 @@ impl Job {
         Build {
             par: Arc::clone(&self.par),
             fix: self.fix,
+            inner: self.inner,
         }
     }
 
@@ -597,7 +612,9 @@ fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
 #[test]
 fn a_name_that_would_escape_the_working_dir_is_confined() {
     let mut job = Job::new(PLENTY);
-    let member = job.tree.announce_root("../escape.txt", Some(2));
+    let member = job
+        .tree
+        .announce_root("../escape.txt", Some(2), &mut Vec::new());
     job.send(member, 0, b"no", Provenance::Fresh);
     assert_eq!(job.file("escape.txt"), b"no");
 }
@@ -757,6 +774,28 @@ fn a_retraction_truncates_the_leaf_and_keeps_its_name_for_what_comes_back() {
     assert_eq!(inner.coverage.bytes_covered(), 0);
 }
 
+// A root member recognised as the name a store's member was written under
+// takes it, since it sits higher; the store's file moves aside on disk and
+// keeps its bytes.
+#[test]
+fn a_shallower_member_that_claims_a_written_name_moves_the_deeper_file_aside() {
+    let mut job = Job::new(PLENTY);
+    let (_, child) = bound_store(&mut job);
+    assert_eq!(job.file("inner.bin"), b"hello");
+    let member = job.member("3f9a.bin", Some(4));
+    job.send(member, 0, b"data", Provenance::Fresh);
+    let renamed = job
+        .writer
+        .rename(&mut job.tree, NodeId::ROOT, member, "INNER.bin")
+        .expect("rename");
+    assert_eq!(renamed, "INNER.bin");
+    let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+    assert_eq!(inner.output_name, "inner (1).bin");
+    assert_eq!(job.file("INNER.bin"), b"data");
+    assert_eq!(job.file("inner (1).bin"), b"hello");
+    assert!(!job.dir.path().join("3f9a.bin").exists());
+}
+
 #[test]
 fn a_recovery_object_in_the_tree_is_fed_and_its_renames_move_the_file() {
     let mut job = Job::new(PLENTY);
@@ -830,4 +869,78 @@ fn dropping_the_writer_gives_its_holds_back() {
     drop(writer);
     assert_eq!(accountant.usage().resident, 0);
     assert_eq!(accountant.usage().namespaces, 0);
+}
+
+// Below the root an object's bytes reach the object under it as its emits,
+// never through the root's path, and what that object cannot place yet is
+// held for its volume in the namespace above it all the same.
+#[test]
+fn bytes_held_below_the_root_reach_their_member_once_its_store_knows_its_map() {
+    let mut job = Job::new(PLENTY);
+    job.inner = map_at().end;
+    let member = job.member("pack.bin", Some(HEADER + map_at().end));
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(SEVEN_Z);
+    front.extend_from_slice(b"hello");
+    job.send(member, 0, &front, Provenance::Fresh);
+    let (store, _) = job.tree.child_of(NodeId::ROOT, member).expect("a store");
+    let (late, _) = job.tree.child_of(store, MemberId(0)).expect("a 7z inside");
+    assert_eq!(job.writer.held_bytes(store), body().len());
+
+    job.send(member, HEADER + map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(store), 0);
+    assert_eq!(job.accountant.usage().resident, 0);
+    let mut access = job.writer.access(&job.tree, late);
+    let mut inner = Vec::new();
+    assert!(access.read(
+        MemberId(0),
+        body().shift(-(body().start as i64)),
+        &mut inner
+    ));
+    assert_eq!(inner, b"hello");
+}
+
+// A source with no checksums for what it delivers, as for every namespace
+// below the root.
+struct Unsourced;
+
+impl Segments for Unsourced {
+    fn segments_for(&self, _: NodeId, _: VolumeIndex, _: ByteRange, _: &mut Vec<Segment>) {}
+}
+
+#[test]
+fn bytes_the_source_has_no_checksums_for_are_checked_as_they_are_in_hand() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let member = job.member("video.mkv", Some(8));
+    for (offset, bytes, provenance) in [
+        (0, &b"fresh"[..], Provenance::Fresh),
+        (5, &b"bad"[..], Provenance::Damaged),
+    ] {
+        let arrival = Arrival {
+            node: NodeId::ROOT,
+            member,
+            offset,
+            bytes: Bytes::copy_from_slice(bytes),
+            provenance,
+        };
+        let mut build = job.build();
+        job.writer
+            .deliver(&mut job.tree, &mut build, &Unsourced, arrival, &mut job.out)
+            .expect("deliver");
+    }
+    assert_eq!(
+        job.par.lock().unwrap().fed,
+        vec![
+            Segment {
+                range: ByteRange::new(0, 5),
+                crc32: crc32(b"fresh"),
+                verified: true,
+            },
+            Segment {
+                range: ByteRange::new(5, 8),
+                crc32: crc32(b"bad"),
+                verified: false,
+            },
+        ]
+    );
 }

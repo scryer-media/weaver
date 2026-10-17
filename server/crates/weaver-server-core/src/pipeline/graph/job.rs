@@ -8,8 +8,10 @@
 // reaches into the tree, and nothing else writes the job's files.
 
 mod passwords;
+mod repair;
 mod runs;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,8 +20,7 @@ use tracing::warn;
 use weaver_graph::holds::HoldsAccountant;
 use weaver_graph::recovery::{RepairOutcome, SliceVerdict};
 use weaver_graph::{
-    Builder, ByteRange, Effect, Kind, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree,
-    VolumeIndex,
+    Builder, Effect, Kind, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
 };
 
 use self::passwords::Passwords;
@@ -59,6 +60,8 @@ pub(crate) struct RecoverySummary {
     // The tree node the object is. One PAR2 object holds every PAR2 set of
     // its namespace, so this is per object, not per set id.
     pub(crate) node: NodeId,
+    // The namespace it lives in, where the members it covers are.
+    pub(crate) namespace: NodeId,
     pub(crate) kind: Kind,
     // Recovery blocks in hand or still on their way.
     pub(crate) blocks_reachable: u64,
@@ -78,6 +81,9 @@ pub(crate) struct GraphJob {
     passwords: Passwords,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
+    // Per recovery object, how many of its volumes were closed when it last
+    // ruled: one waiting on recovery bytes rules again once more are.
+    ruled_at: BTreeMap<NodeId, usize>,
 }
 
 // A root member as the post lists it.
@@ -126,17 +132,25 @@ impl GraphJob {
         let root = ArticleRoot::new(&volumes);
         let mut out = Vec::new();
         for file in files {
-            let member = tree.announce_root(&file.name, None);
+            // Nothing is below the root yet, so no name moves; were one to,
+            // its file would follow as any rename's does.
+            let mut moved = Vec::new();
+            let member = tree.announce_root(&file.name, None, &mut moved);
             // A member that cannot be announced still downloads; its first
             // write reports the same failure where a step can carry it.
-            if let Err(error) = writer.announced(
-                &mut tree,
-                &mut *builder,
-                &root,
-                NodeId::ROOT,
-                member,
-                &mut out,
-            ) {
+            if let Err(error) = writer
+                .apply_all(&mut tree, &mut *builder, &root, moved, &mut out)
+                .and_then(|()| {
+                    writer.announced(
+                        &mut tree,
+                        &mut *builder,
+                        &root,
+                        NodeId::ROOT,
+                        member,
+                        &mut out,
+                    )
+                })
+            {
                 warn!(member = member.0, error = %error, "graph member announcement failed");
             }
         }
@@ -148,6 +162,7 @@ impl GraphJob {
             runs,
             passwords: Passwords::default(),
             reported: None,
+            ruled_at: BTreeMap::new(),
         }
     }
 
@@ -184,9 +199,9 @@ impl GraphJob {
     pub(crate) fn phase(&self) -> RootPhase {
         let tree = &self.tree;
         let activity = phase::activity(
-            tree.recovery_nodes(NodeId::ROOT)
+            self.recovery_objects()
                 .into_iter()
-                .map(|node| tree.recovery(node).and_then(|recovery| recovery.outcome())),
+                .map(|(_, node)| tree.recovery(node).and_then(|recovery| recovery.outcome())),
         );
         let extracting = phase::extracting(tree) || self.runs.live();
         RootPhase::derive(self.payload_waiting(), activity, extracting)
@@ -202,18 +217,18 @@ impl GraphJob {
             .expect("the root namespace lives as long as the tree")
     }
 
-    // Seam for completion, status and health: each recovery object of the
-    // root namespace, with the blocks it can reach and the slices it knows
-    // are damaged. Stable.
+    // Seam for completion, status and health: each recovery object of every
+    // namespace in the tree, parents first, with the blocks it can reach and
+    // the slices it knows are damaged. Stable.
     pub(crate) fn recovery_summary(&self) -> Vec<RecoverySummary> {
         let tree = &self.tree;
         let mut verdicts = Vec::new();
-        tree.recovery_nodes(NodeId::ROOT)
+        self.recovery_objects()
             .into_iter()
-            .filter_map(|node| {
+            .filter_map(|(namespace, node)| {
                 let (kind, recovery) = (tree.kind(node)?, tree.recovery(node)?);
                 verdicts.clear();
-                for member in self.namespace().members() {
+                for member in tree.namespace(namespace)?.members() {
                     if recovery.covers(member.id) {
                         recovery.verdicts(member.id, &mut verdicts);
                     }
@@ -224,6 +239,7 @@ impl GraphJob {
                     .count() as u64;
                 Some(RecoverySummary {
                     node,
+                    namespace,
                     kind,
                     blocks_reachable: recovery.blocks_reachable(),
                     damaged_slices,
@@ -294,8 +310,8 @@ impl GraphJob {
     }
 
     // After an article of `volume` was settled: a member with nothing left
-    // to fetch is closed, and the root's recovery objects repair when what
-    // they cover is in or what they waited for arrived.
+    // to fetch is closed, and the recovery objects of every namespace
+    // repair when what they cover is in or what they waited for arrived.
     fn after_member(&mut self, volume: VolumeIndex) -> Result<(), GraphError> {
         let member = MemberId(volume.0);
         if !self.root.map.volume_waiting(volume) && !self.closed(member) {
@@ -310,7 +326,7 @@ impl GraphJob {
             )?;
             self.heard(out)?;
         }
-        self.repair(member)
+        self.repair()
     }
 
     fn closed(&self, member: MemberId) -> bool {
@@ -340,79 +356,6 @@ impl GraphJob {
             self.is_recovery_volume(member.id).is_none()
                 && self.root.map.volume_waiting(VolumeIndex(member.id.0))
         })
-    }
-
-    // Let the root's recovery objects that have something to say verify and
-    // repair: one that has not ruled on the members it covers rules once
-    // they are all closed, and one waiting on its own volumes rules again
-    // when `settled`, the member just settled, is one of them. What they
-    // rewrote comes back down as repaired bytes; what they still need they
-    // ask for in the next seek round.
-    fn repair(&mut self, settled: MemberId) -> Result<(), GraphError> {
-        let tree = &self.tree;
-        let due = tree.recovery_nodes(NodeId::ROOT).into_iter().any(|node| {
-            let Some(recovery) = tree.recovery(node) else {
-                return false;
-            };
-            match recovery.outcome() {
-                None => self
-                    .namespace()
-                    .members()
-                    .all(|member| !recovery.covers(member.id) || member.closed),
-                Some(RepairOutcome::Waiting) => {
-                    self.is_recovery_volume(settled) == Some(node) && self.closed(settled)
-                }
-                Some(_) => false,
-            }
-        });
-        if !due {
-            return Ok(());
-        }
-        let mut out = Vec::new();
-        self.writer.repair(
-            &mut self.tree,
-            &mut *self.builder,
-            &self.root,
-            NodeId::ROOT,
-            &mut out,
-        )?;
-        self.heard(out)
-    }
-
-    // Ranges of lost articles become damage in the tree as soon as they can
-    // be told; whatever covers them repairs them.
-    fn mark_damage(&mut self) -> Result<(), GraphError> {
-        let mut effects = Vec::new();
-        for (volume, range) in self.root.damage() {
-            self.tree.damage(NodeId::ROOT, volume, range, &mut effects);
-            self.recovery_volume_lost(volume, range, &mut effects);
-        }
-        self.settle(effects)
-    }
-
-    // A lost range of a recovery object's own volume is gone for good, since
-    // nothing recovers the recovery. The object hears it, or it waits on the
-    // gap: a walk that never passes it finds none of the blocks beyond.
-    // A data object is not told, as a repair may still bring its bytes back.
-    fn recovery_volume_lost(
-        &mut self,
-        volume: VolumeIndex,
-        range: ByteRange,
-        effects: &mut Vec<Effect>,
-    ) {
-        let Some((node, inner)) = self.tree.child_of(NodeId::ROOT, MemberId(volume.0)) else {
-            return;
-        };
-        if !self.tree.recovers(node) {
-            return;
-        }
-        let Some(mut object) = self.tree.take_object(node) else {
-            return;
-        };
-        let mut emits = Vec::new();
-        object.volume_lost(inner, range, &mut emits);
-        self.tree.put_object(node, object);
-        self.tree.emitted(node, emits, &mut *self.builder, effects);
     }
 
     // One round of seeks: every object's standing wants lifted to the root,

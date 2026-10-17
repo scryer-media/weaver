@@ -18,7 +18,9 @@ pub enum Purpose {
 // How badly the asker wants it, relative to the other bids into the root's
 // window. Lower is sooner. A RAR object extracting a member bids its next
 // volume at 1, the one after at 2, and so on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Weight(pub u32);
 
 impl Weight {

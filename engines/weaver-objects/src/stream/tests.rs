@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod facts;
+
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;

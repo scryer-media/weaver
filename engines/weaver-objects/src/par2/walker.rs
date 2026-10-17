@@ -1,29 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Walks the packets of one PAR2 volume as its bytes arrive, front to back.
+// Walks the packets of one PAR2 volume as its bytes arrive, front to back,
+// and hands on only packets whose MD5 passes.
 //
-// Metadata packets are small and are parsed whole. A recovery packet is
-// mostly payload the object never needs until a repair spends it, and the
-// namespace keeps the volume's raw bytes, so only its header and exponent
-// are read here and its place recorded; the payload is read back, and its
-// hash checked, when it is spent. Bytes that arrive ahead of the front are
-// held until the front reaches them, within a bound.
+// A metadata packet is held whole and parsed by par2-rs, which checks its
+// hash; one that fails is not a packet, and the walk resyncs from the byte
+// after its magic. A recovery packet is mostly payload, so it is hashed as it
+// passes and only its exponent kept; the payload stays in the volume's file
+// and is read back when a repair spends it. Bytes that arrive ahead of the
+// front are held until the front reaches them, within a bound.
 
 use std::collections::BTreeMap;
 
 use par2_rs::packet::{HEADER_SIZE, MAGIC, PacketHeader, PacketType};
-use par2_rs::{Packet, parse_packet};
+use par2_rs::{FileHashState, Packet, ScannedPacket, parse_packet};
 use weaver_graph::ByteRange;
 
-// A metadata packet longer than this is not one a sane creator writes: an
-// IFSC for the old engine's largest file grid is a third of this.
-const METADATA_CAP: u64 = 4 * 1024 * 1024;
+// The longest body par2-rs buffers for each metadata type. A longer one, and
+// a packet of a type it does not know, is hashed and dropped.
+const MAIN_BODY_CAP: u64 = 12 + 32_768 * 16;
+const FILE_DESC_BODY_CAP: u64 = 56 + 100_000;
+const IFSC_BODY_CAP: u64 = 16 + 32_768 * 20;
+const CREATOR_BODY_CAP: u64 = 100_000;
 // Bytes ahead of the front a volume may hold. Past it, deliveries are not
 // walked; the payloads are still on disk and a repair reads them back.
 const HOLD_CAP: usize = 8 * 1024 * 1024;
-// A recovery packet's header and its four-byte exponent.
-const RECOVERY_HEAD: usize = HEADER_SIZE + 4;
 
 // What the walker found at one place in the volume.
 #[derive(Debug)]
@@ -39,45 +41,41 @@ pub(super) enum Found {
         exponent: u32,
         range: ByteRange,
     },
+    // A packet that passed its hash and is of no use.
+    Unused,
 }
 
-#[derive(Debug, Default)]
+// A packet hashed as it passes.
+struct Streamed {
+    at: u64,
+    header: PacketHeader,
+    hasher: FileHashState,
+    exponent: u32,
+}
+
+#[derive(Default)]
 pub(super) struct Walker {
-    // Where the next packet header is expected.
+    // Where the next packet header is expected, or the next byte of the
+    // packet being streamed.
     next: u64,
+    streamed: Option<Streamed>,
     // Coalesced islands of bytes at or past `next`, keyed by their offset.
     held: BTreeMap<u64, Vec<u8>>,
     held_bytes: usize,
-    // Ranges whose bytes arrived damaged; a header there is not trusted.
-    damaged: Vec<ByteRange>,
     // Ranges no server has; the front steps over them and resyncs, or every
     // packet past a lost article would stay unfound.
     lost: Vec<ByteRange>,
-    // Some delivery was dropped for the hold bound, so the walk may stop
-    // short of the volume's end.
-    pub(super) overflowed: bool,
 }
 
 impl Walker {
-    pub(super) fn deliver(
-        &mut self,
-        offset: u64,
-        bytes: &[u8],
-        damaged: bool,
-        found: &mut Vec<Found>,
-    ) {
-        let range = ByteRange::at(offset, bytes.len() as u64);
-        if damaged {
-            self.damaged.push(range);
-        }
-        if range.end <= self.next {
+    pub(super) fn deliver(&mut self, offset: u64, bytes: &[u8], found: &mut Vec<Found>) {
+        if offset + bytes.len() as u64 <= self.next {
             return;
         }
         let skip = self.next.saturating_sub(offset) as usize;
         let start = offset.max(self.next);
         let bytes = &bytes[skip..];
         if self.held_bytes + bytes.len() > HOLD_CAP {
-            self.overflowed = true;
             return;
         }
         self.hold(start, bytes);
@@ -89,12 +87,6 @@ impl Walker {
             self.lost.push(range);
             self.walk(found);
         }
-    }
-
-    pub(super) fn is_damaged(&self, range: ByteRange) -> bool {
-        self.damaged
-            .iter()
-            .any(|bad| bad.intersect(range).is_some())
     }
 
     // Merge bytes into the islands; new bytes win where they overlap.
@@ -135,8 +127,8 @@ impl Walker {
     }
 
     // Where the held bytes run out and a lost range begins, the front skips
-    // to the range's end; what lies there is not a trusted header and is
-    // resynced from.
+    // to the range's end; a packet the loss cuts is dropped, and what lies
+    // past it is not a trusted header and is resynced from.
     fn cross_loss(&mut self) -> bool {
         let reach = self.next + self.held.get(&self.next).map_or(0, Vec::len) as u64;
         let Some(lost) = self
@@ -147,6 +139,7 @@ impl Walker {
         else {
             return false;
         };
+        self.streamed = None;
         self.advance(lost.end);
         true
     }
@@ -154,6 +147,9 @@ impl Walker {
     // One packet past the front, or false when the held bytes do not reach
     // the next one.
     fn step(&mut self, found: &mut Vec<Found>) -> bool {
+        if self.streamed.is_some() {
+            return self.stream(found);
+        }
         let Some(front) = self.held.get(&self.next) else {
             return false;
         };
@@ -161,8 +157,7 @@ impl Walker {
             return false;
         }
         let at = self.next;
-        let header_range = ByteRange::at(at, HEADER_SIZE as u64);
-        let header = (&front[..8] == MAGIC && !self.is_damaged(header_range))
+        let header = (&front[..8] == MAGIC)
             .then(|| PacketHeader::parse(front, at).ok())
             .flatten();
         let Some(header) = header else {
@@ -170,45 +165,68 @@ impl Walker {
             self.advance(at + step);
             return true;
         };
-        let range = ByteRange::at(at, header.length);
-        let set = *header.recovery_set_id.as_bytes();
-        if header.packet_type == PacketType::RecoverySlice {
-            if front.len() < RECOVERY_HEAD {
+        if body_cap(header.packet_type).is_none_or(|cap| header.body_length() > cap) {
+            let Some(exponent) = front.get(HEADER_SIZE..HEADER_SIZE + 4) else {
                 return false;
-            }
-            let mut exponent = [0u8; 4];
-            exponent.copy_from_slice(&front[HEADER_SIZE..RECOVERY_HEAD]);
-            found.push(Found::Recovery {
-                set,
-                exponent: u32::from_le_bytes(exponent),
-                range,
+            };
+            let mut hasher = FileHashState::new();
+            hasher.update(&front[32..HEADER_SIZE]);
+            self.streamed = Some(Streamed {
+                at,
+                exponent: u32::from_le_bytes([exponent[0], exponent[1], exponent[2], exponent[3]]),
+                header,
+                hasher,
             });
-            self.advance(range.end);
-            return true;
-        }
-        if header.length > METADATA_CAP {
-            self.advance(range.end);
+            self.advance(at + HEADER_SIZE as u64);
             return true;
         }
         if (front.len() as u64) < header.length {
             return false;
         }
         match parse_packet(&front[..header.length as usize], at) {
-            // The packet hash is checked by the parse, so a packet that
-            // parses is right even where its bytes arrived marked damaged.
             Ok((packet, _)) => {
                 found.push(Found::Metadata {
-                    set,
+                    set: *header.recovery_set_id.as_bytes(),
                     at,
                     hash: header.packet_hash,
                     packet,
                 });
-                self.advance(range.end);
+                self.advance(at + header.length);
             }
-            // A metadata packet that fails its hash is not a packet; the
-            // next magic is.
-            _ => self.advance(at + 1),
+            Err(_) => self.advance(at + 1),
         }
+        true
+    }
+
+    // Hash what is held of the streamed packet; at its end, hand it on if
+    // its hash passes. One that fails was read past and is dropped: its
+    // bytes are gone from the hold, so the walk resumes at its end.
+    fn stream(&mut self, found: &mut Vec<Found>) -> bool {
+        let (Some(open), Some(front)) = (self.streamed.as_mut(), self.held.get(&self.next)) else {
+            return false;
+        };
+        let end = open.at + open.header.length;
+        let take = (end - self.next).min(front.len() as u64) as usize;
+        open.hasher.update(&front[..take]);
+        let to = self.next + take as u64;
+        self.advance(to);
+        if to < end {
+            return true;
+        }
+        let Some(open) = self.streamed.take() else {
+            return true;
+        };
+        if open.hasher.finalize() != open.header.packet_hash {
+            return true;
+        }
+        found.push(match open.header.packet_type {
+            PacketType::RecoverySlice if open.header.body_length() > 4 => Found::Recovery {
+                set: *open.header.recovery_set_id.as_bytes(),
+                exponent: open.exponent,
+                range: ByteRange::new(open.at, end),
+            },
+            _ => Found::Unused,
+        });
         true
     }
 
@@ -231,6 +249,16 @@ impl Walker {
     }
 }
 
+fn body_cap(packet_type: PacketType) -> Option<u64> {
+    match packet_type {
+        PacketType::Main => Some(MAIN_BODY_CAP),
+        PacketType::FileDescription => Some(FILE_DESC_BODY_CAP),
+        PacketType::InputFileSliceChecksum => Some(IFSC_BODY_CAP),
+        PacketType::Creator => Some(CREATOR_BODY_CAP),
+        PacketType::RecoverySlice | PacketType::Unknown(_) => None,
+    }
+}
+
 // How far to step from a front that is not a trusted header: to the next
 // magic in hand, or to where the next magic could still begin.
 fn resync(front: &[u8]) -> u64 {
@@ -239,4 +267,57 @@ fn resync(front: &[u8]) -> u64 {
         .position(|window| window == MAGIC)
         .map(|at| at + 1);
     found.unwrap_or(front.len() + 1 - MAGIC.len()) as u64
+}
+
+// What one job's packets may cost across every volume, by par2-rs's three
+// scan meters. Its budget keeps them in cells, which an object shared across
+// threads cannot hold, so they are counted here the same way.
+const MAX_EXAMINED: u64 = 1_048_576;
+const MAX_RETAINED: usize = 262_144;
+const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct Meter {
+    examined: u64,
+    retained: usize,
+    bytes: usize,
+}
+
+impl Meter {
+    // Charge one packet the walk found; false once a limit is passed.
+    // Variable metadata plus container and allocation overhead; recovery
+    // payloads stay in the volume and cost nothing here.
+    pub(super) fn charge(&mut self, found: &Found) -> bool {
+        self.examined += 1;
+        let variable = match found {
+            Found::Unused => None,
+            Found::Recovery { .. } => Some(0),
+            Found::Metadata { packet, .. } => Some(match packet {
+                Packet::Main(main) => (main.recovery_file_ids.len()
+                    + main.non_recovery_file_ids.len())
+                .saturating_mul(16),
+                Packet::FileDescription(file) => {
+                    file.filename.len().saturating_add(file.par2_name.len())
+                }
+                Packet::InputFileSliceChecksum(ifsc) => ifsc
+                    .checksums
+                    .len()
+                    .saturating_mul(size_of::<par2_rs::SliceChecksum>()),
+                Packet::Creator(creator) => creator.creator_id.len(),
+                Packet::Unknown { body, .. } => body.len(),
+                Packet::RecoverySlice(_) => 0,
+            }),
+        };
+        if let Some(variable) = variable {
+            self.retained += 1;
+            self.bytes = self.bytes.saturating_add(
+                variable
+                    .saturating_mul(2)
+                    .saturating_add(2 * size_of::<ScannedPacket>() + 256),
+            );
+        }
+        self.examined <= MAX_EXAMINED
+            && self.retained <= MAX_RETAINED
+            && self.bytes <= MAX_RETAINED_BYTES
+    }
 }

@@ -73,6 +73,12 @@ pub trait Recovery {
     // its members when it was made has nothing to match.
     fn bind(&mut self, _namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {}
 
+    // The files this object describes and can rebuild that no member of
+    // the namespace carries, by name and length. The owner announces each
+    // once the namespace has every member it will get, so the repair has
+    // a member to write it into; the next `bind` matches it by name.
+    fn absent(&self, _out: &mut Vec<(String, u64)>) {}
+
     // Whether this object describes the member, by id, name or content.
     fn covers(&self, member: MemberId) -> bool;
 

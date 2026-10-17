@@ -52,7 +52,9 @@
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
+mod depth;
 mod divergence;
+mod embedded;
 mod harness;
 mod plain_par2;
 mod sets;

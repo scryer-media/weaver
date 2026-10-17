@@ -26,7 +26,7 @@ pub mod zip_engine;
 #[cfg(test)]
 mod testing;
 
-use weaver_graph::{Builder, Kind, Object, ObjectId};
+use weaver_graph::{Builder, Durable, Facts, Kind, Object, ObjectId, Restore, RestoreError};
 
 // The object for a kind this crate has, or `None` for one it has not.
 pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
@@ -50,6 +50,31 @@ pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
     }
 }
 
+// The object of the kind a blob names, at the state the blob describes.
+pub fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
+    fn back<T: Durable + Object + 'static>(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
+        Ok(Box::new(facts.read::<T>(facts.kind)?))
+    }
+    match facts.kind {
+        Kind::Par2 => par2::facts::restore(facts),
+        Kind::Par3 => par3::facts::restore(facts),
+        Kind::RarStore => rar_store::facts::restore(facts),
+        Kind::RarEngine => back::<rar_engine::RarEngine>(facts),
+        Kind::SevenZipEngine => back::<sevenz_engine::SevenZipEngine>(facts),
+        Kind::SevenZipStore => back::<sevenz_store::SevenZipStore>(facts),
+        Kind::Sfv => back::<sfv::Sfv>(facts),
+        Kind::Tar => back::<tar::Tar>(facts),
+        Kind::Xz => back::<stream::XzStream>(facts),
+        Kind::Gzip => back::<stream::GzipStream>(facts),
+        Kind::Bzip2 => back::<stream::Bzip2Stream>(facts),
+        Kind::Zstd => back::<stream::ZstdStream>(facts),
+        Kind::Brotli => back::<stream::BrotliStream>(facts),
+        Kind::Deflate => back::<stream::DeflateStream>(facts),
+        Kind::Zip => back::<zip::Zip>(facts),
+        Kind::ZipEngine => back::<zip_engine::ZipEngine>(facts),
+    }
+}
+
 // The graph's builder over `build`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Objects;
@@ -57,5 +82,11 @@ pub struct Objects;
 impl Builder for Objects {
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         build(kind, id)
+    }
+}
+
+impl Restore for Objects {
+    fn restore(&self, facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
+        restore(facts)
     }
 }

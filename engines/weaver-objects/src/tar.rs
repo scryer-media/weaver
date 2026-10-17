@@ -22,9 +22,10 @@ mod tests;
 use std::collections::HashSet;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Provenance,
-    Pull, Seek, VolumeIndex, Why,
+    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
+    Provenance, Pull, Seek, VolumeIndex, Why,
 };
 
 use crate::grid::crc32;
@@ -40,6 +41,7 @@ const VOLUME: VolumeIndex = VolumeIndex(0);
 const ENVELOPE_LIMIT: u64 = 1 << 20;
 
 // One entry as the walk read it.
+#[derive(Serialize, Deserialize)]
 struct Record {
     start: u64,
     data: ByteRange,
@@ -69,6 +71,7 @@ impl Record {
 }
 
 // What has been said for one member.
+#[derive(Serialize, Deserialize)]
 struct Out {
     // Where its data lies in the volume; empty for a directory.
     data: ByteRange,
@@ -77,12 +80,15 @@ struct Out {
 }
 
 // The two zero blocks, with the checksum of what they were read as.
+#[derive(Serialize, Deserialize)]
 struct End {
     range: ByteRange,
     crc: u32,
 }
 
-#[derive(Default)]
+// Its facts are the whole of it: the walk so far, the headers it kept and
+// what it said.
+#[derive(Default, Serialize, Deserialize)]
 pub struct Tar {
     kept: Kept,
     records: Vec<Record>,
@@ -97,6 +103,27 @@ pub struct Tar {
     lost: Vec<ByteRange>,
     damage_said: HashSet<(u64, u64, u32)>,
     gone: bool,
+}
+
+impl Durable for Tar {
+    const VERSION: u16 = 1;
+
+    // Entries follow one another from the front, each inside its own span,
+    // up to the cursor, and name only members said.
+    fn impossible(&self) -> Option<&'static str> {
+        let mut at = 0;
+        let walked = self.records.iter().all(|record| {
+            let fits = record.start == at
+                && record.start <= record.data.start
+                && record.data.end <= record.end
+                && record
+                    .member
+                    .is_none_or(|member| (member.0 as usize) < self.members.len());
+            at = record.end;
+            fits
+        });
+        (!walked || at > self.cursor || !self.kept.sound()).then_some("a walk no tar gives")
+    }
 }
 
 impl Tar {
@@ -479,5 +506,8 @@ impl Object for Tar {
 
     fn reads_in_order(&self) -> bool {
         true
+    }
+    fn facts(&self) -> Facts {
+        Facts::of(Kind::Tar, self)
     }
 }

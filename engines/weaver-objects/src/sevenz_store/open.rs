@@ -28,7 +28,7 @@ const PROOF_CAP: u64 = 4 * 1024 * 1024;
 const FOLDER_TAG: &str = "7z-aes";
 const HEADER_TAG: &str = "7z-header";
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct Proof {
     folder: usize,
     entry: usize,
@@ -39,6 +39,11 @@ pub(super) struct Proof {
 }
 
 impl Proof {
+    // Whether it names a file of this map, as a restored proof must.
+    pub(super) fn fits(&self, map: &Map) -> bool {
+        self.folder < map.folders.len() && self.entry < map.entries.len()
+    }
+
     pub(super) fn choose(map: &Map) -> Option<Proof> {
         let (entry, folder) = map
             .entries
@@ -258,15 +263,18 @@ impl SevenZipStore {
             let Some(properties) = folder.aes.filter(|_| self.folders[at].is_locked()) else {
                 continue;
             };
-            let opened = match self.folder_key(index, &properties) {
-                Ok(Some(key)) => Cbc::new(
+            let lock = std::mem::replace(&mut self.folders[at], Lock::Locked);
+            let opened = match (self.folder_key(index, &properties), lock) {
+                // Sealed at a restart: the chain it kept, keyed again.
+                (Ok(Some(key)), Lock::Sealed(chain)) => Cbc::unseal(&key[..], *chain).ok(),
+                (Ok(Some(key)), _) => Cbc::new(
                     &key[..],
                     *properties.iv(),
                     folder.pack.len(),
                     folder.plain_len,
                 )
                 .ok(),
-                Ok(None) | Err(_) => None,
+                (Ok(None) | Err(_), _) => None,
             };
             match opened {
                 Some(cbc) => self.folders[at] = Lock::Open(Box::new(cbc)),

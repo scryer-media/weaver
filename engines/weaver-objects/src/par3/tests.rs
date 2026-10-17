@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ObjectId, Provenance, Recovery};
+use weaver_graph::{ByteRange, Delivery, Object, ObjectId, Provenance, Recovery};
 
 use super::Par3;
 use crate::testing::{Job, par3_set, payload};
@@ -78,4 +78,61 @@ fn par3_short_of_blocks_is_impossible() {
             reachable: 1
         }
     ));
+}
+
+// Where the first recovery block's bytes lie in a volume: a recovery data
+// packet ends in its block, and its length sits 24 bytes into its 48-byte
+// header, whose type is the last eight.
+fn first_block(volume: &[u8]) -> ByteRange {
+    let found = volume
+        .windows(8)
+        .position(|window| window == b"PAR REC\x00")
+        .expect("the volume carries a recovery block");
+    let start = found - 40;
+    let length = u64::from_le_bytes(volume[start + 24..start + 32].try_into().unwrap());
+    let end = start as u64 + length;
+    ByteRange::new(end - BLOCK, end)
+}
+
+#[test]
+fn a_hole_in_a_volume_costs_only_the_blocks_it_cuts() {
+    let one = payload(6, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
+    assert!(files.len() >= 2);
+    let (volume, before) = files.split_last().expect("an index and a volume");
+    let mut job = job(before);
+    let block = first_block(&volume.1);
+    let hole = ByteRange::new(block.start + 100, block.start + 200);
+    let at = job
+        .object
+        .claim(&volume.0, &volume.1[..64])
+        .expect("claimed");
+    job.store.volumes.insert(at, volume.1.clone());
+    let mut out = Vec::new();
+    for range in [
+        ByteRange::new(0, hole.start),
+        ByteRange::new(hole.end, volume.1.len() as u64),
+    ] {
+        job.object.deliver(
+            Delivery {
+                volume: at,
+                offset: range.start,
+                bytes: &volume.1[range.start as usize..range.end as usize],
+                provenance: Provenance::Fresh,
+            },
+            &mut out,
+        );
+    }
+    job.object.volume_lost(at, hole, &mut out);
+    job.object.volume_closed(at, &mut out);
+    let mut wrong = one.clone();
+    wrong[5000] ^= 0x42;
+    let first = job.member("one.bin", &wrong);
+    bind(&mut job);
+    assert_eq!(job.object.blocks_reachable(), 2);
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&first] == one);
 }

@@ -1,22 +1,64 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Output names. The namespace allocates every name a member is written
-// under; no object writes a path it chose itself. Two members that want one
-// name both get written: the first keeps it, the second gets a suffix, the
-// same way the download folder suffixes a job whose folder already exists.
+// Output names. Every namespace of a job writes into the one working
+// directory, so the tree holds one ledger for all of them and allocates
+// every name a member is written under; no object writes a path it chose
+// itself. Two members that want one name both get written: the one higher
+// in the tree keeps it and the other gets a suffix, the same way the
+// download folder suffixes a job whose folder already exists. Which one is
+// higher is a matter of position alone, never of arrival, so a restart or
+// a different fetch order gives the same names.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::member::MemberId;
+use crate::tree::NodeId;
+
+// A member of a namespace of the tree: who holds a name.
+pub type Holder = (NodeId, MemberId);
+
+// Where a member sits: the member ids from the root down to it. A shallower
+// member ranks first; at equal depth the lower path does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Position(pub Vec<MemberId>);
+
+impl Ord for Position {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.0.len(), &self.0).cmp(&(other.0.len(), &other.0))
+    }
+}
+
+impl PartialOrd for Position {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// A holder's name changed from `old` to `new`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Moved {
+    pub holder: Holder,
+    pub old: String,
+    pub new: String,
+}
+
+#[derive(Debug)]
+struct Entry {
+    // The holder's position, and the holder itself to order two members
+    // that sit at one position, a window and the owner beside it.
+    rank: (Position, Holder),
+    wanted: String,
+    name: String,
+}
 
 #[derive(Debug, Default)]
 pub struct NameLedger {
     // Allocated name, lower-cased for case-insensitive file systems, to the
     // member holding it.
-    taken: HashMap<String, MemberId>,
-    // Member to the name it was given.
-    given: HashMap<MemberId, String>,
+    taken: HashMap<String, Holder>,
+    entries: HashMap<Holder, Entry>,
 }
 
 impl NameLedger {
@@ -24,47 +66,137 @@ impl NameLedger {
         Self::default()
     }
 
-    // The name `member` may write under for `wanted`. Idempotent: asking
-    // again for the same member returns the same name. A member that asks
-    // for a different name moves to it and releases the old one.
-    pub fn allocate(&mut self, member: MemberId, wanted: &str) -> String {
-        let wanted = &confined(wanted);
-        if let Some(held) = self.given.get(&member)
-            && held.eq_ignore_ascii_case(wanted)
-        {
-            return held.clone();
+    // The name `holder` may write under for `wanted`. A name held by a
+    // member that ranks below it is taken over, and that member moves to
+    // its next free name. Every holder whose name changed, `holder` among
+    // them when it had one before, is pushed to `moved` in an order that
+    // is safe to apply on disk: a member moves out of a name before the
+    // member taking it moves in. Idempotent: asking again for the same
+    // name returns the one held.
+    pub fn allocate(
+        &mut self,
+        holder: Holder,
+        position: Position,
+        wanted: &str,
+        moved: &mut Vec<Moved>,
+    ) -> String {
+        let wanted = confined(wanted);
+        let old = match self.entries.get(&holder) {
+            Some(entry) if entry.wanted.eq_ignore_ascii_case(&wanted) => {
+                return entry.name.clone();
+            }
+            Some(entry) => Some(entry.name.clone()),
+            None => None,
+        };
+        let rank = (position, holder);
+        // The old name stays the holder's until it has a new one, so no
+        // member it moves can move into a file it has not yet left.
+        let name = self.place(holder, &rank, &wanted, moved);
+        if let Some(old) = old.filter(|old| *old != name) {
+            self.taken.remove(&old.to_ascii_lowercase());
+            moved.push(Moved {
+                holder,
+                old,
+                new: name.clone(),
+            });
         }
-        self.release(member);
-        let name = self.first_free(wanted, member);
-        self.taken.insert(name.to_ascii_lowercase(), member);
-        self.given.insert(member, name.clone());
+        self.entries.insert(
+            holder,
+            Entry {
+                rank,
+                wanted,
+                name: name.clone(),
+            },
+        );
         name
     }
 
-    pub fn release(&mut self, member: MemberId) {
-        if let Some(name) = self.given.remove(&member) {
-            self.taken.remove(&name.to_ascii_lowercase());
-        }
-    }
-
-    pub fn given(&self, member: MemberId) -> Option<&str> {
-        self.given.get(&member).map(String::as_str)
-    }
-
-    fn first_free(&self, wanted: &str, member: MemberId) -> String {
-        let free = |candidate: &str| {
-            self.taken
-                .get(&candidate.to_ascii_lowercase())
-                .is_none_or(|holder| *holder == member)
+    // A holder comes back with the name it had, as when a job is rebuilt.
+    // Restored in rank order, a set of names that were distinct are all
+    // given back as they were; a name that is not free is allocated, and
+    // whatever moves is not reported, since nothing was written under it.
+    pub fn restore(&mut self, holder: Holder, position: Position, wanted: &str, held: &str) {
+        let held = confined(held);
+        let rank = (position, holder);
+        let name = if self.taken.contains_key(&held.to_ascii_lowercase()) {
+            self.place(holder, &rank, &confined(wanted), &mut Vec::new())
+        } else {
+            self.taken.insert(held.to_ascii_lowercase(), holder);
+            held
         };
-        if free(wanted) {
-            return wanted.to_owned();
+        self.entries.insert(
+            holder,
+            Entry {
+                rank,
+                wanted: confined(wanted),
+                name,
+            },
+        );
+    }
+
+    pub fn release(&mut self, holder: Holder) {
+        if let Some(entry) = self.entries.remove(&holder) {
+            self.taken.remove(&entry.name.to_ascii_lowercase());
         }
+    }
+
+    pub fn given(&self, holder: Holder) -> Option<&str> {
+        self.entries.get(&holder).map(|entry| entry.name.as_str())
+    }
+
+    pub fn clear(&mut self) {
+        self.taken.clear();
+        self.entries.clear();
+    }
+
+    // The first of `wanted` and its suffixed forms that `holder` may take:
+    // one that is free, its own, or held by a member it outranks, which is
+    // moved on to a name of its own.
+    fn place(
+        &mut self,
+        holder: Holder,
+        rank: &(Position, Holder),
+        wanted: &str,
+        moved: &mut Vec<Moved>,
+    ) -> String {
         let (stem, extension) = split_extension(wanted);
-        (1u32..)
-            .map(|n| format!("{stem} ({n}){extension}"))
-            .find(|candidate| free(candidate))
-            .expect("an unbounded counter finds a free name")
+        for n in 0u32.. {
+            let candidate = match n {
+                0 => wanted.to_owned(),
+                n => format!("{stem} ({n}){extension}"),
+            };
+            let key = candidate.to_ascii_lowercase();
+            let outranked = match self.taken.get(&key) {
+                None => None,
+                Some(other) if *other == holder => None,
+                Some(other) => match self.entries.get(other) {
+                    Some(entry) if *rank < entry.rank => Some(*other),
+                    _ => continue,
+                },
+            };
+            self.taken.insert(key, holder);
+            if let Some(other) = outranked {
+                self.displace(other, moved);
+            }
+            return candidate;
+        }
+        unreachable!("an unbounded counter finds a free name")
+    }
+
+    // `other` lost its name to a member that outranks it and takes the next
+    // name it may. Its own move is reported after whatever it displaced in
+    // turn, so the moves apply in order.
+    fn displace(&mut self, other: Holder, moved: &mut Vec<Moved>) {
+        let Some(entry) = self.entries.remove(&other) else {
+            return;
+        };
+        let name = self.place(other, &entry.rank, &entry.wanted, moved);
+        moved.push(Moved {
+            holder: other,
+            old: entry.name,
+            new: name.clone(),
+        });
+        self.entries.insert(other, Entry { name, ..entry });
     }
 }
 
@@ -100,50 +232,196 @@ fn split_extension(name: &str) -> (&str, &str) {
 mod tests {
     use super::*;
 
+    const ROOT: NodeId = NodeId::ROOT;
+    const STORE: NodeId = NodeId(1);
+
+    fn at(path: &[u32]) -> Position {
+        Position(path.iter().copied().map(MemberId).collect())
+    }
+
+    fn root(ledger: &mut NameLedger, member: u32, wanted: &str) -> String {
+        let mut moved = Vec::new();
+        let name = ledger.allocate((ROOT, MemberId(member)), at(&[member]), wanted, &mut moved);
+        assert_eq!(moved, Vec::new());
+        name
+    }
+
     #[test]
     fn the_second_member_that_wants_a_name_gets_a_suffix() {
         let mut ledger = NameLedger::new();
-        assert_eq!(ledger.allocate(MemberId(1), "subs.srt"), "subs.srt");
-        assert_eq!(ledger.allocate(MemberId(2), "subs.srt"), "subs (1).srt");
-        assert_eq!(ledger.allocate(MemberId(3), "SUBS.SRT"), "SUBS (2).SRT");
-        assert_eq!(ledger.allocate(MemberId(1), "subs.srt"), "subs.srt");
+        assert_eq!(root(&mut ledger, 1, "subs.srt"), "subs.srt");
+        assert_eq!(root(&mut ledger, 2, "subs.srt"), "subs (1).srt");
+        assert_eq!(root(&mut ledger, 3, "SUBS.SRT"), "SUBS (2).SRT");
+        assert_eq!(root(&mut ledger, 1, "subs.srt"), "subs.srt");
     }
 
     #[test]
     fn a_released_name_is_free_again() {
         let mut ledger = NameLedger::new();
-        ledger.allocate(MemberId(1), "a.bin");
-        ledger.release(MemberId(1));
-        assert_eq!(ledger.allocate(MemberId(2), "a.bin"), "a.bin");
+        root(&mut ledger, 1, "a.bin");
+        ledger.release((ROOT, MemberId(1)));
+        assert_eq!(root(&mut ledger, 2, "a.bin"), "a.bin");
     }
 
     #[test]
-    fn a_rename_moves_the_allocation() {
+    fn a_rename_moves_the_allocation_and_is_reported() {
         let mut ledger = NameLedger::new();
-        ledger.allocate(MemberId(1), "3f9a.bin");
+        root(&mut ledger, 1, "3f9a.bin");
+        let mut moved = Vec::new();
+        let holder = (ROOT, MemberId(1));
+        let name = ledger.allocate(holder, at(&[1]), "show.part01.rar", &mut moved);
+        assert_eq!(name, "show.part01.rar");
         assert_eq!(
-            ledger.allocate(MemberId(1), "show.part01.rar"),
-            "show.part01.rar"
+            moved,
+            vec![Moved {
+                holder,
+                old: "3f9a.bin".into(),
+                new: "show.part01.rar".into(),
+            }]
         );
-        assert_eq!(ledger.allocate(MemberId(2), "3f9a.bin"), "3f9a.bin");
+        assert_eq!(root(&mut ledger, 2, "3f9a.bin"), "3f9a.bin");
     }
 
     #[test]
     fn a_name_cannot_climb_out_or_start_at_the_root() {
         let mut ledger = NameLedger::new();
-        assert_eq!(ledger.allocate(MemberId(1), "../../etc/a.bin"), "etc/a.bin");
-        assert_eq!(ledger.allocate(MemberId(2), "/abs\\b.bin"), "abs/b.bin");
-        assert_eq!(ledger.allocate(MemberId(3), "deep/./dir\\"), "deep/dir/");
-        assert_eq!(ledger.allocate(MemberId(4), ".."), "_");
-        assert_eq!(ledger.allocate(MemberId(5), "plain.bin"), "plain.bin");
+        assert_eq!(root(&mut ledger, 1, "../../etc/a.bin"), "etc/a.bin");
+        assert_eq!(root(&mut ledger, 2, "/abs\\b.bin"), "abs/b.bin");
+        assert_eq!(root(&mut ledger, 3, "deep/./dir\\"), "deep/dir/");
+        assert_eq!(root(&mut ledger, 4, ".."), "_");
+        assert_eq!(root(&mut ledger, 5, "plain.bin"), "plain.bin");
     }
 
     #[test]
     fn names_without_an_extension_suffix_at_the_end() {
         let mut ledger = NameLedger::new();
-        ledger.allocate(MemberId(1), ".hidden");
-        ledger.allocate(MemberId(2), "noext");
-        assert_eq!(ledger.allocate(MemberId(3), ".hidden"), ".hidden (1)");
-        assert_eq!(ledger.allocate(MemberId(4), "noext"), "noext (1)");
+        root(&mut ledger, 1, ".hidden");
+        root(&mut ledger, 2, "noext");
+        assert_eq!(root(&mut ledger, 3, ".hidden"), ".hidden (1)");
+        assert_eq!(root(&mut ledger, 4, "noext"), "noext (1)");
+    }
+
+    // The members of the rulings below: a root member, a member two levels
+    // down, and one at the same depth with a lower path.
+    fn shallow() -> (Holder, Position) {
+        ((ROOT, MemberId(5)), at(&[5]))
+    }
+
+    fn deep() -> (Holder, Position) {
+        ((NodeId(2), MemberId(0)), at(&[0, 0, 0]))
+    }
+
+    fn deep_lower() -> (Holder, Position) {
+        ((NodeId(3), MemberId(4)), at(&[0, 0, 1]))
+    }
+
+    // Allocate every member in order and return each one's final name.
+    fn settle(order: &[(Holder, Position, &str)]) -> (Vec<String>, Vec<Moved>) {
+        let mut ledger = NameLedger::new();
+        let mut moved = Vec::new();
+        for (holder, position, wanted) in order {
+            ledger.allocate(*holder, position.clone(), wanted, &mut moved);
+        }
+        let mut names: Vec<(Holder, String)> = order
+            .iter()
+            .map(|(holder, _, _)| (*holder, ledger.given(*holder).unwrap().to_owned()))
+            .collect();
+        names.sort();
+        (names.into_iter().map(|(_, name)| name).collect(), moved)
+    }
+
+    #[test]
+    fn the_shallower_member_keeps_the_name_whichever_arrives_first() {
+        let ((top, top_at), (low, low_at)) = (shallow(), deep());
+        let first = settle(&[
+            (top, top_at.clone(), "subs.srt"),
+            (low, low_at.clone(), "subs.srt"),
+        ]);
+        let second = settle(&[(low, low_at, "subs.srt"), (top, top_at, "subs.srt")]);
+        assert_eq!(first.0, vec!["subs.srt", "subs (1).srt"]);
+        assert_eq!(second.0, first.0);
+        assert_eq!(first.1, Vec::new());
+        assert_eq!(
+            second.1,
+            vec![Moved {
+                holder: low,
+                old: "subs.srt".into(),
+                new: "subs (1).srt".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn at_equal_depth_the_lower_path_keeps_the_name() {
+        let ((a, a_at), (b, b_at)) = (deep(), deep_lower());
+        let forward = settle(&[(a, a_at.clone(), "x.bin"), (b, b_at.clone(), "x.bin")]);
+        let backward = settle(&[(b, b_at, "x.bin"), (a, a_at, "x.bin")]);
+        // Holders sort with the lower node first: `a`, then `b`.
+        assert_eq!(forward.0, vec!["x.bin", "x (1).bin"]);
+        assert_eq!(backward.0, forward.0);
+    }
+
+    #[test]
+    fn a_displaced_holder_moves_on_and_displaces_in_turn() {
+        // `deep_lower` holds the first suffix; the deep member, outranked
+        // by the root one, takes it over, and every move comes out in an
+        // order that never moves a file onto one still in place.
+        let ((top, top_at), (mid, mid_at), (low, low_at)) = (shallow(), deep(), deep_lower());
+        let (names, moved) = settle(&[
+            (low, low_at, "subs.srt"),
+            (mid, mid_at, "subs.srt"),
+            (top, top_at, "subs.srt"),
+        ]);
+        assert_eq!(names, vec!["subs.srt", "subs (1).srt", "subs (2).srt"]);
+        let moves: Vec<(Holder, &str, &str)> = moved
+            .iter()
+            .map(|m| (m.holder, m.old.as_str(), m.new.as_str()))
+            .collect();
+        assert_eq!(
+            moves,
+            vec![
+                (low, "subs.srt", "subs (1).srt"),
+                (low, "subs (1).srt", "subs (2).srt"),
+                (mid, "subs.srt", "subs (1).srt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_folding_applies_across_namespaces() {
+        let ((top, top_at), (low, low_at)) = (shallow(), deep());
+        let (names, _) = settle(&[(low, low_at, "Subs.SRT"), (top, top_at, "subs.srt")]);
+        assert_eq!(names, vec!["subs.srt", "Subs (1).SRT"]);
+    }
+
+    #[test]
+    fn restored_in_any_order_the_names_come_back_as_they_were() {
+        let ((top, top_at), (low, low_at)) = (shallow(), deep());
+        let restored = |order: &[(Holder, &Position, &str)]| {
+            let mut ledger = NameLedger::new();
+            for (holder, position, held) in order {
+                ledger.restore(*holder, (*position).clone(), "subs.srt", held);
+            }
+            (
+                ledger.given(top).unwrap().to_owned(),
+                ledger.given(low).unwrap().to_owned(),
+            )
+        };
+        let forward = restored(&[(top, &top_at, "subs.srt"), (low, &low_at, "subs (1).srt")]);
+        let backward = restored(&[(low, &low_at, "subs (1).srt"), (top, &top_at, "subs.srt")]);
+        assert_eq!(forward, ("subs.srt".into(), "subs (1).srt".into()));
+        assert_eq!(backward, forward);
+        // A restored holder still wants its first name: moved again, it
+        // starts from there.
+        let mut ledger = NameLedger::new();
+        ledger.restore(low, low_at.clone(), "subs.srt", "subs (1).srt");
+        let mut moved = Vec::new();
+        ledger.allocate(
+            (STORE, MemberId(9)),
+            at(&[0, 9]),
+            "subs (1).srt",
+            &mut moved,
+        );
+        assert_eq!(ledger.given(low), Some("subs.srt"));
     }
 }

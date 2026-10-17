@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use unrar_rs::{RarArchive, RarError, ReadSeek, VolumeProvider, VolumeProviderError};
-use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why};
+use weaver_graph::{
+    ByteRange, Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why,
+};
 
 pub(super) struct Run {
     password: Option<String>,
@@ -36,6 +38,7 @@ impl Extraction for Run {
             sink,
             next: 0,
             open: None,
+            reading: 0,
         };
         let Err(Stop::Say(last)) = walk.archive(self.password.as_deref()) else {
             return;
@@ -46,7 +49,11 @@ impl Extraction for Run {
         {
             return;
         }
-        (walk.sink)(last);
+        for emit in last {
+            if !(walk.sink)(emit) {
+                return;
+            }
+        }
     }
 }
 
@@ -54,12 +61,15 @@ impl Extraction for Run {
 // read and so already knows why, or saying why.
 enum Stop {
     Silent,
-    Say(Emit),
+    Say(Vec<Emit>),
 }
 
 struct Open {
     member: MemberId,
     encrypted: bool,
+    // The volumes the member's data spans.
+    first: usize,
+    last: usize,
 }
 
 struct Walk<'s, 'a> {
@@ -69,6 +79,8 @@ struct Walk<'s, 'a> {
     // archive order, so every run of the same set numbers them alike.
     next: u32,
     open: Option<Open>,
+    // The volume whose headers are being read.
+    reading: usize,
 }
 
 impl Walk<'_, '_> {
@@ -83,6 +95,7 @@ impl Walk<'_, '_> {
         let mut index = 0;
         let mut volume = 0;
         while volume < self.input.volumes.count() {
+            self.reading = volume;
             let mut headers = NonZeroUsize::MIN;
             loop {
                 let found = archive
@@ -97,7 +110,7 @@ impl Walk<'_, '_> {
                 }
                 headers = headers
                     .checked_add(1)
-                    .ok_or(Stop::Say(Emit::Refuse(Why::Unsupported)))?;
+                    .ok_or(Stop::Say(vec![Emit::Refuse(Why::Unsupported)]))?;
             }
             volume += 1;
         }
@@ -123,7 +136,7 @@ impl Walk<'_, '_> {
             return Ok(());
         }
         if info.is_encrypted && !has_password {
-            return Err(Stop::Say(Emit::NeedsPassword));
+            return Err(Stop::Say(vec![Emit::NeedsPassword]));
         }
         let member = MemberId(self.next);
         self.next += 1;
@@ -135,6 +148,8 @@ impl Walk<'_, '_> {
         self.open = Some(Open {
             member,
             encrypted: info.is_encrypted,
+            first: info.volumes.first_volume,
+            last: info.volumes.last_volume,
         });
         let mut out = Out {
             sink: &mut *self.sink,
@@ -168,27 +183,68 @@ impl Walk<'_, '_> {
             return Stop::Silent;
         }
         let encrypted = self.open.as_ref().is_some_and(|open| open.encrypted);
-        Stop::Say(verdict(&error, encrypted))
+        let (first, last) = self
+            .open
+            .as_ref()
+            .map_or((self.reading, self.reading), |open| (open.first, open.last));
+        Stop::Say(verdict(
+            &error,
+            encrypted,
+            first..=last,
+            &*self.input.volumes,
+        ))
     }
 }
 
-// What a RAR error means for the job. A wrong key decrypts to bytes whose
+// What a RAR error means for the job, by its class. Damage is said on the
+// volumes the failing member spans, or the one whose headers failed, so a
+// repair can bring their bytes back. A wrong key decrypts to bytes whose
 // checksum fails, so on an encrypted member a checksum failure asks for
 // another password before it is called damage.
-fn verdict(error: &RarError, encrypted: bool) -> Emit {
-    match error {
-        RarError::EncryptedArchive
-        | RarError::EncryptedMember { .. }
-        | RarError::InvalidPassword
-        | RarError::WrongPassword { .. } => Emit::NeedsPassword,
-        RarError::DataCrcMismatch { .. } | RarError::Blake2Mismatch { .. } if encrypted => {
-            Emit::NeedsPassword
+fn verdict(
+    error: &RarError,
+    encrypted: bool,
+    spans: std::ops::RangeInclusive<usize>,
+    volumes: &dyn Volumes,
+) -> Vec<Emit> {
+    match rar_error_class(error) {
+        Class::PasswordRequired => vec![Emit::NeedsPassword],
+        Class::Recoverable
+            if encrypted
+                && matches!(
+                    error,
+                    RarError::DataCrcMismatch { .. } | RarError::PackedDataCrcMismatch { .. }
+                ) =>
+        {
+            vec![Emit::NeedsPassword]
         }
+        Class::Recoverable => {
+            let damaged: Vec<Emit> = spans
+                .filter_map(|volume| {
+                    let volume = VolumeIndex(u32::try_from(volume).ok()?);
+                    let length = volumes.len(volume)?;
+                    Some(Emit::Damaged {
+                        volume,
+                        range: ByteRange::new(0, length),
+                    })
+                })
+                .collect();
+            match damaged.is_empty() {
+                true => vec![Emit::Refuse(Why::Unrepairable)],
+                false => damaged,
+            }
+        }
+        Class::Terminal => vec![terminal(error, encrypted)],
+    }
+}
+
+fn terminal(error: &RarError, encrypted: bool) -> Emit {
+    match error {
+        RarError::Blake2Mismatch { .. } if encrypted => Emit::NeedsPassword,
         RarError::UnsafeLinkTarget { .. } | RarError::UnsupportedLinkType { .. } => {
             Emit::Refuse(Why::NotAFile)
         }
-        RarError::InvalidSignature
-        | RarError::UnsupportedFormat { .. }
+        RarError::UnsupportedFormat { .. }
         | RarError::UnsupportedCompression { .. }
         | RarError::UnsupportedEncryption { .. }
         | RarError::UnsupportedEncryptionKdf { .. }
@@ -199,6 +255,76 @@ fn verdict(error: &RarError, encrypted: bool) -> Emit {
         | RarError::SolidOrderViolation { .. } => Emit::Refuse(Why::Unsupported),
         _ => Emit::Refuse(Why::Unrepairable),
     }
+}
+
+enum Class {
+    Recoverable,
+    PasswordRequired,
+    Terminal,
+}
+
+fn rar_io_error_class(error: &io::Error) -> Class {
+    if let Some(inner) = error.get_ref()
+        && let Some(error) = inner.downcast_ref::<RarError>()
+    {
+        return rar_error_class(error);
+    }
+    unrar_0_11_erased_class(&error.to_string())
+        .or_else(|| untyped_io_class(error))
+        .unwrap_or(Class::Terminal)
+}
+
+fn rar_error_class(error: &RarError) -> Class {
+    match error {
+        RarError::Io(error) => rar_io_error_class(error),
+        RarError::InvalidSignature
+        | RarError::TruncatedHeader { .. }
+        | RarError::HeaderCrcMismatch { .. }
+        | RarError::DataCrcMismatch { .. }
+        | RarError::PackedDataCrcMismatch { .. } => Class::Recoverable,
+        RarError::CorruptArchive { detail }
+            if unrar_0_11_block_header_checksum_mismatch(detail) =>
+        {
+            Class::Recoverable
+        }
+        error if rar_error_is_password_related(error) => Class::PasswordRequired,
+        _ => Class::Terminal,
+    }
+}
+
+fn rar_error_is_password_related(error: &RarError) -> bool {
+    matches!(
+        error,
+        RarError::EncryptedArchive
+            | RarError::EncryptedMember { .. }
+            | RarError::InvalidPassword
+            | RarError::WrongPassword { .. }
+    )
+}
+
+// unrar-rs 0.11 renders a header or signature error on a continuation
+// volume into text; the renderings of the damage errors are read back.
+fn unrar_0_11_erased_class(text: &str) -> Option<Class> {
+    let lower = text.to_ascii_lowercase();
+    let damaged = lower.contains("checksum")
+        || lower.contains("crc mismatch")
+        || lower.contains("truncated header at offset")
+        || lower.contains("not a rar archive (bad signature)");
+    damaged.then_some(Class::Recoverable)
+}
+
+fn untyped_io_class(error: &io::Error) -> Option<Class> {
+    let text = error.to_string();
+    std_read_exact_eof(&text).then_some(Class::Recoverable)
+}
+
+// std: `Read::read_exact` past the end of its reader.
+fn std_read_exact_eof(text: &str) -> bool {
+    text.contains("failed to fill whole buffer")
+}
+
+fn unrar_0_11_block_header_checksum_mismatch(detail: &str) -> bool {
+    detail.starts_with("RAR5 block header checksum mismatch")
 }
 
 // The owner's volumes as unrar-rs reads them: one reader per open, each with

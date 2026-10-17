@@ -66,7 +66,7 @@ pub(super) fn repair_set(
         };
         let member = bound.get(file.path()).copied();
         let verdict = match member {
-            Some(member) => read_member(member, access)
+            Some(member) => read_member(member, file.size(), access)
                 .map_or(FileVerdict::Missing, |bytes| verify_file(set, file, &bytes)),
             None => FileVerdict::Missing,
         };
@@ -119,11 +119,13 @@ pub(super) fn repair_set(
     }
 }
 
-fn read_member(member: MemberId, access: &mut dyn MemberAccess) -> Option<Vec<u8>> {
-    let length = access.length(member)?;
+// The member as far as the set describes it. A set's blocks are judged over
+// the described range alone, so bytes a member carries past it are not read.
+fn read_member(member: MemberId, described: u64, access: &mut dyn MemberAccess) -> Option<Vec<u8>> {
+    let end = access.length(member)?.min(described);
     let mut bytes = Vec::new();
     access
-        .read(member, ByteRange::new(0, length), &mut bytes)
+        .read(member, ByteRange::new(0, end), &mut bytes)
         .then_some(bytes)
 }
 

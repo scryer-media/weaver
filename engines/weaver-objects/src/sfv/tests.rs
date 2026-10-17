@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod facts;
+
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{ObjectId, Provenance, Recovery, SliceVerdict};
 

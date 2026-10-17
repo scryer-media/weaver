@@ -7,12 +7,10 @@ mod writer;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use weaver_graph::{ByteRange, Emit, Object, Provenance, RecoveryKind, VolumeIndex, Weight, Why};
 
 use super::RarStore;
-use crate::keys::Keys;
 use crate::testing::payload;
 use owner::Owner;
 use writer::{Item, Options, Version, write};
@@ -35,7 +33,7 @@ fn items() -> Vec<Item> {
 }
 
 fn store() -> RarStore {
-    RarStore::with_keys(Arc::new(Keys::new(16)))
+    RarStore::new()
 }
 
 fn no_trouble(owner: &Owner) {
@@ -332,44 +330,54 @@ fn a_wrong_password_then_the_right_one() {
 
 #[test]
 fn encrypted_headers_open_with_the_password() {
-    for version in [Version::Rar5, Version::Rar4] {
-        let volumes = write(&items(), &split_encrypted(version, true));
-        let mut owner = Owner::new(
-            store(),
-            volumes
-                .into_iter()
-                .enumerate()
-                .map(|(index, bytes)| (format!("alpha.part{}.rar", index + 1), bytes))
-                .collect(),
-        );
-        owner.frames(0, 4096);
-        assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
-        assert!(owner.members.is_empty());
-        owner.offer("not-the-passphrase");
-        assert!(owner.members.is_empty());
-        owner.offer(PASSWORD);
-        owner.whole(4096);
-        owner.said.retain(|emit| *emit != Emit::NeedsPassword);
-        no_trouble(&owner);
-        streamed(&owner);
-        posted_whole(&owner);
-    }
+    let version = Version::Rar5;
+    let volumes = write(&items(), &split_encrypted(version, true));
+    let mut owner = Owner::new(
+        store(),
+        volumes
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| (format!("alpha.part{}.rar", index + 1), bytes))
+            .collect(),
+    );
+    owner.frames(0, 4096);
+    assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
+    assert!(owner.members.is_empty());
+    owner.offer("not-the-passphrase");
+    assert!(owner.members.is_empty());
+    owner.offer(PASSWORD);
+    owner.whole(4096);
+    owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+    no_trouble(&owner);
+    streamed(&owner);
+    posted_whole(&owner);
 }
 
 #[test]
 fn encrypted_headers_without_the_password_are_refused_at_the_last_close() {
-    for version in [Version::Rar5, Version::Rar4] {
-        let volumes = write(&items(), &encrypted(version, true));
-        let mut owner = Owner::named(store(), volumes);
-        owner.frames(0, 4096);
-        owner.offer("not-the-passphrase");
-        owner.close(0);
-        assert!(
-            owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
-            "{version:?} {:?}",
-            owner.said
-        );
-    }
+    let version = Version::Rar5;
+    let volumes = write(&items(), &encrypted(version, true));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 4096);
+    owner.offer("not-the-passphrase");
+    owner.close(0);
+    assert!(
+        owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
+        "{version:?} {:?}",
+        owner.said
+    );
+}
+
+// RAR4 headers carry no password check, so nothing can prove a candidate
+// before a header is deciphered with it.
+#[test]
+fn rar4_encrypted_headers_go_to_an_engine() {
+    let volumes = write(&items(), &split_encrypted(Version::Rar4, true));
+    let mut owner = Owner::named(store(), volumes);
+    owner.offer(PASSWORD);
+    owner.frames(0, 4096);
+    assert!(owner.members.is_empty());
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::EncryptedHeader)]);
 }
 
 #[test]
@@ -431,6 +439,8 @@ fn a_repair_behind_an_announced_member_retracts_and_rewalks() {
             Provenance::Damaged,
             Some(&wrong),
         );
+        // Damaged bytes stay out of the walk until their volume closes.
+        owner.close(0);
         owner.member("alphz.bin");
         let at = find(&real, b"alpha.bin") as u64;
         let header = ByteRange::new(at.saturating_sub(40), at + 9);

@@ -12,13 +12,18 @@
 
 mod joined;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
 use bytes::Bytes;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, MemberId, Object, Placement, Pull,
-    Seek, VolumeIndex, Weight,
+    ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, MemberId, Object,
+    Placement, Pull, Seek, VolumeIndex, Weight,
 };
 
 pub(crate) use joined::Joined;
@@ -33,7 +38,8 @@ pub trait Format: Send + Sync {
 }
 
 // A volume's name as its set numbers it.
-pub trait SetName: Send + Sync + Sized {
+// Serde, because the names bound are an engine's facts.
+pub trait SetName: Send + Sync + Sized + Serialize + DeserializeOwned {
     // The volume this name is, counted from zero.
     fn index(&self) -> u32;
     fn same_set(&self, other: &Self) -> bool;
@@ -47,16 +53,33 @@ pub trait SetName: Send + Sync + Sized {
     }
 }
 
+// Its facts are the volumes it has and how far its run read. Never the
+// password, which the owner offers again, and never its bids, which a
+// restart makes again: a restored engine is one whose run has not started.
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct EngineObject<F: Format> {
+    #[serde(skip)]
     format: PhantomData<F>,
     // The names of the volumes bound that name a volume of a set, which
     // every other volume's must share.
     names: BTreeMap<u32, F::Name>,
     bound: BTreeSet<u32>,
+    #[serde(skip)]
     password: Option<String>,
     // The furthest volume the run has read, and the volumes already bid for.
     reached: Option<VolumeIndex>,
+    #[serde(skip)]
     asked: BTreeSet<u32>,
+}
+
+impl<F: Format> Durable for EngineObject<F> {
+    const VERSION: u16 = 1;
+
+    fn impossible(&self) -> Option<&'static str> {
+        let named = self.names.keys().all(|volume| self.bound.contains(volume));
+        (!named).then_some("a volume named that is not bound")
+    }
 }
 
 impl<F: Format> Default for EngineObject<F> {
@@ -155,6 +178,10 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
     fn engine_mut(&mut self) -> Option<&mut dyn Engine> {
         Some(self)
+    }
+
+    fn facts(&self) -> Facts {
+        Facts::of(F::KIND, self)
     }
 }
 

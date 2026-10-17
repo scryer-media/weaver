@@ -10,7 +10,7 @@ use weaver_graph::{ByteRange, VolumeIndex};
 // More parts than this is not a set anyone made; the old router's bound.
 pub(super) const MAX_PARTS: u64 = 100_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Geometry {
     part: u64,
     total: u64,

@@ -8,7 +8,7 @@
 
 use crate::engine::SetName;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VolumeName {
     stem: String,
     // The volume this name is, counted from zero.

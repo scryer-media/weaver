@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// How a RAR set numbers its volumes in their names. Two schemes exist:
-// `name.part1.rar`, `name.part2.rar`, … counted from one, and the old
-// `name.rar`, `name.r00`, `name.r01`, … where `.r99` runs on to `.s00`.
-// Case never matters; RAR writers on every host have used both.
+// How a RAR set numbers its volumes in their names: `name.part1.rar`,
+// `name.part2.rar`, … counted from one, or the old `name.rar`, `name.r00`,
+// `name.r01`, … with `.sNN` numbered the same way. Case never matters.
 
 use crate::engine::SetName;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Scheme {
     Part,
     Old,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VolumeName {
     stem: String,
     scheme: Scheme,
@@ -34,39 +33,45 @@ impl SetName for VolumeName {
 
 pub(crate) fn parse(name: &str) -> Option<VolumeName> {
     let lower = name.to_ascii_lowercase();
-    if let Some(base) = lower.strip_suffix(".rar") {
-        if let Some((stem, digits)) = base.rsplit_once(".part")
-            && let Some(number) = number(digits)
-        {
-            return Some(VolumeName {
-                stem: stem.to_owned(),
-                scheme: Scheme::Part,
-                index: number.checked_sub(1)?,
-            });
-        }
-        return Some(VolumeName {
-            stem: base.to_owned(),
-            scheme: Scheme::Old,
-            index: 0,
-        });
-    }
-    let (stem, extension) = lower.rsplit_once('.')?;
-    let (letter, digits) = extension.split_at_checked(1)?;
-    let letter = letter.as_bytes()[0];
-    if !(b'r'..=b'z').contains(&letter) || digits.len() != 2 {
+    // The last four bytes are read as an extension, which must not split a
+    // character.
+    if lower.len() >= 4 && !lower.is_char_boundary(lower.len() - 4) {
         return None;
     }
-    let index = u32::from(letter - b'r') * 100 + number(digits)? + 1;
+    let index = parse_rar_volume(&lower)?;
+    let (stem, scheme) = match lower.strip_suffix(".rar") {
+        Some(stem) => match stem.rfind(".part") {
+            Some(part_pos) if stem[part_pos + 5..].parse::<u32>().is_ok() => {
+                (&stem[..part_pos], Scheme::Part)
+            }
+            _ => (stem, Scheme::Old),
+        },
+        None => (&lower[..lower.len() - 4], Scheme::Old),
+    };
     Some(VolumeName {
         stem: stem.to_owned(),
-        scheme: Scheme::Old,
+        scheme,
         index,
     })
 }
 
-fn number(digits: &str) -> Option<u32> {
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+fn parse_rar_volume(lower: &str) -> Option<u32> {
+    if let Some(stem) = lower.strip_suffix(".rar") {
+        if let Some(part_pos) = stem.rfind(".part") {
+            let num_str = &stem[part_pos + 5..];
+            if let Ok(n) = num_str.parse::<u32>() {
+                return Some(n.saturating_sub(1));
+            }
+        }
+        return Some(0);
     }
-    digits.parse().ok()
+    if lower.len() >= 4 {
+        let ext = &lower[lower.len() - 4..];
+        if (ext.starts_with(".r") || ext.starts_with(".s"))
+            && let Ok(n) = ext[2..].parse::<u32>()
+        {
+            return Some(n + 1);
+        }
+    }
+    None
 }

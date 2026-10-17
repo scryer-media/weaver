@@ -11,6 +11,7 @@
 
 mod bind;
 mod evidence;
+pub(crate) mod facts;
 mod repair;
 mod sets;
 mod walker;
@@ -26,15 +27,21 @@ use par2_rs::packet::{HEADER_SIZE, MAGIC};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
     ByteRange, Delivery, Emit, Extent, Kind, MemberId, Namespace, Object, ObjectId, Placement,
-    Provenance, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
+    Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
 };
 
-use self::bind::{Matched, bind_set};
+use self::bind::bind_sets;
 use self::evidence::Evidence;
-use self::repair::{Earlier, repair_set};
+use self::repair::repair_set;
 use self::sets::{Location, SetState, Volume};
-use self::walker::Found;
+use self::walker::{Found, Meter};
 use crate::grid::{Grid, WHOLE};
+
+// One job holds no more recovery sets than an NZB holds files.
+const MAX_PAR2_RECOVERY_SETS: usize = 100_000;
+// What a job may describe, and what one repair may hold in memory.
+const MAX_JOB_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
+const REPAIR_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 
 pub struct Par2 {
     id: ObjectId,
@@ -48,6 +55,11 @@ pub struct Par2 {
     seen_damaged: Option<BTreeMap<[u8; 16], u64>>,
     // What the last repair came to, for the members bound then.
     outcome: Option<RepairOutcome>,
+    meter: Meter,
+    // A job past the packet or set limits keeps none of its sets.
+    refused: bool,
+    output_limit: u64,
+    memory_limit: usize,
 }
 
 impl Par2 {
@@ -60,6 +72,10 @@ impl Par2 {
             lengths: BTreeMap::new(),
             seen_damaged: None,
             outcome: None,
+            meter: Meter::default(),
+            refused: false,
+            output_limit: MAX_JOB_BYTES,
+            memory_limit: REPAIR_MEMORY_LIMIT,
         }
     }
 
@@ -108,29 +124,6 @@ impl Par2 {
             .sum()
     }
 
-    // Usable indexes of every set but `set`, for the bindings they dispute.
-    fn others(&self, set: &[u8; 16]) -> Vec<&Par2FileSet> {
-        self.sets
-            .iter()
-            .filter(|(key, _)| *key != set)
-            .filter_map(|(_, state)| state.usable())
-            .collect()
-    }
-
-    fn present(&self, state: &SetState) -> u64 {
-        state
-            .recovery
-            .values()
-            .filter(|location| self.usable_location(location))
-            .count() as u64
-    }
-
-    fn usable_location(&self, location: &Location) -> bool {
-        self.volumes
-            .get(location.volume.0 as usize)
-            .is_some_and(|volume| !volume.is_spoiled(location.range))
-    }
-
     fn block_sizes(&self) -> BTreeSet<u64> {
         self.sets
             .values()
@@ -140,13 +133,10 @@ impl Par2 {
             .collect()
     }
 
-    // A member two sets describe is the first set's to rule on, so its
-    // damage counts toward that set alone.
     fn damaged_seen(&mut self) -> BTreeMap<[u8; 16], u64> {
         if let Some(seen) = &self.seen_damaged {
             return seen.clone();
         }
-        let mut ruled = BTreeSet::new();
         let mut seen = BTreeMap::new();
         for key in self.ordered() {
             let state = &self.sets[&key];
@@ -154,7 +144,6 @@ impl Par2 {
                 state
                     .members()
                     .iter()
-                    .filter(|(_, member)| !ruled.contains(*member))
                     .map(|(file, member)| {
                         Evidence::of(
                             &self.grid,
@@ -169,7 +158,6 @@ impl Par2 {
                     })
                     .sum()
             });
-            ruled.extend(state.members().values().copied());
             seen.insert(key, count);
         }
         self.seen_damaged = Some(seen.clone());
@@ -178,7 +166,22 @@ impl Par2 {
 
     fn take(&mut self, volume: VolumeIndex, found: Vec<Found>) {
         for item in found {
+            if self.refused {
+                return;
+            }
+            let set = match &item {
+                Found::Metadata { set, .. } | Found::Recovery { set, .. } => Some(*set),
+                Found::Unused => None,
+            };
+            let new_set = set.is_some_and(|set| !self.sets.contains_key(&set));
+            if !self.meter.charge(&item) || (new_set && self.sets.len() >= MAX_PAR2_RECOVERY_SETS) {
+                self.refused = true;
+                self.sets.clear();
+                self.seen_damaged = None;
+                return;
+            }
             match item {
+                Found::Unused => {}
                 Found::Metadata {
                     set,
                     at,
@@ -188,7 +191,7 @@ impl Par2 {
                     self.sets
                         .entry(set)
                         .or_insert_with(|| SetState::new((volume, at)))
-                        .take_metadata(hash, packet);
+                        .take_metadata(hash, packet, self.output_limit);
                     self.volume(volume).sets.insert(set);
                     self.seen_damaged = None;
                 }
@@ -221,12 +224,9 @@ impl Object for Par2 {
         let mut found = Vec::new();
         let volume = self.volume(delivery.volume);
         volume.arrived.write(delivery.range(), delivery.provenance);
-        volume.walker.deliver(
-            delivery.offset,
-            delivery.bytes,
-            delivery.provenance == Provenance::Damaged,
-            &mut found,
-        );
+        volume
+            .walker
+            .deliver(delivery.offset, delivery.bytes, &mut found);
         self.take(delivery.volume, found);
     }
 
@@ -239,6 +239,12 @@ impl Object for Par2 {
         let state = self.volume(volume);
         state.lost.push(range);
         state.walker.lose(range, &mut found);
+        // A recovery packet whose bytes are lost cannot be read back.
+        for state in self.sets.values_mut() {
+            state
+                .recovery
+                .retain(|_, at| at.volume != volume || at.range.intersect(range).is_none());
+        }
         self.take(volume, found);
     }
 
@@ -288,38 +294,22 @@ impl Object for Par2 {
 impl Recovery for Par2 {
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
         let before = self.covered_members();
-        for key in self.ordered() {
-            let Some(index) = self.sets.get(&key).and_then(SetState::usable) else {
-                if let Some(state) = self.sets.get_mut(&key) {
-                    state.bind(BTreeMap::new());
-                }
-                continue;
-            };
-            let bound = bind_set(index, &self.others(&key), namespace, self.id);
-            let names: Vec<(MemberId, String)> = bound
-                .iter()
-                .filter(|(_, (_, matched))| *matched == Matched::Content)
-                .filter_map(|(file, (member, _))| {
-                    let described = index.file_description(file)?.filename.clone();
-                    Some((*member, described))
-                })
-                .collect();
-            for (member, described) in names {
-                let current = namespace.get(member).map(|record| record.name.as_str());
-                if current != Some(described.as_str())
-                    && namespace.rename(member, &described).is_some()
-                {
-                    renamed.push(member);
-                }
+        let (keys, indexes): (Vec<[u8; 16]>, Vec<&Par2FileSet>) = self
+            .ordered()
+            .into_iter()
+            .filter_map(|key| Some((key, self.sets[&key].usable()?)))
+            .unzip();
+        let (bound, names) = bind_sets(&indexes, namespace, self.id);
+        let mut bound: BTreeMap<_, _> = keys.into_iter().zip(bound).collect();
+        for (member, described) in names {
+            let current = namespace.get(member).map(|record| record.name.as_str());
+            if current != Some(described.as_str()) && namespace.rename(member, &described).is_some()
+            {
+                renamed.push(member);
             }
-            if let Some(state) = self.sets.get_mut(&key) {
-                state.bind(
-                    bound
-                        .into_iter()
-                        .map(|(file, (member, _))| (file, member))
-                        .collect(),
-                );
-            }
+        }
+        for (key, state) in &mut self.sets {
+            state.bind(bound.remove(key).unwrap_or_default());
         }
         self.lengths = self
             .sets
@@ -336,6 +326,26 @@ impl Recovery for Par2 {
         self.seen_damaged = None;
         if self.covered_members() != before {
             self.outcome = None;
+        }
+    }
+
+    // Every file a usable set can rebuild that no member is bound to, once
+    // each, in set order.
+    fn absent(&self, out: &mut Vec<(String, u64)>) {
+        for key in self.ordered() {
+            let state = &self.sets[&key];
+            let Some(index) = state.usable() else {
+                continue;
+            };
+            for file in &index.recovery_file_ids {
+                let Some(description) = index.file_description(file) else {
+                    continue;
+                };
+                let named = (description.filename.clone(), description.length);
+                if !state.members().contains_key(file) && !out.contains(&named) {
+                    out.push(named);
+                }
+            }
         }
     }
 
@@ -373,7 +383,7 @@ impl Recovery for Par2 {
         for key in self.ordered() {
             let state = &self.sets[&key];
             let wanted = state.needed().max(seen.get(&key).copied().unwrap_or(0));
-            let mut shortfall = wanted.saturating_sub(self.present(state));
+            let mut shortfall = wanted.saturating_sub(state.recovery.len() as u64);
             for (index, volume) in self.volumes.iter_mut().enumerate() {
                 if shortfall == 0 {
                     break;
@@ -388,7 +398,6 @@ impl Recovery for Par2 {
     }
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
-        let mut earlier = Earlier::default();
         let mut outcome = RepairOutcome::Clean;
         for key in self.ordered() {
             let coming = self.coming(&key);
@@ -398,13 +407,11 @@ impl Recovery for Par2 {
             let result = match state.concluded() {
                 Some(concluded) => concluded,
                 None => {
-                    let result =
-                        repair_set(state, &self.grid, &self.volumes, coming, &earlier, access);
+                    let result = repair_set(state, &self.grid, coming, self.memory_limit, access);
                     state.last = Some(result);
                     result.outcome
                 }
             };
-            earlier.after(state, result);
             outcome = combine(outcome, result);
         }
         self.outcome = Some(outcome);
@@ -417,7 +424,11 @@ impl Recovery for Par2 {
 
     fn blocks_reachable(&self) -> u64 {
         let packet = self.smallest_packet();
-        let present: u64 = self.sets.values().map(|state| self.present(state)).sum();
+        let present: u64 = self
+            .sets
+            .values()
+            .map(|state| state.recovery.len() as u64)
+            .sum();
         let coming: u64 = self
             .volumes
             .iter()

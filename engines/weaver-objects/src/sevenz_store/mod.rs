@@ -25,14 +25,15 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Pull,
-    RecoveryKind, Seek, VolumeIndex, Weight, Why,
+    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
+    Pull, RecoveryKind, Seek, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
-use crate::crypt::Cbc;
+use crate::crypt::{Cbc, Chain};
 use crate::engine::{Format, SetName};
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
@@ -53,21 +54,55 @@ const RECOVERY: [(&[u8; 8], RecoveryKind); 2] = [
     (b"PAR3\0PKT", RecoveryKind::Par3),
 ];
 
-// A folder's cipher, by what the object knows of its key.
+// A folder's cipher, by what the object knows of its key. A sealed one was
+// open before a restart: it keeps its chain and waits, as a locked one does,
+// for the password that keys it again.
 enum Lock {
     Plain,
     Locked,
     Open(Box<Cbc>),
+    Sealed(Box<Chain>),
 }
 
 impl Lock {
     fn is_locked(&self) -> bool {
-        matches!(self, Lock::Locked)
+        matches!(self, Lock::Locked | Lock::Sealed(_))
+    }
+}
+
+// A lock as its facts keep it: an open cipher is kept as its chain, never
+// its key.
+#[derive(Serialize, Deserialize)]
+enum LockFacts {
+    Plain,
+    Locked,
+    Sealed(Chain),
+}
+
+impl Serialize for Lock {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Lock::Plain => LockFacts::Plain,
+            Lock::Locked => LockFacts::Locked,
+            Lock::Open(cbc) => LockFacts::Sealed(cbc.chain()),
+            Lock::Sealed(chain) => LockFacts::Sealed(Chain::clone(chain)),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Lock {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match LockFacts::deserialize(deserializer)? {
+            LockFacts::Plain => Lock::Plain,
+            LockFacts::Locked => Lock::Locked,
+            LockFacts::Sealed(chain) => Lock::Sealed(Box::new(chain)),
+        })
     }
 }
 
 // What has been said for one member.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Out {
     coverage: Coverage,
     closed: bool,
@@ -84,7 +119,13 @@ struct Candidate {
     folder_wrong: bool,
 }
 
+// Its facts are all of it but what keys it: no password, no candidate and
+// no key. The owner offers the winning password again, and the folders open
+// from the AES properties in the map. Bids are not kept either; a restart
+// makes them again.
+#[derive(Serialize, Deserialize)]
 pub struct SevenZipStore {
+    #[serde(skip, default = "Keys::global")]
     keys: Arc<Keys>,
     names: BTreeMap<VolumeIndex, String>,
     lengths: BTreeMap<VolumeIndex, u64>,
@@ -101,14 +142,17 @@ pub struct SevenZipStore {
     folders: Vec<Lock>,
     members: Vec<Out>,
     grid: Grid,
+    #[serde(skip)]
     candidates: Vec<Candidate>,
     // The candidate that opened the header or the folders.
+    #[serde(skip)]
     opened: Option<usize>,
     proof: Option<open::Proof>,
     asked: bool,
     // Container ranges wanted ahead of the normal order, and the volume
     // ranges already bid for them.
     bids: Vec<(ByteRange, Weight)>,
+    #[serde(skip)]
     bid: BTreeSet<(u32, u64, u64)>,
     damage_said: HashSet<(u64, u64, u32)>,
     lengths_said: BTreeSet<VolumeIndex>,
@@ -117,6 +161,29 @@ pub struct SevenZipStore {
     stale: bool,
     // The object gave its container up; it says nothing more.
     gone: bool,
+}
+
+impl Durable for SevenZipStore {
+    const VERSION: u16 = 1;
+
+    // The folders and members said are the map's, a cipher only where the
+    // map has AES, and the proof is a file of the map.
+    fn impossible(&self) -> Option<&'static str> {
+        let mapped =
+            match &self.map {
+                None => self.folders.is_empty() && self.members.is_empty() && self.proof.is_none(),
+                Some(map) => {
+                    map.is_sound()
+                        && map.folders.len() == self.folders.len()
+                        && map.members.len() == self.members.len()
+                        && self.folders.iter().zip(&map.folders).all(|(lock, folder)| {
+                            matches!(lock, Lock::Plain) == folder.aes.is_none()
+                        })
+                        && self.proof.is_none_or(|proof| proof.fits(map))
+                }
+            };
+        (!mapped || !self.kept.sound()).then_some("a map no 7z header gives")
+    }
 }
 
 impl Default for SevenZipStore {
@@ -642,5 +709,8 @@ impl Object for SevenZipStore {
             .filter_map(|bound| SevenZip::parse(bound))
             .any(|bound| bound.same_set(&wanted));
         (ours && wanted.index() != 0 && !self.names.contains_key(&volume)).then_some(volume)
+    }
+    fn facts(&self) -> Facts {
+        Facts::of(Kind::SevenZipStore, self)
     }
 }

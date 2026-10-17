@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use weaver_graph::{ByteRange, VolumeIndex};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Geometry {
     lengths: BTreeMap<u32, u64>,
 }

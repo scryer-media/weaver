@@ -11,14 +11,14 @@
 use weaver_graph::{ByteRange, Coverage, MemberId};
 
 // What has been said for one member.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Out {
     pub(super) coverage: Coverage,
     pub(super) closed: bool,
     pub(super) damaged: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct Entry {
     // Where the local header starts in the container.
     pub(super) header: u64,
@@ -52,7 +52,7 @@ pub(super) enum Piece {
     Member(MemberId, ByteRange),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Map {
     // By header.
     pub(super) entries: Vec<Entry>,

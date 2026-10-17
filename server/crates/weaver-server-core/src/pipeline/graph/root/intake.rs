@@ -78,9 +78,20 @@ impl Checksums {
 // The root's face toward the namespace write path: the block-aligned
 // checksums of the bytes it delivered, in root coordinates, where member M
 // is volume M. A segment is returned when it overlaps the asked range; the
-// namespace trims and re-checks whatever it does not take whole.
+// namespace trims and re-checks whatever it does not take whole. They are
+// checksums of what the source delivered, so a namespace below the root
+// gets none, and checks the bytes it has in hand.
 impl Segments for Checksums {
-    fn segments_for(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Segment>) {
+    fn segments_for(
+        &self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<Segment>,
+    ) {
+        if node != NodeId::ROOT {
+            return;
+        }
         let Some(kept) = self.volumes.get(&volume) else {
             return;
         };

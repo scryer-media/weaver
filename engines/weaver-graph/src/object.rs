@@ -9,14 +9,17 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::deliver::{Delivery, Emit};
+use crate::facts::Facts;
 use crate::member::MemberId;
 use crate::seek::Seek;
 use crate::volume::{ByteRange, VolumeIndex};
 
 // A format the sniffer can name and an object can own. The list is closed on
 // purpose: adding a format means adding an object, and nothing else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Kind {
     RarStore,
     SevenZipStore,
@@ -74,7 +77,7 @@ impl fmt::Display for Kind {
 }
 
 // An object's identity within its job, stable across restarts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectId(pub u32);
 
 // Where a range of an object's volume went: the inverse map, one entry per
@@ -219,5 +222,11 @@ pub trait Object: Send + Sync {
 
     fn engine_mut(&mut self) -> Option<&mut dyn crate::engine::Engine> {
         None
+    }
+
+    // My durable state, for a checkpoint. An object that keeps none says
+    // so, and a restart fetches again what it held.
+    fn facts(&self) -> Facts {
+        Facts::unsupported(self.kind())
     }
 }

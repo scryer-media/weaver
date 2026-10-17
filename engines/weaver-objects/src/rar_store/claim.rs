@@ -4,41 +4,85 @@
 // Which sibling members are this set's volumes. Every volume of a RAR set
 // starts with the signature, so a member without one is never claimed. A
 // name in the set's own numbering is its own number. A name that numbers
-// nothing of ours, an obfuscated one, is judged by its own first headers:
-// a RAR5 main header says which volume it is, and it is claimed when the
-// set holds the volume before it and the first file continues that
-// volume's last when that one was split; RAR4 numbers volumes only in the
-// end header, so there the first file must continue, by name and size, the
-// file a volume of ours left split at its end.
+// nothing of ours, an obfuscated one, is placed by its own first headers:
+// it follows the held volume whose last member it continues, or, on a
+// boundary between members, the one before the number it states.
 
-use weaver_graph::{ByteRange, Provenance, VolumeIndex};
+use std::io::Cursor;
+use std::sync::Arc;
+
+use unrar_rs::{RarArchive, RarVolumeFacts, RarVolumeMemberFacts};
+use weaver_graph::VolumeIndex;
 
 use super::RarStore;
-use super::header::{File, Format, Signature, What, signature};
-use super::walk::{Step, Walk};
 use crate::engine::SetName;
-use crate::kept::Kept;
 use crate::rar_engine::naming;
 
-// The last file a walk read, when it is split into the next volume.
-fn tail(walk: &Walk) -> Option<&File> {
-    walk.blocks
-        .iter()
-        .rev()
-        .find_map(|block| match &block.what {
-            What::File(file) => Some(file),
-            _ => None,
-        })
+// One volume's headers, as far as they place it in its set.
+struct Nameless<'a> {
+    facts: &'a RarVolumeFacts,
+}
+
+impl Nameless<'_> {
+    fn ordered_members(&self) -> Vec<&RarVolumeMemberFacts> {
+        let mut members: Vec<_> = self.facts.members.iter().collect();
+        members.sort_by_key(|member| member.order);
+        members
+    }
+
+    // The member this volume opens on, when it continues one begun earlier.
+    fn continued_member(&self) -> Option<&RarVolumeMemberFacts> {
+        self.ordered_members()
+            .first()
+            .copied()
+            .filter(|member| member.split_before)
+    }
+
+    // The member this volume ends on, when it carries on into the next one.
+    fn continuing_member(&self) -> Option<&RarVolumeMemberFacts> {
+        self.ordered_members()
+            .last()
+            .copied()
+            .filter(|member| member.split_after)
+    }
+
+    // Whether this volume can follow `previous` at index `index`, judged only
+    // by what both volumes' headers state.
+    fn follows(&self, previous: &Nameless<'_>, index: u32) -> bool {
+        if self.facts.format != previous.facts.format
+            || self.facts.is_encrypted != previous.facts.is_encrypted
+            || self
+                .facts
+                .volume_number
+                .is_some_and(|stated| stated != index)
+        {
+            return false;
+        }
+        match (previous.continuing_member(), self.continued_member()) {
+            (Some(tail), Some(head)) => {
+                head.name == tail.name
+                    && match (head.unpacked_size, tail.unpacked_size) {
+                        (Some(head_size), Some(tail_size)) => head_size == tail_size,
+                        _ => true,
+                    }
+            }
+            // A boundary that falls between two members links only on a
+            // stated number; nothing else in the headers ties the volumes.
+            (None, None) => self.facts.volume_number == Some(index),
+            _ => false,
+        }
+    }
 }
 
 impl RarStore {
     pub(super) fn claim_volume(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        let Signature::Format(format) = signature(first_bytes) else {
-            return None;
-        };
+        let format = unrar_rs::signature::read_signature(&mut Cursor::new(first_bytes)).ok()?;
         let ours = self.volumes.get(&VolumeIndex(0))?;
-        if ours.walk.format.is_some_and(|known| known != format)
-            || ours.walk.main().is_some_and(|main| !main.volume)
+        if ours
+            .walk
+            .facts
+            .as_ref()
+            .is_some_and(|facts| facts.archive_format() != format || !facts.is_volume)
         {
             return None;
         }
@@ -51,7 +95,7 @@ impl RarStore {
         });
         let index = match (named, wanted) {
             (true, Some(wanted)) => VolumeIndex(wanted.index()),
-            _ => self.claim_by_headers(format, first_bytes)?,
+            _ => self.claim_by_headers(first_bytes)?,
         };
         let taken = self
             .volumes
@@ -60,65 +104,45 @@ impl RarStore {
         (!taken).then_some(index)
     }
 
-    fn claim_by_headers(&self, format: Format, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        let walk = self.first_headers(first_bytes);
-        let main = walk.main().filter(|main| main.volume)?;
-        let first = walk.blocks.iter().find_map(|block| match &block.what {
-            What::File(file) => Some(file),
-            _ => None,
-        });
-        match (format, main.number) {
-            (Format::Rar5, Some(number)) if number > 0 => {
-                let previous = self.volumes.get(&VolumeIndex(number - 1))?;
-                previous.name.as_ref()?;
-                let continues = match (previous.walk.ended, tail(&previous.walk), first) {
-                    (false, _, _) | (true, _, None) => true,
-                    (true, Some(tail), Some(first)) if tail.after => {
-                        first.before && first.name == tail.name
-                    }
-                    (true, _, Some(first)) => !first.before,
-                };
-                continues.then_some(VolumeIndex(number))
-            }
-            (Format::Rar4, _) => {
-                let first = first.filter(|first| first.before)?;
-                let mut found = self.volumes.iter().filter(|(index, volume)| {
-                    let next = VolumeIndex(index.0 + 1);
-                    volume.walk.ended
-                        && !volume.walk.is_last()
-                        && self
-                            .volumes
-                            .get(&next)
-                            .is_none_or(|next| next.name.is_none())
-                        && tail(&volume.walk).is_some_and(|tail| {
-                            tail.after && tail.name == first.name && tail.length == first.length
-                        })
-                });
-                let (index, _) = found.next()?;
-                // Two volumes it could continue: no telling which.
-                found.next().is_none().then_some(VolumeIndex(index.0 + 1))
-            }
+    // The one held volume this one can follow, preferring the one its
+    // stated number names.
+    fn claim_by_headers(&self, first_bytes: &[u8]) -> Option<VolumeIndex> {
+        let password = self.header_password();
+        let facts = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+            Cursor::new(first_bytes.to_vec()),
+            password.as_deref().map(String::as_str),
+            Arc::clone(&self.kdf),
+        )
+        .ok()?
+        .facts;
+        if !facts.is_volume {
+            return None;
+        }
+        let this = Nameless { facts: &facts };
+        let candidates: Vec<u32> = self
+            .volumes
+            .iter()
+            .filter(|(index, volume)| {
+                let next = VolumeIndex(index.0 + 1);
+                volume.name.is_some()
+                    && self
+                        .volumes
+                        .get(&next)
+                        .is_none_or(|next| next.name.is_none())
+                    && volume.walk.facts.as_ref().is_some_and(|previous| {
+                        previous.more_volumes && this.follows(&Nameless { facts: previous }, next.0)
+                    })
+            })
+            .map(|(index, _)| index.0 + 1)
+            .collect();
+        let stated: Vec<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| facts.volume_number == Some(*candidate))
+            .collect();
+        match (stated.as_slice(), candidates.as_slice()) {
+            ([only], _) | ([], [only]) => Some(VolumeIndex(*only)),
             _ => None,
         }
-    }
-
-    // The headers a member's first bytes hold, read as a volume of ours.
-    fn first_headers(&self, first_bytes: &[u8]) -> Walk {
-        let mut kept = Kept::default();
-        let all = ByteRange::new(0, first_bytes.len() as u64);
-        kept.want(all);
-        kept.absorb(all, first_bytes, Provenance::Fresh);
-        let keyring = self.header_keyring();
-        let mut walk = Walk::default();
-        while let Step::Moved = walk.step(&mut kept, None, keyring.as_deref()) {
-            let read_a_file = walk
-                .blocks
-                .iter()
-                .any(|block| matches!(block.what, What::File(_)));
-            if read_a_file || walk.ended {
-                break;
-            }
-        }
-        walk
     }
 }

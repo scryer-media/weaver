@@ -17,7 +17,7 @@ use crate::pipeline::direct_store::wiring::MAX_DIRECT_REPAIR_DEFER_WAVES;
 
 use crate::pipeline::direct_store::barrier::BarrierDemand;
 
-mod scenarios;
+pub(in crate::pipeline::tests) mod scenarios;
 
 // A real NZB's `<segment bytes=…>` is the yEnc-**encoded** article size, about
 // 3% larger than the decoded payload. Every fixture here declares inflated
@@ -1825,7 +1825,7 @@ async fn run_multi_member_gate(
 // byte of it is envelope. At `rr_bytes` well over the old 32 KiB half-slot
 // this set could not route at all before envelope v2 — it demoted with
 // `EnvelopeTooLarge`, which is why every `-rr` post did.
-fn recovery_record_store_set(
+pub(in crate::pipeline::tests) fn recovery_record_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,

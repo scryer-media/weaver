@@ -35,7 +35,7 @@ impl SevenZipStore {
             let local = part.shift(-(folder.pack.start as i64));
             match &mut self.folders[index] {
                 Lock::Plain => {}
-                Lock::Locked => continue,
+                Lock::Locked | Lock::Sealed(_) => continue,
                 Lock::Open(cbc) => {
                     cbc.deliver(local.start, slice, provenance, &mut plains);
                     for plain in std::mem::take(&mut plains) {

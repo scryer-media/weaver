@@ -5,7 +5,7 @@
 // namespace's marks. Nothing refetches and damaged bytes are kept, so a
 // claim never changes what ships; it only says what the shipment is.
 
-use weaver_graph::{Member, MemberId};
+use weaver_graph::{Member, MemberId, NodeId, Tree};
 
 // Below this share of its length, a member has produced no delivery
 // evidence: what is on disk for it is a rounding error, not a short
@@ -102,6 +102,28 @@ pub(crate) fn refused(census: &[ClaimedMember]) -> Vec<&ClaimedMember> {
         return Vec::new();
     }
     payload().filter(|row| !row.evidence).collect()
+}
+
+// Some file the member was unpacked into, at any depth, arrived whole: the
+// post was delivered. What an object above a repair found damaged and
+// marked on the member stays marked, though the repair below rebuilt it,
+// so the member's own marks cannot say so.
+pub(crate) fn delivered_below(tree: &Tree, node: NodeId, member: MemberId) -> bool {
+    let Some((child, _)) = tree
+        .child_of(node, member)
+        .filter(|(child, _)| !tree.recovers(*child))
+    else {
+        return false;
+    };
+    tree.namespace(child).is_some_and(|namespace| {
+        namespace.members().any(|below| {
+            if tree.child_of(child, below.id).is_some() {
+                delivered_below(tree, child, below.id)
+            } else {
+                Claim::of(below) == Claim::Complete
+            }
+        })
+    })
 }
 
 fn damaged_bytes(member: &Member) -> u64 {
