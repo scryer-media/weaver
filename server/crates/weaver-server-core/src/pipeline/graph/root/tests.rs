@@ -50,7 +50,15 @@ impl Object for Probe {
         Kind::Zip
     }
     fn deliver(&mut self, _: Delivery<'_>, _: &mut Vec<Emit>) {}
-    fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+    // Its whole volume in, the probe announces one member it never closes,
+    // the way an object still at work on its last bytes looks.
+    fn volume_closed(&mut self, _: VolumeIndex, out: &mut Vec<Emit>) {
+        out.push(Emit::Member {
+            member: MemberId(0),
+            name: "inner.bin".to_string(),
+            length: None,
+        });
+    }
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&mut self, out: &mut Vec<Seek>) {
         out.append(&mut self.wants);
@@ -287,7 +295,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
 
     job.intake(decoded(0, 0, 0, &zip_front(90), Some(90)))
         .unwrap();
-    // Nothing recovers, and the zip object has produced no member yet.
+    // Nothing recovers, and the zip object has a member it has not closed.
     assert_eq!(job.phase(), RootPhase::Extracting);
 
     let (mut plain, _plain_dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());

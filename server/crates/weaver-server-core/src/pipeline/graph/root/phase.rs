@@ -90,9 +90,11 @@ impl RootPhase {
     }
 }
 
-// Whether an object below the root has members still to complete. An
-// object that has announced nothing is not at work here: a run of it is,
-// and the job reads that off its runs.
+// Whether an object below the root is still producing members: it has a
+// member not yet complete, or it has announced none while its volumes are
+// still arriving. One whose volumes are all in and announced nothing is
+// done, unless a run of it is still reading, which the job reads off its
+// runs.
 pub(crate) fn extracting(tree: &Tree) -> bool {
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return false;
@@ -104,7 +106,16 @@ pub(crate) fn extracting(tree: &Tree) -> bool {
         if tree.recovers(child) {
             return false;
         }
-        tree.namespace(child)
-            .is_some_and(|namespace| namespace.members().any(|inner| !inner.is_complete()))
+        let Some(namespace) = tree.namespace(child) else {
+            return false;
+        };
+        if namespace.is_empty() {
+            return tree.volumes(child).is_some_and(|(_, volumes)| {
+                volumes
+                    .values()
+                    .any(|volume| root.get(*volume).is_none_or(|record| !record.is_complete()))
+            });
+        }
+        namespace.members().any(|inner| !inner.is_complete())
     })
 }
