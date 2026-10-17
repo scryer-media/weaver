@@ -8,8 +8,12 @@ repository.workspace = true
 
 [dependencies]
 aws-lc-rs = { workspace = true }
+brotli = { workspace = true }
 bytes = { workspace = true }
+bzip2 = { workspace = true }
 crc-fast = { workspace = true }
+flate2 = { workspace = true }
+lzma-turbo = { workspace = true }
 par2-rs = { workspace = true }
 par3-rs = { workspace = true }
 sevenz-turbo = { workspace = true }
@@ -18,7 +22,9 @@ unrar-rs = { workspace = true }
 weaver-graph = { path = "../weaver-graph" }
 zeroize = { workspace = true }
 zip = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
+lzma-turbo = { workspace = true, features = ["enc"] }
 sevenz-turbo = { workspace = true, features = ["compress"] }
 tempfile = { workspace = true }

@@ -6067,8 +6067,12 @@ name = "weaver-objects"
 version = "0.15.0"
 dependencies = [
  "aws-lc-rs",
+ "brotli 8.0.4",
  "bytes",
+ "bzip2",
  "crc-fast",
+ "flate2",
+ "lzma-turbo",
  "par2-rs",
  "par3-rs",
  "sevenz-turbo",
@@ -6078,6 +6082,7 @@ dependencies = [
  "weaver-graph",
  "zeroize",
  "zip",
+ "zstd 0.13.3",
 ]
 
 [[package]]

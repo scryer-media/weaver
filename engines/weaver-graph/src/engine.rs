@@ -54,4 +54,13 @@ pub trait Engine {
     // object can bid for the volumes after it; the object's state is
     // otherwise its own.
     fn reached(&mut self, _volume: VolumeIndex, _offset: u64) {}
+
+    // The bytes a run holds resident while it runs: a decoder's window, read
+    // from the first bytes the object was delivered. The owner reserves it
+    // before it starts the run, and a run never holds more, so a reservation
+    // never grows once taken. Nothing for an engine whose library sizes its
+    // own memory.
+    fn reserve(&self) -> u64 {
+        0
+    }
 }

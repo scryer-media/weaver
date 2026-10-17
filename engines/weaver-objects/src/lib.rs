@@ -17,6 +17,8 @@ pub mod rar_engine;
 pub mod sevenz_engine;
 pub mod sevenz_store;
 pub mod sfv;
+pub mod stream;
+pub mod tar;
 pub mod zip;
 pub mod zip_engine;
 
@@ -34,6 +36,13 @@ pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         Kind::SevenZipEngine => Some(Box::new(sevenz_engine::SevenZipEngine::new())),
         Kind::SevenZipStore => Some(Box::new(sevenz_store::SevenZipStore::new())),
         Kind::Sfv => Some(Box::new(sfv::Sfv::new(id))),
+        Kind::Tar => Some(Box::new(tar::Tar::new())),
+        Kind::Xz => Some(Box::new(stream::XzStream::new())),
+        Kind::Gzip => Some(Box::new(stream::GzipStream::new())),
+        Kind::Bzip2 => Some(Box::new(stream::Bzip2Stream::new())),
+        Kind::Zstd => Some(Box::new(stream::ZstdStream::new())),
+        Kind::Brotli => Some(Box::new(stream::BrotliStream::new())),
+        Kind::Deflate => Some(Box::new(stream::DeflateStream::new())),
         Kind::Zip => Some(Box::new(zip::Zip::new())),
         Kind::ZipEngine => Some(Box::new(zip_engine::ZipEngine::new())),
         _ => None,
