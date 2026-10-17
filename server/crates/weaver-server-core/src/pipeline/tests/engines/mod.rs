@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// Acceptance under both engines: one generated job admitted twice, once
+// under `Engine::Classic` and once under `Engine::Graph`, served the same
+// articles, settled through the same completion gate, and compared.
+//
+// The harness API (everything a scenario needs; the body need not be read):
+//
+//   ARTICLE                       one article's decoded size, and the PAR2
+//                                 slice size, so an article is one slice
+//   payload(len, seed)            bytes no format sniffs as its own
+//   Post::plain(name, bytes)      a posted file; its role comes from its name
+//   par2_set(base, files, blocks) an index and one volume of `blocks`
+//                                 recovery blocks over `files`, sliced at
+//                                 ARTICLE, named `<base>.par2` and
+//                                 `<base>.volNN+MM.par2`
+//   recovery_blocks(post)         per recovery block of a volume, the
+//                                 articles holding its bytes
+//   one_block_article(post)       an article of a volume whose loss costs
+//                                 exactly one recovery block
+//   Scenario::new(posts)          a job of `posts`, every article intact
+//     .damaged(file, ordinal)     that article arrives with a checksum
+//                                 mismatch and corrupted bytes
+//     .lost(file, ordinal)        every server lacks that article
+//   run_both(&scenario)           -> (classic Outcome, graph Outcome)
+//   run(&scenario, engine)        -> Outcome, for divergence tests
+//   assert_same(&classic, &graph) the same status, failure kind, delivered
+//                                 files and bytes, claims, and article
+//                                 requests; neither engine asked for an
+//                                 article twice
+//
+//   Outcome {
+//     engine, status,             the job's last status
+//     failure,                    the failure message, when it failed
+//     failure_kind,               the history row's failure kind
+//     files,                      delivered path (under the complete
+//                                 directory) to bytes
+//     claims,                     post name to Claim, payload posts only,
+//                                 read off what was delivered
+//     requests,                   (file, ordinal) to times it was asked for
+//     reads,                      graph: member reads its repairs made;
+//                                 classic: PAR2 verification passes that
+//                                 read files back
+//     graph: Option<GraphView>,   the graph job as last seen before it
+//                                 finished: namespace claims by output
+//                                 name, blocks reachable, repair outcomes
+//   }
+//   Outcome::refetched()          articles asked for more than once
+//   Claim::{Complete, Damaged, Missing}
+//
+// Files are indexed as the posts are listed; ordinals count from zero.
+
+mod harness;
+mod plain_par2;

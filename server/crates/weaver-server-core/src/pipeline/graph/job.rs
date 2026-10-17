@@ -388,8 +388,7 @@ impl GraphJob {
         let mut emits = Vec::new();
         object.volume_lost(inner, range, &mut emits);
         self.tree.put_object(node, object);
-        self.tree
-            .emitted(node, emits, &mut *self.builder, effects);
+        self.tree.emitted(node, emits, &mut *self.builder, effects);
     }
 
     // One round of seeks: every object's standing wants lifted to the root,

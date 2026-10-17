@@ -306,3 +306,49 @@ fn wants_asks_for_recovery_while_short() {
     );
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
 }
+
+// The front of a volume walk steps over a lost article and resyncs on the
+// next packet, so every recovery packet clear of the loss is still found.
+#[test]
+fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
+    let data = payload(17, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 1);
+    assert_eq!(files.len(), 2);
+    let mut job = job(&files[..1]);
+    job.member("payload.bin", &data);
+    let (name, bytes) = &files[1];
+    let volume = job.object.claim(name, &bytes[..64]).expect("a PAR2 volume");
+    let lost = ByteRange::at(ARTICLE, ARTICLE);
+    let mut out = Vec::new();
+    for (index, piece) in bytes.chunks(ARTICLE as usize).enumerate() {
+        let offset = index as u64 * ARTICLE;
+        if offset == lost.start {
+            continue;
+        }
+        job.object.deliver(
+            weaver_graph::Delivery {
+                volume,
+                offset,
+                bytes: piece,
+                provenance: Provenance::Fresh,
+            },
+            &mut out,
+        );
+    }
+    job.object.volume_lost(volume, lost, &mut out);
+    job.object.volume_closed(volume, &mut out);
+    bind(&mut job);
+    // Recovery packets wholly outside the lost article.
+    let mut clear = 0;
+    let mut at = 0usize;
+    while at + 64 <= bytes.len() {
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().expect("8 bytes"));
+        let packet = ByteRange::at(at as u64, length);
+        if &bytes[at + 48..at + 64] == b"PAR 2.0\0RecvSlic" && packet.intersect(lost).is_none() {
+            clear += 1;
+        }
+        at += length as usize;
+    }
+    assert!(clear >= 2, "the fixture keeps packets past the loss");
+    assert_eq!(job.object.blocks_reachable(), clear);
+}

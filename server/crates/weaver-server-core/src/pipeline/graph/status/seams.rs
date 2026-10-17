@@ -59,6 +59,7 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
             pipeline.fail_job(job_id, message);
         }
         Step::Deliver => {
+            pipeline.remove_recovery_volumes(job_id).await;
             if let Err(error) = pipeline.start_move_to_complete(job_id).await {
                 pipeline.fail_job(job_id, error);
             }
@@ -71,6 +72,34 @@ fn asker(job_id: JobId) -> AskerId {
 }
 
 impl Pipeline {
+    // PAR2 and PAR3 files, indexes and volumes alike, are spent once the job
+    // delivers and are not part of the release, so they are left out of it
+    // as a classic job's are. Root members are numbered as the posted files
+    // they are.
+    async fn remove_recovery_volumes(&self, job_id: JobId) {
+        let (Some(graph), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id))
+        else {
+            return;
+        };
+        for (member, path) in graph.member_files() {
+            let is_recovery = state
+                .spec
+                .files
+                .get(member.0 as usize)
+                .is_some_and(|file| !file.role.counts_toward_health());
+            if !is_recovery {
+                continue;
+            }
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(file = %path.display(), error = %error, "could not remove a recovery volume");
+                }
+            }
+        }
+    }
+
     pub(in crate::pipeline) fn is_graph_job(&self, job_id: JobId) -> bool {
         self.graph_jobs.contains_key(&job_id)
     }

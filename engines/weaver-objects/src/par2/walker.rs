@@ -50,6 +50,9 @@ pub(super) struct Walker {
     held_bytes: usize,
     // Ranges whose bytes arrived damaged; a header there is not trusted.
     damaged: Vec<ByteRange>,
+    // Ranges no server has; the front steps over them and resyncs, or every
+    // packet past a lost article would stay unfound.
+    lost: Vec<ByteRange>,
     // Some delivery was dropped for the hold bound, so the walk may stop
     // short of the volume's end.
     pub(super) overflowed: bool,
@@ -79,6 +82,13 @@ impl Walker {
         }
         self.hold(start, bytes);
         self.walk(found);
+    }
+
+    pub(super) fn lose(&mut self, range: ByteRange, found: &mut Vec<Found>) {
+        if range.end > self.next {
+            self.lost.push(range);
+            self.walk(found);
+        }
     }
 
     pub(super) fn is_damaged(&self, range: ByteRange) -> bool {
@@ -118,62 +128,88 @@ impl Walker {
         self.held.insert(merged_start, merged);
     }
 
-    // Advance the front over every packet the held bytes complete.
+    // Advance the front over every packet the held bytes complete, and over
+    // a lost range the front has reached.
     fn walk(&mut self, found: &mut Vec<Found>) {
-        while let Some(front) = self.held.get(&self.next) {
-            if front.len() < HEADER_SIZE {
-                return;
+        while self.step(found) || self.cross_loss() {}
+    }
+
+    // Where the held bytes run out and a lost range begins, the front skips
+    // to the range's end; what lies there is not a trusted header and is
+    // resynced from.
+    fn cross_loss(&mut self) -> bool {
+        let reach = self.next + self.held.get(&self.next).map_or(0, Vec::len) as u64;
+        let Some(lost) = self
+            .lost
+            .iter()
+            .find(|lost| lost.start <= reach && lost.end > self.next)
+            .copied()
+        else {
+            return false;
+        };
+        self.advance(lost.end);
+        true
+    }
+
+    // One packet past the front, or false when the held bytes do not reach
+    // the next one.
+    fn step(&mut self, found: &mut Vec<Found>) -> bool {
+        let Some(front) = self.held.get(&self.next) else {
+            return false;
+        };
+        if front.len() < HEADER_SIZE {
+            return false;
+        }
+        let at = self.next;
+        let header_range = ByteRange::at(at, HEADER_SIZE as u64);
+        let header = (&front[..8] == MAGIC && !self.is_damaged(header_range))
+            .then(|| PacketHeader::parse(front, at).ok())
+            .flatten();
+        let Some(header) = header else {
+            let step = resync(front);
+            self.advance(at + step);
+            return true;
+        };
+        let range = ByteRange::at(at, header.length);
+        let set = *header.recovery_set_id.as_bytes();
+        if header.packet_type == PacketType::RecoverySlice {
+            if front.len() < RECOVERY_HEAD {
+                return false;
             }
-            let at = self.next;
-            let header_range = ByteRange::at(at, HEADER_SIZE as u64);
-            let header = (&front[..8] == MAGIC && !self.is_damaged(header_range))
-                .then(|| PacketHeader::parse(front, at).ok())
-                .flatten();
-            let Some(header) = header else {
-                let step = resync(front);
-                self.advance(at + step);
-                continue;
-            };
-            let range = ByteRange::at(at, header.length);
-            let set = *header.recovery_set_id.as_bytes();
-            if header.packet_type == PacketType::RecoverySlice {
-                if front.len() < RECOVERY_HEAD {
-                    return;
-                }
-                let mut exponent = [0u8; 4];
-                exponent.copy_from_slice(&front[HEADER_SIZE..RECOVERY_HEAD]);
-                found.push(Found::Recovery {
+            let mut exponent = [0u8; 4];
+            exponent.copy_from_slice(&front[HEADER_SIZE..RECOVERY_HEAD]);
+            found.push(Found::Recovery {
+                set,
+                exponent: u32::from_le_bytes(exponent),
+                range,
+            });
+            self.advance(range.end);
+            return true;
+        }
+        if header.length > METADATA_CAP {
+            self.advance(range.end);
+            return true;
+        }
+        if (front.len() as u64) < header.length {
+            return false;
+        }
+        match parse_packet(&front[..header.length as usize], at) {
+            // The packet hash is checked by the parse, so a packet that
+            // parses is right even where its bytes arrived marked damaged.
+            Ok((packet, _)) => {
+                found.push(Found::Metadata {
                     set,
-                    exponent: u32::from_le_bytes(exponent),
-                    range,
+                    at,
+                    hash: header.packet_hash,
+                    packet,
                 });
                 self.advance(range.end);
-                continue;
             }
-            if header.length > METADATA_CAP {
-                self.advance(range.end);
-                continue;
-            }
-            if (front.len() as u64) < header.length {
-                return;
-            }
-            match parse_packet(&front[..header.length as usize], at) {
-                // The packet hash is checked by the parse, so a packet that
-                // parses is right even where its bytes arrived marked damaged.
-                Ok((packet, _)) => {
-                    found.push(Found::Metadata {
-                        set,
-                        at,
-                        hash: header.packet_hash,
-                        packet,
-                    });
-                    self.advance(range.end);
-                }
-                // A metadata packet that fails its hash is not a packet; the
-                // next magic is.
-                _ => self.advance(at + 1),
-            }
+            // A metadata packet that fails its hash is not a packet; the
+            // next magic is.
+            _ => self.advance(at + 1),
         }
+        true
     }
 
     // Move the front, dropping what it passed.

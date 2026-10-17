@@ -217,7 +217,11 @@ impl Object for Par2 {
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, _out: &mut Vec<Emit>) {
-        self.volume(volume).lost.push(range);
+        let mut found = Vec::new();
+        let state = self.volume(volume);
+        state.lost.push(range);
+        state.walker.lose(range, &mut found);
+        self.take(volume, found);
     }
 
     fn wants(&mut self, out: &mut Vec<Seek>) {
