@@ -349,6 +349,17 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
         if finished(&pipeline) {
             break;
         }
+        // A run out on a thread speaks through the pipeline's mail, as the
+        // orchestrator hears it: what it says is the job's next move.
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.runs().live())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
         let after = fingerprint(&pipeline, &requests);
         if before == after && stalled.replace(after.clone()) == Some(after.clone()) {
             panic!(

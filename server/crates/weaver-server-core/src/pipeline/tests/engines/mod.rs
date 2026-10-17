@@ -51,6 +51,8 @@
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
+mod divergence;
 mod harness;
 mod plain_par2;
 mod sets;
+mod sfv;
