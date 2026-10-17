@@ -235,7 +235,7 @@ impl SevenZipStore {
             (*properties.iv(), bytes)
         };
         let mut plain = blocks.to_vec();
-        if crypt::decipher(&key, seed, &mut plain).is_err() {
+        if crypt::decipher(&key[..], seed, &mut plain).is_err() {
             return Verdict::Failed;
         }
         let entry = &map.entries[proof.entry];
@@ -259,9 +259,13 @@ impl SevenZipStore {
                 continue;
             };
             let opened = match self.folder_key(index, &properties) {
-                Ok(Some(key)) => {
-                    Cbc::new(&key, *properties.iv(), folder.pack.len(), folder.plain_len).ok()
-                }
+                Ok(Some(key)) => Cbc::new(
+                    &key[..],
+                    *properties.iv(),
+                    folder.pack.len(),
+                    folder.plain_len,
+                )
+                .ok(),
                 Ok(None) | Err(_) => None,
             };
             match opened {

@@ -32,7 +32,7 @@ impl SetName for VolumeName {
     }
 }
 
-pub(super) fn parse(name: &str) -> Option<VolumeName> {
+pub(crate) fn parse(name: &str) -> Option<VolumeName> {
     let lower = name.to_ascii_lowercase();
     if let Some(base) = lower.strip_suffix(".rar") {
         if let Some((stem, digits)) = base.rsplit_once(".part")

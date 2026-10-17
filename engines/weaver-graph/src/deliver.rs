@@ -48,6 +48,9 @@ impl Delivery<'_> {
 pub enum RecoveryKind {
     Par2,
     Par3,
+    // A RAR recovery record: Reed-Solomon over the volume's own bytes, which
+    // only a RAR engine can apply.
+    Rar,
 }
 
 // Why an object cannot stream a member. The reason travels with the refusal

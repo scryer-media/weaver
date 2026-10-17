@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// AES-256-CBC over a stream whose bytes arrive in any order. A block can be
+// AES-CBC over a stream whose bytes arrive in any order. A block can be
 // deciphered as soon as the cipher block before it is in, so a run deciphers
 // the moment its seed arrives and a block whose seed has not stays parked.
 //
@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use aws_lc_rs::cipher::{
-    AES_256, DecryptingKey, DecryptionContext, EncryptingKey, EncryptionContext, UnboundCipherKey,
+    AES_128, AES_256, DecryptingKey, DecryptionContext, EncryptingKey, EncryptionContext,
+    UnboundCipherKey,
 };
 use aws_lc_rs::iv::FixedLength;
 use weaver_graph::{ByteRange, Coverage, Provenance};
@@ -36,6 +37,8 @@ pub const STRIDE: u64 = 4 * 1024 * 1024;
 pub enum CryptError {
     #[error("the cipher rejected the key")]
     Key,
+    #[error("a key of {0} bytes is neither AES-128 nor AES-256")]
+    KeyLength(usize),
     #[error("a cipher stream of {0} bytes is not whole blocks")]
     Unaligned(u64),
     #[error("a payload of {plain} bytes does not fit a cipher stream of {cipher}")]
@@ -61,8 +64,9 @@ pub fn worse(left: Provenance, right: Provenance) -> Provenance {
     }
 }
 
-// Decipher whole blocks in place, chained from `seed`.
-pub fn decipher(key: &[u8; 32], seed: [u8; 16], blocks: &mut [u8]) -> Result<(), CryptError> {
+// Decipher whole blocks in place, chained from `seed`. The key's length picks
+// AES-128 or AES-256.
+pub fn decipher(key: &[u8], seed: [u8; 16], blocks: &mut [u8]) -> Result<(), CryptError> {
     let cipher = Keys::new(key)?;
     cipher.decipher(seed, blocks)
 }
@@ -74,8 +78,13 @@ struct Keys {
 }
 
 impl Keys {
-    fn new(key: &[u8; 32]) -> Result<Self, CryptError> {
-        let unbound = || UnboundCipherKey::new(&AES_256, key).map_err(|_| CryptError::Key);
+    fn new(key: &[u8]) -> Result<Self, CryptError> {
+        let algorithm = match key.len() {
+            16 => &AES_128,
+            32 => &AES_256,
+            other => return Err(CryptError::KeyLength(other)),
+        };
+        let unbound = || UnboundCipherKey::new(algorithm, key).map_err(|_| CryptError::Key);
         Ok(Self {
             decrypt: DecryptingKey::cbc(unbound()?).map_err(|_| CryptError::Key)?,
             encrypt: EncryptingKey::cbc(unbound()?).map_err(|_| CryptError::Key)?,
@@ -203,7 +212,7 @@ fn ceil(offset: u64) -> u64 {
 
 impl Cbc {
     pub fn new(
-        key: &[u8; 32],
+        key: &[u8],
         iv: [u8; 16],
         cipher_len: u64,
         plain_len: u64,
