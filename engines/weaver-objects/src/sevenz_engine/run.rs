@@ -11,14 +11,16 @@
 use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use sevenz_turbo::{
     ArchiveEntry, ArchiveLimits, ArchiveReader, BlockErrorKind, EntryRead, Error, Limit, Password,
     ReadAt,
 };
-use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why};
+use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
+
+use crate::engine::Joined;
 
 pub(super) struct Run {
     password: Option<String>,
@@ -32,11 +34,8 @@ impl Run {
 
 impl Extraction for Run {
     fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
-        let input = Joined {
-            volumes,
-            failed: Arc::new(AtomicBool::new(false)),
-        };
-        let failed = Arc::clone(&input.failed);
+        let input = Joined::new(volumes);
+        let failed = input.failure();
         let password = self
             .password
             .as_deref()
@@ -168,56 +167,10 @@ fn verdict(error: &Error) -> Emit {
     }
 }
 
-// The owner's volumes as one source, end to end. A volume still growing has
-// no length yet, so a read that may lie in it is made there: it waits for
-// the bytes, or for the volume to close short of them, and then the read
-// carries on into the next. A read the owner fails is remembered, so the
-// error sevenz-turbo makes of it ends the run silently instead of being
-// taken for damage.
-struct Joined {
-    volumes: Arc<dyn Volumes>,
-    failed: Arc<AtomicBool>,
-}
-
-impl Joined {
-    fn read(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
-        self.volumes
-            .read_at(volume, offset, into)
-            .inspect_err(|_| self.failed.store(true, Ordering::Release))
-    }
-}
-
+// The joined volumes, as sevenz-turbo reads them.
 impl ReadAt for Joined {
     fn read_at(&self, into: &mut [u8], offset: u64) -> io::Result<usize> {
-        if into.is_empty() {
-            return Ok(0);
-        }
-        let mut start = 0u64;
-        for volume in 0..self.volumes.count() {
-            let volume = VolumeIndex(
-                u32::try_from(volume).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
-            );
-            let local = offset - start;
-            let len = match self.volumes.len(volume) {
-                Some(len) => len,
-                None => {
-                    let read = self.read(volume, local, into)?;
-                    if read > 0 {
-                        return Ok(read);
-                    }
-                    self.volumes
-                        .len(volume)
-                        .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?
-                }
-            };
-            if local < len {
-                let wanted =
-                    usize::try_from(len - local).map_or(into.len(), |rest| rest.min(into.len()));
-                return self.read(volume, local, &mut into[..wanted]);
-            }
-            start += len;
-        }
-        Ok(0)
+        self.read(offset, into)
     }
 
     // The signature header says where the end header lies and how long it
@@ -227,14 +180,7 @@ impl ReadAt for Joined {
     // archive's.
     fn size(&self) -> io::Result<u64> {
         let mut header = [0u8; 32];
-        let mut filled = 0;
-        while filled < header.len() {
-            let read = self.read_at(&mut header[filled..], filled as u64)?;
-            if read == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            filled += read;
-        }
+        self.read_exact(0, &mut header)?;
         let field = |at: usize| {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&header[at..at + 8]);

@@ -63,6 +63,9 @@ pub enum Why {
     // Nothing names the members: the header itself is encrypted and no
     // password opened it.
     EncryptedHeader,
+    // The member's bytes are enciphered; an engine with the password reads
+    // them.
+    Encrypted,
     // An entry whose extent the local header does not declare, under a parent
     // that cannot seek to the directory that would.
     UnboundedEntry,

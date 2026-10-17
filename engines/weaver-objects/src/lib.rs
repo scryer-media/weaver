@@ -9,6 +9,7 @@
 pub mod crypt;
 pub mod engine;
 mod grid;
+mod kept;
 pub mod keys;
 pub mod par2;
 pub mod par3;

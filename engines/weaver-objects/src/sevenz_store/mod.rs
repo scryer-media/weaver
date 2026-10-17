@@ -14,7 +14,6 @@
 
 mod geometry;
 mod header;
-mod kept;
 mod map;
 mod open;
 mod place;
@@ -36,11 +35,11 @@ use zeroize::Zeroizing;
 use crate::crypt::Cbc;
 use crate::engine::{Format, SetName};
 use crate::grid::{Grid, crc32};
+use crate::kept::Kept;
 use crate::keys::Keys;
 use crate::sevenz_engine::SevenZip;
 use geometry::Geometry;
 use header::{SIGNATURE, Signature, Start};
-use kept::Kept;
 use map::Map;
 
 // The one envelope: container coordinates, for every byte that belongs to no

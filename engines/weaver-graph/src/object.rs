@@ -30,6 +30,7 @@ pub enum Kind {
     Deflate,
     RarEngine,
     SevenZipEngine,
+    ZipEngine,
     Par2,
     Par3,
     Sfv,
@@ -41,6 +42,7 @@ impl Kind {
     pub fn engine_for(self) -> Option<Kind> {
         match self {
             Kind::RarStore => Some(Kind::RarEngine),
+            Kind::Zip => Some(Kind::ZipEngine),
             _ => None,
         }
     }
@@ -61,6 +63,7 @@ impl fmt::Display for Kind {
             Kind::Deflate => "stream_deflate",
             Kind::RarEngine => "rar_engine",
             Kind::SevenZipEngine => "sevenz_engine",
+            Kind::ZipEngine => "zip_engine",
             Kind::Par2 => "par2",
             Kind::Par3 => "par3",
             Kind::Sfv => "sfv",

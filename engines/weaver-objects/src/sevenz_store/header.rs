@@ -11,8 +11,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 use sevenz_turbo::{Archive, ArchiveLimits, Error, Password};
 use weaver_graph::{ByteRange, Coverage, Provenance};
 
-use super::kept::Kept;
 use crate::grid::crc32;
+use crate::kept::Kept;
 
 pub(super) const SIGNATURE: ByteRange = ByteRange { start: 0, end: 32 };
 

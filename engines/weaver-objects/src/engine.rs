@@ -10,7 +10,9 @@
 // owner; the run reads them back. A format supplies only how its volumes
 // are named and what a run of it is.
 
-use std::collections::BTreeSet;
+mod joined;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
 use bytes::Bytes;
@@ -18,6 +20,8 @@ use weaver_graph::{
     ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, MemberId, Object, Placement, Pull,
     Seek, VolumeIndex, Weight,
 };
+
+pub(crate) use joined::Joined;
 
 // What one engine format knows: its kind, how its set names its volumes,
 // and the run that extracts it.
@@ -29,16 +33,25 @@ pub trait Format: Send + Sync {
 }
 
 // A volume's name as its set numbers it.
-pub trait SetName: Send + Sync {
+pub trait SetName: Send + Sync + Sized {
     // The volume this name is, counted from zero.
     fn index(&self) -> u32;
     fn same_set(&self, other: &Self) -> bool;
+
+    // The volume this name becomes beside the volumes of its set already
+    // bound, by index, or `None` when its place is taken. A name is its own
+    // number; a set whose last volume carries none says otherwise.
+    fn slot(&self, bound: &BTreeMap<u32, Self>) -> Option<u32> {
+        let index = self.index();
+        (!bound.contains_key(&index)).then_some(index)
+    }
 }
 
 pub struct EngineObject<F: Format> {
     format: PhantomData<F>,
-    // The first volume bound, whose name every other volume must share.
-    set: Option<F::Name>,
+    // The names of the volumes bound that name a volume of a set, which
+    // every other volume's must share.
+    names: BTreeMap<u32, F::Name>,
     bound: BTreeSet<u32>,
     password: Option<String>,
     // The furthest volume the run has read, and the volumes already bid for.
@@ -50,7 +63,7 @@ impl<F: Format> Default for EngineObject<F> {
     fn default() -> Self {
         Self {
             format: PhantomData,
-            set: None,
+            names: BTreeMap::new(),
             bound: BTreeSet::new(),
             password: None,
             reached: None,
@@ -114,17 +127,22 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str) {
-        if self.set.is_none() {
-            self.set = F::parse(name);
+        let first = self.names.values().next();
+        if let Some(parsed) = F::parse(name)
+            && first.is_none_or(|first| first.same_set(&parsed))
+        {
+            self.names.insert(volume.0, parsed);
         }
         self.bound.insert(volume.0);
     }
 
     fn claim(&mut self, name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
         let candidate = F::parse(name)?;
-        let index = candidate.index();
-        (self.set.as_ref()?.same_set(&candidate) && !self.bound.contains(&index))
-            .then_some(VolumeIndex(index))
+        let first = self.names.values().next()?;
+        let index = first
+            .same_set(&candidate)
+            .then(|| candidate.slot(&self.names))??;
+        (!self.bound.contains(&index)).then_some(VolumeIndex(index))
     }
 
     fn reads_in_order(&self) -> bool {

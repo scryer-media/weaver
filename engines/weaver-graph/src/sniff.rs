@@ -20,10 +20,10 @@
 // Each minimum is cut short by bytes that already contradict the kind, and
 // by a known length too small to hold it.
 //
-// Engines (`RarEngine`, `SevenZipEngine`) are never sniffed: an engine is
-// chosen when a store object refuses, not by looking at bytes. Raw deflate is
-// never sniffed either: it has no magic and only a zip object knows where it
-// lies.
+// Engines (`RarEngine`, `SevenZipEngine`, `ZipEngine`) are never sniffed: an
+// engine is chosen when a store object refuses, not by looking at bytes. Raw
+// deflate is never sniffed either: it has no magic and only a zip object
+// knows where it lies.
 
 use crate::object::Kind;
 
@@ -626,7 +626,10 @@ mod tests {
         for bytes in samples {
             for name in ["a.rar", "a.7z", "a.deflate", "a.br", "a.sfv"] {
                 if let Sniff::Object(kind) = sniff(name, bytes, None) {
-                    assert!(!matches!(kind, Kind::RarEngine | Kind::SevenZipEngine));
+                    assert!(!matches!(
+                        kind,
+                        Kind::RarEngine | Kind::SevenZipEngine | Kind::ZipEngine
+                    ));
                     assert_ne!(kind, Kind::Deflate);
                 }
             }
