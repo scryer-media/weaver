@@ -169,3 +169,44 @@ fn history_item_has_password_for_a_submitted_or_validated_password() {
         "the marker is not a public attribute"
     );
 }
+
+#[test]
+fn history_item_exposes_posted_file_names_but_not_as_an_attribute() {
+    let row = JobHistoryRow {
+        job_id: 79,
+        job_hash: None,
+        name: "Posted Names".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 2_000,
+        downloaded_bytes: 2_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: Some("/tmp/history".to_string()),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(
+            serde_json::to_string(&vec![(
+                weaver_server_core::ingest::POSTED_FILE_NAMES_METADATA_KEY.to_string(),
+                r#"[{"name":"short.mkv","posted_name":"a much longer posted name.mkv"}]"#
+                    .to_string(),
+            )])
+            .unwrap(),
+        ),
+        server_attribution: None,
+    };
+
+    let item = history_item_from_row(&row, None);
+
+    assert_eq!(item.posted_file_names.len(), 1);
+    assert_eq!(item.posted_file_names[0].name, "short.mkv");
+    assert_eq!(
+        item.posted_file_names[0].posted_name,
+        "a much longer posted name.mkv"
+    );
+    assert!(item.attributes.is_empty());
+}

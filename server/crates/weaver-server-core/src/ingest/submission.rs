@@ -202,6 +202,13 @@ pub fn nzb_to_submission_spec(
         })
         .collect::<Vec<_>>();
     let filenames = unique_download_filenames(filename_candidates.iter().map(String::as_str));
+    let metadata = super::append_posted_file_names_metadata(
+        metadata,
+        filename_candidates
+            .iter()
+            .map(String::as_str)
+            .zip(filenames.iter().map(String::as_str)),
+    );
 
     for (nzb_file, filename) in nzb.files.iter().zip(filenames) {
         let role = FileRole::from_filename(&filename);
@@ -1700,6 +1707,38 @@ mod tests {
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn submission_spec_records_the_posted_name_of_a_shortened_file() {
+        let words = vec!["Harbor"; 60].join(" ");
+        let posted_name = format!("[Fixture] {words} - 07 (1080p) [ABCD1234].mkv");
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@test.com" date="1234567890" subject="&quot;{posted_name}&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="500000" number="1">long-seg1@test.com</segment></segments>
+  </file>
+  <file poster="test@test.com" date="1234567890" subject="&quot;short.nfo&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="500" number="1">short-seg1@test.com</segment></segments>
+  </file>
+</nzb>"#
+        );
+        let nzb = weaver_nzb::parse_nzb(xml.as_bytes()).unwrap();
+
+        let spec = nzb_to_submission_spec(&nzb, None, None, None, Vec::new());
+
+        let disk_name = &spec.files[0].filename;
+        assert!(disk_name.len() < posted_name.len());
+        assert_eq!(
+            crate::ingest::posted_file_names(&spec.metadata),
+            vec![crate::ingest::PostedFileName {
+                name: disk_name.clone(),
+                posted_name,
+            }]
         );
     }
 }

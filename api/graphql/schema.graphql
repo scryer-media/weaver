@@ -862,6 +862,12 @@ type HistoryItem {
 	attention: QueueAttention
 	deleteOperation: HistoryDeleteRowState
 	duplicateSummary: DuplicateSummaryInfo
+	"""
+	The files written under a different name than they were posted with,
+	each with the name the poster gave it. Empty when every file kept its
+	posted name.
+	"""
+	postedFileNames: [PostedFileName!]!
 }
 
 type HistoryPage {
@@ -2064,6 +2070,22 @@ input PostProcessingSettingsInput {
 	Omission keeps the present choice.
 	"""
 	globalScriptsRun: GlobalScriptsRun
+}
+
+"""
+A file Weaver wrote under a different name than it was posted with,
+because the posted name was too long for a filesystem, used characters
+one refuses, or clashed with another file in the job.
+"""
+type PostedFileName {
+	"""
+	The file's name on disk, inside `outputDir`.
+	"""
+	name: String!
+	"""
+	The name the file was posted with.
+	"""
+	postedName: String!
 }
 
 """

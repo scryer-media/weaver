@@ -14,8 +14,9 @@ pub use import::{
     nzb_password_candidates, nzb_to_spec,
 };
 pub use metadata::{
-    ORIGINAL_TITLE_METADATA_KEY, RENAMED_TITLE_METADATA_KEY, append_original_title_metadata,
-    original_release_title, renamed_title, set_renamed_title,
+    ORIGINAL_TITLE_METADATA_KEY, POSTED_FILE_NAMES_METADATA_KEY, PostedFileName,
+    RENAMED_TITLE_METADATA_KEY, append_original_title_metadata, append_posted_file_names_metadata,
+    original_release_title, posted_file_names, renamed_title, set_renamed_title,
 };
 pub use naming::{completed_folder_name, derive_release_name, strip_nzb_source_suffix};
 pub use persisted_nzb::{

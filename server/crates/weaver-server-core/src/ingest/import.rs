@@ -68,10 +68,18 @@ pub fn nzb_to_spec(
 
     let mut files = Vec::with_capacity(nzb.files.len());
     let mut total_bytes: u64 = 0;
-    let filenames = unique_download_filenames(
-        nzb.files
+    let posted_names = nzb
+        .files
+        .iter()
+        .map(|nzb_file| nzb_file.filename().unwrap_or("unknown"))
+        .collect::<Vec<_>>();
+    let filenames = unique_download_filenames(posted_names.iter().copied());
+    let metadata = super::append_posted_file_names_metadata(
+        metadata,
+        posted_names
             .iter()
-            .map(|nzb_file| nzb_file.filename().unwrap_or("unknown")),
+            .copied()
+            .zip(filenames.iter().map(String::as_str)),
     );
 
     for (nzb_file, filename) in nzb.files.iter().zip(filenames) {
