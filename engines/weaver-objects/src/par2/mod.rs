@@ -46,6 +46,8 @@ pub struct Par2 {
     needed: u64,
     // Damaged slices the grid shows, recounted after the evidence changes.
     seen_damaged: Option<u64>,
+    // What the last repair came to, for the members bound then.
+    outcome: Option<RepairOutcome>,
 }
 
 impl Par2 {
@@ -58,7 +60,15 @@ impl Par2 {
             lengths: BTreeMap::new(),
             needed: 0,
             seen_damaged: None,
+            outcome: None,
         }
+    }
+
+    fn covered_members(&self) -> BTreeSet<MemberId> {
+        self.sets
+            .values()
+            .flat_map(|state| state.members.values().copied())
+            .collect()
     }
 
     // Set keys in the order their first packets were found.
@@ -244,13 +254,18 @@ impl Object for Par2 {
         Some(VolumeIndex((self.volumes.len() - 1) as u32))
     }
 
-    fn recovery(&mut self) -> Option<&mut dyn Recovery> {
+    fn recovery(&self) -> Option<&dyn Recovery> {
+        Some(self)
+    }
+
+    fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {
         Some(self)
     }
 }
 
 impl Recovery for Par2 {
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
+        let before = self.covered_members();
         for key in self.ordered() {
             let Some(state) = self.sets.get_mut(&key) else {
                 continue;
@@ -290,6 +305,9 @@ impl Recovery for Par2 {
             })
             .collect();
         self.seen_damaged = None;
+        if self.covered_members() != before {
+            self.outcome = None;
+        }
     }
 
     fn covers(&self, member: MemberId) -> bool {
@@ -375,7 +393,12 @@ impl Recovery for Par2 {
             outcome = combine(outcome, result.outcome);
         }
         self.needed = waiting;
+        self.outcome = Some(outcome);
         outcome
+    }
+
+    fn outcome(&self) -> Option<RepairOutcome> {
+        self.outcome
     }
 
     fn blocks_reachable(&self) -> u64 {

@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use weaver_graph::{ByteRange, Kind, MemberId, NodeId, Tree, VolumeIndex, Weight};
+use weaver_graph::{ByteRange, MemberId, NodeId, Tree, VolumeIndex, Weight};
 
 use super::source::ArticleMap;
 use super::window::{Bid, Window};
@@ -26,12 +26,7 @@ pub(crate) const BOOTSTRAP_VOLUMES: usize = 4;
 // Bid the leading volumes of every set still being fetched: from its first
 // volume on, past the ones already in hand, stopping at the first volume no
 // member has been bound to yet.
-pub(crate) fn bootstrap(
-    tree: &Tree,
-    map: &ArticleMap,
-    kind: impl Fn(NodeId) -> Option<Kind>,
-    window: &mut Window,
-) {
+pub(crate) fn bootstrap(tree: &Tree, map: &ArticleMap, window: &mut Window) {
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return;
     };
@@ -44,10 +39,7 @@ pub(crate) fn bootstrap(
         }
     }
     for (set, volumes) in sets {
-        let Some(set_kind) = kind(set) else {
-            continue;
-        };
-        if set_kind.is_recovery() {
+        if tree.recovers(set) {
             continue;
         }
         let mut asked = 0;
@@ -63,7 +55,7 @@ pub(crate) fn bootstrap(
                 range: ByteRange::new(0, u64::MAX),
                 weight: Weight::FIRST,
                 bidder: set,
-                in_order: reads_in_order(set_kind),
+                in_order: tree.reads_in_order(set),
             });
             asked += 1;
         }
@@ -73,10 +65,4 @@ pub(crate) fn bootstrap(
 // A root member is the root volume of the same index.
 pub(crate) fn root_volume(member: MemberId) -> VolumeIndex {
     VolumeIndex(member.0)
-}
-
-// An engine or a stream can use a volume only once every volume before it
-// has been read.
-pub(crate) fn reads_in_order(kind: Kind) -> bool {
-    kind.is_engine() || kind.is_stream()
 }

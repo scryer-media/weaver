@@ -6174,6 +6174,7 @@ dependencies = [
  "weaver-model",
  "weaver-nntp",
  "weaver-nzb",
+ "weaver-objects",
  "weaver-tunnel",
  "weaver-yenc",
  "windows-sys 0.61.2",

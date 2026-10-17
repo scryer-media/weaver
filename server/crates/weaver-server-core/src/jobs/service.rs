@@ -1239,9 +1239,12 @@ impl Pipeline {
                 );
             }
 
+            // A reprocessed job is a new admission, so it takes the engine
+            // the switch names now, like any other.
+            let engine = crate::pipeline::graph::Engine::from_environment();
             self.db
                 .create_active_job(&crate::ActiveJob {
-                    engine: crate::pipeline::graph::Engine::Classic,
+                    engine,
                     job_id,
                     nzb_hash,
                     nzb_path,
@@ -1324,6 +1327,7 @@ impl Pipeline {
             self.install_repeated_articles(&state)?;
             self.job_scheduling_memory.insert(job_id, scheduling_memory);
             self.jobs.insert(job_id, state);
+            self.admit_graph_job(job_id, engine);
             if let Some(file_identities) = self
                 .jobs
                 .get(&job_id)

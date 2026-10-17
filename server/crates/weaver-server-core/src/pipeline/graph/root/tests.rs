@@ -6,24 +6,26 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{
-    Builder, ByteRange, Delivery, Effect, Emit, Extent, Kind, MemberId, NodeId, Object, ObjectId,
-    Placement, Provenance, Pull, Seek, Tree, VolumeIndex, Weight,
+    Builder, ByteRange, Delivery, Emit, Extent, Kind, MemberId, NodeId, Object, ObjectId,
+    Placement, Pull, Seek, VolumeIndex, Weight,
 };
 use weaver_model::files::FileRole;
 
 use super::intake::Decoded;
-use super::phase::{Activity, RootPhase};
+use super::phase::{self, Activity, RootPhase};
 use super::seams::apply_moves;
 use super::source::{Class, Move};
 use super::window::{WINDOW_IN_ORDER_VOLUMES, WINDOW_VOLUMES};
 use super::{ArticleRoot, Ask};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
+use crate::operations::disk::CapacityReader;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::pipeline::graph::Engine;
-use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Sink};
-use crate::pipeline::graph::namespace::{Arrival, Segments};
+use crate::pipeline::graph::job::{GraphJob, RootFile};
+use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::tests::{
     insert_active_job, new_direct_pipeline, retire_pipeline_database, sample_nzb_zstd,
 };
@@ -31,6 +33,7 @@ use crate::pipeline::{
     DecodeResult, DecodedChunk, SegmentEncoding, SegmentSource, SegmentTerminalState,
     YencLayoutAssertions,
 };
+use weaver_graph::recovery::RepairOutcome;
 
 const ZIP_FRONT: &[u8] = b"PK\x03\x04";
 
@@ -77,47 +80,6 @@ impl Builder for Probes {
     }
 }
 
-// The namespace write path's stand-in: routes through the tree and keeps
-// every delivery it was handed.
-#[derive(Clone, Default)]
-struct Recording {
-    arrivals: Arc<Mutex<Vec<Arrival>>>,
-}
-
-impl Sink for Recording {
-    fn deliver(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        _: &dyn Segments,
-        arrival: Arrival,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), GraphError> {
-        self.arrivals.lock().unwrap().push(arrival.clone());
-        tree.deliver(
-            arrival.node,
-            arrival.member,
-            arrival.offset,
-            arrival.bytes,
-            arrival.provenance,
-            builder,
-            out,
-        );
-        Ok(())
-    }
-
-    fn apply(
-        &mut self,
-        _: &mut Tree,
-        _: &mut dyn Builder,
-        effects: Vec<Effect>,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), GraphError> {
-        out.extend(effects);
-        Ok(())
-    }
-}
-
 fn file(name: &str, sizes: &[u32]) -> RootFile {
     RootFile {
         name: name.to_string(),
@@ -129,15 +91,31 @@ fn file(name: &str, sizes: &[u32]) -> RootFile {
     }
 }
 
-fn job_with(files: &[RootFile], wants: Vec<Seek>) -> (GraphJob, Recording, Arc<Mutex<Vec<Pull>>>) {
+// A job whose files go to a fresh directory, kept for as long as the
+// returned handle lives.
+fn job_with(
+    files: &[RootFile],
+    wants: Vec<Seek>,
+) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
     let answers = Arc::new(Mutex::new(Vec::new()));
-    let sink = Recording::default();
     let builder = Probes {
         wants,
         answers: Arc::clone(&answers),
     };
-    let job = GraphJob::new(files, Box::new(builder), Box::new(sink.clone()));
-    (job, sink, answers)
+    let dir = tempfile::tempdir().unwrap();
+    let writer = NamespaceWriter::new(
+        1,
+        dir.path().to_path_buf(),
+        Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: u64::MAX,
+            scratch_total: u64::MAX,
+            scratch_ceiling: u64::MAX,
+            disk_reserve: 0,
+        })),
+        CapacityReader::unknown(),
+    );
+    let job = GraphJob::new(files, Box::new(builder), writer);
+    (job, dir, answers)
 }
 
 fn decoded(volume: u32, ordinal: u32, offset: u64, bytes: &[u8], length: Option<u64>) -> Decoded {
@@ -278,6 +256,15 @@ fn the_phase_is_the_first_state_that_holds() {
         RootPhase::derive(false, Activity::Idle, false),
         RootPhase::Done
     );
+    assert_eq!(phase::activity([]), Activity::Idle);
+    assert_eq!(
+        phase::activity([Some(RepairOutcome::Clean), None]),
+        Activity::Verifying
+    );
+    assert_eq!(
+        phase::activity([None, Some(RepairOutcome::Waiting)]),
+        Activity::Repairing
+    );
     assert_eq!(RootPhase::Done.job_status(), None);
     assert_eq!(
         RootPhase::Extracting.job_status(),
@@ -289,24 +276,19 @@ fn the_phase_is_the_first_state_that_holds() {
 #[test]
 fn a_graph_job_reports_each_phase_as_its_tree_moves() {
     let files = [file("inner.zip", &[100]), file("plain.bin", &[100])];
-    let (mut job, _, _) = job_with(&files, Vec::new());
+    let (mut job, _dir, _) = job_with(&files, Vec::new());
     assert_eq!(job.phase_change(), Some(RootPhase::Downloading));
     assert_eq!(job.phase_change(), None);
 
     job.intake(decoded(1, 0, 0, &[7; 90], Some(90))).unwrap();
-    job.set_activity(Activity::Verifying);
     assert_eq!(job.phase(), RootPhase::Downloading);
 
     job.intake(decoded(0, 0, 0, &zip_front(90), Some(90)))
         .unwrap();
-    assert_eq!(job.phase(), RootPhase::Verifying);
-    job.set_activity(Activity::Repairing);
-    assert_eq!(job.phase(), RootPhase::Repairing);
-    job.set_activity(Activity::Idle);
-    // The zip object has produced no member yet.
+    // Nothing recovers, and the zip object has produced no member yet.
     assert_eq!(job.phase(), RootPhase::Extracting);
 
-    let (mut plain, _, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
+    let (mut plain, _plain_dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
     plain.intake(decoded(0, 0, 0, &[7; 90], Some(90))).unwrap();
     assert_eq!(plain.phase(), RootPhase::Done);
 }
@@ -318,7 +300,7 @@ fn a_data_seek_moves_the_articles_that_cover_it_into_the_window() {
         ByteRange::new(150, 160),
         Weight(1),
     )];
-    let (mut job, _, answers) = job_with(&[file("inner.zip", &[100, 100, 100])], wants);
+    let (mut job, _dir, answers) = job_with(&[file("inner.zip", &[100, 100, 100])], wants);
     // The first article binds the zip object and says how long the file is,
     // which pins where the second article's bytes can lie.
     job.intake(decoded(0, 0, 0, &zip_front(90), Some(270)))
@@ -326,13 +308,22 @@ fn a_data_seek_moves_the_articles_that_cover_it_into_the_window() {
 
     let moves = job.seek_round(|_| true).unwrap();
 
+    // The seek moves its article; the bootstrap leads the bound set's
+    // first volume, so the rest of it follows into the window.
     assert_eq!(
         moves,
-        vec![Move {
-            volume: VolumeIndex(0),
-            ordinal: 1,
-            class: Class::Window(0),
-        }]
+        vec![
+            Move {
+                volume: VolumeIndex(0),
+                ordinal: 1,
+                class: Class::Window(0),
+            },
+            Move {
+                volume: VolumeIndex(0),
+                ordinal: 2,
+                class: Class::Window(0),
+            }
+        ]
     );
     assert_eq!(*answers.lock().unwrap(), vec![Pull::Moved(1)]);
 }
@@ -385,7 +376,7 @@ async fn a_recovery_seek_lands_in_the_promoted_class() {
         ByteRange::new(64, 65),
         Weight(1),
     )];
-    let (mut job, _, answers) = job_with(
+    let (mut job, _dir, answers) = job_with(
         &[file("inner.zip", &[64, 64]), file("blocks.par2", &[64])],
         wants,
     );
@@ -505,14 +496,14 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
 #[tokio::test]
 async fn a_lost_article_marks_its_range_damaged() {
     // Both edges known: the range is exact.
-    let (mut job, _, _) = job_with(&[file("plain.bin", &[100, 100, 100])], Vec::new());
+    let (mut job, _dir, _) = job_with(&[file("plain.bin", &[100, 100, 100])], Vec::new());
     job.intake(decoded(0, 0, 0, &[7; 90], Some(270))).unwrap();
     job.intake(decoded(0, 2, 180, &[7; 90], Some(270))).unwrap();
     job.lost(VolumeIndex(0), 1).unwrap();
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 180)]);
 
     // An unknown end: once nothing else can arrive, the widest bound.
-    let (mut job, _, _) = job_with(&[file("plain.bin", &[100, 100])], Vec::new());
+    let (mut job, _dir, _) = job_with(&[file("plain.bin", &[100, 100])], Vec::new());
     job.intake(decoded(0, 0, 0, &[7; 90], None)).unwrap();
     job.lost(VolumeIndex(0), 1).unwrap();
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 190)]);
@@ -554,15 +545,16 @@ async fn a_lost_article_marks_its_range_damaged() {
 
 #[tokio::test]
 async fn a_damaged_yenc_article_is_delivered_as_damaged() {
-    let (mut job, sink, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
+    let (mut job, dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
     let mut article = decoded(0, 0, 0, &[7; 90], Some(90));
     article.intact = false;
     job.intake(article).unwrap();
-    let arrivals = sink.arrivals.lock().unwrap();
-    assert_eq!(arrivals.len(), 1);
-    assert_eq!(arrivals[0].provenance, Provenance::Damaged);
-    drop(arrivals);
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(0, 90)]);
+    assert_eq!(
+        std::fs::read(dir.path().join("plain.bin")).unwrap(),
+        vec![7; 90],
+        "damaged bytes are written all the same"
+    );
 
     // Through the decode path: a checksum mismatch is damage.
     let temp_dir = tempfile::tempdir().unwrap();

@@ -29,6 +29,7 @@ artifact-trust = { git = "https://github.com/scryer-media/artifact-trust", tag =
     "verification",
 ] }
 weaver-graph = { path = "../../../engines/weaver-graph" }
+weaver-objects = { path = "../../../engines/weaver-objects" }
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }

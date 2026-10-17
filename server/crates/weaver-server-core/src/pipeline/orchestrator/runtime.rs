@@ -236,6 +236,9 @@ impl Pipeline {
         );
         let bandwidth_ledger = BandwidthLedgerRuntime::default();
 
+        let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
+            crate::pipeline::graph::limits::budgets(&direct_store_settings, &tuner).0,
+        ));
         let mut pipeline = Self {
             cmd_rx,
             event_tx,
@@ -247,6 +250,8 @@ impl Pipeline {
             metrics,
             jobs: HashMap::new(),
             graph_jobs: HashMap::new(),
+            graph_status: Default::default(),
+            graph_holds,
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             archive_password_winners: HashMap::new(),

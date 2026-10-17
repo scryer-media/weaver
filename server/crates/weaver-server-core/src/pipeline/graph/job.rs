@@ -2,117 +2,66 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // One graph job's runtime: its tree, its article root, the builder its
-// objects come from, and the sink its bytes go to. The pipeline holds one per
-// job admitted under the graph engine and hands it what the download and
-// decode paths learn; nothing else of the pipeline reaches into the tree.
+// objects come from, and the namespace writer its bytes go through. The
+// pipeline holds one per job admitted under the graph engine and hands it
+// what the download and decode paths learn; nothing else of the pipeline
+// reaches into the tree, and nothing else writes the job's files.
 
-use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use tracing::warn;
+use weaver_graph::holds::HoldsAccountant;
+use weaver_graph::recovery::{RepairOutcome, SliceVerdict};
 use weaver_graph::{
-    Builder, Effect, Kind, MemberId, NodeId, Object, ObjectId, Pull, Seek, SeekUp, Tree,
-    VolumeIndex,
+    Builder, Effect, Kind, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
 };
 
 use super::Engine;
-use super::namespace::{Arrival, Segments};
+use super::namespace::{NamespaceWriter, WriteError};
 use super::root::intake::Decoded;
-use super::root::phase::{self, Activity, RootPhase};
-use super::root::sample::{self, reads_in_order};
+use super::root::phase::{self, RootPhase};
+use super::root::sample;
 use super::root::source::Move;
 use super::root::{ArticleRoot, Ask};
+use crate::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraphError {
     #[error("the namespace write path failed")]
-    Write(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Write(#[from] WriteError),
 }
 
-// Where the root's bytes and the tree's effects go: the namespace write path.
-// Kept behind a trait so the root never depends on how a namespace writes.
-pub(crate) trait Sink: Send + Sync {
-    // Bytes of a member, through the write path. The effects it leaves for
-    // the job's owner come back in `out`.
-    fn deliver(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        segments: &dyn Segments,
-        arrival: Arrival,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), GraphError>;
-
-    // Effects the tree raised outside a delivery: an answered seek, a range
-    // marked damaged. The ones left for the owner come back in `out`.
-    fn apply(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        effects: Vec<Effect>,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), GraphError>;
+// Where a graph job writes and what it may hold: its working directory, the
+// process-wide holds accountant every job shares, and the free space of the
+// volume its scratch lives on.
+pub(crate) struct Storage {
+    pub(crate) working_dir: PathBuf,
+    pub(crate) accountant: Arc<HoldsAccountant>,
+    pub(crate) free_disk: CapacityReader,
 }
 
-// The builder before any format's object exists: every member is a leaf.
-pub(crate) struct NoObjects;
-
-impl Builder for NoObjects {
-    fn build(&mut self, _: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
-        None
-    }
-}
-
-// The sink while the classic path still writes every byte: the tree records
-// coverage and routes, and leaf writes are left to the classic path.
-pub(crate) struct Shadow;
-
-impl Sink for Shadow {
-    fn deliver(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        _: &dyn Segments,
-        arrival: Arrival,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), GraphError> {
-        let mut effects = Vec::new();
-        tree.deliver(
-            arrival.node,
-            arrival.member,
-            arrival.offset,
-            arrival.bytes,
-            arrival.provenance,
-            builder,
-            &mut effects,
-        );
-        self.apply(tree, builder, effects, out)
-    }
-
-    fn apply(
-        &mut self,
-        _: &mut Tree,
-        _: &mut dyn Builder,
-        effects: Vec<Effect>,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), GraphError> {
-        out.extend(
-            effects
-                .into_iter()
-                .filter(|effect| !matches!(effect, Effect::WriteLeaf { .. })),
-        );
-        Ok(())
-    }
+// What one recovery object says of the members it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecoverySummary {
+    // The tree node the object is. One PAR2 object holds every PAR2 set of
+    // its namespace, so this is per object, not per set id.
+    pub(crate) node: NodeId,
+    pub(crate) kind: Kind,
+    // Recovery blocks in hand or still on their way.
+    pub(crate) blocks_reachable: u64,
+    // Slices the evidence in hand says are damaged, over every member the
+    // object covers.
+    pub(crate) damaged_slices: u64,
+    // What its last repair came to; `None` before it ran one.
+    pub(crate) outcome: Option<RepairOutcome>,
 }
 
 pub(crate) struct GraphJob {
     tree: Tree,
     root: ArticleRoot,
     builder: Box<dyn Builder + Send + Sync>,
-    sink: Box<dyn Sink>,
-    // What each bound node is, from the tree's own announcements.
-    kinds: BTreeMap<NodeId, Kind>,
-    activity: Activity,
-    // A recovery object has said what the members are called.
-    names_trusted: bool,
+    writer: NamespaceWriter,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
 }
@@ -127,29 +76,53 @@ pub(crate) struct RootFile {
 
 impl GraphJob {
     // The runtime a job admitted under `engine` gets, if any: a classic job
-    // has none.
-    pub(crate) fn for_engine(engine: Engine, files: &[RootFile]) -> Option<Self> {
-        (engine == Engine::Graph).then(|| Self::new(files, Box::new(NoObjects), Box::new(Shadow)))
+    // has none. `scope` is the job's process-wide id.
+    pub(crate) fn for_engine(
+        engine: Engine,
+        scope: u64,
+        files: &[RootFile],
+        storage: Storage,
+    ) -> Option<Self> {
+        (engine == Engine::Graph).then(|| {
+            let writer = NamespaceWriter::new(
+                scope,
+                storage.working_dir,
+                storage.accountant,
+                storage.free_disk,
+            );
+            Self::new(files, Box::new(weaver_objects::Objects), writer)
+        })
     }
 
     pub(crate) fn new(
         files: &[RootFile],
-        builder: Box<dyn Builder + Send + Sync>,
-        sink: Box<dyn Sink>,
+        mut builder: Box<dyn Builder + Send + Sync>,
+        mut writer: NamespaceWriter,
     ) -> Self {
         let mut tree = Tree::new();
-        for file in files {
-            tree.announce_root(&file.name, None);
-        }
         let volumes: Vec<_> = files.iter().map(|file| file.articles.clone()).collect();
+        let root = ArticleRoot::new(&volumes);
+        let mut out = Vec::new();
+        for file in files {
+            let member = tree.announce_root(&file.name, None);
+            // A member that cannot be announced still downloads; its first
+            // write reports the same failure where a step can carry it.
+            if let Err(error) = writer.announced(
+                &mut tree,
+                &mut *builder,
+                &root,
+                NodeId::ROOT,
+                member,
+                &mut out,
+            ) {
+                warn!(member = member.0, error = %error, "graph member announcement failed");
+            }
+        }
         Self {
             tree,
-            root: ArticleRoot::new(&volumes),
+            root,
             builder,
-            sink,
-            kinds: BTreeMap::new(),
-            activity: Activity::Idle,
-            names_trusted: false,
+            writer,
             reported: None,
         }
     }
@@ -160,6 +133,74 @@ impl GraphJob {
 
     pub(crate) fn root(&self) -> &ArticleRoot {
         &self.root
+    }
+
+    pub(crate) fn writer(&self) -> &NamespaceWriter {
+        &self.writer
+    }
+
+    // Seam for completion, status and health: where the job stands, read
+    // off the tree. Stable.
+    pub(crate) fn phase(&self) -> RootPhase {
+        let tree = &self.tree;
+        let activity = phase::activity(
+            tree.recovery_nodes(NodeId::ROOT)
+                .into_iter()
+                .map(|node| tree.recovery(node).and_then(|recovery| recovery.outcome())),
+        );
+        RootPhase::derive(self.payload_waiting(), activity, phase::extracting(tree))
+    }
+
+    // Seam for completion, status and health: the root namespace, which is
+    // the job's claim on its members. Its members, their coverage,
+    // `is_clean`, `damaged_ranges` and each member's `output_name` are the
+    // job's files as the graph sees them. Stable.
+    pub(crate) fn namespace(&self) -> &Namespace {
+        self.tree
+            .namespace(NodeId::ROOT)
+            .expect("the root namespace lives as long as the tree")
+    }
+
+    // Seam for completion, status and health: each recovery object of the
+    // root namespace, with the blocks it can reach and the slices it knows
+    // are damaged. Stable.
+    pub(crate) fn recovery_summary(&self) -> Vec<RecoverySummary> {
+        let tree = &self.tree;
+        let mut verdicts = Vec::new();
+        tree.recovery_nodes(NodeId::ROOT)
+            .into_iter()
+            .filter_map(|node| {
+                let (kind, recovery) = (tree.kind(node)?, tree.recovery(node)?);
+                verdicts.clear();
+                for member in self.namespace().members() {
+                    if recovery.covers(member.id) {
+                        recovery.verdicts(member.id, &mut verdicts);
+                    }
+                }
+                let damaged_slices = verdicts
+                    .iter()
+                    .filter(|verdict| **verdict == SliceVerdict::Damaged)
+                    .count() as u64;
+                Some(RecoverySummary {
+                    node,
+                    kind,
+                    blocks_reachable: recovery.blocks_reachable(),
+                    damaged_slices,
+                    outcome: recovery.outcome(),
+                })
+            })
+            .collect()
+    }
+
+    // Seam for completion, status and health: every root member written to
+    // a file of its own, leaves and recovery volumes alike, with the path
+    // it is written at. A member bound to an object that places its bytes
+    // elsewhere has none. Stable.
+    pub(crate) fn member_files(&self) -> Vec<(MemberId, PathBuf)> {
+        self.writer
+            .files(NodeId::ROOT)
+            .map(|(member, path)| (member, path.to_path_buf()))
+            .collect()
     }
 
     // Articles the queues do not hold were fetched by an earlier run.
@@ -173,43 +214,109 @@ impl GraphJob {
         self.root.map.take_moves()
     }
 
-    // A recovery object bound the members' names; the sets they form can
-    // be bootstrapped from now on.
-    pub(crate) fn trust_names(&mut self) {
-        self.names_trusted = true;
-    }
-
-    pub(crate) fn set_activity(&mut self, activity: Activity) {
-        self.activity = activity;
-    }
-
     pub(crate) fn intake(&mut self, decoded: Decoded) -> Result<(), GraphError> {
-        if let Some(length) = decoded.length
-            && let Some(member) = self
-                .tree
-                .namespace_mut(NodeId::ROOT)
-                .and_then(|namespace| namespace.get_mut(MemberId(decoded.volume.0)))
-            && member.length.is_none()
-        {
-            member.length = Some(length);
-        }
+        let volume = decoded.volume;
+        let member = MemberId(volume.0);
+        let length = decoded.length;
         let arrival = self.root.receive(decoded);
-        let mut out = Vec::new();
-        self.sink.deliver(
+        if let Some(length) = length {
+            self.writer
+                .length_learned(&mut self.tree, &self.root, NodeId::ROOT, member, length)?;
+        }
+        self.writer.deliver(
             &mut self.tree,
             &mut *self.builder,
             &self.root,
             arrival,
-            &mut out,
+            &mut Vec::new(),
         )?;
-        self.observe(&out);
-        self.mark_damage()
+        self.mark_damage()?;
+        self.after_member(volume)
     }
 
     // Every server failed the article; nothing will fetch it again.
     pub(crate) fn lost(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
         self.root.map.lost(volume, ordinal);
-        self.mark_damage()
+        self.mark_damage()?;
+        self.after_member(volume)
+    }
+
+    // After an article of `volume` was settled: a member with nothing left
+    // to fetch is closed, and the root's recovery objects repair when what
+    // they cover is in or what they waited for arrived.
+    fn after_member(&mut self, volume: VolumeIndex) -> Result<(), GraphError> {
+        let member = MemberId(volume.0);
+        if !self.root.map.volume_waiting(volume) && !self.closed(member) {
+            self.writer.close(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                NodeId::ROOT,
+                member,
+                &mut Vec::new(),
+            )?;
+        }
+        self.repair(member)
+    }
+
+    fn closed(&self, member: MemberId) -> bool {
+        self.namespace()
+            .get(member)
+            .is_some_and(|record| record.closed)
+    }
+
+    fn is_recovery_volume(&self, member: MemberId) -> Option<NodeId> {
+        self.tree
+            .child_of(NodeId::ROOT, member)
+            .map(|(child, _)| child)
+            .filter(|child| self.tree.recovers(*child))
+    }
+
+    // A root member that is not a recovery volume still has articles to
+    // come. Recovery volumes are left out: their articles stay parked until
+    // a repair asks for them. Root members are numbered as the volumes they
+    // are.
+    fn payload_waiting(&self) -> bool {
+        self.namespace().members().any(|member| {
+            self.is_recovery_volume(member.id).is_none()
+                && self.root.map.volume_waiting(VolumeIndex(member.id.0))
+        })
+    }
+
+    // Let the root's recovery objects that have something to say verify and
+    // repair: one that has not ruled on the members it covers rules once
+    // they are all closed, and one waiting on its own volumes rules again
+    // when `settled`, the member just settled, is one of them. What they
+    // rewrote comes back down as repaired bytes; what they still need they
+    // ask for in the next seek round.
+    fn repair(&mut self, settled: MemberId) -> Result<(), GraphError> {
+        let tree = &self.tree;
+        let due = tree.recovery_nodes(NodeId::ROOT).into_iter().any(|node| {
+            let Some(recovery) = tree.recovery(node) else {
+                return false;
+            };
+            match recovery.outcome() {
+                None => self
+                    .namespace()
+                    .members()
+                    .all(|member| !recovery.covers(member.id) || member.closed),
+                Some(RepairOutcome::Waiting) => {
+                    self.is_recovery_volume(settled) == Some(node) && self.closed(settled)
+                }
+                Some(_) => false,
+            }
+        });
+        if !due {
+            return Ok(());
+        }
+        self.writer.repair(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            NodeId::ROOT,
+            &mut Vec::new(),
+        )?;
+        Ok(())
     }
 
     // Ranges of lost articles become damage in the tree as soon as they can
@@ -229,15 +336,7 @@ impl GraphJob {
         &mut self,
         queued: impl FnMut(VolumeIndex) -> bool,
     ) -> Result<Vec<Move>, GraphError> {
-        if self.names_trusted {
-            let kinds = &self.kinds;
-            sample::bootstrap(
-                &self.tree,
-                &self.root.map,
-                |node| kinds.get(&node).copied(),
-                &mut self.root.window,
-            );
-        }
+        sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
         let mut wants = Vec::new();
         self.tree.collect_wants(&mut wants);
         let mut asks = Vec::new();
@@ -247,10 +346,7 @@ impl GraphJob {
             let mut recorder = Recorder {
                 asks: &mut asks,
                 bidder: node,
-                in_order: self
-                    .kinds
-                    .get(&node)
-                    .is_some_and(|kind| reads_in_order(*kind)),
+                in_order: self.tree.reads_in_order(node),
             };
             let pull = self.tree.lift(node, seek, &mut recorder);
             lifted.push((node, seek, pull, start..asks.len()));
@@ -277,31 +373,18 @@ impl GraphJob {
         })
     }
 
-    pub(crate) fn phase(&self) -> RootPhase {
-        RootPhase::derive(
-            self.root.map.waiting(),
-            self.activity,
-            phase::extracting(&self.tree, &self.kinds),
-        )
-    }
-
     fn settle(&mut self, effects: Vec<Effect>) -> Result<(), GraphError> {
         if effects.is_empty() {
             return Ok(());
         }
-        let mut out = Vec::new();
-        self.sink
-            .apply(&mut self.tree, &mut *self.builder, effects, &mut out)?;
-        self.observe(&out);
+        self.writer.apply_all(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            effects,
+            &mut Vec::new(),
+        )?;
         Ok(())
-    }
-
-    fn observe(&mut self, effects: &[Effect]) {
-        for effect in effects {
-            if let Effect::Bound { kind, child, .. } = effect {
-                self.kinds.insert(*child, *kind);
-            }
-        }
     }
 }
 

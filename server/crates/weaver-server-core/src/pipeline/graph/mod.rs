@@ -12,6 +12,7 @@ pub(crate) mod leaf;
 pub(crate) mod limits;
 pub(crate) mod namespace;
 pub(crate) mod root;
+pub(crate) mod status;
 
 use std::fmt;
 use std::str::FromStr;
@@ -108,52 +109,4 @@ impl fmt::Display for Engine {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_defaults_to_classic_when_unset_or_blank() {
-        assert_eq!(Engine::parse(None), Engine::Classic);
-        assert_eq!(Engine::parse(Some("")), Engine::Classic);
-        assert_eq!(Engine::parse(Some("  ")), Engine::Classic);
-        assert_eq!(Engine::default(), Engine::Classic);
-    }
-
-    #[test]
-    fn parse_reads_both_engines() {
-        assert_eq!(Engine::parse(Some("classic")), Engine::Classic);
-        assert_eq!(Engine::parse(Some("graph")), Engine::Graph);
-    }
-
-    #[test]
-    fn parse_ignores_case() {
-        assert_eq!(Engine::parse(Some("GRAPH")), Engine::Graph);
-        assert_eq!(Engine::parse(Some("Graph")), Engine::Graph);
-        assert_eq!(Engine::parse(Some("ClAsSiC")), Engine::Classic);
-        assert_eq!(Engine::parse(Some(" graph ")), Engine::Graph);
-    }
-
-    #[test]
-    fn parse_falls_back_to_classic_on_an_unknown_value() {
-        assert_eq!(Engine::parse(Some("turbo")), Engine::Classic);
-        assert_eq!(Engine::parse(Some("graph2")), Engine::Classic);
-    }
-
-    #[test]
-    fn spelling_round_trips() {
-        for engine in [Engine::Classic, Engine::Graph] {
-            assert_eq!(engine.as_str().parse::<Engine>(), Ok(engine));
-            assert_eq!(engine.to_string(), engine.as_str());
-        }
-        assert_eq!(
-            "turbo".parse::<Engine>(),
-            Err(UnknownEngine("turbo".to_string()))
-        );
-    }
-
-    #[test]
-    fn classic_switches_apply_only_to_classic() {
-        assert!(Engine::Classic.classic_switches_apply());
-        assert!(!Engine::Graph.classic_switches_apply());
-    }
-}
+mod tests;

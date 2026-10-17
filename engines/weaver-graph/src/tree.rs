@@ -183,7 +183,7 @@ impl Tree {
         // The object steps out of its node for the call, so the parent's
         // namespace can be borrowed beside it; it steps back in after.
         let mut object = found.object.take()?;
-        let result = match (object.recovery(), self.nodes.get_mut(&parent)) {
+        let result = match (object.recovery_mut(), self.nodes.get_mut(&parent)) {
             (Some(recovery), Some(parent)) => Some(act(recovery, &mut parent.namespace)),
             _ => None,
         };
@@ -191,6 +191,104 @@ impl Tree {
             found.object = Some(object);
         }
         result
+    }
+
+    fn object(&self, node: NodeId) -> Option<&dyn Object> {
+        self.nodes.get(&node)?.object.as_deref()
+    }
+
+    // What the object at `node` is. `None` for the root and for a node
+    // whose object is lent out.
+    pub fn kind(&self, node: NodeId) -> Option<Kind> {
+        self.object(node).map(Object::kind)
+    }
+
+    pub fn reads_in_order(&self, node: NodeId) -> bool {
+        self.object(node).is_some_and(Object::reads_in_order)
+    }
+
+    // The recovery face of the object at `node`, if it has one.
+    pub fn recovery(&self, node: NodeId) -> Option<&dyn Recovery> {
+        self.object(node)?.recovery()
+    }
+
+    pub fn recovers(&self, node: NodeId) -> bool {
+        self.recovery(node).is_some()
+    }
+
+    // The recovery objects bound in `node`'s namespace, in binding order:
+    // the ones that cover its members.
+    pub fn recovery_nodes(&self, node: NodeId) -> Vec<NodeId> {
+        let mut found = Vec::new();
+        if let Some(parent) = self.nodes.get(&node) {
+            for (child, _) in parent.children.values() {
+                if !found.contains(child) && self.recovers(*child) {
+                    found.push(*child);
+                }
+            }
+        }
+        found
+    }
+
+    // Nothing more will arrive for a member of `node`'s namespace. It takes
+    // the length it reached when it declared none, the object it is bound
+    // to hears that its volume is closed, and the owner closes its file.
+    pub fn close(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(found) = self.nodes.get_mut(&node) else {
+            return;
+        };
+        let Some(record) = found.namespace.get_mut(member) else {
+            return;
+        };
+        if record.closed {
+            return;
+        }
+        record.closed = true;
+        let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
+        record.length.get_or_insert(reached);
+        if let Some((child, volume)) = found.children.get(&member).copied() {
+            let mut emits = std::mem::take(&mut self.emits);
+            emits.clear();
+            if let Some(object) = self
+                .nodes
+                .get_mut(&child)
+                .and_then(|found| found.object.as_mut())
+            {
+                object.volume_closed(volume, &mut emits);
+            }
+            self.apply(child, &mut emits, builder, effects);
+            self.emits = emits;
+        }
+        effects.push(Effect::Closed { node, member });
+    }
+
+    // Lend the object at `node` out of the tree, so the owner can run it
+    // against the rest of the tree, which stays readable: a recovery object
+    // repairing reads the members and volumes around it. While it is out the
+    // node answers nothing; `put_object` brings it back.
+    pub fn take_object(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
+        self.nodes.get_mut(&node)?.object.take()
+    }
+
+    // Return an object taken with `take_object`. A node retracted meanwhile
+    // has nowhere to take it, so the object is dropped with it.
+    pub fn put_object(&mut self, node: NodeId, object: Box<dyn Object>) {
+        if let Some(found) = self.nodes.get_mut(&node) {
+            found.object = Some(object);
+        }
+    }
+
+    // The namespace `node` was bound in and the members that are its
+    // volumes, in volume order. `None` for the root.
+    pub fn volumes(&self, node: NodeId) -> Option<(NodeId, &[MemberId])> {
+        let binding = self.nodes.get(&node)?.binding.as_ref()?;
+        Some((binding.parent, &binding.volumes))
     }
 
     pub fn namespace_mut(&mut self, node: NodeId) -> Option<&mut Namespace> {
@@ -494,7 +592,7 @@ impl Tree {
                 } => {
                     self.deliver(node, member, offset, bytes, provenance, builder, effects);
                 }
-                Emit::MemberClosed(member) => effects.push(Effect::Closed { node, member }),
+                Emit::MemberClosed(member) => self.close(node, member, builder, effects),
                 Emit::Retract(member) => self.retract(node, member, effects),
                 Emit::RecoveryAt {
                     volume,

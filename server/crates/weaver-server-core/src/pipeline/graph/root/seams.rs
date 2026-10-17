@@ -10,6 +10,7 @@
 // touch the queue's work items.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use tracing::warn;
@@ -21,7 +22,7 @@ use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::JobState;
 use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::graph::Engine;
-use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile};
+use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{DecodedChunk, Pipeline};
 
@@ -50,7 +51,14 @@ impl Pipeline {
                     .collect(),
             })
             .collect();
-        let Some(mut graph) = GraphJob::for_engine(engine, &files) else {
+        let storage = Storage {
+            working_dir: state.working_dir.clone(),
+            accountant: Arc::clone(&self.graph_holds),
+            free_disk: self
+                .storage_capacity
+                .reader(crate::operations::StorageRoot::Intermediate),
+        };
+        let Some(mut graph) = GraphJob::for_engine(engine, job_id.0, &files, storage) else {
             return;
         };
         let mut queued = std::collections::HashSet::new();
@@ -63,7 +71,9 @@ impl Pipeline {
         self.after_graph_step(job_id);
     }
 
-    // A decoded article of a graph job, as the decoder placed it.
+    // A decoded article of a graph job, as the decoder placed it. True when
+    // the job is a graph job: its bytes went through the graph, which is
+    // the only writer of a graph job's files, so the caller writes nothing.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::pipeline) fn graph_article_decoded(
         &mut self,
@@ -74,10 +84,10 @@ impl Pipeline {
         positioned: bool,
         length: u64,
         segments: &[weaver_yenc::Segment],
-    ) {
+    ) -> bool {
         let job_id = segment_id.file_id.job_id;
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
-            return;
+            return false;
         };
         let decoded = Decoded {
             volume: VolumeIndex(segment_id.file_id.file_index),
@@ -98,6 +108,7 @@ impl Pipeline {
         };
         let result = graph.intake(decoded);
         self.after_graph_result(job_id, result);
+        true
     }
 
     // Every server failed an article of a graph job.
@@ -191,13 +202,8 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     );
     taken.sort_by_key(|work| classes.get(&work.segment_id).copied());
     for mut work in taken {
-        match classes.get(&work.segment_id) {
-            Some(Class::Critical) => work.completion_critical = true,
-            Some(Class::Recovery) => {
-                work.completion_critical = true;
-                work.is_recovery = true;
-            }
-            _ => {}
+        if let Some(class) = classes.get(&work.segment_id) {
+            classify(&mut work, *class);
         }
         state.download_queue.push(work);
     }
@@ -207,6 +213,18 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
             Some(Class::Window(rank)) => Some((work.priority.min(WINDOW_PRIORITY), Some(*rank))),
             _ => None,
         });
+}
+
+// The queue flags a class is fetched under.
+fn classify(work: &mut DownloadWork, class: Class) {
+    match class {
+        Class::Critical => work.completion_critical = true,
+        Class::Recovery => {
+            work.completion_critical = true;
+            work.is_recovery = true;
+        }
+        Class::FirstArticle | Class::Window(_) | Class::Ordinary => {}
+    }
 }
 
 fn file(job_id: JobId, volume: VolumeIndex) -> NzbFileId {

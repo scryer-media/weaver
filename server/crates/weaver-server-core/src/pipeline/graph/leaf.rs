@@ -183,10 +183,8 @@ impl Leaf {
 // the two never disagree on which names are safe.
 fn relative_path(output_name: &str) -> Result<PathBuf, LeafError> {
     let normalized = output_name.replace('\\', "/");
-    crate::pipeline::extraction::validate_sanitized_rar_member_path(
-        normalized.trim_end_matches('/'),
-    )
-    .map_err(|_| LeafError::UnsafeName(output_name.to_owned()))
+    crate::pipeline::extraction::validate_relative_output_path(normalized.trim_end_matches('/'))
+        .map_err(|_| LeafError::UnsafeName(output_name.to_owned()))
 }
 
 fn create_parent(path: &Path) -> Result<(), LeafError> {

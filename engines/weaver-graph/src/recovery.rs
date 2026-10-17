@@ -90,6 +90,11 @@ pub trait Recovery {
     // Repair what is damaged among the members this object covers.
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome;
 
+    // What the last repair came to, or `None` before one ran, and again
+    // after a bind changed which members this object covers: the verdict
+    // was on other members.
+    fn outcome(&self) -> Option<RepairOutcome>;
+
     // Recovery blocks reachable right now, for health and for the
     // impossible verdict. A lost recovery article lowers it.
     fn blocks_reachable(&self) -> u64;

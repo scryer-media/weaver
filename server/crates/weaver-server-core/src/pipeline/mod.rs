@@ -2552,6 +2552,12 @@ pub struct Pipeline {
     // The graph runtime of each job admitted under the graph engine. A job
     // without one is a classic job.
     pub(super) graph_jobs: HashMap<JobId, graph::job::GraphJob>,
+    // The repair slots graph jobs share, and what each job's recovery
+    // objects said when it last advanced.
+    pub(super) graph_status: graph::status::GraphStatus,
+    // The holds accountant every graph job's namespaces share, so the
+    // budgets bound the process, not each job.
+    pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,

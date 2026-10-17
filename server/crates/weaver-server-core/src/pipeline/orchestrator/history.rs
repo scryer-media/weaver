@@ -427,6 +427,7 @@ impl Pipeline {
         self.added_script_holds.remove(&job_id);
         self.jobs.remove(&job_id);
         self.graph_jobs.remove(&job_id);
+        self.forget_graph_repair(job_id);
         self.pipeline_failure_stages.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
         self.posted_name_disagreement_logged.remove(&job_id);

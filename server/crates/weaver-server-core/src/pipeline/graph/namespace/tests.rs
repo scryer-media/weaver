@@ -4,7 +4,7 @@
 use std::sync::Mutex;
 
 use weaver_graph::holds::HoldBudgets;
-use weaver_graph::recovery::SliceVerdict;
+use weaver_graph::recovery::{Recovery, SliceVerdict};
 use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, Seek};
 
 use super::*;
@@ -78,9 +78,10 @@ impl Object for Store {
 }
 
 // Builds the pretend store, and the pretend recovery set with the job's
-// record of what it was fed.
+// record of what it was fed and the fix it makes when asked to repair.
 struct Build {
     par: Arc<Mutex<Seen>>,
+    fix: Option<Fix>,
 }
 
 impl Builder for Build {
@@ -89,6 +90,9 @@ impl Builder for Build {
             Kind::RarStore => Some(Box::new(Store { announced: false })),
             Kind::Par2 => Some(Box::new(Par {
                 volume: None,
+                others: Vec::new(),
+                fixing: None,
+                fix: self.fix,
                 seen: Arc::clone(&self.par),
             })),
             _ => None,
@@ -112,54 +116,34 @@ impl Segments for Source {
     }
 }
 
-// A recovery object over one member that records its evidence and, asked
-// to repair, reads the member and writes a fix.
+// What the pretend recovery set saw: its evidence, and what it read when
+// asked to repair.
 #[derive(Default)]
 struct Seen {
     fed: Vec<Segment>,
     read: Option<Vec<u8>>,
+    volume: Option<Vec<u8>>,
 }
 
-struct Watch {
-    member: MemberId,
-    seen: Arc<Mutex<Seen>>,
+// The repair the pretend set makes: read the named member, write a fix.
+#[derive(Clone, Copy)]
+struct Fix {
+    name: &'static str,
     read: ByteRange,
     fix: (u64, &'static [u8]),
 }
 
-impl Recovery for Watch {
-    fn covers(&self, member: MemberId) -> bool {
-        member == self.member
-    }
-
-    fn feed(&mut self, _: MemberId, segments: &[Segment]) {
-        self.seen.lock().unwrap().fed.extend_from_slice(segments);
-    }
-
-    fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
-
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
-        let mut bytes = Vec::new();
-        if access.read(self.member, self.read, &mut bytes) {
-            self.seen.lock().unwrap().read = Some(bytes);
-        }
-        access.write_repaired(self.member, self.fix.0, self.fix.1);
-        RepairOutcome::Repaired { slices: 1 }
-    }
-
-    fn blocks_reachable(&self) -> u64 {
-        0
-    }
-}
-
 // A recovery object the tree holds as a node: bound to its own member, it
-// covers the members beside it, keeps its own bytes as one envelope, and
-// recognises a member by what has arrived of it, renaming it.
+// covers the members beside it except any called `other.*`, keeps its own
+// bytes in its member's file, and recognises a member by what has arrived
+// of it, renaming it.
 const PAR2_SIGNATURE: &[u8] = b"PAR2\0PKT\x40\x00\x00\x00";
 
 struct Par {
     volume: Option<MemberId>,
+    others: Vec<MemberId>,
+    fixing: Option<MemberId>,
+    fix: Option<Fix>,
     seen: Arc<Mutex<Seen>>,
 }
 
@@ -184,7 +168,11 @@ impl Object for Par {
         None
     }
 
-    fn recovery(&mut self) -> Option<&mut dyn Recovery> {
+    fn recovery(&self) -> Option<&dyn Recovery> {
+        Some(self)
+    }
+
+    fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {
         Some(self)
     }
 }
@@ -192,6 +180,15 @@ impl Object for Par {
 impl Recovery for Par {
     fn bind(&mut self, namespace: &mut weaver_graph::Namespace, renamed: &mut Vec<MemberId>) {
         self.volume = namespace.find_by_name("set.par2").map(|own| own.id);
+        self.fixing = self
+            .fix
+            .and_then(|fix| namespace.find_by_name(fix.name))
+            .map(|member| member.id);
+        self.others = namespace
+            .members()
+            .filter(|member| member.name.starts_with("other."))
+            .map(|member| member.id)
+            .collect();
         let recognised: Vec<MemberId> = namespace
             .members()
             .filter(|member| member.name == "3f9a.bin" && member.coverage.bytes_covered() > 0)
@@ -204,7 +201,7 @@ impl Recovery for Par {
     }
 
     fn covers(&self, member: MemberId) -> bool {
-        self.volume.is_some_and(|own| own != member)
+        self.volume.is_some_and(|own| own != member) && !self.others.contains(&member)
     }
 
     fn feed(&mut self, _: MemberId, segments: &[Segment]) {
@@ -214,8 +211,25 @@ impl Recovery for Par {
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&mut self, _: &mut Vec<Seek>) {}
 
-    fn repair(&mut self, _: &mut dyn MemberAccess) -> RepairOutcome {
-        RepairOutcome::Clean
+    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+        let mut volume = Vec::new();
+        let span = ByteRange::new(0, PAR2_SIGNATURE.len() as u64);
+        if access.read_volume(VolumeIndex(0), span, &mut volume) {
+            self.seen.lock().unwrap().volume = Some(volume);
+        }
+        let (Some(fix), Some(member)) = (self.fix, self.fixing) else {
+            return RepairOutcome::Clean;
+        };
+        let mut bytes = Vec::new();
+        if access.read(member, fix.read, &mut bytes) {
+            self.seen.lock().unwrap().read = Some(bytes);
+        }
+        access.write_repaired(member, fix.fix.0, fix.fix.1);
+        RepairOutcome::Repaired { slices: 1 }
+    }
+
+    fn outcome(&self) -> Option<RepairOutcome> {
+        None
     }
 
     fn blocks_reachable(&self) -> u64 {
@@ -236,6 +250,7 @@ struct Job {
     writer: NamespaceWriter,
     accountant: Arc<HoldsAccountant>,
     par: Arc<Mutex<Seen>>,
+    fix: Option<Fix>,
     out: Vec<Effect>,
 }
 
@@ -244,6 +259,7 @@ impl Job {
         let dir = tempfile::tempdir().expect("temp dir");
         let accountant = Arc::new(HoldsAccountant::new(budgets));
         let writer = NamespaceWriter::new(
+            1,
             dir.path().to_path_buf(),
             Arc::clone(&accountant),
             CapacityReader::unknown(),
@@ -254,14 +270,31 @@ impl Job {
             writer,
             accountant,
             par: Arc::new(Mutex::new(Seen::default())),
+            fix: None,
             out: Vec::new(),
         }
     }
 
+    // A recovery set at the root, bound before anything else arrives.
+    fn with_set(mut self, fix: Option<Fix>) -> Self {
+        self.fix = fix;
+        let set = self.member("set.par2", None);
+        self.send(set, 0, PAR2_SIGNATURE, Provenance::Fresh);
+        self
+    }
+
     fn member(&mut self, name: &str, length: Option<u64>) -> MemberId {
         let member = self.tree.announce_root(name, length);
+        let mut build = self.build();
         self.writer
-            .announced(&mut self.tree, NodeId::ROOT, member)
+            .announced(
+                &mut self.tree,
+                &mut build,
+                &Source,
+                NodeId::ROOT,
+                member,
+                &mut self.out,
+            )
             .expect("announce");
         member
     }
@@ -285,22 +318,30 @@ impl Job {
             bytes: Bytes::copy_from_slice(bytes),
             provenance,
         };
+        let mut build = self.build();
         self.writer
-            .deliver(
+            .deliver(&mut self.tree, &mut build, &Source, arrival, &mut self.out)
+            .expect("deliver");
+    }
+
+    fn close(&mut self, member: MemberId) {
+        let mut build = self.build();
+        self.writer
+            .close(
                 &mut self.tree,
-                &mut Build {
-                    par: Arc::clone(&self.par),
-                },
+                &mut build,
                 &Source,
-                arrival,
+                NodeId::ROOT,
+                member,
                 &mut self.out,
             )
-            .expect("deliver");
+            .expect("close");
     }
 
     fn build(&self) -> Build {
         Build {
             par: Arc::clone(&self.par),
+            fix: self.fix,
         }
     }
 
@@ -360,9 +401,7 @@ fn a_breach_refuses_the_member_to_a_leaf_which_receives_every_byte() {
 
     // Decided now: the rest goes straight to the file.
     job.send(member, 2, b"r! mid.", Provenance::Fresh);
-    job.writer
-        .close(&mut job.tree, NodeId::ROOT, member)
-        .expect("close");
+    job.close(member);
     assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
 }
 
@@ -377,9 +416,7 @@ fn held_bytes_paged_to_scratch_come_back_intact() {
     job.send(member, 4, b"back", Provenance::Fresh);
     assert_eq!(job.accountant.usage().scratch, 4);
     job.send(member, 2, b"rx", Provenance::Fresh);
-    job.writer
-        .close(&mut job.tree, NodeId::ROOT, member)
-        .expect("close");
+    job.close(member);
     assert_eq!(job.file("notes.bin"), b"Rarxback");
     assert_eq!(job.accountant.usage().scratch, 0);
 }
@@ -423,9 +460,7 @@ fn a_member_of_unknown_length_is_sized_when_it_closes() {
     let member = job.member("post.uu", None);
     job.send(member, 0, b"abc", Provenance::Fresh);
     job.send(member, 3, b"def", Provenance::Fresh);
-    job.writer
-        .close(&mut job.tree, NodeId::ROOT, member)
-        .expect("close");
+    job.close(member);
     assert_eq!(job.root().get(member).unwrap().length, Some(6));
     assert_eq!(job.file("post.uu"), b"abcdef");
 }
@@ -481,18 +516,12 @@ fn a_rename_moves_the_file_and_the_name_allocation() {
 
 #[test]
 fn damaged_bytes_are_written_and_marked_and_a_repair_overwrites_them() {
-    let mut job = Job::new(PLENTY);
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "video.mkv",
+        read: ByteRange::new(0, 8),
+        fix: (2, b"OK"),
+    }));
     let member = job.member("video.mkv", Some(8));
-    let seen = Arc::new(Mutex::new(Seen::default()));
-    job.writer.add_recovery(
-        NodeId::ROOT,
-        Box::new(Watch {
-            member,
-            seen: Arc::clone(&seen),
-            read: ByteRange::new(0, 8),
-            fix: (2, b"OK"),
-        }),
-    );
     job.send(member, 0, b"go", Provenance::Fresh);
     job.send(member, 2, b"XX", Provenance::Damaged);
     job.send(member, 4, b"good", Provenance::Fresh);
@@ -514,8 +543,18 @@ fn damaged_bytes_are_written_and_marked_and_a_repair_overwrites_them() {
             &mut job.out,
         )
         .expect("repair");
+    let outcomes: Vec<RepairOutcome> = outcomes.into_iter().map(|(_, outcome)| outcome).collect();
     assert_eq!(outcomes, vec![RepairOutcome::Repaired { slices: 1 }]);
-    assert_eq!(seen.lock().unwrap().read.as_deref(), Some(&b"goXXgood"[..]));
+    let seen = job.par.lock().unwrap();
+    assert_eq!(seen.read.as_deref(), Some(&b"goXXgood"[..]));
+    assert_eq!(
+        seen.volume.as_deref(),
+        Some(PAR2_SIGNATURE),
+        "the set reads its own volume back from its member's file"
+    );
+    drop(seen);
+    assert_eq!(job.writer.read_backs(), 1);
+    assert_eq!(job.file("set.par2"), PAR2_SIGNATURE);
     assert_eq!(job.file("video.mkv"), b"goOKgood");
     let coverage = &job.root().get(member).unwrap().coverage;
     assert!(coverage.is_clean());
@@ -527,26 +566,16 @@ fn damaged_bytes_are_written_and_marked_and_a_repair_overwrites_them() {
 }
 
 #[test]
-fn the_segment_feed_is_verified_only_for_fresh_bytes() {
-    let mut job = Job::new(PLENTY);
+fn the_segment_feed_is_evidence_unless_the_bytes_are_damage() {
+    let mut job = Job::new(PLENTY).with_set(None);
     let member = job.member("video.mkv", Some(12));
     let uncovered = job.member("other.mkv", Some(2));
-    let seen = Arc::new(Mutex::new(Seen::default()));
-    job.writer.add_recovery(
-        NodeId::ROOT,
-        Box::new(Watch {
-            member,
-            seen: Arc::clone(&seen),
-            read: ByteRange::new(0, 0),
-            fix: (0, b""),
-        }),
-    );
     job.send(member, 0, b"fresh", Provenance::Fresh);
     job.send(member, 5, b"bad", Provenance::Damaged);
     job.send(member, 8, b"good", Provenance::Repaired);
     job.send(uncovered, 0, b"no", Provenance::Fresh);
     assert_eq!(
-        seen.lock().unwrap().fed,
+        job.par.lock().unwrap().fed,
         vec![
             Segment {
                 range: ByteRange::new(0, 5),
@@ -561,7 +590,7 @@ fn the_segment_feed_is_verified_only_for_fresh_bytes() {
             Segment {
                 range: ByteRange::new(8, 12),
                 crc32: crc32(b"good"),
-                verified: false,
+                verified: true,
             },
         ]
     );
@@ -635,9 +664,10 @@ fn a_recovery_object_in_the_tree_is_fed_and_its_renames_move_the_file() {
         "its own bytes are not evidence"
     );
 
+    assert_eq!(job.file("set.par2"), PAR2_SIGNATURE);
+
     let member = job.member("3f9a.bin", Some(8));
     job.send(member, 0, b"data", Provenance::Fresh);
-    assert_eq!(job.file("3f9a.bin"), b"data\0\0\0\0");
     assert_eq!(
         job.par.lock().unwrap().fed,
         vec![Segment {
@@ -647,11 +677,53 @@ fn a_recovery_object_in_the_tree_is_fed_and_its_renames_move_the_file() {
         }]
     );
 
-    // The next change to the namespace lets the object match again, and it
-    // recognises the member by what has arrived of it.
-    job.member("other.bin", Some(1));
+    // The member's front changed, so the object matched again and
+    // recognised the member by what has arrived of it.
     assert_eq!(job.root().get(member).unwrap().output_name, "show.mkv");
     assert!(!job.dir.path().join("3f9a.bin").exists());
     job.send(member, 4, b"more", Provenance::Fresh);
     assert_eq!(job.file("show.mkv"), b"datamore");
+}
+
+#[test]
+fn segments_that_arrived_before_the_set_are_fed_when_it_covers_the_member() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("video.mkv", Some(12));
+    job.send(member, 0, b"fresh", Provenance::Fresh);
+    job.send(member, 5, b"bad", Provenance::Damaged);
+    job.send(member, 8, b"good", Provenance::Repaired);
+    assert!(job.par.lock().unwrap().fed.is_empty());
+
+    let set = job.member("set.par2", None);
+    job.send(set, 0, PAR2_SIGNATURE, Provenance::Fresh);
+    assert_eq!(
+        job.par.lock().unwrap().fed,
+        vec![
+            Segment {
+                range: ByteRange::new(0, 5),
+                crc32: SOURCE_CRC,
+                verified: true,
+            },
+            Segment {
+                range: ByteRange::new(5, 8),
+                crc32: SOURCE_CRC,
+                verified: false,
+            },
+        ],
+        "a repaired run is not the source's bytes, so it gives nothing"
+    );
+}
+
+#[test]
+fn dropping_the_writer_gives_its_holds_back() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("notes.bin", None);
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().resident, 2);
+    let Job {
+        writer, accountant, ..
+    } = job;
+    drop(writer);
+    assert_eq!(accountant.usage().resident, 0);
+    assert_eq!(accountant.usage().namespaces, 0);
 }

@@ -805,7 +805,7 @@ impl DirectSetPlan {
 
     fn resolve_member_path(member_name: &str) -> Result<String, ()> {
         let sanitized = unrar_rs::sanitize_path(member_name);
-        let safe = crate::pipeline::extraction::validate_sanitized_rar_member_path(&sanitized)
+        let safe = crate::pipeline::extraction::validate_relative_output_path(&sanitized)
             .map_err(|_| ())?;
         let safe = safe.to_string_lossy().replace('\\', "/");
         if safe.is_empty() {

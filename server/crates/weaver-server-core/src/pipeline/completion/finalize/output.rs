@@ -1330,7 +1330,7 @@ impl Pipeline {
             )
         ) {
             1
-        } else if self.par2_verified.contains(&job_id) {
+        } else if self.par2_verified.contains(&job_id) || self.graph_recovery_verified(job_id) {
             2
         } else {
             0
@@ -1344,6 +1344,7 @@ impl Pipeline {
             .extracted_archives
             .get(&job_id)
             .is_some_and(|archives| !archives.is_empty())
+            || self.graph_unpacked(job_id)
         {
             2
         } else {

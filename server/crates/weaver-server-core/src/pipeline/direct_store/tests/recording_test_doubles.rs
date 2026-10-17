@@ -2641,7 +2641,7 @@ fn each_volume_owns_a_separate_sparse_envelope_file() {
     // validator refuses would make every barrier unreadable.
     for volume_index in [0u32, 7, u32::MAX] {
         assert!(
-            crate::pipeline::extraction::validate_sanitized_rar_member_path(
+            crate::pipeline::extraction::validate_relative_output_path(
                 &plan.envelope_relative_path(volume_index)
             )
             .is_ok(),

@@ -1200,7 +1200,7 @@ fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
     }
 }
 
-fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
+pub(in crate::pipeline) fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -2013,7 +2013,7 @@ async fn insert_active_job_with_persisted_nzb_named(
     working_dir
 }
 
-fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
+pub(in crate::pipeline) fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rar5")
@@ -2249,7 +2249,7 @@ fn two_segment_standalone_job_spec(
     }
 }
 
-async fn submit_decoded_segment(
+pub(in crate::pipeline) async fn submit_decoded_segment(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
     segment_number: u32,
@@ -2659,7 +2659,10 @@ fn unresolved_spans(pipeline: &Pipeline, job_id: JobId, set_name: &str) -> Vec<(
     spans
 }
 
-fn job_status_for_assert(pipeline: &Pipeline, job_id: JobId) -> Option<JobStatus> {
+pub(in crate::pipeline) fn job_status_for_assert(
+    pipeline: &Pipeline,
+    job_id: JobId,
+) -> Option<JobStatus> {
     pipeline
         .jobs
         .get(&job_id)

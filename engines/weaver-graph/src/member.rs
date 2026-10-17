@@ -31,6 +31,8 @@ pub struct Member {
     // unbinds it, or a retraction, which starts it over.
     pub bound_to: Option<ObjectId>,
     pub coverage: Coverage,
+    // Nothing more will arrive for it: everything that could has.
+    pub closed: bool,
 }
 
 impl Member {
@@ -217,6 +219,7 @@ impl Namespace {
                 length,
                 bound_to: None,
                 coverage: Coverage::new(),
+                closed: false,
             },
         );
         id
@@ -279,6 +282,7 @@ impl Namespace {
             found.coverage.clear();
             found.bound_to = None;
             found.length = None;
+            found.closed = false;
         }
         self.first_bytes.remove(&member);
     }

@@ -1880,8 +1880,10 @@ impl Pipeline {
             }
 
             // A graph job's root takes the article as placed, damaged or not;
-            // a classic job has no root and this finds nothing.
-            self.graph_article_decoded(
+            // a classic job has no root and this finds nothing. The graph is
+            // a graph job's only writer, so the classic write path below is
+            // skipped; only the job's progress counts the article.
+            if self.graph_article_decoded(
                 segment_id,
                 file_offset,
                 &data,
@@ -1889,7 +1891,30 @@ impl Pipeline {
                 !encoding.is_uu(),
                 yenc_layout.file_size,
                 &segments,
-            );
+            ) {
+                if !crc_valid {
+                    self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                self.metrics
+                    .bytes_decoded
+                    .fetch_add(u64::from(decoded_size), Ordering::Relaxed);
+                self.metrics
+                    .segments_decoded
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.downloaded_bytes += u64::from(decoded_size);
+                    if let Some(category_bytes) = state.category_bytes.as_ref() {
+                        category_bytes.fetch_add(u64::from(decoded_size), Ordering::Relaxed);
+                    }
+                }
+                self.send_segment_event(|| PipelineEvent::SegmentDecoded {
+                    segment_id,
+                    decoded_size,
+                    file_offset,
+                    crc_valid,
+                });
+                return;
+            }
             if retain_damage {
                 if !crc_valid {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);

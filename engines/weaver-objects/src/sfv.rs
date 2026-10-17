@@ -32,6 +32,8 @@ pub struct Sfv {
     // Each bound member's length once all of it arrived.
     lengths: BTreeMap<MemberId, u64>,
     grid: Grid,
+    // What the last check came to, for the members bound then.
+    outcome: Option<RepairOutcome>,
 }
 
 impl Sfv {
@@ -42,6 +44,7 @@ impl Sfv {
             bound: BTreeMap::new(),
             lengths: BTreeMap::new(),
             grid: Grid::default(),
+            outcome: None,
         }
     }
 
@@ -139,7 +142,11 @@ impl Object for Sfv {
         None
     }
 
-    fn recovery(&mut self) -> Option<&mut dyn Recovery> {
+    fn recovery(&self) -> Option<&dyn Recovery> {
+        Some(self)
+    }
+
+    fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {
         Some(self)
     }
 }
@@ -179,6 +186,9 @@ impl Recovery for Sfv {
                     .map(|length| (*member, length))
             })
             .collect();
+        if bound != self.bound {
+            self.outcome = None;
+        }
         self.bound = bound;
     }
 
@@ -218,14 +228,20 @@ impl Recovery for Sfv {
                 damaged += 1;
             }
         }
-        if damaged == 0 {
+        let outcome = if damaged == 0 {
             RepairOutcome::Clean
         } else {
             RepairOutcome::Impossible {
                 damaged,
                 reachable: 0,
             }
-        }
+        };
+        self.outcome = Some(outcome);
+        outcome
+    }
+
+    fn outcome(&self) -> Option<RepairOutcome> {
+        self.outcome
     }
 
     fn blocks_reachable(&self) -> u64 {

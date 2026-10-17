@@ -138,6 +138,9 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Result<(), String> {
+        if let Some(reconciled) = self.reconcile_graph_delivery(job_id) {
+            return reconciled;
+        }
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(());
         };

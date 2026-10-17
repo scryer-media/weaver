@@ -35,23 +35,6 @@ pub enum Kind {
     Sfv,
 }
 
-impl Kind {
-    pub fn is_recovery(self) -> bool {
-        matches!(self, Kind::Par2 | Kind::Par3 | Kind::Sfv)
-    }
-
-    pub fn is_stream(self) -> bool {
-        matches!(
-            self,
-            Kind::Xz | Kind::Gzip | Kind::Bzip2 | Kind::Zstd | Kind::Brotli | Kind::Deflate
-        )
-    }
-
-    pub fn is_engine(self) -> bool {
-        matches!(self, Kind::RarEngine | Kind::SevenZipEngine)
-    }
-}
-
 impl fmt::Display for Kind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -168,9 +151,19 @@ pub trait Object: Send + Sync {
         None
     }
 
+    // Whether I can use a volume only once every volume before it has been
+    // read: an engine or a stream, which have no map to seek by.
+    fn reads_in_order(&self) -> bool {
+        false
+    }
+
     // My recovery face, if I am a recovery object: the namespace I live in
     // feeds, binds and repairs through it.
-    fn recovery(&mut self) -> Option<&mut dyn crate::recovery::Recovery> {
+    fn recovery(&self) -> Option<&dyn crate::recovery::Recovery> {
+        None
+    }
+
+    fn recovery_mut(&mut self) -> Option<&mut dyn crate::recovery::Recovery> {
         None
     }
 }

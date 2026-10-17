@@ -263,10 +263,6 @@ impl ArticleMap {
         }
     }
 
-    pub(crate) fn waiting(&self) -> bool {
-        self.volumes.iter().any(Volume::waiting)
-    }
-
     pub(crate) fn volume_waiting(&self, volume: VolumeIndex) -> bool {
         self.volumes
             .get(volume.0 as usize)
@@ -299,6 +295,11 @@ impl ArticleMap {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return Pull::Lost;
         };
+        // The clamp for open-ended seeks: a recovery object does not know how
+        // long its volume is and asks to the end of the address space, so the
+        // range is cut at the furthest the volume's end can lie.
+        let end = found.bounds(found.articles.len()).1;
+        let range = ByteRange::new(range.start.min(end), range.end.min(end));
         if found.ordered_only {
             // Without positions only the front can be told apart, and it is
             // already here.

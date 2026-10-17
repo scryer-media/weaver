@@ -5,9 +5,8 @@
 // what a graph job reports as its status, and it is stored with the job so a
 // restart shows the same phase before anything has been re-derived.
 
-use std::collections::BTreeMap;
-
-use weaver_graph::{Kind, NodeId, Tree};
+use weaver_graph::recovery::RepairOutcome;
+use weaver_graph::{NodeId, Tree};
 
 use crate::jobs::model::JobStatus;
 
@@ -20,13 +19,25 @@ pub(crate) enum RootPhase {
     Done,
 }
 
-// What the job's recovery objects are doing, as the namespace reports it.
+// What the job's recovery objects are doing, read off what each has ruled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum Activity {
     #[default]
     Idle,
     Verifying,
     Repairing,
+}
+
+// One waiting on recovery bytes is repairing; one that has not ruled is
+// verifying; with every one ruled, or none to rule, nothing is at work.
+pub(crate) fn activity(outcomes: impl IntoIterator<Item = Option<RepairOutcome>>) -> Activity {
+    outcomes
+        .into_iter()
+        .fold(Activity::Idle, |at, outcome| match outcome {
+            Some(RepairOutcome::Waiting) => Activity::Repairing,
+            None if at == Activity::Idle => Activity::Verifying,
+            _ => at,
+        })
 }
 
 impl RootPhase {
@@ -82,7 +93,7 @@ impl RootPhase {
 // Whether an object below the root is still producing members: a member of
 // the root is bound to an object that is not a recovery object, and that
 // object's namespace is empty or has a member not yet complete.
-pub(crate) fn extracting(tree: &Tree, kinds: &BTreeMap<NodeId, Kind>) -> bool {
+pub(crate) fn extracting(tree: &Tree) -> bool {
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return false;
     };
@@ -90,7 +101,7 @@ pub(crate) fn extracting(tree: &Tree, kinds: &BTreeMap<NodeId, Kind>) -> bool {
         let Some((child, _)) = tree.child_of(NodeId::ROOT, member.id) else {
             return false;
         };
-        if kinds.get(&child).is_none_or(|kind| kind.is_recovery()) {
+        if tree.recovers(child) {
             return false;
         }
         tree.namespace(child).is_some_and(|namespace| {

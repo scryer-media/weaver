@@ -19,7 +19,7 @@ pub(crate) use member::{
     RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest, rar_entry_via,
 };
 
-pub(crate) use member::validate_sanitized_rar_member_path;
+pub(crate) use member::validate_relative_output_path;
 
 pub(crate) use member::apply_rar_member_filesystem_metadata;
 

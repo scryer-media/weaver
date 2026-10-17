@@ -17,7 +17,7 @@ pub(crate) use safety::{
 // Re-exported so the direct-store coverage snapshot gates its destination
 // paths with the same validator RAR extraction gates member paths with, rather
 // than growing a second, subtly different one.
-pub(crate) use rar::validate_sanitized_rar_member_path;
+pub(crate) use rar::validate_relative_output_path;
 
 // Same reasoning for the decode ceilings: direct-store's small-member
 // tolerance opens an archive of its own to extract the tolerated members, and

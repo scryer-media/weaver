@@ -626,7 +626,7 @@ mod tests {
         for bytes in samples {
             for name in ["a.rar", "a.7z", "a.deflate", "a.br", "a.sfv"] {
                 if let Sniff::Object(kind) = sniff(name, bytes, None) {
-                    assert!(!kind.is_engine());
+                    assert!(!matches!(kind, Kind::RarEngine | Kind::SevenZipEngine));
                     assert_ne!(kind, Kind::Deflate);
                 }
             }

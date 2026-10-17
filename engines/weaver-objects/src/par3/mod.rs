@@ -48,6 +48,8 @@ pub struct Par3 {
     bound: BTreeMap<String, MemberId>,
     // Damaged blocks the last repair found while it waited.
     needed: u64,
+    // What the last repair came to, for the members bound then.
+    outcome: Option<RepairOutcome>,
 }
 
 impl Par3 {
@@ -57,6 +59,7 @@ impl Par3 {
             volumes: vec![Volume::default()],
             bound: BTreeMap::new(),
             needed: 0,
+            outcome: None,
         }
     }
 
@@ -151,7 +154,11 @@ impl Object for Par3 {
         Some(VolumeIndex((self.volumes.len() - 1) as u32))
     }
 
-    fn recovery(&mut self) -> Option<&mut dyn Recovery> {
+    fn recovery(&self) -> Option<&dyn Recovery> {
+        Some(self)
+    }
+
+    fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {
         Some(self)
     }
 }
@@ -170,6 +177,9 @@ impl Recovery for Par3 {
                     bound.insert(file.path().to_owned(), member.id);
                 }
             }
+        }
+        if bound != self.bound {
+            self.outcome = None;
         }
         self.bound = bound;
     }
@@ -236,7 +246,12 @@ impl Recovery for Par3 {
             outcome = combine(outcome, result.outcome);
         }
         self.needed = waiting;
+        self.outcome = Some(outcome);
         outcome
+    }
+
+    fn outcome(&self) -> Option<RepairOutcome> {
+        self.outcome
     }
 
     // What the kept fronts of volumes still reachable carry.

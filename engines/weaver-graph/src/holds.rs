@@ -15,17 +15,21 @@
 // refuses the member to a leaf (`Why::HoldsBreached`) and keeps downloading.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 
+use crate::tree::NodeId;
 use crate::volume::{ByteRange, VolumeIndex};
 
-// Which namespace a hold belongs to, unique across the process. The caller
-// picks the numbering, because the graph's own ids are only unique within a
-// job and the accountant spans every job.
+// Which namespace a hold belongs to, unique across the process. A node id is
+// only unique within its tree and the accountant spans every job, so the
+// caller names the tree too: `scope` is the job's own process-wide id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HoldsNamespace(pub u64);
+pub struct HoldsNamespace {
+    pub scope: u64,
+    pub node: NodeId,
+}
 
 // The four ceilings, in bytes, with the meanings the settings already give
 // them.
@@ -351,9 +355,13 @@ fn byte_len(bytes: &Bytes) -> u64 {
 // file can therefore be larger than what is live; the accountant counts the
 // live bytes, and the disk reserve sees the real file through the free space
 // the caller reports.
+// It shares the accountant it reports to, so dropping it releases whatever
+// it still holds: a namespace that goes away without a `discard` must not
+// leave its bytes counted against every other job.
 #[derive(Debug)]
 pub struct HoldLedger {
     namespace: HoldsNamespace,
+    accountant: Arc<HoldsAccountant>,
     volumes: BTreeMap<VolumeIndex, BTreeMap<u64, Hold>>,
     // Resident holds oldest first, as (age, volume, start), which is the
     // order they page out in.
@@ -365,9 +373,10 @@ pub struct HoldLedger {
 }
 
 impl HoldLedger {
-    pub fn new(namespace: HoldsNamespace) -> Self {
+    pub fn new(namespace: HoldsNamespace, accountant: Arc<HoldsAccountant>) -> Self {
         Self {
             namespace,
+            accountant,
             volumes: BTreeMap::new(),
             resident_by_age: BTreeSet::new(),
             next_age: 0,
@@ -394,9 +403,9 @@ impl HoldLedger {
         volume: VolumeIndex,
         offset: u64,
         bytes: Bytes,
-        accountant: &HoldsAccountant,
         free_disk: u64,
     ) -> HoldOutcome {
+        let accountant = Arc::clone(&self.accountant);
         let len = byte_len(&bytes);
         let range = ByteRange::at(offset, len);
         let mut page_outs = Vec::new();
@@ -406,7 +415,7 @@ impl HoldLedger {
                 page_outs,
             };
         }
-        self.cut(volume, range, accountant);
+        self.cut(volume, range);
 
         // Each page-out in this call spends free space the caller counted
         // before any of them was written.
@@ -420,7 +429,7 @@ impl HoldLedger {
                         page_outs,
                     };
                 }
-                match self.page_out_oldest(accountant, free_disk) {
+                match self.page_out_oldest(free_disk) {
                     Some(Ok(page_out)) => {
                         free_disk = free_disk.saturating_sub(page_out.range.len());
                         page_outs.push(page_out);
@@ -468,20 +477,17 @@ impl HoldLedger {
 
     // Release the held parts of `range`, which now have a home, in offset
     // order. Parts of a hold outside `range` stay held.
-    pub fn take(
-        &mut self,
-        volume: VolumeIndex,
-        range: ByteRange,
-        accountant: &HoldsAccountant,
-    ) -> Vec<Taken> {
-        self.cut(volume, range, accountant)
+    pub fn take(&mut self, volume: VolumeIndex, range: ByteRange) -> Vec<Taken> {
+        self.cut(volume, range)
     }
 
     // Drop every hold, for a namespace that is going away. The caller
     // removes the scratch file.
-    pub fn discard(&mut self, accountant: &HoldsAccountant) {
-        accountant.release_resident(self.namespace, self.resident);
-        accountant.release_scratch(self.namespace, self.scratch);
+    pub fn discard(&mut self) {
+        self.accountant
+            .release_resident(self.namespace, self.resident);
+        self.accountant
+            .release_scratch(self.namespace, self.scratch);
         self.volumes.clear();
         self.resident_by_age.clear();
         self.resident = 0;
@@ -571,12 +577,7 @@ impl HoldLedger {
 
     // Remove `range` from every hold it overlaps, releasing the accounting
     // of the removed parts and keeping the parts outside it.
-    fn cut(
-        &mut self,
-        volume: VolumeIndex,
-        range: ByteRange,
-        accountant: &HoldsAccountant,
-    ) -> Vec<Taken> {
+    fn cut(&mut self, volume: VolumeIndex, range: ByteRange) -> Vec<Taken> {
         let Some(holds) = self.volumes.get(&volume) else {
             return Vec::new();
         };
@@ -594,9 +595,11 @@ impl HoldLedger {
                 continue;
             };
             if hold.is_resident() {
-                accountant.release_resident(self.namespace, inside.len());
+                self.accountant
+                    .release_resident(self.namespace, inside.len());
             } else {
-                accountant.release_scratch(self.namespace, inside.len());
+                self.accountant
+                    .release_scratch(self.namespace, inside.len());
             }
             let left = ByteRange::new(hold.range.start, inside.start);
             let right = ByteRange::new(inside.end, hold.range.end);
@@ -626,14 +629,11 @@ impl HoldLedger {
 
     // Page this namespace's oldest resident hold to scratch. `None` when
     // nothing here is resident.
-    fn page_out_oldest(
-        &mut self,
-        accountant: &HoldsAccountant,
-        free_disk: u64,
-    ) -> Option<Result<PageOut, Budget>> {
+    fn page_out_oldest(&mut self, free_disk: u64) -> Option<Result<PageOut, Budget>> {
         let &(_, volume, start) = self.resident_by_age.first()?;
         let len = self.volumes.get(&volume)?.get(&start)?.range.len();
-        if let Reserve::Breached(budget) = accountant.page_out(self.namespace, len, free_disk) {
+        if let Reserve::Breached(budget) = self.accountant.page_out(self.namespace, len, free_disk)
+        {
             return Some(Err(budget));
         }
         let hold = self.unplace(volume, start)?;
@@ -661,12 +661,24 @@ impl HoldLedger {
     }
 }
 
+impl Drop for HoldLedger {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const NS: HoldsNamespace = HoldsNamespace(1);
-    const OTHER: HoldsNamespace = HoldsNamespace(2);
+    const NS: HoldsNamespace = HoldsNamespace {
+        scope: 1,
+        node: NodeId(0),
+    };
+    const OTHER: HoldsNamespace = HoldsNamespace {
+        scope: 2,
+        node: NodeId(0),
+    };
     const PLENTY: u64 = u64::MAX;
 
     fn budgets(resident_limit: u64) -> HoldBudgets {
@@ -695,9 +707,9 @@ mod tests {
 
     #[test]
     fn a_hold_that_fits_stays_in_ram_and_a_take_returns_it_and_zeroes_the_accountant() {
-        let accountant = HoldsAccountant::new(budgets(100));
-        let mut ledger = HoldLedger::new(NS);
-        let outcome = ledger.hold(VolumeIndex(0), 10, bytes(7, 5), &accountant, PLENTY);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        let outcome = ledger.hold(VolumeIndex(0), 10, bytes(7, 5), PLENTY);
         assert_eq!(outcome.placed, Placed::Ram);
         assert!(outcome.page_outs.is_empty());
         assert_eq!(accountant.namespace_usage(NS).resident, 5);
@@ -706,7 +718,7 @@ mod tests {
             vec![ByteRange::new(10, 15)]
         );
 
-        let taken = ledger.take(VolumeIndex(0), ByteRange::new(0, 100), &accountant);
+        let taken = ledger.take(VolumeIndex(0), ByteRange::new(0, 100));
         assert_eq!(
             taken,
             vec![Taken {
@@ -720,11 +732,11 @@ mod tests {
 
     #[test]
     fn pressure_pages_the_oldest_resident_holds_out_first() {
-        let accountant = HoldsAccountant::new(budgets(10));
-        let mut ledger = HoldLedger::new(NS);
-        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), &accountant, PLENTY);
-        ledger.hold(VolumeIndex(1), 0, bytes(2, 4), &accountant, PLENTY);
-        let outcome = ledger.hold(VolumeIndex(2), 0, bytes(3, 4), &accountant, PLENTY);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(10)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
+        ledger.hold(VolumeIndex(1), 0, bytes(2, 4), PLENTY);
+        let outcome = ledger.hold(VolumeIndex(2), 0, bytes(3, 4), PLENTY);
         assert_eq!(outcome.placed, Placed::Ram);
         assert_eq!(
             outcome.page_outs,
@@ -743,19 +755,19 @@ mod tests {
             }
         );
 
-        let taken = ledger.take(VolumeIndex(0), ByteRange::new(0, 4), &accountant);
+        let taken = ledger.take(VolumeIndex(0), ByteRange::new(0, 4));
         assert_eq!(taken[0].location, Location::Scratch { offset: 0, len: 4 });
-        ledger.take(VolumeIndex(1), ByteRange::new(0, 4), &accountant);
-        ledger.take(VolumeIndex(2), ByteRange::new(0, 4), &accountant);
+        ledger.take(VolumeIndex(1), ByteRange::new(0, 4));
+        ledger.take(VolumeIndex(2), ByteRange::new(0, 4));
         assert_idle(&accountant);
     }
 
     #[test]
     fn bytes_larger_than_ram_go_straight_to_scratch_without_paging_anything() {
-        let accountant = HoldsAccountant::new(budgets(10));
-        let mut ledger = HoldLedger::new(NS);
-        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), &accountant, PLENTY);
-        let outcome = ledger.hold(VolumeIndex(0), 4, bytes(2, 20), &accountant, PLENTY);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(10)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
+        let outcome = ledger.hold(VolumeIndex(0), 4, bytes(2, 20), PLENTY);
         assert_eq!(outcome.placed, Placed::Scratch);
         assert_eq!(
             outcome.page_outs,
@@ -768,21 +780,21 @@ mod tests {
         );
         assert_eq!(ledger.resident_bytes(), 4);
         assert_eq!(ledger.scratch_bytes(), 20);
-        ledger.take(VolumeIndex(0), ByteRange::new(0, 24), &accountant);
+        ledger.take(VolumeIndex(0), ByteRange::new(0, 24));
         assert_idle(&accountant);
     }
 
     #[test]
     fn ram_another_namespace_holds_sends_new_bytes_to_scratch() {
-        let accountant = HoldsAccountant::new(budgets(10));
-        let mut first = HoldLedger::new(NS);
-        let mut second = HoldLedger::new(OTHER);
-        first.hold(VolumeIndex(0), 0, bytes(1, 8), &accountant, PLENTY);
-        let outcome = second.hold(VolumeIndex(0), 0, bytes(2, 4), &accountant, PLENTY);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(10)));
+        let mut first = HoldLedger::new(NS, Arc::clone(&accountant));
+        let mut second = HoldLedger::new(OTHER, Arc::clone(&accountant));
+        first.hold(VolumeIndex(0), 0, bytes(1, 8), PLENTY);
+        let outcome = second.hold(VolumeIndex(0), 0, bytes(2, 4), PLENTY);
         assert_eq!(outcome.placed, Placed::Scratch);
         assert_eq!(first.resident_bytes(), 8);
-        first.discard(&accountant);
-        second.discard(&accountant);
+        first.discard();
+        second.discard();
         assert_idle(&accountant);
     }
 
@@ -815,9 +827,9 @@ mod tests {
             ),
         ];
         for (budgets, free_disk, budget) in cases {
-            let accountant = HoldsAccountant::new(budgets);
-            let mut ledger = HoldLedger::new(NS);
-            let outcome = ledger.hold(VolumeIndex(0), 0, bytes(1, 4), &accountant, free_disk);
+            let accountant = Arc::new(HoldsAccountant::new(budgets));
+            let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+            let outcome = ledger.hold(VolumeIndex(0), 0, bytes(1, 4), free_disk);
             assert_eq!(outcome.placed, Placed::Breached(budget));
             assert_eq!(ledger.total_held(), 0);
             assert_idle(&accountant);
@@ -826,28 +838,28 @@ mod tests {
 
     #[test]
     fn page_outs_in_one_call_spend_the_reported_free_space() {
-        let accountant = HoldsAccountant::new(HoldBudgets {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
             disk_reserve: 10,
             ..budgets(8)
-        });
-        let mut ledger = HoldLedger::new(NS);
-        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), &accountant, PLENTY);
-        ledger.hold(VolumeIndex(1), 0, bytes(2, 4), &accountant, PLENTY);
+        }));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
+        ledger.hold(VolumeIndex(1), 0, bytes(2, 4), PLENTY);
         // Room for one page-out of 4 above the reserve, not two.
-        let outcome = ledger.hold(VolumeIndex(2), 0, bytes(3, 8), &accountant, 15);
+        let outcome = ledger.hold(VolumeIndex(2), 0, bytes(3, 8), 15);
         assert_eq!(outcome.placed, Placed::Breached(Budget::DiskReserve));
         assert_eq!(outcome.page_outs.len(), 1);
         assert_eq!(outcome.page_outs[0].volume, VolumeIndex(0));
-        ledger.discard(&accountant);
+        ledger.discard();
         assert_idle(&accountant);
     }
 
     #[test]
     fn a_reheld_overlap_replaces_the_old_bytes_and_their_accounting() {
-        let accountant = HoldsAccountant::new(budgets(100));
-        let mut ledger = HoldLedger::new(NS);
-        ledger.hold(VolumeIndex(0), 0, bytes(1, 10), &accountant, PLENTY);
-        ledger.hold(VolumeIndex(0), 4, bytes(2, 2), &accountant, PLENTY);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 10), PLENTY);
+        ledger.hold(VolumeIndex(0), 4, bytes(2, 2), PLENTY);
         assert_eq!(
             ledger.held_ranges(VolumeIndex(0)),
             vec![
@@ -857,7 +869,7 @@ mod tests {
             ]
         );
         assert_eq!(accountant.usage().resident, 10);
-        let taken = ledger.take(VolumeIndex(0), ByteRange::new(3, 7), &accountant);
+        let taken = ledger.take(VolumeIndex(0), ByteRange::new(3, 7));
         let ranges: Vec<_> = taken.iter().map(|piece| piece.range).collect();
         assert_eq!(
             ranges,
@@ -869,16 +881,16 @@ mod tests {
         );
         assert_eq!(taken[1].location, Location::Ram(bytes(2, 2)));
         assert_eq!(accountant.usage().resident, 6);
-        ledger.take(VolumeIndex(0), ByteRange::new(0, 10), &accountant);
+        ledger.take(VolumeIndex(0), ByteRange::new(0, 10));
         assert_idle(&accountant);
     }
 
     #[test]
     fn a_partial_take_of_scratch_returns_the_span_and_keeps_the_rest() {
-        let accountant = HoldsAccountant::new(budgets(0));
-        let mut ledger = HoldLedger::new(NS);
-        ledger.hold(VolumeIndex(3), 100, bytes(1, 10), &accountant, PLENTY);
-        let taken = ledger.take(VolumeIndex(3), ByteRange::new(104, 106), &accountant);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(0)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(3), 100, bytes(1, 10), PLENTY);
+        let taken = ledger.take(VolumeIndex(3), ByteRange::new(104, 106));
         assert_eq!(
             taken,
             vec![Taken {
@@ -887,7 +899,7 @@ mod tests {
             }]
         );
         assert_eq!(accountant.usage().scratch, 8);
-        let rest = ledger.take(VolumeIndex(3), ByteRange::new(0, 200), &accountant);
+        let rest = ledger.take(VolumeIndex(3), ByteRange::new(0, 200));
         assert_eq!(
             rest.iter()
                 .map(|piece| piece.location.clone())
@@ -902,52 +914,65 @@ mod tests {
 
     #[test]
     fn scratch_offsets_start_over_once_nothing_lives_there() {
-        let accountant = HoldsAccountant::new(budgets(0));
-        let mut ledger = HoldLedger::new(NS);
-        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), &accountant, PLENTY);
-        ledger.hold(VolumeIndex(0), 4, bytes(1, 4), &accountant, PLENTY);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(0)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
+        ledger.hold(VolumeIndex(0), 4, bytes(1, 4), PLENTY);
         assert_eq!(ledger.scratch_extent(), 8);
-        ledger.take(VolumeIndex(0), ByteRange::new(0, 4), &accountant);
+        ledger.take(VolumeIndex(0), ByteRange::new(0, 4));
         assert_eq!(ledger.scratch_extent(), 8);
-        ledger.take(VolumeIndex(0), ByteRange::new(4, 8), &accountant);
+        ledger.take(VolumeIndex(0), ByteRange::new(4, 8));
         assert_eq!(ledger.scratch_extent(), 0);
-        let outcome = ledger.hold(VolumeIndex(0), 0, bytes(1, 4), &accountant, PLENTY);
+        let outcome = ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
         assert_eq!(outcome.page_outs[0].scratch_offset, 0);
-        ledger.discard(&accountant);
+        ledger.discard();
         assert_idle(&accountant);
     }
 
     #[test]
     fn lowered_budgets_evict_nothing_and_judge_the_next_hold() {
-        let accountant = HoldsAccountant::new(budgets(100));
-        let mut ledger = HoldLedger::new(NS);
-        ledger.hold(VolumeIndex(0), 0, bytes(1, 50), &accountant, PLENTY);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 50), PLENTY);
         accountant.set_budgets(HoldBudgets {
             scratch_ceiling: 10,
             ..budgets(20)
         });
         assert_eq!(ledger.resident_bytes(), 50);
-        let outcome = ledger.hold(VolumeIndex(1), 0, bytes(2, 10), &accountant, PLENTY);
+        let outcome = ledger.hold(VolumeIndex(1), 0, bytes(2, 10), PLENTY);
         assert_eq!(outcome.placed, Placed::Breached(Budget::ScratchCeiling));
         assert!(outcome.page_outs.is_empty());
-        ledger.discard(&accountant);
+        ledger.discard();
         assert_idle(&accountant);
     }
 
     #[test]
     fn an_empty_hold_holds_nothing() {
-        let accountant = HoldsAccountant::new(budgets(0));
-        let mut ledger = HoldLedger::new(NS);
-        let outcome = ledger.hold(VolumeIndex(0), 5, Bytes::new(), &accountant, 0);
+        let accountant = Arc::new(HoldsAccountant::new(budgets(0)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        let outcome = ledger.hold(VolumeIndex(0), 5, Bytes::new(), 0);
         assert_eq!(outcome.placed, Placed::Ram);
         assert_eq!(ledger.total_held(), 0);
         assert_idle(&accountant);
     }
 
     #[test]
+    fn a_dropped_ledger_releases_what_it_still_holds() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(4)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
+        let outcome = ledger.hold(VolumeIndex(1), 0, bytes(2, 4), PLENTY);
+        assert_eq!(outcome.page_outs.len(), 1);
+        assert_eq!(accountant.namespace_usage(NS).scratch, 4);
+        assert_eq!(accountant.namespace_usage(NS).resident, 4);
+        drop(ledger);
+        assert_idle(&accountant);
+    }
+
+    #[test]
     #[should_panic(expected = "released 1 resident bytes with only 0 accounted")]
     fn releasing_more_than_was_accounted_is_a_bug() {
-        let accountant = HoldsAccountant::new(budgets(10));
+        let accountant = Arc::new(HoldsAccountant::new(budgets(10)));
         accountant.release_resident(NS, 1);
     }
 }
