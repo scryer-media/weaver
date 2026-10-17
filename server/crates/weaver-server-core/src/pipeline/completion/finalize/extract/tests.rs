@@ -2000,28 +2000,17 @@ fn conventional_7z_decode_reservation_is_sized_from_the_archive_and_its_threads(
 
 // A 7z block whose bytes are wrong is classed for the scheduler to keep for
 // the recovery data; a method this build cannot decode, a password problem,
-// and a read that failed for any reason but malformed or short bytes are
-// terminal. The I/O cases are rendered the way the decoder renders them, from
-// the reader's own error.
+// a fault in the decoder, and a read that failed for any reason but malformed
+// or short bytes are terminal.
 #[test]
 fn sevenz_extraction_error_marks_only_data_errors() {
-    use sevenz_turbo::BlockErrorKind;
+    use sevenz_turbo::Error;
 
-    let block = |kind, message: String| sevenz_turbo::Error::BlockDecode {
-        block_index: 0,
-        packed_offset: 32,
-        kind,
-        message,
-    };
-    let read_failure = |error: std::io::Error| {
-        block(
-            BlockErrorKind::Io,
-            sevenz_turbo::Error::Io(error, "".into()).to_string(),
-        )
-    };
+    let block = |cause: Error| cause.in_block(0, 32);
+    let read_failure = |error: std::io::Error| block(Error::Io(error, "".into()));
     let data_errors = [
-        block(BlockErrorKind::Corrupted, "detail".to_string()),
-        block(BlockErrorKind::ChecksumMismatch, "detail".to_string()),
+        block(Error::Corrupted("detail".into())),
+        block(Error::ChecksumVerificationFailed),
         read_failure(std::io::ErrorKind::UnexpectedEof.into()),
         read_failure(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2041,9 +2030,10 @@ fn sevenz_extraction_error_marks_only_data_errors() {
         );
     }
     let terminal = [
-        block(BlockErrorKind::UnsupportedMethod, "detail".to_string()),
-        block(BlockErrorKind::Password, "detail".to_string()),
-        block(BlockErrorKind::Io, "detail".to_string()),
+        block(Error::UnsupportedCompressionMethod("detail".into())),
+        block(Error::MaybeBadPassword(std::io::Error::other("detail"))),
+        block(Error::Internal("detail".into())),
+        block(Error::Cancelled),
         read_failure(std::io::Error::from_raw_os_error(5)),
         read_failure(std::io::ErrorKind::PermissionDenied.into()),
         read_failure(std::io::Error::new(
