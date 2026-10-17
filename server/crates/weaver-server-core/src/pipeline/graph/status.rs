@@ -84,7 +84,7 @@ impl RootJob for GraphJob {
                 // The object is called what its first volume is.
                 name: tree
                     .volumes(object.node)
-                    .and_then(|(_, volumes)| root.get(*volumes.first()?))
+                    .and_then(|(_, volumes)| root.get(*volumes.values().next()?))
                     .map_or_else(
                         || object.kind.to_string(),
                         |member| member.output_name.clone(),

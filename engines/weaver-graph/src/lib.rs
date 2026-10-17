@@ -27,6 +27,7 @@
 // say which object a member belongs to.
 
 pub mod deliver;
+pub mod engine;
 pub mod holds;
 pub mod member;
 pub mod names;
@@ -39,6 +40,7 @@ pub mod tree;
 pub mod volume;
 
 pub use deliver::{Delivery, Emit, Provenance, RecoveryKind, Why};
+pub use engine::{Engine, Extraction, Sink, Volumes};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{Extent, Kind, Object, ObjectId, Placement};

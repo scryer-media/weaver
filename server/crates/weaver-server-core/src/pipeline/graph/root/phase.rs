@@ -90,9 +90,9 @@ impl RootPhase {
     }
 }
 
-// Whether an object below the root is still producing members: a member of
-// the root is bound to an object that is not a recovery object, and that
-// object's namespace is empty or has a member not yet complete.
+// Whether an object below the root has members still to complete. An
+// object that has announced nothing is not at work here: a run of it is,
+// and the job reads that off its runs.
 pub(crate) fn extracting(tree: &Tree) -> bool {
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return false;
@@ -104,8 +104,7 @@ pub(crate) fn extracting(tree: &Tree) -> bool {
         if tree.recovers(child) {
             return false;
         }
-        tree.namespace(child).is_some_and(|namespace| {
-            namespace.is_empty() || namespace.members().any(|inner| !inner.is_complete())
-        })
+        tree.namespace(child)
+            .is_some_and(|namespace| namespace.members().any(|inner| !inner.is_complete()))
     })
 }

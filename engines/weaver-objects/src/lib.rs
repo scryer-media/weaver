@@ -6,9 +6,12 @@
 // faces; nothing outside a format's own module knows its fields. The graph
 // asks for an object by kind through `build`.
 
+pub mod engine;
 mod grid;
 pub mod par2;
 pub mod par3;
+pub mod rar_engine;
+pub mod sevenz_engine;
 pub mod sfv;
 
 #[cfg(test)]
@@ -21,6 +24,8 @@ pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
     match kind {
         Kind::Par2 => Some(Box::new(par2::Par2::new(id))),
         Kind::Par3 => Some(Box::new(par3::Par3::new(id))),
+        Kind::RarEngine => Some(Box::new(rar_engine::RarEngine::new())),
+        Kind::SevenZipEngine => Some(Box::new(sevenz_engine::SevenZipEngine::new())),
         Kind::Sfv => Some(Box::new(sfv::Sfv::new(id))),
         _ => None,
     }

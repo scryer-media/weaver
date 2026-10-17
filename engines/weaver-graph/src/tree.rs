@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 
 use crate::deliver::{Delivery, Emit, Provenance, Why};
+use crate::engine::Engine;
 use crate::member::{MemberId, Namespace};
 use crate::object::{Extent, Kind, Object, ObjectId, Placement};
 use crate::recovery::Recovery;
@@ -28,14 +29,15 @@ impl NodeId {
     pub const ROOT: NodeId = NodeId(0);
 }
 
-// Where a node sits: which members of which namespace are its volumes, in
-// volume order. One object may own several members of its parent, one per
-// volume: a RAR set's twenty parts are one node with twenty volumes. The
-// root has no parent; its volumes are the source's.
+// Where a node sits: which members of which namespace are its volumes, by
+// volume index. One object may own several members of its parent, one per
+// volume: a RAR set's twenty parts are one node with twenty volumes. A map,
+// because volumes are claimed as they arrive, and a third part can arrive
+// before the second. The root has no parent; its volumes are the source's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Binding {
     parent: NodeId,
-    volumes: Vec<MemberId>,
+    volumes: BTreeMap<VolumeIndex, MemberId>,
 }
 
 struct Node {
@@ -285,10 +287,42 @@ impl Tree {
     }
 
     // The namespace `node` was bound in and the members that are its
-    // volumes, in volume order. `None` for the root.
-    pub fn volumes(&self, node: NodeId) -> Option<(NodeId, &[MemberId])> {
+    // volumes, by volume index. `None` for the root.
+    pub fn volumes(&self, node: NodeId) -> Option<(NodeId, &BTreeMap<VolumeIndex, MemberId>)> {
         let binding = self.nodes.get(&node)?.binding.as_ref()?;
         Some((binding.parent, &binding.volumes))
+    }
+
+    // The engine face of the object at `node`, if it reads its volumes as
+    // files.
+    pub fn engine(&self, node: NodeId) -> Option<&dyn Engine> {
+        self.object(node)?.engine()
+    }
+
+    pub fn engine_mut(&mut self, node: NodeId) -> Option<&mut dyn Engine> {
+        self.nodes.get_mut(&node)?.object.as_mut()?.engine_mut()
+    }
+
+    // Every node whose object has an engine face, in node order.
+    pub fn engines(&self) -> Vec<NodeId> {
+        self.nodes
+            .iter()
+            .filter(|(_, found)| found.object.as_ref().is_some_and(|o| o.engine().is_some()))
+            .map(|(node, _)| *node)
+            .collect()
+    }
+
+    // What the object at `node` said outside a delivery: an engine's run
+    // says it from the thread it runs on, and its owner hands it here. The
+    // emits are applied exactly as if the object had said them in `deliver`.
+    pub fn emitted(
+        &mut self,
+        node: NodeId,
+        mut emits: Vec<Emit>,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        self.apply(node, &mut emits, builder, effects);
     }
 
     pub fn namespace_mut(&mut self, node: NodeId) -> Option<&mut Namespace> {
@@ -438,13 +472,12 @@ impl Tree {
             let child_node = self.nodes.get_mut(&child).expect("child is live");
             let id = ObjectId(child.0);
             if let Some(binding) = child_node.binding.as_mut() {
-                let index = volume.0 as usize;
-                if binding.volumes.len() <= index {
-                    binding.volumes.resize(index + 1, member);
-                }
-                binding.volumes[index] = member;
+                binding.volumes.insert(volume, member);
             }
-            let kind = child_node.object.as_ref().map(|object| object.kind());
+            let kind = child_node.object.as_mut().map(|object| {
+                object.bound(volume, &name);
+                object.kind()
+            });
             let parent = self.nodes.get_mut(&node).expect("parent is live");
             parent.namespace.bind(member, id);
             if let Some(kind) = kind {
@@ -468,7 +501,7 @@ impl Tree {
                 let child = NodeId(self.next_node);
                 // Object ids are node ids: one object per node, for life.
                 let id = ObjectId(child.0);
-                let Some(object) = builder.build(kind, id) else {
+                let Some(mut object) = builder.build(kind, id) else {
                     effects.push(Effect::Refused {
                         node,
                         member,
@@ -476,6 +509,7 @@ impl Tree {
                     });
                     return;
                 };
+                object.bound(VolumeIndex(0), &name);
                 self.next_node += 1;
                 self.nodes.insert(
                     child,
@@ -484,7 +518,7 @@ impl Tree {
                         namespace: Namespace::new(),
                         binding: Some(Binding {
                             parent: node,
-                            volumes: vec![member],
+                            volumes: BTreeMap::from([(VolumeIndex(0), member)]),
                         }),
                         children: BTreeMap::new(),
                         undecided: BTreeMap::new(),
@@ -581,6 +615,11 @@ impl Tree {
                         if announced == member {
                             break;
                         }
+                    }
+                    // A member announced again after a retraction kept its
+                    // record and its name, but not its length.
+                    if let Some(record) = found.namespace.get_mut(member) {
+                        record.length = record.length.or(length);
                     }
                     effects.push(Effect::Announced { node, member });
                 }
@@ -682,7 +721,7 @@ impl Tree {
         self.nodes
             .remove(&node)
             .and_then(|removed| removed.binding)
-            .map(|binding| binding.volumes)
+            .map(|binding| binding.volumes.into_values().collect())
             .unwrap_or_default()
     }
 
@@ -715,7 +754,7 @@ impl Tree {
                 continue;
             };
             let parent = binding.parent;
-            let Some(member) = binding.volumes.get(ask.volume.0 as usize).copied() else {
+            let Some(member) = binding.volumes.get(&ask.volume).copied() else {
                 // A volume the object has not been given yet cannot be
                 // asked for by name; it arrives when the parent sees it.
                 pulled = pulled.fold(Pull::Unseekable);
@@ -936,7 +975,11 @@ mod tests {
             None
         }
         fn claim(&mut self, name: &str, _: &[u8]) -> Option<VolumeIndex> {
-            name.ends_with(".r00").then_some(VolumeIndex(1))
+            match name.rsplit_once(".r") {
+                Some((_, "00")) => Some(VolumeIndex(1)),
+                Some((_, "01")) => Some(VolumeIndex(2)),
+                _ => None,
+            }
         }
     }
 
@@ -1201,5 +1244,79 @@ mod tests {
                 .is_leaf()
         );
         let _ = RecoveryKind::Par2;
+    }
+
+    #[test]
+    fn a_volume_claimed_before_the_one_ahead_of_it_leaves_a_gap_until_that_one_comes() {
+        let (mut tree, first, child, _) = bound_tree();
+        let third = tree.announce_root("show.r01", None);
+        let second = tree.announce_root("show.r00", None);
+        let deliver = |tree: &mut Tree, member| {
+            tree.deliver(
+                NodeId::ROOT,
+                member,
+                0,
+                Bytes::from_static(b"w"),
+                Provenance::Fresh,
+                &mut Build,
+                &mut Vec::new(),
+            )
+        };
+        deliver(&mut tree, third);
+        let volumes = |tree: &Tree| {
+            let (_, volumes) = tree.volumes(child).unwrap();
+            volumes.iter().map(|(v, m)| (v.0, *m)).collect::<Vec<_>>()
+        };
+        assert_eq!(volumes(&tree), vec![(0, first), (2, third)]);
+        let seek = Seek::data(
+            VolumeIndex(1),
+            ByteRange::new(0, 10),
+            crate::seek::Weight(1),
+        );
+        assert_eq!(
+            tree.lift(child, seek, &mut Root(Vec::new())),
+            Pull::Unseekable
+        );
+        deliver(&mut tree, second);
+        assert_eq!(volumes(&tree), vec![(0, first), (1, second), (2, third)]);
+    }
+
+    #[test]
+    fn retracts_handed_to_the_tree_start_a_member_over_and_its_length_comes_back() {
+        let (mut tree, _, child, _) = bound_tree();
+        let mut effects = Vec::new();
+        tree.emitted(
+            child,
+            vec![Emit::Retract(MemberId(0))],
+            &mut Build,
+            &mut effects,
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Retracted {
+                node: child,
+                member: MemberId(0)
+            }]
+        );
+        let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+        assert_eq!(inner.coverage.bytes_covered(), 0);
+        assert!(tree.is_undecided(child, MemberId(0)));
+
+        tree.emitted(
+            child,
+            vec![Emit::Member {
+                member: MemberId(0),
+                name: "inner.bin".into(),
+                length: Some(5),
+            }],
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+        assert_eq!(
+            (inner.length, inner.output_name.as_str()),
+            (Some(5), "inner.bin")
+        );
+        assert_eq!(tree.namespace(child).unwrap().len(), 1);
     }
 }

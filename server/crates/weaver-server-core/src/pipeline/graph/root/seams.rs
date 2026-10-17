@@ -22,7 +22,9 @@ use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::JobState;
 use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
+use crate::pipeline::graph::limits;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{DecodedChunk, Pipeline};
 
@@ -57,6 +59,8 @@ impl Pipeline {
             free_disk: self
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
+            slots: limits::budgets(&self.direct_store.settings(), &self.tuner).1,
+            mail: self.graph_runs.sender(),
         };
         let Some(mut graph) = GraphJob::for_engine(engine, job_id.0, &files, storage) else {
             return;
@@ -122,6 +126,21 @@ impl Pipeline {
             segment_id.segment_number,
         );
         self.after_graph_result(job_id, result);
+    }
+
+    // What an engine's run said. A run that ended may have been the last
+    // thing the job waited on, so the completion gate looks again.
+    pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
+        let job_id = JobId(said.scope);
+        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+            return;
+        };
+        let ended = matches!(said.heard, Heard::Ended);
+        let result = graph.run_said(said);
+        self.after_graph_result(job_id, result);
+        if ended {
+            self.schedule_job_completion_check(job_id);
+        }
     }
 
     fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {

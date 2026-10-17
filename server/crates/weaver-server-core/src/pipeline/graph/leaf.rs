@@ -217,7 +217,7 @@ fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;

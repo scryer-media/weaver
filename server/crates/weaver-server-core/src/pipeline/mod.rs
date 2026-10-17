@@ -2558,6 +2558,8 @@ pub struct Pipeline {
     // The holds accountant every graph job's namespaces share, so the
     // budgets bound the process, not each job.
     pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
+    // Where the engines graph jobs run say what they found.
+    pub(super) graph_runs: graph::engine::RunMail,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,

@@ -24,6 +24,7 @@ use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::operations::disk::CapacityReader;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::engine::{RunMail, Runs};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::tests::{
@@ -114,7 +115,8 @@ fn job_with(
         })),
         CapacityReader::unknown(),
     );
-    let job = GraphJob::new(files, Box::new(builder), writer);
+    let runs = Runs::new(1, 1, RunMail::default().sender());
+    let job = GraphJob::new(files, Box::new(builder), writer, runs);
     (job, dir, answers)
 }
 

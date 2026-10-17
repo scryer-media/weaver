@@ -6070,8 +6070,10 @@ dependencies = [
  "crc-fast",
  "par2-rs",
  "par3-rs",
+ "sevenz-turbo",
  "tempfile",
  "thiserror 2.0.21",
+ "unrar-rs",
  "weaver-graph",
 ]
 

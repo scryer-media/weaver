@@ -33,7 +33,7 @@ use weaver_graph::{
     VolumeIndex, Why,
 };
 
-use super::envelope::Envelopes;
+use super::envelope::{Envelopes, Shelf};
 use super::leaf::{Leaf, LeafError};
 use crate::operations::disk::CapacityReader;
 
@@ -199,9 +199,8 @@ impl NamespaceWriter {
         self.bind_recoveries(tree, segments, node)
     }
 
-    // Nothing more will arrive for the member. One still undecided is a
-    // leaf now; the tree closes it and says so, and the owning object hears
-    // it as a closed volume.
+    // Nothing more will arrive for the member. The tree closes it and says
+    // so, and the owning object hears it as a closed volume.
     pub(crate) fn close(
         &mut self,
         tree: &mut Tree,
@@ -211,10 +210,6 @@ impl NamespaceWriter {
         member: MemberId,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        if tree.is_undecided(node, member) {
-            tree.settle_leaf(node, member);
-            self.release_to_leaf(tree, node, member)?;
-        }
         let mut effects = Vec::new();
         tree.close(node, member, builder, &mut effects);
         self.apply_all(tree, builder, segments, effects, out)
@@ -537,8 +532,14 @@ impl NamespaceWriter {
         self.placements.clear();
         tree.locate(child, volume, arrival.range(), &mut self.placements);
         self.envelopes
-            .capture(child, &self.placements, &arrival.bytes)?;
+            .capture(child, &self.placements, &arrival.bytes, arrival.provenance)?;
         Ok(())
+    }
+
+    // The node's envelopes, shared with the run of an engine that reads
+    // them as its volumes.
+    pub(crate) fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
+        self.envelopes.shelf(node)
     }
 
     fn apply(
@@ -570,6 +571,13 @@ impl NamespaceWriter {
                 self.announced(tree, builder, segments, *node, *member, out)?;
             }
             Effect::Closed { node, member } => {
+                // A member that ended before its front could say what it is
+                // is a leaf, whoever closed it: the root's source or an
+                // object's emit.
+                if tree.is_undecided(*node, *member) {
+                    tree.settle_leaf(*node, *member);
+                    self.release_to_leaf(tree, *node, *member)?;
+                }
                 // A leaf and a recovery volume live in their own files; a
                 // member another object owns has no file to close.
                 let in_own_file = tree
@@ -945,7 +953,7 @@ impl MemberAccess for Access<'_> {
         let member = self.recovery.and_then(|recovery| {
             let (parent, volumes) = self.tree.volumes(recovery)?;
             (parent == self.node)
-                .then(|| volumes.get(volume.0 as usize).copied())
+                .then(|| volumes.get(&volume).copied())
                 .flatten()
         });
         let Some(member) = member else {

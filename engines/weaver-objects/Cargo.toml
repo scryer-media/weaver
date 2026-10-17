@@ -11,8 +11,11 @@ bytes = { workspace = true }
 crc-fast = { workspace = true }
 par2-rs = { workspace = true }
 par3-rs = { workspace = true }
+sevenz-turbo = { workspace = true }
 thiserror = { workspace = true }
+unrar-rs = { workspace = true }
 weaver-graph = { path = "../weaver-graph" }
 
 [dev-dependencies]
+sevenz-turbo = { workspace = true, features = ["compress"] }
 tempfile = { workspace = true }

@@ -14,6 +14,10 @@ use weaver_model::files::FileRole;
 use super::*;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
+use crate::pipeline::graph::engine::Heard;
+use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
+use crate::pipeline::graph::root::phase::RootPhase;
+use crate::pipeline::graph::stand_in::EnginesForStores;
 use crate::pipeline::tests::{insert_active_job, new_direct_pipeline, retire_pipeline_database};
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -151,9 +155,26 @@ async fn decode(
     ordinal: u32,
     intact: bool,
 ) {
+    let body = posts[index as usize]
+        .articles()
+        .nth(ordinal as usize)
+        .unwrap()
+        .to_vec();
+    decode_as(pipeline, job_id, posts, index, ordinal, body, intact).await;
+}
+
+// Article `ordinal` of file `index`, its bytes `body`.
+async fn decode_as(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    posts: &[Post],
+    index: u32,
+    ordinal: u32,
+    body: Vec<u8>,
+    intact: bool,
+) {
     let post = &posts[index as usize];
     let offset = ordinal as usize * ARTICLE;
-    let body = post.articles().nth(ordinal as usize).unwrap().to_vec();
     let crc = par2_rs::checksum::crc32(&body);
     let len = body.len() as u64;
     pipeline
@@ -426,6 +447,125 @@ async fn dropping_a_graph_job_gives_its_holds_back() {
     pipeline.graph_jobs.remove(&job_id);
     assert_eq!(pipeline.graph_holds.usage().resident, 0);
     assert_eq!(pipeline.graph_holds.usage().namespaces, 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// Volume `index` of an echo store: the first carries the store's signature,
+// every one a header and then `body`.
+fn echo_volume(index: u32, body: &[u8]) -> Post {
+    let mut bytes = if index == 0 {
+        SIGNATURE.to_vec()
+    } else {
+        vec![0x80; HEADER]
+    };
+    bytes.extend_from_slice(body);
+    Post::plain(&format!("lantern.part{}.rar", index + 1), bytes)
+}
+
+// Read the job's archives as echo engines, through the stand-in.
+fn echo_engines(pipeline: &mut Pipeline, job_id: JobId, volumes: u32) {
+    let echoes = Echoes {
+        volumes,
+        bids: Default::default(),
+    };
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .set_builder(Box::new(EnginesForStores(echoes)));
+}
+
+// Hear the job's runs until the current one returned and none is waiting.
+async fn drain_runs(pipeline: &mut Pipeline, job_id: JobId) {
+    loop {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        let runs = pipeline.graph_jobs[&job_id].runs();
+        let ended = matches!(said.heard, Heard::Ended) && runs.current(said.node, said.generation);
+        pipeline.graph_run_said(said);
+        if ended && !pipeline.graph_jobs[&job_id].runs().live() {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_archive_built_as_its_engine_through_the_stand_in_writes_what_the_engine_read() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_007);
+    let bodies = [payload(2 * ARTICLE + 9, 8), payload(ARTICLE - 3, 9)];
+    let posts: Vec<Post> = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| echo_volume(index as u32, body))
+        .collect();
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    echo_engines(&mut pipeline, job_id, 2);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    drain_runs(&mut pipeline, job_id).await;
+
+    let job = &pipeline.graph_jobs[&job_id];
+    assert_eq!(job.tree().engines().len(), 1);
+    for (index, body) in bodies.iter().enumerate() {
+        assert_eq!(&read(&working_dir.join(format!("echo-{index}.bin"))), body);
+        classic_wrote_nothing(&pipeline, job_id, index as u32);
+    }
+    // The volumes are the engine's input, not files of the job.
+    assert!(job.member_files().is_empty());
+    assert_eq!(job.phase(), RootPhase::Done);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn a_repair_behind_what_the_engine_read_retracts_its_output_and_reads_again() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_008);
+    let body = payload(4 * ARTICLE - HEADER, 10);
+    let mut posts = vec![echo_volume(0, &body)];
+    let volume = posts[0].bytes.clone();
+    posts.extend(par2_set("lantern.part1.rar", &volume));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    echo_engines(&mut pipeline, job_id, 1);
+    // The index and the volume's first article, so the set can reach its
+    // blocks; the rest of the volume stays out until the run has read.
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
+    // The second article arrives wrong, and the run reads it as it is.
+    for ordinal in 0..4 {
+        let mut article = posts[0].articles().nth(ordinal).unwrap().to_vec();
+        if ordinal == 1 {
+            article.iter_mut().for_each(|byte| *byte ^= 0x5a);
+        }
+        let intact = ordinal != 1;
+        decode_as(
+            &mut pipeline,
+            job_id,
+            &posts,
+            0,
+            ordinal as u32,
+            article,
+            intact,
+        )
+        .await;
+    }
+    drain_runs(&mut pipeline, job_id).await;
+    let echoed = working_dir.join("echo-0.bin");
+    assert_ne!(read(&echoed), body);
+
+    // The blocks arrive and the set repairs the article behind the run's
+    // mark: the run is retracted and reads the volume again.
+    for ordinal in 1..posts[2].articles().count() as u32 {
+        decode(&mut pipeline, job_id, &posts, 2, ordinal, true).await;
+    }
+    let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
+    assert_eq!(
+        job.recovery_summary()[0].outcome,
+        Some(RepairOutcome::Repaired { slices: 1 })
+    );
+    assert!(job.runs().live());
+    drain_runs(&mut pipeline, job_id).await;
+    assert_eq!(read(&echoed), body);
+    assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
     retire_pipeline_database(pipeline).await;
 }
 

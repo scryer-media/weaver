@@ -7,23 +7,29 @@
 // what the download and decode paths learn; nothing else of the pipeline
 // reaches into the tree, and nothing else writes the job's files.
 
+mod runs;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tracing::warn;
 use weaver_graph::holds::HoldsAccountant;
 use weaver_graph::recovery::{RepairOutcome, SliceVerdict};
 use weaver_graph::{
-    Builder, Effect, Kind, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
+    Builder, ByteRange, Effect, Kind, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree,
+    VolumeIndex,
 };
 
 use super::Engine;
+use super::engine::{Runs, Said};
 use super::namespace::{NamespaceWriter, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, RootPhase};
 use super::root::sample;
 use super::root::source::Move;
 use super::root::{ArticleRoot, Ask};
+use super::stand_in::EnginesForStores;
 use crate::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
@@ -33,12 +39,15 @@ pub(crate) enum GraphError {
 }
 
 // Where a graph job writes and what it may hold: its working directory, the
-// process-wide holds accountant every job shares, and the free space of the
-// volume its scratch lives on.
+// process-wide holds accountant every job shares, the free space of the
+// volume its scratch lives on, how many engines it may run at once, and
+// where their runs speak.
 pub(crate) struct Storage {
     pub(crate) working_dir: PathBuf,
     pub(crate) accountant: Arc<HoldsAccountant>,
     pub(crate) free_disk: CapacityReader,
+    pub(crate) slots: usize,
+    pub(crate) mail: mpsc::Sender<Said>,
 }
 
 // What one recovery object says of the members it covers.
@@ -62,6 +71,7 @@ pub(crate) struct GraphJob {
     root: ArticleRoot,
     builder: Box<dyn Builder + Send + Sync>,
     writer: NamespaceWriter,
+    runs: Runs,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
 }
@@ -90,7 +100,13 @@ impl GraphJob {
                 storage.accountant,
                 storage.free_disk,
             );
-            Self::new(files, Box::new(weaver_objects::Objects), writer)
+            let runs = Runs::new(scope, storage.slots, storage.mail);
+            Self::new(
+                files,
+                Box::new(EnginesForStores(weaver_objects::Objects)),
+                writer,
+                runs,
+            )
         })
     }
 
@@ -98,6 +114,7 @@ impl GraphJob {
         files: &[RootFile],
         mut builder: Box<dyn Builder + Send + Sync>,
         mut writer: NamespaceWriter,
+        runs: Runs,
     ) -> Self {
         let mut tree = Tree::new();
         let volumes: Vec<_> = files.iter().map(|file| file.articles.clone()).collect();
@@ -123,8 +140,19 @@ impl GraphJob {
             root,
             builder,
             writer,
+            runs,
             reported: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runs(&self) -> &Runs {
+        &self.runs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_builder(&mut self, builder: Box<dyn Builder + Send + Sync>) {
+        self.builder = builder;
     }
 
     pub(crate) fn tree(&self) -> &Tree {
@@ -148,7 +176,8 @@ impl GraphJob {
                 .into_iter()
                 .map(|node| tree.recovery(node).and_then(|recovery| recovery.outcome())),
         );
-        RootPhase::derive(self.payload_waiting(), activity, phase::extracting(tree))
+        let extracting = phase::extracting(tree) || self.runs.live();
+        RootPhase::derive(self.payload_waiting(), activity, extracting)
     }
 
     // Seam for completion, status and health: the root namespace, which is
@@ -231,14 +260,16 @@ impl GraphJob {
             &mut Vec::new(),
         )?;
         self.mark_damage()?;
-        self.after_member(volume)
+        self.after_member(volume)?;
+        self.step_runs()
     }
 
     // Every server failed the article; nothing will fetch it again.
     pub(crate) fn lost(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
         self.root.map.lost(volume, ordinal);
         self.mark_damage()?;
-        self.after_member(volume)
+        self.after_member(volume)?;
+        self.step_runs()
     }
 
     // After an article of `volume` was settled: a member with nothing left
@@ -260,8 +291,13 @@ impl GraphJob {
     }
 
     fn closed(&self, member: MemberId) -> bool {
-        self.namespace()
-            .get(member)
+        self.closed_in(NodeId::ROOT, member)
+    }
+
+    fn closed_in(&self, node: NodeId, member: MemberId) -> bool {
+        self.tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
             .is_some_and(|record| record.closed)
     }
 
@@ -325,8 +361,35 @@ impl GraphJob {
         let mut effects = Vec::new();
         for (volume, range) in self.root.damage() {
             self.tree.damage(NodeId::ROOT, volume, range, &mut effects);
+            self.recovery_volume_lost(volume, range, &mut effects);
         }
         self.settle(effects)
+    }
+
+    // A lost range of a recovery object's own volume is gone for good, since
+    // nothing recovers the recovery. The object hears it, or it waits on the
+    // gap: a walk that never passes it finds none of the blocks beyond.
+    // A data object is not told, as a repair may still bring its bytes back.
+    fn recovery_volume_lost(
+        &mut self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((node, inner)) = self.tree.child_of(NodeId::ROOT, MemberId(volume.0)) else {
+            return;
+        };
+        if !self.tree.recovers(node) {
+            return;
+        }
+        let Some(mut object) = self.tree.take_object(node) else {
+            return;
+        };
+        let mut emits = Vec::new();
+        object.volume_lost(inner, range, &mut emits);
+        self.tree.put_object(node, object);
+        self.tree
+            .emitted(node, emits, &mut *self.builder, effects);
     }
 
     // One round of seeks: every object's standing wants lifted to the root,

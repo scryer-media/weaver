@@ -252,6 +252,7 @@ impl Pipeline {
             graph_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
+            graph_runs: Default::default(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             archive_password_winners: HashMap::new(),
@@ -1230,6 +1231,9 @@ impl Pipeline {
                             event,
                             &mut pending_download_results,
                         );
+                    }
+                    Some(said) = self.graph_runs.recv() => {
+                        self.graph_run_said(said);
                     }
                     Some(result) = self.decode_done_rx.recv() => {
                         crate::runtime::perf_probe::record(

@@ -141,6 +141,11 @@ pub trait Object: Send + Sync {
     // Bytes of my envelope, for the inverse map's remainder.
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes>;
 
+    // A member of my parent's namespace, by its name there, is now this
+    // volume of mine. The name is how an object that chains its volumes by
+    // name knows its own set when a sibling asks to be claimed.
+    fn bound(&mut self, _volume: VolumeIndex, _name: &str) {}
+
     // A new member appeared beside the one I am bound to. Is it one of my
     // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z
     // store claims `.7z.002`, which has no signature of its own. Only an
@@ -164,6 +169,16 @@ pub trait Object: Send + Sync {
     }
 
     fn recovery_mut(&mut self) -> Option<&mut dyn crate::recovery::Recovery> {
+        None
+    }
+
+    // My engine face, if I read my volumes as files: the owner starts and
+    // runs it, and hands what it emits back to me through the tree.
+    fn engine(&self) -> Option<&dyn crate::engine::Engine> {
+        None
+    }
+
+    fn engine_mut(&mut self) -> Option<&mut dyn crate::engine::Engine> {
         None
     }
 }

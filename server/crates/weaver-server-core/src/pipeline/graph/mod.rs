@@ -6,12 +6,14 @@
 // the classic one, so every job is stamped with the engine it was admitted
 // under and a restart keeps that engine whatever the switch says now.
 
+pub(crate) mod engine;
 pub(crate) mod envelope;
 pub(crate) mod job;
 pub(crate) mod leaf;
 pub(crate) mod limits;
 pub(crate) mod namespace;
 pub(crate) mod root;
+pub(crate) mod stand_in;
 pub(crate) mod status;
 
 use std::fmt;
