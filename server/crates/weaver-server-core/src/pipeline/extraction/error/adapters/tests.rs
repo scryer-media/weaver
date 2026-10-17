@@ -75,7 +75,7 @@ fn flate2_1_1_gzip_trailer_mismatch_is_recoverable() {
 }
 
 #[test]
-fn zip_8_6_member_crc_mismatch_is_recoverable() {
+fn zip_9_member_crc_mismatch_is_recoverable() {
     let payload = b"one stored member, read back with one byte changed";
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     writer
@@ -94,7 +94,7 @@ fn zip_8_6_member_crc_mismatch_is_recoverable() {
     archive[at] ^= 0x01;
     let mut zip = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
     let error = read_all(zip.by_index(0).unwrap());
-    assert!(zip_8_6_crc32_mismatch(&error));
+    assert!(zip_9_crc32_mismatch(&error));
     assert_eq!(
         untyped_io_class(&error),
         Some(ExtractionErrorClass::Recoverable)
@@ -143,14 +143,14 @@ fn zip_with_bad_unicode_path_field() -> Vec<u8> {
     archive
 }
 
+// zip 9.0 no longer checks the field's CRC-32 when it opens an archive, so
+// no adapter classifies that failure: the member keeps its own name.
 #[test]
-fn zip_8_6_unicode_extra_field_mismatch_is_recognised() {
-    let error = zip::ZipArchive::new(Cursor::new(zip_with_bad_unicode_path_field()))
-        .expect_err("the Unicode path field fails its CRC");
-    let zip::result::ZipError::InvalidArchive(detail) = &error else {
-        panic!("an invalid archive: {error:?}");
-    };
-    assert!(zip_8_6_unicode_extra_field_checksum(detail));
+fn zip_9_opens_past_a_unicode_path_field_mismatch() {
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_with_bad_unicode_path_field()))
+        .expect("the archive opens");
+    let member = archive.by_index(0).expect("the member opens");
+    assert_eq!(member.name().expect("the name decodes"), "member.bin");
 }
 
 #[test]

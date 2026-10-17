@@ -316,11 +316,6 @@ pub(crate) fn zip_error_class(error: &zip::result::ZipError) -> ExtractionErrorC
     match error {
         ZipError::Io(error) => io_error_class(error),
         ZipError::InvalidPassword => ExtractionErrorClass::PasswordRequired,
-        ZipError::InvalidArchive(detail)
-            if adapters::zip_8_6_unicode_extra_field_checksum(detail) =>
-        {
-            ExtractionErrorClass::Recoverable
-        }
         _ => ExtractionErrorClass::Terminal,
     }
 }

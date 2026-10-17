@@ -323,7 +323,15 @@ fn extract_zip_nzbs(path: &Path, limit: u64) -> Result<IntakeOutput, IntakeError
         if entry.is_dir() {
             continue;
         }
-        let entry_name = entry.name().to_string();
+        let entry_name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(error) => {
+                output
+                    .permanent_errors
+                    .push(format!("failed to read zip entry {i} name: {error}"));
+                continue;
+            }
+        };
         let safe_path = match validate_archive_entry_path(&entry_name, "zip") {
             Ok(path) => path,
             Err(error) => {

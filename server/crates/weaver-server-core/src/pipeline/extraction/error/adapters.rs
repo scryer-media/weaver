@@ -21,7 +21,7 @@ pub(super) fn untyped_io_class(error: &io::Error) -> Option<ExtractionErrorClass
     let recoverable = std_read_exact_eof(&text)
         || zstd_0_13_checksum_mismatch(&text)
         || flate2_1_1_gzip_checksum_mismatch(&text)
-        || zip_8_6_crc32_mismatch(error)
+        || zip_9_crc32_mismatch(error)
         || tar_0_4_header_checksum_mismatch(&text);
     recoverable.then_some(ExtractionErrorClass::Recoverable)
 }
@@ -53,16 +53,10 @@ fn flate2_1_1_gzip_checksum_mismatch(text: &str) -> bool {
     text.contains("corrupt gzip stream does not have a matching checksum")
 }
 
-// zip 8.6.0: a member whose CRC-32 does not match is an `InvalidData`
+// zip 9.0: a member whose CRC-32 does not match is an `InvalidData`
 // `io::Error` with this text, raised from its `Crc32Reader`.
-fn zip_8_6_crc32_mismatch(error: &io::Error) -> bool {
+fn zip_9_crc32_mismatch(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::InvalidData && error.to_string().contains("Invalid checksum")
-}
-
-// zip 8.6.0: an Info-ZIP Unicode extra field whose CRC-32 does not match the
-// name it shadows is `ZipError::InvalidArchive` with this detail.
-pub(super) fn zip_8_6_unicode_extra_field_checksum(detail: &str) -> bool {
-    detail.starts_with("CRC32 checksum failed on Unicode extra field")
 }
 
 // tar 0.4.46: an entry header whose checksum does not match is an `Other`
