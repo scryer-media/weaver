@@ -238,7 +238,22 @@ impl<O: Object> Job<O> {
         self.namespace.keep_first_bytes(member, offset, bytes);
     }
 
-    // A recovery file: volume 0 if it is the first, claimed otherwise.
+    // A volume named but not yet arrived, claimed and bound as the tree
+    // would: the object says where it goes, and `None` on the first makes
+    // it the first.
+    pub(crate) fn name(&mut self, name: &str, bytes: &[u8]) -> VolumeIndex {
+        let claimed = self.object.claim(name, &bytes[..bytes.len().min(64)]);
+        let volume = match claimed {
+            Some(volume) => volume,
+            None if self.store.volumes.is_empty() => VolumeIndex(0),
+            None => panic!("claimed"),
+        };
+        self.object.bound(volume, name);
+        self.store.volumes.insert(volume, bytes.to_vec());
+        volume
+    }
+
+    // A recovery file, named and then delivered.
     // Delivered in pieces of `chunk` bytes, in the order `order` gives.
     pub(crate) fn volume(
         &mut self,
@@ -250,15 +265,7 @@ impl<O: Object> Job<O> {
         let member = self.namespace.announce(name, Some(bytes.len() as u64));
         self.arrive(member, 0, bytes, Provenance::Fresh);
         self.namespace.bind(member, self.own);
-        let first = self.store.volumes.is_empty();
-        let volume = if first {
-            VolumeIndex(0)
-        } else {
-            self.object
-                .claim(name, &bytes[..bytes.len().min(64)])
-                .expect("claimed")
-        };
-        self.store.volumes.insert(volume, bytes.to_vec());
+        let volume = self.name(name, bytes);
         let mut pieces: Vec<(usize, &[u8])> = bytes
             .chunks(chunk)
             .enumerate()

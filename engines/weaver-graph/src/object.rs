@@ -195,7 +195,8 @@ pub trait Object: Send + Sync {
     // with the volume index the member becomes, its position in the set and
     // never the order it arrived in, or `None` to let the sniffer decide. A
     // freshly built object is asked first about the member it was built
-    // for, and `None` makes that member its first volume.
+    // for, and `None` makes that member its first volume. The answer only
+    // reads: the volume exists once `bound` says so.
     fn claim(&mut self, _name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
         None
     }

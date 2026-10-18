@@ -62,11 +62,8 @@ pub struct Zip {
     basis: Vec<(ByteRange, u32)>,
     members: Vec<Out>,
     grid: Grid,
-    // Container ranges wanted ahead of the normal order, and the volume
-    // ranges already bid for them.
+    // Container ranges wanted ahead of the normal order.
     bids: Vec<(ByteRange, Weight)>,
-    #[serde(skip)]
-    bid: BTreeSet<(u32, u64, u64)>,
     damage_said: HashSet<(u64, u64, u32)>,
     // Something changed since the object last looked.
     stale: bool,
@@ -279,16 +276,18 @@ impl Object for Zip {
             return;
         }
         let mut pieces = Vec::new();
-        for (range, weight) in self.bids.clone() {
+        for (range, weight) in &self.bids {
+            // A range in hand is wanted no more.
+            if self.kept.read(*range).is_some() {
+                continue;
+            }
             pieces.clear();
-            self.to_volumes(range, &mut pieces);
+            self.to_volumes(*range, &mut pieces);
             for (volume, range) in &pieces {
                 // Only volumes bound so far can be bid: a seek into one not
                 // yet claimed would be answered as unseekable.
-                if self.bound.contains(&volume.0)
-                    && self.bid.insert((volume.0, range.start, range.end))
-                {
-                    out.push(Seek::data(*volume, *range, weight));
+                if self.bound.contains(&volume.0) {
+                    out.push(Seek::data(*volume, *range, *weight));
                 }
             }
         }

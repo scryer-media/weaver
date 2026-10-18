@@ -37,7 +37,6 @@ pub(super) struct StoreFacts {
     volumes: Vec<VolumeFacts>,
     pub(super) entries: Vec<EntryFacts>,
     asked: bool,
-    bid: BTreeSet<VolumeIndex>,
     damage_said: BTreeSet<(VolumeIndex, u64, u64, u32)>,
     recovery_said: BTreeSet<(VolumeIndex, u64)>,
     gaps_said: BTreeSet<VolumeIndex>,
@@ -171,7 +170,6 @@ pub(super) fn of(store: &RarStore) -> Facts {
         volumes,
         entries,
         asked: store.asked,
-        bid: store.bid.clone(),
         damage_said: store.damage_said.iter().copied().collect(),
         recovery_said: store.recovery_said.clone(),
         gaps_said: store.gaps_said.clone(),
@@ -209,7 +207,6 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
     }
     let keyings: Vec<_> = kept.entries.iter().map(|entry| entry.keying).collect();
     store.entries = kept.entries.into_iter().map(entry).collect();
-    store.bid = kept.bid;
     store.damage_said = kept.damage_said.into_iter().collect();
     store.recovery_said = kept.recovery_said;
     store.gaps_said = kept.gaps_said;

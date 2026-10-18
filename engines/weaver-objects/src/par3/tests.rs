@@ -103,11 +103,7 @@ fn a_hole_in_a_volume_costs_only_the_blocks_it_cuts() {
     let mut job = job(before);
     let block = first_block(&volume.1);
     let hole = ByteRange::new(block.start + 100, block.start + 200);
-    let at = job
-        .object
-        .claim(&volume.0, &volume.1[..64])
-        .expect("claimed");
-    job.store.volumes.insert(at, volume.1.clone());
+    let at = job.name(&volume.0, &volume.1);
     let mut out = Vec::new();
     for range in [
         ByteRange::new(0, hole.start),

@@ -66,7 +66,7 @@ impl Par2 {
     pub fn new(id: ObjectId) -> Self {
         Self {
             id,
-            volumes: vec![Volume::default()],
+            volumes: Vec::new(),
             sets: BTreeMap::new(),
             grid: Grid::default(),
             lengths: BTreeMap::new(),
@@ -256,12 +256,10 @@ impl Object for Par2 {
         Recovery::wants(self, out);
     }
 
-    // Moved and Unseekable both mean wait; only Lost changes what can be had.
-    fn pulled(&mut self, seek: Seek, pull: Pull, out: &mut Vec<Emit>) {
-        if pull == Pull::Lost {
-            self.volume_lost(seek.volume, seek.range, out);
-        }
-    }
+    // Every answer means wait. A seek asks for the rest of a volume, and one
+    // lost article loses it whole, though the blocks beyond that article
+    // still come; what is lost reaches `volume_lost` at its exact range.
+    fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
     // The volume's bytes are all envelope: they stay in the volume's own
     // file, which is the .par2 member itself.
@@ -278,12 +276,14 @@ impl Object for Par2 {
         None
     }
 
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        if first_bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
-            return None;
-        }
-        self.volumes.push(Volume::named(name));
-        Some(VolumeIndex((self.volumes.len() - 1) as u32))
+    // Every PAR2 file is a volume of the one object, numbered as it comes.
+    fn claim(&mut self, _name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+        (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice()))
+            .then(|| VolumeIndex(self.volumes.len() as u32))
+    }
+
+    fn bound(&mut self, volume: VolumeIndex, name: &str) {
+        self.volume(volume).name(name);
     }
 
     fn recovery(&self) -> Option<&dyn Recovery> {

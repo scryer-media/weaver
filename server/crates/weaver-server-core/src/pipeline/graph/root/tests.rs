@@ -383,7 +383,7 @@ fn the_window_holds_eight_volumes_and_four_for_an_in_order_reader() {
 }
 
 #[test]
-fn a_bid_the_full_window_has_no_room_for_stands_until_a_place_frees() {
+fn a_bid_the_full_window_had_no_room_for_is_drawn_when_asked_again_once_a_place_frees() {
     let volumes: Vec<Vec<(u32, u32)>> = (0..12).map(|_| vec![(0, 100)]).collect();
     let mut root = ArticleRoot::new(&volumes);
     let asks: Vec<Ask> = (0..12)
@@ -392,14 +392,14 @@ fn a_bid_the_full_window_has_no_room_for_stands_until_a_place_frees() {
     root.answer(&asks, |_| true);
     assert_eq!(windowed(&root.map.take_moves()), (0..8).collect::<Vec<_>>());
 
-    // Nothing asks again, and the volumes that were drawn have nothing left
-    // queued: the bids that stood take their places.
+    // The window keeps no bid: a round that asks nothing draws nothing.
     root.answer(&[], |volume| volume.0 >= 8);
-    assert_eq!(windowed(&root.map.take_moves()), vec![8, 9, 10, 11]);
-
-    // Their volumes done too, nothing stands.
-    root.answer(&[], |_| false);
     assert!(windowed(&root.map.take_moves()).is_empty());
+
+    // The bidder asks again, and the volumes that were drawn have nothing
+    // left queued: the rest take their places.
+    root.answer(&asks, |volume| volume.0 >= 8);
+    assert_eq!(windowed(&root.map.take_moves()), vec![8, 9, 10, 11]);
 }
 
 #[tokio::test]

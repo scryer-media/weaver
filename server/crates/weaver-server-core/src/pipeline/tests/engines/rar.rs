@@ -15,13 +15,15 @@ use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, Stall, assert_same, par2_set, payload, run, run_both,
     try_run,
 };
+use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_rar4_store_set, encrypted_store_set, header_encrypted_store_set,
 };
 use crate::pipeline::tests::direct_store::{
-    obfuscate_volumes, single_member_rar4_store_set_numbered, single_member_store_set,
+    obfuscate_volumes, recovery_record_store_set, single_member_rar4_store_set_numbered,
+    single_member_store_set,
 };
 
 const MEMBER: &str = "beacon.bin";
@@ -100,6 +102,15 @@ fn assert_repaired_in_stream(graph: &Outcome) {
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
+// Every volume's mark is what its bytes are now.
+fn assert_volumes_complete(graph: &Outcome) {
+    let claims = &graph.graph().claims;
+    assert!(
+        claims.values().all(|claim| *claim == Claim::Complete),
+        "{claims:?}"
+    );
+}
+
 // Classic waits at Downloading on these sets and never settles.
 fn assert_classic_stalls(stall: Result<Outcome, Stall>) {
     let stall = stall.expect_err("classic settles");
@@ -157,10 +168,9 @@ async fn a_four_volume_rar4_set_delivers_its_member_under_both_engines() {
 }
 
 // Divergence: classic never settles on a stored set with a damaged article
-// beside PAR2. The graph repairs the slice in the stream. Its view still
-// marks part02 Damaged: the member failed its checksum as a whole before
-// the repair, and that mark is put on every volume the member spans and
-// is not lifted by the repaired delivery.
+// beside PAR2. The graph repairs the slice in the stream, and every volume
+// ends complete: the one damaged mark was the article's, and its repair
+// replaced it.
 #[tokio::test]
 async fn a_member_damaged_mid_volume_is_repaired_in_the_stream_under_graph() {
     let body = body();
@@ -170,10 +180,7 @@ async fn a_member_damaged_mid_volume_is_repaired_in_the_stream_under_graph() {
     let graph = run(&scenario, Engine::Graph).await;
     assert_member(&graph, &body);
     assert_repaired_in_stream(&graph);
-    assert_eq!(
-        graph.graph().claims["silver.horizon.part02.rar"],
-        Claim::Damaged
-    );
+    assert_volumes_complete(&graph);
 }
 
 // Divergence: classic delivers the member without reading anything back;
@@ -221,9 +228,12 @@ async fn nameless_volumes_renamed_by_par2_deliver_under_both_engines() {
     );
 }
 
-// Posted last volume first, so the store is built on the set's last
-// volume and every earlier one arrives after it. Each takes the position
-// the set gives it, by its name or, nameless, by its headers.
+// Nameless and posted last volume first, so the store is built on the
+// set's last volume and every earlier one arrives after it, and nothing but
+// the headers says where each goes. A named set is fetched in its names'
+// order whatever order it is posted in. A nameless RAR4 set posted
+// backwards places nothing: a RAR4 volume states its number only in its
+// end record, and classic stalls on it too.
 fn reversed(mut volumes: Vec<(String, Vec<u8>)>) -> Scenario {
     volumes.reverse();
     Scenario::new(posts(volumes))
@@ -242,7 +252,6 @@ async fn assert_reversed_delivers(scenario: &Scenario, body: &[u8]) {
     assert_same(&classic, &graph);
 }
 
-// Nameless: nothing but the headers says which volume comes first.
 #[tokio::test]
 async fn a_nameless_rar5_set_whose_first_volume_arrives_last_delivers_under_both_engines() {
     let body = body();
@@ -257,42 +266,20 @@ async fn a_nameless_four_volume_rar5_set_posted_backwards_delivers_under_both_en
     assert_reversed_delivers(&reversed(set), &body).await;
 }
 
+// A nameless RAR4 volume's front states no position: its number is in its
+// end record, and the first-volume flag of its main header is not among the
+// facts unrar-rs reads. The set's last volume founds the store at the first
+// position, and the set is never placed. Neither engine settles.
 #[tokio::test]
-async fn a_four_volume_rar5_set_posted_backwards_delivers_under_both_engines() {
-    let body = body();
-    let set = single_member_store_set(MEMBER, &body, 4);
-    assert_reversed_delivers(&reversed(set), &body).await;
-}
-
-#[tokio::test]
-async fn a_four_volume_rar4_set_posted_backwards_delivers_under_both_engines() {
-    let body = body();
-    let set = single_member_rar4_store_set_numbered(MEMBER, &body, 4);
-    assert_reversed_delivers(&reversed(set), &body).await;
-}
-
-#[tokio::test]
-async fn tmp_old_numbering_rar4_backwards() {
-    let body = body();
-    let names = [
-        "silver.horizon.rar",
-        "silver.horizon.r00",
-        "silver.horizon.r01",
-        "silver.horizon.r02",
-    ];
-    let set = single_member_rar4_store_set_numbered(MEMBER, &body, 4)
-        .into_iter()
-        .zip(names)
-        .map(|((_, bytes), name)| (name.to_owned(), bytes))
-        .collect();
-    assert_reversed_delivers(&reversed(set), &body).await;
-}
-
-#[tokio::test]
-async fn tmp_nameless_rar4_backwards() {
+async fn a_nameless_four_volume_rar4_set_posted_backwards_settles_under_neither_engine() {
     let body = body();
     let set = obfuscate_volumes(&single_member_rar4_store_set_numbered(MEMBER, &body, 4));
-    assert_reversed_delivers(&reversed(set), &body).await;
+    let scenario = reversed(set);
+    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    let stall = try_run(&scenario, Engine::Graph)
+        .await
+        .expect_err("the graph settles");
+    assert_eq!(stall.status, Some(JobStatus::Extracting), "{}", stall.state);
 }
 
 #[tokio::test]
@@ -361,8 +348,8 @@ async fn an_encrypted_rar4_set_delivers_under_both_engines() {
 
 // One damaged article of cipher text: the graph repairs it through the
 // posted bytes the store rebuilds, and asks for nothing again. Divergence:
-// classic never settles. The graph's view marks part02 Damaged, as in the
-// plain damaged row.
+// classic never settles. Every volume ends complete, as in the plain
+// damaged row.
 #[tokio::test]
 async fn an_encrypted_rar5_set_with_a_damaged_cipher_article_is_repaired_under_graph() {
     let body = body();
@@ -374,10 +361,7 @@ async fn an_encrypted_rar5_set_with_a_damaged_cipher_article_is_repaired_under_g
     let graph = run(&scenario, Engine::Graph).await;
     assert_member(&graph, &body);
     assert_repaired_in_stream(&graph);
-    assert_eq!(
-        graph.graph().claims["silver.horizon.part02.rar"],
-        Claim::Damaged
-    );
+    assert_volumes_complete(&graph);
 }
 
 // Divergence: classic also leaves its direct-unpack scratch file, empty,
@@ -426,4 +410,45 @@ async fn an_xz_stream_inside_a_stored_rar_volume_streams_under_both_engines() {
             .values()
             .all(|claim| *claim == Claim::Complete)
     );
+}
+
+// Each volume carries a recovery record and there is no PAR2. Neither
+// engine decodes the record, so nothing can repair the damaged article.
+// Divergence: classic fails the job at unpack and delivers nothing. The
+// graph rules that nothing will repair the set: the store gives its
+// volumes up unrepaired, they are delivered as they came, the damaged one
+// claimed damaged, and the job completes.
+#[tokio::test]
+async fn a_rar5_set_with_recovery_records_and_a_damaged_article_ends_unrepaired_under_both_engines()
+{
+    let body = body();
+    let set = recovery_record_store_set(MEMBER, &body, 2, 96);
+    let scenario = Scenario::new(posts(set.clone())).damaged(0, 2);
+    let (classic, graph) = (
+        run(&scenario, Engine::Classic).await,
+        run(&scenario, Engine::Graph).await,
+    );
+    assert!(
+        matches!(classic.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        classic.status
+    );
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
+    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        set.iter()
+            .map(|(name, _)| delivered(name))
+            .collect::<Vec<_>>()
+    );
+    assert!(graph.files[&delivered(&set[0].0)] != set[0].1);
+    assert_eq!(graph.files[&delivered(&set[1].0)], set[1].1);
+    let view = graph.graph();
+    assert_eq!(view.claims[&set[0].0], Claim::Damaged);
+    assert_eq!(view.claims[&set[1].0], Claim::Complete);
+    assert_eq!(view.blocks_reachable, 0);
+    assert!(view.outcomes.is_empty(), "{:?}", view.outcomes);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(classic.refetched().is_empty(), "{:?}", classic.refetched());
 }

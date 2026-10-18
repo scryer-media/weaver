@@ -66,8 +66,10 @@ impl GraphJob {
     }
 
     // A recovery object that has not ruled rules once every member it
-    // covers is closed; one waiting on recovery bytes rules again once more
-    // of its volumes are closed than when it last ruled.
+    // covers is closed and the namespace has announced every member it
+    // will get, since a volume of its own may still be on its way behind
+    // them; one waiting on recovery bytes rules again once more of its
+    // volumes are closed than when it last ruled.
     fn due(&self, node: NodeId) -> bool {
         let tree = &self.tree;
         let Some(namespace) = tree.namespace(node) else {
@@ -78,9 +80,12 @@ impl GraphJob {
                 return false;
             };
             match recovery.outcome() {
-                None => namespace
-                    .members()
-                    .all(|member| !recovery.covers(member.id) || member.closed),
+                None => {
+                    self.members_known(node)
+                        && namespace
+                            .members()
+                            .all(|member| !recovery.covers(member.id) || member.closed)
+                }
                 Some(RepairOutcome::Waiting) => {
                     let ruled = self.ruled_at.get(&recovery_node).copied().unwrap_or(0);
                     self.closed_volumes(recovery_node) > ruled
@@ -99,16 +104,22 @@ impl GraphJob {
         })
     }
 
-    // Everything the namespace will get is in: the members that are its
-    // object's volumes are closed, no run of it is still reading, and every
-    // member but a recovery volume is closed.
-    fn namespace_in(&self, node: NodeId) -> bool {
-        let tree = &self.tree;
-        let volumes_in = tree.volumes(node).is_none_or(|(parent, volumes)| {
+    // The namespace has announced every member it will get: the members
+    // that are its object's volumes are closed and no run of it is still
+    // reading. The root's members are the post's, known from the start.
+    fn members_known(&self, node: NodeId) -> bool {
+        let volumes_in = self.tree.volumes(node).is_none_or(|(parent, volumes)| {
             volumes
                 .values()
                 .all(|member| self.closed_in(parent, *member))
         });
+        volumes_in && !self.runs.has(node)
+    }
+
+    // Everything the namespace will get is in: every member is announced,
+    // and every member but a recovery volume is closed.
+    fn namespace_in(&self, node: NodeId) -> bool {
+        let tree = &self.tree;
         let members_in = tree.namespace(node).is_some_and(|namespace| {
             namespace.members().all(|member| {
                 member.closed
@@ -117,7 +128,7 @@ impl GraphJob {
                         .is_some_and(|(child, _)| tree.recovers(child))
             })
         });
-        volumes_in && members_in && !self.runs.has(node)
+        self.members_known(node) && members_in
     }
 
     // A file a recovery object of the namespace describes and no member

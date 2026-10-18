@@ -3,15 +3,21 @@
 
 // Seeks under both engines: the RAR store's bids bringing volumes forward
 // into the root's window, the PAR2 object's recovery seeks promoted over
-// every bid, lost and unseekable answers, a seek lifted through a store's
-// extent map, and a recovery seek standing across a restart.
+// every bid, lost answers, a store read out of a stream, a seek lifted
+// through a store's extent map, a store nothing names, an open-ended
+// recovery seek, and a recovery seek standing across a restart. Where the
+// engines part, the row names how.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 
+use weaver_graph::recovery::RepairOutcome;
+
 use super::harness::{
-    ARTICLE, JOB, Outcome, Post, Scenario, finished, par2_set, par2_volumes, payload, run, serve,
+    ARTICLE, Claim, JOB, Outcome, Post, Scenario, Stall, finished, one_block_article, par2_set,
+    par2_volumes, payload, recovery_blocks, run, serve, try_run,
 };
+use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::Pipeline;
 use crate::pipeline::graph::Engine;
@@ -56,6 +62,13 @@ fn posts(volumes: &[(String, Vec<u8>)]) -> Vec<Post> {
         .collect()
 }
 
+fn named(files: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+    files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect()
+}
+
 fn xz(bytes: &[u8]) -> Vec<u8> {
     let props = lzma_turbo::LzmaEncProps::xz_preset(0, false).unwrap();
     let mut encoder = lzma_turbo::XzWriter::new(Vec::new(), &props).unwrap();
@@ -70,6 +83,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> usize {
         .expect("the needle is in the haystack")
 }
 
+// Every member delivered at its name with its bytes, and no article asked
+// for twice.
 fn assert_members(outcome: &Outcome, members: &[(String, Vec<u8>)]) {
     assert!(
         outcome.completed(),
@@ -96,124 +111,324 @@ fn assert_members(outcome: &Outcome, members: &[(String, Vec<u8>)]) {
             outcome.engine
         );
     }
-}
-
-fn dump(label: &str, outcome: &Outcome) {
-    eprintln!(
-        "{label} {}: status {:?} failure {:?} kind {:?} refetched {:?} reads {} view {:?}\n  order {:?}\n  files {:?}",
-        outcome.engine,
-        outcome.status,
-        outcome.failure,
-        outcome.failure_kind,
+    assert_eq!(
         outcome.refetched(),
-        outcome.reads,
-        outcome.graph,
-        outcome.order,
-        outcome.files.keys().collect::<Vec<_>>()
+        Vec::new(),
+        "{}: refetched",
+        outcome.engine
     );
 }
 
-async fn explore(label: &str, scenario: &Scenario) -> (Outcome, Outcome) {
-    for (index, post) in scenario.posts.iter().enumerate() {
-        eprintln!(
-            "{label} post {index} {} {}",
-            post.name,
-            post.bytes.len().div_ceil(ARTICLE)
-        );
+// A run that sat at `status` with nothing left to do.
+fn assert_stalled(result: Result<Outcome, Stall>, engine: Engine, status: JobStatus) {
+    match result {
+        Err(stall) => {
+            assert_eq!(stall.engine, engine);
+            assert_eq!(stall.status, Some(status), "{engine}: {}", stall.state);
+        }
+        Ok(outcome) => panic!(
+            "{engine} finished {:?} {:?}, expected a stall at {status:?}",
+            outcome.status, outcome.failure
+        ),
     }
-    let graph = run(scenario, Engine::Graph).await;
-    dump(label, &graph);
-    let classic = run(scenario, Engine::Classic).await;
-    dump(label, &classic);
-    (classic, graph)
 }
 
-#[tokio::test]
-async fn r1_reverse() {
-    let members = members(4, 11);
-    let mut volumes = store_set(&members, 12);
-    volumes.reverse();
-    let mut posts = posts(&volumes);
-    posts.insert(6, Post::plain("ember.bin", payload(6 * ARTICLE, 3)));
-    explore("r1", &Scenario::new(posts)).await;
+fn assert_failed(outcome: &Outcome, kind: HistoryFailureKind) {
+    assert!(
+        matches!(outcome.status, Some(JobStatus::Failed { .. })),
+        "{}: {:?} {:?}",
+        outcome.engine,
+        outcome.status,
+        outcome.failure
+    );
+    assert_eq!(outcome.failure_kind, Some(kind), "{}: kind", outcome.engine);
+    assert_eq!(
+        outcome.refetched(),
+        Vec::new(),
+        "{}: refetched",
+        outcome.engine
+    );
 }
 
-#[tokio::test]
-async fn r2_two_stores() {
-    let a = renamed(store_set(&members(4, 21), 10), "amber.dusk");
-    let b = store_set(&members(4, 41), 10);
-    let mut out = Vec::new();
-    for (left, right) in a.iter().zip(&b) {
-        out.push(Post::plain(&left.0, left.1.clone()));
-        out.push(Post::plain(&right.0, right.1.clone()));
-    }
-    explore("r2", &Scenario::new(out)).await;
-}
-
-fn named(files: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
-    files
+// Where in the order a file's first article was asked for.
+fn first(outcome: &Outcome, file: u32) -> usize {
+    outcome
+        .order
         .iter()
-        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-        .collect()
+        .position(|(at, _)| *at == file)
+        .unwrap_or_else(|| panic!("{}: file {file} asked for", outcome.engine))
+}
+
+// Where in the order a file's first article past its head was asked for.
+// The graph samples every recovery volume's head early, to learn what it
+// holds, so a recovery seek shows from the volume's second article on.
+fn past_head(outcome: &Outcome, file: u32) -> usize {
+    outcome
+        .order
+        .iter()
+        .position(|(at, ordinal)| *at == file && *ordinal > 0)
+        .unwrap_or_else(|| panic!("{}: file {file} past its head", outcome.engine))
+}
+
+// Where in the order a file's last article was asked for.
+fn last(outcome: &Outcome, file: u32) -> usize {
+    outcome
+        .order
+        .iter()
+        .rposition(|(at, _)| *at == file)
+        .unwrap_or_else(|| panic!("{}: file {file} asked for", outcome.engine))
+}
+
+// Row 1. A store posted out of volume order, reversed and shuffled, a plain
+// file between its volumes: the store's bids bring each next volume forward
+// as far as the window lets them, and both engines ask in one order.
+async fn out_of_order(order: &[usize]) {
+    let members = members(4, 11);
+    let volumes = store_set(&members, 12);
+    let mut posts: Vec<Post> = order
+        .iter()
+        .map(|index| Post::plain(&volumes[*index].0, volumes[*index].1.clone()))
+        .collect();
+    let plain = payload(6 * ARTICLE, 3);
+    posts.insert(6, Post::plain("ember.bin", plain.clone()));
+    let scenario = Scenario::new(posts);
+    let classic = run(&scenario, Engine::Classic).await;
+    let graph = run(&scenario, Engine::Graph).await;
+    let mut all = members.clone();
+    all.push(("ember.bin".to_string(), plain));
+    assert_members(&classic, &all);
+    assert_members(&graph, &all);
+    assert_eq!(graph.order, classic.order, "one order of asks");
 }
 
 #[tokio::test]
-async fn r3_recovery_promoted() {
-    let volumes = store_set(&members(3, 61), 6);
-    let mut out = posts(&volumes);
-    out.extend(par2_volumes("silver.horizon", &named(&volumes), 3, 3));
-    explore("r3", &Scenario::new(out).damaged(3, 2)).await;
+async fn a_store_posted_in_reverse_is_asked_for_in_one_order_by_both_engines() {
+    out_of_order(&(0..12).rev().collect::<Vec<_>>()).await;
 }
 
 #[tokio::test]
-async fn r4_lost_recovery_next_volume() {
-    let volumes = store_set(&members(3, 71), 4);
-    let mut out = posts(&volumes);
-    out.extend(par2_volumes("silver.horizon", &named(&volumes), 3, 3));
-    let first = super::harness::recovery_blocks(&out[5]);
-    eprintln!("r4 blocks {first:?}");
-    explore(
-        "r4a",
-        &Scenario::new(out).damaged(1, 2).lost(5, first[0][1]),
-    )
-    .await;
+async fn a_store_posted_shuffled_is_asked_for_in_one_order_by_both_engines() {
+    out_of_order(&[5, 0, 9, 3, 11, 1, 7, 10, 2, 8, 4, 6]).await;
 }
 
+// Row 2. Two stores interleaved volume by volume: the window ranks every
+// bid by its distance from where its store reads, so volume k of both
+// stores is asked for before volume k + 1 of either, and neither starves.
 #[tokio::test]
-async fn r4_lost_recovery_alone() {
-    let volumes = store_set(&members(3, 81), 4);
-    let mut out = posts(&volumes);
-    out.extend(par2_set("silver.horizon", &named(&volumes), 1));
-    let blocks = super::harness::recovery_blocks(&out[5]);
-    eprintln!("r4b blocks {blocks:?}");
-    let _ = super::harness::try_run(
-        &Scenario::new(out.drain(..).collect())
-            .damaged(1, 2)
-            .lost(5, blocks[0][1]),
-        Engine::Graph,
-    )
-    .await
-    .map(|outcome| dump("r4b", &outcome))
-    .map_err(|stall| eprintln!("r4b stall {:?} {}", stall.status, stall.state));
+async fn two_stores_share_the_window_volume_by_volume() {
+    let left: Vec<(String, Vec<u8>)> = members(4, 21)
+        .into_iter()
+        .map(|(name, bytes)| (format!("amber.{name}"), bytes))
+        .collect();
+    let right = members(4, 41);
+    let a = renamed(store_set(&left, 10), "amber.dusk");
+    let b = store_set(&right, 10);
+    let mut posts = Vec::new();
+    for (first, second) in a.iter().zip(&b) {
+        posts.push(Post::plain(&first.0, first.1.clone()));
+        posts.push(Post::plain(&second.0, second.1.clone()));
+    }
+    let scenario = Scenario::new(posts);
+    let classic = run(&scenario, Engine::Classic).await;
+    let graph = run(&scenario, Engine::Graph).await;
+    for outcome in [&classic, &graph] {
+        assert!(
+            outcome.completed(),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.failure
+        );
+        assert_eq!(outcome.refetched(), Vec::new(), "{}", outcome.engine);
+        assert_eq!(
+            outcome.files.len(),
+            8,
+            "{}: both stores' members",
+            outcome.engine
+        );
+        for volume in 0..9u32 {
+            for store in 0..2u32 {
+                assert!(
+                    first(outcome, 2 * volume + store) < first(outcome, 2 * (volume + 1)),
+                    "{}: volume {volume} of store {store} before volume {} of either",
+                    outcome.engine,
+                    volume + 1
+                );
+                assert!(
+                    first(outcome, 2 * volume + store) < first(outcome, 2 * (volume + 1) + 1),
+                    "{}: volume {volume} of store {store} before volume {} of either",
+                    outcome.engine,
+                    volume + 1
+                );
+            }
+        }
+    }
+    assert_eq!(graph.order, classic.order, "one order of asks");
 }
 
+// Row 3. A damaged article in the second volume: the PAR2 object's recovery
+// seek is promoted over every store bid, so the recovery volume that holds
+// enough blocks comes whole before the store's remaining volumes, and the
+// others are only sampled. Classic leaves the job at Downloading: it holds
+// the store's damage for an unpack that a store fed in order never asks
+// for, where the graph repairs as soon as the blocks are in.
 #[tokio::test]
-async fn r5_lost_data() {
+async fn a_recovery_seek_is_promoted_over_every_store_bid() {
+    let members = members(3, 61);
+    let volumes = store_set(&members, 6);
+    let mut posts = posts(&volumes);
+    posts.extend(par2_volumes("silver.horizon", &named(&volumes), 3, 3));
+    let scenario = Scenario::new(posts).damaged(3, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_members(&graph, &members);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    let damaged = graph
+        .order
+        .iter()
+        .position(|article| *article == (3, 2))
+        .unwrap();
+    let recovery = past_head(&graph, 7);
+    assert!(damaged < recovery, "the recovery seek follows the damage");
+    assert!(
+        last(&graph, 7) < last(&graph, 5),
+        "the recovery volume comes whole before the store's last volume"
+    );
+    assert_stalled(
+        try_run(&scenario, Engine::Classic).await,
+        Engine::Classic,
+        JobStatus::Downloading,
+    );
+}
+
+// Row 4a. A recovery article lost in the first recovery volume: the seek is
+// lost there, but the blocks beyond the lost article still come, and the
+// next volume makes up the shortfall. Classic stalls at Downloading, as in
+// row 3.
+#[tokio::test]
+async fn a_lost_recovery_article_is_made_up_from_the_next_volume() {
+    let members = members(3, 71);
+    let volumes = store_set(&members, 4);
+    let mut posts = posts(&volumes);
+    posts.extend(par2_volumes("silver.horizon", &named(&volumes), 3, 3));
+    let blocks = recovery_blocks(&posts[5]);
+    let scenario = Scenario::new(posts).damaged(1, 2).lost(5, blocks[0][1]);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_members(&graph, &members);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    assert_eq!(graph.graph().blocks_reachable, 2);
+    assert_stalled(
+        try_run(&scenario, Engine::Classic).await,
+        Engine::Classic,
+        JobStatus::Downloading,
+    );
+}
+
+// Row 4b. The only recovery block lost: nothing can make it up, so the
+// graph rules the repair impossible at once and asks for nothing again.
+// Classic leaves the job at Downloading: its RAR set never takes in the
+// damaged second volume, holding it for a repair that cannot come, where
+// the graph fails the repair.
+#[tokio::test]
+async fn a_lost_recovery_article_nothing_makes_up_fails_the_repair() {
+    let members = members(3, 81);
+    let volumes = store_set(&members, 4);
+    let mut posts = posts(&volumes);
+    posts.extend(par2_set("silver.horizon", &named(&volumes), 1));
+    let blocks = recovery_blocks(&posts[5]);
+    let scenario = Scenario::new(posts).damaged(1, 2).lost(5, blocks[0][1]);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_failed(&graph, HistoryFailureKind::Repair);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Impossible {
+            damaged: 1,
+            reachable: 0
+        })]
+    );
+    assert_stalled(
+        try_run(&scenario, Engine::Classic).await,
+        Engine::Classic,
+        JobStatus::Downloading,
+    );
+}
+
+// Row 4c. A recovery article lost in the one volume that holds the blocks:
+// the block it carried is gone, and the volume's next block repairs.
+#[tokio::test]
+async fn a_lost_recovery_article_is_made_up_from_the_same_volume() {
+    let members = members(3, 75);
+    let volumes = store_set(&members, 4);
+    let mut posts = posts(&volumes);
+    posts.extend(par2_volumes("silver.horizon", &named(&volumes), 2, 1));
+    let lost = one_block_article(&posts[5]);
+    let scenario = Scenario::new(posts).damaged(1, 2).lost(5, lost);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_members(&graph, &members);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    let classic = try_run(&scenario, Engine::Classic).await;
+    assert_stalled(classic, Engine::Classic, JobStatus::Downloading);
+}
+
+// Row 5. A data article lost with no recovery: the loss reaches the store
+// as damage at its exact range. The graph delivers the volumes as posted,
+// the damaged one marked, where classic fails the unpack; the same parting
+// as depth.rs's undecodable member.
+#[tokio::test]
+async fn a_lost_data_article_without_recovery_delivers_the_volumes_as_posted() {
     let members = members(4, 91);
     let volumes = store_set(&members, 8);
-    explore("r5", &Scenario::new(posts(&volumes)).lost(5, 2)).await;
+    let scenario = Scenario::new(posts(&volumes)).lost(5, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.refetched(), Vec::new());
+    let mut names: Vec<String> = volumes
+        .iter()
+        .map(|(name, _)| format!("{FOLDER}/{name}"))
+        .collect();
+    names.sort();
+    assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), names);
+    assert_eq!(
+        graph.graph().claims.get("silver.horizon.part06.rar"),
+        Some(&Claim::Damaged)
+    );
+    assert_eq!(graph.graph().outcomes, Vec::new());
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_failed(&classic, HistoryFailureKind::Unpack);
 }
 
+// Row 6a. A store posted inside an xz stream: the stream cannot seek, so
+// every bid is answered Unseekable and the store reads in stream order.
+// Classic leaves the job at Extracting: it has no reader for a store inside
+// a stream.
 #[tokio::test]
-async fn r6_store_in_xz() {
+async fn a_store_read_out_of_a_stream_reads_in_stream_order() {
     let members = members(3, 101);
     let volume = store_set(&members, 1).remove(0);
-    let out = vec![Post::plain("silver.horizon.rar.xz", xz(&volume.1))];
-    explore("r6a", &Scenario::new(out)).await;
+    let scenario = Scenario::new(vec![Post::plain("silver.horizon.rar.xz", xz(&volume.1))]);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_members(&graph, &members);
+    assert_stalled(
+        try_run(&scenario, Engine::Classic).await,
+        Engine::Classic,
+        JobStatus::Extracting,
+    );
 }
 
+// Row 6b. A PAR2 set inside a store inside an xz stream, over a damaged
+// member beside it: the set's walker finds both volumes, but the repair
+// cannot read the blocks back through a store a stream fed, whose output is
+// not kept, so the graph fails it with no block reachable. Classic stalls
+// at Extracting, as in row 6a.
 #[tokio::test]
-async fn r6_par2_in_store_in_xz() {
+async fn a_par2_set_in_a_store_in_a_stream_cannot_read_its_blocks_back() {
     let body = payload(6 * ARTICLE, 111);
     let set = par2_set("ember", &[("ember.bin", &body)], 2);
     let mut bad = body.clone();
@@ -224,22 +439,54 @@ async fn r6_par2_in_store_in_xz() {
         (set[1].name.clone(), set[1].bytes.clone()),
     ];
     let volume = store_set(&inside, 1).remove(0);
-    let out = vec![Post::plain("silver.horizon.rar.xz", xz(&volume.1))];
-    explore("r6b", &Scenario::new(out)).await;
+    let scenario = Scenario::new(vec![Post::plain("silver.horizon.rar.xz", xz(&volume.1))]);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_failed(&graph, HistoryFailureKind::Repair);
+    assert!(
+        graph
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("only 0 recovery blocks reachable")),
+        "{:?}",
+        graph.failure
+    );
+    assert_stalled(
+        try_run(&scenario, Engine::Classic).await,
+        Engine::Classic,
+        JobStatus::Extracting,
+    );
 }
 
+// Row 6c. A PAR2 volume posted as an xz stream beside its data: the volume
+// inside the stream is never bound to the set at the root, so both engines
+// fail the repair with no block to spend.
 #[tokio::test]
-async fn r7_lift_through_extent() {
+async fn a_par2_volume_posted_in_a_stream_is_not_bound_to_its_set() {
+    let body = payload(6 * ARTICLE, 113);
+    let set = par2_set("ember", &[("ember.bin", &body)], 2);
+    let scenario = Scenario::new(vec![
+        Post::plain("ember.bin", body.clone()),
+        Post::plain(&set[0].name, set[0].bytes.clone()),
+        Post::plain(&format!("{}.xz", set[1].name), xz(&set[1].bytes)),
+    ])
+    .damaged(0, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_failed(&graph, HistoryFailureKind::Repair);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_failed(&classic, HistoryFailureKind::Repair);
+}
+
+// Row 7. A PAR2 set stored inside a two-volume RAR, over a member stored
+// beside it with an article damaged: the recovery seek is lifted through
+// the store's extent map to the volume ranges that hold the blocks, and the
+// set rules only once the store's volumes are in. The graph repairs inside
+// the store; classic runs no repair inside an archive and fails the unpack.
+#[tokio::test]
+async fn a_recovery_seek_is_lifted_through_a_store_extent_map() {
     let a = payload(4 * ARTICLE, 121);
     let set = par2_set("ember", &[("ember.bin", &a)], 4);
     let (index, recovery) = (&set[0], &set[1]);
-    let b_len = recovery.bytes.len() - index.bytes.len() - a.len();
-    eprintln!(
-        "r7 index {} recovery {} b {b_len}",
-        index.bytes.len(),
-        recovery.bytes.len()
-    );
-    let b = payload(b_len, 122);
+    let b = payload(recovery.bytes.len() - index.bytes.len() - a.len(), 122);
     let inside: Vec<(String, Vec<u8>)> = vec![
         (index.name.clone(), index.bytes.clone()),
         ("ember.bin".to_string(), a.clone()),
@@ -249,38 +496,84 @@ async fn r7_lift_through_extent() {
     let volumes = store_set(&inside, 2);
     let at = find(&volumes[0].1, &a[ARTICLE..2 * ARTICLE]);
     let ordinal = (at / ARTICLE + 1) as u32;
-    eprintln!("r7 a at {at} damaged ordinal {ordinal}");
-    explore("r7", &Scenario::new(posts(&volumes)).damaged(0, ordinal)).await;
+    let scenario = Scenario::new(posts(&volumes)).damaged(0, ordinal);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.refetched(), Vec::new());
+    assert!(
+        graph.files[&format!("{FOLDER}/ember.bin")] == a,
+        "ember.bin repaired"
+    );
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_failed(&classic, HistoryFailureKind::Unpack);
 }
 
+// Row 8. A store whose volumes no name places, its first volume posted
+// last, with a PAR2 set at the root: the store bids for nothing it cannot
+// name, places each volume by its headers as it arrives, and both engines
+// deliver its members, asking for nothing twice.
 #[tokio::test]
-async fn r8_unbound() {
-    let volumes = store_set(&members(2, 131), 2);
-    let mut out = posts(&obfuscate_volumes(&volumes));
-    out.swap(0, 1);
-    let set = par2_set("silver.horizon", &named(&volumes), 1);
-    out.extend(set);
-    explore("r8", &Scenario::new(out)).await;
+async fn a_store_nothing_names_bids_for_nothing() {
+    let members = members(2, 131);
+    let volumes = store_set(&members, 2);
+    let mut posts = posts(&obfuscate_volumes(&volumes));
+    posts.swap(0, 1);
+    posts.extend(par2_set("silver.horizon", &named(&volumes), 1));
+    let scenario = Scenario::new(posts);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_members(&graph, &members);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_members(&classic, &members);
 }
 
+// Row 9. A plain file damaged with a one-volume set: the recovery seek asks
+// for the rest of the volume, open-ended, and the volume is fetched right
+// after the damage. Both engines repair.
 #[tokio::test]
-async fn r9_open_ended() {
+async fn an_open_ended_recovery_seek_fetches_the_volume_after_the_damage() {
     let body = payload(5 * ARTICLE, 141);
-    let mut out = vec![Post::plain("ember.bin", body.clone())];
-    out.extend(par2_set("ember", &[("ember.bin", &body)], 1));
-    explore("r9", &Scenario::new(out).damaged(0, 2)).await;
+    let mut posts = vec![Post::plain("ember.bin", body.clone())];
+    posts.extend(par2_set("ember", &[("ember.bin", &body)], 1));
+    let scenario = Scenario::new(posts).damaged(0, 2);
+    let expected = vec![("ember.bin".to_string(), body)];
+    let classic = run(&scenario, Engine::Classic).await;
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_members(&classic, &expected);
+    assert_members(&graph, &expected);
+    let damaged = graph
+        .order
+        .iter()
+        .position(|article| *article == (0, 2))
+        .unwrap();
+    assert!(
+        damaged < past_head(&graph, 2),
+        "the volume follows the damage"
+    );
 }
 
+// Row 10. A graph run restarted once, the moment the recovery seek was
+// answered: the restored objects restate their wants, and the run finishes
+// in the order the whole run took, asking for nothing twice.
 #[tokio::test]
-async fn r10_restart() {
-    let volumes = store_set(&members(3, 151), 4);
-    let mut out = posts(&volumes);
-    out.extend(par2_set("silver.horizon", &named(&volumes), 2));
-    let scenario = Scenario::new(out).damaged(1, 2);
+async fn a_recovery_seek_stands_across_a_restart() {
+    let members = members(3, 151);
+    let volumes = store_set(&members, 4);
+    let mut posts = posts(&volumes);
+    posts.extend(par2_set("silver.horizon", &named(&volumes), 2));
+    let scenario = Scenario::new(posts).damaged(1, 2);
     let whole = run(&scenario, Engine::Graph).await;
-    dump("r10 whole", &whole);
+    assert_members(&whole, &members);
     let (status, order, requests) = run_restarting_once(&scenario).await;
-    eprintln!("r10 restarted {status:?}\n  order {order:?}\n  {requests:?}");
+    assert_eq!(status, Some(JobStatus::Complete));
+    assert_eq!(order, whole.order, "the restarted run's order");
+    assert!(
+        requests.values().all(|count| *count == 1),
+        "the restarted run asks for nothing twice: {requests:?}"
+    );
 }
 
 // A graph run restarted once, the moment the recovery seek was answered:

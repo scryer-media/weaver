@@ -153,16 +153,11 @@ pub(super) struct Volume {
     pub(super) walked_blocks: u64,
     // The sets whose packets the walk has found in it.
     pub(super) sets: BTreeSet<[u8; 16]>,
-    // A recovery seek for it is outstanding.
-    pub(super) asked: bool,
 }
 
 impl Volume {
-    pub(super) fn named(name: &str) -> Self {
-        Self {
-            named_blocks: named_blocks(name),
-            ..Self::default()
-        }
+    pub(super) fn name(&mut self, name: &str) {
+        self.named_blocks = named_blocks(name);
     }
 
     // Whether the volume can bring the set blocks: it carries the set's
@@ -171,12 +166,8 @@ impl Volume {
         self.sets.is_empty() || self.sets.contains(set)
     }
 
-    // Ask for every byte of the volume not yet in hand, once.
-    pub(super) fn ask(&mut self, index: VolumeIndex, out: &mut Vec<Seek>) {
-        if self.asked {
-            return;
-        }
-        self.asked = true;
+    // Ask for every byte of the volume not yet in hand.
+    pub(super) fn ask(&self, index: VolumeIndex, out: &mut Vec<Seek>) {
         let mut cursor = 0;
         for run in self.arrived.runs() {
             if run.range.start > cursor {

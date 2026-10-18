@@ -34,11 +34,7 @@ fn twin(files: &[(String, Vec<u8>)], data: &[u8]) -> Twin {
         let file = job.namespace.announce(name, Some(bytes.len() as u64));
         job.arrive(file, 0, bytes, Provenance::Fresh);
         job.namespace.bind(file, OWN);
-        let volume = match index {
-            0 => VolumeIndex(0),
-            _ => job.object.claim(name, &bytes[..64]).expect("claimed"),
-        };
-        job.store.volumes.insert(volume, bytes.clone());
+        let volume = job.name(name, bytes);
         volumes.push((volume, bytes.clone()));
     }
     Twin {

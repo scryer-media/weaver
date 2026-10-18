@@ -6,10 +6,9 @@
 // Every volume of a RAR set starts with the signature, so a member without
 // one is never claimed. A name in the set's own numbering is its own
 // number. A name that numbers nothing of ours, an obfuscated one, is placed
-// by its own first headers: beside the held volume it continues or that
-// continues it, or, on a boundary between members, by the number it
-// states. The store's first volume is placed the same way, with nothing
-// held yet: by its name, or by the number its headers state.
+// by its own first headers: at the number they state, or, stating none,
+// after the held volume whose last member it continues. The store's first
+// volume is placed the same way, with nothing held yet.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -17,7 +16,7 @@ use std::sync::Arc;
 use unrar_rs::{ArchiveFormat, RarArchive, RarVolumeFacts, RarVolumeMemberFacts};
 use weaver_graph::VolumeIndex;
 
-use super::RarStore;
+use super::{RarStore, Volume};
 use crate::engine::SetName;
 use crate::rar_engine::naming;
 
@@ -62,11 +61,15 @@ impl Nameless<'_> {
 
     // Whether this volume can follow `previous` at index `index`, judged only
     // by what both volumes' headers state.
+    // Whether both volumes are of one kind of set: the same format, and
+    // both enciphered or neither.
+    fn kin(&self, other: &Nameless<'_>) -> bool {
+        self.facts.format == other.facts.format
+            && self.facts.is_encrypted == other.facts.is_encrypted
+    }
+
     fn follows(&self, previous: &Nameless<'_>, index: u32) -> bool {
-        if self.facts.format != previous.facts.format
-            || self.facts.is_encrypted != previous.facts.is_encrypted
-            || self.position().is_some_and(|stated| stated != index)
-        {
+        if !self.kin(previous) || self.position().is_some_and(|stated| stated != index) {
             return false;
         }
         match (previous.continuing_member(), self.continued_member()) {
@@ -86,7 +89,7 @@ impl Nameless<'_> {
 }
 
 impl RarStore {
-    pub(super) fn claim_volume(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+    pub(super) fn claim_volume(&self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
         let format = unrar_rs::signature::read_signature(&mut Cursor::new(first_bytes)).ok()?;
         if self.volumes.values().any(|ours| {
             ours.walk.in_set() == Some(false)
@@ -121,9 +124,11 @@ impl RarStore {
         (!taken).then_some(index)
     }
 
-    // The position this volume's headers give it: beside the one held
-    // volume it continues or that continues it, preferring the position it
-    // states; with nothing held, the position it states.
+    // The position this volume's headers give it. One that states its
+    // number is at that number, when the held volumes beside it agree: the
+    // one before carries on into it, the one after is of the same kind and
+    // states the next number. One that states none, a nameless RAR4 front,
+    // follows the one held volume whose last member it continues.
     fn claim_by_headers(&self, first_bytes: &[u8]) -> Option<VolumeIndex> {
         let password = self.header_password();
         let facts = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
@@ -137,44 +142,42 @@ impl RarStore {
             return None;
         }
         let this = Nameless { facts: &facts };
-        let free = |index: u32| {
+        let held = |index: u32| {
             self.volumes
                 .get(&VolumeIndex(index))
-                .is_none_or(|volume| volume.name.is_none())
+                .filter(|volume| volume.name.is_some())
         };
-        let held = self.volumes.iter().filter_map(|(index, volume)| {
-            let facts = volume.walk.facts.as_ref()?;
-            volume
-                .name
-                .is_some()
-                .then_some((index.0, volume, Nameless { facts }))
-        });
-        let mut candidates = Vec::new();
-        for (index, volume, held) in held {
-            let next = index + 1;
-            if free(next) && volume.walk.successor() != Some(false) && this.follows(&held, next) {
-                candidates.push(next);
-            }
-            if let Some(before) = index.checked_sub(1)
-                && free(before)
-                && held.follows(&this, index)
-            {
-                candidates.push(before);
-            }
+        let joins = |previous: &Volume, index: u32| {
+            previous.walk.successor() != Some(false)
+                && previous
+                    .walk
+                    .facts
+                    .as_ref()
+                    .is_some_and(|facts| this.follows(&Nameless { facts }, index))
+        };
+        if let Some(stated) = this.position() {
+            let before = stated
+                .checked_sub(1)
+                .and_then(held)
+                .is_none_or(|previous| joins(previous, stated));
+            let after = held(stated + 1).is_none_or(|next| {
+                next.walk.facts.as_ref().is_none_or(|facts| {
+                    let next = Nameless { facts };
+                    next.kin(&this) && next.position() == Some(stated + 1)
+                })
+            });
+            return (before && after).then_some(VolumeIndex(stated));
         }
-        // A gap between two held volumes is found from both sides.
-        candidates.sort_unstable();
-        candidates.dedup();
-        let stated: Vec<u32> = candidates
+        let candidates: Vec<u32> = self
+            .volumes
             .iter()
-            .copied()
-            .filter(|candidate| this.position() == Some(*candidate))
+            .filter(|(index, volume)| {
+                volume.name.is_some() && held(index.0 + 1).is_none() && joins(volume, index.0 + 1)
+            })
+            .map(|(index, _)| index.0 + 1)
             .collect();
-        match (stated.as_slice(), candidates.as_slice()) {
-            ([only], _) | ([], [only]) => Some(VolumeIndex(*only)),
-            ([], []) if self.volumes.values().all(|volume| volume.name.is_none()) => {
-                this.position().map(VolumeIndex)
-            }
+        match candidates.as_slice() {
+            [only] => Some(VolumeIndex(*only)),
             _ => None,
         }
     }

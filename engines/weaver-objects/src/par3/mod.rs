@@ -43,9 +43,6 @@ struct Volume {
     front: Vec<u8>,
     arrived: Coverage,
     closed: bool,
-    // Nothing more of the volume will come.
-    lost: bool,
-    asked: bool,
 }
 
 pub struct Par3 {
@@ -63,7 +60,7 @@ impl Par3 {
     pub fn new(id: ObjectId) -> Self {
         Self {
             id,
-            volumes: vec![Volume::default()],
+            volumes: Vec::new(),
             bound: BTreeMap::new(),
             needed: 0,
             outcome: None,
@@ -88,9 +85,7 @@ impl Par3 {
     }
 
     fn coming(&self) -> bool {
-        self.volumes
-            .iter()
-            .any(|volume| !volume.closed && !volume.lost)
+        self.volumes.iter().any(|volume| !volume.closed)
     }
 }
 
@@ -144,23 +139,17 @@ impl Object for Par3 {
         self.volume(volume).closed = true;
     }
 
-    // A loss that runs to the end of the volume ends it; any other leaves a
-    // hole in what arrived.
-    fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, _out: &mut Vec<Emit>) {
-        if range.end == u64::MAX {
-            self.volume(volume).lost = true;
-        }
-    }
+    // A loss is a hole in what arrived, which no packet in it passes; the
+    // volume still closes once the rest is in.
+    fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
     fn wants(&mut self, out: &mut Vec<Seek>) {
         Recovery::wants(self, out);
     }
 
-    fn pulled(&mut self, seek: Seek, pull: Pull, out: &mut Vec<Emit>) {
-        if pull == Pull::Lost {
-            self.volume_lost(seek.volume, seek.range, out);
-        }
-    }
+    // Every answer means wait: a lost article of the volume reaches
+    // `volume_lost` at its exact range, and the rest of it still comes.
+    fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
@@ -175,14 +164,16 @@ impl Object for Par3 {
         None
     }
 
+    // Every PAR3 file is a volume of the one object, numbered as it comes,
+    // up to the carrier limit.
     fn claim(&mut self, _name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        if first_bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice())
-            || self.volumes.len() >= MAX_CARRIERS
-        {
-            return None;
-        }
-        self.volumes.push(Volume::default());
-        Some(VolumeIndex((self.volumes.len() - 1) as u32))
+        (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
+            && self.volumes.len() < MAX_CARRIERS)
+            .then(|| VolumeIndex(self.volumes.len() as u32))
+    }
+
+    fn bound(&mut self, volume: VolumeIndex, _name: &str) {
+        self.volume(volume);
     }
 
     fn recovery(&self) -> Option<&dyn Recovery> {
@@ -228,11 +219,10 @@ impl Recovery for Par3 {
         if self.needed == 0 {
             return;
         }
-        for (index, volume) in self.volumes.iter_mut().enumerate() {
-            if volume.closed || volume.lost || volume.asked {
+        for (index, volume) in self.volumes.iter().enumerate() {
+            if volume.closed {
                 continue;
             }
-            volume.asked = true;
             let start = volume.arrived.runs().next().map_or(0, |run| {
                 if run.range.start == 0 {
                     run.range.end

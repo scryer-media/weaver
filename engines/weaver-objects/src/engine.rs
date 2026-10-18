@@ -67,10 +67,8 @@ pub struct EngineObject<F: Format> {
     bound: BTreeSet<u32>,
     #[serde(skip)]
     password: Option<String>,
-    // The furthest volume the run has read, and the volumes already bid for.
+    // The furthest volume the run has read.
     reached: Option<VolumeIndex>,
-    #[serde(skip)]
-    asked: BTreeSet<u32>,
 }
 
 impl<F: Format> Durable for EngineObject<F> {
@@ -90,7 +88,6 @@ impl<F: Format> Default for EngineObject<F> {
             bound: BTreeSet::new(),
             password: None,
             reached: None,
-            asked: BTreeSet::new(),
         }
     }
 }
@@ -114,19 +111,17 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
-    // The volumes after the one the run is on, the nearest first, each once.
+    // The volumes after the one the run is on, the nearest first.
     fn wants(&mut self, out: &mut Vec<Seek>) {
         let Some(reached) = self.reached else {
             return;
         };
         for &volume in self.bound.range(reached.0 + 1..) {
-            if self.asked.insert(volume) {
-                out.push(Seek::data(
-                    VolumeIndex(volume),
-                    ByteRange::new(0, u64::MAX),
-                    Weight(volume - reached.0),
-                ));
-            }
+            out.push(Seek::data(
+                VolumeIndex(volume),
+                ByteRange::new(0, u64::MAX),
+                Weight(volume - reached.0),
+            ));
         }
     }
 

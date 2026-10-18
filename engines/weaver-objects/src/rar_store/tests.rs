@@ -240,13 +240,14 @@ fn nameless_volumes_are_grouped_by_their_headers() {
 }
 
 #[test]
-fn a_nameless_volume_without_its_predecessor_is_not_claimed() {
+fn a_nameless_volume_without_its_predecessor_is_placed_where_it_states() {
     let volumes = write(&items(), &split(Version::Rar5));
     let mut object = store();
     object.bound(VolumeIndex(0), "c0ffee");
-    // Volume 2 of the set says it follows volume 1, which nobody holds.
+    // Volume 2 of the set states its number; volume 1, which nobody holds
+    // yet, does not decide where it goes.
     let front = &volumes[2][..4096.min(volumes[2].len())];
-    assert_eq!(object.claim("d00d", front), None);
+    assert_eq!(object.claim("d00d", front), Some(VolumeIndex(2)));
 }
 
 #[test]
@@ -567,28 +568,44 @@ fn unlock_bids_run_ahead_of_the_volume_being_read() {
         .collect();
     let expected: Vec<_> = (1..=8).map(|index| (index, Weight(index))).collect();
     assert_eq!(first, expected);
-    // Reading on moves the window: each bid once, the volume being read and
-    // those in hand never.
+    // Reading on moves the window: the bids are restated from where the
+    // read stands, the volume being read and those in hand never.
     owner.frames(0, 4096);
     owner.close(0);
     owner.frames(1, 4096);
     owner.close(1);
-    let later: Vec<_> = owner.seeks[8..]
+    let later: Vec<_> = owner
+        .seeks
         .iter()
         .map(|seek| (seek.volume.0, seek.weight))
         .collect();
-    assert_eq!(later, vec![(9, Weight(8)), (10, Weight(8))]);
+    let expected: Vec<_> = (3..=10).map(|index| (index, Weight(index - 2))).collect();
+    assert_eq!(later, expected);
 }
 
+// The store is built on the second volume, and the first never comes: it
+// is a volume missing like any other, damaged whole once the rest are in,
+// and nothing is announced without the headers that name the members.
 #[test]
-fn a_set_without_its_first_volume_is_refused() {
+fn a_set_without_its_first_volume_says_it_damaged_whole() {
     let volumes = write(&items(), &split(Version::Rar5));
-    let mut owner = Owner::new(
-        store(),
-        vec![("alpha.part2.rar".to_owned(), volumes[1].clone())],
-    );
-    owner.frames(0, 4096);
-    assert!(owner.said.contains(&Emit::Refuse(Why::FirstBytesLost)));
+    let length = volumes[1].len() as u64;
+    let named = volumes
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| (format!("alpha.part{}.rar", index + 1), bytes))
+        .collect();
+    let mut owner = Owner::founded(store(), named, 1);
+    for volume in [1, 2] {
+        owner.frames(volume, 4096);
+    }
+    for volume in [1, 2] {
+        owner.close(volume);
+    }
+    assert!(owner.said.contains(&Emit::Damaged {
+        volume: VolumeIndex(0),
+        range: ByteRange::new(0, length),
+    }));
     assert!(owner.members.is_empty());
 }
 

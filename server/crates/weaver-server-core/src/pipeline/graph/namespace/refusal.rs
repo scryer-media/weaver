@@ -127,7 +127,6 @@ impl NamespaceWriter {
                 && into.len() as u64 == piece.len();
             pieces.push((piece, posted.then(|| Bytes::from(into))));
         }
-        drop(read);
         tree.put_object(retired, object);
         pieces
     }

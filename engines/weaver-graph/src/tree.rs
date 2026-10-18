@@ -1469,10 +1469,9 @@ mod tests {
 
     // A pretend store: a seven-byte header on volume 0, then one member
     // whose bytes run across volumes of a fixed length. It claims `.r00`
-    // as its second volume and refuses on a magic word.
+    // as its second volume.
     struct Split {
         announced: bool,
-        refuse: bool,
     }
 
     impl Object for Split {
@@ -1599,10 +1598,7 @@ mod tests {
     impl Builder for Build {
         fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
             match kind {
-                Kind::RarStore => Some(Box::new(Split {
-                    announced: false,
-                    refuse: false,
-                })),
+                Kind::RarStore => Some(Box::new(Split { announced: false })),
                 Kind::RarEngine => Some(Box::new(Reader(Vec::new()))),
                 _ => None,
             }

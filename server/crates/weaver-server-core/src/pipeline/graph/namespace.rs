@@ -165,10 +165,7 @@ impl NamespaceWriter {
         self.files.get(&node)?.refused.get(&member).copied()
     }
 
-    pub(crate) fn leaf_path(&self, node: NodeId, member: MemberId) -> Option<&Path> {
-        Some(self.files.get(&node)?.leaves.get(&member)?.path())
-    }
-
+    #[cfg(test)]
     pub(crate) fn held_bytes(&self, node: NodeId) -> u64 {
         self.files
             .get(&node)
@@ -270,6 +267,7 @@ impl NamespaceWriter {
 
     // A recovery object recognised the member: the tree's ledger moves its
     // name, and every file whose name changed follows.
+    #[cfg(test)]
     pub(crate) fn rename(
         &mut self,
         tree: &mut Tree,

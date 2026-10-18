@@ -11,9 +11,9 @@
 // The window holds only volumes with work still queued: one whose articles
 // are all in flight or done takes no place.
 //
-// An object bids for a volume once. A bid the window has no room for stands
-// until a later round draws it or its volume has nothing left queued, so a
-// full window delays a bidder and never drops it.
+// The window remembers no bid. Every object restates its wants each round,
+// from its own state, so a bid the window had no room for is asked again
+// and drawn once a place frees.
 
 use weaver_graph::{ByteRange, NodeId, VolumeIndex, Weight};
 
@@ -46,9 +46,7 @@ pub(crate) struct Window {
 
 impl Window {
     pub(crate) fn bid(&mut self, bid: Bid) {
-        if !self.bids.contains(&bid) {
-            self.bids.push(bid);
-        }
+        self.bids.push(bid);
     }
 
     // The window's rank for a volume, if it holds it.
@@ -59,9 +57,9 @@ impl Window {
             .map(|held| held.rank)
     }
 
-    // Let go of the volumes with nothing left queued, then draw the standing
+    // Let go of the volumes with nothing left queued, then draw the round's
     // bids into the free places, lightest first. Returns every bid that
-    // landed in the window, with its volume's rank; the rest stand.
+    // landed in the window, with its volume's rank.
     pub(crate) fn draw(&mut self, mut queued: impl FnMut(VolumeIndex) -> bool) -> Vec<(Bid, u32)> {
         self.held.retain(|held| queued(held.volume));
         let mut bids = std::mem::take(&mut self.bids);
@@ -72,11 +70,7 @@ impl Window {
                 drawn.push((bid, rank));
                 continue;
             }
-            if !queued(bid.volume) {
-                continue;
-            }
-            if !self.has_room(bid.in_order) {
-                self.bids.push(bid);
+            if !queued(bid.volume) || !self.has_room(bid.in_order) {
                 continue;
             }
             let rank = self.next_rank;

@@ -151,11 +151,8 @@ pub struct SevenZipStore {
     opened: Option<usize>,
     proof: Option<open::Proof>,
     asked: bool,
-    // Container ranges wanted ahead of the normal order, and the volume
-    // ranges already bid for them.
+    // Container ranges wanted ahead of the normal order.
     bids: Vec<(ByteRange, Weight)>,
-    #[serde(skip)]
-    bid: BTreeSet<(u32, u64, u64)>,
     damage_said: HashSet<(u64, u64, u32)>,
     lengths_said: BTreeSet<VolumeIndex>,
     recovery_said: bool,
@@ -222,7 +219,6 @@ impl SevenZipStore {
             proof: None,
             asked: false,
             bids: Vec::new(),
-            bid: BTreeSet::new(),
             damage_said: HashSet::new(),
             lengths_said: BTreeSet::new(),
             recovery_said: false,
@@ -603,20 +599,22 @@ impl Object for SevenZipStore {
         if self.gone {
             return;
         }
+        // Only volumes bound so far can be bid: a seek into one not yet
+        // claimed would be answered as unseekable.
+        if self.geometry.is_none() {
+            return;
+        }
         let mut pieces = Vec::new();
-        for (range, weight) in self.bids.clone() {
-            // Only volumes bound so far can be bid: a seek into one not yet
-            // claimed would be answered as unseekable.
-            if self.geometry.is_none() {
-                break;
+        for (range, weight) in &self.bids {
+            // A range in hand is wanted no more.
+            if self.kept.read(*range).is_some() {
+                continue;
             }
             pieces.clear();
-            self.to_volumes(range, &mut pieces);
+            self.to_volumes(*range, &mut pieces);
             for (volume, range) in &pieces {
-                if self.names.contains_key(volume)
-                    && self.bid.insert((volume.0, range.start, range.end))
-                {
-                    out.push(Seek::data(*volume, *range, weight));
+                if self.names.contains_key(volume) {
+                    out.push(Seek::data(*volume, *range, *weight));
                 }
             }
         }

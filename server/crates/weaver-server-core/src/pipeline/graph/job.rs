@@ -192,10 +192,6 @@ impl GraphJob {
         &self.tree
     }
 
-    pub(crate) fn root(&self) -> &ArticleRoot {
-        &self.root
-    }
-
     pub(crate) fn writer(&self) -> &NamespaceWriter {
         &self.writer
     }

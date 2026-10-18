@@ -57,6 +57,7 @@ impl Leaf {
         &self.path
     }
 
+    #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
         self.file.is_some()
     }

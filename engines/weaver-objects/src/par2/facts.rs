@@ -58,7 +58,6 @@ pub(super) struct VolumeFacts {
     named_blocks: Option<u64>,
     walked_blocks: u64,
     sets: BTreeSet<[u8; 16]>,
-    asked: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -212,7 +211,6 @@ pub(super) fn of(par2: &Par2) -> Facts {
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,
             sets: volume.sets.clone(),
-            asked: volume.asked,
         })
         .collect();
     let sets = par2
@@ -264,7 +262,6 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,
             sets: volume.sets,
-            asked: volume.asked,
         })
         .collect();
     for set in kept.sets {

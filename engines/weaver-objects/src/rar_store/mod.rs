@@ -144,7 +144,6 @@ pub struct RarStore {
     // The candidate that opened the headers.
     headers_open: Option<usize>,
     asked: bool,
-    bid: BTreeSet<VolumeIndex>,
     damage_said: HashSet<(VolumeIndex, u64, u64, u32)>,
     recovery_said: BTreeSet<(VolumeIndex, u64)>,
     gaps_said: BTreeSet<VolumeIndex>,
@@ -169,7 +168,6 @@ impl RarStore {
             candidates: Vec::new(),
             headers_open: None,
             asked: false,
-            bid: BTreeSet::new(),
             damage_said: HashSet::new(),
             recovery_said: BTreeSet::new(),
             gaps_said: BTreeSet::new(),
@@ -407,13 +405,11 @@ impl Object for RarStore {
             else {
                 continue;
             };
-            if self.bid.insert(volume) {
-                out.push(Seek::data(
-                    volume,
-                    ByteRange::new(0, length),
-                    Weight(distance),
-                ));
-            }
+            out.push(Seek::data(
+                volume,
+                ByteRange::new(0, length),
+                Weight(distance),
+            ));
         }
     }
 

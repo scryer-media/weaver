@@ -7,7 +7,10 @@
 // the bytes pass: every part but the last carries the CRC of its own packed
 // bytes, and the last carries the whole file's, keyed when the header says.
 // A part that fails its own is damaged at its range; a file that fails as a
-// whole is damaged at every part.
+// whole is damaged at every part, unless some of its bytes came damaged:
+// those are the cause, already marked where they lie, and the file is
+// judged again when their repair arrives, so no mark is left on a part
+// whose bytes were never bad.
 
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Emit, MemberId, Provenance, SliceVerdict, VolumeIndex};
@@ -121,6 +124,9 @@ impl RarStore {
         let Some(expected) = entry.crc else {
             return;
         };
+        if entry.out.coverage.damaged_ranges().next().is_some() {
+            return;
+        }
         let hash_key = entry.hash_key.as_deref();
         let (SliceVerdict::Damaged, crc) = gate(
             &entry.plain_runs,

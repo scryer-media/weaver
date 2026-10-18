@@ -28,6 +28,7 @@ pub(super) struct Owner {
     pub members: BTreeMap<u32, Got>,
     // Everything said but members and their bytes.
     pub said: Vec<Emit>,
+    // What the object wants as of the last round.
     pub seeks: Vec<Seek>,
     // How seeks are answered; a range moved ahead is delivered at once.
     pub pull: Pull,
@@ -148,11 +149,13 @@ impl Owner {
     pub fn settle(&mut self) {
         loop {
             let mut changed = false;
+            // The object restates its wants every round; only a change in
+            // them is news.
             let mut seeks = Vec::new();
             self.object.wants(&mut seeks);
+            changed |= seeks != self.seeks;
+            self.seeks.clone_from(&seeks);
             for seek in seeks {
-                changed = true;
-                self.seeks.push(seek);
                 let mut out = Vec::new();
                 self.object.pulled(seek, self.pull, &mut out);
                 self.apply(out);

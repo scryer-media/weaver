@@ -287,7 +287,11 @@ impl ArticleMap {
 
     // Answer a seek, and raise the articles that carry it to `class` when
     // one is given. A seek with no class is only answered: a bid the window
-    // did not draw keeps its articles where they are.
+    // did not draw keeps its articles where they are. A lost article loses
+    // the seek, but every article of the range that can still come is
+    // raised all the same: one lost article does not leave the rest of the
+    // range where the normal order would never reach it, and the lost range
+    // itself reaches every object it lands in at its exact bounds as damage.
     pub(crate) fn seek(
         &mut self,
         volume: VolumeIndex,
@@ -312,19 +316,16 @@ impl ArticleMap {
             };
         }
         let covering: Vec<usize> = found.covering(range).collect();
-        if covering.iter().any(|index| {
+        let lost = covering.iter().any(|index| {
             matches!(found.articles[*index].state, State::Lost { .. })
                 && found.surely_in(*index, range)
-        }) {
-            return Pull::Lost;
-        }
-        let Some(class) = class else {
-            return Pull::Moved(0);
-        };
+        });
         let mut moved = 0;
         for index in covering {
             let article = &mut found.articles[index];
-            if article.state == State::Waiting && class < article.class {
+            if let Some(class) = class.filter(|class| *class < article.class)
+                && article.state == State::Waiting
+            {
                 article.class = class;
                 self.moves.push(Move {
                     volume,
@@ -334,7 +335,7 @@ impl ArticleMap {
                 moved += 1;
             }
         }
-        Pull::Moved(moved)
+        if lost { Pull::Lost } else { Pull::Moved(moved) }
     }
 
     // The first article of every volume leads the payload.

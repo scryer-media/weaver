@@ -433,7 +433,11 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
         .iter()
         .map(|seek| (seek.volume.0, seek.weight.0))
         .collect();
-    assert_eq!(bids, vec![(3, 2)], "each volume is bid once");
+    assert_eq!(
+        bids,
+        vec![(2, 1), (3, 2)],
+        "the bids are restated from where the run stands"
+    );
 }
 
 #[test]

@@ -289,10 +289,7 @@ fn wants_asks_for_recovery_while_short() {
     let mut job = Job::new(Par2::new(OWN), OWN);
     job.volume(&files[0].0, &files[0].1, ARTICLE as usize, false);
     // A volume named but not yet arrived.
-    let volume = job
-        .object
-        .claim(&files[1].0, &files[1].1[..64])
-        .expect("claimed");
+    let volume = job.name(&files[1].0, &files[1].1);
     let (member, bad) = damaged_member(&mut job, "payload.bin", &data, 300);
     bind(&mut job);
     let wrong = job.store.members[&member].clone();
@@ -357,9 +354,7 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
 // A set's volume named but not yet arrived: claimed from its front, so
 // nothing of it is walked and it may be any set's.
 fn named_volume(job: &mut Job<Par2>, file: &(String, Vec<u8>)) -> weaver_graph::VolumeIndex {
-    let volume = job.object.claim(&file.0, &file.1[..64]).expect("claimed");
-    job.store.volumes.insert(volume, file.1.clone());
-    volume
+    job.name(&file.0, &file.1)
 }
 
 fn wanted(job: &mut Job<Par2>) -> Vec<weaver_graph::VolumeIndex> {
