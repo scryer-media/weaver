@@ -173,6 +173,53 @@ debug-assertions = true
 debug = 0
 split-debuginfo = "off"
 incremental = false
+debug-assertions = true
+overflow-checks = true
+
+# Keep test harnesses cheap to build while optimising the codec, checksum and
+# recovery kernels exercised by the ordinary suite and the archive campaigns.
+[profile.test.package.weaver-yenc]
+opt-level = 3
+
+[profile.test.package.crc-fast]
+opt-level = 3
+
+# PAR3 selects its grouped GF(2^16) kernel at build time. Optimise its
+# Reed-Solomon implementation too: the unoptimised kernel can exhaust a
+# worker's stack on aarch64.
+[profile.test.package.reedsolomon-rs]
+opt-level = 3
+
+[profile.test.package.par2-rs]
+opt-level = 3
+
+[profile.test.package.par3-rs]
+opt-level = 3
+
+[profile.test.package.blake3]
+opt-level = 3
+
+[profile.test.package.ppmd-turbo]
+opt-level = 3
+
+[profile.test.package.zlib-rs]
+opt-level = 3
+
+[profile.test.package.lzma-turbo]
+opt-level = 3
+
+# These are dependencies here, so optimising them does not also optimise the
+# archive libraries' own large test harnesses.
+[profile.test.package.unrar-rs]
+opt-level = 3
+
+# RAR5 key derivation calls sha2's compression kernel on every PBKDF2
+# iteration, including when unrar-rs uses the AWS-LC crypto backend.
+[profile.test.package.sha2]
+opt-level = 3
+
+[profile.test.package.sevenz-turbo]
+opt-level = 3
 
 [profile.matrix]
 inherits = "test"
