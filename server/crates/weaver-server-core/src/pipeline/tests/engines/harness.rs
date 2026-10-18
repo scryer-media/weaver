@@ -25,6 +25,7 @@ use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::status::Delivery;
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, YencLayoutAssertions,
 };
@@ -199,6 +200,8 @@ pub(super) struct Scenario {
     // The decoded size of every article but each post's last; PAR2 slices
     // stay at ARTICLE whatever it is.
     pub(super) article: usize,
+    // Every batch the download queue hands out is served last article first.
+    pub(super) backwards: bool,
 }
 
 impl Scenario {
@@ -210,7 +213,14 @@ impl Scenario {
             password: None,
             global_passwords: Vec::new(),
             article: ARTICLE,
+            backwards: false,
         }
+    }
+
+    // Whatever the download queue hands out at once arrives in reverse.
+    pub(super) fn backwards(mut self) -> Self {
+        self.backwards = true;
+        self
     }
 
     // Every post cut into articles of `size` bytes instead of ARTICLE.
@@ -295,6 +305,8 @@ pub(super) struct GraphView {
     pub(super) kinds: BTreeSet<String>,
     // How many password candidates each node was offered, at the last look.
     pub(super) offered: BTreeMap<weaver_graph::NodeId, usize>,
+    // The files the job hands over at every depth, by output name.
+    pub(super) delivery: Delivery,
 }
 
 #[derive(Debug)]
@@ -429,19 +441,13 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
     let mut reads = 0;
     let mut stalled = None;
     loop {
-        while let Some(work) = pipeline
-            .jobs
-            .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
-        {
-            let article = (
-                work.segment_id.file_id.file_index,
-                work.segment_id.segment_number,
-            );
-            *requests.entry(article).or_insert(0usize) += 1;
-            order.push(article);
-            serve(&mut pipeline, scenario, article).await;
-            observe(&pipeline, &mut graph, &mut reads);
+        while let Some(batch) = handed_out(&mut pipeline, scenario.backwards) {
+            for article in batch {
+                *requests.entry(article).or_insert(0usize) += 1;
+                order.push(article);
+                serve(&mut pipeline, scenario, article).await;
+                observe(&pipeline, &mut graph, &mut reads);
+            }
         }
         if finished(&pipeline) {
             break;
@@ -469,6 +475,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
+            observe(&pipeline, &mut graph, &mut reads);
             continue;
         }
         // Classic's extraction runs out on a task too, and says it is done
@@ -551,6 +558,24 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             .map(|(_, index)| index)
             .collect(),
     })
+}
+
+// The next articles the download queue hands out: one, or with `backwards`
+// every one it holds, last first. `None` once it is dry.
+fn handed_out(pipeline: &mut Pipeline, backwards: bool) -> Option<Vec<(u32, u32)>> {
+    let queue = &mut pipeline.jobs.get_mut(&JOB)?.download_queue;
+    let mut batch = Vec::new();
+    while let Some(work) = queue.pop() {
+        batch.push((
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        ));
+        if !backwards {
+            break;
+        }
+    }
+    batch.reverse();
+    (!batch.is_empty()).then_some(batch)
 }
 
 // One article as the scenario's server answers it.
@@ -667,6 +692,7 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
             .map(|kind| kind.to_string()),
     );
     view.offered = job.passwords_offered();
+    view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
     let namespace = job.namespace();
     view.claims = state
         .spec

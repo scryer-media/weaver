@@ -119,7 +119,7 @@ impl GraphJob {
                 .values()
                 .all(|member| self.closed_in(parent, *member))
         });
-        volumes_in && !self.runs.has(node)
+        volumes_in && !self.runs.reading(node)
     }
 
     // Everything the namespace will get is in: every member is announced,
