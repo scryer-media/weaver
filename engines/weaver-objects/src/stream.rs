@@ -69,8 +69,10 @@ pub type DeflateStream = Stream<Deflate>;
 // header up to the field that sizes its window.
 const FIRST: usize = 64;
 
-// Its facts are its name and front: how far the run read is the run's, and
-// a restored stream is one whose run has not started.
+// Its facts are its name, its front and how far a run has consumed its
+// input: a repair below that frontier is one the decoder already used. A
+// restored stream is one whose run has not started; it replays from the
+// stream's start over the partial, so the frontier is all it keeps of a run.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Stream<D> {
@@ -78,6 +80,7 @@ pub struct Stream<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
     first: Vec<u8>,
+    consumed: u64,
 }
 
 impl<D: Decoder> Default for Stream<D> {
@@ -86,6 +89,7 @@ impl<D: Decoder> Default for Stream<D> {
             decoder: PhantomData,
             name: String::new(),
             first: Vec::new(),
+            consumed: 0,
         }
     }
 }
@@ -170,6 +174,13 @@ impl<D: Decoder> Object for Stream<D> {
 impl<D: Decoder> Engine for Stream<D> {
     fn start(&self) -> Box<dyn Extraction> {
         Box::new(run::Run::<D>::new(member_name(&self.name), self.reserve()))
+    }
+
+    // A rerun reads from the front again, so the frontier only grows.
+    fn reached(&mut self, volume: VolumeIndex, offset: u64) {
+        if volume == VolumeIndex(0) {
+            self.consumed = self.consumed.max(offset);
+        }
     }
 
     fn reserve(&self) -> u64 {

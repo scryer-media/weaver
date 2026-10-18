@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use par2_rs::{FileId, Packet, Par2FileSet};
+use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{ByteRange, Coverage, MemberId, Seek, VolumeIndex, Weight};
 
@@ -19,7 +20,7 @@ use super::walker::Walker;
 const MAX_PAR2_INPUT_SLICES: u64 = 32_768;
 
 // Where one recovery packet sits, header included.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Location {
     pub(super) volume: VolumeIndex,
     pub(super) range: ByteRange,
@@ -65,9 +66,31 @@ impl SetState {
             return;
         }
         self.packets.push(packet);
-        self.index = Par2FileSet::from_packets(self.packets.clone())
-            .ok()
-            .filter(|set| validate_par2_geometry(set, output_limit).is_ok());
+        self.index = index_of(&self.packets, output_limit);
+    }
+
+    // A set as a checkpoint recorded it: the index is rebuilt from its
+    // packets, as each new one rebuilt it.
+    pub(super) fn restored(
+        first_seen: (VolumeIndex, u64),
+        packets: Vec<Packet>,
+        hashes: BTreeSet<[u8; 16]>,
+        output_limit: u64,
+    ) -> Self {
+        Self {
+            index: index_of(&packets, output_limit),
+            packets,
+            hashes,
+            ..Self::new(first_seen)
+        }
+    }
+
+    pub(super) fn packets(&self) -> &[Packet] {
+        &self.packets
+    }
+
+    pub(super) fn hashes(&self) -> &BTreeSet<[u8; 16]> {
+        &self.hashes
     }
 
     // An index that can verify every file it protects: each has its
@@ -195,6 +218,12 @@ impl Volume {
             .saturating_sub(self.walked_blocks)
             .saturating_sub(lost)
     }
+}
+
+fn index_of(packets: &[Packet], output_limit: u64) -> Option<Par2FileSet> {
+    Par2FileSet::from_packets(packets.to_vec())
+        .ok()
+        .filter(|set| validate_par2_geometry(set, output_limit).is_ok())
 }
 
 // Admit declared geometry before anything is built on it.

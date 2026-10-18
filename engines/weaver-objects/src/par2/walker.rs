@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use par2_rs::packet::{HEADER_SIZE, MAGIC, PacketHeader, PacketType};
 use par2_rs::{FileHashState, Packet, ScannedPacket, parse_packet};
 use weaver_graph::ByteRange;
@@ -68,6 +70,26 @@ pub(super) struct Walker {
 }
 
 impl Walker {
+    // A walk resumed at a packet boundary: a packet streamed when the
+    // checkpoint was taken is hashed again from its header, and what was
+    // held past the front is delivered again by the replay.
+    pub(super) fn resumed(front: u64, lost: Vec<ByteRange>) -> Self {
+        Self {
+            next: front,
+            lost,
+            ..Self::default()
+        }
+    }
+
+    // The packet boundary the walk has reached.
+    pub(super) fn front(&self) -> u64 {
+        self.streamed.as_ref().map_or(self.next, |open| open.at)
+    }
+
+    pub(super) fn lost(&self) -> &[ByteRange] {
+        &self.lost
+    }
+
     pub(super) fn deliver(&mut self, offset: u64, bytes: &[u8], found: &mut Vec<Found>) {
         if offset + bytes.len() as u64 <= self.next {
             return;
@@ -276,7 +298,7 @@ const MAX_EXAMINED: u64 = 1_048_576;
 const MAX_RETAINED: usize = 262_144;
 const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct Meter {
     examined: u64,
     retained: usize,

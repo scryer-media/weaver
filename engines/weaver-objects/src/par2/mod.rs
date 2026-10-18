@@ -220,6 +220,10 @@ impl Object for Par2 {
         Kind::Par2
     }
 
+    fn facts(&self) -> weaver_graph::Facts {
+        facts::of(self)
+    }
+
     fn deliver(&mut self, delivery: Delivery<'_>, _out: &mut Vec<Emit>) {
         let mut found = Vec::new();
         let volume = self.volume(delivery.volume);

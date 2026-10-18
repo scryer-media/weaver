@@ -2,7 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::super::*;
-use super::{brotli, bzip2, decoded, deflate, first_payload, gzip, whole, xz, zstd};
+use super::{
+    brotli, bzip2, decoded, deflate, first_payload, gzip, second_payload, whole, xz, xz_at, zstd,
+};
 use crate::testing::replay::{Step, frames, restores_alike};
 
 // Restored mid-front, a stream sizes its run alike, and a run of the
@@ -27,4 +29,77 @@ fn every_stream_restored_from_its_facts_runs_as_the_live_one() {
     restored::<Zstd>("alpha.bin.zst", "alpha.bin", zstd);
     restored::<Brotli>("alpha.bin.br", "alpha.bin", brotli);
     restored::<Deflate>("alpha.bin", "alpha.bin", deflate);
+}
+
+// The steps of an xz volume of two concatenated streams, the run's frontier
+// told after every frame as an owner tells it.
+fn xz_steps(bytes: &[u8], frame: usize) -> Vec<Step<'_>> {
+    let mut steps = vec![Step::Bound(0, "alpha.tar.xz")];
+    for step in frames(0, bytes, frame) {
+        let Step::Bytes(_, offset, chunk) = step else {
+            continue;
+        };
+        steps.push(step);
+        steps.push(Step::Reached(0, offset + chunk.len() as u64));
+    }
+    steps.push(Step::Closed(0));
+    steps
+}
+
+// Cut after the stream header, inside the first block header, mid-member and
+// at the second stream's start: each restores with the same window and
+// frontier, and its run decodes both streams through as one member.
+#[test]
+fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
+    let (first, second) = (first_payload(), second_payload());
+    let mut bytes = xz_at(&first, 1 << 18);
+    let boundary = bytes.len();
+    bytes.extend_from_slice(&xz(&second));
+    let joined = [first, second].concat();
+    let reserve = |object: &dyn Object| object.engine().map(Engine::reserve);
+    let header = xz_steps(&bytes, 12);
+    let block = xz_steps(&bytes, 4);
+    let wide = xz_steps(&bytes, 256);
+    // A cut after k frames and their frontiers is step 1 + 2k.
+    let (middle, past) = (wide.len() / 4, boundary.div_ceil(256));
+    let cuts: [(&[Step<'_>], usize, u64); 4] = [
+        (&header, 3, 12),
+        (&block, 1 + 2 * 4, 16),
+        (&wide, 1 + 2 * middle, 256 * middle as u64),
+        (&wide, 1 + 2 * past, 256 * past as u64),
+    ];
+    for (steps, cut, frontier) in cuts {
+        let (facts, live, again) = restores_alike(Box::new(XzStream::new()), steps, cut, &[]);
+        let kept: XzStream = facts.read(Kind::Xz).expect("decodes");
+        assert_eq!(kept.consumed, frontier, "cut {cut}");
+        assert_eq!(kept.first.len(), FIRST.min(frontier as usize), "cut {cut}");
+        assert_eq!(reserve(live.as_ref()), reserve(again.as_ref()));
+        assert_eq!(
+            whole(&kept, bytes.clone()),
+            decoded("alpha.tar", joined.clone()),
+            "cut {cut}"
+        );
+    }
+    // Restored before the block header said its dictionary, the stream holds
+    // the format's largest; once it has, the first block's.
+    let early = header_facts(&header, 3);
+    let late = header_facts(&block, 1 + 2 * 8);
+    assert!(early.reserve() > late.reserve());
+    assert_eq!(late.reserve(), Xz::window(&bytes));
+}
+
+fn header_facts(steps: &[Step<'_>], cut: usize) -> XzStream {
+    let (facts, _, _) = restores_alike(Box::new(XzStream::new()), steps, cut, &[]);
+    facts.read(Kind::Xz).expect("decodes")
+}
+
+#[test]
+fn a_stream_front_longer_than_it_keeps_is_refused() {
+    let mut stream = XzStream::new();
+    stream.first = vec![0; FIRST + 1];
+    let facts = Facts::of(Kind::Xz, &stream);
+    assert!(matches!(
+        crate::restore(&facts),
+        Err(weaver_graph::RestoreError::Impossible { .. })
+    ));
 }

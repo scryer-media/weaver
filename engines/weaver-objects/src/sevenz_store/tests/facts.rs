@@ -43,10 +43,10 @@ fn a_split_7z_restored_between_its_volumes_goes_on_as_the_live_one() {
 fn an_encrypted_7z_restored_mid_folder_opens_again_and_its_facts_hold_no_key() {
     let volumes = vec![("alpha.7z".to_owned(), archive(aes(), false))];
     let mut steps = steps(&volumes, 1000);
-    // The tail first, with the end header and the proof file, then the
-    // password, so the folder is open from there on.
-    steps[2..].rotate_right(1);
-    steps.insert(3, Step::Password(PASSWORD));
+    // The signature, then the tail with the end header and the proof file,
+    // then the password, so the folder is open from there on.
+    steps[3..].rotate_right(2);
+    steps.insert(5, Step::Password(PASSWORD));
     let (facts, _, _) = restores_alike(
         Box::new(store()),
         &steps,
@@ -54,8 +54,11 @@ fn an_encrypted_7z_restored_mid_folder_opens_again_and_its_facts_hold_no_key() {
         &[Step::Password(PASSWORD)],
     );
     let kept: SevenZipStore = facts.read(Kind::SevenZipStore).expect("decodes");
-    let shape: Vec<_> = kept.folders.iter().map(|lock| match lock { Lock::Plain => 'p', Lock::Locked => 'l', Lock::Open(_) => 'o', Lock::Sealed(_) => 's' }).collect();
-    assert!(shape.contains(&'s'), "{shape:?} map {} proof {:?}", kept.map.is_some(), kept.proof);
+    assert!(
+        kept.folders
+            .iter()
+            .any(|lock| matches!(lock, Lock::Sealed(_)))
+    );
     let properties = kept
         .map
         .as_ref()

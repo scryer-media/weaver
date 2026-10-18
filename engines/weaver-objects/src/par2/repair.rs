@@ -26,7 +26,7 @@ use super::sets::SetState;
 use crate::grid::Grid;
 
 // What one set's repair came to.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct SetRepair {
     pub(super) outcome: RepairOutcome,
     // Damaged slices it found, for the recovery it asks for while waiting.

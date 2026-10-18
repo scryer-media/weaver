@@ -145,7 +145,7 @@ impl Load {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct FileGrid {
     // Runs per block index, keyed by their start.
     blocks: BTreeMap<u64, BTreeMap<u64, Run>>,
@@ -153,7 +153,7 @@ struct FileGrid {
 }
 
 // Every grid of every member one recovery object watches, under one budget.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Grid {
     files: BTreeMap<(MemberId, u64), FileGrid>,
     load: Load,

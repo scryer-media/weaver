@@ -11,14 +11,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, Coverage, Provenance};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Piece {
     range: ByteRange,
     bytes: Vec<u8>,
     coverage: Coverage,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Kept {
     // Disjoint, keyed by start.
     pieces: BTreeMap<u64, Piece>,

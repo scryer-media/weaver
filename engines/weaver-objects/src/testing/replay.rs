@@ -19,6 +19,23 @@ pub(crate) enum Step<'a> {
     Bytes(u32, u64, &'a [u8]),
     Closed(u32),
     Password(&'a str),
+    // How far the object's run read, as its owner tells it.
+    Reached(u32, u64),
+    // Bytes the object placed before the checkpoint, delivered again as a
+    // restart replays its partials: what it holds now the owner already
+    // holds, so nothing here is held again.
+    Replay(u32, u64, &'a [u8]),
+}
+
+// The replay of every delivery among `steps`, as a restart makes it.
+pub(crate) fn replay<'a>(steps: &[Step<'a>]) -> Vec<Step<'a>> {
+    steps
+        .iter()
+        .filter_map(|step| match *step {
+            Step::Bytes(volume, offset, bytes) => Some(Step::Replay(volume, offset, bytes)),
+            _ => None,
+        })
+        .collect()
 }
 
 // One volume in frames, in order.
@@ -48,6 +65,20 @@ impl Owner {
             }
             Step::Closed(volume) => object.volume_closed(VolumeIndex(volume), out),
             Step::Password(secret) => object.offer_password(secret, out),
+            Step::Replay(volume, offset, bytes) => object.deliver(
+                Delivery {
+                    volume: VolumeIndex(volume),
+                    offset,
+                    bytes,
+                    provenance: Provenance::Fresh,
+                },
+                out,
+            ),
+            Step::Reached(volume, offset) => {
+                if let Some(engine) = object.engine_mut() {
+                    engine.reached(VolumeIndex(volume), offset);
+                }
+            }
         }
         self.release(object, out);
         for emit in out.iter() {
