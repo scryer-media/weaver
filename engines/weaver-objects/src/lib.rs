@@ -15,6 +15,7 @@ pub mod par2;
 pub mod par3;
 pub mod rar_engine;
 pub mod rar_store;
+mod runs;
 pub mod sevenz_engine;
 pub mod sevenz_store;
 pub mod sfv;

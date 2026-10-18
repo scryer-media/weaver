@@ -16,7 +16,7 @@ use unrar_rs::{
 use weaver_graph::{ByteRange, Emit, MemberId, RecoveryKind, VolumeIndex, Why};
 
 use super::{Entry, Lock, Out, Piece, RarStore};
-use crate::grid::Grid;
+use crate::runs::CrcRuns;
 
 // A name as the namespace numbers it: forward slashes, a directory with a
 // trailing one, as the 7z store names them.
@@ -184,8 +184,8 @@ impl RarStore {
             complete: dir,
             hash_key: None,
             out: Out::default(),
-            grid: Grid::default(),
-            parts: Grid::default(),
+            plain_runs: CrcRuns::default(),
+            parts: Default::default(),
         });
         if dir {
             self.entries[id.0 as usize].out.closed = true;

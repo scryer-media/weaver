@@ -35,8 +35,9 @@ use weaver_graph::{
 use zeroize::Zeroizing;
 
 use crate::crypt::Cbc;
-use crate::grid::{Grid, crc32};
+use crate::grid::crc32;
 use crate::kept::Kept;
+use crate::runs::CrcRuns;
 use walk::{Step, Walk};
 
 // How many volumes past the one being read are bid for. A solid set never
@@ -102,9 +103,10 @@ struct Entry {
     lock: Lock,
     hash_key: Option<Zeroizing<[u8; 32]>>,
     out: Out,
-    // The plaintext's whole-file CRC, and every part's packed CRC.
-    grid: Grid,
-    parts: Grid,
+    // The plaintext's runs for the whole-file CRC, and every part's packed
+    // runs, by piece, for its own.
+    plain_runs: CrcRuns,
+    parts: BTreeMap<usize, CrcRuns>,
 }
 
 impl Entry {
@@ -298,6 +300,10 @@ impl RarStore {
 impl Object for RarStore {
     fn kind(&self) -> Kind {
         Kind::RarStore
+    }
+
+    fn facts(&self) -> weaver_graph::Facts {
+        facts::of(self)
     }
 
     fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {

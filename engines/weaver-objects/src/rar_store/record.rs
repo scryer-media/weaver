@@ -10,34 +10,11 @@
 // whole is damaged at every part.
 
 use bytes::Bytes;
-use unrar_rs::convert_crc32_to_mac;
-use weaver_graph::{ByteRange, Emit, MemberId, Provenance, Segment, VolumeIndex};
+use weaver_graph::{ByteRange, Emit, MemberId, Provenance, SliceVerdict, VolumeIndex};
 
 use super::{Lock, RarStore};
-use crate::grid::{Folded, WHOLE, crc32};
-
-// The composed CRC32, folded with the hash key when the header keys it;
-// `None` while the key it needs is not known.
-fn fold_member_crc(composed: u32, uses_mac: bool, hash_key: Option<&[u8; 32]>) -> Option<u32> {
-    match (uses_mac, hash_key) {
-        (true, Some(hash_key)) => Some(convert_crc32_to_mac(composed, hash_key)),
-        (false, _) => Some(composed),
-        (true, None) => None,
-    }
-}
-
-// A fold against the CRC a header wrote: `None` while unfolded or unkeyed,
-// else the folded CRC and whether it holds.
-fn holds(
-    folded: Option<Folded>,
-    uses_mac: bool,
-    hash_key: Option<&[u8; 32]>,
-    expected: u32,
-) -> Option<(u32, bool)> {
-    let folded = folded?;
-    let crc = fold_member_crc(folded.crc32, uses_mac, hash_key)?;
-    Some((folded.crc32, crc == expected))
-}
+use crate::grid::crc32;
+use crate::runs::gate;
 
 impl RarStore {
     pub(super) fn route(
@@ -98,20 +75,10 @@ impl RarStore {
         else {
             return;
         };
-        let key = MemberId(piece as u32);
-        entry.parts.offer(
-            key,
-            WHOLE,
-            &Segment {
-                range: part.shift(-(data.start as i64)),
-                crc32: crc32(bytes),
-                verified: provenance.is_verified(),
-            },
-        );
-        let folded = entry
-            .parts
-            .fold(key, WHOLE, 0, ByteRange::new(0, data.len()));
-        if let Some((crc, false)) = holds(folded, uses_mac, entry.hash_key.as_deref(), expected) {
+        let hash_key = entry.hash_key.as_deref();
+        let runs = entry.parts.entry(piece).or_default();
+        runs.feed(part.shift(-(data.start as i64)), crc32(bytes), provenance);
+        if let (SliceVerdict::Damaged, crc) = gate(runs, data.len(), expected, uses_mac, hash_key) {
             self.say_damaged(volume, data, crc, out);
         }
     }
@@ -133,15 +100,7 @@ impl RarStore {
             bytes: Bytes::copy_from_slice(bytes),
             provenance,
         });
-        entry.grid.offer(
-            member,
-            WHOLE,
-            &Segment {
-                range,
-                crc32: crc32(bytes),
-                verified: provenance.is_verified(),
-            },
-        );
+        entry.plain_runs.feed(range, crc32(bytes), provenance);
         entry.out.coverage.write(range, provenance);
         let Some(length) = entry.plain_len() else {
             return;
@@ -151,11 +110,17 @@ impl RarStore {
             entry.out.closed = true;
             out.push(Emit::MemberClosed(member));
         }
-        let verdict = entry.crc.and_then(|expected| {
-            let folded = entry.grid.fold(member, WHOLE, 0, whole);
-            holds(folded, entry.uses_mac, entry.hash_key.as_deref(), expected)
-        });
-        let Some((crc, false)) = verdict else {
+        let Some(expected) = entry.crc else {
+            return;
+        };
+        let hash_key = entry.hash_key.as_deref();
+        let (SliceVerdict::Damaged, crc) = gate(
+            &entry.plain_runs,
+            length,
+            expected,
+            entry.uses_mac,
+            hash_key,
+        ) else {
             return;
         };
         let parts: Vec<(VolumeIndex, ByteRange)> = entry

@@ -22,9 +22,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, MemberId, Segment, SliceVerdict};
 
-// The old engine's bounds, kept as the object's own: a run is folded eagerly
-// inside its block, so ordered traffic needs one per grid, and these only
-// bite on pathological interleavings.
+// A run is folded eagerly inside its block, so ordered traffic needs one per
+// grid, and these bounds only bite on pathological interleavings.
 const MAX_PENDING_RUNS_PER_FILE: usize = 4096;
 const MAX_DERIVED_BLOCKS_PER_FILE: usize = 16_384;
 const MAX_PENDING_RUNS_PER_JOB: usize = 16_384;
