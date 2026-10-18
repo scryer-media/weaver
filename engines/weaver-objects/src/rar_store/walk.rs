@@ -217,11 +217,36 @@ impl Walk {
         hole(kept, self.facts.as_ref().map_or(0, data_end), closed)
     }
 
+    // Whether the volume is one of a set. Only the main header sets the
+    // volume flag, so a set flag is its word at once; a clear one is its
+    // word only once the walk has ended, since a walk short of the main
+    // header reports the flag clear. Enciphered headers make that walk
+    // common.
+    pub(super) fn in_set(&self) -> Option<bool> {
+        let facts = self.facts.as_ref()?;
+        match (facts.is_volume, self.ended) {
+            (true, _) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        }
+    }
+
+    // Whether a volume follows this one: never, for an archive that is no
+    // set; otherwise what the end record says, once the walk has read it.
+    pub(super) fn successor(&self) -> Option<bool> {
+        match self.in_set()? {
+            false => Some(false),
+            true => self
+                .facts
+                .as_ref()
+                .filter(|_| self.ended && self.short_at.is_none())
+                .map(|facts| facts.more_volumes),
+        }
+    }
+
     // Whether no volume follows this one.
     pub(super) fn is_last(&self) -> bool {
-        self.facts.as_ref().is_some_and(|facts| {
-            !facts.is_volume || (self.ended && self.short_at.is_none() && !facts.more_volumes)
-        })
+        self.successor() == Some(false)
     }
 
     pub(super) fn step(

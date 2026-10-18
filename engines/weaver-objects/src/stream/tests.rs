@@ -455,7 +455,7 @@ fn reserve<D: Decoder>(bytes: &[u8]) -> u64 {
         );
     }
     assert!(out.is_empty());
-    stream.reserve()
+    D::window(&stream.first)
 }
 
 #[test]

@@ -32,7 +32,7 @@ fn yenc_declared_bytes(decoded_len: u32) -> u32 {
 // Non-final parts carry the packed CRC32 of *their* bytes (the RAR5 spec's
 // rule for split files); the final part carries the whole-member CRC32. That
 // is exactly what the two integrity layers read.
-fn single_member_store_set(
+pub(in crate::pipeline::tests) fn single_member_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -954,7 +954,9 @@ async fn run_par2_direct_gate_with_password(
 // The same volume bytes under hex names that classify to nothing — the shape
 // of a fully obfuscated posting. The real names survive only inside the PAR2
 // descriptions the caller builds from the un-obfuscated list.
-fn obfuscate_volumes(volumes: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+pub(in crate::pipeline::tests) fn obfuscate_volumes(
+    volumes: &[(String, Vec<u8>)],
+) -> Vec<(String, Vec<u8>)> {
     volumes
         .iter()
         .enumerate()
@@ -1067,7 +1069,7 @@ async fn run_obfuscated_par2_gate(
 // variant is kept for the paths that must tolerate it; a renamed
 // conventional set needs the numbers, because every unnumbered volume's
 // parsed facts claim position zero and the fact-driven topology collides.
-fn single_member_rar4_store_set_numbered(
+pub(in crate::pipeline::tests) fn single_member_rar4_store_set_numbered(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -1682,7 +1684,7 @@ fn single_member_rar4_store_set(
 // volumes, and one volume carries the tail of one member and the head of the
 // next. That is the shape a season pack posts as, and the shape the first
 // shape demoted on sight.
-fn multi_member_store_set(
+pub(in crate::pipeline::tests) fn multi_member_store_set(
     members: &[(&str, Vec<u8>)],
     volume_count: usize,
 ) -> Vec<(String, Vec<u8>)> {

@@ -81,10 +81,21 @@ impl Pipeline {
         state.download_queue.extend_segment_ids(&mut queued);
         state.recovery_queue.extend_segment_ids(&mut queued);
         graph.arrived_before(|volume, ordinal| queued.contains(&segment(job_id, volume, ordinal)));
+        self.install_graph_job(job_id, graph);
+    }
+
+    // Give a job the graph runtime a restore rebuilt, or one just admitted,
+    // and take its first checkpoint: from here on, a graph job with no rows
+    // is one from before checkpoints.
+    pub(crate) fn install_graph_job(&mut self, job_id: JobId, mut graph: GraphJob) {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
         let moves = graph.sample();
         apply_moves(state, &moves);
         self.graph_jobs.insert(job_id, graph);
         self.after_graph_step(job_id);
+        self.checkpoint_graph_job(job_id);
     }
 
     // A decoded article of a graph job, as the decoder placed it. True when
@@ -161,7 +172,7 @@ impl Pipeline {
 
     // How many runs a graph job may hold now: the extraction concurrency the
     // tuner allows at this moment, the limit the repair slots follow too.
-    fn graph_slot_limit(&self) -> usize {
+    pub(in crate::pipeline::graph) fn graph_slot_limit(&self) -> usize {
         limits::budgets(&self.direct_store.settings(), &self.tuner).1
     }
 
@@ -170,6 +181,8 @@ impl Pipeline {
             warn!(job_id = job_id.0, error = %error, "graph job step failed");
         }
         self.after_graph_step(job_id);
+        // The step's bytes are written: the checkpoint can say so.
+        self.checkpoint_graph_job(job_id);
     }
 
     // After anything reached the tree: answer the objects' seeks, move the

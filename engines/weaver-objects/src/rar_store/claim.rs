@@ -78,11 +78,12 @@ impl RarStore {
     pub(super) fn claim_volume(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
         let format = unrar_rs::signature::read_signature(&mut Cursor::new(first_bytes)).ok()?;
         let ours = self.volumes.get(&VolumeIndex(0))?;
-        if ours
-            .walk
-            .facts
-            .as_ref()
-            .is_some_and(|facts| facts.archive_format() != format || !facts.is_volume)
+        if ours.walk.in_set() == Some(false)
+            || ours
+                .walk
+                .facts
+                .as_ref()
+                .is_some_and(|facts| facts.archive_format() != format)
         {
             return None;
         }
@@ -119,22 +120,23 @@ impl RarStore {
             return None;
         }
         let this = Nameless { facts: &facts };
-        let candidates: Vec<u32> = self
-            .volumes
-            .iter()
-            .filter(|(index, volume)| {
-                let next = VolumeIndex(index.0 + 1);
-                volume.name.is_some()
-                    && self
-                        .volumes
-                        .get(&next)
-                        .is_none_or(|next| next.name.is_none())
-                    && volume.walk.facts.as_ref().is_some_and(|previous| {
-                        previous.more_volumes && this.follows(&Nameless { facts: previous }, next.0)
-                    })
-            })
-            .map(|(index, _)| index.0 + 1)
-            .collect();
+        let candidates: Vec<u32> =
+            self.volumes
+                .iter()
+                .filter(|(index, volume)| {
+                    let next = VolumeIndex(index.0 + 1);
+                    volume.name.is_some()
+                        && self
+                            .volumes
+                            .get(&next)
+                            .is_none_or(|next| next.name.is_none())
+                        && volume.walk.successor() != Some(false)
+                        && volume.walk.facts.as_ref().is_some_and(|previous| {
+                            this.follows(&Nameless { facts: previous }, next.0)
+                        })
+                })
+                .map(|(index, _)| index.0 + 1)
+                .collect();
         let stated: Vec<u32> = candidates
             .iter()
             .copied()

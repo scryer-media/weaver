@@ -7,6 +7,8 @@
 // having when nothing can repair it, and the coverage they leave says which
 // bytes they were.
 
+mod durable;
+
 use std::collections::BTreeMap;
 
 use bytes::Bytes;

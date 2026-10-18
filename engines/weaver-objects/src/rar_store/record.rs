@@ -47,7 +47,15 @@ impl RarStore {
                 Lock::Locked => continue,
                 Lock::Plain => {}
                 Lock::Open(cbc) => {
-                    cbc.deliver(stream.start, slice, provenance, &mut plains);
+                    let said = &mut entry.out;
+                    cbc.deliver(
+                        &said.coverage,
+                        &mut said.padding,
+                        stream.start,
+                        slice,
+                        provenance,
+                        &mut plains,
+                    );
                     for plain in plains {
                         self.record(id, plain.offset, &plain.bytes, plain.provenance, out);
                     }

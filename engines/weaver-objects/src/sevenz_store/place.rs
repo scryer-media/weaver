@@ -14,6 +14,7 @@ use weaver_graph::{ByteRange, Extent, MemberId, Placement, VolumeIndex};
 
 use super::header::SIGNATURE;
 use super::map::Map;
+use super::record::FolderPlaced;
 use super::{ENVELOPE, Lock, SevenZipStore};
 use crate::crypt::BLOCK;
 
@@ -162,9 +163,9 @@ impl SevenZipStore {
             let local = part.shift(-(folder.pack.start as i64));
             match &self.folders[index] {
                 // The proof file is kept to try passwords against.
-                Lock::Locked | Lock::Sealed(_) => self.held_or_kept(part, out),
+                Lock::Locked | Lock::Sealed(..) => self.held_or_kept(part, out),
                 Lock::Plain => classify_plain(map, index, local, folder.pack.start, out),
-                Lock::Open(_) => {
+                Lock::Open(..) => {
                     let payload = ByteRange::new(
                         local.start.min(folder.plain_len),
                         local.end.min(folder.plain_len),
@@ -233,7 +234,7 @@ impl SevenZipStore {
         let base = self.base(volume);
         let mut cursor = container.start;
         for (index, folder) in map.folders_in(container) {
-            let Lock::Open(cbc) = &self.folders[index] else {
+            let Lock::Open(cbc, padding) = &self.folders[index] else {
                 continue;
             };
             let Some(part) = container.intersect(folder.pack) else {
@@ -269,7 +270,13 @@ impl SevenZipStore {
                 }
                 at == wanted.end
             };
-            if !cbc.seal(part.shift(-(folder.pack.start as i64)), &mut plain, into) {
+            let placed = FolderPlaced {
+                map,
+                folder: index,
+                members: &self.members,
+            };
+            let local = part.shift(-(folder.pack.start as i64));
+            if !cbc.seal(&placed, padding, local, &mut plain, into) {
                 return false;
             }
             cursor = part.end;

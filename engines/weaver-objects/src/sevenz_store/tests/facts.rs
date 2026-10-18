@@ -57,7 +57,7 @@ fn an_encrypted_7z_restored_mid_folder_opens_again_and_its_facts_hold_no_key() {
     assert!(
         kept.folders
             .iter()
-            .any(|lock| matches!(lock, Lock::Sealed(_)))
+            .any(|lock| matches!(lock, Lock::Sealed(..)))
     );
     let properties = kept
         .map

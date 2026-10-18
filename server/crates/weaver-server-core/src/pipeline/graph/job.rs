@@ -9,7 +9,9 @@
 
 mod passwords;
 mod repair;
+pub(crate) mod restore;
 mod runs;
+mod snapshot;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -25,6 +27,7 @@ use weaver_graph::{
 
 use self::passwords::Passwords;
 use super::Engine;
+use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
 use super::namespace::{NamespaceWriter, WriteError};
 use super::root::intake::Decoded;
@@ -84,6 +87,8 @@ pub(crate) struct GraphJob {
     // Per recovery object, how many of its volumes were closed when it last
     // ruled: one waiting on recovery bytes rules again once more are.
     ruled_at: BTreeMap<NodeId, usize>,
+    // The checkpoint waiting for the database, if one is.
+    pending: Pending,
 }
 
 // A root member as the post lists it.
@@ -163,6 +168,7 @@ impl GraphJob {
             passwords: Passwords::default(),
             reported: None,
             ruled_at: BTreeMap::new(),
+            pending: Pending::default(),
         }
     }
 
@@ -192,6 +198,10 @@ impl GraphJob {
 
     pub(crate) fn writer(&self) -> &NamespaceWriter {
         &self.writer
+    }
+
+    pub(crate) fn pending(&self) -> &Pending {
+        &self.pending
     }
 
     // Seam for completion, status and health: where the job stands, read
@@ -368,18 +378,6 @@ impl GraphJob {
         sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
         let mut wants = Vec::new();
         self.tree.collect_wants(&mut wants);
-        let mut held = Vec::new();
-        for (node, seek) in &wants {
-            self.writer.seek_held(
-                &mut self.tree,
-                &mut *self.builder,
-                &self.root,
-                *node,
-                *seek,
-                &mut held,
-            )?;
-        }
-        self.heard(held)?;
         let mut asks = Vec::new();
         let mut lifted = Vec::with_capacity(wants.len());
         for (node, seek) in wants {

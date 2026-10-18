@@ -12,8 +12,10 @@
 //
 // Restore walks the kept header bytes again and requires them to read as
 // recorded, so the layout is rebuilt rather than trusted. A member's CRC
-// runs and an open cipher's chain are rebuilt by the server's replay of
-// the placed ranges, which every restart does.
+// runs and an open cipher's seeds are rebuilt by the server's replay of
+// the placed ranges, which every restart does. What came out of the cipher
+// is the member's coverage, which the cipher reads; the one thing coverage
+// cannot say, the plaintext past the payload, is the member's padding.
 
 use std::collections::BTreeSet;
 
@@ -25,6 +27,7 @@ use weaver_graph::{ByteRange, Coverage, Durable, Facts, Kind, Object, RestoreErr
 
 use super::walk::Block;
 use super::{Entry, Lock, Out, Piece, RarStore, Volume};
+use crate::crypt::Padding;
 use crate::kept::Kept;
 use crate::runs::CrcRuns;
 
@@ -63,6 +66,7 @@ pub(super) struct EntryFacts {
     pub(super) keying: Option<KeyTuple>,
     coverage: Coverage,
     closed: bool,
+    padding: Padding,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,6 +156,7 @@ pub(super) fn of(store: &RarStore) -> Facts {
             keying: keying(entry),
             coverage: entry.out.coverage.clone(),
             closed: entry.out.closed,
+            padding: entry.out.padding.clone(),
         })
         .collect();
     let facts = StoreFacts {
@@ -252,6 +257,7 @@ fn entry(facts: EntryFacts) -> Entry {
         out: Out {
             coverage: facts.coverage,
             closed: facts.closed,
+            padding: facts.padding,
         },
         plain_runs: CrcRuns::default(),
         parts: Default::default(),

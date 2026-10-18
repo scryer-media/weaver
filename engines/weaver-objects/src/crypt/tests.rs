@@ -22,14 +22,48 @@ fn cbc(plain: &[u8], cipher: &[u8]) -> Cbc {
     Cbc::new(&KEY, IV, cipher.len() as u64, plain.len() as u64).unwrap()
 }
 
-// Plaintext as it came out, with how it came out.
+// The stream's owner: the plaintext as it placed it, with how it came out,
+// and the padding it keeps. The cipher reads both and keeps neither.
 #[derive(Default)]
 struct Out {
     bytes: Vec<u8>,
     coverage: Coverage,
+    padding: Padding,
 }
 
 impl Out {
+    // Cipher bytes through the stream, and what came out placed.
+    fn deliver(
+        &mut self,
+        stream: &mut Cbc,
+        offset: u64,
+        bytes: &[u8],
+        provenance: Provenance,
+    ) -> Vec<Plain> {
+        let mut plains = Vec::new();
+        stream.deliver(
+            &self.coverage,
+            &mut self.padding,
+            offset,
+            bytes,
+            provenance,
+            &mut plains,
+        );
+        let said = plains.clone();
+        self.take(&mut plains);
+        said
+    }
+
+    fn seal(&self, stream: &Cbc, range: ByteRange, plain: &[u8], into: &mut Vec<u8>) -> bool {
+        stream.seal(
+            &self.coverage,
+            &self.padding,
+            range,
+            &mut reader(plain),
+            into,
+        )
+    }
+
     fn take(&mut self, plains: &mut Vec<Plain>) {
         for plain in plains.drain(..) {
             let end = plain.offset as usize + plain.bytes.len();
@@ -70,15 +104,13 @@ fn bytes_in_any_order_decipher_once_their_seed_is_in() {
     let (plain, cipher) = posted(1000);
     let mut stream = cbc(&plain, &cipher);
     let mut out = Out::default();
-    let mut plains = Vec::new();
     for range in scrambled(cipher.len(), 37) {
-        stream.deliver(
+        out.deliver(
+            &mut stream,
             range.start,
             &cipher[range.start as usize..range.end as usize],
             Provenance::Fresh,
-            &mut plains,
         );
-        out.take(&mut plains);
     }
     assert_eq!(out.bytes, plain);
     assert!(out.coverage.verified(ByteRange::new(0, plain.len() as u64)));
@@ -90,17 +122,14 @@ fn bytes_in_any_order_decipher_once_their_seed_is_in() {
 fn a_block_waits_for_the_one_before_it() {
     let (plain, cipher) = posted(64);
     let mut stream = cbc(&plain, &cipher);
-    let mut plains = Vec::new();
-    stream.deliver(32, &cipher[32..48], Provenance::Fresh, &mut plains);
+    let mut out = Out::default();
+    let plains = out.deliver(&mut stream, 32, &cipher[32..48], Provenance::Fresh);
     assert!(plains.is_empty());
     // Its seed is in: the block after it deciphers, it still waits.
-    stream.deliver(16, &cipher[16..32], Provenance::Fresh, &mut plains);
+    let plains = out.deliver(&mut stream, 16, &cipher[16..32], Provenance::Fresh);
     assert_eq!(plains.len(), 1);
     assert_eq!(plains[0].offset, 32);
-    let mut out = Out::default();
-    out.take(&mut plains);
-    stream.deliver(0, &cipher[..16], Provenance::Fresh, &mut plains);
-    out.take(&mut plains);
+    out.deliver(&mut stream, 0, &cipher[..16], Provenance::Fresh);
     assert_eq!(out.bytes, plain[..48]);
 }
 
@@ -108,16 +137,14 @@ fn a_block_waits_for_the_one_before_it() {
 fn partial_edge_blocks_are_kept_and_seal_back() {
     let (plain, cipher) = posted(64);
     let mut stream = cbc(&plain, &cipher);
-    let mut plains = Vec::new();
-    stream.deliver(5, &cipher[5..27], Provenance::Fresh, &mut plains);
+    let mut out = Out::default();
+    let plains = out.deliver(&mut stream, 5, &cipher[5..27], Provenance::Fresh);
     assert!(plains.is_empty());
     let mut into = Vec::new();
-    assert!(stream.seal(ByteRange::new(5, 27), &mut reader(&plain), &mut into));
+    assert!(out.seal(&stream, ByteRange::new(5, 27), &plain, &mut into));
     assert_eq!(into, cipher[5..27]);
-    assert!(!stream.seal(ByteRange::new(4, 27), &mut reader(&plain), &mut Vec::new()));
-    stream.deliver(0, &cipher[..5], Provenance::Fresh, &mut plains);
-    let mut out = Out::default();
-    out.take(&mut plains);
+    assert!(!out.seal(&stream, ByteRange::new(4, 27), &plain, &mut Vec::new()));
+    out.deliver(&mut stream, 0, &cipher[..5], Provenance::Fresh);
     assert_eq!(out.bytes, plain[..16]);
 }
 
@@ -125,33 +152,38 @@ fn partial_edge_blocks_are_kept_and_seal_back() {
 fn the_padding_is_kept_and_the_final_block_seals_with_it() {
     let (plain, cipher) = posted(1000);
     let mut stream = cbc(&plain, &cipher);
-    let mut plains = Vec::new();
-    stream.deliver(0, &cipher, Provenance::Fresh, &mut plains);
     let mut out = Out::default();
-    out.take(&mut plains);
+    out.deliver(&mut stream, 0, &cipher, Provenance::Fresh);
     assert_eq!(out.bytes.len(), plain.len());
     let mut into = Vec::new();
     let tail = ByteRange::new(960, cipher.len() as u64);
-    assert!(stream.seal(tail, &mut reader(&plain), &mut into));
+    assert!(out.seal(&stream, tail, &plain, &mut into));
     assert_eq!(into, cipher[960..]);
+}
+
+// Past two strides, so the seeds inside the run are what sealing uses.
+fn two_strides() -> (Vec<u8>, Vec<u8>) {
+    posted(2 * STRIDE as usize + 4096 + 3)
+}
+
+fn chunks(len: usize) -> impl Iterator<Item = ByteRange> {
+    (0..len)
+        .step_by(65_536)
+        .map(move |start| ByteRange::new(start as u64, (start + 65_536).min(len) as u64))
 }
 
 #[test]
 fn sealing_re_enciphers_from_any_kept_seed() {
-    // Past two strides, so the seeds inside the run are what sealing uses.
-    let len = 2 * STRIDE as usize + 4096 + 3;
-    let (plain, cipher) = posted(len);
+    let (plain, cipher) = two_strides();
     let mut stream = cbc(&plain, &cipher);
-    let mut plains = Vec::new();
-    for start in (0..cipher.len()).step_by(65_536) {
-        let end = (start + 65_536).min(cipher.len());
-        stream.deliver(
-            start as u64,
-            &cipher[start..end],
+    let mut out = Out::default();
+    for range in chunks(cipher.len()) {
+        out.deliver(
+            &mut stream,
+            range.start,
+            &cipher[range.start as usize..range.end as usize],
             Provenance::Fresh,
-            &mut plains,
         );
-        plains.clear();
     }
     // Two stride seeds and the final block.
     assert_eq!(stream.kept(), 3);
@@ -166,10 +198,7 @@ fn sealing_re_enciphers_from_any_kept_seed() {
         ByteRange::new(0, cipher_len),
     ] {
         let mut into = Vec::new();
-        assert!(
-            stream.seal(range, &mut reader(&plain), &mut into),
-            "{range}"
-        );
+        assert!(out.seal(&stream, range, &plain, &mut into), "{range}");
         assert_eq!(
             into,
             cipher[range.start as usize..range.end as usize],
@@ -178,18 +207,40 @@ fn sealing_re_enciphers_from_any_kept_seed() {
     }
 }
 
+// A cipher opened again with nothing kept, over its owner's record of what
+// it placed, seals each range before the replay delivers it, says nothing
+// new, and keeps the seeds the first one kept.
+#[test]
+fn a_cipher_opened_again_over_its_owners_record_seals_through_a_replay() {
+    let (plain, cipher) = two_strides();
+    let mut out = Out::default();
+    let mut first = cbc(&plain, &cipher);
+    for range in chunks(cipher.len()) {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        out.deliver(&mut first, range.start, bytes, Provenance::Fresh);
+    }
+    let mut again = cbc(&plain, &cipher);
+    for range in chunks(cipher.len()) {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        let mut into = Vec::new();
+        assert!(out.seal(&again, range, &plain, &mut into), "{range}");
+        assert!(into == bytes, "{range}");
+        let said = out.deliver(&mut again, range.start, bytes, Provenance::Fresh);
+        assert!(said.is_empty(), "{range}");
+    }
+    assert_eq!(again.kept(), first.kept());
+}
+
 #[test]
 fn a_repaired_block_re_chains_the_one_after_it() {
     let (plain, cipher) = posted(80);
     let mut stream = cbc(&plain, &cipher);
-    let mut plains = Vec::new();
+    let mut out = Out::default();
     let mut garbled = cipher.clone();
     garbled[20] ^= 0xFF;
-    stream.deliver(0, &garbled[..16], Provenance::Fresh, &mut plains);
-    stream.deliver(16, &garbled[16..32], Provenance::Damaged, &mut plains);
-    stream.deliver(32, &garbled[32..], Provenance::Fresh, &mut plains);
-    let mut out = Out::default();
-    out.take(&mut plains);
+    out.deliver(&mut stream, 0, &garbled[..16], Provenance::Fresh);
+    out.deliver(&mut stream, 16, &garbled[16..32], Provenance::Damaged);
+    out.deliver(&mut stream, 32, &garbled[32..], Provenance::Fresh);
     assert_eq!(
         out.coverage.damaged_ranges().collect::<Vec<_>>(),
         vec![ByteRange::new(16, 48)]
@@ -200,17 +251,17 @@ fn a_repaired_block_re_chains_the_one_after_it() {
     assert!(stream.kept() >= 3);
     // A posted range rebuilt over damage gives back what was posted.
     let mut into = Vec::new();
-    assert!(stream.seal(ByteRange::new(0, 80), &mut reader(&out.bytes), &mut into));
+    let placed = out.bytes.clone();
+    assert!(out.seal(&stream, ByteRange::new(0, 80), &placed, &mut into));
     assert_eq!(into, garbled);
 
-    stream.deliver(16, &cipher[16..32], Provenance::Repaired, &mut plains);
+    let plains = out.deliver(&mut stream, 16, &cipher[16..32], Provenance::Repaired);
     let repaired: Vec<(u64, Provenance)> = plains
         .iter()
         .map(|plain| (plain.offset, plain.provenance))
         .collect();
     assert_eq!(repaired, vec![(16, Provenance::Repaired)]);
     assert_eq!(plains[0].bytes.len(), 32);
-    out.take(&mut plains);
     assert_eq!(out.bytes, plain);
     assert!(out.coverage.verified(ByteRange::new(0, 80)));
     assert_eq!(stream.kept(), 1);
@@ -220,10 +271,9 @@ fn a_repaired_block_re_chains_the_one_after_it() {
 fn a_replay_says_nothing_new() {
     let (plain, cipher) = posted(100);
     let mut stream = cbc(&plain, &cipher);
-    let mut plains = Vec::new();
-    stream.deliver(0, &cipher, Provenance::Fresh, &mut plains);
-    plains.clear();
-    stream.deliver(0, &cipher, Provenance::Fresh, &mut plains);
+    let mut out = Out::default();
+    out.deliver(&mut stream, 0, &cipher, Provenance::Fresh);
+    let plains = out.deliver(&mut stream, 0, &cipher, Provenance::Fresh);
     assert!(plains.is_empty());
 }
 

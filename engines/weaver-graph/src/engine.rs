@@ -58,9 +58,10 @@ pub trait Engine {
     // The bytes a run holds resident while it runs: a decoder's window, read
     // from the first bytes the object was delivered. The owner reserves it
     // before it starts the run, and a run never holds more, so a reservation
-    // never grows once taken. Nothing for an engine whose library sizes its
-    // own memory.
-    fn reserve(&self) -> u64 {
-        0
+    // never grows once taken. `None` while the bytes that size it have not
+    // all come: no run starts before then. Nothing for an engine whose
+    // library sizes its own memory.
+    fn reserve(&self) -> Option<u64> {
+        Some(0)
     }
 }

@@ -41,6 +41,23 @@ impl Passwords {
         }
     }
 
+    // The candidate each node was offered last, by index: a checkpoint
+    // keeps the index, never the candidate.
+    pub(super) fn last_offered(&self) -> impl Iterator<Item = (NodeId, usize)> + '_ {
+        self.offered
+            .iter()
+            .filter_map(|(node, offered)| Some((*node, offered.checked_sub(1)?)))
+    }
+
+    // A restore takes up where the checkpoint left the node: the cursor is
+    // past the candidate it was offered last, and that candidate is offered
+    // again. `None` when the job no longer has it.
+    pub(super) fn offered_before(&mut self, node: NodeId, index: usize) -> Option<&str> {
+        let candidate = self.candidates.get(index)?;
+        self.offered.insert(node, index + 1);
+        Some(candidate)
+    }
+
     // The candidate after the one the node was offered last, if any is left.
     fn next(&mut self, node: NodeId) -> Option<&str> {
         let offered = self.offered.entry(node).or_default();

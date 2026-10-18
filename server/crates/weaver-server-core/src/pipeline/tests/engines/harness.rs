@@ -32,7 +32,7 @@ use crate::pipeline::{
 pub(super) const ARTICLE: usize = 64;
 
 // Every run is its own pipeline, so one id serves every scenario.
-const JOB: JobId = JobId(93_001);
+pub(super) const JOB: JobId = JobId(93_001);
 const JOB_NAME: &str = "lantern beacon";
 
 pub(super) struct Post {
@@ -144,6 +144,7 @@ pub(super) struct Scenario {
     pub(super) damage: Vec<(u32, u32)>,
     pub(super) lost: Vec<(u32, u32)>,
     pub(super) password: Option<String>,
+    pub(super) global_passwords: Vec<String>,
 }
 
 impl Scenario {
@@ -153,12 +154,20 @@ impl Scenario {
             damage: Vec::new(),
             lost: Vec::new(),
             password: None,
+            global_passwords: Vec::new(),
         }
     }
 
     // The password the job is submitted with.
     pub(super) fn password(mut self, password: &str) -> Self {
         self.password = Some(password.to_string());
+        self
+    }
+
+    // A password the settings carry, not the job: classic tries it once
+    // the volumes are in, graph offers it when an object asks.
+    pub(super) fn global_password(mut self, password: &str) -> Self {
+        self.global_passwords.push(password.to_string());
         self
     }
 
@@ -172,7 +181,7 @@ impl Scenario {
         self
     }
 
-    fn spec(&self) -> JobSpec {
+    pub(super) fn spec(&self) -> JobSpec {
         JobSpec {
             name: JOB_NAME.to_string(),
             password: self.password.clone(),
@@ -232,6 +241,8 @@ pub(super) struct Outcome {
     pub(super) files: BTreeMap<String, Vec<u8>>,
     pub(super) claims: BTreeMap<String, Claim>,
     pub(super) requests: BTreeMap<(u32, u32), usize>,
+    // Every article in the order it was asked for.
+    pub(super) order: Vec<(u32, u32)>,
     pub(super) reads: u64,
     pub(super) graph: Option<GraphView>,
     // The posts that are PAR2 recovery volumes, by file index.
@@ -307,7 +318,26 @@ pub(super) fn assert_same(classic: &Outcome, graph: &Outcome) {
     );
 }
 
+// A run whose gate rounds stopped changing anything before the job
+// finished: the status it sat at, and the pipeline's account of the job.
+#[derive(Debug)]
+pub(super) struct Stall {
+    pub(super) engine: Engine,
+    pub(super) status: Option<JobStatus>,
+    pub(super) state: String,
+}
+
 pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
+    try_run(scenario, engine).await.unwrap_or_else(|stall| {
+        panic!(
+            "{} job stalled at {:?}: {}",
+            stall.engine, stall.status, stall.state
+        )
+    })
+}
+
+// A run that may stall, for a row that asserts an engine does.
+pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outcome, Stall> {
     let temp_dir = tempfile::tempdir().unwrap();
     // One server: an article it serves damaged has nowhere else to come
     // from, so both engines give it up for repair at once.
@@ -318,11 +348,18 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
     };
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers, 1).await;
+    if !scenario.global_passwords.is_empty() {
+        pipeline
+            .db
+            .save_archive_password_settings(Some(scenario.global_passwords.clone()), None)
+            .unwrap();
+    }
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     pipeline.admit_graph_job(JOB, engine);
     assert_eq!(pipeline.is_graph_job(JOB), engine == Engine::Graph);
 
     let mut requests = BTreeMap::new();
+    let mut order = Vec::new();
     let mut graph = (engine == Engine::Graph).then(GraphView::default);
     let mut reads = 0;
     let mut stalled = None;
@@ -337,6 +374,7 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
                 work.segment_id.segment_number,
             );
             *requests.entry(article).or_insert(0usize) += 1;
+            order.push(article);
             serve(&mut pipeline, scenario, article).await;
             observe(&pipeline, &mut graph, &mut reads);
         }
@@ -385,10 +423,14 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
         }
         let after = fingerprint(&pipeline, &requests);
         if before == after && stalled.replace(after.clone()) == Some(after.clone()) {
-            panic!(
-                "{engine} job stalled at {after}: {}",
-                debug_job_state(&pipeline, JOB)
-            );
+            let status = job_status_for_assert(&pipeline, JOB);
+            let state = format!("{after}: {}", debug_job_state(&pipeline, JOB));
+            retire_pipeline_database(pipeline).await;
+            return Err(Stall {
+                engine,
+                status,
+                state,
+            });
         }
     }
 
@@ -417,7 +459,7 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
         .map(|post| (post.name.clone(), delivered_claim(&files, post)))
         .collect();
     retire_pipeline_database(pipeline).await;
-    Outcome {
+    Ok(Outcome {
         engine,
         status,
         failure,
@@ -425,6 +467,7 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
         files,
         claims,
         requests,
+        order,
         reads,
         graph,
         volumes: scenario
@@ -442,11 +485,15 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
             })
             .map(|(_, index)| index)
             .collect(),
-    }
+    })
 }
 
 // One article as the scenario's server answers it.
-async fn serve(pipeline: &mut Pipeline, scenario: &Scenario, (file, ordinal): (u32, u32)) {
+pub(super) async fn serve(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    (file, ordinal): (u32, u32),
+) {
     let segment_id = SegmentId {
         file_id: NzbFileId {
             job_id: JOB,
@@ -510,7 +557,7 @@ async fn serve(pipeline: &mut Pipeline, scenario: &Scenario, (file, ordinal): (u
     settle_direct_demotion_work(pipeline).await;
 }
 
-fn finished(pipeline: &Pipeline) -> bool {
+pub(super) fn finished(pipeline: &Pipeline) -> bool {
     matches!(
         job_status_for_assert(pipeline, JOB),
         Some(JobStatus::Complete | JobStatus::Failed { .. }) | None
@@ -581,7 +628,7 @@ fn delivered_claim(files: &BTreeMap<String, Vec<u8>>, post: &Post) -> Claim {
 
 // The delivered files, without the marker every output directory carries,
 // whose bytes name the run's own paths.
-fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+pub(super) fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

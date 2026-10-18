@@ -5,14 +5,16 @@
 // deciphered as soon as the cipher block before it is in, so a run deciphers
 // the moment its seed arrives and a block whose seed has not stays parked.
 //
-// Nothing here keeps the stream. A deciphered block is dropped once the block
-// after it is deciphered too, and kept only where it is still a seed someone
-// needs: at the end of a run, every STRIDE bytes inside one, and either side
-// of damage, which a repair re-deciphers through. Partial edge blocks are kept
-// until they fill, and the final block's plaintext past the payload, the
-// padding no member holds, is kept for good. That is all `seal` needs to give
-// back exactly the bytes that were posted: it re-enciphers the plaintext the
-// caller reads back from the nearest kept seed forward.
+// Nothing here keeps the stream, nor a ledger of what came out of it: that is
+// the owner's record of what it placed, which the cipher reads. A deciphered
+// block is dropped once the block after it has come out too, and kept only
+// where it is still a seed someone needs: at the end of a run, every STRIDE
+// bytes inside one, and either side of damage, which a repair re-deciphers
+// through. Partial edge blocks are kept until they fill. The plaintext past
+// the payload, the padding no member holds, the owner keeps beside its
+// record. That is all `seal` needs to give back exactly the bytes that were
+// posted: it re-enciphers the plaintext the owner reads back from the
+// nearest kept seed forward.
 //
 // Format-blind: offsets are the cipher stream's own, plaintext offsets are
 // the same numbers, and the caller says where the payload ends.
@@ -175,6 +177,35 @@ impl Block {
     }
 }
 
+// What of a cipher stream's plaintext its owner has placed. The owner's
+// record is the one ledger of what came out: the cipher reads it and keeps
+// none of its own, so a cipher opened again over a restored record knows
+// everything the record does.
+pub trait Placed {
+    // The worst provenance `range` was placed in, or `None` while a byte of
+    // it never was.
+    fn placed(&self, range: ByteRange) -> Option<Provenance>;
+}
+
+impl Placed for Coverage {
+    fn placed(&self, range: ByteRange) -> Option<Provenance> {
+        self.covered(range).then(|| {
+            self.overlapping(range)
+                .map(|run| run.provenance)
+                .fold(Provenance::Fresh, worse)
+        })
+    }
+}
+
+// The plaintext past the payload, which no member holds, by the block it
+// came out of: its bytes from where the payload ends, and how it came out.
+// It is the one thing a member's coverage cannot say, so the owner keeps it
+// beside the member's record, as facts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Padding {
+    blocks: BTreeMap<u64, (Vec<u8>, Provenance)>,
+}
+
 pub struct Cbc {
     keys: Keys,
     iv: [u8; 16],
@@ -182,25 +213,17 @@ pub struct Cbc {
     plain_len: u64,
     // Cipher blocks still needed, by offset: parked, partial, or seeds.
     blocks: BTreeMap<u64, Block>,
-    // Deciphered blocks, with the provenance their plaintext came out in.
-    done: Coverage,
-    // The plaintext past the payload, which no member holds, and how much
-    // of it came out.
-    padding: Vec<u8>,
-    padded: Coverage,
 }
 
-// A cipher's state without its key: the blocks it keeps and what came out.
-// A restart keeps this, and the key comes back from the password.
+// A cipher's state without its key: the cipher blocks it keeps. What came
+// out of them is the owner's record. A restart keeps this, and the key
+// comes back from the password.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Chain {
     iv: [u8; 16],
     cipher_len: u64,
     plain_len: u64,
     blocks: BTreeMap<u64, Block>,
-    done: Coverage,
-    padding: Vec<u8>,
-    padded: Coverage,
 }
 
 impl fmt::Debug for Cbc {
@@ -226,6 +249,71 @@ fn ceil(offset: u64) -> u64 {
     offset.div_ceil(BLOCK) * BLOCK
 }
 
+// What has come out, as one call sees it: the owner's record and padding,
+// and on top of them what this call deciphered, which the owner records
+// once the call returns.
+struct Seen<'a> {
+    placed: &'a dyn Placed,
+    padding: &'a Padding,
+    now: Coverage,
+    now_padding: Padding,
+}
+
+impl<'a> Seen<'a> {
+    fn new(placed: &'a dyn Placed, padding: &'a Padding) -> Self {
+        Self {
+            placed,
+            padding,
+            now: Coverage::new(),
+            now_padding: Padding::default(),
+        }
+    }
+
+    // How the plaintext of whole blocks `range` came out, or `None` while a
+    // byte of it has not.
+    fn came_out(&self, plain_len: u64, range: ByteRange) -> Option<Provenance> {
+        let mut worst = Provenance::Fresh;
+        let payload_end = range.end.min(plain_len);
+        if range.start < payload_end {
+            let payload = ByteRange::new(range.start, payload_end);
+            let mut cursor = payload.start;
+            for run in self.now.overlapping(payload) {
+                let Some(part) = run.range.intersect(payload) else {
+                    continue;
+                };
+                if part.start > cursor {
+                    let before = self.placed.placed(ByteRange::new(cursor, part.start))?;
+                    worst = worse(worst, before);
+                }
+                worst = worse(worst, run.provenance);
+                cursor = part.end;
+            }
+            if cursor < payload_end {
+                let rest = self.placed.placed(ByteRange::new(cursor, payload_end))?;
+                worst = worse(worst, rest);
+            }
+        }
+        let first_padded = range.start.max(floor(plain_len));
+        for start in (first_padded..range.end).step_by(BLOCK as usize) {
+            let (_, provenance) = self
+                .now_padding
+                .blocks
+                .get(&start)
+                .or_else(|| self.padding.blocks.get(&start))?;
+            worst = worse(worst, *provenance);
+        }
+        Some(worst)
+    }
+
+    fn padding_of(&self, start: u64) -> Option<&[u8]> {
+        self.now_padding
+            .blocks
+            .get(&start)
+            .or_else(|| self.padding.blocks.get(&start))
+            .map(|(bytes, _)| bytes.as_slice())
+    }
+}
+
 impl Cbc {
     pub fn new(
         key: &[u8],
@@ -248,9 +336,6 @@ impl Cbc {
             cipher_len,
             plain_len,
             blocks: BTreeMap::new(),
-            done: Coverage::new(),
-            padding: vec![0; (cipher_len - plain_len) as usize],
-            padded: Coverage::new(),
         })
     }
 
@@ -260,9 +345,6 @@ impl Cbc {
             cipher_len: self.cipher_len,
             plain_len: self.plain_len,
             blocks: self.blocks.clone(),
-            done: self.done.clone(),
-            padding: self.padding.clone(),
-            padded: self.padded.clone(),
         }
     }
 
@@ -274,14 +356,11 @@ impl Cbc {
             .blocks
             .keys()
             .all(|start| start.is_multiple_of(BLOCK) && *start < chain.cipher_len);
-        if !aligned || chain.padding.len() != fresh.padding.len() {
+        if !aligned {
             return Err(CryptError::Chain);
         }
         Ok(Self {
             blocks: chain.blocks,
-            done: chain.done,
-            padding: chain.padding,
-            padded: chain.padded,
             ..fresh
         })
     }
@@ -295,18 +374,29 @@ impl Cbc {
         self.blocks.len()
     }
 
-    // Whether every block under this plaintext range has been deciphered.
-    pub fn deciphered(&self, range: ByteRange) -> bool {
-        range.is_empty()
-            || self
-                .done
-                .covered(ByteRange::new(floor(range.start), ceil(range.end)))
-    }
-
-    // Cipher bytes at a stream offset. Plaintext that came out of them, or
-    // out of blocks they unparked or re-chained, goes into `out`.
+    // Cipher bytes at a stream offset. `placed` is what the owner has placed
+    // of the plaintext, and `padding` what it keeps past the payload; the
+    // plaintext that came out of these bytes, or out of blocks they unparked
+    // or re-chained, goes into `out` for the owner to place, and the padding
+    // that came out into `padding`.
     pub fn deliver(
         &mut self,
+        placed: &dyn Placed,
+        padding: &mut Padding,
+        offset: u64,
+        bytes: &[u8],
+        provenance: Provenance,
+        out: &mut Vec<Plain>,
+    ) {
+        let mut seen = Seen::new(placed, padding);
+        self.deliver_seen(&mut seen, offset, bytes, provenance, out);
+        let came = seen.now_padding;
+        padding.blocks.extend(came.blocks);
+    }
+
+    fn deliver_seen(
+        &mut self,
+        seen: &mut Seen<'_>,
         offset: u64,
         bytes: &[u8],
         provenance: Provenance,
@@ -323,12 +413,17 @@ impl Cbc {
             let start = floor(cursor);
             let end = (start + BLOCK).min(range.end);
             let piece = &bytes[(cursor - offset) as usize..(end - offset) as usize];
-            // A block deciphered and dropped was only dropped because the
-            // block after it no longer needed it, which means nothing about
-            // it was in doubt: a replay or a repair over it is the same bytes.
-            if self.blocks.contains_key(&start) || !self.done.covered(block_at(start)) {
+            // A block that came out and was dropped was only dropped because
+            // the block after it no longer needed it, which means nothing
+            // about it was in doubt: a replay or a repair over it is the same
+            // bytes, and says nothing. It is kept again where the rule that
+            // keeps blocks needs it as a seed, as every block that came out
+            // is when it is first deciphered.
+            let kept = self.blocks.contains_key(&start);
+            let came = seen.came_out(self.plain_len, block_at(start)).is_some();
+            if kept || !came || self.needed(seen, start) {
                 let block = self.blocks.entry(start).or_insert(Block::EMPTY);
-                if block.write((cursor - start) as usize, piece, provenance) {
+                if block.write((cursor - start) as usize, piece, provenance) && (kept || !came) {
                     dirty.insert(start);
                 }
             }
@@ -347,17 +442,22 @@ impl Cbc {
         };
         let mut touched = ByteRange::new(first, last + BLOCK);
         while let Some(start) = dirty.pop_first() {
-            if let Some(run) = self.run_from(start, &mut dirty) {
+            if let Some(run) = self.run_from(seen, start, &mut dirty) {
                 touched = ByteRange::new(touched.start.min(run.start), touched.end.max(run.end));
-                self.decipher_run(run, out);
+                self.decipher_run(seen, run, out);
             }
         }
-        self.drop_spent(touched);
+        self.drop_spent(seen, touched);
     }
 
     // The longest run of full blocks from `start` that can be deciphered now:
     // its seed is in, and every block in it is new, changed or parked.
-    fn run_from(&self, start: u64, dirty: &mut BTreeSet<u64>) -> Option<ByteRange> {
+    fn run_from(
+        &self,
+        seen: &Seen<'_>,
+        start: u64,
+        dirty: &mut BTreeSet<u64>,
+    ) -> Option<ByteRange> {
         if !self.blocks.get(&start).is_some_and(Block::full) {
             return None;
         }
@@ -365,7 +465,7 @@ impl Cbc {
         let mut end = start + BLOCK;
         while end < self.cipher_len
             && self.blocks.get(&end).is_some_and(Block::full)
-            && (dirty.contains(&end) || !self.done.covered(block_at(end)))
+            && (dirty.contains(&end) || seen.came_out(self.plain_len, block_at(end)).is_none())
         {
             dirty.remove(&end);
             end += BLOCK;
@@ -383,7 +483,7 @@ impl Cbc {
             .map(|block| (block.cipher, block.provenance()))
     }
 
-    fn decipher_run(&mut self, run: ByteRange, out: &mut Vec<Plain>) {
+    fn decipher_run(&mut self, seen: &mut Seen<'_>, run: ByteRange, out: &mut Vec<Plain>) {
         let Some((seed, mut seed_provenance)) = self.seed(run.start) else {
             return;
         };
@@ -411,17 +511,18 @@ impl Cbc {
                 run.start + index as u64 * BLOCK,
                 run.start + until as u64 * BLOCK,
             );
-            self.done.write(piece, provenance);
             let bytes =
                 &plain[(piece.start - run.start) as usize..(piece.end - run.start) as usize];
-            self.emit(piece, bytes, provenance, out);
+            self.emit(seen, piece, bytes, provenance, out);
             index = until;
         }
     }
 
-    // Hand plaintext out, keeping what lies past the payload as padding.
+    // Hand the payload out for the owner to place, and the plaintext past it
+    // to the owner's padding.
     fn emit(
-        &mut self,
+        &self,
+        seen: &mut Seen<'_>,
         piece: ByteRange,
         bytes: &[u8],
         provenance: Provenance,
@@ -429,56 +530,63 @@ impl Cbc {
     ) {
         let payload_end = piece.end.min(self.plain_len);
         if piece.start < payload_end {
+            let payload = ByteRange::new(piece.start, payload_end);
+            seen.now.write(payload, provenance);
             out.push(Plain {
                 offset: piece.start,
-                bytes: bytes[..(payload_end - piece.start) as usize].to_vec(),
+                bytes: bytes[..payload.len() as usize].to_vec(),
                 provenance,
             });
         }
-        if piece.end > self.plain_len {
-            let from = self.plain_len.max(piece.start);
-            let at = (from - self.plain_len) as usize;
-            let tail = &bytes[(from - piece.start) as usize..];
-            self.padding[at..at + tail.len()].copy_from_slice(tail);
-            self.padded
-                .write(ByteRange::new(from, piece.end), Provenance::Fresh);
+        let first_padded = piece.start.max(floor(self.plain_len));
+        for start in (first_padded..piece.end).step_by(BLOCK as usize) {
+            let from = start.max(self.plain_len);
+            let tail =
+                &bytes[(from - piece.start) as usize..(start + BLOCK - piece.start) as usize];
+            seen.now_padding
+                .blocks
+                .insert(start, (tail.to_vec(), provenance));
         }
     }
 
     // Drop deciphered blocks nobody needs as a seed any more.
-    fn drop_spent(&mut self, around: ByteRange) {
+    fn drop_spent(&mut self, seen: &Seen<'_>, around: ByteRange) {
         let from = around.start.saturating_sub(BLOCK);
         let spent: Vec<u64> = self
             .blocks
             .range(from..around.end)
             .map(|(start, _)| *start)
-            .filter(|start| self.done.covered(block_at(*start)) && !self.needed(*start))
+            .filter(|start| {
+                seen.came_out(self.plain_len, block_at(*start)).is_some()
+                    && !self.needed(seen, *start)
+            })
             .collect();
         for start in spent {
             self.blocks.remove(&start);
         }
     }
 
-    fn needed(&self, start: u64) -> bool {
+    fn needed(&self, seen: &Seen<'_>, start: u64) -> bool {
         let next = start + BLOCK;
         next >= self.cipher_len
             || next.is_multiple_of(STRIDE)
-            || !self.done.covered(block_at(next))
-            || self.came_out_damaged(start)
-            || self.came_out_damaged(next)
+            || seen.came_out(self.plain_len, block_at(next)).is_none()
+            || self.came_out_damaged(seen, start)
+            || self.came_out_damaged(seen, next)
     }
 
-    fn came_out_damaged(&self, start: u64) -> bool {
-        self.done
-            .overlapping(block_at(start))
-            .any(|run| run.provenance == Provenance::Damaged)
+    fn came_out_damaged(&self, seen: &Seen<'_>, start: u64) -> bool {
+        seen.came_out(self.plain_len, block_at(start)) == Some(Provenance::Damaged)
     }
 
     // The cipher bytes that were posted for `range`, rebuilt from what is
-    // kept and from the plaintext `plain` reads back. `false` when a byte in
-    // it never arrived or its plaintext cannot be read.
+    // kept and from the plaintext `plain` reads back of what the owner has
+    // placed. `false` when a byte in it never arrived or its plaintext
+    // cannot be read.
     pub fn seal(
         &self,
+        placed: &dyn Placed,
+        padding: &Padding,
         range: ByteRange,
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
@@ -489,6 +597,8 @@ impl Cbc {
         if range.end > self.cipher_len {
             return false;
         }
+        let seen = Seen::new(placed, padding);
+        eprintln!("TMPSEAL range={range} kept={:?} came={:?} pad={:?}", self.blocks.keys().collect::<Vec<_>>(), seen.came_out(self.plain_len, ByteRange::new(floor(range.start), ceil(range.end))), padding.blocks.keys().collect::<Vec<_>>());
         let first = floor(range.start);
         let end = ceil(range.end);
         let mut posted: Vec<u8> = Vec::with_capacity((end - first) as usize);
@@ -510,7 +620,7 @@ impl Cbc {
                 .range(cursor..end)
                 .next()
                 .map_or(end, |(start, _)| *start);
-            let Some(bytes) = self.reseal(cursor, stop, &posted, plain) else {
+            let Some(bytes) = self.reseal(&seen, cursor, stop, &posted, plain) else {
                 return false;
             };
             posted.extend_from_slice(&bytes);
@@ -526,6 +636,7 @@ impl Cbc {
     // the IV.
     fn reseal(
         &self,
+        seen: &Seen<'_>,
         start: u64,
         stop: u64,
         posted: &[u8],
@@ -542,9 +653,7 @@ impl Cbc {
                 None => (self.iv, 0),
             }
         };
-        if !self.done.covered(ByteRange::new(from, stop)) {
-            return None;
-        }
+        seen.came_out(self.plain_len, ByteRange::new(from, stop))?;
         let payload_end = stop.min(self.plain_len);
         let payload = ByteRange::new(from.min(payload_end), payload_end);
         let mut buffer = Vec::with_capacity((stop - from) as usize);
@@ -554,13 +663,9 @@ impl Cbc {
         if buffer.len() as u64 != payload.len() {
             return None;
         }
-        if stop > self.plain_len {
-            let tail = ByteRange::new(from.max(self.plain_len), stop);
-            if !self.padded.covered(tail) {
-                return None;
-            }
-            let at = (tail.start - self.plain_len) as usize;
-            buffer.extend_from_slice(&self.padding[at..at + tail.len() as usize]);
+        let first_padded = from.max(floor(self.plain_len));
+        for block in (first_padded..stop).step_by(BLOCK as usize) {
+            buffer.extend_from_slice(seen.padding_of(block)?);
         }
         if buffer.len() as u64 != stop - from {
             return None;

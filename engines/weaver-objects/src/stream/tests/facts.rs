@@ -80,12 +80,12 @@ fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
             "cut {cut}"
         );
     }
-    // Restored before the block header said its dictionary, the stream holds
-    // the format's largest; once it has, the first block's.
+    // Restored before its front is in, the stream reserves nothing yet;
+    // once it is, the first block's dictionary.
     let early = header_facts(&header, 3);
-    let late = header_facts(&block, 1 + 2 * 8);
-    assert!(early.reserve() > late.reserve());
-    assert_eq!(late.reserve(), Xz::window(&bytes));
+    let late = header_facts(&block, 1 + 2 * (FIRST / 4));
+    assert_eq!(early.reserve(), None);
+    assert_eq!(late.reserve(), Some(Xz::window(&bytes)));
 }
 
 fn header_facts(steps: &[Step<'_>], cut: usize) -> XzStream {

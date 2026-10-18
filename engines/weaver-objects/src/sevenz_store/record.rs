@@ -11,8 +11,38 @@ use bytes::Bytes;
 use weaver_graph::{ByteRange, Emit, MemberId, Provenance, Segment, SliceVerdict};
 
 use super::map::Map;
-use super::{Lock, SevenZipStore};
+use super::{Lock, Out, SevenZipStore};
+use crate::crypt::{Placed, worse};
 use crate::grid::{self, WHOLE, crc32};
+
+// What of an AES folder's plaintext its members have placed: the members'
+// coverage at their offsets in the folder. Bytes no member holds were
+// placed nowhere, so the cipher keeps their blocks.
+pub(super) struct FolderPlaced<'a> {
+    pub(super) map: &'a Map,
+    pub(super) folder: usize,
+    pub(super) members: &'a [Out],
+}
+
+impl Placed for FolderPlaced<'_> {
+    fn placed(&self, range: ByteRange) -> Option<Provenance> {
+        let mut worst = Provenance::Fresh;
+        let mut cursor = range.start;
+        for (_, entry) in self.map.entries_in(self.folder, range) {
+            let Some(part) = range.intersect(entry.span()) else {
+                continue;
+            };
+            if part.start > cursor {
+                return None;
+            }
+            let said = self.members.get(entry.member?.0 as usize)?;
+            let placed = said.coverage.placed(part.shift(-(entry.offset as i64)))?;
+            worst = worse(worst, placed);
+            cursor = part.end;
+        }
+        (cursor >= range.end).then_some(worst)
+    }
+}
 
 impl SevenZipStore {
     pub(super) fn route(
@@ -35,9 +65,21 @@ impl SevenZipStore {
             let local = part.shift(-(folder.pack.start as i64));
             match &mut self.folders[index] {
                 Lock::Plain => {}
-                Lock::Locked | Lock::Sealed(_) => continue,
-                Lock::Open(cbc) => {
-                    cbc.deliver(local.start, slice, provenance, &mut plains);
+                Lock::Locked | Lock::Sealed(..) => continue,
+                Lock::Open(cbc, padding) => {
+                    let placed = FolderPlaced {
+                        map: &map,
+                        folder: index,
+                        members: &self.members,
+                    };
+                    cbc.deliver(
+                        &placed,
+                        padding,
+                        local.start,
+                        slice,
+                        provenance,
+                        &mut plains,
+                    );
                     for plain in std::mem::take(&mut plains) {
                         let span = ByteRange::at(plain.offset, plain.bytes.len() as u64);
                         self.emit_plain(&map, index, span, &plain.bytes, plain.provenance, out);

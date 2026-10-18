@@ -110,8 +110,8 @@ impl Engine for Echo {
     fn reached(&mut self, volume: VolumeIndex, _: u64) {
         self.reached = Some(volume);
     }
-    fn reserve(&self) -> u64 {
-        self.window
+    fn reserve(&self) -> Option<u64> {
+        Some(self.window)
     }
 }
 

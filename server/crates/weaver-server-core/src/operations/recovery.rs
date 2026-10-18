@@ -70,6 +70,7 @@ pub async fn recover_server_state(
                 active_volume_status = counts.active_volume_status,
                 active_rar_verified_suspect = counts.active_rar_verified_suspect,
                 active_direct_coverage = counts.active_direct_coverage,
+                graph_checkpoint = counts.graph_checkpoint,
                 "removed orphaned active-state rows before recovery"
             );
         }

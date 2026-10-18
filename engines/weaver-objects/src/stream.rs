@@ -81,6 +81,10 @@ pub struct Stream<D> {
     name: String,
     first: Vec<u8>,
     consumed: u64,
+    // The volume grows no further, so a front shorter than FIRST is the
+    // whole of it.
+    #[serde(default)]
+    closed: bool,
 }
 
 impl<D: Decoder> Default for Stream<D> {
@@ -90,6 +94,7 @@ impl<D: Decoder> Default for Stream<D> {
             name: String::new(),
             first: Vec::new(),
             consumed: 0,
+            closed: false,
         }
     }
 }
@@ -127,7 +132,9 @@ impl<D: Decoder> Object for Stream<D> {
         self.first[at..end].copy_from_slice(&delivery.bytes[..end - at]);
     }
 
-    fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {}
+    fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {
+        self.closed = true;
+    }
 
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
@@ -173,7 +180,10 @@ impl<D: Decoder> Object for Stream<D> {
 
 impl<D: Decoder> Engine for Stream<D> {
     fn start(&self) -> Box<dyn Extraction> {
-        Box::new(run::Run::<D>::new(member_name(&self.name), self.reserve()))
+        Box::new(run::Run::<D>::new(
+            member_name(&self.name),
+            D::window(&self.first),
+        ))
     }
 
     // A rerun reads from the front again, so the frontier only grows.
@@ -183,8 +193,11 @@ impl<D: Decoder> Engine for Stream<D> {
         }
     }
 
-    fn reserve(&self) -> u64 {
-        D::window(&self.first)
+    // The window is sized from the front, so it is known once the front is
+    // in: a stream inside another object's member often arrives a sliver
+    // at a time.
+    fn reserve(&self) -> Option<u64> {
+        (self.closed || self.first.len() >= FIRST).then(|| D::window(&self.first))
     }
 }
 

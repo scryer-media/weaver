@@ -34,7 +34,7 @@ use weaver_graph::{
 };
 use zeroize::Zeroizing;
 
-use crate::crypt::Cbc;
+use crate::crypt::{Cbc, Padding};
 use crate::grid::crc32;
 use crate::kept::Kept;
 use crate::runs::CrcRuns;
@@ -84,11 +84,14 @@ struct Piece {
     after: bool,
 }
 
-// What has been said for one member.
+// What has been said for one member: what of it was placed, which an open
+// cipher reads as what came out of it, and the plaintext its cipher stream
+// carries past it, which no member holds.
 #[derive(Default)]
 struct Out {
     coverage: Coverage,
     closed: bool,
+    padding: Padding,
 }
 
 struct Entry {

@@ -11,6 +11,8 @@
 // edges of each decoded article, a file's declared length) tightens the
 // bounds of the articles around it.
 
+mod durable;
+
 use std::collections::{BTreeMap, HashMap};
 
 use weaver_graph::{ByteRange, Pull, VolumeIndex};

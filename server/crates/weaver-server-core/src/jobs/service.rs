@@ -1980,6 +1980,25 @@ impl Pipeline {
                 .or_insert(*floor);
             *slot = (*slot).max(*floor);
         }
+        // The engine the row was stamped with at admission, never the switch's
+        // answer now: a job resumes on the engine it started on.
+        let engine = self
+            .db_blocking(move |db| db.load_active_job_engine(job_id))
+            .await?
+            .unwrap_or_default();
+        // A graph job resumes from its checkpoint, which alone says which of
+        // its articles are on disk, so the queue skips exactly those.
+        let graph_restore = match engine {
+            crate::pipeline::graph::Engine::Graph => {
+                let restored = self
+                    .restore_graph_job(job_id, &spec, &working_dir)
+                    .await
+                    .map_err(|error| crate::SchedulerError::Internal(error.to_string()))?;
+                restore_skip_plan.skip = restored.skip;
+                Some(restored.job)
+            }
+            crate::pipeline::graph::Engine::Classic => None,
+        };
         let (mut assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
         let repair_outputs = self
@@ -2058,12 +2077,6 @@ impl Pipeline {
                 .then_some(staging_dir)
         };
 
-        // The engine the row was stamped with at admission, never the switch's
-        // answer now: a job resumes on the engine it started on.
-        let engine = self
-            .db_blocking(move |db| db.load_active_job_engine(job_id))
-            .await?
-            .unwrap_or_default();
         let server_attribution = self
             .db_blocking(move |db| db.load_active_server_attribution(job_id))
             .await?;
@@ -2213,7 +2226,10 @@ impl Pipeline {
         self.install_repeated_articles(&state)?;
         self.job_scheduling_memory.insert(job_id, scheduling_memory);
         self.jobs.insert(job_id, state);
-        self.admit_graph_job(job_id, engine);
+        match graph_restore {
+            Some(graph) => self.install_graph_job(job_id, graph),
+            None => self.admit_graph_job(job_id, engine),
+        }
         // After the job state exists, and before anything can decode a segment
         // for it: `install_restored` marks the job examined, so the lazy
         // admission seam does not rediscover the same sets from the spec and

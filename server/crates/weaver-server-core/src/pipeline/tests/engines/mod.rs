@@ -24,8 +24,14 @@
 //                                 mismatch and corrupted bytes
 //     .lost(file, ordinal)        every server lacks that article
 //     .password(secret)           the password the job is submitted with
+//     .global_password(secret)    a password among the candidates every
+//                                 job is offered, the job has none of its own
 //   run_both(&scenario)           -> (classic Outcome, graph Outcome)
 //   run(&scenario, engine)        -> Outcome, for divergence tests
+//   try_run(&scenario, engine)    -> Result<Outcome, Stall>: Err when the job
+//                                 stops moving before it finishes
+//   Stall { engine, status,       the status it stalled at, and the
+//           state }               pipeline's state then, for the message
 //   assert_same(&classic, &graph) the same status, failure kind, delivered
 //                                 files and bytes, claims, and article
 //                                 requests; neither engine asked for an
@@ -40,6 +46,7 @@
 //     claims,                     post name to Claim, payload posts only,
 //                                 read off what was delivered
 //     requests,                   (file, ordinal) to times it was asked for
+//     order,                      every (file, ordinal) asked, in order
 //     reads,                      graph: member reads its repairs made;
 //                                 classic: PAR2 verification passes that
 //                                 read files back
@@ -57,6 +64,9 @@ mod divergence;
 mod embedded;
 mod harness;
 mod plain_par2;
+mod rar;
+mod restart;
+mod seek;
 mod sets;
 mod sevenz;
 mod sfv;

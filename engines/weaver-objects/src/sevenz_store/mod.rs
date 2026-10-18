@@ -33,7 +33,7 @@ use weaver_graph::{
 };
 use zeroize::Zeroizing;
 
-use crate::crypt::{Cbc, Chain};
+use crate::crypt::{Cbc, Chain, Padding};
 use crate::engine::{Format, SetName};
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
@@ -56,17 +56,19 @@ const RECOVERY: [(&[u8; 8], RecoveryKind); 2] = [
 
 // A folder's cipher, by what the object knows of its key. A sealed one was
 // open before a restart: it keeps its chain and waits, as a locked one does,
-// for the password that keys it again.
+// for the password that keys it again. An open or sealed folder keeps the
+// plaintext its cipher stream carries past its files, which no member holds;
+// what else came out of the cipher is its members' coverage.
 enum Lock {
     Plain,
     Locked,
-    Open(Box<Cbc>),
-    Sealed(Box<Chain>),
+    Open(Box<Cbc>, Padding),
+    Sealed(Box<Chain>, Padding),
 }
 
 impl Lock {
     fn is_locked(&self) -> bool {
-        matches!(self, Lock::Locked | Lock::Sealed(_))
+        matches!(self, Lock::Locked | Lock::Sealed(..))
     }
 }
 
@@ -76,7 +78,7 @@ impl Lock {
 enum LockFacts {
     Plain,
     Locked,
-    Sealed(Chain),
+    Sealed(Chain, Padding),
 }
 
 impl Serialize for Lock {
@@ -84,8 +86,8 @@ impl Serialize for Lock {
         match self {
             Lock::Plain => LockFacts::Plain,
             Lock::Locked => LockFacts::Locked,
-            Lock::Open(cbc) => LockFacts::Sealed(cbc.chain()),
-            Lock::Sealed(chain) => LockFacts::Sealed(Chain::clone(chain)),
+            Lock::Open(cbc, padding) => LockFacts::Sealed(cbc.chain(), padding.clone()),
+            Lock::Sealed(chain, padding) => LockFacts::Sealed(Chain::clone(chain), padding.clone()),
         }
         .serialize(serializer)
     }
@@ -96,7 +98,7 @@ impl<'de> Deserialize<'de> for Lock {
         Ok(match LockFacts::deserialize(deserializer)? {
             LockFacts::Plain => Lock::Plain,
             LockFacts::Locked => Lock::Locked,
-            LockFacts::Sealed(chain) => Lock::Sealed(Box::new(chain)),
+            LockFacts::Sealed(chain, padding) => Lock::Sealed(Box::new(chain), padding),
         })
     }
 }

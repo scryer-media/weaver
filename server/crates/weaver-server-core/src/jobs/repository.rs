@@ -26,6 +26,8 @@ pub struct OrphanActiveStateCounts {
     pub active_rar_verified_suspect: usize,
     pub active_direct_coverage: usize,
     pub active_repair_outputs: usize,
+    // Every graph checkpoint table together.
+    pub graph_checkpoint: usize,
 }
 
 impl OrphanActiveStateCounts {
@@ -45,12 +47,13 @@ impl OrphanActiveStateCounts {
             + self.active_rar_verified_suspect
             + self.active_direct_coverage
             + self.active_repair_outputs
+            + self.graph_checkpoint
     }
 }
 
 const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 22] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
@@ -66,6 +69,13 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
     "active_rar_verified_suspect",
     "active_direct_coverage",
     "active_repair_outputs",
+    "graph_nodes",
+    "graph_members",
+    "graph_coverage",
+    "graph_envelopes",
+    "graph_crypt",
+    "graph_recovery",
+    "graph_holds",
 ];
 
 async fn run_inline_incremental_vacuum(datastore: &StoreDatastore) -> Result<(), StateError> {
@@ -396,6 +406,13 @@ impl Database {
                                 "active_direct_coverage",
                             )
                             .await?,
+                            graph_checkpoint: {
+                                let mut removed = 0;
+                                for table in crate::jobs::graph_checkpoint::TABLES {
+                                    removed += delete_orphan_rows(tx, table).await?;
+                                }
+                                removed
+                            },
                         })
                     })
                 })

@@ -24,6 +24,7 @@ use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::operations::disk::CapacityReader;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{RunMail, Runs};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
@@ -670,9 +671,18 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
             switch == Engine::Graph
         );
 
-        // A row stamped graph, whatever the switch says.
+        // A row stamped graph, whatever the switch says, with the checkpoint
+        // its admission took.
         let working_dir = insert_active_job(&mut pipeline, restored_id, lantern.clone()).await;
         stamp_graph(&pipeline.db, restored_id);
+        let (admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
+        pipeline
+            .db
+            .save_graph_checkpoint(
+                restored_id,
+                Arc::new(checkpoint::rows(&admitted.snapshot())),
+            )
+            .unwrap();
         retire_pipeline_database(pipeline).await;
         working_dir
     };

@@ -29,8 +29,8 @@ use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location,
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, RecoveryKind, Seek,
-    Segment, Tree, VolumeIndex, Why,
+    Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, RecoveryKind, Segment,
+    Tree, VolumeIndex, Why,
 };
 
 use super::envelope::{Envelopes, Shelf};
@@ -531,7 +531,9 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
         // The object the bytes reach keeps what it placed even when they
-        // make it give up: its refusal reads them back from it.
+        // make it give up: its refusal reads them back from it. That is the
+        // object the member was bound to, or the one this delivery bound it
+        // to, which may have given it up before the delivery returned.
         let reached = tree.child_of(node, member);
         let mut effects = Vec::new();
         tree.deliver(
@@ -550,12 +552,16 @@ impl NamespaceWriter {
             // A recovery object's volume stays in its member's own file,
             // where a repair reads its blocks back.
             self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
-        } else if let Some(owner) = reached.or_else(|| tree.child_of(node, member)) {
+        } else if let Some(owner) = reached
+            .or_else(|| tree.retired(node, member))
+            .or_else(|| tree.child_of(node, member))
+        {
             self.capture_below(tree, builder, owner, &arrival, &mut effects)?;
         }
         for effect in effects {
             self.apply(tree, builder, segments, effect, out)?;
         }
+        self.release_placed(tree, builder, segments, out)?;
         // The front decides content matches, a finished member has the
         // length matches need, and a recovery volume's bytes may describe
         // more of the members.
@@ -705,7 +711,7 @@ impl NamespaceWriter {
             }
             Effect::Announced { node, member } => {
                 self.announced(tree, builder, segments, *node, *member, out)?;
-                self.replay_volumes(tree, builder, segments, *node, out)?;
+                self.release_placed(tree, builder, segments, out)?;
             }
             Effect::Closed { node, member } => {
                 // A member that ended before its front could say what it is
@@ -961,46 +967,53 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    // The object at `node` announced a member, so bytes of its volumes it
-    // could not place before may have a place now: everything held for
-    // them goes down again, and what still has no place is held again.
-    fn replay_volumes(
+    // Held bytes go down again once the object their member is a volume of
+    // places them, at whatever depth: an object's map grows only as it
+    // hears its volumes or announces a member, and either may come from an
+    // object above it, so this runs over every hold after each. What just
+    // arrived may be the headers that link a volume whose data came first.
+    // What its object still cannot place stays held.
+    fn release_placed(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
         segments: &dyn Segments,
-        node: NodeId,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let Some((parent, volumes)) = tree.volumes(node) else {
-            return Ok(());
-        };
-        let members: Vec<MemberId> = volumes.values().copied().collect();
-        for member in members {
-            self.replay(tree, builder, segments, parent, member, ALL, out)?;
+        let parents: Vec<NodeId> = self
+            .files
+            .iter()
+            .filter(|(_, files)| files.holds.total_held() > 0)
+            .map(|(node, _)| *node)
+            .collect();
+        let mut placements = Vec::new();
+        for parent in parents {
+            let members: Vec<MemberId> = tree
+                .namespace(parent)
+                .map(|namespace| namespace.members().map(|member| member.id).collect())
+                .unwrap_or_default();
+            for member in members {
+                let Some((child, volume)) = tree.child_of(parent, member) else {
+                    continue;
+                };
+                let held = self
+                    .files
+                    .get(&parent)
+                    .map(|files| files.holds.held_ranges(held_volume(member)))
+                    .unwrap_or_default();
+                for range in held {
+                    placements.clear();
+                    tree.locate(child, volume, range, &mut placements);
+                    if placements
+                        .iter()
+                        .any(|placement| !matches!(placement, Placement::Held { .. }))
+                    {
+                        self.replay(tree, builder, segments, parent, member, range, out)?;
+                    }
+                }
+            }
         }
         Ok(())
-    }
-
-    // An object asks for bytes of its volume that may have arrived before it
-    // knew it wanted them, and been held because it could place them
-    // nowhere then: the seek is answered from the holds first.
-    pub(crate) fn seek_held(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        segments: &dyn Segments,
-        node: NodeId,
-        seek: Seek,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
-        let Some((parent, member, range)) = tree.volumes(node).and_then(|(parent, volumes)| {
-            let member = *volumes.get(&seek.volume)?;
-            Some((parent, member, tree.in_member(node, seek.range)?))
-        }) else {
-            return Ok(());
-        };
-        self.replay(tree, builder, segments, parent, member, range, out)
     }
 
     // What is held of `range` of the member, in offset order, read back
@@ -1272,6 +1285,7 @@ fn index(offset: u64) -> usize {
     usize::try_from(offset).expect("an offset fits the address space")
 }
 
+mod durable;
 mod refusal;
 #[cfg(test)]
 mod tests;

@@ -6,6 +6,7 @@ pub mod assembly;
 pub mod duplicate;
 pub mod duplicate_persistence;
 pub mod error;
+pub(crate) mod graph_checkpoint;
 pub mod handle;
 pub mod ids;
 pub mod model;

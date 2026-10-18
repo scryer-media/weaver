@@ -325,7 +325,9 @@ impl RarStore {
     ) -> bool {
         let mut cursor = range.start;
         for (id, part, stream) in self.linked(volume, range) {
-            let Some(Lock::Open(cbc)) = self.entries.get(id).map(|entry| &entry.lock) else {
+            let Some((Lock::Open(cbc), said)) =
+                self.entries.get(id).map(|entry| (&entry.lock, &entry.out))
+            else {
                 continue;
             };
             if part.start > cursor
@@ -343,7 +345,7 @@ impl RarStore {
                     buffer,
                 )
             };
-            if !cbc.seal(stream, &mut plain, into) {
+            if !cbc.seal(&said.coverage, &said.padding, stream, &mut plain, into) {
                 return false;
             }
             cursor = part.end;

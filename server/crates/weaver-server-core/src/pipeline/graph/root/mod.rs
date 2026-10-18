@@ -14,6 +14,7 @@
 //   phase    where the job stands, read off the tree
 //   seams    the pipeline's hooks into all of the above
 
+pub(crate) mod facts;
 pub(crate) mod intake;
 pub(crate) mod phase;
 pub(crate) mod sample;

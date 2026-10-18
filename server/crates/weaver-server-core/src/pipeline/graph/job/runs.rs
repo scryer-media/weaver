@@ -79,7 +79,11 @@ impl GraphJob {
                         self.retract_run(node)?;
                         true
                     }
-                    None => !self.runs.has(node) && shelf.has_bytes(),
+                    None => {
+                        !self.runs.has(node)
+                            && shelf.has_bytes()
+                            && self.tree.engine(node).and_then(Engine::reserve).is_some()
+                    }
                     Some(_) => false,
                 };
                 if asks {
@@ -106,7 +110,7 @@ impl GraphJob {
     // can never fit is refused to the tree as a run's own refusal is; one
     // that does not fit now hands back the nodes its slot admitted.
     fn start_run(&mut self, node: NodeId) -> Result<Vec<NodeId>, GraphError> {
-        let Some(window) = self.tree.engine(node).map(Engine::reserve) else {
+        let Some(window) = self.tree.engine(node).and_then(Engine::reserve) else {
             return Ok(Vec::new());
         };
         match self.runs.reserve(node, window) {

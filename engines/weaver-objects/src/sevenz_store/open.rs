@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 use super::header::{self, Start};
 use super::map::Map;
 use super::{Lock, SevenZipStore};
-use crate::crypt::{self, BLOCK, Cbc};
+use crate::crypt::{self, BLOCK, Cbc, Padding};
 use crate::grid::crc32;
 use crate::keys::{Derived, Tuple};
 
@@ -266,18 +266,21 @@ impl SevenZipStore {
             let lock = std::mem::replace(&mut self.folders[at], Lock::Locked);
             let opened = match (self.folder_key(index, &properties), lock) {
                 // Sealed at a restart: the chain it kept, keyed again.
-                (Ok(Some(key)), Lock::Sealed(chain)) => Cbc::unseal(&key[..], *chain).ok(),
+                (Ok(Some(key)), Lock::Sealed(chain, padding)) => {
+                    Cbc::unseal(&key[..], *chain).ok().map(|cbc| (cbc, padding))
+                }
                 (Ok(Some(key)), _) => Cbc::new(
                     &key[..],
                     *properties.iv(),
                     folder.pack.len(),
                     folder.plain_len,
                 )
-                .ok(),
+                .ok()
+                .map(|cbc| (cbc, Padding::default())),
                 (Ok(None) | Err(_), _) => None,
             };
             match opened {
-                Some(cbc) => self.folders[at] = Lock::Open(Box::new(cbc)),
+                Some((cbc, padding)) => self.folders[at] = Lock::Open(Box::new(cbc), padding),
                 None => failed = true,
             }
         }

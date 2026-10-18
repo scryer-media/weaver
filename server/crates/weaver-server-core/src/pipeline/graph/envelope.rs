@@ -14,6 +14,8 @@
 // one condition: the pipeline writes, closes and cancels, and the engine's
 // run, on a thread of its own, waits on the same shelf for what it reads.
 
+pub(crate) mod durable;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
