@@ -27,7 +27,7 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-use unrar_rs::{EncryptedStore, KdfCache, StoredLayoutBuilder};
+use unrar_rs::{EncryptedStore, StoredLayoutBuilder};
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Provenance,
     Pull, Seek, VolumeIndex, Weight, Why,
@@ -37,6 +37,7 @@ use zeroize::Zeroizing;
 use crate::crypt::{Cbc, Chain, Padding};
 use crate::grid::crc32;
 use crate::kept::Kept;
+use crate::keys::Keys;
 use crate::runs::CrcRuns;
 use walk::{Step, Walk};
 
@@ -135,8 +136,8 @@ struct Candidate {
 }
 
 pub struct RarStore {
-    // The set's derivations, shared by every walk, check and key.
-    kdf: Arc<KdfCache>,
+    // The process's derivations, shared by every walk, check and key.
+    keys: Arc<Keys>,
     volumes: BTreeMap<VolumeIndex, Volume>,
     layout: Option<StoredLayoutBuilder>,
     entries: Vec<Entry>,
@@ -160,8 +161,13 @@ impl Default for RarStore {
 
 impl RarStore {
     pub fn new() -> Self {
+        Self::with_keys(Keys::global())
+    }
+
+    // With a key cache of its own, so a test counts its own derivations.
+    pub fn with_keys(keys: Arc<Keys>) -> Self {
         Self {
-            kdf: Arc::new(KdfCache::new()),
+            keys,
             volumes: BTreeMap::new(),
             layout: None,
             entries: Vec::new(),
@@ -229,7 +235,7 @@ impl RarStore {
                 &mut found.kept,
                 found.length,
                 password.as_deref().map(String::as_str),
-                &self.kdf,
+                self.keys.kdf(),
                 found.closed,
             );
             match step {
@@ -311,7 +317,12 @@ impl Object for RarStore {
         facts::of(self)
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
         if self.gone || delivery.bytes.is_empty() {
             return;
         }
@@ -331,6 +342,20 @@ impl Object for RarStore {
             }
             self.settle(out);
             if self.gone {
+                // The delivery that made the store give its set up still
+                // reaches the members announced before it, so what the
+                // store answers for those bytes is where they went. Giving
+                // up stays its last word, after which nothing is heard.
+                let last = out.pop();
+                self.route(
+                    volume,
+                    range,
+                    delivery.bytes,
+                    delivery.provenance,
+                    read,
+                    out,
+                );
+                out.extend(last);
                 return;
             }
             // A damaged delivery over the walk's next bytes is kept whole, so
@@ -346,7 +371,14 @@ impl Object for RarStore {
                 break;
             }
         }
-        self.route(volume, range, delivery.bytes, delivery.provenance, out);
+        self.route(
+            volume,
+            range,
+            delivery.bytes,
+            delivery.provenance,
+            read,
+            out,
+        );
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
@@ -448,18 +480,22 @@ impl Object for RarStore {
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
-        if self.gone
-            || self
-                .candidates
-                .iter()
-                .any(|candidate| candidate.secret.as_str() == secret)
-        {
+        if self.gone {
             return;
         }
-        self.candidates.push(Candidate {
-            secret: Zeroizing::new(secret.to_owned()),
-            headers_wrong: false,
-        });
+        // The offer answers the question the store asked: a candidate that
+        // opens nothing leaves it free to ask for the next one.
+        self.asked = false;
+        if !self
+            .candidates
+            .iter()
+            .any(|candidate| candidate.secret.as_str() == secret)
+        {
+            self.candidates.push(Candidate {
+                secret: Zeroizing::new(secret.to_owned()),
+                headers_wrong: false,
+            });
+        }
         for volume in self.volumes.values_mut() {
             volume.walk.touch();
         }

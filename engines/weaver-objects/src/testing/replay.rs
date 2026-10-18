@@ -10,7 +10,8 @@
 use std::collections::BTreeMap;
 
 use weaver_graph::{
-    ByteRange, Delivery, Emit, Extent, Facts, MemberId, Object, Placement, Provenance, VolumeIndex,
+    ByteRange, Coverage, Delivery, Emit, Extent, Facts, MemberId, Object, Placement, Provenance,
+    VolumeIndex,
 };
 
 pub(crate) enum Step<'a> {
@@ -53,6 +54,8 @@ struct Owner {
     placed: Vec<(VolumeIndex, ByteRange)>,
     // How far each member is known to reach.
     members: BTreeMap<MemberId, u64>,
+    // What each member was written, read back as a namespace reads it.
+    written: BTreeMap<MemberId, (Vec<u8>, Coverage)>,
 }
 
 impl Owner {
@@ -72,6 +75,7 @@ impl Owner {
                     bytes,
                     provenance: Provenance::Fresh,
                 },
+                &mut |placement, into| read(&self.written, placement, into),
                 out,
             ),
             Step::Reached(volume, offset) => {
@@ -94,6 +98,19 @@ impl Owner {
             };
             let reach = self.members.entry(member).or_default();
             *reach = (*reach).max(end);
+            if let Emit::Bytes {
+                offset,
+                bytes,
+                provenance,
+                ..
+            } = emit
+            {
+                let (written, coverage) = self.written.entry(member).or_default();
+                let (start, end) = (*offset as usize, end as usize);
+                written.resize(written.len().max(end), 0);
+                written[start..end].copy_from_slice(bytes);
+                coverage.write(ByteRange::at(*offset, bytes.len() as u64), *provenance);
+            }
         }
     }
 
@@ -112,6 +129,7 @@ impl Owner {
                 bytes,
                 provenance: Provenance::Fresh,
             },
+            &mut |placement, into| read(&self.written, placement, into),
             out,
         );
         let range = ByteRange::at(offset, bytes.len() as u64);
@@ -163,6 +181,24 @@ impl Owner {
             restored.extent(*member, ByteRange::new(0, *end), &mut theirs);
             assert_eq!(ours, theirs, "member {}", member.0);
         }
+    }
+}
+
+// What a member placement holds: only the bytes written to it.
+fn read(
+    written: &BTreeMap<MemberId, (Vec<u8>, Coverage)>,
+    placement: &Placement,
+    into: &mut Vec<u8>,
+) -> bool {
+    let Placement::Member { member, range } = placement else {
+        return false;
+    };
+    let Some((bytes, coverage)) = written.get(member) else {
+        return false;
+    };
+    coverage.covered(*range) && {
+        into.extend_from_slice(&bytes[range.start as usize..range.end as usize]);
+        true
     }
 }
 

@@ -1504,7 +1504,10 @@ impl Pipeline {
             self.par3_publications_awaiting_placements.remove(&key);
         }
         if !self.jobs.get(&job_id).is_some_and(|state| {
-            !matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete)
+            !matches!(
+                state.status,
+                JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial
+            )
         }) {
             return;
         }

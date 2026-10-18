@@ -601,6 +601,7 @@ pub(crate) fn live_job_ids(handle: &SchedulerHandle) -> HashSet<u64> {
             !matches!(
                 info.status,
                 weaver_server_core::JobStatus::Complete
+                    | weaver_server_core::JobStatus::Partial
                     | weaver_server_core::JobStatus::Failed { .. }
             )
         })
@@ -708,8 +709,11 @@ fn history_query_plan(
         for state in states {
             match state {
                 QueueItemState::Completed => statuses.push("complete".to_string()),
+                // Clients see a partial delivery as failed, so asking for
+                // failed rows asks for partial ones too.
                 QueueItemState::Failed => {
                     statuses.push("failed".to_string());
+                    statuses.push("partial".to_string());
                     statuses.push("cancelled".to_string());
                 }
                 QueueItemState::Paused => statuses.push("paused".to_string()),

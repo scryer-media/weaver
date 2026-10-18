@@ -5,17 +5,21 @@
 // of these first and keeps its own path when the job has no graph runtime.
 
 use tracing::{info, warn};
+use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
-use weaver_graph::{MemberId, NodeId};
+use weaver_graph::{MemberId, NodeId, Why};
 
 use super::claims::{self, Claim, ClaimedMember};
-use super::{RecoverySummary, RootJob, Step, drive, metrics, shown_status};
+use super::{
+    Delivery, Failure, RecoverySummary, RootJob, Step, drive, failure, metrics, shown_status,
+};
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 use crate::pipeline::graph::limits;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{Pipeline, TerminalReconciliation, health_milli};
+use crate::post_processing::model::PipelineFailureStage;
 
 // The classic completion gate hands a graph job here instead of to its own
 // passes: no whole-file verification, no listing check and no re-scan of the
@@ -48,22 +52,26 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     settle(pipeline, job_id, step).await;
 }
 
-// What an advance came to, applied to the job.
+// What an advance came to, applied to the job. A job with nothing left to
+// wait for ends as its settled claims say: it fails only when the files a
+// recovery object could not rebuild are all it has.
 pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
     match step {
         Step::Wait => {}
-        Step::Fail(message) => {
-            metrics::failed("repair_impossible");
-            // The repair is the stage that broke, whatever the root showed.
-            pipeline.transition_postprocessing_status(job_id, JobStatus::Repairing, None);
-            pipeline.fail_job(job_id, message);
-        }
-        Step::Deliver => {
-            pipeline.remove_recovery_volumes(job_id).await;
-            if let Err(error) = pipeline.start_move_to_complete(job_id).await {
+        Step::Deliver => match pipeline.graph_terminal_status(job_id) {
+            Some(JobStatus::Failed { error }) => {
+                metrics::failed("repair_impossible");
+                // The repair is the stage that broke, whatever the root showed.
+                pipeline.transition_postprocessing_status(job_id, JobStatus::Repairing, None);
                 pipeline.fail_job(job_id, error);
             }
-        }
+            _ => {
+                pipeline.remove_recovery_volumes(job_id).await;
+                if let Err(error) = pipeline.start_move_to_complete(job_id).await {
+                    pipeline.fail_job(job_id, error);
+                }
+            }
+        },
     }
 }
 
@@ -143,7 +151,7 @@ impl Pipeline {
         job_id: JobId,
     ) -> Option<Result<(), String>> {
         let job = self.graph_jobs.get(&job_id)?;
-        let (namespace, tree) = (job.namespace(), job.tree());
+        let namespace = job.namespace();
         let state = self.jobs.get(&job_id)?;
         let ignore = self.par2_ignore_extensions();
         let census: Vec<ClaimedMember> = state
@@ -169,14 +177,14 @@ impl Pipeline {
                     .count();
                 row.lost_bytes = self.file_terminal_failed_bytes(file_id);
                 row.declared_bytes = file.segments.iter().map(|s| u64::from(s.bytes)).sum();
-                row.evidence |= claims::delivered_below(tree, NodeId::ROOT, MemberId(index));
                 Some(row)
             })
             .collect();
         let total_bytes = state.spec.total_bytes;
         metrics::claimed(&census);
 
-        let refused = claims::refused(&census);
+        let delivery = self.graph_delivery(job_id).unwrap_or_default();
+        let refused = claims::refused(&census, &delivery);
         if !refused.is_empty() {
             let missing_bytes: u64 = refused.iter().map(|row| row.declared_bytes).sum();
             let names = refused
@@ -234,6 +242,84 @@ impl Pipeline {
             },
         );
         Some(Ok(()))
+    }
+
+    // What a graph job hands over, file by file at every depth, off its
+    // settled claims, with the repair failure that left any of it short.
+    // `None` for a classic job.
+    fn graph_ruling(&self, job_id: JobId) -> Option<(Delivery, Option<Failure>)> {
+        let job = self.graph_jobs.get(&job_id)?;
+        let state = self.jobs.get(&job_id)?;
+        let summary = RootJob::recovery_summary(job);
+        let outcomes: Vec<RepairOutcome> = summary
+            .sets
+            .iter()
+            .map(|set| set.outcome.unwrap_or(RepairOutcome::Waiting))
+            .collect();
+        let failure = failure(&summary, &outcomes, job);
+        let ignore = self.par2_ignore_extensions();
+        // Root members are numbered as the posted files they are.
+        let payload = |member: MemberId| {
+            state
+                .spec
+                .files
+                .get(member.0 as usize)
+                .is_some_and(|file| file.role.counts_toward_health())
+        };
+        let failed = |object: NodeId| {
+            failure
+                .as_ref()
+                .is_some_and(|failure| failure.objects.contains(&object))
+        };
+        let delivery = Delivery::read(
+            job.tree(),
+            payload,
+            |name| par2_damage_ignorable(name, &ignore),
+            failed,
+            // Refused after announcing a member it never closed, which the
+            // tree keeps buried under the member; an object refused for
+            // never placing any announced nothing to keep, so its why says.
+            |node, member| {
+                job.tree().left_open(node, member)
+                    || job.writer().refused(node, member) == Some(Why::Unmapped)
+            },
+        );
+        Some((delivery, failure))
+    }
+
+    pub(in crate::pipeline) fn graph_delivery(&self, job_id: JobId) -> Option<Delivery> {
+        self.graph_ruling(job_id).map(|(delivery, _)| delivery)
+    }
+
+    // Why a graph job delivered short of whole, for its terminal record: the
+    // stage that left it short, and the error a recovery object that could
+    // not rebuild what it found words. `None` for a classic job.
+    pub(in crate::pipeline) fn graph_shortfall(
+        &self,
+        job_id: JobId,
+    ) -> Option<(PipelineFailureStage, Option<String>)> {
+        let (delivery, failure) = self.graph_ruling(job_id)?;
+        Some((
+            delivery.shortfall_stage(),
+            failure.map(|failure| failure.message),
+        ))
+    }
+
+    // The status a graph job with nothing left to wait for ends in. `None`
+    // for a classic job, which always completes.
+    pub(in crate::pipeline) fn graph_terminal_status(&self, job_id: JobId) -> Option<JobStatus> {
+        let (delivery, failure) = self.graph_ruling(job_id)?;
+        let status = delivery.status(failure.as_ref().map(|failure| failure.message.as_str()));
+        if status == JobStatus::Partial {
+            info!(
+                job_id = job_id.0,
+                whole = ?delivery.whole,
+                damaged = ?delivery.damaged,
+                unrepaired = ?delivery.unrepaired,
+                "the job delivered in part"
+            );
+        }
+        Some(status)
     }
 
     // Show the root's phase as the job's status when it changed, the way an

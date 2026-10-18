@@ -68,6 +68,12 @@ impl Passwords {
 }
 
 impl GraphJob {
+    // How many candidates each node has been offered, by node.
+    #[cfg(test)]
+    pub(crate) fn passwords_offered(&self) -> BTreeMap<NodeId, usize> {
+        self.passwords.offered.clone()
+    }
+
     // The object at `node` asked for a password: it gets the next candidate,
     // and an engine's run starts over under it, by the transition a repair
     // behind the run takes. With none left, the object refuses, as it would
@@ -78,12 +84,13 @@ impl GraphJob {
             self.tree.emitted(
                 node,
                 vec![Emit::Refuse(Why::EncryptedHeader)],
-                builder,
+                &mut self.writer.placing(builder),
                 effects,
             );
             return;
         };
-        self.tree.offer_password(node, secret, builder, effects);
+        self.tree
+            .offer_password(node, secret, &mut self.writer.placing(builder), effects);
         if self.tree.engine(node).is_some() {
             self.writer.shelf(node).restart();
         }

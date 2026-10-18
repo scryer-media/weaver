@@ -128,8 +128,15 @@ pub trait Object: Send + Sync {
     fn kind(&self) -> Kind;
 
     // Bytes of one of my volumes. Say what they were into `out`, which the
-    // caller reuses between calls.
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>);
+    // caller reuses between calls. `read` hands back what one of my
+    // placements holds, as it does for `posted`: an object that deciphers
+    // reads its placed plaintext to put back the cipher it came from.
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    );
 
     // My volume has no more bytes coming: everything that could arrive has.
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>);

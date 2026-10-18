@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod facts;
+mod map;
 mod owner;
 
 use std::io::Cursor;
@@ -298,6 +299,34 @@ fn a_wrong_password_opens_nothing_and_the_right_one_after_it_does() {
     streamed(&owner);
 }
 
+fn asks(owner: &Owner) -> usize {
+    owner
+        .said
+        .iter()
+        .filter(|emit| **emit == Emit::NeedsPassword)
+        .count()
+}
+
+// An offer answers the store's question: a candidate that opens nothing
+// leaves it asking for the next one, folders and header alike.
+#[test]
+fn a_wrong_candidate_leaves_the_store_asking_for_the_next() {
+    for encrypt_header in [false, true] {
+        let mut owner = Owner::single(store(), archive(aes(), encrypt_header));
+        owner.frames(0, 4096);
+        assert_eq!(asks(&owner), 1, "header encrypted: {encrypt_header}");
+        owner.offer("not-the-passphrase");
+        assert_eq!(asks(&owner), 2, "header encrypted: {encrypt_header}");
+        owner.offer("not-the-passphrase");
+        assert_eq!(asks(&owner), 3, "the same wrong answer, asked again");
+        owner.offer(PASSWORD);
+        assert_eq!(asks(&owner), 3, "the right one is not asked past");
+        owner.close(0);
+        no_trouble(&owner);
+        streamed(&owner);
+    }
+}
+
 #[test]
 fn an_encrypted_header_asks_and_opens_by_the_second_candidate() {
     let bytes = archive(aes(), true);
@@ -430,4 +459,109 @@ fn the_key_cache_derives_each_tuple_once_across_objects() {
     second.close(0);
     streamed(&second);
     assert_eq!(keys.derivations(), derived);
+}
+
+// A stretch of cipher posted wrong, its articles said damaged or not
+// noticed at all, then its repair: every member comes out whole and marked
+// nowhere damaged, and the container reads back as posted, whether the
+// password came before the bytes or after them. A repair that changes a
+// block whose cipher was let go deciphers it from its plaintext enciphered
+// again, and a block that changes re-chains the one after it. The second set
+// is the pipeline row's shape: two small members, 64-byte articles that are
+// also the PAR2 slices.
+#[test]
+fn a_repaired_cipher_stretch_gives_the_members_whole() {
+    let small = vec![
+        ("ember.bin", payload(41, 5 * 64 + 11)),
+        ("quill.bin", payload(42, 3 * 64 - 3)),
+    ];
+    let small_entries: Vec<_> = small
+        .iter()
+        .map(|(name, bytes)| (None, Entry::File(name, bytes)))
+        .collect();
+    let (large, smaller) = (archive(aes(), false), write(aes(), false, &small_entries));
+    // Each set's articles, and the stretches posted wrong in them.
+    let mut cases = Vec::new();
+    for article in [384u64, 700, 1000, 4096] {
+        for ordinal in [1, 2] {
+            let stretch = ByteRange::new(ordinal * article, (ordinal + 1) * article);
+            cases.push((&large, files(), article, stretch));
+        }
+    }
+    for stretch in [ByteRange::new(1032, 1732), ByteRange::new(10_022, 10_132)] {
+        cases.push((&large, files(), 700, stretch));
+    }
+    for ordinal in [1, 2] {
+        cases.push((
+            &smaller,
+            small.clone(),
+            64,
+            ByteRange::new(ordinal * 64, (ordinal + 1) * 64),
+        ));
+    }
+    let mut failed = Vec::new();
+    for (bytes, members, article, stretch) in cases {
+        let length = bytes.len() as u64;
+        let stretch = ByteRange::new(stretch.start, stretch.end.min(length));
+        let mut wrong = bytes.clone();
+        let ends = [
+            stretch.start,
+            stretch.end.saturating_sub(8).max(stretch.start),
+        ];
+        for at in ends
+            .into_iter()
+            .flat_map(|at| at..(at + 8).min(stretch.end))
+        {
+            wrong[at as usize] ^= 0x5a;
+        }
+        let articles: Vec<ByteRange> = (0..length)
+            .step_by(article as usize)
+            .map(|start| ByteRange::new(start, (start + article).min(length)))
+            .collect();
+        let hit: Vec<ByteRange> = articles
+            .iter()
+            .copied()
+            .filter(|range| {
+                range
+                    .intersect(stretch)
+                    .is_some_and(|part| !part.is_empty())
+            })
+            .collect();
+        let repair = ByteRange::new(hit[0].start, hit[hit.len() - 1].end);
+        for said in [Provenance::Damaged, Provenance::Fresh] {
+            for early in [true, false] {
+                let mut owner = Owner::single(store(), bytes.clone());
+                if early {
+                    owner.offer(PASSWORD);
+                }
+                for range in &articles {
+                    let posted = &wrong[range.start as usize..range.end as usize];
+                    match hit.contains(range) {
+                        true => owner.deliver_as(0, *range, said, Some(posted)),
+                        false => owner.deliver(0, *range),
+                    }
+                }
+                if !early {
+                    owner.offer(PASSWORD);
+                }
+                owner.deliver_as(0, repair, Provenance::Repaired, None);
+                owner.close(0);
+                let whole = owner.members.len() == members.len()
+                    && members.iter().all(|(name, bytes)| {
+                        let got = owner.member(name);
+                        let range = ByteRange::new(0, bytes.len() as u64);
+                        got.bytes == *bytes
+                            && got.closed
+                            && got
+                                .coverage
+                                .overlapping(range)
+                                .all(|run| run.provenance != Provenance::Damaged)
+                    });
+                if !whole || owner.posted(0).as_deref() != Some(bytes.as_slice()) {
+                    failed.push((members.len(), article, stretch, said, early, whole));
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}");
 }

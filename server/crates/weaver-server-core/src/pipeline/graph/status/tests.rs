@@ -6,8 +6,9 @@ use weaver_graph::slots::AskerId;
 use weaver_graph::{ByteRange, Kind, Member, MemberId, Namespace, NodeId, Provenance};
 
 use super::claims::{Claim, ClaimedMember, refused};
-use super::seams::settle;
-use super::{RecoverySummary, RepairSlots, RootJob, SetSummary, Step, drive, shown_status};
+use super::{
+    Delivery, RecoverySummary, RepairSlots, RootJob, SetSummary, Step, drive, failure, shown_status,
+};
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::{
@@ -102,6 +103,7 @@ fn namespace(members: &[(&str, u64, &[(u64, u64, Provenance)])]) -> Namespace {
 
 fn set(kind: Kind, name: &str, reachable: u64, damaged: u64) -> SetSummary {
     SetSummary {
+        node: NodeId(1),
         kind,
         namespace: NodeId::ROOT,
         name: name.to_string(),
@@ -334,8 +336,9 @@ fn only_a_payload_that_delivered_nothing_is_refused() {
     ]);
     let row = |id, furniture| ClaimedMember::read(member(&names, id), furniture);
 
+    let none = Delivery::default();
     let nothing = vec![row(0, false), row(1, false), row(2, true)];
-    let refused_names: Vec<_> = refused(&nothing)
+    let refused_names: Vec<_> = refused(&nothing, &none)
         .iter()
         .map(|row| row.name.clone())
         .collect();
@@ -343,11 +346,18 @@ fn only_a_payload_that_delivered_nothing_is_refused() {
 
     // Beside a delivered sibling the same holes ship as damage.
     let delivered = vec![row(0, false), row(1, false), row(2, true), row(3, false)];
-    assert!(refused(&delivered).is_empty());
+    assert!(refused(&delivered, &none).is_empty());
+
+    // So they do beside a file unpacked whole from one of them.
+    let unpacked = Delivery {
+        whole: vec!["ember.inner".to_string()],
+        ..Delivery::default()
+    };
+    assert!(refused(&nothing, &unpacked).is_empty());
 
     // Furniture neither fails a job nor delivers one.
-    assert!(refused(&[row(2, true)]).is_empty());
-    assert_eq!(refused(&[row(2, true), row(0, false)]).len(), 1);
+    assert!(refused(&[row(2, true)], &none).is_empty());
+    assert_eq!(refused(&[row(2, true), row(0, false)], &none).len(), 1);
 }
 
 #[test]
@@ -399,9 +409,11 @@ fn an_impossible_repair_fails_in_the_recovery_failure_shape() {
             reachable: 1,
         }]);
     let mut slots = RepairSlots::default();
+    // The job delivers; what it ends as is read off its claims.
+    assert_eq!(drive(&mut job, &mut slots, AskerId(1), 1), Step::Deliver);
     assert_eq!(
-        drive(&mut job, &mut slots, AskerId(1), 1),
-        Step::Fail(
+        failure(&job.summary, &job.ruled, &job).map(|failure| failure.message),
+        Some(
             "PAR2 recovery failed for 1 set(s): ember.par2 (ember.bin): \
              not repairable: 3 damaged slices, only 1 recovery blocks reachable"
                 .to_string()
@@ -464,9 +476,10 @@ fn a_repair_of_one_set_never_excuses_another() {
         },
     ]);
     let mut slots = RepairSlots::default();
+    assert_eq!(drive(&mut job, &mut slots, AskerId(1), 1), Step::Deliver);
     assert_eq!(
-        drive(&mut job, &mut slots, AskerId(1), 1),
-        Step::Fail(
+        failure(&job.summary, &job.ruled, &job).map(|failure| failure.message),
+        Some(
             "PAR2 recovery failed for 1 set(s): ember.dat.par2 (ember.dat): \
              not repairable: 2 damaged slices, only 0 recovery blocks reachable"
                 .to_string()
@@ -474,35 +487,35 @@ fn a_repair_of_one_set_never_excuses_another() {
     );
 }
 
-#[tokio::test]
-async fn an_impossible_repair_fails_the_job_at_the_repair_stage() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(91_201);
-    let spec = standalone_job_spec("Ember Repair", &[("ember.bin".to_string(), 64)]);
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
-    settle_download_state(&mut pipeline, job_id);
-    let mut events = pipeline.event_tx.subscribe();
-    let message = "PAR2 recovery failed for 1 set(s): ember.par2 (ember.bin): \
-                   not repairable: 3 damaged slices, only 1 recovery blocks reachable";
-
-    settle(&mut pipeline, job_id, Step::Fail(message.to_string())).await;
-
+// The one derivation a job with nothing left to wait for ends by: whole,
+// short beside whole, or nothing but what a repair could not rebuild.
+#[test]
+fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
+    let names = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let delivery = |whole: &[&str], damaged: &[&str], unrepaired: &[&str]| Delivery {
+        whole: names(whole),
+        damaged: names(damaged),
+        unrepaired: names(unrepaired),
+    };
+    let error = "PAR2 recovery failed for 1 set(s)";
     assert_eq!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Failed {
-            error: message.to_string()
-        })
+        delivery(&["ember.bin"], &[], &[]).status(None),
+        JobStatus::Complete
     );
-    while !matches!(
-        events.recv().await.expect("pipeline event channel closed"),
-        PipelineEvent::JobFailed { job_id: failed, .. } if failed == job_id
-    ) {}
-    let states = pipeline.db.nzbget_history_states(&[job_id.0]).unwrap();
     assert_eq!(
-        states[&job_id.0].failure_kind,
-        Some(HistoryFailureKind::Repair)
+        delivery(&["ember.bin"], &[], &["ember.dat"]).status(Some(error)),
+        JobStatus::Partial
+    );
+    // Nothing could have rebuilt it; it is delivered as it stands.
+    assert_eq!(
+        delivery(&[], &["ember.dat"], &[]).status(None),
+        JobStatus::Partial
+    );
+    assert_eq!(
+        delivery(&[], &[], &["ember.dat"]).status(Some(error)),
+        JobStatus::Failed {
+            error: error.to_string()
+        }
     );
 }
 
@@ -566,7 +579,8 @@ async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Failed {
-            error: "SFV recovery failed for 1 set(s): ember.field.sfv: not repairable: \
+            error: "SFV recovery failed for 1 set(s): ember.field.sfv (ember.field.bin): \
+                    not repairable: \
                     1 damaged slices, only 0 recovery blocks reachable"
                 .to_string()
         })

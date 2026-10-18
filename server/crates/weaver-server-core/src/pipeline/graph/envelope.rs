@@ -16,7 +16,7 @@
 
 pub(crate) mod durable;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
@@ -42,9 +42,9 @@ pub(crate) struct Shelf {
 #[derive(Debug, Default)]
 pub(crate) struct Shelved {
     pub(crate) kept: BTreeMap<u32, Kept>,
-    // How many volumes the object has, a gap for one not claimed yet
-    // included, and whether any more can join.
-    pub(crate) volumes: u32,
+    // The volumes bound to the object, by index, and whether any more can
+    // join. An index orders them; a gap is not a volume.
+    pub(crate) volumes: BTreeSet<u32>,
     pub(crate) complete: bool,
     // Which run may read. Moving it on stops the one reading: a repair
     // behind what it read, or the node going away.

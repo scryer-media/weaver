@@ -17,6 +17,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
+use std::ops::Bound;
 
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -53,9 +54,10 @@ pub trait SetName: Send + Sync + Sized + Serialize + DeserializeOwned {
     }
 }
 
-// Its facts are the volumes it has and how far its run read. Never the
-// password, which the owner offers again, and never its bids, which a
-// restart makes again: a restored engine is one whose run has not started.
+// Its facts are the volumes it has. Never the password, which the owner
+// offers again, and never how far its run read, which is a run's live
+// progress and no durable byte: a restored engine is one whose run has not
+// started, and the run it starts tells it again where it is.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct EngineObject<F: Format> {
@@ -68,11 +70,12 @@ pub struct EngineObject<F: Format> {
     #[serde(skip)]
     password: Option<String>,
     // The furthest volume the run has read.
+    #[serde(skip)]
     reached: Option<VolumeIndex>,
 }
 
 impl<F: Format> Durable for EngineObject<F> {
-    const VERSION: u16 = 1;
+    const VERSION: u16 = 2;
 
     fn impossible(&self) -> Option<&'static str> {
         let named = self.names.keys().all(|volume| self.bound.contains(volume));
@@ -105,22 +108,31 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
     // The run reads the volumes from the owner's files; the bytes on their
     // way there say nothing the run does not read itself.
-    fn deliver(&mut self, _delivery: Delivery<'_>, _out: &mut Vec<Emit>) {}
+    fn deliver(
+        &mut self,
+        _delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        _out: &mut Vec<Emit>,
+    ) {
+    }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {}
 
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
-    // The volumes after the one the run is on, the nearest first.
+    // The volumes after the one the run is on, the nearest first: weighed
+    // by how many bound volumes lie between, since an index orders the
+    // volumes and need not be dense.
     fn wants(&mut self, out: &mut Vec<Seek>) {
         let Some(reached) = self.reached else {
             return;
         };
-        for &volume in self.bound.range(reached.0 + 1..) {
+        let after = (Bound::Excluded(reached.0), Bound::Unbounded);
+        for (distance, &volume) in (1..).zip(self.bound.range(after)) {
             out.push(Seek::data(
                 VolumeIndex(volume),
                 ByteRange::new(0, u64::MAX),
-                Weight(volume - reached.0),
+                Weight(distance),
             ));
         }
     }

@@ -546,7 +546,10 @@ impl Pipeline {
                     if self.jobs.get(&job_id).is_some_and(|state| {
                         !matches!(
                             state.status,
-                            JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                            JobStatus::Paused
+                                | JobStatus::Complete
+                                | JobStatus::Partial
+                                | JobStatus::Failed { .. }
                         )
                     }) && let Err(error) = self.start_move_to_complete(job_id).await
                     {

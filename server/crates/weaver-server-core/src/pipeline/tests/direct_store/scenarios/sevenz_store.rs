@@ -18,7 +18,7 @@ use sevenz_turbo::encoder_options::AesEncoderOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
 
 // One entry of a fixture archive.
-pub(super) struct Entry {
+pub(in crate::pipeline::tests) struct Entry {
     name: &'static str,
     // `None` for an entry the archive names but stores no bytes for. Such an
     // entry has no stream at all — a zero-length stream is a different thing,
@@ -31,7 +31,7 @@ pub(super) struct Entry {
 }
 
 impl Entry {
-    pub(super) fn file(name: &'static str, bytes: Vec<u8>) -> Self {
+    pub(in crate::pipeline::tests) fn file(name: &'static str, bytes: Vec<u8>) -> Self {
         Self {
             name,
             bytes: Some(bytes),
@@ -90,7 +90,7 @@ fn build_7z(entries: &[Entry], method: EncoderMethod, password: Option<&str>) ->
     build_7z_shaped(entries, method, password, false)
 }
 
-pub(super) fn build_7z_shaped(
+pub(in crate::pipeline::tests) fn build_7z_shaped(
     entries: &[Entry],
     method: EncoderMethod,
     password: Option<&str>,
@@ -134,7 +134,10 @@ pub(super) fn build_7z_shaped(
 // a pure byte split at a fixed size, with no per-volume header. The last
 // volume is whatever is left, so an `archive` that does not divide evenly
 // produces the short tail real sets have.
-pub(super) fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
+pub(in crate::pipeline::tests) fn split_volumes(
+    archive: &[u8],
+    count: usize,
+) -> Vec<(String, Vec<u8>)> {
     assert!(count >= 1);
     if count == 1 {
         return vec![("silver.horizon.7z".to_string(), archive.to_vec())];

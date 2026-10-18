@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The article root's facts: what each article of the post came to, the
-// offsets the decoder told exactly, the checksums it computed, and the next
-// node id of the tree. They are the root row's blob, versioned like any
-// object's. The post's own sizes are not here: a restore has the spec.
+// The article root's facts: the post's file names, what each article of the
+// post came to, the offsets the decoder told exactly, the checksums it
+// computed, and the next node id of the tree. They are the root row's blob,
+// versioned like any object's. The post's own sizes are not here: a restore
+// has the spec, and the names are only there to prove it is the same post.
 
 use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, VolumeIndex};
 
 use super::ArticleRoot;
+use crate::pipeline::graph::job::RootFile;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RootFacts {
     pub(crate) next_node: u32,
+    // Each file's name as the post lists it, in post order.
+    pub(crate) posted: Vec<String>,
     pub(crate) volumes: Vec<VolumeFacts>,
     // How many member reads the job's repairs made. The writer's count,
     // kept here because the root row is the job's one row.
@@ -21,7 +25,7 @@ pub(crate) struct RootFacts {
 }
 
 impl RootFacts {
-    pub(crate) const VERSION: u16 = 1;
+    pub(crate) const VERSION: u16 = 2;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,17 +75,20 @@ impl ArticleRoot {
         self.checksums.facts(&mut volumes);
         RootFacts {
             next_node,
+            posted: self.posted.clone(),
             volumes,
             read_backs: 0,
         }
     }
 
     // The root at the state its facts describe, over the post's articles.
-    pub(crate) fn restore(
-        volumes: &[Vec<(u32, u32)>],
-        facts: &RootFacts,
-    ) -> Result<Self, RootFactsError> {
-        let mut root = Self::new(volumes);
+    // The post must be the one they were taken from: its files by name, as
+    // the map checks them by their articles.
+    pub(crate) fn restore(files: &[RootFile], facts: &RootFacts) -> Result<Self, RootFactsError> {
+        let mut root = Self::new(files);
+        if root.posted != facts.posted {
+            return Err(RootFactsError::Mismatch("another file name"));
+        }
         root.map.restore(&facts.volumes)?;
         root.checksums.restore(&facts.volumes);
         Ok(root)

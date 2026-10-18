@@ -8,10 +8,12 @@ mod writer;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use weaver_graph::{ByteRange, Emit, Object, Provenance, RecoveryKind, VolumeIndex, Weight, Why};
 
 use super::RarStore;
+use crate::keys::{CAPACITY, Keys};
 use crate::testing::payload;
 use owner::Owner;
 use writer::{Item, Options, Version, write};
@@ -434,6 +436,35 @@ fn encrypted_files_without_the_password_are_refused_at_the_last_close() {
     assert!(owner.said.contains(&Emit::Refuse(Why::Encrypted)));
 }
 
+// One key cache per process: a second store offered the same password over
+// the same salts derives nothing, neither a file key nor a header check.
+#[test]
+fn two_stores_with_one_password_and_salt_derive_once() {
+    for (version, headers) in [
+        (Version::Rar5, false),
+        (Version::Rar4, false),
+        (Version::Rar5, true),
+    ] {
+        let keys = Arc::new(Keys::new(CAPACITY));
+        let volumes = write(&items(), &encrypted(version, headers));
+        let mut counts = Vec::new();
+        for _ in 0..2 {
+            let object = RarStore::with_keys(Arc::clone(&keys));
+            let mut owner = Owner::named(object, volumes.clone());
+            owner.offer(PASSWORD);
+            owner.whole(4096);
+            owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+            no_trouble(&owner);
+            streamed(&owner);
+            let kdf = keys.kdf();
+            let derived = kdf.rar5_derivation_count() + kdf.rar4_derivation_count();
+            counts.push((keys.derivations(), derived));
+        }
+        assert!(counts[0].1 > 0, "{version:?} {headers}");
+        assert_eq!(counts[0], counts[1], "{version:?} {headers}");
+    }
+}
+
 #[test]
 fn a_damaged_file_header_waits_for_repair() {
     for version in [Version::Rar5, Version::Rar4] {
@@ -521,6 +552,40 @@ fn a_damaged_member_byte_is_reported_at_its_volume_range() {
         });
         assert!(damaged, "{version:?} {:?}", owner.said);
         assert!(owner.member("beta.bin").closed);
+    }
+}
+
+// A damaged article inside the first part of a split file: the namespace
+// already marks it where it lies, so neither the part's own CRC nor the
+// file's blames anything, and the repair is what they judge.
+#[test]
+fn bytes_that_came_damaged_are_never_blamed_on_their_part() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let real = volumes[0].clone();
+        let at = (find(&real, &files()[0].1[..64]) + 1000) as u64;
+        let article = ByteRange::new(at, at + 200);
+        let mut bad = real[article.start as usize..article.end as usize].to_vec();
+        bad[17] ^= 0xff;
+        let mut owner = Owner::named(store(), volumes);
+        let length = real.len() as u64;
+        owner.deliver(0, ByteRange::new(0, article.start));
+        owner.deliver_as(0, article, Provenance::Damaged, Some(&bad));
+        owner.deliver(0, ByteRange::new(article.end, length));
+        for volume in 1..owner.volumes.len() {
+            owner.deliver(
+                volume,
+                ByteRange::new(0, owner.volumes[volume].1.len() as u64),
+            );
+        }
+        for volume in 0..owner.volumes.len() {
+            owner.close(volume);
+        }
+        no_trouble(&owner);
+        owner.deliver_as(0, article, Provenance::Repaired, None);
+        no_trouble(&owner);
+        streamed(&owner);
+        posted_whole(&owner);
     }
 }
 

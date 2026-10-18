@@ -66,6 +66,9 @@ pub struct MemberRecord {
     pub owner: Option<(NodeId, VolumeIndex)>,
     // What it was to a retired object that gave it up, until it is buried.
     pub given_up: Option<(NodeId, VolumeIndex)>,
+    // It was given up and is buried: settled, so no object bound later is
+    // offered it.
+    pub buried: bool,
     // Its first bytes have not decided an owner yet.
     pub undecided: bool,
 }

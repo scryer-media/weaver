@@ -27,7 +27,12 @@ impl Object for Carrier {
         Kind::RarStore
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
         if !self.announced {
             self.announced = true;
             out.push(Emit::Member {
@@ -107,7 +112,12 @@ impl Object for Trail {
         Kind::Par3
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, _: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
         self.tape
             .lock()
             .unwrap()
@@ -202,6 +212,17 @@ impl Builder for Carrying {
             })),
             _ => None,
         }
+    }
+
+    fn read(
+        &self,
+        _: &weaver_graph::Tree,
+        _: weaver_graph::NodeId,
+        _: weaver_graph::VolumeIndex,
+        _: &weaver_graph::Placement,
+        _: &mut Vec<u8>,
+    ) -> bool {
+        false
     }
 }
 

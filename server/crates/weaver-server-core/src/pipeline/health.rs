@@ -422,7 +422,10 @@ impl Pipeline {
         }
         let failed_bytes = match self.jobs.get(&job_id) {
             Some(state)
-                if !matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete) =>
+                if !matches!(
+                    state.status,
+                    JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial
+                ) =>
             {
                 state.failed_bytes
             }
@@ -614,8 +617,10 @@ impl Pipeline {
     // If no PAR2 data, defaults to 850 (85%).
     pub(super) fn check_health(&mut self, job_id: JobId) {
         if self.jobs.get(&job_id).is_none_or(|state| {
-            matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete)
-                || state.spec.total_bytes == 0
+            matches!(
+                state.status,
+                JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial
+            ) || state.spec.total_bytes == 0
         }) {
             return;
         }
@@ -941,7 +946,10 @@ impl Pipeline {
         } = update;
 
         if let Some(state) = self.jobs.get(&job_id) {
-            if matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete) {
+            if matches!(
+                state.status,
+                JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial
+            ) {
                 return;
             }
         } else {
@@ -1076,7 +1084,10 @@ impl Pipeline {
         let probing = self.jobs.get(&job_id).is_some_and(|state| {
             state.health_probing
                 && state.held_segments.is_empty()
-                && !matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete)
+                && !matches!(
+                    state.status,
+                    JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial
+                )
         });
         if !probing || self.job_has_pending_download_work_beyond_health_probe(job_id) {
             return false;

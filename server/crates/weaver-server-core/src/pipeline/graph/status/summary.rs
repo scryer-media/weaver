@@ -21,6 +21,8 @@ pub(crate) struct RecoverySummary {
 // One recovery object of the namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SetSummary {
+    // The object's own node.
+    pub(crate) node: NodeId,
     pub(crate) kind: Kind,
     // The namespace it lives in, at whatever depth.
     pub(crate) namespace: NodeId,

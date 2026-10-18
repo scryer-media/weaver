@@ -317,6 +317,9 @@ pub enum JobStatus {
     QueuedPostProcessing,
     PostProcessing,
     Complete,
+    // Delivered with what extracted; at least one member is damaged or
+    // missing. Terminal like Complete; clients see it as failed.
+    Partial,
     Failed { error: String },
     Paused,
 }
@@ -337,9 +340,18 @@ impl JobStatus {
             Self::QueuedPostProcessing => "queued_post_processing",
             Self::PostProcessing => "post_processing",
             Self::Complete => "complete",
+            Self::Partial => "partial",
             Self::Failed { .. } => "failed",
             Self::Paused => "paused",
         }
+    }
+
+    // The stage a terminal status names as failed by itself, when no step
+    // recorded one: a partial delivery left members short, which every
+    // reader outside the engine takes for a failed unpack.
+    pub fn shortfall_stage(&self) -> Option<crate::post_processing::model::PipelineFailureStage> {
+        matches!(self, Self::Partial)
+            .then_some(crate::post_processing::model::PipelineFailureStage::Extract)
     }
 }
 
@@ -518,6 +530,7 @@ pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobSt
         "queued_post_processing" => JobStatus::QueuedPostProcessing,
         "post_processing" => JobStatus::PostProcessing,
         "complete" => JobStatus::Complete,
+        "partial" => JobStatus::Partial,
         "failed" => JobStatus::Failed {
             error: error.unwrap_or("unknown error").to_string(),
         },
@@ -587,7 +600,7 @@ pub fn runtime_lanes_from_status_snapshot(
             PostState::PostProcessing,
             RunState::Active,
         ),
-        JobStatus::Complete => (
+        JobStatus::Complete | JobStatus::Partial => (
             DownloadState::Complete,
             PostState::Completed,
             RunState::Active,
@@ -832,6 +845,24 @@ mod tests {
             job_status_from_persisted_str("moving", None),
             JobStatus::Moving
         );
+    }
+
+    #[test]
+    fn partial_round_trips_through_its_persisted_string_and_ends_like_complete() {
+        assert_eq!(JobStatus::Partial.persisted_status(), "partial");
+        assert_eq!(
+            job_status_from_persisted_str("partial", None),
+            JobStatus::Partial
+        );
+        assert_eq!(
+            runtime_lanes_from_status_snapshot(&JobStatus::Partial),
+            runtime_lanes_from_status_snapshot(&JobStatus::Complete)
+        );
+        assert_eq!(
+            JobStatus::Partial.shortfall_stage(),
+            Some(crate::post_processing::model::PipelineFailureStage::Extract)
+        );
+        assert_eq!(JobStatus::Complete.shortfall_stage(), None);
     }
 
     #[test]

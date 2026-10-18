@@ -62,6 +62,7 @@ enum WhyMirror {
     FirstBytesLost,
     HoldsBreached,
     Unsupported,
+    Unmapped,
 }
 through!(Why, WhyMirror);
 

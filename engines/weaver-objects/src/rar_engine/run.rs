@@ -85,8 +85,12 @@ struct Walk<'s, 'a> {
 
 impl Walk<'_, '_> {
     fn archive(&mut self, password: Option<&str>) -> Result<(), Stop> {
+        let first = self.input.index(0).map_err(|_| Stop::Silent)?;
+        let Some(first) = first else {
+            return Ok(());
+        };
         let mut archive =
-            RarArchive::open_prefix(self.input.reader(0), password, NonZeroUsize::MIN)
+            RarArchive::open_prefix(self.input.reader(first), password, NonZeroUsize::MIN)
                 .map_err(|error| self.fail(error))?;
         // Bytes may catch up with a large member as it decodes; adaptive
         // decoding picks inline or batched work from what it measures.
@@ -94,12 +98,12 @@ impl Walk<'_, '_> {
         archive.set_verify(true);
         let mut index = 0;
         let mut volume = 0;
-        while volume < self.input.volumes.count() {
+        while let Some(at) = self.input.index(volume).map_err(|_| Stop::Silent)? {
             self.reading = volume;
             let mut headers = NonZeroUsize::MIN;
             loop {
                 let found = archive
-                    .extend_volume_prefix(volume, Box::new(self.input.reader(volume)), headers)
+                    .extend_volume_prefix(volume, Box::new(self.input.reader(at)), headers)
                     .map_err(|error| self.fail(error))?;
                 while index < archive.len() {
                     self.member(&mut archive, index, password.is_some())?;
@@ -187,12 +191,7 @@ impl Walk<'_, '_> {
             .open
             .as_ref()
             .map_or((self.reading, self.reading), |open| (open.first, open.last));
-        Stop::Say(verdict(
-            &error,
-            encrypted,
-            first..=last,
-            &*self.input.volumes,
-        ))
+        Stop::Say(verdict(&error, encrypted, first..=last, &self.input))
     }
 }
 
@@ -205,7 +204,7 @@ fn verdict(
     error: &RarError,
     encrypted: bool,
     spans: std::ops::RangeInclusive<usize>,
-    volumes: &dyn Volumes,
+    input: &Input,
 ) -> Vec<Emit> {
     match rar_error_class(error) {
         Class::PasswordRequired => vec![Emit::NeedsPassword],
@@ -220,9 +219,9 @@ fn verdict(
         }
         Class::Recoverable => {
             let damaged: Vec<Emit> = spans
-                .filter_map(|volume| {
-                    let volume = VolumeIndex(u32::try_from(volume).ok()?);
-                    let length = volumes.len(volume)?;
+                .filter_map(|position| {
+                    let volume = input.index(position).ok()??;
+                    let length = input.volumes.len(volume)?;
                     Some(Emit::Damaged {
                         volume,
                         range: ByteRange::new(0, length),
@@ -336,11 +335,30 @@ struct Input {
 }
 
 impl Input {
-    fn reader(&self, volume: usize) -> Reader {
+    // The volume unrar-rs numbers `position`: bound volume `position`, for
+    // a RAR set's volumes are numbered by their names. A position short of
+    // the last bound volume with nothing bound there is still that volume:
+    // reading it says it is lost, which is what the set is missing. Past
+    // the last bound volume there is none.
+    fn index(&self, position: usize) -> io::Result<Option<VolumeIndex>> {
+        let Ok(position) = u32::try_from(position) else {
+            return Ok(None);
+        };
+        let after = position.checked_sub(1).map(VolumeIndex);
+        match self.volumes.next(after) {
+            Ok(found) => Ok(found.map(|_| VolumeIndex(position))),
+            Err(error) => {
+                self.failed.store(true, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    fn reader(&self, volume: VolumeIndex) -> Reader {
         Reader {
             volumes: Arc::clone(&self.volumes),
             failed: Arc::clone(&self.failed),
-            volume: VolumeIndex(u32::try_from(volume).unwrap_or(u32::MAX)),
+            volume,
             position: 0,
         }
     }
@@ -348,13 +366,13 @@ impl Input {
 
 impl VolumeProvider for Input {
     fn get_volume(&self, index: usize) -> Result<Box<dyn ReadSeek>, VolumeProviderError> {
-        if index >= self.volumes.count() {
+        let Ok(Some(volume)) = self.index(index) else {
             return Err(VolumeProviderError::Unavailable {
                 volume: index,
                 reason: "the set has no such volume".into(),
             });
-        }
-        Ok(Box::new(self.reader(index)))
+        };
+        Ok(Box::new(self.reader(volume)))
     }
 }
 

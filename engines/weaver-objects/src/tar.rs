@@ -365,7 +365,12 @@ impl Object for Tar {
         Kind::Tar
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
         if self.gone || delivery.volume != VOLUME || delivery.bytes.is_empty() {
             return;
         }

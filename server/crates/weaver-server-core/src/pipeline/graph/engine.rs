@@ -30,7 +30,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace, Reserve};
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
-use weaver_graph::{Emit, Extraction, NodeId};
+use weaver_graph::{Emit, Extraction, NodeId, Why};
 
 use self::volumes::RunVolumes;
 use super::envelope::Shelf;
@@ -266,6 +266,12 @@ impl Runs {
             let mut sink =
                 |emit| volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok();
             extraction.run(reader, &mut sink);
+            // A run that read bytes nothing will bring built on less than its
+            // volumes hold, and ends silent on the failed read: what it said
+            // is refused as damage nothing repairs.
+            if volumes.lost() {
+                sink(Emit::Refuse(Why::Unrepairable));
+            }
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.
             let _ = mail.blocking_send(said(Heard::Ended));

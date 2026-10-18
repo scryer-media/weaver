@@ -11,10 +11,12 @@ const IV: [u8; 16] = [9; 16];
 // pads: with bytes no member holds.
 fn posted(plain_len: usize) -> (Vec<u8>, Vec<u8>) {
     let plain = payload(3, plain_len);
-    let cipher_len = ceil(plain_len as u64) as usize;
+    let cipher_len = block_ceil(plain_len as u64) as usize;
     let mut cipher = plain.clone();
     cipher.extend((0..cipher_len - plain_len).map(|index| 0xA0 + index as u8));
-    Keys::new(&KEY).unwrap().encipher(IV, &mut cipher).unwrap();
+    MemberCipherKey::Aes256(KEY)
+        .encrypt_range(&IV, &mut cipher)
+        .unwrap();
     (plain, cipher)
 }
 
@@ -44,9 +46,8 @@ impl Out {
         stream.deliver(
             &self.coverage,
             &mut self.padding,
-            offset,
-            bytes,
-            provenance,
+            (offset, bytes, provenance),
+            &mut reader(&self.bytes),
             &mut plains,
         );
         let said = plains.clone();

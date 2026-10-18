@@ -7,7 +7,7 @@
 // An entry that names no member of the namespace fails nothing: an SFV is
 // often written over files the post does not carry.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -80,22 +80,87 @@ impl Sfv {
     }
 }
 
-// Entries of the text: a name, whitespace, eight hex digits. Lines starting
-// with `;` are comments, and a line that is not an entry is skipped.
-fn entries(text: &[u8]) -> Vec<(String, u32)> {
-    String::from_utf8_lossy(text)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with(';'))
-        .filter_map(|line| {
-            let (name, crc) = line.rsplit_once(char::is_whitespace)?;
-            let name = name.trim();
-            (crc.len() == 8 && !name.is_empty())
-                .then(|| u32::from_str_radix(crc, 16).ok())
-                .flatten()
-                .map(|crc| (name.to_owned(), crc))
-        })
-        .collect()
+// The entries of the text, keyed by lower-cased basename.
+//
+// Basenames because a listing is written relative to wherever the release was
+// packed, often with DOS separators, while the members are named flat;
+// lower-cased because the same listing is routinely produced on a
+// case-insensitive filesystem and the case it records is not evidence of
+// anything. A basename listed with disagreeing CRCs is withdrawn: the
+// listing contradicts itself, so neither value is evidence.
+fn entries(text: &[u8]) -> BTreeMap<String, u32> {
+    let text = String::from_utf8_lossy(text);
+    // A listing written on Windows commonly carries a UTF-8 BOM, which
+    // would otherwise become part of the first entry's name.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut entries = BTreeMap::new();
+    let mut conflicting = BTreeSet::new();
+    // `str::lines` splits on `\n` and drops a trailing `\r`, so CRLF
+    // listings need no separate handling.
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        // `;` opens a comment line, the header most generators write.
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+        let Some((name, checksum)) = line.rsplit_once(char::is_whitespace) else {
+            continue;
+        };
+        let name = name.trim_end();
+        // Up to eight hex digits: canonical listings pad to eight, and a
+        // few generators drop leading zeros. Anything else, a size column,
+        // a stray word, an md5, is not a CRC32 and is refused rather than
+        // truncated into one.
+        if name.is_empty()
+            || checksum.is_empty()
+            || checksum.len() > 8
+            || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let Ok(crc32) = u32::from_str_radix(checksum, 16) else {
+            continue;
+        };
+        let basename = sfv_basename(name);
+        if basename.is_empty() {
+            continue;
+        }
+        insert_entry(&mut entries, &mut conflicting, basename, crc32);
+    }
+    entries
+}
+
+fn insert_entry(
+    entries: &mut BTreeMap<String, u32>,
+    conflicting: &mut BTreeSet<String>,
+    basename: String,
+    crc32: u32,
+) {
+    if conflicting.contains(&basename) {
+        return;
+    }
+    match entries.get(&basename) {
+        // A listing repeated verbatim is not a contradiction.
+        Some(existing) if *existing == crc32 => {}
+        Some(_) => {
+            entries.remove(&basename);
+            conflicting.insert(basename);
+        }
+        None => {
+            entries.insert(basename, crc32);
+        }
+    }
+}
+
+// The last path component, lower-cased. Both separators are honoured because
+// a listing packed on Windows records `subdir\file.rar` and the same release
+// unpacked elsewhere records `subdir/file.rar`.
+fn sfv_basename(name: &str) -> String {
+    name.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 // The CRC32 of a member, read back in pieces.
@@ -122,7 +187,12 @@ impl Object for Sfv {
         Kind::Sfv
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, _out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        _out: &mut Vec<Emit>,
+    ) {
         let Ok(offset) = usize::try_from(delivery.offset) else {
             return;
         };
@@ -171,30 +241,25 @@ impl Object for Sfv {
 }
 
 impl Recovery for Sfv {
-    // By name, exactly or, failing that, by one unique case-folded match.
+    // By lower-cased basename. Two members whose names differ only by case
+    // cannot be told apart by a listing that records neither reliably, so
+    // neither binds.
     fn bind(&mut self, namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {
-        let candidates: Vec<_> = namespace
+        let mut by_basename: BTreeMap<String, Option<MemberId>> = BTreeMap::new();
+        for member in namespace
             .members()
             .filter(|member| member.bound_to != Some(self.id))
-            .collect();
-        let mut bound = BTreeMap::new();
-        for (name, crc) in entries(&self.text) {
-            let exact: Vec<_> = candidates
-                .iter()
-                .filter(|member| member.name == name)
-                .collect();
-            let found = if exact.is_empty() {
-                candidates
-                    .iter()
-                    .filter(|member| member.name.eq_ignore_ascii_case(&name))
-                    .collect()
-            } else {
-                exact
-            };
-            if let [member] = found.as_slice() {
-                bound.insert(member.id, crc);
-            }
+        {
+            by_basename
+                .entry(sfv_basename(&member.name))
+                .and_modify(|found| *found = None)
+                .or_insert(Some(member.id));
         }
+        let entries = entries(&self.text);
+        let bound: BTreeMap<MemberId, u32> = by_basename
+            .into_iter()
+            .filter_map(|(basename, member)| Some((member?, *entries.get(&basename)?)))
+            .collect();
         self.lengths = bound
             .keys()
             .filter_map(|member| {
@@ -245,6 +310,10 @@ impl Recovery for Sfv {
             };
             if !intact {
                 damaged += 1;
+                // One checksum over the member: all of it is what failed.
+                if let Some(length) = access.length(member) {
+                    access.found_damaged(member, ByteRange::new(0, length));
+                }
             }
         }
         let outcome = if damaged == 0 {

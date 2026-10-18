@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use weaver_graph::{ByteRange, MemberId, NodeId, Tree, VolumeIndex, Weight};
+use weaver_graph::{ByteRange, MemberId, NodeId, Tree, VERDICT_BYTES, VolumeIndex, Weight};
 
 use super::source::ArticleMap;
 use super::window::{Bid, Window};
@@ -59,6 +59,26 @@ pub(crate) fn bootstrap(tree: &Tree, map: &ArticleMap, window: &mut Window) {
             });
             asked += 1;
         }
+    }
+}
+
+// Queue the front of every root member that has not yet said what it is, up
+// to the most bytes any verdict reads, each round until it decides. Nothing
+// else wants an undecided member's bytes, since no object owns it yet, so
+// without this a parked recovery volume would stay undecided until a repair
+// asked for it, and the repair cannot ask before it decides. The sample asks
+// for the front's first article; this carries on from it, so the first
+// article of every member still leads, and most members decide on it alone.
+// It raises nothing: the order of what is queued stays as it is.
+pub(crate) fn fronts(tree: &Tree, map: &mut ArticleMap) {
+    let Some(root) = tree.namespace(NodeId::ROOT) else {
+        return;
+    };
+    for member in tree.undecided(NodeId::ROOT) {
+        if root.first_bytes(member).is_empty() {
+            continue;
+        }
+        map.queue(root_volume(member), ByteRange::new(0, VERDICT_BYTES as u64));
     }
 }
 

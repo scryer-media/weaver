@@ -134,7 +134,7 @@ impl RarStore {
         let facts = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
             Cursor::new(first_bytes.to_vec()),
             password.as_deref().map(String::as_str),
-            Arc::clone(&self.kdf),
+            Arc::clone(self.keys.kdf()),
         )
         .ok()?
         .facts;

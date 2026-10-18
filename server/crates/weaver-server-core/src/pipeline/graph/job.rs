@@ -133,8 +133,7 @@ impl GraphJob {
         runs: Runs,
     ) -> Self {
         let mut tree = Tree::new();
-        let volumes: Vec<_> = files.iter().map(|file| file.articles.clone()).collect();
-        let root = ArticleRoot::new(&volumes);
+        let root = ArticleRoot::new(files);
         let mut out = Vec::new();
         for file in files {
             // Nothing is below the root yet, so no name moves; were one to,
@@ -372,6 +371,7 @@ impl GraphJob {
         queued: impl FnMut(VolumeIndex) -> bool,
     ) -> Result<Vec<Move>, GraphError> {
         sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
+        sample::fronts(&self.tree, &mut self.root.map);
         let mut wants = Vec::new();
         self.tree.collect_wants(&mut wants);
         let mut asks = Vec::new();
@@ -392,8 +392,13 @@ impl GraphJob {
             let pull = answers[span]
                 .iter()
                 .fold(pull, |pull, answer| pull.fold(*answer));
-            self.tree
-                .pulled(node, seek, pull, &mut *self.builder, &mut effects);
+            self.tree.pulled(
+                node,
+                seek,
+                pull,
+                &mut self.writer.placing(&mut *self.builder),
+                &mut effects,
+            );
         }
         self.settle(effects)?;
         Ok(self.root.map.take_moves())

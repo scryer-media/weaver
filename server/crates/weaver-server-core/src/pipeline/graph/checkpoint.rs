@@ -174,6 +174,7 @@ pub(crate) fn rows(snapshot: &Snapshot) -> GraphCheckpoint {
                 bound: member.bound_to.map(|object| i64::from(object.0)),
                 owner: member.owner.map(pair),
                 given_up: member.given_up.map(pair),
+                buried: member.buried,
                 undecided: member.undecided,
                 has_file: state.has_file,
                 refused: state.refused.map(|why| why_name(why).to_owned()),
@@ -325,6 +326,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
                 .transpose()?,
             owner: row.owner.map(id_pair).transpose()?,
             given_up: row.given_up.map(id_pair).transpose()?,
+            buried: row.buried,
             undecided: row.undecided,
         };
         nodes
@@ -506,7 +508,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
         .find(|provenance| provenance_name(*provenance) == name)
 }
 
-const REASONS: [Why; 10] = [
+const REASONS: [Why; 11] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -517,6 +519,7 @@ const REASONS: [Why; 10] = [
     Why::FirstBytesLost,
     Why::HoldsBreached,
     Why::Unsupported,
+    Why::Unmapped,
 ];
 
 fn why_name(why: Why) -> &'static str {
@@ -531,6 +534,7 @@ fn why_name(why: Why) -> &'static str {
         Why::FirstBytesLost => "first_bytes_lost",
         Why::HoldsBreached => "holds_breached",
         Why::Unsupported => "unsupported",
+        Why::Unmapped => "unmapped",
     }
 }
 

@@ -58,8 +58,12 @@ impl Tree {
                     closed: member.closed,
                     bound_to: member.bound_to,
                     owner: found.children.get(&member.id).copied(),
-                    given_up: self.retired.get(&(node, member.id)).copied(),
-                    undecided: found.undecided.contains_key(&member.id),
+                    given_up: self.retired.get(&(node, member.id)).copied().flatten(),
+                    buried: self
+                        .retired
+                        .get(&(node, member.id))
+                        .is_some_and(Option::is_none),
+                    undecided: found.undecided.contains(&member.id),
                 })
                 .collect(),
             coverage: namespace
@@ -161,7 +165,7 @@ impl Tree {
             });
             if member.undecided {
                 // Its front comes again with the replay.
-                node.undecided.insert(member.member, Vec::new());
+                node.undecided.insert(member.member);
             }
         }
         for run in &record.coverage {
@@ -244,12 +248,18 @@ impl Tree {
                     found.children.insert(member.member, (child, volume));
                 }
             }
+            if member.buried && member.given_up.is_some() {
+                return Err(refuse("a member is both given up and buried"));
+            }
             if let Some((node, volume)) = member.given_up {
                 if !self.nodes.contains_key(&node) {
                     return Err(refuse("a member was given up by a node not in the record"));
                 }
                 self.retired
-                    .insert((record.node, member.member), (node, volume));
+                    .insert((record.node, member.member), Some((node, volume)));
+            }
+            if member.buried {
+                self.retired.insert((record.node, member.member), None);
             }
         }
         Ok(())

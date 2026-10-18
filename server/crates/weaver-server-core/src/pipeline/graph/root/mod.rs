@@ -30,6 +30,7 @@ use weaver_graph::{ByteRange, NodeId, Pull, Purpose, Seek, Segment, VolumeIndex,
 use self::intake::{Checksums, Decoded};
 use self::source::{ArticleMap, Class};
 use self::window::{Bid, Window};
+use crate::pipeline::graph::job::RootFile;
 use crate::pipeline::graph::namespace::{Arrival, Segments};
 
 // A seek that reached the root, with the object that asked it.
@@ -45,15 +46,20 @@ pub(crate) struct ArticleRoot {
     pub(crate) map: ArticleMap,
     pub(crate) window: Window,
     checksums: Checksums,
+    // Each file's name as the post lists it. A root member is the post's
+    // file of its number whatever a recovery set renames it to, so this,
+    // not the member's name, is what says a restore has the right post.
+    posted: Vec<String>,
 }
 
 impl ArticleRoot {
-    // Each volume's articles: ordinal and declared encoded size.
-    pub(crate) fn new(volumes: &[Vec<(u32, u32)>]) -> Self {
+    pub(crate) fn new(files: &[RootFile]) -> Self {
+        let volumes: Vec<_> = files.iter().map(|file| file.articles.clone()).collect();
         Self {
-            map: ArticleMap::new(volumes),
+            map: ArticleMap::new(&volumes),
             window: Window::default(),
             checksums: Checksums::default(),
+            posted: files.iter().map(|file| file.name.clone()).collect(),
         }
     }
 

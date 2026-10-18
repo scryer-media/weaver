@@ -4581,6 +4581,45 @@ async fn nzbget_history_reports_each_failure_cause_in_its_own_status_field() {
     }
 }
 
+// A partial delivery is a failed unpack to NZBGet clients, whether the job
+// is still in memory or its history row has landed.
+#[tokio::test]
+async fn nzbget_history_reports_a_partial_job_as_an_unpack_failure() {
+    use weaver_server_core::history::HistoryFailureKind;
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(802, "partial", 1_700_000_802, None))
+        .unwrap();
+    assert!(
+        db.set_history_failure_kind(802, Some(HistoryFailureKind::Unpack))
+            .unwrap()
+    );
+    let mut live = sample_job(801, "partial-live", JobStatus::Partial);
+    (live.download_state, live.post_state, live.run_state) =
+        weaver_server_core::runtime_lanes_from_status_snapshot(&live.status);
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![live], db.clone());
+    let app = nzbget_test_router(
+        db,
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    for id in [801, 802] {
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["NZBID"] == id)
+            .unwrap();
+        assert_eq!(entry["Status"], "FAILURE/UNPACK", "{id}");
+        assert_eq!(entry["UnpackStatus"], "FAILURE", "{id}");
+        assert_eq!(entry["ParStatus"], "NONE", "{id}");
+        assert_eq!(entry["DeleteStatus"], "NONE", "{id}");
+    }
+}
+
 #[tokio::test]
 async fn nzbget_history_reads_the_failure_cause_from_text_when_none_was_kept() {
     let db = Database::open_in_memory().unwrap();

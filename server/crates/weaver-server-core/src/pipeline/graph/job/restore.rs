@@ -39,7 +39,7 @@ pub(crate) enum RestoreFailure {
     Tree(#[from] RestoreError),
     #[error(transparent)]
     Root(#[from] RootFactsError),
-    #[error("root member {0} is not the post's file of that number")]
+    #[error("root member {0} is not one of the post's files")]
     Post(u32),
     #[error(transparent)]
     Write(#[from] WriteError),
@@ -70,8 +70,7 @@ impl GraphJob {
         limit: usize,
     ) -> Result<Restored, RestoreFailure> {
         let tree = Tree::rebuild(&snapshot.tree, &weaver_objects::Objects)?;
-        let volumes: Vec<_> = files.iter().map(|file| file.articles.clone()).collect();
-        let root = ArticleRoot::restore(&volumes, &snapshot.root)?;
+        let root = ArticleRoot::restore(files, &snapshot.root)?;
         same_post(&tree, files)?;
         let runs = Runs::new(
             scope,
@@ -141,8 +140,12 @@ impl GraphJob {
             return Ok(());
         };
         let mut effects = Vec::new();
-        self.tree
-            .offer_password(node, &secret, &mut *self.builder, &mut effects);
+        self.tree.offer_password(
+            node,
+            &secret,
+            &mut self.writer.placing(&mut *self.builder),
+            &mut effects,
+        );
         self.settle(effects)
     }
 
@@ -280,18 +283,18 @@ impl GraphJob {
     }
 }
 
-// The root's members are the post's files, in order and by name.
+// A root member is the post's file of its number: its identity is that
+// index, never its name, which a recovery set's rename changes. That the
+// post is the one checkpointed, by its names, is the root's facts' check.
 fn same_post(tree: &Tree, files: &[RootFile]) -> Result<(), RestoreFailure> {
     let Some(namespace) = tree.namespace(NodeId::ROOT) else {
         return Err(RestoreFailure::Post(0));
     };
-    for member in namespace.members() {
-        let named = files
-            .get(member.id.0 as usize)
-            .is_some_and(|file| file.name == member.name);
-        if !named {
-            return Err(RestoreFailure::Post(member.id.0));
-        }
+    match namespace
+        .members()
+        .find(|member| member.id.0 as usize >= files.len())
+    {
+        Some(member) => Err(RestoreFailure::Post(member.id.0)),
+        None => Ok(()),
     }
-    Ok(())
 }

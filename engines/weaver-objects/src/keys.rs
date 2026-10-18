@@ -4,9 +4,14 @@
 // Derived keys, once per process. A key derivation is deliberately slow, and
 // every object of a job, and every job of a set offered the same password,
 // derives the same key from the same tuple. The cache is keyed by a digest of
-// the whole tuple, so the password itself is never held here, and bounded by
+// the whole tuple, so this map never holds the password, and bounded by
 // count, oldest first out. An entry is the derived key or the finding that
 // the password is wrong for that tuple, so a wrong candidate is tried once.
+//
+// RAR header walks derive inside unrar-rs, which needs its own KdfCache: the
+// process's one is kept here beside the keys, so a walk, a check and a key
+// derive a tuple once wherever they run. That cache holds passwords and its
+// `Debug` prints them, so it is never printed.
 //
 // Nothing here is ever printed: `Debug` says "redacted", and no key leaves
 // through a log, a metric, an emit or a checkpoint.
@@ -16,6 +21,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use aws_lc_rs::digest::{Context, SHA256};
+use unrar_rs::KdfCache;
 use zeroize::Zeroizing;
 
 // Entries kept. A job offers a handful of passwords; this is many jobs'.
@@ -93,6 +99,7 @@ struct Inner {
 pub struct Keys {
     inner: Mutex<Inner>,
     capacity: usize,
+    kdf: Arc<KdfCache>,
 }
 
 impl fmt::Debug for Keys {
@@ -106,7 +113,13 @@ impl Keys {
         Self {
             inner: Mutex::new(Inner::default()),
             capacity: capacity.max(1),
+            kdf: Arc::new(KdfCache::new()),
         }
+    }
+
+    // unrar-rs's derivations, for the walks and checks that run inside it.
+    pub fn kdf(&self) -> &Arc<KdfCache> {
+        &self.kdf
     }
 
     // The process's one cache.

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A run's volumes: the node's envelope files, read while they grow. A read
-// waits on the shelf until its range is in, damaged bytes counting as in, since
-// the engine's own checks catch them. It ends short only where a closed volume
-// ends, and fails once its bytes are lost or the run is stopped. Nothing here
-// polls: every change to the shelf wakes the reads waiting on it.
+// A run's volumes: the node's envelope files, read while they grow. A run
+// reads verified bytes only: a read waits on the shelf until every byte of
+// its range is in, fresh or repaired, and damaged bytes wait for their repair
+// as missing ones wait to arrive, so a decoder never builds on bytes known to
+// be bad. A read ends short only where a closed volume ends, and fails once
+// its bytes are lost, damaged ones nothing will repair included, or the run
+// is stopped. A lost read is remembered: the run cannot tell it from its
+// own failure, so its owner says why it ended. Nothing here polls: every
+// change to the shelf wakes the reads waiting on it.
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use weaver_graph::{ByteRange, VolumeIndex, Volumes};
@@ -30,8 +35,11 @@ pub(crate) enum Unreadable {
 
 impl From<Unreadable> for io::Error {
     fn from(error: Unreadable) -> Self {
+        // A stopped run's reads fail for good. `Interrupted` is the one kind
+        // every reader retries, a decoder's header parse and `read_exact`
+        // included, so a run stopped under one would spin and never return.
         let kind = match error {
-            Unreadable::Stopped => io::ErrorKind::Interrupted,
+            Unreadable::Stopped => io::ErrorKind::BrokenPipe,
             Unreadable::Lost { .. } => io::ErrorKind::NotFound,
         };
         io::Error::new(kind, error)
@@ -44,6 +52,7 @@ pub(crate) struct RunVolumes {
     // The run's own handles, so a read never holds the shelf's lock while
     // it touches the disk.
     files: Mutex<BTreeMap<u32, File>>,
+    lost: AtomicBool,
 }
 
 impl RunVolumes {
@@ -52,7 +61,13 @@ impl RunVolumes {
             shelf,
             generation,
             files: Mutex::default(),
+            lost: AtomicBool::new(false),
         }
+    }
+
+    // Whether a read failed because nothing will bring its bytes.
+    pub(crate) fn lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
     }
 
     // Whether the run may still speak: nothing has stopped it.
@@ -74,7 +89,7 @@ impl RunVolumes {
                 return Err(Unreadable::Stopped);
             }
             let complete = state.complete;
-            let known = volume.0 < state.volumes;
+            let known = state.volumes.contains(&volume.0);
             let kept = state.kept.get_mut(&volume.0);
             let end = kept
                 .as_ref()
@@ -85,7 +100,7 @@ impl RunVolumes {
                 return Ok((0, None));
             }
             match kept {
-                Some(kept) if kept.coverage.covered(want) => {
+                Some(kept) if kept.coverage.verified(want) => {
                     kept.reached = kept.reached.max(want.end);
                     return Ok((want.len(), Some(kept.path().to_path_buf())));
                 }
@@ -109,8 +124,25 @@ impl RunVolumes {
 }
 
 impl Volumes for RunVolumes {
-    fn count(&self) -> usize {
-        self.shelf.lock().volumes as usize
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        let Some(from) = after.map_or(Some(0), |after| after.0.checked_add(1)) else {
+            return Ok(None);
+        };
+        let mut state = self.shelf.lock();
+        loop {
+            if state.generation != self.generation {
+                return Err(Unreadable::Stopped.into());
+            }
+            let Some(&next) = state.volumes.range(from..).next() else {
+                return Ok(None);
+            };
+            // No index lies between `after` and `from`, so only a gap past
+            // `from` can still fill, and only while a volume can still join.
+            if next == from || state.complete {
+                return Ok(Some(VolumeIndex(next)));
+            }
+            state = self.shelf.wait(state);
+        }
     }
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
@@ -119,7 +151,11 @@ impl Volumes for RunVolumes {
 
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
         let range = ByteRange::at(offset, into.len() as u64);
-        let (len, path) = self.wait_for(volume, range)?;
+        let (len, path) = self.wait_for(volume, range).inspect_err(|error| {
+            if matches!(error, Unreadable::Lost { .. }) {
+                self.lost.store(true, Ordering::Release);
+            }
+        })?;
         let Some(path) = path else {
             return Ok(0);
         };

@@ -19,11 +19,7 @@
 use bytes::Bytes;
 use weaver_graph::{Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, Tree};
 
-use super::{Arrival, NamespaceWriter, Segments, WriteError};
-
-// How much of a volume is read back at once, so a large volume never sits in
-// memory whole.
-const READ_BACK: u64 = 1 << 20;
+use super::{Arrival, NamespaceWriter, READ_BACK, Segments, WriteError};
 
 impl NamespaceWriter {
     pub(super) fn materialise(

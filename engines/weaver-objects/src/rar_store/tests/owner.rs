@@ -156,6 +156,9 @@ impl Owner {
         let real = &self.volumes[volume.0 as usize].1[range.start as usize..range.end as usize];
         let bytes = bytes.unwrap_or(real).to_vec();
         let mut out = Vec::new();
+        let members = &self.members;
+        let mut read =
+            |placement: &Placement, into: &mut Vec<u8>| read_member(members, placement, into);
         self.object.deliver(
             Delivery {
                 volume,
@@ -163,6 +166,7 @@ impl Owner {
                 bytes: &bytes,
                 provenance,
             },
+            &mut read,
             &mut out,
         );
         self.apply(out);
@@ -340,16 +344,7 @@ impl Owner {
         let length = self.volumes[volume].1.len() as u64;
         let mut read = |placement: &Placement, into: &mut Vec<u8>| -> bool {
             match placement {
-                Placement::Member { member, range } => {
-                    let Some(got) = self.members.get(&member.0) else {
-                        return false;
-                    };
-                    if !got.coverage.covered(*range) {
-                        return false;
-                    }
-                    into.extend_from_slice(&got.bytes[range.start as usize..range.end as usize]);
-                    true
-                }
+                Placement::Member { .. } => read_member(&self.members, placement, into),
                 Placement::Envelope { envelope, range } => {
                     let Some(shelf) = self.shelves.get(envelope) else {
                         return false;
@@ -372,5 +367,20 @@ impl Owner {
                 &mut into,
             )
             .then_some(into)
+    }
+}
+
+// What a member placement holds, read back as a namespace reads it: only the
+// bytes that arrived.
+fn read_member(members: &BTreeMap<u32, Got>, placement: &Placement, into: &mut Vec<u8>) -> bool {
+    let Placement::Member { member, range } = placement else {
+        return false;
+    };
+    let Some(got) = members.get(&member.0) else {
+        return false;
+    };
+    got.coverage.covered(*range) && {
+        into.extend_from_slice(&got.bytes[range.start as usize..range.end as usize]);
+        true
     }
 }

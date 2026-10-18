@@ -254,7 +254,7 @@ impl Pipeline {
         };
         if matches!(
             state.status,
-            JobStatus::Paused | JobStatus::Failed { .. } | JobStatus::Complete
+            JobStatus::Paused | JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial
         ) {
             return false;
         }

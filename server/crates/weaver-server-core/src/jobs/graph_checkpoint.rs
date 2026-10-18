@@ -63,6 +63,7 @@ pub(crate) struct MemberRow {
     pub(crate) bound: Option<i64>,
     pub(crate) owner: Option<(i64, i64)>,
     pub(crate) given_up: Option<(i64, i64)>,
+    pub(crate) buried: bool,
     pub(crate) undecided: bool,
     pub(crate) has_file: bool,
     pub(crate) refused: Option<String>,
@@ -204,6 +205,7 @@ async fn write_checkpoint(
             owner_volume,
             given_up_node,
             given_up_volume,
+            SqlArg::Bool(row.buried),
             SqlArg::Bool(row.undecided),
             SqlArg::Bool(row.has_file),
             SqlArg::OptText(row.refused.clone()),
@@ -214,7 +216,7 @@ async fn write_checkpoint(
         tx,
         "graph_members (job_id, node_id, member_id, name, output_name, length, closed, \
          bound_node_id, owner_node_id, owner_volume, given_up_node_id, given_up_volume, \
-         undecided, has_file, refused, unusable_at)",
+         buried, undecided, has_file, refused, unusable_at)",
         members,
     )
     .await?;
@@ -333,8 +335,8 @@ async fn read_checkpoint(
     let members = tx
         .fetch_all(
             "SELECT node_id, member_id, name, output_name, length, closed, bound_node_id, \
-             owner_node_id, owner_volume, given_up_node_id, given_up_volume, undecided, \
-             has_file, refused, unusable_at \
+             owner_node_id, owner_volume, given_up_node_id, given_up_volume, buried, \
+             undecided, has_file, refused, unusable_at \
              FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
             &args,
         )
@@ -351,6 +353,7 @@ async fn read_checkpoint(
                 bound: row.opt_i64("bound_node_id")?,
                 owner: pair(row, "owner_node_id", "owner_volume")?,
                 given_up: pair(row, "given_up_node_id", "given_up_volume")?,
+                buried: row.bool("buried")?,
                 undecided: row.bool("undecided")?,
                 has_file: row.bool("has_file")?,
                 refused: row.opt_text("refused")?,

@@ -5,7 +5,12 @@
 // namespace's marks. Nothing refetches and damaged bytes are kept, so a
 // claim never changes what ships; it only says what the shipment is.
 
+use std::collections::BTreeSet;
+
 use weaver_graph::{Member, MemberId, NodeId, Tree};
+
+use crate::jobs::model::JobStatus;
+use crate::post_processing::model::PipelineFailureStage;
 
 // Below this share of its length, a member has produced no delivery
 // evidence: what is on disk for it is a rounding error, not a short
@@ -94,36 +99,179 @@ impl ClaimedMember {
 
 // The members the job cannot be delivered without. A member that produced
 // nothing is a hole handed over as a delivery only when nothing else of the
-// payload arrived either; beside a delivered sibling it is ordinary damage
-// and ships as it stands.
-pub(crate) fn refused(census: &[ClaimedMember]) -> Vec<&ClaimedMember> {
+// payload arrived either, and no file of the delivery is whole at any
+// depth; beside a delivered sibling it is ordinary damage and ships as it
+// stands.
+pub(crate) fn refused<'c>(
+    census: &'c [ClaimedMember],
+    delivery: &Delivery,
+) -> Vec<&'c ClaimedMember> {
     let payload = || census.iter().filter(|row| !row.furniture);
-    if payload().any(|row| row.evidence) {
+    if !delivery.whole.is_empty() || payload().any(|row| row.evidence) {
         return Vec::new();
     }
     payload().filter(|row| !row.evidence).collect()
 }
 
-// Some file the member was unpacked into, at any depth, arrived whole: the
-// post was delivered. What an object above a repair found damaged and
-// marked on the member stays marked, though the repair below rebuilt it,
-// so the member's own marks cannot say so.
-pub(crate) fn delivered_below(tree: &Tree, node: NodeId, member: MemberId) -> bool {
-    let Some((child, _)) = tree
-        .child_of(node, member)
-        .filter(|(child, _)| !tree.recovers(*child))
-    else {
-        return false;
-    };
-    tree.namespace(child).is_some_and(|namespace| {
-        namespace.members().any(|below| {
-            if tree.child_of(child, below.id).is_some() {
-                delivered_below(tree, child, below.id)
-            } else {
-                Claim::of(below) == Claim::Complete
+// The files a graph job hands over, at every depth, named as they are
+// written: a member an object unpacked is spent, and what it unpacked into
+// is delivered in its place; what a refused object closed whole stays
+// delivered beside the member it gave back. Read when the job ends, each
+// file as its own claim says. A short file is unrepaired when a recovery
+// object whose repair failed covers it, or covers a short volume it was
+// unpacked from: those are the bytes the repair could not rebuild. A
+// volume of an object refused after announcing a member it never closed is
+// delivered as it stands, never whole, however clean its bytes: the object
+// failed, not the post.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Delivery {
+    pub(crate) whole: Vec<String>,
+    // Damaged or missing with nothing that could rebuild them: delivered as
+    // they stand.
+    pub(crate) damaged: Vec<String>,
+    // A recovery object that covers them could not rebuild them. Left as
+    // they stand, and not a delivery.
+    pub(crate) unrepaired: Vec<String>,
+}
+
+impl Delivery {
+    // `payload` picks the root members that are the post's files,
+    // `furniture` the names whose state never decides a job, and `failed`
+    // the recovery objects whose repair could not rebuild what they found.
+    // `unmapped` picks the members given back by an object refused after
+    // announcing a member it never closed, or for never placing any.
+    pub(crate) fn read(
+        tree: &Tree,
+        payload: impl Fn(MemberId) -> bool,
+        furniture: impl Fn(&str) -> bool,
+        failed: impl Fn(NodeId) -> bool,
+        unmapped: impl Fn(NodeId, MemberId) -> bool,
+    ) -> Self {
+        let mut walk = Walk {
+            tree,
+            furniture: &furniture,
+            failed: &failed,
+            unmapped: &unmapped,
+            opened: BTreeSet::new(),
+            delivery: Self::default(),
+        };
+        if let Some(root) = tree.namespace(NodeId::ROOT) {
+            for member in root.members().filter(|member| payload(member.id)) {
+                walk.member(NodeId::ROOT, member, false);
             }
+        }
+        walk.delivery
+    }
+
+    // How a job that has nothing left to wait for ends: complete when every
+    // file it hands over is whole, partial while anything is delivered
+    // beside what is short, and failed, for `failure`, when the only files
+    // are ones a recovery object could not rebuild.
+    pub(crate) fn status(&self, failure: Option<&str>) -> JobStatus {
+        if self.damaged.is_empty() && self.unrepaired.is_empty() {
+            return JobStatus::Complete;
+        }
+        match failure {
+            Some(error) if self.whole.is_empty() && self.damaged.is_empty() => JobStatus::Failed {
+                error: error.to_string(),
+            },
+            _ => JobStatus::Partial,
+        }
+    }
+
+    // The stage a short delivery names as the one that left it short: the
+    // repair, when a file is short because a recovery object could not
+    // rebuild it, and otherwise the engine that read it short.
+    pub(crate) fn shortfall_stage(&self) -> PipelineFailureStage {
+        if self.unrepaired.is_empty() {
+            PipelineFailureStage::Extract
+        } else {
+            PipelineFailureStage::Repair
+        }
+    }
+}
+
+struct Walk<'t, F, R> {
+    tree: &'t Tree,
+    furniture: &'t F,
+    failed: &'t R,
+    unmapped: &'t dyn Fn(NodeId, MemberId) -> bool,
+    // Every volume of a set opens the same namespace; it is read once.
+    opened: BTreeSet<NodeId>,
+    delivery: Delivery,
+}
+
+impl<F: Fn(&str) -> bool, R: Fn(NodeId) -> bool> Walk<'_, F, R> {
+    // `short` says a volume the member was unpacked from is short where a
+    // failed repair covers it.
+    fn member(&mut self, node: NodeId, member: &Member, short: bool) {
+        let tree = self.tree;
+        match tree.child_of(node, member.id) {
+            Some((child, _)) if tree.recovers(child) => {}
+            Some((child, _)) => self.namespace(child, short),
+            None => {
+                if !(self.furniture)(&member.output_name) {
+                    let into = match Claim::of(member) {
+                        Claim::Complete if !(self.unmapped)(node, member.id) => {
+                            &mut self.delivery.whole
+                        }
+                        Claim::Complete => &mut self.delivery.damaged,
+                        _ if short || self.unrepaired(node, member) => {
+                            &mut self.delivery.unrepaired
+                        }
+                        Claim::Damaged { .. } | Claim::Missing { .. } => &mut self.delivery.damaged,
+                    };
+                    into.push(member.output_name.clone());
+                }
+                for kept in tree.kept(node, member.id) {
+                    self.namespace(kept, short);
+                }
+            }
+        }
+    }
+
+    fn namespace(&mut self, node: NodeId, short: bool) {
+        let tree = self.tree;
+        if !self.opened.insert(node) {
+            return;
+        }
+        let Some(namespace) = tree.namespace(node) else {
+            return;
+        };
+        let short = short || self.short_volume(node);
+        // A buried member is no file: it says its object left it open.
+        for below in namespace
+            .members()
+            .filter(|below| !tree.buried_member(node, below.id))
+        {
+            self.member(node, below, short);
+        }
+    }
+
+    // Some volume of `node` is short and a failed repair covers it.
+    fn short_volume(&self, node: NodeId) -> bool {
+        let Some((parent, volumes)) = self.tree.volumes(node) else {
+            return false;
+        };
+        let Some(namespace) = self.tree.namespace(parent) else {
+            return false;
+        };
+        volumes
+            .values()
+            .filter_map(|volume| namespace.get(*volume))
+            .any(|volume| Claim::of(volume) != Claim::Complete && self.unrepaired(parent, volume))
+    }
+
+    // A recovery object whose repair failed covers the member.
+    fn unrepaired(&self, node: NodeId, member: &Member) -> bool {
+        self.tree.recovery_nodes(node).into_iter().any(|object| {
+            (self.failed)(object)
+                && self
+                    .tree
+                    .recovery(object)
+                    .is_some_and(|recovery| recovery.covers(member.id))
         })
-    })
+    }
 }
 
 fn damaged_bytes(member: &Member) -> u64 {

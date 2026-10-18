@@ -12,6 +12,7 @@ use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
 };
 use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
 
 // PAR2 names a file by the MD5 of at most this much of its front; damage
 // past it leaves an obfuscated member recognisable by its front.
@@ -100,9 +101,10 @@ async fn a_member_two_sets_describe_is_repaired_once() {
 }
 
 // The member's binding answers to the first set that describes it under
-// both engines: its shortfall fails the job, though the second set alone
-// holds blocks enough. The failure text differs (classic lists the set's
-// files and says "advertised"), so the shapes are compared, not the text.
+// both engines: its shortfall is the repair's, though the second set alone
+// holds blocks enough. Classic fails the job. Under the graph the members
+// it never reached are delivered whole beside it, so the job ends Partial
+// (the partial-extraction ruling of 2026-10-18), its failure the repair's.
 #[tokio::test]
 async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
     let scenario = Scenario::new(shared_member()).damaged(1, 0).damaged(1, 2);
@@ -110,14 +112,21 @@ async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
     for outcome in [&classic, &graph] {
         assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
         assert_eq!(outcome.failure_kind, Some(HistoryFailureKind::Repair));
-        assert!(
-            failed_with(outcome, "PAR2 recovery failed for 1 set(s): lantern.par2"),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.failure
-        );
-        assert!(outcome.files.is_empty(), "{}", outcome.engine);
     }
+    assert!(
+        failed_with(&classic, "PAR2 recovery failed for 1 set(s): lantern.par2"),
+        "{:?}",
+        classic.failure
+    );
+    assert!(classic.files.is_empty());
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.claims["lantern.bin"], Claim::Complete);
+    assert_eq!(graph.claims["beacon.bin"], Claim::Complete);
     assert!(failed_with(
         &classic,
         "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin, ember.bin): \

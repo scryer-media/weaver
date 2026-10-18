@@ -49,6 +49,10 @@ pub enum RepairOutcome {
 pub trait MemberAccess {
     fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]);
+    // A range the object proved bad and could not rebuild. The namespace
+    // marks it damaged, as bytes that arrived failing their own check are,
+    // so the member's coverage says what the object found.
+    fn found_damaged(&mut self, _member: MemberId, _range: ByteRange) {}
     fn length(&self, member: MemberId) -> Option<u64>;
     // Bytes of the recovery object's own volume, which the namespace kept
     // where the object's inverse map placed them. This is where the

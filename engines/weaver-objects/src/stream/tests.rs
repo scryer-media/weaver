@@ -136,8 +136,9 @@ impl Gate {
 }
 
 impl Volumes for Gate {
-    fn count(&self) -> usize {
-        1
+    fn next(&self, after: Option<VolumeIndex>) -> std::io::Result<Option<VolumeIndex>> {
+        let next = after.map_or(0, |after| after.0 as usize + 1);
+        Ok((next < 1).then(|| VolumeIndex(next as u32)))
     }
 
     fn len(&self, _volume: VolumeIndex) -> Option<u64> {
@@ -451,6 +452,7 @@ fn reserve<D: Decoder>(bytes: &[u8]) -> u64 {
                 bytes: std::slice::from_ref(byte),
                 provenance: Provenance::Fresh,
             },
+            &mut |_, _| false,
             &mut out,
         );
     }
@@ -465,8 +467,9 @@ fn each_stream_reserves_the_window_its_first_bytes_declare() {
     // 1 MiB is dictionary property 16, 4 MiB property 20.
     assert_eq!(reserve::<Xz>(&xz_at(&plain, 1 << 20)), lzma2(16));
     assert_eq!(reserve::<Xz>(&xz_at(&plain, 4 << 20)), lzma2(20));
-    assert_eq!(reserve::<Zstd>(&zstd_at(&plain, 20)), 1 << 20);
-    assert_eq!(reserve::<Zstd>(&zstd_at(&plain, 23)), 1 << 23);
+    // A zstd frame reserves the decoder's own limit, whatever it declares.
+    assert_eq!(reserve::<Zstd>(&zstd_at(&plain, 20)), 1 << 27);
+    assert_eq!(reserve::<Zstd>(&zstd_at(&plain, 23)), 1 << 27);
     assert_eq!(reserve::<Brotli>(&brotli_at(&plain, 18)), 1 << 18);
     assert_eq!(reserve::<Brotli>(&brotli_at(&plain, 22)), 1 << 22);
     assert_eq!(reserve::<Bzip2>(&bzip2_at(&plain, 1)), 100_000);
@@ -477,20 +480,27 @@ fn each_stream_reserves_the_window_its_first_bytes_declare() {
 
 #[test]
 fn a_stream_whose_front_has_not_arrived_reserves_its_largest_window() {
-    assert_eq!(
-        reserve::<Xz>(&[]),
-        lzma_turbo::Lzma2Reader::<io::Empty>::memory_required(40).unwrap()
-    );
-    assert_eq!(reserve::<Zstd>(&[]), 1 << 31);
+    assert_eq!(reserve::<Xz>(&[]), 128 << 20);
+    assert_eq!(reserve::<Zstd>(&[]), 1 << 27);
     assert_eq!(reserve::<Brotli>(&[]), 1 << 30);
     assert_eq!(reserve::<Bzip2>(&[]), 900_000);
 }
 
+// A frame of one raw byte whose header asks for a window of 1 << log.
+fn zstd_window(log: u8) -> Vec<u8> {
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, (log - 10) << 3];
+    // The last block, raw, one byte long.
+    frame.extend_from_slice(&[0x09, 0x00, 0x00, b'z']);
+    frame
+}
+
+// The decoder keeps its default window limit: a frame that asks for more is
+// refused, however little it holds.
 #[test]
-fn a_zstd_frame_of_one_segment_reserves_its_content_size() {
-    // Magic, a descriptor saying one segment with a four-byte size, the size.
-    let frame = [0x28, 0xB5, 0x2F, 0xFD, 0xA0, 0x00, 0x00, 0x01, 0x00];
-    assert_eq!(reserve::<Zstd>(&frame), 1 << 16);
+fn a_zstd_frame_wider_than_the_decoders_limit_is_refused() {
+    let stream = stream::<Zstd>("a.zst");
+    assert_eq!(whole(&stream, zstd_window(27)), decoded("a", b"z".to_vec()));
+    refused(&whole(&stream, zstd_window(28)));
 }
 
 #[test]

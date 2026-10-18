@@ -11,7 +11,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use weaver_graph::{VolumeIndex, Why};
+use weaver_graph::Why;
 
 use crate::engine::Joined;
 use crate::zip::records::{self, END, END64, END64_LEN, End, LOCATOR, LOCATOR_LEN, TAIL};
@@ -41,7 +41,7 @@ impl Image {
     // Once every volume has its length: the directory is at the tail, and
     // every place in a spanned set is the length of the volumes before it.
     pub(super) fn open(joined: Joined) -> Result<Image, Unopened> {
-        let lengths = lengths(&joined)?;
+        let lengths = joined.closed_lens()?;
         let total: u64 = lengths.iter().sum();
         let whole = |joined| Image {
             joined,
@@ -102,20 +102,6 @@ impl Image {
 
     fn len(&self) -> u64 {
         self.prefix + self.rest.len() as u64
-    }
-}
-
-// Every volume's length, waiting for each to close, and for the set to stop
-// growing while the run waited.
-fn lengths(joined: &Joined) -> io::Result<Vec<u64>> {
-    loop {
-        let count = joined.volumes().count();
-        let lengths = (0..count)
-            .map(|volume| joined.closed_len(VolumeIndex(volume as u32)))
-            .collect::<io::Result<Vec<u64>>>()?;
-        if joined.volumes().count() == count {
-            return Ok(lengths);
-        }
     }
 }
 

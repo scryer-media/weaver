@@ -75,6 +75,17 @@ impl Builder for Fakes {
             _ => None,
         }
     }
+
+    fn read(
+        &self,
+        _: &weaver_graph::Tree,
+        _: weaver_graph::NodeId,
+        _: weaver_graph::VolumeIndex,
+        _: &weaver_graph::Placement,
+        _: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
 }
 
 struct Store {
@@ -104,7 +115,12 @@ impl Object for Store {
         Kind::RarStore
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
         let header = HEADER as u64;
         let end = delivery.offset + delivery.bytes.len() as u64;
         if end <= header {
@@ -232,7 +248,13 @@ impl Object for LockedEngine {
     fn kind(&self) -> Kind {
         Kind::RarEngine
     }
-    fn deliver(&mut self, _: Delivery<'_>, _: &mut Vec<Emit>) {}
+    fn deliver(
+        &mut self,
+        _: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
+    }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&mut self, _: &mut Vec<Seek>) {}

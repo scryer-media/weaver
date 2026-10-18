@@ -29,8 +29,8 @@ use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location,
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    Builder, ByteRange, Effect, Emit, MemberId, NodeId, Placement, Provenance, RecoveryKind,
-    Segment, Tree, VolumeIndex, Why,
+    Builder, ByteRange, Effect, Emit, Kind, MemberId, NodeId, Object, ObjectId, Placement,
+    Provenance, RecoveryKind, Segment, Tree, VolumeIndex, Why,
 };
 
 use super::envelope::{Envelopes, Shelf};
@@ -224,7 +224,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut effects = Vec::new();
-        tree.close(node, member, builder, &mut effects);
+        tree.close(node, member, &mut self.placing(builder), &mut effects);
         self.apply_all(tree, builder, segments, effects, out)
     }
 
@@ -287,7 +287,7 @@ impl NamespaceWriter {
         } = emit
         else {
             let mut effects = Vec::new();
-            tree.emitted(node, vec![emit], builder, &mut effects);
+            tree.emitted(node, vec![emit], &mut self.placing(builder), &mut effects);
             return self.apply_all(tree, builder, segments, effects, out);
         };
         let arrival = Arrival {
@@ -360,7 +360,7 @@ impl NamespaceWriter {
             let outcome = object
                 .recovery_mut()
                 .map(|recovery| recovery.repair(&mut access));
-            let (reads, repaired) = (access.reads, access.repaired);
+            let (reads, repaired, found) = (access.reads, access.repaired, access.found);
             tree.put_object(recovery_node, object);
             self.read_backs += reads;
             outcomes.extend(outcome.map(|outcome| (recovery_node, outcome)));
@@ -374,8 +374,97 @@ impl NamespaceWriter {
                 };
                 self.deliver(tree, builder, segments, arrival, out)?;
             }
+            for (member, range) in found {
+                let marked = (node, member, range, Provenance::Damaged);
+                self.redeliver(tree, builder, segments, marked, out)?;
+            }
+            if matches!(
+                outcome,
+                Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
+            ) {
+                self.vouched(tree, builder, segments, (node, recovery_node), out)?;
+            }
         }
+        // A repair reads members back, so it may have identified one by its
+        // content; the bind that follows gives it the name it is.
+        self.bind_recoveries(tree, segments, node)?;
         Ok(outcomes)
+    }
+
+    // A recovery object that found what it covers whole, or made it so, has
+    // proven every byte of it, the ones that arrived marked damaged and were
+    // good after all among them: it rewrites only the slices that were bad.
+    // Every byte still marked damaged is delivered again as repaired, read
+    // back from wherever it went, so the marks here and in every namespace
+    // below it say what the object proved.
+    fn vouched(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, recovery): (NodeId, NodeId),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let marked: Vec<(MemberId, ByteRange)> = tree
+            .namespace(node)
+            .map(|namespace| {
+                namespace
+                    .damaged_ranges()
+                    .filter(|(member, _)| {
+                        tree.recovery(recovery)
+                            .is_some_and(|object| object.covers(*member))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (member, range) in marked {
+            let proven = (node, member, range, Provenance::Repaired);
+            self.redeliver(tree, builder, segments, proven, out)?;
+        }
+        Ok(())
+    }
+
+    // Deliver a range of a member again, read back from wherever it went,
+    // under what a recovery object proved of it: the one write path then
+    // marks it here and in every namespace below.
+    fn redeliver(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, member, range, provenance): (NodeId, MemberId, ByteRange, Provenance),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let mut at = range.start;
+        while at < range.end {
+            let chunk = ByteRange::new(at, range.end.min(at.saturating_add(READ_BACK)));
+            at = chunk.end;
+            let mut bytes = Vec::new();
+            if !self
+                .access(tree, node)
+                .read_at(node, member, chunk, &mut bytes)
+            {
+                continue;
+            }
+            let arrival = Arrival {
+                node,
+                member,
+                offset: chunk.start,
+                bytes: Bytes::from(bytes),
+                provenance,
+            };
+            self.deliver(tree, builder, segments, arrival, out)?;
+        }
+        Ok(())
+    }
+
+    // The builder, with this writer behind it: what an object taking a
+    // delivery reads back of its placements is read where the writer put it.
+    pub(crate) fn placing<'a>(&'a self, builder: &'a mut dyn Builder) -> Placing<'a> {
+        Placing {
+            builder,
+            writer: self,
+        }
     }
 
     // The namespace's face toward its recovery objects.
@@ -385,8 +474,10 @@ impl NamespaceWriter {
             tree,
             node,
             recovery: None,
+            held: true,
             reads: 0,
             repaired: Vec::new(),
+            found: Vec::new(),
         }
     }
 
@@ -575,7 +666,7 @@ impl NamespaceWriter {
             arrival.offset,
             arrival.bytes.clone(),
             arrival.provenance,
-            builder,
+            &mut self.placing(builder),
             &mut effects,
         );
         let recovery_volume = tree
@@ -652,7 +743,7 @@ impl NamespaceWriter {
         tree.emitted(
             child,
             vec![weaver_graph::Emit::Refuse(Why::HoldsBreached)],
-            builder,
+            &mut self.placing(builder),
             effects,
         );
         for (offset, bytes) in breached {
@@ -770,7 +861,14 @@ impl NamespaceWriter {
                 child,
                 ..
             } => {
+                // What the member received before it was bound: held, or
+                // in its file when it was a leaf first. A member that closed
+                // before then has its object hear that last.
                 self.replay(tree, builder, segments, *node, *member, ALL, out)?;
+                self.replay_file(tree, builder, segments, *node, *member, out)?;
+                let mut effects = Vec::new();
+                tree.volume_closed(*node, *member, &mut self.placing(builder), &mut effects);
+                self.apply_all(tree, builder, segments, effects, out)?;
                 if tree.recovers(*child) {
                     self.bind_recoveries(tree, segments, *node)?;
                 }
@@ -806,7 +904,13 @@ impl NamespaceWriter {
                 range,
             } => {
                 let mut effects = Vec::new();
-                tree.damaged_under_windows(*node, *member, *range, builder, &mut effects);
+                tree.damaged_under_windows(
+                    *node,
+                    *member,
+                    *range,
+                    &mut self.placing(builder),
+                    &mut effects,
+                );
                 self.apply_all(tree, builder, segments, effects, out)?;
             }
             Effect::Renamed { .. } => self.moved(std::slice::from_ref(&effect))?,
@@ -868,7 +972,7 @@ impl NamespaceWriter {
             (member, range),
             object,
             passed,
-            builder,
+            &mut self.placing(builder),
             &mut effects,
         );
         self.apply_all(tree, builder, segments, effects, out)?;
@@ -1096,7 +1200,10 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    // The member is closed: its file takes the length the tree gave it.
+    // The member is closed: its file takes the length the tree gave it. A
+    // member none of whose bytes arrived has no file: a name is a file only
+    // once something of it was written, so a file a recovery object
+    // describes is one only when its repair writes it.
     fn close_leaf(
         &mut self,
         tree: &Tree,
@@ -1108,6 +1215,9 @@ impl NamespaceWriter {
             .and_then(|namespace| namespace.get(member))
             .ok_or(WriteError::UnknownMember { node, member })?;
         let length = record.length.unwrap_or(0);
+        if length > 0 && record.coverage.bytes_covered() == 0 {
+            return Ok(());
+        }
         let output_name = record.output_name.clone();
         self.leaf(node, member, &output_name)?.close(length)?;
         Ok(())
@@ -1125,19 +1235,37 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    // Forget every namespace the tree dropped, with the files it wrote.
+    // Forget what the tree dropped: the envelopes of every node nothing
+    // reads back through, and the file of every member no namespace holds,
+    // with the namespace's own files once the namespace is gone too.
     fn prune(&mut self, tree: &Tree) -> Result<(), WriteError> {
-        let gone: Vec<NodeId> = self
-            .files
-            .keys()
-            .copied()
-            .filter(|node| tree.namespace(*node).is_none())
-            .collect();
-        for node in gone {
-            self.envelopes.forget(node)?;
-            // Dropping the namespace's holds gives their count back.
-            if let Some(files) = self.files.remove(&node) {
-                for leaf in files.leaves.into_values().chain(files.scratch) {
+        let nodes: Vec<NodeId> = self.files.keys().copied().collect();
+        for node in nodes {
+            if tree.buried(node) {
+                self.envelopes.forget(node)?;
+            }
+            let Some(namespace) = tree.namespace(node) else {
+                // Dropping the namespace's holds gives their count back.
+                if let Some(files) = self.files.remove(&node) {
+                    for leaf in files.leaves.into_values().chain(files.scratch) {
+                        leaf.remove()?;
+                    }
+                }
+                continue;
+            };
+            let gone: Vec<MemberId> = self.files[&node]
+                .leaves
+                .keys()
+                .copied()
+                .filter(|member| {
+                    namespace.get(*member).is_none() || tree.buried_member(node, *member)
+                })
+                .collect();
+            for member in gone {
+                self.take_held(node, member, ALL)?;
+                let files = self.files_mut(node);
+                files.refused.remove(&member);
+                if let Some(leaf) = files.leaves.remove(&member) {
                     leaf.remove()?;
                 }
             }
@@ -1185,6 +1313,40 @@ impl NamespaceWriter {
     }
 }
 
+pub(crate) struct Placing<'a> {
+    builder: &'a mut dyn Builder,
+    writer: &'a NamespaceWriter,
+}
+
+impl Builder for Placing<'_> {
+    fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
+        self.builder.build(kind, id)
+    }
+
+    fn read(
+        &self,
+        tree: &Tree,
+        node: NodeId,
+        volume: VolumeIndex,
+        placement: &Placement,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let Some((parent, member)) = tree
+            .volumes(node)
+            .and_then(|(parent, volumes)| Some((parent, *volumes.get(&volume)?)))
+        else {
+            return false;
+        };
+        let access = self.writer.access(tree, parent);
+        let start = into.len();
+        let read = access.read_placement((parent, member), node, placement, into);
+        if !read {
+            into.truncate(start);
+        }
+        read
+    }
+}
+
 // A namespace's recovery objects read members and write repaired ranges
 // through this. A read follows the member to wherever its bytes are: its
 // leaf, or through the inverse map of the object that owns it, into that
@@ -1197,8 +1359,13 @@ pub(crate) struct Access<'a> {
     node: NodeId,
     // The recovery object this access was lent to, whose volumes it reads.
     recovery: Option<NodeId>,
+    // Whether bytes still held count as read. A repair reads them; what is
+    // on disk, which a restart reads back, does not hold them.
+    held: bool,
     reads: u64,
     repaired: Vec<(MemberId, u64, Bytes)>,
+    // Ranges the object proved bad and could not rebuild.
+    found: Vec<(MemberId, ByteRange)>,
 }
 
 impl Access<'_> {
@@ -1216,20 +1383,91 @@ impl Access<'_> {
             .child_of(node, member)
             .filter(|(child, _)| self.recovery != Some(*child) && !self.tree.recovers(*child))
         else {
-            return self.read_leaf(node, member, range, into);
+            return self.read_own(node, member, range, into);
         };
         // The object rebuilds its volume's bytes from its placements: one
         // that deciphers puts the cipher back.
-        let mut read = |placement: &Placement, into: &mut Vec<u8>| match placement {
+        let mut read = |placement: &Placement, into: &mut Vec<u8>| {
+            self.read_placement((node, member), child, placement, into)
+        };
+        self.tree.posted(child, volume, range, &mut read, into)
+    }
+
+    // What one placement of the object at `child`, bound to `member` of
+    // `node`, holds.
+    fn read_placement(
+        &self,
+        (node, member): (NodeId, MemberId),
+        child: NodeId,
+        placement: &Placement,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        match placement {
             Placement::Member { member, range } => self.read_at(child, *member, *range, into),
             Placement::Envelope { envelope, range } => {
                 self.writer.envelopes.read(child, *envelope, *range, into)
             }
             // What the object could not place was held for the member, and
             // once released it is in the member's own file.
-            Placement::Held { range } => self.read_leaf(node, member, *range, into),
+            Placement::Held { range } => self.read_own(node, member, *range, into),
+        }
+    }
+
+    // A member no object reads: its bytes are in its own file, or still
+    // held while its front has not said what it is.
+    fn read_own(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let start = into.len();
+        if self.read_leaf(node, member, range, into) {
+            return true;
+        }
+        into.truncate(start);
+        self.held && self.read_held(node, member, range, into)
+    }
+
+    // Bytes still held for the member, read where they are kept and left
+    // held, for a member whose object has not placed them yet.
+    fn read_held(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let Some(files) = self.writer.files.get(&node) else {
+            return range.is_empty();
         };
-        self.tree.posted(child, volume, range, &mut read, into)
+        let start = into.len();
+        let mut at = range.start;
+        for piece in files.holds.peek(held_volume(member), range) {
+            if piece.range.start != at {
+                break;
+            }
+            let read = match piece.location {
+                Location::Ram(bytes) => {
+                    into.extend_from_slice(&bytes);
+                    true
+                }
+                Location::Scratch { offset, len } => files
+                    .scratch
+                    .as_ref()
+                    .is_some_and(|scratch| scratch.read(offset, index(len), into).is_ok()),
+            };
+            if !read {
+                break;
+            }
+            at = piece.range.end;
+        }
+        let whole = at == range.end;
+        if !whole {
+            into.truncate(start);
+        }
+        whole
     }
 
     fn read_leaf(
@@ -1272,6 +1510,10 @@ impl MemberAccess for Access<'_> {
             .push((member, offset, Bytes::copy_from_slice(bytes)));
     }
 
+    fn found_damaged(&mut self, member: MemberId, range: ByteRange) {
+        self.found.push((member, range));
+    }
+
     fn length(&self, member: MemberId) -> Option<u64> {
         self.tree.namespace(self.node)?.get(member)?.length
     }
@@ -1306,6 +1548,10 @@ const ALL: ByteRange = ByteRange {
     end: u64::MAX,
 };
 
+// How much of a member is read back at once, so a large one never sits in
+// memory whole.
+const READ_BACK: u64 = 1 << 20;
+
 fn held_volume(member: MemberId) -> VolumeIndex {
     VolumeIndex(member.0)
 }
@@ -1318,6 +1564,7 @@ fn index(offset: u64) -> usize {
     usize::try_from(offset).expect("an offset fits the address space")
 }
 
+mod claimed;
 mod durable;
 mod refusal;
 #[cfg(test)]

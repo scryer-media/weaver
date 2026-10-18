@@ -8,16 +8,16 @@
 // and an AES 7z repaired through what was posted.
 
 use std::io::Cursor;
-use std::path::PathBuf;
 
 use sevenz_turbo::encoder_options::AesEncoderOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, par3_set, payload, run_both,
 };
 use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::recovery_record_store_set;
 
 const SECRET: &str = "quill-ember-secret";
@@ -48,31 +48,10 @@ fn stored(password: Option<&str>) -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-// A PAR3 index and its volumes over `files`, blocks of one article, index
-// first.
-fn par3_set(base: &str, files: &[(&str, &[u8])], blocks: u64) -> Vec<Vec<u8>> {
-    let source = tempfile::tempdir().unwrap();
-    let names: Vec<PathBuf> = files
-        .iter()
-        .map(|(name, bytes)| {
-            std::fs::write(source.path().join(name), bytes).unwrap();
-            PathBuf::from(name)
-        })
-        .collect();
-    let out = tempfile::tempdir().unwrap();
-    let report = par3_rs::create(
-        &par3_rs::InputSpec::new(source.path(), &names),
-        &out.path().join(base),
-        &par3_rs::CreateOptions::default()
-            .with_block_size(ARTICLE as u64)
-            .with_recovery(par3_rs::RecoveryAmount::Blocks(blocks)),
-    )
-    .unwrap();
-    let mut written = report.files_written.clone();
-    written.sort_by_key(|path| path.to_string_lossy().contains(".vol"));
-    written
-        .iter()
-        .map(|path| std::fs::read(path).unwrap())
+fn par3_bytes(archive: &[u8], blocks: u64) -> Vec<Vec<u8>> {
+    par3_set("lantern", &[("lantern.7z", archive)], blocks)
+        .into_iter()
+        .map(|post| post.bytes)
         .collect()
 }
 
@@ -179,10 +158,7 @@ async fn a_stored_7z_carrying_a_trailing_par2_fails_unpacking_under_classic_and_
 async fn a_stored_7z_carrying_a_trailing_par3_is_repaired_under_both_engines_and_only_classic_refetches()
  {
     let archive = stored(None);
-    let post = trailing(
-        &archive,
-        par3_set("lantern", &[("lantern.7z", &archive)], 2),
-    );
+    let post = trailing(&archive, par3_bytes(&archive, 2));
     let (classic, graph) = run_both(&Scenario::new(vec![post]).damaged(0, 1)).await;
     assert_members(&classic);
     assert_eq!(classic.refetched(), vec![(0, 0)]);
@@ -196,10 +172,7 @@ async fn a_stored_7z_carrying_a_trailing_par3_is_repaired_under_both_engines_and
 async fn a_trailing_par3_losing_one_of_its_blocks_still_repairs_under_both_engines_and_only_classic_refetches()
  {
     let archive = stored(None);
-    let post = trailing(
-        &archive,
-        par3_set("lantern", &[("lantern.7z", &archive)], 3),
-    );
+    let post = trailing(&archive, par3_bytes(&archive, 3));
     let lost = last_block_article(&post);
     let scenario = Scenario::new(vec![post]).damaged(0, 1).lost(0, lost);
     let (classic, graph) = run_both(&scenario).await;
@@ -210,15 +183,15 @@ async fn a_trailing_par3_losing_one_of_its_blocks_still_repairs_under_both_engin
 }
 
 // One recovery block, lost with its article: nothing is left to repair the
-// damaged slice with.
+// damaged slice with. Classic fails the job. Under the graph the member the
+// damage never reached is delivered whole beside the container as it
+// stands, so the job ends Partial (the partial-extraction ruling of
+// 2026-10-18), its failure the repair's.
 #[tokio::test]
-async fn a_trailing_par3_losing_its_only_block_fails_for_health_under_classic_and_for_repair_under_graph()
+async fn a_trailing_par3_losing_its_only_block_fails_for_health_under_classic_and_ends_partial_for_repair_under_graph()
  {
     let archive = stored(None);
-    let post = trailing(
-        &archive,
-        par3_set("lantern", &[("lantern.7z", &archive)], 1),
-    );
+    let post = trailing(&archive, par3_bytes(&archive, 1));
     let lost = last_block_article(&post);
     let scenario = Scenario::new(vec![post]).damaged(0, 1).lost(0, lost);
     let (classic, graph) = run_both(&scenario).await;
@@ -232,15 +205,17 @@ async fn a_trailing_par3_losing_its_only_block_fails_for_health_under_classic_an
         "{:?}",
         classic.failure
     );
-    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert_eq!(
-        graph.failure.as_deref(),
-        Some(
-            "PAR3 recovery failed for 1 set(s): lantern.7z (lantern.7z): not repairable: \
-             1 damaged slices, only 0 recovery blocks reachable"
-        )
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered("lantern.7z"), delivered("quill.bin")]
     );
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert_eq!(graph.graph().blocks_reachable, 0);
     assert_eq!(
         graph.graph().outcomes,

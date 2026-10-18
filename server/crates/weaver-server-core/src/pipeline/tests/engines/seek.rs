@@ -332,7 +332,7 @@ async fn a_lost_recovery_article_is_made_up_from_the_next_volume() {
 // graph rules the repair impossible at once and asks for nothing again.
 // Classic leaves the job at Downloading: its RAR set never takes in the
 // damaged second volume, holding it for a repair that cannot come, where
-// the graph fails the repair.
+// the graph delivers what the repair did not need.
 #[tokio::test]
 async fn a_lost_recovery_article_nothing_makes_up_fails_the_repair() {
     let members = members(3, 81);
@@ -342,7 +342,16 @@ async fn a_lost_recovery_article_nothing_makes_up_fails_the_repair() {
     let blocks = recovery_blocks(&posts[5]);
     let scenario = Scenario::new(posts).damaged(1, 2).lost(5, blocks[0][1]);
     let graph = run(&scenario, Engine::Graph).await;
-    assert_failed(&graph, HistoryFailureKind::Repair);
+    // The members the damage never reached are delivered whole beside the
+    // one it did: the job ends Partial, and the repair that could not
+    // rebuild it is what failed.
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert_eq!(
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Impossible {
@@ -379,22 +388,41 @@ async fn a_lost_recovery_article_is_made_up_from_the_same_volume() {
 
 // Row 5. A data article lost with no recovery: the loss reaches the store
 // as damage at its exact range. The graph delivers the volumes as posted,
-// the damaged one marked, where classic fails the unpack; the same parting
-// as depth.rs's undecodable member.
+// the damaged one marked, beside the members the store had closed whole,
+// where classic fails the unpack; the same parting as depth.rs's
+// undecodable member.
 #[tokio::test]
 async fn a_lost_data_article_without_recovery_delivers_the_volumes_as_posted() {
     let members = members(4, 91);
     let volumes = store_set(&members, 8);
     let scenario = Scenario::new(posts(&volumes)).lost(5, 2);
     let graph = run(&scenario, Engine::Graph).await;
-    assert!(graph.completed(), "{:?}", graph.failure);
+    // The damaged volume is delivered as it stands: the job ends Partial.
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
     assert_eq!(graph.refetched(), Vec::new());
+    // The lost article lies in the third member; the other three closed
+    // whole before the store gave up.
+    let kept = [0, 1, 3];
     let mut names: Vec<String> = volumes
         .iter()
-        .map(|(name, _)| format!("{FOLDER}/{name}"))
+        .map(|(name, _)| name)
+        .chain(kept.iter().map(|at| &members[*at].0))
+        .map(|name| format!("{FOLDER}/{name}"))
         .collect();
     names.sort();
     assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), names);
+    for at in kept {
+        let (name, bytes) = &members[at];
+        assert!(
+            graph.files[&format!("{FOLDER}/{name}")] == *bytes,
+            "{name} closed whole"
+        );
+    }
     assert_eq!(
         graph.graph().claims.get("silver.horizon.part06.rar"),
         Some(&Claim::Damaged)

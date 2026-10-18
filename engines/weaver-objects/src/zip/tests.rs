@@ -189,6 +189,11 @@ fn a_spanned_set_streams_with_its_volumes_out_of_order() {
     for volume in [2, 0, 1] {
         owner.close(volume);
     }
+    // The `.zip` said it is disk 2: nothing numbered follows it.
+    assert_eq!(
+        weaver_graph::Object::claim(&mut owner.object, "alpha.z03", b""),
+        None
+    );
     no_trouble(&owner);
     streamed(&owner);
     for (volume, (_, bytes)) in volumes.iter().enumerate() {
@@ -207,12 +212,12 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     use weaver_graph::Object;
     assert_eq!(zip.claim("alpha.z02", b""), Some(VolumeIndex(1)));
     zip.bound(VolumeIndex(1), "alpha.z02");
-    assert_eq!(zip.claim("alpha.zip", b""), Some(VolumeIndex(2)));
-    zip.bound(VolumeIndex(2), "alpha.zip");
+    assert_eq!(zip.claim("alpha.zip", b""), Some(VolumeIndex(u32::MAX)));
+    zip.bound(VolumeIndex(u32::MAX), "alpha.zip");
     assert_eq!(
         zip.claim("alpha.z03", b""),
-        None,
-        "nothing follows the last"
+        Some(VolumeIndex(2)),
+        "a numbered volume takes its number until the last says its disk"
     );
     assert_eq!(zip.claim("beta.z03", b""), None);
     assert_eq!(zip.claim("alpha.z02", b""), None);

@@ -47,6 +47,13 @@ impl Member {
         self.length
             .is_some_and(|length| self.coverage.covered(ByteRange::new(0, length)))
     }
+
+    // Closed whole: nothing more will arrive, every byte did, and every one
+    // of them is good. Such a member is delivered whatever its producer or
+    // its siblings do after.
+    pub fn is_whole(&self) -> bool {
+        self.closed && self.is_complete() && self.coverage.is_clean()
+    }
 }
 
 // One contiguous run of bytes that arrived, with how they arrived.
@@ -192,7 +199,15 @@ pub struct Namespace {
     // The front of each member, up to FIRST_BYTES: what a recovery object
     // recognises an obfuscated member by. Kept apart from the members so a
     // member record stays a plain value.
-    first_bytes: BTreeMap<MemberId, Vec<u8>>,
+    first_bytes: BTreeMap<MemberId, Front>,
+}
+
+// What arrived of a member's first FIRST_BYTES, and where: bytes past a
+// hole are kept, so the front reaches as far as they do once it fills.
+#[derive(Debug, Default)]
+struct Front {
+    bytes: Vec<u8>,
+    arrived: Coverage,
 }
 
 // How much of a member's front the namespace keeps. PAR2 identifies a file
@@ -291,31 +306,43 @@ impl Namespace {
         self.members.remove(&member)
     }
 
-    // Keep the part of a delivered range that lies in the member's front.
-    // Only bytes contiguous from offset zero count, because a front with a
-    // hole in it identifies nothing; bytes over what is kept replace it, the
-    // way a repair replaces a damaged first article.
+    // Keep the part of a delivered range that lies in the member's first
+    // FIRST_BYTES. Bytes over what is kept replace it, the way a repair
+    // replaces a damaged first article.
     pub fn keep_first_bytes(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
         if !self.members.contains_key(&member) {
             return;
         }
-        let front = self.first_bytes.entry(member).or_default();
         let Ok(start) = usize::try_from(offset) else {
             return;
         };
-        if start > front.len() || start >= FIRST_BYTES {
+        if start >= FIRST_BYTES || bytes.is_empty() {
             return;
         }
         let end = start.saturating_add(bytes.len()).min(FIRST_BYTES);
-        if end > front.len() {
-            front.resize(end, 0);
+        let front = self.first_bytes.entry(member).or_default();
+        if end > front.bytes.len() {
+            front.bytes.resize(end, 0);
         }
-        front[start..end].copy_from_slice(&bytes[..end - start]);
+        front.bytes[start..end].copy_from_slice(&bytes[..end - start]);
+        front
+            .arrived
+            .write(ByteRange::new(start as u64, end as u64), Provenance::Fresh);
     }
 
-    // The member's front as far as it arrived, at most FIRST_BYTES.
+    // The member's front: what arrived contiguous from offset zero, at most
+    // FIRST_BYTES, because a front with a hole in it identifies nothing.
     pub fn first_bytes(&self, member: MemberId) -> &[u8] {
-        self.first_bytes.get(&member).map_or(&[], Vec::as_slice)
+        let Some(front) = self.first_bytes.get(&member) else {
+            return &[];
+        };
+        let reached = front
+            .arrived
+            .runs()
+            .next()
+            .filter(|run| run.range.start == 0)
+            .map_or(0, |run| run.range.end);
+        &front.bytes[..usize::try_from(reached).unwrap_or(0).min(front.bytes.len())]
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<&Member> {

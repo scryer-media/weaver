@@ -8,9 +8,10 @@
 // fails marks the member's extent damaged for the recovery beside it.
 
 use bytes::Bytes;
-use weaver_graph::{ByteRange, Emit, MemberId, Provenance, Segment, SliceVerdict};
+use weaver_graph::{ByteRange, Emit, MemberId, Placement, Provenance, Segment, SliceVerdict};
 
 use super::map::Map;
+use super::place::read_folder;
 use super::{Lock, Out, SevenZipStore};
 use crate::crypt::{Placed, worse};
 use crate::grid::{self, WHOLE, crc32};
@@ -28,14 +29,14 @@ impl Placed for FolderPlaced<'_> {
     fn placed(&self, range: ByteRange) -> Option<Provenance> {
         let mut worst = Provenance::Fresh;
         let mut cursor = range.start;
-        for (_, entry) in self.map.entries_in(self.folder, range) {
+        for (member, entry) in self.map.entries_in(self.folder, range) {
             let Some(part) = range.intersect(entry.span()) else {
                 continue;
             };
             if part.start > cursor {
                 return None;
             }
-            let said = self.members.get(entry.member?.0 as usize)?;
+            let said = self.members.get(member.0 as usize)?;
             let placed = said.coverage.placed(part.shift(-(entry.offset as i64)))?;
             worst = worse(worst, placed);
             cursor = part.end;
@@ -50,6 +51,7 @@ impl SevenZipStore {
         range: ByteRange,
         bytes: &[u8],
         provenance: Provenance,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
         let Some(map) = self.map.take() else {
@@ -72,14 +74,11 @@ impl SevenZipStore {
                         folder: index,
                         members: &self.members,
                     };
-                    cbc.deliver(
-                        &placed,
-                        padding,
-                        local.start,
-                        slice,
-                        provenance,
-                        &mut plains,
-                    );
+                    let mut plain = |wanted: ByteRange, buffer: &mut Vec<u8>| {
+                        read_folder(&map, index, wanted, read, buffer)
+                    };
+                    let arrival = (local.start, slice, provenance);
+                    cbc.deliver(&placed, padding, arrival, &mut plain, &mut plains);
                     for plain in std::mem::take(&mut plains) {
                         let span = ByteRange::at(plain.offset, plain.bytes.len() as u64);
                         self.emit_plain(&map, index, span, &plain.bytes, plain.provenance, out);
@@ -102,8 +101,8 @@ impl SevenZipStore {
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
-        for (_, entry) in map.entries_in(folder, range) {
-            let (Some(member), Some(part)) = (entry.member, range.intersect(entry.span())) else {
+        for (member, entry) in map.entries_in(folder, range) {
+            let Some(part) = range.intersect(entry.span()) else {
                 continue;
             };
             let slice =

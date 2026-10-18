@@ -11,11 +11,13 @@ use crate::zip_engine::ZipEngine;
 const PASSWORD: &str = "a-test-passphrase";
 
 // Two volumes bound, the run past the first, a password offered: restored,
-// the engine claims and bids alike, and its facts hold no password.
-fn restored(engine: Box<dyn Object>, names: [&str; 3]) {
+// the engine claims and bids alike, and its facts hold no password. `last`
+// is the index the set's last name binds at, which a set whose last volume
+// carries no number does not know from the name.
+fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
     let steps = [
         Step::Bound(0, names[0]),
-        Step::Bound(2, names[2]),
+        Step::Bound(last, names[2]),
         Step::Password(PASSWORD),
     ];
     let (facts, mut live, mut again) = restores_alike(engine, &steps, 3, &[]);
@@ -41,13 +43,16 @@ fn every_engine_restored_from_its_facts_claims_and_bids_alike() {
     restored(
         Box::new(RarEngine::new()),
         ["alpha.part1.rar", "alpha.part2.rar", "alpha.part3.rar"],
+        2,
     );
     restored(
         Box::new(SevenZipEngine::new()),
         ["alpha.7z.001", "alpha.7z.002", "alpha.7z.003"],
+        2,
     );
     restored(
         Box::new(ZipEngine::new()),
         ["alpha.z01", "alpha.z02", "alpha.zip"],
+        u32::MAX,
     );
 }

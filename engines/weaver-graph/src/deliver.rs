@@ -98,6 +98,10 @@ pub enum Why {
     HoldsBreached,
     // The format is recognised but the object does not implement this shape.
     Unsupported,
+    // Every volume is in and nothing more will reach the object, yet it
+    // never placed every member it named: its map never came, or never
+    // closed what it announced.
+    Unmapped,
 }
 
 // What a child says back when bytes arrive.

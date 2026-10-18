@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ::zip::ZipArchive;
-use ::zip::result::ZipError;
 use bytes::Bytes;
-use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
+use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 
 use super::image::{Image, Unopened};
 use crate::engine::Joined;
+use crate::verdict;
 
 pub(super) struct Run {
     password: Option<String>,
@@ -74,13 +74,13 @@ struct Walk<'s, 'a> {
 
 impl Walk<'_, '_> {
     fn all(&mut self, image: Image, password: Option<&str>) -> Result<(), Option<Emit>> {
-        let mut archive = ZipArchive::new(image).map_err(|error| Some(verdict(&error)))?;
+        let mut archive = ZipArchive::new(image).map_err(|error| Some(verdict::zip(&error)))?;
         for index in 0..archive.len() {
             let file = match password {
                 Some(password) => archive.by_index_decrypt(index, password.as_bytes()),
                 None => archive.by_index(index),
             };
-            let mut file = file.map_err(|error| Some(verdict(&error)))?;
+            let mut file = file.map_err(|error| Some(verdict::zip(&error)))?;
             // The namespace has no directories, and no links or devices: a
             // directory is implied by the paths of the members inside it, and
             // the others are not file bodies.
@@ -106,7 +106,7 @@ impl Walk<'_, '_> {
             if out.stopped {
                 return Err(None);
             }
-            copied.map_err(|error| Some(read_verdict(&error, encrypted)))?;
+            copied.map_err(|error| Some(verdict::zip_read(&error, encrypted)))?;
             self.open = None;
             self.say(Emit::MemberClosed(member))?;
         }
@@ -122,32 +122,6 @@ fn is_file_body(directory: bool, mode: Option<u32>) -> bool {
     const KIND: u32 = 0o170_000;
     const FILE: u32 = 0o100_000;
     !directory && mode.is_none_or(|mode| matches!(mode & KIND, 0 | FILE))
-}
-
-// What a zip error means for the job.
-fn verdict(error: &ZipError) -> Emit {
-    match error {
-        ZipError::InvalidPassword => Emit::NeedsPassword,
-        ZipError::UnsupportedArchive(why) if *why == ZipError::PASSWORD_REQUIRED => {
-            Emit::NeedsPassword
-        }
-        ZipError::UnsupportedArchive(_) | ZipError::CompressionMethodNotSupported(_) => {
-            Emit::Refuse(Why::Unsupported)
-        }
-        ZipError::Io(error) => read_verdict(error, false),
-        _ => Emit::Refuse(Why::Unrepairable),
-    }
-}
-
-// A read that failed inside an entry. A checksum that fails in enciphered
-// content is a possibly wrong password, so a wrong key asks for another
-// before it is called damage.
-fn read_verdict(error: &io::Error, encrypted: bool) -> Emit {
-    if encrypted && error.kind() == io::ErrorKind::InvalidData {
-        Emit::NeedsPassword
-    } else {
-        Emit::Refuse(Why::Unrepairable)
-    }
 }
 
 // The decoder's output, handed to the sink as it is written.

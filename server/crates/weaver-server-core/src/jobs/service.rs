@@ -148,7 +148,9 @@ impl Pipeline {
         let download_state = match status {
             JobStatus::Queued => crate::jobs::model::DownloadState::Queued,
             JobStatus::Checking => crate::jobs::model::DownloadState::Checking,
-            JobStatus::Complete | JobStatus::Moving => crate::jobs::model::DownloadState::Complete,
+            JobStatus::Complete | JobStatus::Partial | JobStatus::Moving => {
+                crate::jobs::model::DownloadState::Complete
+            }
             JobStatus::Failed { .. } => crate::jobs::model::DownloadState::Failed,
             _ => {
                 if download_queue.is_empty() && recovery_queue.is_empty() {
@@ -187,7 +189,10 @@ impl Pipeline {
     }
 
     fn is_restartable_terminal_status(status: &JobStatus) -> bool {
-        matches!(status, JobStatus::Complete | JobStatus::Failed { .. })
+        matches!(
+            status,
+            JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }
+        )
     }
 
     fn scrub_restored_par2_file_identities(
@@ -2148,7 +2153,9 @@ impl Pipeline {
                     crate::jobs::model::PostState::QueuedPostProcessing
                 }
                 JobStatus::PostProcessing => crate::jobs::model::PostState::PostProcessing,
-                JobStatus::Complete => crate::jobs::model::PostState::Completed,
+                JobStatus::Complete | JobStatus::Partial => {
+                    crate::jobs::model::PostState::Completed
+                }
                 JobStatus::Failed { .. } => crate::jobs::model::PostState::Failed,
                 JobStatus::Paused => crate::jobs::model::PostState::Idle,
                 JobStatus::Downloading | JobStatus::Checking => crate::jobs::model::PostState::Idle,
@@ -2184,7 +2191,9 @@ impl Pipeline {
                     JobStatus::QueuedExtract => crate::jobs::model::PostState::QueuedExtract,
                     JobStatus::Extracting => crate::jobs::model::PostState::Extracting,
                     JobStatus::Moving => crate::jobs::model::PostState::Finalizing,
-                    JobStatus::Complete => crate::jobs::model::PostState::Completed,
+                    JobStatus::Complete | JobStatus::Partial => {
+                        crate::jobs::model::PostState::Completed
+                    }
                     JobStatus::Failed { .. } => crate::jobs::model::PostState::Failed,
                     _ => crate::jobs::model::PostState::Idle,
                 })
@@ -2354,6 +2363,7 @@ impl Pipeline {
                     JobStatus::Paused
                         | JobStatus::Moving
                         | JobStatus::Complete
+                        | JobStatus::Partial
                         | JobStatus::Failed { .. }
                 )
             })
@@ -2372,6 +2382,19 @@ mod tests {
     use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
     use crate::jobs::{FileSpec, JobSpec, SegmentSpec};
     use weaver_model::files::FileRole;
+
+    #[test]
+    fn a_partial_job_restarts_like_any_terminal_job() {
+        assert!(Pipeline::is_restartable_terminal_status(
+            &JobStatus::Partial
+        ));
+        assert!(Pipeline::is_restartable_terminal_status(
+            &JobStatus::Complete
+        ));
+        assert!(!Pipeline::is_restartable_terminal_status(
+            &JobStatus::Extracting
+        ));
+    }
 
     fn sparse_segment_job_spec() -> JobSpec {
         JobSpec {

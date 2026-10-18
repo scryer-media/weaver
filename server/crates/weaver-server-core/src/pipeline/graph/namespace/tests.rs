@@ -28,7 +28,12 @@ impl Object for Store {
         Kind::RarStore
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
         if delivery.bytes.windows(7).any(|window| window == b"RETRACT") {
             out.push(Emit::Retract(MemberId(0)));
             return;
@@ -81,7 +86,19 @@ impl Object for Store {
     }
 }
 
-const SEVEN_Z: &[u8] = b"7z\xbc\xaf\x27\x1c";
+// A 7z signature header: the magic, format version 0.4, and the start
+// header's fields, which nothing here reads. The sniffer reads the whole
+// 32 bytes before it names the kind.
+const SEVEN_Z: &[u8] = &{
+    let mut header = [0u8; 32];
+    let magic = *b"7z\xbc\xaf\x27\x1c\x00\x04";
+    let mut at = 0;
+    while at < magic.len() {
+        header[at] = magic[at];
+        at += 1;
+    }
+    header
+};
 const MAP: &[u8] = b"MAP";
 // The pretend 7z lays out as signature, body, map: the map at the end says
 // where the body's member lies.
@@ -104,7 +121,12 @@ impl Object for Late {
         Kind::SevenZipStore
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
         let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);
         if !self.mapped && range.intersect(map_at()) == Some(map_at()) {
             self.mapped = true;
@@ -189,6 +211,17 @@ impl Builder for Build {
             _ => None,
         }
     }
+
+    fn read(
+        &self,
+        _: &weaver_graph::Tree,
+        _: weaver_graph::NodeId,
+        _: weaver_graph::VolumeIndex,
+        _: &weaver_graph::Placement,
+        _: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
 }
 
 // The source's segments: one per delivered range, with a checksum the
@@ -232,7 +265,20 @@ struct Fix {
 // covers the members beside it except any called `other.*`, keeps its own
 // bytes in its member's file, and recognises a member by what has arrived
 // of it, renaming it.
-const PAR2_SIGNATURE: &[u8] = b"PAR2\0PKT\x40\x00\x00\x00";
+//
+// Its front is a whole PAR2 packet header, which the sniffer reads before
+// it names the kind: magic, a packet length of 64, and the hash, set id and
+// type fields, which nothing here reads.
+const PAR2_SIGNATURE: &[u8] = &{
+    let mut header = [0u8; 64];
+    let magic = *b"PAR2\0PKT\x40";
+    let mut at = 0;
+    while at < magic.len() {
+        header[at] = magic[at];
+        at += 1;
+    }
+    header
+};
 
 struct Par {
     volume: Option<MemberId>,
@@ -247,7 +293,13 @@ impl Object for Par {
         Kind::Par2
     }
 
-    fn deliver(&mut self, _: Delivery<'_>, _: &mut Vec<Emit>) {}
+    fn deliver(
+        &mut self,
+        _: Delivery<'_>,
+        _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
+    }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&mut self, _: &mut Vec<Seek>) {}
@@ -774,6 +826,71 @@ fn a_retraction_truncates_the_leaf_and_keeps_its_name_for_what_comes_back() {
     let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
     assert_eq!(inner.output_name, "inner.bin");
     assert_eq!(inner.coverage.bytes_covered(), 0);
+}
+
+// The store closed "inner.bin" whole and had "open.bin" part written when it
+// gave up. The volume is written out as posted, the closed member stays
+// delivered beside it, and the open one's file is gone: the volume stands
+// for it, and the member stays only buried.
+#[test]
+fn a_refusal_keeps_the_member_it_closed_and_replaces_the_open_one_with_the_volume() {
+    let mut job = Job::new(PLENTY);
+    let (member, child) = bound_store(&mut job);
+    let mut build = job.build();
+    for emit in [
+        Emit::MemberClosed(MemberId(0)),
+        Emit::Member {
+            member: MemberId(1),
+            name: "open.bin".into(),
+            length: Some(4),
+        },
+        Emit::Bytes {
+            member: MemberId(1),
+            offset: 0,
+            bytes: Bytes::from_static(b"ab"),
+            provenance: Provenance::Fresh,
+        },
+    ] {
+        job.writer
+            .said(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                child,
+                emit,
+                &mut job.out,
+            )
+            .expect("said");
+    }
+    assert!(job.file("open.bin").starts_with(b"ab"));
+    job.writer
+        .said(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            child,
+            Emit::Refuse(Why::Compressed),
+            &mut job.out,
+        )
+        .expect("refuse");
+    assert_eq!(job.file("pack.bin"), [SIGNATURE, b"hello"].concat());
+    assert_eq!(job.file("inner.bin"), b"hello");
+    assert!(!job.dir.path().join("open.bin").exists());
+    assert!(job.tree.buried(child));
+    let kept = job.tree.namespace(child).expect("what it closed stays");
+    assert!(kept.get(MemberId(0)).is_some_and(|inner| inner.is_whole()));
+    // The open member stays only buried, with no file: the tree's word
+    // that the store left it open.
+    assert!(job.tree.buried_member(child, MemberId(1)));
+    assert!(job.tree.left_open(NodeId::ROOT, member));
+    assert_eq!(
+        job.writer
+            .files(child)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        [MemberId(0)]
+    );
+    assert!(job.root().get(member).unwrap().is_leaf());
 }
 
 // A root member recognised as the name a store's member was written under

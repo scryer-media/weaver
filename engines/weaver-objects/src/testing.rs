@@ -283,6 +283,7 @@ impl<O: Object> Job<O> {
                     bytes: piece,
                     provenance: Provenance::Fresh,
                 },
+                &mut |_, _| false,
                 &mut out,
             );
         }

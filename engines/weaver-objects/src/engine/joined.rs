@@ -34,14 +34,28 @@ impl Joined {
         Arc::clone(&self.failed)
     }
 
-    pub(crate) fn volumes(&self) -> &Arc<dyn Volumes> {
-        &self.volumes
-    }
-
     fn read_volume(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
         self.volumes
             .read_at(volume, offset, into)
             .inspect_err(|_| self.failed.store(true, Ordering::Release))
+    }
+
+    // The volume after `after` in the set's order, as the owner says.
+    pub(crate) fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        self.volumes
+            .next(after)
+            .inspect_err(|_| self.failed.store(true, Ordering::Release))
+    }
+
+    // Every volume's length in the set's order, waiting for each to close.
+    pub(crate) fn closed_lens(&self) -> io::Result<Vec<u64>> {
+        let mut lens = Vec::new();
+        let mut at = None;
+        while let Some(volume) = self.next(at)? {
+            lens.push(self.closed_len(volume)?);
+            at = Some(volume);
+        }
+        Ok(lens)
     }
 
     // Bytes at `offset` of the joined set; short only at its end.
@@ -50,10 +64,9 @@ impl Joined {
             return Ok(0);
         }
         let mut start = 0u64;
-        for volume in 0..self.volumes.count() {
-            let volume = VolumeIndex(
-                u32::try_from(volume).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
-            );
+        let mut at = None;
+        while let Some(volume) = self.next(at)? {
+            at = Some(volume);
             let local = offset - start;
             let len = match self.volumes.len(volume) {
                 Some(len) => len,

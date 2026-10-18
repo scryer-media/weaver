@@ -22,6 +22,7 @@ fn member(id: u32, name: &str) -> MemberRecord {
         bound_to: None,
         owner: None,
         given_up: None,
+        buried: false,
         undecided: false,
     }
 }
@@ -50,7 +51,12 @@ fn node(id: u32, parent: Option<u32>, kind: Option<Kind>) -> NodeRecord {
 // Every field a checkpoint carries, in every shape it takes.
 fn full() -> Snapshot {
     let mut root = node(0, None, None);
-    root.members = vec![member(0, "set.part1.rar"), member(1, "set.par2")];
+    root.members = vec![
+        member(0, "set.part1.rar"),
+        member(1, "set.par2"),
+        member(2, "set.r00"),
+    ];
+    root.members[2].buried = true;
     root.members[0].bound_to = Some(ObjectId(1));
     root.members[0].owner = Some((NodeId(1), VolumeIndex(0)));
     root.members[0].closed = true;
@@ -97,6 +103,7 @@ fn full() -> Snapshot {
         },
         root: RootFacts {
             next_node: 3,
+            posted: vec!["alpha.part1.rar".to_owned(), "alpha.par2".to_owned()],
             volumes: vec![
                 VolumeFacts {
                     articles: vec![

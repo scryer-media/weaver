@@ -16,7 +16,7 @@ pub struct Brotli;
 // The largest window a large-window stream may declare.
 const LARGEST_BITS: u32 = 30;
 // How much compressed input the decoder pulls at once.
-const BUFFER: usize = 64 << 10;
+const BUFFER: usize = 4096;
 
 impl Decoder for Brotli {
     const KIND: Kind = Kind::Brotli;

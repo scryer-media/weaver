@@ -82,8 +82,8 @@ enum Verdict {
 }
 
 impl SevenZipStore {
-    // Ask the job for a password, once: an offer answers it, and asking
-    // again would only ask the same question.
+    // Ask the job for a password, once until an offer answers it: asking
+    // again before then would only ask the same question.
     pub(super) fn ask(&mut self, out: &mut Vec<Emit>) {
         if !self.asked {
             self.asked = true;
@@ -289,10 +289,11 @@ impl SevenZipStore {
             return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
         }
         // The proof's bytes were kept, not held: they go to their members
-        // here, and the owner holds the rest of the folder's.
+        // here, and the owner holds the rest of the folder's. Nothing of a
+        // folder opened only now has come out, so there is nothing to read.
         if let Some(proof) = self.proof.take() {
             for (range, bytes, provenance) in self.kept.take(proof.range) {
-                self.route(range, &bytes, provenance, out);
+                self.route(range, &bytes, provenance, &mut |_, _| false, out);
             }
         }
     }

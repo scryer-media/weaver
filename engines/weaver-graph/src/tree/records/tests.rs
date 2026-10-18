@@ -5,7 +5,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::super::{Builder, Tree};
-use crate::deliver::{Delivery, Emit, Provenance};
+use crate::deliver::{Delivery, Emit, Provenance, Why};
 use crate::facts::{Durable, Facts, Restore, RestoreError};
 use crate::member::MemberId;
 use crate::object::{Extent, Kind, Object, ObjectId, Placement};
@@ -43,7 +43,12 @@ impl Object for Wrap {
     fn kind(&self) -> Kind {
         self.kind
     }
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
         if !self.announced {
             self.announced = true;
             out.push(Emit::Member {
@@ -101,6 +106,10 @@ impl Builder for Objects {
             inner: inner.to_owned(),
             announced: false,
         }))
+    }
+
+    fn read(&self, _: &Tree, _: NodeId, _: VolumeIndex, _: &Placement, _: &mut Vec<u8>) -> bool {
+        false
     }
 }
 
@@ -235,5 +244,66 @@ fn a_retired_node_comes_back_retired_with_what_it_gave_up() {
         rebuilt.retired(NodeId::ROOT, archive),
         Some((NodeId(1), VolumeIndex(0)))
     );
+    assert_eq!(rebuilt.records(), record);
+}
+
+// A refusal the owner buried leaves its member settled; the record says so,
+// so a rebuilt tree offers it to no later object either.
+#[test]
+fn a_buried_refusal_comes_back_settled() {
+    let (tree, archive) = three_levels();
+    let mut record = tree.records();
+    record.nodes[0].members[1].owner = None;
+    record.nodes[0].members[1].buried = true;
+    let rebuilt = Tree::rebuild(&record, &Objects).expect("rebuilds");
+    assert_eq!(rebuilt.retired(NodeId::ROOT, archive), None);
+    assert_eq!(
+        rebuilt.records().nodes[0].members[1],
+        record.nodes[0].members[1]
+    );
+
+    let mut both = record.clone();
+    both.nodes[0].members[1].given_up = Some((NodeId(1), VolumeIndex(0)));
+    assert!(
+        Tree::rebuild(&both, &Objects).is_err(),
+        "given up and buried at once"
+    );
+}
+
+// A refused object that announced a member and never closed it, buried: the
+// member stays in its namespace, settled, and the record carries it back,
+// so a rebuilt tree still reads that the object left a member open, and the
+// member holds no name.
+#[test]
+fn a_member_a_buried_refusal_left_open_comes_back_buried() {
+    let (mut tree, archive) = three_levels();
+    let mut effects = Vec::new();
+    tree.emitted(
+        NodeId(1),
+        vec![Emit::Refuse(Why::Unsupported)],
+        &mut Objects,
+        &mut effects,
+    );
+    tree.bury(NodeId::ROOT, archive);
+    assert!(tree.left_open(NodeId::ROOT, archive));
+    let open: Vec<(NodeId, MemberId)> = [NodeId(1), NodeId(2)]
+        .into_iter()
+        .flat_map(|node| {
+            tree.namespace(node)
+                .into_iter()
+                .flat_map(|namespace| namespace.members().map(|member| member.id))
+                .map(move |member| (node, member))
+                .collect::<Vec<_>>()
+        })
+        .filter(|(node, member)| tree.buried_member(*node, *member))
+        .collect();
+    assert!(!open.is_empty(), "a member left open stays, buried");
+
+    let record = tree.records();
+    let rebuilt = Tree::rebuild(&record, &Objects).expect("rebuilds");
+    assert!(rebuilt.left_open(NodeId::ROOT, archive));
+    for (node, member) in &open {
+        assert!(rebuilt.buried_member(*node, *member), "{node:?} {member:?}");
+    }
     assert_eq!(rebuilt.records(), record);
 }

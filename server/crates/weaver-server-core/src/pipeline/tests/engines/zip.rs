@@ -12,7 +12,9 @@ use ::zip::{AesMode, CompressionMethod, ZipWriter};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, assert_same, payload, run_both};
+use super::harness::{
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
+};
 
 const SECRET: &str = "beacon-lantern-secret";
 
@@ -23,11 +25,11 @@ fn members() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-fn stored() -> SimpleFileOptions {
+pub(super) fn stored() -> SimpleFileOptions {
     SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
 }
 
-fn archive(options: SimpleFileOptions) -> Vec<u8> {
+pub(super) fn archive(options: SimpleFileOptions) -> Vec<u8> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     for (name, bytes) in members() {
         writer.start_file(name, options).unwrap();
@@ -48,8 +50,18 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
 // `.zip` last. The `zip` crate writes no spanned sets, so the directory is
 // rewritten here: the spanning marker leads the first volume, and every
 // entry, and the end record, names its disk and the offset within it.
-fn spanned(single: &[u8], parts: usize) -> Vec<Post> {
-    const MARKER: [u8; 4] = [0x50, 0x4b, 0x07, 0x08];
+pub(super) fn spanned(single: &[u8], parts: usize) -> Vec<Post> {
+    let part = (SPANNING_MARKER.len() + single.len()).div_ceil(parts);
+    let cuts: Vec<usize> = (1..parts).map(|index| index * part).collect();
+    spanned_at(single, &cuts)
+}
+
+const SPANNING_MARKER: [u8; 4] = [0x50, 0x4b, 0x07, 0x08];
+
+// The same, cut at the given offsets of the spanned bytes, the marker
+// included, so a test can say where a disk starts.
+pub(super) fn spanned_at(single: &[u8], cuts: &[usize]) -> Vec<Post> {
+    const MARKER: [u8; 4] = SPANNING_MARKER;
     const CENTRAL: u32 = 0x0201_4b50;
     const END: u32 = 0x0605_4b50;
     const END_LEN: usize = 22;
@@ -61,8 +73,13 @@ fn spanned(single: &[u8], parts: usize) -> Vec<Post> {
     let offset = u32_at(single, tail + 16) as usize;
     let mut directory = single[offset..offset + size].to_vec();
     let total = MARKER.len() + single.len();
-    let part = total.div_ceil(parts);
-    let locate = |at: usize| ((at / part) as u16, (at % part) as u32);
+    let parts = cuts.len() + 1;
+    // The disk an offset is on, and where in it.
+    let locate = |at: usize| {
+        let disk = cuts.iter().filter(|cut| **cut <= at).count();
+        let start = disk.checked_sub(1).map_or(0, |before| cuts[before]);
+        (disk as u16, (at - start) as u32)
+    };
     let mut at = 0;
     for _ in 0..entries {
         assert_eq!(u32_at(&directory, at), CENTRAL);
@@ -91,8 +108,13 @@ fn spanned(single: &[u8], parts: usize) -> Vec<Post> {
     joined.extend(directory_at.to_le_bytes());
     joined.extend(0u16.to_le_bytes());
     assert_eq!(joined.len(), total);
-    let volumes: Vec<Post> = joined
-        .chunks(part)
+    let bounds: Vec<usize> = std::iter::once(0)
+        .chain(cuts.iter().copied())
+        .chain(std::iter::once(total))
+        .collect();
+    let volumes: Vec<Post> = bounds
+        .windows(2)
+        .map(|edge| &joined[edge[0]..edge[1]])
         .enumerate()
         .map(|(index, bytes)| {
             let name = if index + 1 == parts {
@@ -192,4 +214,224 @@ async fn an_aes_zip_with_the_job_password_is_extracted_under_both_engines() {
     let (classic, graph) = run_both(&scenario).await;
     assert_members(&classic);
     assert_same(&classic, &graph);
+}
+
+pub(super) fn deflated() -> Vec<u8> {
+    archive(SimpleFileOptions::default().compression_method(CompressionMethod::Deflated))
+}
+
+fn kinds(graph: &Outcome) -> Vec<&str> {
+    graph.graph().kinds.iter().map(String::as_str).collect()
+}
+
+// The deflated zip cut into articles of every size from the whole file down
+// to a byte (4 KiB is the whole file again): one outcome and one set of files
+// under both engines, and neither refetches.
+#[tokio::test]
+async fn a_deflate_zip_delivers_alike_in_every_frame_size_under_both_engines() {
+    let mut seen = None;
+    for size in [usize::MAX, 4096, 64, 1] {
+        let scenario = Scenario::new(vec![Post::plain("lantern.zip", deflated())]).framed(size);
+        let (classic, graph) = run_both(&scenario).await;
+        assert_members(&classic);
+        assert_members(&graph);
+        assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
+        assert_same(&classic, &graph);
+        let files = seen.get_or_insert_with(|| graph.files.clone());
+        assert_eq!(*files, graph.files, "frames of {size} bytes");
+    }
+}
+
+// A wrong candidate and then the right one. The store hands the enciphered
+// entries to the engine, whose run asks for a password, fails the wrong one
+// and asks again; each candidate is offered once.
+#[tokio::test]
+async fn an_aes_zip_tries_a_wrong_candidate_once_then_the_right_one_under_both_engines() {
+    let enciphered = stored().with_aes_encryption(AesMode::Aes256, SECRET);
+    let scenario = Scenario::new(vec![Post::plain("lantern.zip", archive(enciphered))])
+        .global_password("cinder-wrong-guess")
+        .global_password(SECRET);
+    let (classic, graph) = run_both(&scenario).await;
+    assert_members(&classic);
+    assert_members(&graph);
+    assert_eq!(kinds(&graph), ["zip", "zip_engine"]);
+    let offered: Vec<_> = graph.graph().offered.values().copied().collect();
+    assert_eq!(offered, [2], "one try for each of the two candidates");
+    assert_same(&classic, &graph);
+}
+
+// The second entry's local header.
+fn second_local(bytes: &[u8]) -> usize {
+    const LOCAL: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, window)| *window == LOCAL)
+        .nth(1)
+        .map(|(at, _)| at)
+        .unwrap()
+}
+
+// quill.bin's deflated stream damaged with no PAR2, in 16-byte articles: the
+// fifth article past its local header's, inside its data. The engine's run
+// closes ember.bin whole and then fails quill.bin's CRC, and the job ends
+// Partial with the archive as posted delivered. Divergence from the partial
+// extraction ruling (2026-10-18), not asserted: graph does not deliver
+// ember.bin, though the engine closed it; the 7z row above keeps its closed
+// member under the same refusal. Divergence: classic fails the job (Repair)
+// and delivers nothing.
+#[tokio::test]
+async fn a_deflate_zip_with_a_damaged_member_and_no_par2_ends_partial_under_graph() {
+    let bytes = deflated();
+    let damaged = (second_local(&bytes) / 16 + 4) as u32;
+    let scenario = Scenario::new(vec![Post::plain("lantern.zip", bytes.clone())])
+        .framed(16)
+        .damaged(0, damaged);
+    let (classic, graph) = run_both(&scenario).await;
+
+    assert!(
+        matches!(classic.status, Some(JobStatus::Failed { .. })),
+        "classic: {:?}",
+        classic.status
+    );
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Repair));
+    assert!(
+        classic.files.is_empty(),
+        "classic: {:?}",
+        classic.files.keys()
+    );
+    assert!(
+        classic.refetched().is_empty(),
+        "classic: {:?}",
+        classic.refetched()
+    );
+
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "graph: {:?}",
+        graph.failure
+    );
+    assert!(
+        graph.refetched().is_empty(),
+        "graph: {:?}",
+        graph.refetched()
+    );
+    assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
+    assert!(!graph.files.contains_key(&delivered("quill.bin")));
+    assert_eq!(
+        graph.files.get(&delivered("lantern.zip")).map(Vec::len),
+        Some(bytes.len()),
+        "the archive as posted"
+    );
+    assert_eq!(
+        graph.graph().claims.get("lantern.zip"),
+        Some(&Claim::Damaged)
+    );
+}
+
+// The spanned set posted out of order: the `.zip`, which ends the set and
+// holds the directory, first. It carries no signature of its own, so it is
+// a leaf until `.z01` binds the store, which is then offered it. Its name
+// gives no number, so it binds as the symbolic last volume and `.z02` still
+// takes its own; the store learns the `.zip`'s disk from the end record in
+// its tail and maps. Classic opens the first file as the whole zip and
+// fails (Unpack).
+async fn spanned_out_of_order(scenario: Scenario) -> Outcome {
+    let (classic, graph) = run_both(&scenario).await;
+    assert!(
+        matches!(classic.status, Some(JobStatus::Failed { .. })),
+        "classic: {:?}",
+        classic.status
+    );
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
+    assert_members(&graph);
+    assert!(
+        graph.refetched().is_empty(),
+        "graph: {:?}",
+        graph.refetched()
+    );
+    graph
+}
+
+#[tokio::test]
+async fn a_stored_zip_spanned_and_posted_last_volume_first_delivers_its_members_under_graph() {
+    let mut volumes = spanned(&archive(stored()), 3);
+    volumes.rotate_right(1);
+    assert_eq!(volumes[0].name, "lantern.zip");
+    spanned_out_of_order(Scenario::new(volumes)).await;
+}
+
+#[tokio::test]
+async fn a_stored_zip_spanned_and_posted_backwards_delivers_its_members_under_graph() {
+    let mut volumes = spanned(&archive(stored()), 3);
+    volumes.reverse();
+    spanned_out_of_order(Scenario::new(volumes)).await;
+}
+
+// Deflated entries are the engine's: the store gives the set up with the
+// `.zip` bound as the symbolic last volume, and the engine's run walks the
+// bound volumes in their order, the `.zip` after `.z02`.
+#[tokio::test]
+async fn a_deflate_zip_spanned_and_posted_last_volume_first_delivers_its_members_under_graph() {
+    let mut volumes = spanned(&deflated(), 3);
+    volumes.rotate_right(1);
+    assert_eq!(volumes[0].name, "lantern.zip");
+    let graph = spanned_out_of_order(Scenario::new(volumes)).await;
+    assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
+}
+
+#[tokio::test]
+async fn an_aes_zip_spanned_and_posted_last_volume_first_delivers_its_members_under_graph() {
+    let enciphered = stored().with_aes_encryption(AesMode::Aes256, SECRET);
+    let mut volumes = spanned(&archive(enciphered), 3);
+    volumes.rotate_right(1);
+    assert_eq!(volumes[0].name, "lantern.zip");
+    let graph = spanned_out_of_order(Scenario::new(volumes).password(SECRET)).await;
+    assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
+}
+
+// The last disk starts exactly at an entry's local header, so the `.zip`
+// opens like a whole archive and founds the store alone, as disk 0. `.z01`
+// binding after it is the conflict: the store gives the set up to the
+// engine, which walks `.z01`, `.z02` and the `.zip` in their order.
+#[tokio::test]
+async fn a_zip_whose_last_disk_starts_at_an_entry_posted_last_volume_first_delivers_through_the_engine_under_graph()
+ {
+    let single = archive(stored());
+    let boundary = SPANNING_MARKER.len() + second_local(&single);
+    let mut volumes = spanned_at(&single, &[boundary / 2, boundary]);
+    volumes.rotate_right(1);
+    assert_eq!(volumes[0].name, "lantern.zip");
+    assert_eq!(&volumes[0].bytes[..4], b"PK\x03\x04");
+    let graph = spanned_out_of_order(Scenario::new(volumes)).await;
+    assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
+}
+
+// One article of ember.bin's deflated stream damaged beside PAR2: graph
+// repairs it in the stream and the engine reads it whole, with no refetch.
+// The engine waits at the damaged article until the PAR2 set has ruled on
+// the archive, which it does only once its index is in and it covers it.
+// Classic repairs it at the end and fetches nothing twice either.
+#[tokio::test]
+async fn a_deflate_zip_damaged_beside_par2_is_repaired_with_no_refetch_under_both_engines() {
+    let bytes = deflated();
+    let mut posts = vec![Post::plain("lantern.zip", bytes.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.zip", &bytes)], 2));
+    let scenario = Scenario::new(posts).damaged(0, 1);
+    let (classic, graph) = run_both(&scenario).await;
+    assert_members(&classic);
+    assert_members(&graph);
+    assert!(kinds(&graph).contains(&"par2"), "{:?}", kinds(&graph));
+    assert!(graph.reads > 0, "the repair read its slices");
+    assert!(
+        graph.refetched().is_empty(),
+        "graph: {:?}",
+        graph.refetched()
+    );
+    assert!(
+        classic.refetched().is_empty(),
+        "classic: {:?}",
+        classic.refetched()
+    );
 }

@@ -10,7 +10,7 @@
 // the job is complete or failed; a round that changes nothing ends it too,
 // with the job's state in the panic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use weaver_graph::recovery::RepairOutcome;
@@ -50,8 +50,8 @@ impl Post {
         }
     }
 
-    fn articles(&self) -> impl Iterator<Item = &[u8]> {
-        self.bytes.chunks(ARTICLE)
+    fn articles(&self, size: usize) -> impl Iterator<Item = &[u8]> {
+        self.bytes.chunks(size)
     }
 }
 
@@ -118,6 +118,40 @@ pub(super) fn par2_volumes(
     posts
 }
 
+// A PAR3 index and its volumes over `files`, blocks of one article, named
+// as the creator names them under `base`, the index first.
+pub(super) fn par3_set(base: &str, files: &[(&str, &[u8])], blocks: u64) -> Vec<Post> {
+    let source = tempfile::tempdir().unwrap();
+    let names: Vec<std::path::PathBuf> = files
+        .iter()
+        .map(|(name, bytes)| {
+            std::fs::write(source.path().join(name), bytes).unwrap();
+            std::path::PathBuf::from(name)
+        })
+        .collect();
+    let out = tempfile::tempdir().unwrap();
+    let report = par3_rs::create(
+        &par3_rs::InputSpec::new(source.path(), &names),
+        &out.path().join(base),
+        &par3_rs::CreateOptions::default()
+            .with_block_size(ARTICLE as u64)
+            .with_recovery(par3_rs::RecoveryAmount::Blocks(blocks)),
+    )
+    .unwrap();
+    let mut written = report.files_written.clone();
+    written.sort_by_key(|path| path.to_string_lossy().contains(".vol"));
+    written
+        .iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            Post {
+                bytes: std::fs::read(path).unwrap(),
+                ..Post::plain(name, Vec::new())
+            }
+        })
+        .collect()
+}
+
 // For each recovery block of a PAR2 volume, the ordinals of the articles
 // holding its bytes.
 pub(super) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
@@ -162,6 +196,9 @@ pub(super) struct Scenario {
     pub(super) lost: Vec<(u32, u32)>,
     pub(super) password: Option<String>,
     pub(super) global_passwords: Vec<String>,
+    // The decoded size of every article but each post's last; PAR2 slices
+    // stay at ARTICLE whatever it is.
+    pub(super) article: usize,
 }
 
 impl Scenario {
@@ -172,7 +209,14 @@ impl Scenario {
             lost: Vec::new(),
             password: None,
             global_passwords: Vec::new(),
+            article: ARTICLE,
         }
+    }
+
+    // Every post cut into articles of `size` bytes instead of ARTICLE.
+    pub(super) fn framed(mut self, size: usize) -> Self {
+        self.article = size;
+        self
     }
 
     // The password the job is submitted with.
@@ -215,7 +259,7 @@ impl Scenario {
                     groups: vec!["alt.binaries.test".to_string()],
                     posted_at_epoch: None,
                     segments: post
-                        .articles()
+                        .articles(self.article)
                         .enumerate()
                         .map(|(ordinal, article)| SegmentSpec {
                             ordinal: ordinal as u32,
@@ -247,6 +291,10 @@ pub(super) struct GraphView {
     pub(super) claims: BTreeMap<String, Claim>,
     pub(super) blocks_reachable: u64,
     pub(super) outcomes: Vec<Option<RepairOutcome>>,
+    // The kind of every object the tree held at any look, by its name.
+    pub(super) kinds: BTreeSet<String>,
+    // How many password candidates each node was offered, at the last look.
+    pub(super) offered: BTreeMap<weaver_graph::NodeId, usize>,
 }
 
 #[derive(Debug)]
@@ -262,7 +310,7 @@ pub(super) struct Outcome {
     pub(super) order: Vec<(u32, u32)>,
     pub(super) reads: u64,
     pub(super) graph: Option<GraphView>,
-    // The posts that are PAR2 recovery volumes, by file index.
+    // The posts that are PAR2 or PAR3 recovery volumes, by file index.
     pub(super) volumes: Vec<u32>,
 }
 
@@ -497,7 +545,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
                     FileRole::Par2 {
                         is_index: false,
                         ..
-                    }
+                    } | FileRole::Par3 { is_index: false }
                 )
             })
             .map(|(_, index)| index)
@@ -524,8 +572,11 @@ pub(super) async fn serve(
     }
     let intact = !scenario.damage.contains(&(file, ordinal));
     let post = &scenario.posts[file as usize];
-    let offset = ordinal as usize * ARTICLE;
-    let posted = post.articles().nth(ordinal as usize).unwrap();
+    let offset = ordinal as usize * scenario.article;
+    let posted = post
+        .articles(scenario.article)
+        .nth(ordinal as usize)
+        .unwrap();
     // The checksum the article declares is the posted one, so damaged bytes
     // disagree with it.
     let crc = par2_rs::checksum::crc32(posted);
@@ -544,7 +595,7 @@ pub(super) async fn serve(
                 yenc_layout: YencLayoutAssertions {
                     file_size: post.bytes.len() as u64,
                     part: Some(ordinal + 1),
-                    total: Some(post.articles().count() as u32),
+                    total: Some(post.articles(scenario.article).count() as u32),
                     begin: Some(offset as u64 + 1),
                     end: Some(offset as u64 + len),
                 },
@@ -577,7 +628,7 @@ pub(super) async fn serve(
 pub(super) fn finished(pipeline: &Pipeline) -> bool {
     matches!(
         job_status_for_assert(pipeline, JOB),
-        Some(JobStatus::Complete | JobStatus::Failed { .. }) | None
+        Some(JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }) | None
     )
 }
 
@@ -608,6 +659,14 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
     ) else {
         return;
     };
+    let tree = job.tree();
+    view.kinds.extend(
+        tree.live()
+            .into_iter()
+            .filter_map(|node| tree.kind(node))
+            .map(|kind| kind.to_string()),
+    );
+    view.offered = job.passwords_offered();
     let namespace = job.namespace();
     view.claims = state
         .spec

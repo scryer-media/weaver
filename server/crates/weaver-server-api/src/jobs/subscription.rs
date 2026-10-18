@@ -120,6 +120,7 @@ impl JobsSubscription {
                             !matches!(
                                 info.status,
                                 weaver_server_core::JobStatus::Complete
+                                    | weaver_server_core::JobStatus::Partial
                                     | weaver_server_core::JobStatus::Failed { .. }
                             )
                         })

@@ -10,7 +10,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use weaver_graph::{VolumeIndex, Volumes};
+use weaver_graph::Volumes;
 
 use crate::engine::Joined;
 
@@ -34,12 +34,7 @@ impl Front {
     }
 
     fn len(&self) -> io::Result<u64> {
-        let mut total = 0u64;
-        for volume in 0..self.input.volumes().count() {
-            let volume = u32::try_from(volume).map_err(|_| io::ErrorKind::InvalidInput)?;
-            total += self.input.closed_len(VolumeIndex(volume))?;
-        }
-        Ok(total)
+        Ok(self.input.closed_lens()?.iter().sum())
     }
 }
 

@@ -792,6 +792,7 @@ impl Pipeline {
                 crate::JobStatus::Paused
                     | crate::JobStatus::Failed { .. }
                     | crate::JobStatus::Complete
+                    | crate::JobStatus::Partial
             ) {
                 return;
             }
@@ -931,7 +932,10 @@ impl Pipeline {
         };
         if matches!(
             state.status,
-            crate::JobStatus::Paused | crate::JobStatus::Failed { .. } | crate::JobStatus::Complete
+            crate::JobStatus::Paused
+                | crate::JobStatus::Failed { .. }
+                | crate::JobStatus::Complete
+                | crate::JobStatus::Partial
         ) {
             return;
         }

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{
     Builder, ByteRange, Delivery, Emit, Extent, Kind, MemberId, NodeId, Object, ObjectId,
-    Placement, Pull, Seek, VolumeIndex, Weight,
+    Placement, Pull, Seek, VolumeIndex, Weight, Why,
 };
 use weaver_model::files::FileRole;
 
@@ -50,7 +50,13 @@ impl Object for Probe {
     fn kind(&self) -> Kind {
         Kind::Zip
     }
-    fn deliver(&mut self, _: Delivery<'_>, _: &mut Vec<Emit>) {}
+    fn deliver(
+        &mut self,
+        _: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
+    }
     // Its whole volume in, the probe announces one member it never closes,
     // the way an object still at work on its last bytes looks.
     fn volume_closed(&mut self, _: VolumeIndex, out: &mut Vec<Emit>) {
@@ -87,6 +93,17 @@ impl Builder for Probes {
                 answers: Arc::clone(&self.answers),
             }) as Box<dyn Object>
         })
+    }
+
+    fn read(
+        &self,
+        _: &weaver_graph::Tree,
+        _: weaver_graph::NodeId,
+        _: weaver_graph::VolumeIndex,
+        _: &weaver_graph::Placement,
+        _: &mut Vec<u8>,
+    ) -> bool {
+        false
     }
 }
 
@@ -287,7 +304,10 @@ fn the_phase_is_the_first_state_that_holds() {
 
 #[test]
 fn a_graph_job_reports_each_phase_as_its_tree_moves() {
-    let files = [file("inner.zip", &[100]), file("plain.bin", &[100])];
+    // inner.zip in two articles, the second held back. The zip object
+    // announces its member from the first; with bytes still to fetch the
+    // root reports downloading, since that phase wins over extracting.
+    let files = [file("inner.zip", &[100, 100]), file("plain.bin", &[100])];
     let (mut job, _dir, _) = job_with(&files, Vec::new());
     assert_eq!(job.phase_change(), Some(RootPhase::Downloading));
     assert_eq!(job.phase_change(), None);
@@ -295,10 +315,20 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
     job.intake(decoded(1, 0, 0, &[7; 90], Some(90)), 1).unwrap();
     assert_eq!(job.phase(), RootPhase::Downloading);
 
-    job.intake(decoded(0, 0, 0, &zip_front(90), Some(90)), 1)
+    job.intake(decoded(0, 0, 0, &zip_front(90), Some(180)), 1)
         .unwrap();
-    // Nothing recovers, and the zip object has a member it has not closed.
-    assert_eq!(job.phase(), RootPhase::Extracting);
+    assert_eq!(job.phase(), RootPhase::Downloading);
+
+    // Every volume in and the probe never closes the member it announced:
+    // the object is refused as unmapped in the settle that closes the last
+    // volume, and the job is done.
+    job.intake(decoded(0, 1, 90, &[0; 90], Some(180)), 1)
+        .unwrap();
+    assert_eq!(job.phase(), RootPhase::Done);
+    assert_eq!(
+        job.writer().refused(NodeId::ROOT, MemberId(0)),
+        Some(Why::Unmapped)
+    );
 
     let (mut plain, _plain_dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
     plain
@@ -344,7 +374,9 @@ fn a_data_seek_moves_the_articles_that_cover_it_into_the_window() {
 
 #[test]
 fn the_window_holds_eight_volumes_and_four_for_an_in_order_reader() {
-    let volumes: Vec<Vec<(u32, u32)>> = (0..12).map(|_| vec![(0, 100)]).collect();
+    let volumes: Vec<RootFile> = (0..12)
+        .map(|volume| file(&format!("part{volume}.bin"), &[100]))
+        .collect();
 
     let mut root = ArticleRoot::new(&volumes);
     let asks: Vec<Ask> = (0..12)
@@ -384,7 +416,9 @@ fn the_window_holds_eight_volumes_and_four_for_an_in_order_reader() {
 
 #[test]
 fn a_bid_the_full_window_had_no_room_for_is_drawn_when_asked_again_once_a_place_frees() {
-    let volumes: Vec<Vec<(u32, u32)>> = (0..12).map(|_| vec![(0, 100)]).collect();
+    let volumes: Vec<RootFile> = (0..12)
+        .map(|volume| file(&format!("part{volume}.bin"), &[100]))
+        .collect();
     let mut root = ArticleRoot::new(&volumes);
     let asks: Vec<Ask> = (0..12)
         .map(|volume| data_bid(volume, volume + 1, 1, false))
@@ -545,7 +579,7 @@ async fn a_lost_article_marks_its_range_damaged() {
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 190)]);
 
     // A seek into a lost range is answered Lost.
-    let mut root = ArticleRoot::new(&[vec![(0, 100), (1, 100), (2, 100)]]);
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
     root.receive(decoded(0, 0, 0, &[7; 90], Some(270)));
     root.receive(decoded(0, 2, 180, &[7; 90], Some(270)));
     root.map.lost(VolumeIndex(0), 1);
@@ -640,7 +674,7 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
 
 #[test]
 fn a_uu_root_answers_only_for_its_front() {
-    let mut root = ArticleRoot::new(&[vec![(0, 100), (1, 100), (2, 100)]]);
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
     let mut article = decoded(0, 0, 0, &[7; 60], None);
     article.positioned = false;
     root.receive(article);

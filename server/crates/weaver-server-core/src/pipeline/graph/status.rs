@@ -32,6 +32,7 @@ use super::job::GraphJob;
 use super::root::phase::RootPhase;
 use crate::jobs::model::JobStatus;
 
+pub(crate) use claims::Delivery;
 pub(in crate::pipeline) use seams::advance;
 pub(crate) use slots::RepairSlots;
 pub(crate) use summary::{RecoverySummary, SetSummary};
@@ -81,6 +82,7 @@ impl RootJob for GraphJob {
         let sets = objects
             .into_iter()
             .map(|object| SetSummary {
+                node: object.node,
                 kind: object.kind,
                 namespace: object.namespace,
                 // The object is called what its first volume is, in the
@@ -133,12 +135,15 @@ pub(crate) enum Step {
     // For a slot, for recovery bytes, or for an object still producing
     // members. Whatever ends the wait advances the job again.
     Wait,
+    // Nothing is left to wait for. What the job ends as is read off its
+    // settled claims, whether every repair came good or not.
     Deliver,
-    Fail(String),
 }
 
 // Verify, then repair under a slot, then deliver. Called once nothing is
-// left for the queues to fetch.
+// left for the queues to fetch. A repair that cannot rebuild what it found
+// does not end the job here: the members it left short are part of what
+// the job delivers, beside the whole ones.
 pub(crate) fn drive(
     job: &mut dyn RootJob,
     slots: &mut RepairSlots,
@@ -152,11 +157,11 @@ pub(crate) fn drive(
         };
         let outcomes = job.repair();
         metrics::repaired(&summary, &outcomes);
-        if let Some(message) = failure(&summary, &outcomes, &*job) {
-            slots.release(ticket);
-            return Step::Fail(message);
-        }
-        if outcomes.contains(&RepairOutcome::Waiting) {
+        // The job ends at the first object that could not rebuild what it
+        // found, as it did when that failed it: blocks another object still
+        // waits on are not held for.
+        let ruled_short = failure(&summary, &outcomes, &*job).is_some();
+        if !ruled_short && outcomes.contains(&RepairOutcome::Waiting) {
             slots.yield_slot(ticket);
             return Step::Wait;
         }
@@ -168,17 +173,23 @@ pub(crate) fn drive(
     }
 }
 
-// The job fails, worded as a recovery failure reads today, when an object
-// could not rebuild what it found, unless another object of its namespace
-// vouched for that namespace and left no damage in it: an object that only
-// checks never overrules one that repaired, but a repair of one set never
-// excuses another's. Each set is judged in the namespace it lives in, at
-// whatever depth.
-fn failure(
+// The objects that could not rebuild what they found, and that failure
+// worded as a recovery failure reads today, unless another object of its
+// namespace vouched for that namespace and left no damage in it: an object
+// that only checks never overrules one that repaired, but a repair of one
+// set never excuses another's. Each set is judged in the namespace it lives
+// in, at whatever depth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Failure {
+    pub(crate) objects: Vec<NodeId>,
+    pub(crate) message: String,
+}
+
+pub(crate) fn failure(
     summary: &RecoverySummary,
     outcomes: &[RepairOutcome],
     job: &dyn RootJob,
-) -> Option<String> {
+) -> Option<Failure> {
     let ruled: Vec<(&SetSummary, RepairOutcome)> =
         summary.sets.iter().zip(outcomes.iter().copied()).collect();
     let excused = |set: &SetSummary| {
@@ -215,12 +226,16 @@ fn failure(
             )
         })
         .collect::<Vec<_>>();
-    Some(format!(
+    let message = format!(
         "{} recovery failed for {} set(s): {}",
         kinds.into_iter().collect::<Vec<_>>().join("/"),
         failed.len(),
         described.join("; ")
-    ))
+    );
+    Some(Failure {
+        objects: failed.iter().map(|(set, _, _)| set.node).collect(),
+        message,
+    })
 }
 
 fn label(kind: Kind) -> String {

@@ -1205,7 +1205,9 @@ fn job_status_index(status: &JobStatus) -> Option<usize> {
         JobStatus::Moving => "moving",
         JobStatus::QueuedPostProcessing => "queued_post_processing",
         JobStatus::PostProcessing => "post_processing",
-        JobStatus::Failed { .. } => "failed",
+        // The history chunks persist a fixed-width status array, so a new
+        // key would orphan every stored chunk; clients read Partial as failed.
+        JobStatus::Failed { .. } | JobStatus::Partial => "failed",
         JobStatus::Complete => "complete",
     };
     JOB_STATUS_KEYS

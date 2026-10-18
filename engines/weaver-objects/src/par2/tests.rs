@@ -330,6 +330,7 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
                 bytes: piece,
                 provenance: Provenance::Fresh,
             },
+            &mut |_, _| false,
             &mut out,
         );
     }

@@ -6,6 +6,11 @@
 // record set or a GNU long name, each with its data padded to 512. Every
 // dialect is read the same way: ustar with its prefix, GNU, pax, and the
 // pre-POSIX header with no magic at all.
+//
+// Only a regular entry is a file. A GNU sparse entry, a multi-volume
+// continuation, a contiguous file and any type tar does not name are not
+// extracted: their stored data is envelope. A sparse entry's map may run on
+// into extension blocks after its header, and its data starts past them.
 
 use weaver_graph::ByteRange;
 
@@ -22,14 +27,20 @@ const CHECKSUM: std::ops::Range<usize> = 148..156;
 const TYPEFLAG: usize = 156;
 const MAGIC: std::ops::Range<usize> = 257..263;
 const PREFIX: std::ops::Range<usize> = 345..500;
+const GNU_MAGIC: std::ops::Range<usize> = 257..265;
+// Whether another block of the sparse map follows: in the header, and at the
+// end of every extension block.
+const SPARSE_EXTENDED: usize = 482;
+const EXTENSION_EXTENDED: usize = 504;
 
 // What the entry's data is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Body {
     File,
     Directory,
-    // A link, a device, a fifo, a volume label, or a lone zero block: not
-    // a file body, so its data, if any, is envelope.
+    // A link, a device, a fifo, a volume label, a sparse or continued
+    // piece, a type tar does not name, or a lone zero block: not a file
+    // body, so its data, if any, is envelope.
     Skipped,
 }
 
@@ -81,6 +92,9 @@ pub(super) fn read(kept: &Kept, start: u64) -> Read {
             return Read::Unsupported;
         };
         let typeflag = header[TYPEFLAG];
+        if typeflag == b'S' {
+            return sparse(kept, start, header, block.end, extended, size);
+        }
         if !matches!(typeflag, b'x' | b'g' | b'L' | b'K') {
             return Read::Entry(entry(header, block.end, extended, size));
         }
@@ -123,6 +137,31 @@ fn zero(kept: &Kept, start: u64, at: u64) -> Read {
     }
 }
 
+// A GNU sparse entry, read past the extension blocks its map runs on into.
+// Only a GNU header carries the map; a sparse type on any other is refused.
+fn sparse(
+    kept: &Kept,
+    start: u64,
+    header: &[u8],
+    mut data: u64,
+    extended: Extended,
+    size: u64,
+) -> Read {
+    if &header[GNU_MAGIC] != b"ustar  \0" {
+        return Read::Unsupported;
+    }
+    let mut more = header[SPARSE_EXTENDED] == 1;
+    while more {
+        let block = ByteRange::at(data, BLOCK);
+        let Some(extension) = kept.read(block) else {
+            return Read::Wait(ByteRange::new(start, block.end));
+        };
+        more = extension[EXTENSION_EXTENDED] == 1;
+        data = block.end;
+    }
+    Read::Entry(entry(header, data, extended, size))
+}
+
 pub(super) fn is_zero_block(kept: &Kept, at: u64) -> bool {
     kept.read(ByteRange::at(at, BLOCK)).is_some_and(is_zero)
 }
@@ -134,12 +173,11 @@ fn entry(header: &[u8], data: u64, extended: Extended, size: u64) -> Entry {
         .unwrap_or_else(|| ustar_name(header));
     let typeflag = header[TYPEFLAG];
     let body = match typeflag {
-        b'5' | b'D' => Body::Directory,
-        b'1' | b'2' | b'3' | b'4' | b'6' | b'V' => Body::Skipped,
+        b'5' => Body::Directory,
         // A pre-POSIX header marks a directory by its trailing slash alone.
         b'0' | 0 if name.ends_with('/') => Body::Directory,
-        // Everything else is a file body, as POSIX reads an unknown type.
-        _ => Body::File,
+        b'0' | 0 => Body::File,
+        _ => Body::Skipped,
     };
     Entry {
         data,

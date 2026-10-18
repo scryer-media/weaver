@@ -504,6 +504,7 @@ impl Pipeline {
                     | JobStatus::QueuedPostProcessing
                     | JobStatus::PostProcessing
                     | JobStatus::Complete
+                    | JobStatus::Partial
                     | JobStatus::Failed { .. }
             ) {
                 return;

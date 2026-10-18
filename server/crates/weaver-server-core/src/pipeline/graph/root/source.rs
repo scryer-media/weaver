@@ -338,6 +338,26 @@ impl ArticleMap {
         if lost { Pull::Lost } else { Pull::Moved(moved) }
     }
 
+    // Queue the articles that may carry `range` without raising them: they
+    // are wanted, but ahead of nothing, so queued work keeps its order and
+    // only parked work joins it. An article already raised keeps its class.
+    pub(crate) fn queue(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let Some(found) = self.volumes.get(volume.0 as usize) else {
+            return;
+        };
+        let moves: Vec<Move> = found
+            .covering(range)
+            .map(|index| &found.articles[index])
+            .filter(|article| article.state == State::Waiting && article.class == Class::Ordinary)
+            .map(|article| Move {
+                volume,
+                ordinal: article.ordinal,
+                class: Class::Ordinary,
+            })
+            .collect();
+        self.moves.extend(moves);
+    }
+
     // The first article of every volume leads the payload.
     pub(crate) fn sample(&mut self) {
         for index in 0..self.volumes.len() {

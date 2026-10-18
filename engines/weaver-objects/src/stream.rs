@@ -69,10 +69,10 @@ pub type DeflateStream = Stream<Deflate>;
 // header up to the field that sizes its window.
 const FIRST: usize = 64;
 
-// Its facts are its name, its front and how far a run has consumed its
-// input: a repair below that frontier is one the decoder already used. A
-// restored stream is one whose run has not started; it replays from the
-// stream's start over the partial, so the frontier is all it keeps of a run.
+// Its facts are its name and its front. How far a run has read is the run's
+// live progress, kept on the owner's shelf and never here: a restored stream
+// is one whose run has not started, and it replays from the stream's start
+// over the partial.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Stream<D> {
@@ -80,7 +80,6 @@ pub struct Stream<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
     first: Vec<u8>,
-    consumed: u64,
     // The volume grows no further, so a front shorter than FIRST is the
     // whole of it.
     #[serde(default)]
@@ -93,7 +92,6 @@ impl<D: Decoder> Default for Stream<D> {
             decoder: PhantomData,
             name: String::new(),
             first: Vec::new(),
-            consumed: 0,
             closed: false,
         }
     }
@@ -106,7 +104,7 @@ impl<D: Decoder> Stream<D> {
 }
 
 impl<D: Decoder> Durable for Stream<D> {
-    const VERSION: u16 = 1;
+    const VERSION: u16 = 2;
 
     fn impossible(&self) -> Option<&'static str> {
         (self.first.len() > FIRST).then_some("a front longer than a stream keeps")
@@ -120,7 +118,12 @@ impl<D: Decoder> Object for Stream<D> {
 
     // The run reads the volume from the owner's file. Only the front is
     // kept, for the window it declares; a repair of it replaces it.
-    fn deliver(&mut self, delivery: Delivery<'_>, _out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        _out: &mut Vec<Emit>,
+    ) {
         let at = delivery.offset as usize;
         if delivery.volume != VolumeIndex(0) || at > self.first.len() || at >= FIRST {
             return;
@@ -184,13 +187,6 @@ impl<D: Decoder> Engine for Stream<D> {
             member_name(&self.name),
             D::window(&self.first),
         ))
-    }
-
-    // A rerun reads from the front again, so the frontier only grows.
-    fn reached(&mut self, volume: VolumeIndex, offset: u64) {
-        if volume == VolumeIndex(0) {
-            self.consumed = self.consumed.max(offset);
-        }
     }
 
     // The window is sized from the front, so it is known once the front is

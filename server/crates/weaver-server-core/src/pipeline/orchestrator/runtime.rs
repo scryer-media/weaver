@@ -1345,7 +1345,7 @@ impl Pipeline {
                         // Folded over every job, so only while something
                         // is moving; an idle pipeline's health is unchanged.
                         let min_health: Option<u32> = live.then(|| self.jobs.values()
-                            .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete))
+                            .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial))
                             .filter(|s| s.spec.total_bytes > 0)
                             .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
                             .min()).flatten();
@@ -3125,7 +3125,10 @@ pub(crate) fn timestamp_secs() -> u64 {
 }
 
 pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
-    matches!(status, JobStatus::Complete | JobStatus::Failed { .. })
+    matches!(
+        status,
+        JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }
+    )
 }
 
 #[cfg(test)]

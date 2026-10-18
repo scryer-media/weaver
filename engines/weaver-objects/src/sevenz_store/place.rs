@@ -250,25 +250,8 @@ impl SevenZipStore {
             {
                 return false;
             }
-            let mut plain = |wanted: ByteRange, buffer: &mut Vec<u8>| -> bool {
-                let mut at = wanted.start;
-                for (_, entry) in map.entries_in(index, wanted) {
-                    let Some(piece) = wanted.intersect(entry.span()) else {
-                        continue;
-                    };
-                    let Some(member) = entry.member.filter(|_| piece.start == at) else {
-                        return false;
-                    };
-                    let placement = Placement::Member {
-                        member,
-                        range: piece.shift(-(entry.offset as i64)),
-                    };
-                    if !read(&placement, buffer) {
-                        return false;
-                    }
-                    at = piece.end;
-                }
-                at == wanted.end
+            let mut plain = |wanted: ByteRange, buffer: &mut Vec<u8>| {
+                read_folder(map, index, wanted, read, buffer)
             };
             let placed = FolderPlaced {
                 map,
@@ -298,11 +281,39 @@ impl SevenZipStore {
     }
 }
 
-// A stored stretch of a folder's plaintext, to its members. Bytes no member
-// has, a skipped entry's, are the envelope's.
+// The plaintext of `wanted`, a stretch of an AES folder, read back member
+// by member. `false` at a byte no member holds or `read` cannot give.
+pub(super) fn read_folder(
+    map: &Map,
+    folder: usize,
+    wanted: ByteRange,
+    read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+    buffer: &mut Vec<u8>,
+) -> bool {
+    let mut at = wanted.start;
+    for (member, entry) in map.entries_in(folder, wanted) {
+        let Some(piece) = wanted.intersect(entry.span()) else {
+            continue;
+        };
+        if piece.start != at {
+            return false;
+        }
+        let placement = Placement::Member {
+            member,
+            range: piece.shift(-(entry.offset as i64)),
+        };
+        if !read(&placement, buffer) {
+            return false;
+        }
+        at = piece.end;
+    }
+    at == wanted.end
+}
+
+// A stored stretch of a folder's plaintext, to its members.
 fn classify_plain(map: &Map, folder: usize, local: ByteRange, pack: u64, out: &mut Vec<Piece>) {
     let mut cursor = local.start;
-    for (_, entry) in map.entries_in(folder, local) {
+    for (member, entry) in map.entries_in(folder, local) {
         let Some(part) = local.intersect(entry.span()) else {
             continue;
         };
@@ -311,10 +322,7 @@ fn classify_plain(map: &Map, folder: usize, local: ByteRange, pack: u64, out: &m
                 ByteRange::new(cursor, part.start).shift(pack as i64),
             ));
         }
-        match entry.member {
-            Some(member) => out.push(Piece::Member(member, part.shift(-(entry.offset as i64)))),
-            None => out.push(Piece::Envelope(part.shift(pack as i64))),
-        }
+        out.push(Piece::Member(member, part.shift(-(entry.offset as i64))));
         cursor = part.end;
     }
     if cursor < local.end {

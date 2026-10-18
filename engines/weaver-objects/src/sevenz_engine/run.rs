@@ -15,12 +15,12 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use sevenz_turbo::{
-    ArchiveEntry, ArchiveLimits, ArchiveReader, BlockErrorKind, EntryRead, Error, Limit, Password,
-    ReadAt,
+    ArchiveEntry, ArchiveLimits, ArchiveReader, EntryRead, Error, Password, ReadAt,
 };
-use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
+use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 
 use crate::engine::Joined;
+use crate::verdict;
 
 pub(super) struct Run {
     password: Option<String>,
@@ -64,7 +64,7 @@ impl Extraction for Run {
         {
             return;
         }
-        (walk.sink)(verdict(&error));
+        (walk.sink)(verdict::sevenz(&error));
     }
 }
 
@@ -135,36 +135,6 @@ fn is_file_body(entry: &ArchiveEntry) -> bool {
         && entry
             .unix_mode()
             .is_none_or(|mode| matches!(mode & KIND, 0 | FILE))
-}
-
-// What a 7z error means for the job. sevenz-turbo already calls a checksum
-// failure in encrypted content a possibly bad password, so a wrong key asks
-// for another before it is called damage.
-fn verdict(error: &Error) -> Emit {
-    match error {
-        Error::PasswordRequired
-        | Error::MaybeBadPassword(_)
-        | Error::BlockDecode {
-            kind: BlockErrorKind::Password,
-            ..
-        } => Emit::NeedsPassword,
-        Error::LimitExceeded { what, .. } if *what != Limit::ArchiveBytes => {
-            Emit::Refuse(Why::Unsupported)
-        }
-        Error::BadSignature(_)
-        | Error::UnsupportedVersion { .. }
-        | Error::ExternalUnsupported
-        | Error::UnsupportedCompressionMethod(_)
-        | Error::Unsupported(_)
-        | Error::MaxMemLimited { .. }
-        | Error::MemoryLimited { .. }
-        | Error::EndHeaderTooLarge { .. }
-        | Error::BlockDecode {
-            kind: BlockErrorKind::UnsupportedMethod,
-            ..
-        } => Emit::Refuse(Why::Unsupported),
-        _ => Emit::Refuse(Why::Unrepairable),
-    }
 }
 
 // The joined volumes, as sevenz-turbo reads them.

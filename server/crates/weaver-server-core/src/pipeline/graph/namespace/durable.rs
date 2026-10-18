@@ -64,7 +64,8 @@ impl NamespaceWriter {
     }
 
     // The posted bytes of a root member's range, read back through the
-    // inverse map of whatever owns it, as a repair reads them.
+    // inverse map of whatever owns it, as a repair reads them, from what is
+    // on disk only: a restart has no holds.
     pub(crate) fn read_posted(
         &self,
         tree: &Tree,
@@ -73,9 +74,9 @@ impl NamespaceWriter {
         into: &mut Vec<u8>,
     ) -> bool {
         let start = into.len();
-        let read = self
-            .access(tree, NodeId::ROOT)
-            .read_at(NodeId::ROOT, member, range, into);
+        let mut access = self.access(tree, NodeId::ROOT);
+        access.held = false;
+        let read = access.read_at(NodeId::ROOT, member, range, into);
         if !read {
             into.truncate(start);
         }

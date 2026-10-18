@@ -120,6 +120,21 @@ impl SetState {
         }
     }
 
+    // An impossible verdict counted the blocks of the volumes bound then; a
+    // volume bound since may bring more, so the set is tried again. Without
+    // this the verdict would depend on whether a volume's front decided
+    // before or after the damage arrived.
+    pub(super) fn reopen(&mut self) -> bool {
+        let impossible = matches!(
+            self.last.map(|last| last.outcome),
+            Some(RepairOutcome::Impossible { .. })
+        );
+        if impossible {
+            self.last = None;
+        }
+        impossible
+    }
+
     // Damaged slices the last repair found while it waited for blocks.
     pub(super) fn needed(&self) -> u64 {
         self.last

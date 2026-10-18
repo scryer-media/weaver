@@ -22,6 +22,7 @@ use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
+use crate::pipeline::graph::status::Delivery;
 
 const CANDIDATES: [&str; 4] = ["lantern-one", "lantern-two", OPENS, "lantern-four"];
 const WRONG: [&str; 4] = ["lantern-one", "lantern-two", "lantern-four", "lantern-five"];
@@ -202,13 +203,45 @@ fn a_store_that_refuses_hands_back_its_volumes_as_leaves_with_their_bytes() {
             refusing.file(&format!("lantern.part{}.rar", member + 1)),
             refusing.volumes[member as usize]
         );
-        assert!(
-            !refusing.exists(&format!("inner-{member}.bin")),
-            "the store's subtree went with it"
-        );
+        // The store closed each member itself before it gave up, so it
+        // vouched for it: what an object closed whole stays delivered
+        // (the partial-extraction ruling of 2026-10-18).
+        assert_eq!(refusing.file(&format!("inner-{member}.bin")), body(member));
     }
     assert_eq!(refusing.job.phase(), RootPhase::Done);
     assert!(refusing.status().contains("Unsupported"));
+}
+
+// The store closed each of its members whole before it gave up: buried, it
+// keeps them, and the delivery lists them whole beside the volumes handed
+// back as posted.
+#[test]
+fn what_a_refused_store_closed_whole_is_delivered_whole() {
+    let mut refusing = refusing(Mode::Refuse, 2, &[]);
+    refusing.deliver_all();
+    let delivery = Delivery::read(
+        refusing.job.tree(),
+        |_| true,
+        |_| false,
+        |_| false,
+        |_, _| false,
+    );
+    assert_eq!(
+        delivery,
+        Delivery {
+            whole: vec![
+                "lantern.part1.rar".to_string(),
+                "inner-0.bin".to_string(),
+                "inner-1.bin".to_string(),
+                "lantern.part2.rar".to_string(),
+            ],
+            ..Delivery::default()
+        }
+    );
+    for member in 0..2 {
+        assert!(refusing.is_leaf(member));
+        assert_eq!(refusing.file(&format!("inner-{member}.bin")), body(member));
+    }
 }
 
 #[tokio::test]

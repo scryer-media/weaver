@@ -7,7 +7,11 @@
 
 use std::io::Write;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, assert_same, payload, run, run_both};
+use super::harness::{
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run, run_both,
+};
+use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
 
 fn ember() -> Vec<u8> {
@@ -18,30 +22,30 @@ fn quill() -> Vec<u8> {
     payload(4 * ARTICLE - 3, 62)
 }
 
-fn xz(bytes: &[u8]) -> Vec<u8> {
+pub(super) fn xz(bytes: &[u8]) -> Vec<u8> {
     let props = lzma_turbo::LzmaEncProps::xz_preset(0, false).unwrap();
     let mut encoder = lzma_turbo::XzWriter::new(Vec::new(), &props).unwrap();
     encoder.write_all(bytes).unwrap();
     encoder.finish().unwrap()
 }
 
-fn gzip(bytes: &[u8]) -> Vec<u8> {
+pub(super) fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(bytes).unwrap();
     encoder.finish().unwrap()
 }
 
-fn bzip2(bytes: &[u8]) -> Vec<u8> {
+pub(super) fn bzip2(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
     encoder.write_all(bytes).unwrap();
     encoder.finish().unwrap()
 }
 
-fn zstd(bytes: &[u8]) -> Vec<u8> {
+pub(super) fn zstd(bytes: &[u8]) -> Vec<u8> {
     zstd::stream::encode_all(bytes, 1).unwrap()
 }
 
-fn brotli(bytes: &[u8]) -> Vec<u8> {
+pub(super) fn brotli(bytes: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
     {
         let mut encoder = brotli::CompressorWriter::new(&mut output, 4096, 1, 18);
@@ -50,7 +54,7 @@ fn brotli(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
-fn tar(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub(super) fn tar(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
     for (name, bytes) in members {
         let mut header = tar::Header::new_gnu();
@@ -126,7 +130,7 @@ async fn a_brotli_stream_delivers_the_file_it_holds_under_both_engines() {
     one_stream("ember.bin.br", brotli(&ember())).await;
 }
 
-fn members() -> Vec<(&'static str, Vec<u8>)> {
+pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![("ember.bin", ember()), ("quill.bin", quill())]
 }
 
@@ -163,4 +167,33 @@ async fn subs_srt_beside_subs_srt_gz_delivers_both_and_overwrites_nothing() {
     assert_delivered(&classic, &[("subs.srt", inner.clone())]);
     let graph = run(&scenario, Engine::Graph).await;
     assert_delivered(&graph, &[("subs.srt", plain), ("subs (1).srt", inner)]);
+}
+
+// A PAR2 set that describes only a file never posted covers nothing here,
+// and an xz whose first article arrived damaged has no recovery behind it.
+// The set rules as soon as its volumes are in, so nothing waits on it: the
+// job ends with the xz delivered as it stands, its stream header unreadable,
+// Partial for unpacking. The file the set describes was never rebuilt, so
+// it is no file; the graph's claim on the xz is what was delivered of it.
+#[tokio::test]
+async fn an_xz_damaged_at_its_front_beside_a_par2_set_covering_nothing_ends_without_waiting() {
+    let other = payload(2 * ARTICLE + 7, 65);
+    let mut posts = vec![Post::plain("ember.bin.xz", xz(&ember()))];
+    posts.extend(par2_set("tinder", &[("tinder.bin", &other)], 2));
+    let graph = run(&Scenario::new(posts).damaged(0, 0), Engine::Graph).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+    assert!(graph.files.contains_key(&delivered("ember.bin.xz")));
+    assert!(!graph.files.contains_key(&delivered("ember.bin")));
+    assert!(!graph.files.contains_key(&delivered("tinder.bin")));
+    assert_eq!(graph.claims.get("ember.bin.xz"), Some(&Claim::Damaged));
+    assert_eq!(
+        graph.graph().claims.get("ember.bin.xz"),
+        Some(&Claim::Damaged)
+    );
 }

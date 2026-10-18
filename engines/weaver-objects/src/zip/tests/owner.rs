@@ -4,7 +4,9 @@
 // The store's owner, in miniature: it binds volumes, delivers their bytes,
 // holds what the store cannot place yet and hands it back once the store
 // places it, answers seeks, and writes members the way a namespace does.
-// Every volume is bound up front, in name order, as the tree samples them.
+// Every volume is bound up front, in name order, as the tree samples them;
+// a spanned set's `.zip` binds as the symbolic last volume. Tests name
+// volumes by their position in the set.
 
 use std::collections::BTreeMap;
 
@@ -13,6 +15,7 @@ use weaver_graph::{
 };
 
 use super::super::Zip;
+use crate::zip_engine::naming::LAST;
 
 #[derive(Debug, Default)]
 pub(super) struct Got {
@@ -36,12 +39,56 @@ pub(super) struct Owner {
     // Held pieces, with the bytes they arrived with.
     held: Vec<(VolumeIndex, ByteRange, Provenance, Vec<u8>)>,
     bound: Vec<bool>,
+    // The volume each position binds as.
+    index: Vec<VolumeIndex>,
     next: u32,
+}
+
+// What is held of `range` of `volume`, read the way the owner reads a held
+// placement back: every byte of it, or nothing.
+fn read_held(
+    held: &[(VolumeIndex, ByteRange, Provenance, Vec<u8>)],
+    volume: VolumeIndex,
+    range: ByteRange,
+    into: &mut Vec<u8>,
+) -> bool {
+    let mut pieces: Vec<_> = held
+        .iter()
+        .filter(|(at, piece, _, _)| *at == volume && piece.intersect(range).is_some())
+        .collect();
+    pieces.sort_by_key(|(_, piece, _, _)| piece.start);
+    let start = into.len();
+    let mut cursor = range.start;
+    for (_, piece, _, bytes) in pieces {
+        if piece.start > cursor {
+            break;
+        }
+        let end = piece.end.min(range.end);
+        if end > cursor {
+            let from = (cursor - piece.start) as usize;
+            into.extend_from_slice(&bytes[from..(end - piece.start) as usize]);
+            cursor = end;
+        }
+    }
+    if cursor < range.end {
+        into.truncate(start);
+        return false;
+    }
+    true
 }
 
 impl Owner {
     pub fn new(object: Zip, volumes: Vec<(String, Vec<u8>)>) -> Self {
         let count = volumes.len();
+        let index = volumes
+            .iter()
+            .enumerate()
+            .map(|(position, (name, _))| match position {
+                0 => VolumeIndex(0),
+                _ if name.to_ascii_lowercase().ends_with(".zip") => VolumeIndex(LAST),
+                _ => VolumeIndex(position as u32),
+            })
+            .collect();
         let mut owner = Self {
             object,
             volumes,
@@ -51,6 +98,7 @@ impl Owner {
             pull: Pull::Moved(1),
             held: Vec::new(),
             bound: vec![false; count],
+            index,
             next: 0,
         };
         let name = owner.volumes[0].0.clone();
@@ -67,11 +115,17 @@ impl Owner {
         Self::new(object, vec![("alpha.zip".to_owned(), bytes)])
     }
 
+    fn position(&self, volume: VolumeIndex) -> usize {
+        self.index
+            .iter()
+            .position(|at| *at == volume)
+            .expect("a volume bound")
+    }
+
     fn size(&mut self, volume: usize) {
         let length = self.volumes[volume].1.len() as u64;
         let mut out = Vec::new();
-        self.object
-            .sized(VolumeIndex(volume as u32), length, &mut out);
+        self.object.sized(self.index[volume], length, &mut out);
         self.apply(out);
     }
 
@@ -83,12 +137,9 @@ impl Owner {
         }
         let (name, bytes) = &self.volumes[volume];
         let first = &bytes[..bytes.len().min(32)];
-        assert_eq!(
-            self.object.claim(name, first),
-            Some(VolumeIndex(volume as u32))
-        );
+        assert_eq!(self.object.claim(name, first), Some(self.index[volume]));
         let name = name.clone();
-        self.object.bound(VolumeIndex(volume as u32), &name);
+        self.object.bound(self.index[volume], &name);
         self.bound[volume] = true;
         self.size(volume);
     }
@@ -106,7 +157,7 @@ impl Owner {
         bytes: Option<&[u8]>,
     ) {
         self.bind(volume);
-        self.push(VolumeIndex(volume as u32), range, provenance, bytes);
+        self.push(self.index[volume], range, provenance, bytes);
         self.settle();
     }
 
@@ -120,15 +171,21 @@ impl Owner {
         if range.is_empty() {
             return;
         }
-        let real = &self.volumes[volume.0 as usize].1[range.start as usize..range.end as usize];
+        let position = self.position(volume);
+        let real = &self.volumes[position].1[range.start as usize..range.end as usize];
         let bytes = bytes.unwrap_or(real).to_vec();
         let mut out = Vec::new();
+        let held = &self.held;
         self.object.deliver(
             Delivery {
                 volume,
                 offset: range.start,
                 bytes: &bytes,
                 provenance,
+            },
+            &mut |placement, into| match placement {
+                Placement::Held { range } => read_held(held, volume, *range, into),
+                _ => false,
             },
             &mut out,
         );
@@ -199,8 +256,7 @@ impl Owner {
     pub fn close(&mut self, volume: usize) {
         self.bind(volume);
         let mut out = Vec::new();
-        self.object
-            .volume_closed(VolumeIndex(volume as u32), &mut out);
+        self.object.volume_closed(self.index[volume], &mut out);
         self.apply(out);
         self.settle();
     }
@@ -306,7 +362,7 @@ impl Owner {
         let mut into = Vec::new();
         self.object
             .posted(
-                VolumeIndex(volume as u32),
+                self.index[volume],
                 ByteRange::new(0, length),
                 &mut read,
                 &mut into,

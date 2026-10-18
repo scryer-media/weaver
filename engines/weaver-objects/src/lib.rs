@@ -21,13 +21,17 @@ pub mod sevenz_store;
 pub mod sfv;
 pub mod stream;
 pub mod tar;
+mod verdict;
 pub mod zip;
 pub mod zip_engine;
 
 #[cfg(test)]
 mod testing;
 
-use weaver_graph::{Builder, Durable, Facts, Kind, Object, ObjectId, Restore, RestoreError};
+use weaver_graph::{
+    Builder, Durable, Facts, Kind, NodeId, Object, ObjectId, Placement, Restore, RestoreError,
+    Tree, VolumeIndex,
+};
 
 // The object for a kind this crate has, or `None` for one it has not.
 pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
@@ -83,6 +87,11 @@ pub struct Objects;
 impl Builder for Objects {
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         build(kind, id)
+    }
+
+    // The objects keep no bytes: the owner that wraps them reads its own.
+    fn read(&self, _: &Tree, _: NodeId, _: VolumeIndex, _: &Placement, _: &mut Vec<u8>) -> bool {
+        false
     }
 }
 

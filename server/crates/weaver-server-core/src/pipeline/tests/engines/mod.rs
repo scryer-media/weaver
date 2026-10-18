@@ -15,7 +15,10 @@
 //                                 recovery blocks over `files`, sliced at
 //                                 ARTICLE, named `<base>.par2` and
 //                                 `<base>.volNN+MM.par2`
-//   recovery_blocks(post)         per recovery block of a volume, the
+//   par3_set(base, files, blocks) a PAR3 index and its volumes of `blocks`
+//                                 recovery blocks over `files`, blocks of
+//                                 ARTICLE, named as the creator names them
+//   recovery_blocks(post)       per recovery block of a volume, the
 //                                 articles holding its bytes
 //   one_block_article(post)       an article of a volume whose loss costs
 //                                 exactly one recovery block
@@ -63,8 +66,10 @@ mod depth;
 mod divergence;
 mod embedded;
 mod harness;
+mod par3;
 mod plain_par2;
 mod rar;
+mod rar_engine;
 mod restart;
 mod seek;
 mod sets;

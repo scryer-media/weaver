@@ -224,7 +224,12 @@ impl Object for Par2 {
         facts::of(self)
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, _out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        _out: &mut Vec<Emit>,
+    ) {
         let mut found = Vec::new();
         let volume = self.volume(delivery.volume);
         volume.arrived.write(delivery.range(), delivery.provenance);
@@ -284,6 +289,15 @@ impl Object for Par2 {
 
     fn bound(&mut self, volume: VolumeIndex, name: &str) {
         self.volume(volume).name(name);
+        let mut reopened = false;
+        for state in self.sets.values_mut() {
+            reopened |= state.reopen();
+        }
+        // The object's verdict is its sets' verdicts: one tried again leaves
+        // the object unruled until it repairs again.
+        if reopened {
+            self.outcome = None;
+        }
     }
 
     fn recovery(&self) -> Option<&dyn Recovery> {

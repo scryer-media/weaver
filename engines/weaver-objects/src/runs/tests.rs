@@ -136,3 +136,44 @@ fn held_bytes_count_runs_once_and_follow_a_repair() {
         SliceVerdict::Intact
     );
 }
+
+#[test]
+fn a_damaged_run_keeps_the_gate_unknown_until_its_repair_is_judged() {
+    let data = bytes();
+    let mut wrong = data.clone();
+    wrong[1500] ^= 0xff;
+    for (repair, verdict) in [
+        (&data, SliceVerdict::Intact),
+        (&wrong, SliceVerdict::Damaged),
+    ] {
+        let mut runs = fed(&[(0, 1000), (2000, 3000)], &data, Provenance::Fresh);
+        runs.feed(
+            ByteRange::new(1000, 2000),
+            crc32(&wrong[1000..2000]),
+            Provenance::Damaged,
+        );
+        assert_eq!(runs.held(), 3000, "damaged bytes are in");
+        assert_eq!(runs.compose(0, 3000), None);
+        assert_eq!(
+            gate(&runs, 3000, crc32(&data), false, None).0,
+            SliceVerdict::Unknown,
+            "nothing is said over damaged bytes"
+        );
+        // A clean duplicate is still a duplicate: only a repair replaces.
+        runs.feed(
+            ByteRange::new(1000, 2000),
+            crc32(&data[1000..2000]),
+            Provenance::Fresh,
+        );
+        assert_eq!(
+            gate(&runs, 3000, crc32(&data), false, None).0,
+            SliceVerdict::Unknown
+        );
+        runs.feed(
+            ByteRange::new(1000, 2000),
+            crc32(&repair[1000..2000]),
+            Provenance::Repaired,
+        );
+        assert_eq!(gate(&runs, 3000, crc32(&data), false, None).0, verdict);
+    }
+}

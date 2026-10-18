@@ -6,13 +6,16 @@
 // number. A lone `name.zip` is a set of one. Case never matters.
 //
 // The last volume's number is how many came before it, which its name does
-// not say. It is given the volume after every numbered one bound so far, and
-// a numbered name that would land at or after it is not the set's: the root
-// samples its members in name order, and `.z01` … `.z99` sort before `.zip`.
+// not say, and which volumes posted out of order cannot say either. So it is
+// the symbolic last volume, after every numbered one whatever their count,
+// and the store learns its disk from the end record it carries.
 
 use std::collections::BTreeMap;
 
 use crate::engine::SetName;
+
+// The volume `name.zip` binds as in a spanned set: after every other.
+pub(crate) const LAST: u32 = u32::MAX;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VolumeName {
@@ -28,28 +31,22 @@ impl VolumeName {
 }
 
 impl SetName for VolumeName {
-    // The last volume's index is its slot; on its own it has none, and the
-    // engine object asks for the slot.
     fn index(&self) -> u32 {
-        self.number.unwrap_or(u32::MAX)
+        self.number.unwrap_or(LAST)
     }
 
     fn same_set(&self, other: &VolumeName) -> bool {
         self.stem == other.stem
     }
 
+    // A `name.zip` bound first, as a volume of its own, is a set of one:
+    // nothing joins it.
     fn slot(&self, bound: &BTreeMap<u32, VolumeName>) -> Option<u32> {
-        let last = bound
+        let alone = bound
             .iter()
-            .find(|(_, name)| name.is_last())
-            .map(|(index, _)| *index);
-        match self.number {
-            None => last
-                .is_none()
-                .then(|| bound.keys().next_back().map_or(0, |index| index + 1)),
-            Some(index) => (!bound.contains_key(&index) && last.is_none_or(|last| index < last))
-                .then_some(index),
-        }
+            .any(|(index, name)| name.is_last() && *index != LAST);
+        let index = self.index();
+        (!alone && !bound.contains_key(&index)).then_some(index)
     }
 }
 

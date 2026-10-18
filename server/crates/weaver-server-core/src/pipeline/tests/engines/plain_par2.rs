@@ -9,6 +9,7 @@ use super::harness::{
     ARTICLE, Claim, Post, Scenario, assert_same, one_block_article, par2_set, payload, run_both,
 };
 use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
 
 // Plain files followed by one PAR2 set over them, the index then the
 // volume; the files are numbered as listed, the index and volume after.
@@ -169,7 +170,13 @@ async fn a_damaged_article_without_par2_is_delivered_under_graph_and_fails_under
         "{:?}",
         classic.failure
     );
-    assert!(graph.completed(), "{:?}", graph.failure);
+    // Delivered as it stands, short of whole: the job ends Partial.
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
     assert_eq!(graph.claims["lantern.bin"], Claim::Damaged);
     assert_eq!(graph.graph().claims["lantern.bin"], Claim::Damaged);
 }
@@ -199,7 +206,13 @@ async fn a_damaged_member_no_set_covers_is_refused_under_classic_and_a_damaged_l
         "{:?}",
         classic.failure
     );
-    assert!(graph.completed(), "{:?}", graph.failure);
+    // The damaged leaf beside the whole member makes the job Partial.
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
     assert_eq!(graph.claims["lantern.bin"], Claim::Complete);
     assert_eq!(graph.claims["beacon.bin"], Claim::Damaged);
     let view = graph.graph();

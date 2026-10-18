@@ -33,7 +33,7 @@ fn shelved(dir: &Path) -> (Envelopes, Arc<Shelf>) {
 
 fn close(shelf: &Shelf, volume: u32, len: u64, settled: bool) {
     shelf.update(|state| {
-        state.volumes = state.volumes.max(volume + 1);
+        state.volumes.insert(volume);
         let kept = shelf.kept(state, volume).unwrap();
         kept.closed = Some(len);
         kept.settled = settled;
@@ -52,7 +52,7 @@ fn read(volumes: &RunVolumes, offset: u64, len: usize) -> io::Result<Vec<u8>> {
 }
 
 #[test]
-fn a_read_waits_for_its_bytes_and_counts_damaged_ones_as_in() {
+fn a_read_waits_for_its_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let (mut envelopes, shelf) = shelved(dir.path());
     envelopes
@@ -62,10 +62,62 @@ fn a_read_waits_for_its_bytes_and_counts_damaged_ones_as_in() {
     let waiting = Arc::clone(&volumes);
     let read = std::thread::spawn(move || read(&waiting, 4, 8));
     envelopes
-        .keep(NODE, 0, 5, b"-and-back", Provenance::Damaged)
+        .keep(NODE, 0, 5, b"-and-back", Provenance::Fresh)
         .unwrap();
     assert_eq!(read.join().unwrap().unwrap(), b"t-and-ba");
     assert_eq!(shelf.reached(), Some((FIRST, 12)));
+}
+
+// Damaged bytes are read only once repaired: the read waits over them as it
+// waits for bytes still on their way, and the repair lands ahead of what the
+// run read, so the run goes on reading and is never stopped.
+#[test]
+fn a_read_over_damaged_bytes_waits_for_their_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 0, b"front", Provenance::Fresh)
+        .unwrap();
+    envelopes
+        .keep(NODE, 0, 5, b"-xnd-back", Provenance::Damaged)
+        .unwrap();
+    let volumes = reader(&shelf);
+    assert_eq!(read(&volumes, 0, 5).unwrap(), b"front");
+    let waiting = Arc::clone(&volumes);
+    let read = std::thread::spawn(move || read(&waiting, 4, 8));
+    // A change that leaves the range damaged does not let it through.
+    close(&shelf, 0, 14, false);
+    envelopes
+        .keep(NODE, 0, 5, b"-and-back", Provenance::Repaired)
+        .unwrap();
+    assert_eq!(read.join().unwrap().unwrap(), b"t-and-ba");
+    assert!(volumes.current(), "the run was never stopped");
+    assert_eq!(shelf.reached(), Some((FIRST, 12)));
+}
+
+// Damaged bytes nothing will repair are lost to a read, as missing ones are.
+#[test]
+fn a_read_over_damaged_bytes_nothing_will_repair_fails_as_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 0, b"front", Provenance::Fresh)
+        .unwrap();
+    envelopes
+        .keep(NODE, 0, 5, b"-xnd-back", Provenance::Damaged)
+        .unwrap();
+    close(&shelf, 0, 14, false);
+    let volumes = reader(&shelf);
+    let waiting = Arc::clone(&volumes);
+    let read = std::thread::spawn(move || read(&waiting, 4, 8));
+    close(&shelf, 0, 14, true);
+    let error = read.join().unwrap().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let lost = error.get_ref().unwrap().downcast_ref::<Unreadable>();
+    assert!(matches!(
+        lost,
+        Some(Unreadable::Lost { volume: FIRST, range }) if *range == ByteRange::new(4, 12)
+    ));
 }
 
 #[test]
@@ -80,7 +132,31 @@ fn a_read_ends_short_where_a_closed_volume_ends() {
     assert_eq!(read(&volumes, 6, 8).unwrap(), b"6789");
     assert_eq!(read(&volumes, 10, 8).unwrap(), b"");
     assert_eq!(volumes.len(FIRST), Some(10));
-    assert_eq!(volumes.count(), 1);
+    assert_eq!(volumes.next(None).unwrap(), Some(FIRST));
+    assert_eq!(volumes.next(Some(FIRST)).unwrap(), None);
+}
+
+// An index orders the volumes: once no volume can join, a run walks the
+// bound ones in order, past the gaps between them.
+#[test]
+fn a_complete_set_is_walked_in_index_order_past_its_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_envelopes, shelf) = shelved(dir.path());
+    shelf.update(|state| {
+        state.volumes = std::collections::BTreeSet::from([0, 1, u32::MAX]);
+        state.complete = true;
+    });
+    let volumes = reader(&shelf);
+    let mut walked = Vec::new();
+    let mut at = None;
+    while let Some(volume) = volumes.next(at).unwrap() {
+        walked.push(volume);
+        at = Some(volume);
+    }
+    assert_eq!(
+        walked,
+        [VolumeIndex(0), VolumeIndex(1), VolumeIndex(u32::MAX)]
+    );
 }
 
 #[test]
@@ -110,7 +186,7 @@ fn a_volume_that_never_joined_is_lost_once_no_more_can_join() {
     let dir = tempfile::tempdir().unwrap();
     let (_envelopes, shelf) = shelved(dir.path());
     shelf.update(|state| {
-        state.volumes = 1;
+        state.volumes = std::collections::BTreeSet::from([0]);
         state.complete = true;
     });
     let volumes = reader(&shelf);
@@ -138,7 +214,7 @@ fn a_repair_behind_what_the_run_read_stops_its_reads() {
         .unwrap();
     assert!(!volumes.current());
     let error = read(&volumes, 8, 2).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
 }
 
 #[test]
@@ -150,7 +226,7 @@ fn forgetting_the_node_stops_a_waiting_read() {
     let read = std::thread::spawn(move || read(&volumes, 0, 4));
     envelopes.forget(NODE).unwrap();
     let error = read.join().unwrap().unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
 }
 
 // A run that says nothing and returns.

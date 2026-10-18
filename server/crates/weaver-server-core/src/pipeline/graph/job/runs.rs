@@ -7,6 +7,8 @@
 // and tells each object how far its run has read, so it bids for what comes
 // next. What a run says is applied here, at the node it speaks for.
 
+use std::collections::BTreeSet;
+
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
@@ -127,7 +129,7 @@ impl GraphJob {
                 self.tree.emitted(
                     node,
                     vec![Emit::Refuse(Why::Unsupported)],
-                    &mut *self.builder,
+                    &mut self.writer.placing(&mut *self.builder),
                     &mut effects,
                 );
                 self.settle(effects)?;
@@ -146,8 +148,12 @@ impl GraphJob {
     fn retract_run(&mut self, node: NodeId) -> Result<(), GraphError> {
         let retracts = self.members(node).into_iter().map(Emit::Retract).collect();
         let mut effects = Vec::new();
-        self.tree
-            .emitted(node, retracts, &mut *self.builder, &mut effects);
+        self.tree.emitted(
+            node,
+            retracts,
+            &mut self.writer.placing(&mut *self.builder),
+            &mut effects,
+        );
         self.settle(effects)
     }
 
@@ -168,7 +174,7 @@ impl GraphJob {
         let Some(namespace) = self.tree.namespace(parent) else {
             return Ok(());
         };
-        let count = volumes.keys().next_back().map_or(0, |volume| volume.0 + 1);
+        let bound: BTreeSet<u32> = volumes.keys().map(|volume| volume.0).collect();
         let complete = namespace
             .members()
             .all(|member| !self.tree.is_undecided(parent, member.id));
@@ -187,7 +193,7 @@ impl GraphJob {
         let shelf = self.writer.shelf(node);
         shelf
             .update(|state| {
-                state.volumes = count;
+                state.volumes = bound;
                 state.complete = complete;
                 for (volume, closed, settled) in ends {
                     let kept = shelf.kept(state, volume)?;
@@ -200,15 +206,16 @@ impl GraphJob {
     }
 
     // Nothing more will come for the member, not even a repair: the payload
-    // is in, and every recovery object that covers it has ruled.
-    fn settled(&self, parent: NodeId, member: MemberId) -> bool {
+    // is in, and every recovery object beside it has ruled. One that has not
+    // may cover it yet, since it binds what it covers as its own volumes
+    // arrive, and those can come after the member closed.
+    fn settled(&self, parent: NodeId, _member: MemberId) -> bool {
         !self.payload_waiting()
             && self.tree.recovery_nodes(parent).into_iter().all(|node| {
                 self.tree.recovery(node).is_none_or(|recovery| {
-                    !recovery.covers(member)
-                        || recovery
-                            .outcome()
-                            .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
+                    recovery
+                        .outcome()
+                        .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
                 })
             })
     }

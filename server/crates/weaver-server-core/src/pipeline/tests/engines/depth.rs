@@ -17,6 +17,7 @@ use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
 };
 use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
 
 // A stored 7z of `entries`, in order.
 fn stored(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -267,8 +268,9 @@ async fn a_described_file_no_post_carries_is_rebuilt_whole_under_both_engines() 
 
 // A member two deep that no set covers, with one outer article served
 // damaged inside it. Graph refuses the archive the damage has no cover in,
-// and delivers that archive as it stands; classic fails unpacking the outer
-// one after fetching the article again.
+// and delivers that archive as it stands beside the member it had closed
+// whole; classic fails unpacking the outer one after fetching the article
+// again.
 #[tokio::test]
 async fn an_uncovered_damaged_member_two_deep_is_refused_to_its_archive_under_graph_and_fails_under_classic()
  {
@@ -278,10 +280,20 @@ async fn an_uncovered_damaged_member_two_deep_is_refused_to_its_archive_under_gr
     let ordinal = article_inside(&outer, &entries[0].1);
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]).damaged(0, ordinal);
     let (classic, graph) = run_both(&scenario).await;
-    assert!(graph.completed(), "graph: {:?}", graph.failure);
+    // The refused archive is delivered as it stands: the job ends Partial.
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        vec![delivered("level.7z")]
+        vec![delivered("level.7z"), delivered("quill.bin")]
+    );
+    assert!(
+        graph.files[&delivered("quill.bin")] == entries[1].1,
+        "closed whole before the refusal"
     );
     assert!(graph.graph().outcomes.is_empty());
     assert_eq!(graph.graph().claims["lantern.7z"], Claim::Damaged);

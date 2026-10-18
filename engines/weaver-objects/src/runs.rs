@@ -15,6 +15,11 @@
 // runs do not tile exactly has no reference value, which is a refusal, never
 // a pass. The bytes held are counted as runs come and go, so a whole is
 // composed once, when every byte of it is in, and not at every delivery.
+//
+// Each run keeps whether its bytes are verified. Damaged bytes are recorded
+// so the count of what is in stays true, but they have no reference value:
+// a range holding any of them composes to nothing until their repair
+// replaces them, so no verdict is ever said over bytes known to be bad.
 
 use unrar_rs::convert_crc32_to_mac;
 use weaver_graph::{ByteRange, Provenance, SliceVerdict};
@@ -23,8 +28,22 @@ use crate::grid::crc32_combine;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CrcRuns {
-    runs: Vec<(u64, u64, u32)>,
+    runs: Vec<Run>,
     held: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
+    start: u64,
+    len: u64,
+    crc: u32,
+    verified: bool,
+}
+
+impl Run {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
 }
 
 impl CrcRuns {
@@ -35,33 +54,38 @@ impl CrcRuns {
             Provenance::Repaired => {
                 self.overwrite(range.start, range.len(), crc);
             }
-            Provenance::Fresh | Provenance::Damaged => self.insert(range.start, range.len(), crc),
+            Provenance::Fresh | Provenance::Damaged => {
+                self.insert(Run {
+                    start: range.start,
+                    len: range.len(),
+                    crc,
+                    verified: provenance.is_verified(),
+                });
+            }
         }
     }
 
     // Inserts one run. Overlapping an existing run is ignored.
-    pub(crate) fn insert(&mut self, start: u64, len: u64, crc: u32) {
-        if len == 0 {
+    fn insert(&mut self, run: Run) {
+        if run.len == 0 {
             return;
         }
-        let end = start.saturating_add(len);
-        let position = self
+        let position = self.runs.partition_point(|next| next.start < run.start);
+        if self
             .runs
-            .partition_point(|(run_start, _, _)| *run_start < start);
-        if position < self.runs.len() {
-            let (next_start, _, _) = self.runs[position];
-            if next_start < end {
-                return;
-            }
+            .get(position)
+            .is_some_and(|next| next.start < run.end())
+        {
+            return;
         }
-        if let Some(index) = position.checked_sub(1) {
-            let (previous_start, previous_len, _) = self.runs[index];
-            if previous_start.saturating_add(previous_len) > start {
-                return;
-            }
+        if position
+            .checked_sub(1)
+            .is_some_and(|previous| self.runs[previous].end() > run.start)
+        {
+            return;
         }
-        self.runs.insert(position, (start, len, crc));
-        self.held += len;
+        self.runs.insert(position, run);
+        self.held += run.len;
     }
 
     // The bytes the runs hold between them.
@@ -69,9 +93,9 @@ impl CrcRuns {
         self.held
     }
 
-    // Replaces every run overlapping `[start, start + len)` with a single run
-    // for the rewritten span, and returns the sub-ranges of the discarded runs
-    // that fall outside it: the stale gaps.
+    // Replaces every run overlapping `[start, start + len)` with a single,
+    // verified run for the rewritten span, and returns the sub-ranges of the
+    // discarded runs that fall outside it: the stale gaps.
     pub(crate) fn overwrite(&mut self, start: u64, len: u64, crc: u32) -> Vec<(u64, u64)> {
         if len == 0 {
             return Vec::new();
@@ -79,29 +103,34 @@ impl CrcRuns {
         let end = start.saturating_add(len);
         let mut gaps = Vec::new();
         let held = &mut self.held;
-        self.runs.retain(|&(run_start, run_len, _)| {
-            let run_end = run_start.saturating_add(run_len);
-            if run_end <= start || run_start >= end {
+        self.runs.retain(|run| {
+            if run.end() <= start || run.start >= end {
                 return true;
             }
-            *held -= run_len;
-            if run_start < start {
-                gaps.push((run_start, start));
+            *held -= run.len;
+            if run.start < start {
+                gaps.push((run.start, start));
             }
-            if run_end > end {
-                gaps.push((end, run_end));
+            if run.end() > end {
+                gaps.push((end, run.end()));
             }
             false
         });
-        let position = self
-            .runs
-            .partition_point(|(run_start, _, _)| *run_start < start);
-        self.runs.insert(position, (start, len, crc));
+        let position = self.runs.partition_point(|run| run.start < start);
+        self.runs.insert(
+            position,
+            Run {
+                start,
+                len,
+                crc,
+                verified: true,
+            },
+        );
         self.held += len;
         gaps
     }
 
-    // The composed value for `[start, start + len)`, when the runs fed in tile
+    // The composed value for `[start, start + len)`, when verified runs tile
     // it exactly: the first starts at `start`, each one abuts the next, and the
     // last ends at `start + len`.
     pub(crate) fn compose(&self, start: u64, len: u64) -> Option<u32> {
@@ -109,23 +138,21 @@ impl CrcRuns {
             return None;
         }
         let end = start.checked_add(len)?;
-        let mut index = self
-            .runs
-            .partition_point(|(run_start, _, _)| *run_start < start);
+        let mut index = self.runs.partition_point(|run| run.start < start);
         let mut cursor = start;
         // CRC32 of no bytes is zero, and combining it with the first run is the
         // identity.
         let mut composed = 0u32;
         while cursor < end {
-            let (run_start, run_len, run_crc) = *self.runs.get(index)?;
-            if run_start != cursor {
+            let run = self.runs.get(index)?;
+            if run.start != cursor || !run.verified {
                 return None;
             }
-            let run_end = run_start.checked_add(run_len)?;
+            let run_end = run.start.checked_add(run.len)?;
             if run_end > end {
                 return None;
             }
-            composed = crc32_combine(composed, run_crc, run_len);
+            composed = crc32_combine(composed, run.crc, run.len);
             cursor = run_end;
             index += 1;
         }
@@ -148,9 +175,10 @@ pub(crate) fn fold_member_crc(
     }
 }
 
-// What the runs say of `[0, length)` against the CRC a header wrote. The
-// composed value comes back beside a damaged verdict, so a blame can be said
-// once per version of the bytes.
+// What the runs say of `[0, length)` against the CRC a header wrote: unknown
+// while any byte of it is missing or unverified. The composed value comes
+// back beside a damaged verdict, so a blame can be said once per version of
+// the bytes.
 pub(crate) fn gate(
     runs: &CrcRuns,
     length: u64,

@@ -632,7 +632,10 @@ impl Pipeline {
                         );
                     } else if matches!(
                         s.status,
-                        JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                        JobStatus::Paused
+                            | JobStatus::Complete
+                            | JobStatus::Partial
+                            | JobStatus::Failed { .. }
                     ) {
                         // A job someone paused, or one that is already over, is
                         // not dispatching because it was told not to. Warning

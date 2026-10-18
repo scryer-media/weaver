@@ -276,6 +276,7 @@ impl JobsQuery {
                 !matches!(
                     info.status,
                     weaver_server_core::JobStatus::Complete
+                        | weaver_server_core::JobStatus::Partial
                         | weaver_server_core::JobStatus::Failed { .. }
                 )
             })
@@ -302,6 +303,7 @@ impl JobsQuery {
                 !matches!(
                     info.status,
                     weaver_server_core::JobStatus::Complete
+                        | weaver_server_core::JobStatus::Partial
                         | weaver_server_core::JobStatus::Failed { .. }
                 )
             })
@@ -348,6 +350,7 @@ impl JobsQuery {
                 && !matches!(
                     info.status,
                     weaver_server_core::JobStatus::Complete
+                        | weaver_server_core::JobStatus::Partial
                         | weaver_server_core::JobStatus::Failed { .. }
                 )
         }) else {
@@ -372,6 +375,7 @@ impl JobsQuery {
                 !matches!(
                     info.status,
                     weaver_server_core::JobStatus::Complete
+                        | weaver_server_core::JobStatus::Partial
                         | weaver_server_core::JobStatus::Failed { .. }
                 )
             })
@@ -398,6 +402,7 @@ impl JobsQuery {
                 !matches!(
                     info.status,
                     weaver_server_core::JobStatus::Complete
+                        | weaver_server_core::JobStatus::Partial
                         | weaver_server_core::JobStatus::Failed { .. }
                 )
             })

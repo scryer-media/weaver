@@ -58,6 +58,7 @@ fn deliver(object: &mut Par2, twin_volumes: &[(VolumeIndex, Vec<u8>)], act: Act)
             bytes: piece,
             provenance: Provenance::Fresh,
         },
+        &mut |_, _| false,
         &mut Vec::new(),
     );
 }

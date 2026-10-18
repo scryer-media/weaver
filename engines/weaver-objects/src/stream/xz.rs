@@ -20,21 +20,25 @@ use super::{Decoder, Front};
 pub struct Xz;
 
 const STREAM_HEADER: usize = 12;
-// The largest dictionary property LZMA2 has.
-const LARGEST_PROPERTY: u8 = 40;
+// The most an xz decoder may hold: enough for the dictionary `xz -9`
+// writes, and no tiny stream may ask for more.
+const MEMORY_LIMIT: u64 = 128 << 20;
 
 impl Decoder for Xz {
     const KIND: Kind = Kind::Xz;
 
     fn window(first: &[u8]) -> u64 {
-        let property = dictionary(first).unwrap_or(LARGEST_PROPERTY);
-        Lzma2Reader::<io::Empty>::memory_required(property).unwrap_or(u64::MAX)
+        dictionary(first)
+            .and_then(|property| Lzma2Reader::<io::Empty>::memory_required(property).ok())
+            .map_or(MEMORY_LIMIT, |window| window.min(MEMORY_LIMIT))
     }
 
     // Held to the first block's window: a later block that asks for more
     // fails instead of growing the reservation.
     fn open(input: Front, window: u64) -> io::Result<Box<dyn Read + Send>> {
-        let options = XzOptions::default().with_memory_limit(window);
+        let options = XzOptions::default()
+            .with_memory_limit(window.max(1))
+            .with_concatenated(true);
         Ok(Box::new(XzReader::with_options(input, options)))
     }
 

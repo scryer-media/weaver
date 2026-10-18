@@ -12,11 +12,16 @@ use weaver_graph::{ByteRange, Kind, MemberId, Provenance};
 use weaver_model::files::FileRole;
 
 use super::*;
+use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::model::JobStatus;
 use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
+use crate::pipeline::PipelineEvent;
+use crate::pipeline::download::queue::DownloadQueue;
 use crate::pipeline::graph::engine::Heard;
 use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
 use crate::pipeline::graph::root::phase::RootPhase;
+use crate::pipeline::graph::status::Delivery;
 use crate::pipeline::tests::{insert_active_job, new_direct_pipeline, retire_pipeline_database};
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -515,27 +520,98 @@ async fn an_archive_handed_to_its_engine_writes_what_the_engine_read() {
     retire_pipeline_database(pipeline).await;
 }
 
+// Two volumes extract whole and a plain file beside them arrives damaged:
+// the job delivers everything it has and ends Partial, the extracted
+// members listed whole, the damaged file short, the history row a failed
+// unpack.
 #[tokio::test]
-async fn a_repair_behind_what_the_engine_read_retracts_its_output_and_reads_again() {
+async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let job_id = JobId(92_008);
+    let job_id = JobId(92_009);
+    let bodies = [payload(2 * ARTICLE + 9, 11), payload(ARTICLE - 3, 12)];
+    let mut posts: Vec<Post> = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| echo_volume(index as u32, body))
+        .collect();
+    posts.push(Post::plain("lantern.dat", payload(2 * ARTICLE, 13)));
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let mut events = pipeline.event_tx.subscribe();
+    echo_engines(&mut pipeline, job_id, 2);
+    decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
+    decode(&mut pipeline, job_id, &posts, 2, 1, false).await;
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    drain_runs(&mut pipeline, job_id).await;
+
+    assert_eq!(
+        pipeline.graph_delivery(job_id),
+        Some(Delivery {
+            whole: vec!["echo-0.bin".to_string(), "echo-1.bin".to_string()],
+            damaged: vec!["lantern.dat".to_string()],
+            unrepaired: Vec::new(),
+        })
+    );
+    assert_eq!(
+        pipeline.graph_terminal_status(job_id),
+        Some(JobStatus::Partial)
+    );
+
+    // The queues owe nothing more, so the completion gate hands the job to
+    // its delivery.
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+    state.status = JobStatus::Downloading;
+    state.refresh_runtime_lanes_from_status();
+    pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.inflight_moves.contains(&job_id));
+    let done = pipeline.move_done_rx.recv().await.unwrap();
+    pipeline.handle_move_to_complete_done(done).await;
+    while !matches!(
+        events.recv().await.expect("pipeline event channel closed"),
+        PipelineEvent::JobCompleted { job_id: completed } if completed == job_id
+    ) {}
+
+    let finished = pipeline
+        .finished_jobs
+        .iter()
+        .find(|job| job.job_id == job_id)
+        .unwrap();
+    assert_eq!(finished.status, JobStatus::Partial);
+    let row = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!((row.status.as_str(), row.error_message), ("partial", None));
+    let states = pipeline.db.nzbget_history_states(&[job_id.0]).unwrap();
+    assert_eq!(
+        states[&job_id.0].failure_kind,
+        Some(HistoryFailureKind::Unpack)
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
+// An echo volume beside a PAR2 set, its second article arriving as `wrong`
+// with `intact` the checksum's verdict on it. The index and the volume's
+// first article come first, so the set can reach its blocks; the rest of
+// the set stays out until the test sends it.
+async fn echo_volume_with_a_wrong_article(
+    temp_dir: &tempfile::TempDir,
+    job_id: JobId,
+    intact: bool,
+) -> (Pipeline, PathBuf, Vec<u8>, Vec<Post>) {
     let body = payload(4 * ARTICLE - HEADER, 10);
     let mut posts = vec![echo_volume(0, &body)];
     let volume = posts[0].bytes.clone();
     posts.extend(par2_set("lantern.part1.rar", &volume));
-    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (mut pipeline, working_dir) = graph_job(temp_dir, job_id, &posts).await;
     echo_engines(&mut pipeline, job_id, 1);
-    // The index and the volume's first article, so the set can reach its
-    // blocks; the rest of the volume stays out until the run has read.
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
-    // The second article arrives wrong, and the run reads it as it is.
     for ordinal in 0..4 {
         let mut article = posts[0].articles().nth(ordinal).unwrap().to_vec();
         if ordinal == 1 {
             article.iter_mut().for_each(|byte| *byte ^= 0x5a);
         }
-        let intact = ordinal != 1;
+        let intact = intact || ordinal != 1;
         decode_as(
             &mut pipeline,
             job_id,
@@ -547,21 +623,71 @@ async fn a_repair_behind_what_the_engine_read_retracts_its_output_and_reads_agai
         )
         .await;
     }
-    drain_runs(&mut pipeline, job_id).await;
-    let echoed = working_dir.join("echo-0.bin");
-    assert_ne!(read(&echoed), body);
+    (pipeline, working_dir.join("echo-0.bin"), body, posts)
+}
 
-    // The blocks arrive and the set repairs the article behind the run's
-    // mark: the run is retracted and reads the volume again.
+// The recovery blocks arrive, and the set repairs the one wrong slice.
+async fn repair_the_wrong_article(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post]) {
     for ordinal in 1..posts[2].articles().count() as u32 {
-        decode(&mut pipeline, job_id, &posts, 2, ordinal, true).await;
+        decode(pipeline, job_id, posts, 2, ordinal, true).await;
     }
-    let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
     assert_eq!(
-        job.recovery_summary()[0].outcome,
+        pipeline.graph_jobs[&job_id].recovery_summary()[0].outcome,
         Some(RepairOutcome::Repaired { slices: 1 })
     );
-    assert!(job.runs().live());
+}
+
+// The generation the job's one engine run reads under.
+fn run_generation(pipeline: &Pipeline, job_id: JobId) -> Option<u64> {
+    let job = &pipeline.graph_jobs[&job_id];
+    let node = *job.tree().engines().first()?;
+    job.runs().generation(node)
+}
+
+// A run reads verified bytes only: it waits at the article that failed its
+// checksum, the repair brings that range in as repaired, and the run reads
+// on from where it stood, once, to the whole body.
+#[tokio::test]
+async fn an_engine_waits_at_a_damaged_article_until_its_repair_and_reads_it_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_008);
+    let (mut pipeline, echoed, body, posts) =
+        echo_volume_with_a_wrong_article(&temp_dir, job_id, false).await;
+    assert!(pipeline.graph_jobs[&job_id].runs().live());
+    assert!(std::fs::read(&echoed).unwrap_or_default().len() < body.len());
+    let started = run_generation(&pipeline, job_id);
+    assert!(started.is_some());
+
+    repair_the_wrong_article(&mut pipeline, job_id, &posts).await;
+    assert!(pipeline.graph_jobs[&job_id].runs().live());
+    drain_runs(&mut pipeline, job_id).await;
+    assert_eq!(read(&echoed), body);
+    assert_eq!(
+        run_generation(&pipeline, job_id),
+        started,
+        "never retracted"
+    );
+    assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
+    retire_pipeline_database(pipeline).await;
+}
+
+// An article whose own checksum passed is verified, so the run reads it; the
+// PAR2 set proves its slice wrong and repairs it behind what the run read.
+// The run's output is retracted and it reads the volume again.
+#[tokio::test]
+async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engine_read() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_010);
+    let (mut pipeline, echoed, body, posts) =
+        echo_volume_with_a_wrong_article(&temp_dir, job_id, true).await;
+    drain_runs(&mut pipeline, job_id).await;
+    assert_eq!(read(&echoed).len(), body.len());
+    assert_ne!(read(&echoed), body);
+    let first = run_generation(&pipeline, job_id);
+
+    repair_the_wrong_article(&mut pipeline, job_id, &posts).await;
+    assert!(pipeline.graph_jobs[&job_id].runs().live());
+    assert_ne!(run_generation(&pipeline, job_id), first, "read again");
     drain_runs(&mut pipeline, job_id).await;
     assert_eq!(read(&echoed), body);
     assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);

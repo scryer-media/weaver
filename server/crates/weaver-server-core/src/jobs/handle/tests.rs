@@ -97,7 +97,7 @@ fn runtime_lanes_for_status(
             crate::jobs::model::RunState::Active,
             None,
         ),
-        JobStatus::Complete => (
+        JobStatus::Complete | JobStatus::Partial => (
             crate::jobs::model::DownloadState::Complete,
             crate::jobs::model::PostState::Completed,
             crate::jobs::model::RunState::Active,

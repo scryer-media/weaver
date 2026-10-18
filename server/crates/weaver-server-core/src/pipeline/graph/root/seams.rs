@@ -33,6 +33,16 @@ use crate::pipeline::{DecodedChunk, Pipeline};
 const WINDOW_PRIORITY: u32 = 3;
 
 impl Pipeline {
+    // The engine the job was stamped with: a graph job is one with a graph
+    // runtime, which admission and restore give it from the stamp.
+    pub(in crate::pipeline) fn job_engine(&self, job_id: JobId) -> Engine {
+        if self.graph_jobs.contains_key(&job_id) {
+            Engine::Graph
+        } else {
+            Engine::Classic
+        }
+    }
+
     // Give a job admitted or restored under `engine` its graph runtime. The
     // job's state must already be in place: what its queues hold says which
     // articles this run still has to fetch.
@@ -227,7 +237,7 @@ impl Pipeline {
 }
 
 // Put each moved article in its new class. Parked recovery work joins the
-// main queue, since a moved article is wanted ahead of something. A class
+// main queue, since a moved article is wanted. A class
 // change re-queues the work under its new flags; a window rank re-keys it in
 // place, ranked ahead of everything else at its priority.
 pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
@@ -249,10 +259,17 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     let mut taken = state
         .recovery_queue
         .extract_matching(|work| classes.contains_key(&work.segment_id));
+    // An ordinary move only brings parked work back: queued work keeps its
+    // place.
+    let raised = |work: &DownloadWork| {
+        classes
+            .get(&work.segment_id)
+            .is_some_and(|class| *class != Class::Ordinary)
+    };
     taken.extend(
         state
             .download_queue
-            .extract_matching(|work| classes.contains_key(&work.segment_id) && !ranked(work)),
+            .extract_matching(|work| raised(work) && !ranked(work)),
     );
     taken.sort_by_key(|work| classes.get(&work.segment_id).copied());
     for mut work in taken {

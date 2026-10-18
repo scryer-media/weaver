@@ -114,7 +114,7 @@ fn runtime_lanes_for_status(
             weaver_server_core::RunState::Active,
             None,
         ),
-        JobStatus::Complete => (
+        JobStatus::Complete | JobStatus::Partial => (
             weaver_server_core::DownloadState::Complete,
             weaver_server_core::PostState::Completed,
             weaver_server_core::RunState::Active,
@@ -876,7 +876,10 @@ fn spawn_test_scheduler(
                         }
                     }
                     jobs.retain(|_, state| {
-                        !matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
+                        !matches!(
+                            state.status,
+                            JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }
+                        )
                     });
                     db.delete_all_job_history()
                         .expect("failed to delete all history rows from test db");

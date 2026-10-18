@@ -29,7 +29,7 @@ use crate::pipeline::tests::direct_store::{
 const MEMBER: &str = "beacon.bin";
 const SECRET: &str = "quill-ember-secret";
 
-fn delivered(name: &str) -> String {
+pub(super) fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
 }
 
@@ -39,7 +39,7 @@ fn body() -> Vec<u8> {
     payload(7 * ARTICLE + 13, 51)
 }
 
-fn posts(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
+pub(super) fn posts(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
     volumes
         .into_iter()
         .map(|(name, bytes)| Post::plain(&name, bytes))
@@ -47,7 +47,7 @@ fn posts(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
 }
 
 // The volumes, then an index and a volume of two recovery blocks over them.
-fn with_par2(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
+pub(super) fn with_par2(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
     let files: Vec<(&str, &[u8])> = volumes
         .iter()
         .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
@@ -112,7 +112,7 @@ fn assert_volumes_complete(graph: &Outcome) {
 }
 
 // Classic waits at Downloading on these sets and never settles.
-fn assert_classic_stalls(stall: Result<Outcome, Stall>) {
+pub(super) fn assert_classic_stalls(stall: Result<Outcome, Stall>) {
     let stall = stall.expect_err("classic settles");
     assert_eq!(stall.engine, Engine::Classic);
     assert_eq!(
@@ -269,17 +269,39 @@ async fn a_nameless_four_volume_rar5_set_posted_backwards_delivers_under_both_en
 // A nameless RAR4 volume's front states no position: its number is in its
 // end record, and the first-volume flag of its main header is not among the
 // facts unrar-rs reads. The set's last volume founds the store at the first
-// position, and the set is never placed. Neither engine settles.
+// position, and the set is never placed. Classic stalls. Under graph every
+// volume closes with the store unmapped, so it is refused, the volumes are
+// delivered as posted and the job is Partial for unpacking.
 #[tokio::test]
-async fn a_nameless_four_volume_rar4_set_posted_backwards_settles_under_neither_engine() {
+async fn a_nameless_four_volume_rar4_set_posted_backwards_stalls_under_classic_and_is_refused_under_graph()
+ {
     let body = body();
     let set = obfuscate_volumes(&single_member_rar4_store_set_numbered(MEMBER, &body, 4));
     let scenario = reversed(set);
     assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
-    let stall = try_run(&scenario, Engine::Graph)
+    let graph = try_run(&scenario, Engine::Graph)
         .await
-        .expect_err("the graph settles");
-    assert_eq!(stall.status, Some(JobStatus::Extracting), "{}", stall.state);
+        .expect("the graph settles");
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+    assert_eq!(graph.files.len(), 4, "{:?}", graph.files.keys());
+    for post in &scenario.posts {
+        assert!(
+            graph.files.get(&format!("lantern beacon/{}", post.name)) == Some(&post.bytes),
+            "{} as posted",
+            post.name
+        );
+    }
+    assert!(
+        graph.refetched().is_empty(),
+        "graph: {:?}",
+        graph.refetched()
+    );
 }
 
 #[tokio::test]
@@ -333,6 +355,61 @@ async fn a_header_encrypted_rar5_set_without_a_password_check_goes_to_the_engine
     let graph = run(&scenario, Engine::Graph).await;
     assert_member(&graph, &body);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// A three-volume set the RAR engine reads, posted without one volume. The
+// engine reads volume p as bound volume p, so the member cannot be read
+// whole: its object announced it and never closed it, so the refusal reads
+// the posted volumes back as they were, delivered as they stand, and the
+// job is Partial. Divergence: classic never settles.
+async fn assert_missing_volume_is_partial(missing: &str) {
+    let body = body();
+    let volumes: Vec<(String, Vec<u8>)> =
+        header_encrypted_store_set(MEMBER, &body, 3, SECRET, HeaderCheck::Absent)
+            .into_iter()
+            .zip([
+                "silver.horizon.rar",
+                "silver.horizon.r00",
+                "silver.horizon.r01",
+            ])
+            .filter(|(_, name)| *name != missing)
+            .map(|((_, bytes), name)| (name.to_owned(), bytes))
+            .collect();
+    let posted = volumes.clone();
+    let scenario = Scenario::new(posts(volumes)).password(SECRET);
+    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(
+        graph.graph().kinds.contains("rar_engine"),
+        "{:?}",
+        graph.graph().kinds
+    );
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    let mut names: Vec<String> = posted.iter().map(|(name, _)| delivered(name)).collect();
+    names.sort();
+    assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), names);
+    assert!(!graph.files.contains_key(&delivered(MEMBER)));
+    for (name, bytes) in &posted {
+        assert!(graph.files[&delivered(name)] == *bytes, "{name} as posted");
+    }
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// Without `.r01`, the last: the engine finds no volume past `.r00`.
+#[tokio::test]
+async fn a_three_volume_set_the_engine_reads_posted_without_its_r01_is_partial_under_graph() {
+    assert_missing_volume_is_partial("silver.horizon.r01").await;
+}
+
+// Without `.r00`, inside the set: the engine reads position 1 as lost.
+#[tokio::test]
+async fn a_three_volume_set_the_engine_reads_posted_without_its_r00_is_partial_under_graph() {
+    assert_missing_volume_is_partial("silver.horizon.r00").await;
 }
 
 #[tokio::test]
@@ -435,7 +512,13 @@ async fn a_rar5_set_with_recovery_records_and_a_damaged_article_ends_unrepaired_
     );
     assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
     assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
-    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    // The damaged volume is delivered as it stands: the job ends Partial.
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
         set.iter()

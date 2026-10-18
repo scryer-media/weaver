@@ -1337,7 +1337,8 @@ pub(crate) async fn transition_duplicate_snapshot_for_history_tx(
 ) -> Result<(), StateError> {
     let lifecycle = match history_status {
         "complete" | "succeeded" => DuplicateJobLifecycle::Succeeded,
-        "failed" => DuplicateJobLifecycle::Failed,
+        // A partial delivery reads as failed outside the engine.
+        "failed" | "partial" => DuplicateJobLifecycle::Failed,
         "cancelled" => DuplicateJobLifecycle::Cancelled,
         _ => return Ok(()),
     };

@@ -35,7 +35,8 @@ use weaver_graph::{
 use crate::engine::{Format, SetName};
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
-use crate::zip_engine::{ZipFormat, naming::VolumeName};
+use crate::zip_engine::ZipFormat;
+use crate::zip_engine::naming::{LAST, VolumeName};
 use geometry::Geometry;
 use map::{Map, Out};
 
@@ -50,6 +51,15 @@ pub struct Zip {
     // The names bound that name a volume of a set, and every volume bound.
     names: BTreeMap<u32, VolumeName>,
     bound: BTreeSet<u32>,
+    // The disk the symbolic last volume is, once its end record said, and
+    // its length until then: the geometry is by disk.
+    last_disk: Option<u32>,
+    last_length: Option<u64>,
+    // The symbolic last volume opened with a local header while it was the
+    // only volume bound: it is a whole archive, disk 0, and streams from its
+    // front. A numbered volume bound beside it says otherwise.
+    #[serde(default)]
+    opens_alone: bool,
     geometry: Geometry,
     kept: Kept,
     map: Option<Map>,
@@ -72,7 +82,7 @@ pub struct Zip {
 }
 
 impl Durable for Zip {
-    const VERSION: u16 = 1;
+    const VERSION: u16 = 3;
 
     // A member said is an entry of the map, and every entry's member is one.
     fn impossible(&self) -> Option<&'static str> {
@@ -94,10 +104,11 @@ impl Zip {
         Self::default()
     }
 
-    // The volume the directory ends: the one named last, or the only one
+    // The disk the directory ends: the one named last, or the only one
     // when the first names no set.
     fn last(&self) -> Option<VolumeIndex> {
         match self.names.iter().find(|(_, name)| name.is_last()) {
+            Some((&LAST, _)) => self.disk(VolumeIndex(LAST)),
             Some((index, _)) => Some(VolumeIndex(*index)),
             None => {
                 (self.bound.contains(&0) && !self.names.contains_key(&0)).then_some(VolumeIndex(0))
@@ -109,13 +120,123 @@ impl Zip {
         self.geometry.total(self.last()?)
     }
 
+    // The disk a bound volume is: its own number, or for the symbolic last
+    // the disk its end record said, or disk 0 when it opened alone.
+    fn disk(&self, volume: VolumeIndex) -> Option<VolumeIndex> {
+        match volume.0 {
+            LAST => self
+                .last_disk
+                .or(self.opens_alone.then_some(0))
+                .map(VolumeIndex),
+            _ => Some(volume),
+        }
+    }
+
+    // The bound volume a disk is.
+    fn volume(&self, disk: VolumeIndex) -> VolumeIndex {
+        match self.disk(VolumeIndex(LAST)) {
+            Some(last) if last == disk && self.bound.contains(&LAST) => VolumeIndex(LAST),
+            _ => disk,
+        }
+    }
+
+    // Where the symbolic last volume's disk is decided, from what it has
+    // delivered. Alone and opening with a local header, it is a whole
+    // archive at disk 0, so it streams from its front; otherwise its end
+    // record says. A numbered volume bound beside one that opened alone is
+    // a spanned set whose last disk starts at an entry, which the store
+    // has mapped as disk 0: it gives the set to the engine, which reads the
+    // bound volumes in their order.
+    fn decide_last(
+        &mut self,
+        delivery: &Delivery<'_>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
+        if self.opens_alone {
+            if self.bound.iter().any(|volume| *volume != LAST) {
+                self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+            }
+            return;
+        }
+        if delivery.volume.0 != LAST || self.last_disk.is_some() {
+            return;
+        }
+        let alone = self.bound.iter().all(|volume| *volume == LAST);
+        let signature = ByteRange::new(0, 4);
+        if alone
+            && read_through(signature, delivery, read)
+                .is_some_and(|front| front == records::LOCAL.to_le_bytes())
+        {
+            self.opens_alone = true;
+            if let Some(length) = self.last_length {
+                self.geometry.set(VolumeIndex(0), length);
+            }
+            self.stale = true;
+            return;
+        }
+        self.resolve_last(delivery, read, out);
+    }
+
     fn global(&self, volume: VolumeIndex, range: ByteRange) -> Option<ByteRange> {
-        let base = self.geometry.base(volume)?;
+        let base = self.geometry.base(self.disk(volume)?)?;
         Some(range.shift(base as i64))
     }
 
     fn to_volumes(&self, range: ByteRange, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+        let start = out.len();
         self.geometry.to_volumes(range, out);
+        for (volume, _) in &mut out[start..] {
+            *volume = self.volume(*volume);
+        }
+    }
+
+    // Learn the symbolic last volume's disk from the end record in its own
+    // tail. Every byte of it is held by the owner until then, since it has
+    // no place in the container, so the tail is read back through the owner
+    // where this delivery does not carry it.
+    fn resolve_last(
+        &mut self,
+        delivery: &Delivery<'_>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
+        let Some(length) = self.last_length else {
+            return;
+        };
+        let tail = ByteRange::new(
+            length.saturating_sub(records::TAIL + records::LOCATOR_LEN),
+            length,
+        );
+        let Some(bytes) = read_through(tail, delivery, read) else {
+            return;
+        };
+        let Some(end) = records::find_end(&bytes) else {
+            return;
+        };
+        // A saturated disk number is in the zip64 locator, as the count of
+        // disks, just ahead of the end record.
+        let disk = match end.this_disk {
+            disk if disk != u32::from(u16::MAX) => Some(disk),
+            _ => usize::try_from(end.at)
+                .ok()
+                .and_then(|at| at.checked_sub(records::LOCATOR_LEN as usize))
+                .and_then(|at| {
+                    records::locator(&bytes[at..])?;
+                    records::u32_at(&bytes, at + 16)?.checked_sub(1)
+                }),
+        };
+        // A numbered volume at or past the last disk is not of this set.
+        let Some(disk) = disk.filter(|disk| {
+            self.bound
+                .iter()
+                .all(|volume| *volume == LAST || volume < disk)
+        }) else {
+            return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+        };
+        self.last_disk = Some(disk);
+        self.geometry.set(VolumeIndex(disk), length);
+        self.stale = true;
     }
 
     fn give_up(&mut self, emit: Emit, out: &mut Vec<Emit>) {
@@ -220,7 +341,16 @@ impl Object for Zip {
         Kind::Zip
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
+        if self.gone {
+            return;
+        }
+        self.decide_last(&delivery, read, out);
         if self.gone {
             return;
         }
@@ -316,7 +446,11 @@ impl Object for Zip {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
-        if self.geometry.set(volume, length) {
+        let Some(disk) = self.disk(volume) else {
+            self.last_length = Some(length);
+            return;
+        };
+        if self.geometry.set(disk, length) {
             self.stale = true;
             self.settle(out);
         }
@@ -342,15 +476,47 @@ impl Object for Zip {
 
     fn claim(&mut self, name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
         let candidate = ZipFormat::parse(name)?;
-        let first = self.names.get(&0)?;
+        // The member that founds the store binds at its own name's index,
+        // the `.zip` at the symbolic last.
+        if self.bound.is_empty() {
+            return Some(VolumeIndex(candidate.index()));
+        }
+        // A store founded by its `.zip` has no first volume's name yet.
+        let first = self.names.values().next()?;
         let index = first
             .same_set(&candidate)
             .then(|| candidate.slot(&self.names))??;
-        (!self.bound.contains(&index)).then_some(VolumeIndex(index))
+        let before_last = index == LAST || self.last_disk.is_none_or(|last| index < last);
+        (before_last && !self.bound.contains(&index)).then_some(VolumeIndex(index))
     }
 
     fn facts(&self) -> Facts {
         Facts::of(Kind::Zip, self)
+    }
+}
+
+// `range` of the delivery's volume: the delivery's own bytes where it
+// carries them, the rest read through the owner.
+fn read_through(
+    range: ByteRange,
+    delivery: &Delivery<'_>,
+    read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+) -> Option<Vec<u8>> {
+    let carried = delivery.range().intersect(range);
+    let mut bytes = Vec::new();
+    let mut read_held = |range: ByteRange, bytes: &mut Vec<u8>| {
+        range.is_empty() || read(&Placement::Held { range }, bytes)
+    };
+    match carried {
+        Some(carried) => {
+            if !read_held(ByteRange::new(range.start, carried.start), &mut bytes) {
+                return None;
+            }
+            let from = (carried.start - delivery.offset) as usize;
+            bytes.extend_from_slice(&delivery.bytes[from..from + carried.len() as usize]);
+            read_held(ByteRange::new(carried.end, range.end), &mut bytes).then_some(bytes)
+        }
+        None => read_held(range, &mut bytes).then_some(bytes),
     }
 }
 

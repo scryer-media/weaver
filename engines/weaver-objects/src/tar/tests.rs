@@ -243,6 +243,7 @@ impl Owner {
                 bytes: &bytes,
                 provenance,
             },
+            &mut |_, _| false,
             &mut out,
         );
         self.apply(out);
@@ -426,6 +427,37 @@ fn every_dialect_streams_whole_in_frames_of_any_size() {
         assert_eq!(owner.files(), mixed_files(), "frames of {frame}");
         assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
     }
+}
+
+// A GNU sparse entry whose map runs on into an extension block, and a
+// multi-volume continuation: neither is a file, so both stay envelope and
+// the walk finds the regular entry behind them.
+#[test]
+fn sparse_and_continued_entries_are_not_extracted() {
+    let mut writer = Writer::default();
+    let mut sparse = header("holes.bin", "", 1_024, b'S', Dialect::Gnu);
+    sparse[482] = 1;
+    seal(&mut sparse);
+    let mut extension = vec![0u8; BLOCK];
+    extension[..12].copy_from_slice(b"00000004000\0");
+    extension[12..24].copy_from_slice(b"00000002000\0");
+    extension[504] = 0;
+    extension.extend_from_slice(&payload(7, 1_024));
+    writer.raw(sparse, &extension);
+    writer.raw(
+        header("part.bin", "", 600, b'M', Dialect::Gnu),
+        &payload(8, 600),
+    );
+    writer.file("after.bin", &payload(9, 800));
+    let archive = writer.finish().bytes;
+    let mut owner = Owner::new(archive.clone());
+    owner.whole(4096);
+    clean(&owner);
+    assert_eq!(
+        owner.files(),
+        vec![("after.bin".to_owned(), payload(9, 800))]
+    );
+    assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
 }
 
 #[test]

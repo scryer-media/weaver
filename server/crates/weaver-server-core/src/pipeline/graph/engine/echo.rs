@@ -44,6 +44,17 @@ impl Builder for Echoes {
             window: self.window,
         }))
     }
+
+    fn read(
+        &self,
+        _: &weaver_graph::Tree,
+        _: weaver_graph::NodeId,
+        _: weaver_graph::VolumeIndex,
+        _: &weaver_graph::Placement,
+        _: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
 }
 
 struct Echo {
@@ -57,7 +68,13 @@ impl Object for Echo {
     fn kind(&self) -> Kind {
         Kind::RarEngine
     }
-    fn deliver(&mut self, _: Delivery<'_>, _: &mut Vec<Emit>) {}
+    fn deliver(
+        &mut self,
+        _: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
+    }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&mut self, out: &mut Vec<Seek>) {

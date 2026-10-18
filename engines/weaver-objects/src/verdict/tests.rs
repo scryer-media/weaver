@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// Each rendering against the one the pinned crate produces, and each answer
+// a typed error gets. Where the crate can be made to fail for real, it is.
+
+use std::io::{Cursor, Read, Write};
+
+use sevenz_turbo::{BlockErrorKind, Error};
+
+use super::*;
+
+fn block(kind: BlockErrorKind, message: String) -> Error {
+    Error::BlockDecode {
+        block_index: 0,
+        packed_offset: 32,
+        kind,
+        message,
+    }
+}
+
+// The message a block carries is the reader error's own rendering.
+fn read_failure(error: io::Error) -> Error {
+    block(BlockErrorKind::Io, Error::Io(error, "".into()).to_string())
+}
+
+#[test]
+fn a_short_read_exact_is_damage() {
+    let error = Cursor::new([0u8; 3]).read_exact(&mut [0u8; 8]).unwrap_err();
+    assert!(std_read_exact_eof(&error.to_string()));
+    assert_eq!(io(&error), DAMAGED);
+}
+
+#[test]
+fn a_zip_member_whose_crc_fails_is_damage() {
+    let payload = b"one stored member, read back with one byte changed";
+    let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "member.bin",
+            ::zip::write::SimpleFileOptions::default()
+                .compression_method(::zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer.write_all(payload).unwrap();
+    let mut archive = writer.finish().unwrap().into_inner();
+    let at = archive
+        .windows(payload.len())
+        .position(|window| window == payload)
+        .unwrap();
+    archive[at] ^= 0x01;
+    let mut zip = ::zip::ZipArchive::new(Cursor::new(archive)).unwrap();
+    let error = zip
+        .by_index(0)
+        .unwrap()
+        .read_to_end(&mut Vec::new())
+        .unwrap_err();
+    assert!(zip_8_6_crc32_mismatch(&error));
+    assert_eq!(io(&error), DAMAGED);
+    assert_eq!(super::zip(&ZipError::Io(error)), DAMAGED);
+}
+
+#[test]
+fn sevenz_block_errors_are_read_from_their_rendering() {
+    for error in [
+        read_failure(io::ErrorKind::UnexpectedEof.into()),
+        read_failure(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kind: NotFound quoted in the message",
+        )),
+        read_failure(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
+        block(BlockErrorKind::Corrupted, "detail".to_string()),
+        block(BlockErrorKind::ChecksumMismatch, "detail".to_string()),
+    ] {
+        assert_eq!(sevenz(&error), DAMAGED, "{error}");
+    }
+    for error in [
+        block(BlockErrorKind::UnsupportedMethod, "detail".to_string()),
+        block(BlockErrorKind::Io, "detail".to_string()),
+        read_failure(io::ErrorKind::PermissionDenied.into()),
+        read_failure(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "kind: InvalidData quoted in the message",
+        )),
+    ] {
+        assert_eq!(sevenz(&error), TERMINAL, "{error}");
+    }
+    assert_eq!(
+        sevenz(&block(
+            BlockErrorKind::Password,
+            format!("{:?}", Error::PasswordRequired)
+        )),
+        PASSWORD
+    );
+}
+
+// A password-kind block error that is not the reader's own missing-password
+// refusal cannot tell a wrong key from damage, so it asks for no password.
+#[test]
+fn a_password_block_error_without_the_readers_refusal_asks_for_no_password() {
+    assert_eq!(
+        sevenz(&block(BlockErrorKind::Password, "detail".to_string())),
+        TERMINAL
+    );
+}
+
+// Verified bytes that fail to decode under a key indict the key, whatever
+// read failure the reader reports.
+#[test]
+fn a_maybe_bad_password_asks_for_another() {
+    let short = Cursor::new([0u8; 3]).read_exact(&mut [0u8; 8]).unwrap_err();
+    assert_eq!(sevenz(&Error::MaybeBadPassword(short)), PASSWORD);
+    let other = io::Error::new(io::ErrorKind::InvalidData, "bad padding");
+    assert_eq!(sevenz(&Error::MaybeBadPassword(other)), PASSWORD);
+}
+
+#[test]
+fn a_bad_read_in_an_encrypted_zip_entry_asks_for_another_password() {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "Invalid checksum");
+    assert_eq!(zip_read(&bad(), true), PASSWORD);
+    assert_eq!(zip_read(&bad(), false), DAMAGED);
+}
+
+// Only failures that name damage are damage; anything else, an unknown
+// shape or a text that names no checksum, no repair is known to change.
+#[test]
+fn a_7z_failure_that_names_no_damage_is_terminal() {
+    for error in [
+        Error::NextHeaderCrcMismatch,
+        Error::ChecksumVerificationFailed,
+        Error::Other("block checksum".into()),
+    ] {
+        assert_eq!(sevenz(&error), DAMAGED, "{error}");
+    }
+    for error in [
+        Error::ExternalUnsupported,
+        Error::Other("bad property".into()),
+    ] {
+        assert_eq!(sevenz(&error), TERMINAL, "{error}");
+    }
+}
+
+#[test]
+fn a_zip_directory_the_library_refuses_is_terminal() {
+    assert_eq!(
+        super::zip(&ZipError::InvalidArchive("Invalid zip header".into())),
+        TERMINAL
+    );
+    assert_eq!(
+        super::zip(&ZipError::InvalidArchive(
+            "CRC32 checksum failed on Unicode extra field".into()
+        )),
+        DAMAGED
+    );
+    assert_eq!(super::zip(&ZipError::InvalidPassword), PASSWORD);
+}

@@ -196,8 +196,9 @@ impl Gate {
 }
 
 impl Volumes for Gate {
-    fn count(&self) -> usize {
-        self.volumes.len()
+    fn next(&self, after: Option<VolumeIndex>) -> std::io::Result<Option<VolumeIndex>> {
+        let next = after.map_or(0, |after| after.0 as usize + 1);
+        Ok((next < self.volumes.len()).then(|| VolumeIndex(next as u32)))
     }
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {

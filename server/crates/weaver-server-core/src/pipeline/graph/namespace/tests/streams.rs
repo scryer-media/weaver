@@ -19,7 +19,13 @@ impl Object for Decoded {
         Kind::Xz
     }
 
-    fn deliver(&mut self, _: Delivery<'_>, _: &mut Vec<Emit>) {}
+    fn deliver(
+        &mut self,
+        _: Delivery<'_>,
+        _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
+    }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&mut self, _: &mut Vec<Seek>) {}

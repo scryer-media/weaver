@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Passwords, through unrar-rs and the set's one KDF cache. Enciphered
+// Passwords, through unrar-rs and the process's one key cache. Enciphered
 // headers open only on a candidate the archive's own check verifies: a
 // header CRC is no proof, and RAR4 headers carry no check, so they go to an
 // engine. An AES file opens on the first candidate its check does not
 // refute; a file with no check, every RAR4 file among them, opens on the
 // first candidate, and its CRC at the close is the backstop.
 
-use unrar_rs::{
-    KdfCache, MemberKeying, PasswordCheck, RarVolumeHeaderEncryption, check_member_password,
-};
+use unrar_rs::{MemberKeying, PasswordCheck, RarVolumeHeaderEncryption, check_member_password};
 use weaver_graph::{Emit, Why};
 use zeroize::Zeroizing;
 
 use super::{Lock, RarStore};
 use crate::crypt::Cbc;
+use crate::keys::{self, Keys, Tuple};
 
 // A file's key, IV and hash key.
 struct FileKey {
@@ -31,46 +30,77 @@ enum Derived {
     Unkeyable,
 }
 
-// The derivation for one candidate, through the cache, so the check and the
-// key derive the tuple once.
-fn derive(cache: &KdfCache, password: &str, keying: &MemberKeying) -> Derived {
-    match keying {
+// The derivation for one candidate, once per tuple in the process: the key
+// cache holds the key, or the finding that the check refutes the password.
+// A RAR5 entry is the key then the hash key; a RAR4 one the key then the IV.
+fn derive(keys: &Keys, password: &str, keying: &MemberKeying) -> Derived {
+    let kdf = keys.kdf();
+    let (format, salt, count): (_, &[u8], _) = match keying {
+        MemberKeying::Rar5(facts) => ("rar5", &facts.salt, [facts.kdf_count_lg2]),
+        MemberKeying::Rar4 { salt } => ("rar4", salt.as_ref().map_or(&[], |salt| salt), [0]),
+    };
+    let tuple = Tuple {
+        format,
+        password,
+        salt,
+        params: &count,
+    };
+    let derived = keys.derive(&tuple, || match keying {
         MemberKeying::Rar5(facts) => {
-            match check_member_password(
-                cache,
-                password,
-                &facts.salt,
-                facts.kdf_count_lg2,
-                facts.psw_check.as_ref(),
-            ) {
-                PasswordCheck::Wrong => return Derived::Wrong,
+            let check = facts.psw_check.as_ref();
+            match check_member_password(kdf, password, &facts.salt, count[0], check) {
+                PasswordCheck::Wrong => return Err(Derived::Wrong),
                 PasswordCheck::Verified | PasswordCheck::Unverifiable => {}
             }
-            let Ok(material) =
-                cache.derive_material_rar5(password, &facts.salt, facts.kdf_count_lg2)
-            else {
-                return Derived::Unkeyable;
-            };
-            Derived::Key(FileKey {
-                key: Zeroizing::new(material.key.to_vec()),
-                iv: facts.iv,
-                hash_key: Some(Zeroizing::new(material.hash_key)),
-            })
+            let material = kdf
+                .derive_material_rar5(password, &facts.salt, count[0])
+                .map_err(|_| Derived::Unkeyable)?;
+            Ok(Zeroizing::new([material.key, material.hash_key].concat()))
         }
         MemberKeying::Rar4 { salt } => {
-            let (key, iv) = cache.derive_key_rar4(password, salt.as_ref());
-            Derived::Key(FileKey {
-                key: Zeroizing::new(key.to_vec()),
+            let (key, iv) = kdf.derive_key_rar4(password, salt.as_ref());
+            Ok(Zeroizing::new([&key[..], &iv[..]].concat()))
+        }
+    });
+    match derived {
+        Ok(keys::Derived::Key(material)) => Derived::Key(file_key(&material, keying)),
+        Ok(keys::Derived::Wrong) => Derived::Wrong,
+        Err(Derived::Wrong) => {
+            keys.mark_wrong(&tuple);
+            Derived::Wrong
+        }
+        Err(other) => other,
+    }
+}
+
+// A file's key out of a cache entry.
+fn file_key(material: &[u8], keying: &MemberKeying) -> FileKey {
+    let mut half = [0; 32];
+    match keying {
+        MemberKeying::Rar5(facts) => {
+            half.copy_from_slice(&material[32..64]);
+            let key = Zeroizing::new(material[..32].to_vec());
+            FileKey {
+                key,
+                iv: facts.iv,
+                hash_key: Some(Zeroizing::new(half)),
+            }
+        }
+        MemberKeying::Rar4 { .. } => {
+            let mut iv = [0; 16];
+            iv.copy_from_slice(&material[16..32]);
+            FileKey {
+                key: Zeroizing::new(material[..16].to_vec()),
                 iv,
                 hash_key: None,
-            })
+            }
         }
     }
 }
 
 impl RarStore {
-    // Ask the job for a password, once: an offer answers it, and asking
-    // again would only ask the same question.
+    // Ask the job for a password, once until an offer answers it: asking
+    // again before then would only ask the same question.
     pub(super) fn ask(&mut self, out: &mut Vec<Emit>) {
         if !self.asked {
             self.asked = true;
@@ -104,17 +134,21 @@ impl RarStore {
         let Some(check) = facts.psw_check.as_ref() else {
             return self.give_up(Emit::NeedsEngine(Why::EncryptedHeader), out);
         };
+        let (format, salt, count) = ("rar5", &facts.salt[..], [facts.kdf_count_lg2]);
         for index in 0..self.candidates.len() {
-            if self.candidates[index].headers_wrong {
+            let secret = self.candidates[index].secret.clone();
+            let tuple = Tuple {
+                format,
+                password: &secret,
+                salt,
+                params: &count,
+            };
+            if self.candidates[index].headers_wrong || self.keys.is_wrong(&tuple) {
+                self.candidates[index].headers_wrong = true;
                 continue;
             }
-            match check_member_password(
-                &self.kdf,
-                &self.candidates[index].secret,
-                &facts.salt,
-                facts.kdf_count_lg2,
-                Some(check),
-            ) {
+            let kdf = self.keys.kdf();
+            match check_member_password(kdf, &secret, &facts.salt, count[0], Some(check)) {
                 PasswordCheck::Verified => {
                     self.headers_open = Some(index);
                     for volume in self.volumes.values_mut() {
@@ -126,7 +160,10 @@ impl RarStore {
                 PasswordCheck::Unverifiable => {
                     return self.give_up(Emit::NeedsEngine(Why::EncryptedHeader), out);
                 }
-                PasswordCheck::Wrong => self.candidates[index].headers_wrong = true,
+                PasswordCheck::Wrong => {
+                    self.keys.mark_wrong(&tuple);
+                    self.candidates[index].headers_wrong = true;
+                }
             }
         }
         self.ask(out);
@@ -156,7 +193,7 @@ impl RarStore {
             let keying = store.keying();
             let mut opened = None;
             for candidate in &order {
-                match derive(&self.kdf, &self.candidates[*candidate].secret, &keying) {
+                match derive(&self.keys, &self.candidates[*candidate].secret, &keying) {
                     Derived::Key(key) => {
                         opened = Some(key);
                         break;

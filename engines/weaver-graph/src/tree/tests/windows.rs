@@ -34,7 +34,12 @@ impl Object for Tape {
     fn kind(&self) -> Kind {
         Kind::Par2
     }
-    fn deliver(&mut self, delivery: Delivery<'_>, _: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&crate::object::Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
         self.hear(Heard::Bytes(delivery.offset, delivery.bytes.to_vec()));
     }
     fn sized(&mut self, _: VolumeIndex, length: u64, _: &mut Vec<Emit>) {
@@ -99,6 +104,10 @@ impl Builder for Taping {
             Kind::Par2 => Some(Box::new(Tape(Arc::clone(&self.0)))),
             _ => Build.build(kind, id),
         }
+    }
+
+    fn read(&self, _: &Tree, _: NodeId, _: VolumeIndex, _: &Placement, _: &mut Vec<u8>) -> bool {
+        false
     }
 }
 

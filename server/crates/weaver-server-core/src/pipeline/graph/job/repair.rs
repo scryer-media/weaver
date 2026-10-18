@@ -69,7 +69,11 @@ impl GraphJob {
     // covers is closed and the namespace has announced every member it
     // will get, since a volume of its own may still be on its way behind
     // them; one waiting on recovery bytes rules again once more of its
-    // volumes are closed than when it last ruled.
+    // volumes are closed than when it last ruled. It learns what it covers
+    // from its own bytes, so one that covers nothing yet rules only once a
+    // volume of its own is in: a verdict on nothing would read as settled
+    // to every member beside it, and a member it binds after would never
+    // be repaired before an engine reads it.
     fn due(&self, node: NodeId) -> bool {
         let tree = &self.tree;
         let Some(namespace) = tree.namespace(node) else {
@@ -81,7 +85,9 @@ impl GraphJob {
             };
             match recovery.outcome() {
                 None => {
+                    let covers = namespace.members().any(|member| recovery.covers(member.id));
                     self.members_known(node)
+                        && (covers || self.closed_volumes(recovery_node) > 0)
                         && namespace
                             .members()
                             .all(|member| !recovery.covers(member.id) || member.closed)
@@ -120,14 +126,7 @@ impl GraphJob {
     // and every member but a recovery volume is closed.
     fn namespace_in(&self, node: NodeId) -> bool {
         let tree = &self.tree;
-        let members_in = tree.namespace(node).is_some_and(|namespace| {
-            namespace.members().all(|member| {
-                member.closed
-                    || tree
-                        .child_of(node, member.id)
-                        .is_some_and(|(child, _)| tree.recovers(child))
-            })
-        });
+        let members_in = tree.namespace(node).is_some() && !tree.leaves_open(node);
         self.members_known(node) && members_in
     }
 
@@ -177,32 +176,54 @@ impl GraphJob {
     // recovery object there vouched for is refused by its object: the
     // members that were its volumes are damaged leaves of the namespace it
     // was bound in. A leaf that is itself a refused member refuses nothing
-    // more, so a refusal stops where the damage first had no cover. The
-    // root came out of no object, and keeps its damaged leaves. Asked only
-    // once every run is started, since a repair's bytes reach a namespace
-    // below by its run reading them again. Returns whether it refused.
+    // more, so a refusal stops where the damage first had no cover. An
+    // object that never placed every member it named is refused the same
+    // way, since what it holds would otherwise ship as nothing. The root
+    // came out of no object, and keeps its damaged leaves. Asked only once
+    // every run is started, since a repair's bytes reach a namespace below
+    // by its run reading them again. Parents come first, and a refusal
+    // takes the subtree with it. Returns whether it refused.
     pub(super) fn refuse_unrepaired(&mut self) -> Result<bool, GraphError> {
         if !self.quiet() {
             return Ok(false);
         }
-        let refusing: Vec<NodeId> = self
-            .tree
-            .live()
-            .into_iter()
-            .filter(|node| self.tree.volumes(*node).is_some() && self.unrepaired(*node))
-            .collect();
-        let mut effects = Vec::new();
-        for node in refusing {
+        let mut refused = false;
+        for node in self.tree.live() {
+            if self.tree.volumes(node).is_none() || !self.tree.live().contains(&node) {
+                continue;
+            }
+            let why = if self.unrepaired(node) {
+                Why::Unrepairable
+            } else if self.unmapped(node) {
+                Why::Unmapped
+            } else {
+                continue;
+            };
+            let mut effects = Vec::new();
             self.tree.emitted(
                 node,
-                vec![Emit::Refuse(Why::Unrepairable)],
-                &mut *self.builder,
+                vec![Emit::Refuse(why)],
+                &mut self.writer.placing(&mut *self.builder),
                 &mut effects,
             );
+            refused |= !effects.is_empty();
+            self.settle(effects)?;
         }
-        let refused = !effects.is_empty();
-        self.settle(effects)?;
         Ok(refused)
+    }
+
+    // Every volume of the object is in and no run of it reads, yet it named
+    // no member, or left one it named open. A recovery object places
+    // nothing, and a member that is a recovery volume below may stay parked.
+    fn unmapped(&self, node: NodeId) -> bool {
+        let tree = &self.tree;
+        if tree.recovers(node) || !self.members_known(node) {
+            return false;
+        }
+        let Some(namespace) = tree.namespace(node) else {
+            return false;
+        };
+        namespace.members().next().is_none() || !self.namespace_in(node)
     }
 
     // The payload is in, no run is reading, and every recovery object in the
@@ -314,6 +335,11 @@ impl GraphJob {
         let mut emits = Vec::new();
         object.volume_lost(volume, range, &mut emits);
         self.tree.put_object(child, object);
-        self.tree.emitted(child, emits, &mut *self.builder, effects);
+        self.tree.emitted(
+            child,
+            emits,
+            &mut self.writer.placing(&mut *self.builder),
+            effects,
+        );
     }
 }

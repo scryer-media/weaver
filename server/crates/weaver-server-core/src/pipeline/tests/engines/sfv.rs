@@ -7,9 +7,10 @@
 
 use super::harness::{ARTICLE, Claim, Outcome, Post, Scenario, assert_same, payload, run_both};
 use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
 
 // A listing: a comment, then `name XXXXXXXX` per entry.
-fn listing(name: &str, entries: &[(&str, u32)]) -> Post {
+pub(super) fn listing(name: &str, entries: &[(&str, u32)]) -> Post {
     let mut text = String::from("; generated listing\n");
     for (listed, crc) in entries {
         text.push_str(&format!("{listed} {crc:08X}\n"));
@@ -17,7 +18,7 @@ fn listing(name: &str, entries: &[(&str, u32)]) -> Post {
     Post::plain(name, text.into_bytes())
 }
 
-fn crc(bytes: &[u8]) -> u32 {
+pub(super) fn crc(bytes: &[u8]) -> u32 {
     par2_rs::checksum::crc32(bytes)
 }
 
@@ -60,10 +61,11 @@ async fn an_sfv_entry_naming_no_member_never_fails_the_job() {
     assert!(claims_all(&graph.claims, Claim::Complete));
 }
 
-// A listing that disagrees fails the job under both engines alike, at the
-// same stage, with the same files and claims; each words it its own way.
-// Classic names the file, the graph names the listing as a recovery set
-// that could not repair it, as it does for a PAR2 set short of blocks.
+// A listing that disagrees with the only payload file fails the job under
+// both engines alike, with the same files and claims; each words it its own
+// way. Classic names the file, the graph names the listing as a recovery set
+// that could not repair it, and the file it found damaged, as it does for a
+// PAR2 set short of blocks.
 fn assert_failed_each_its_way(classic: &Outcome, graph: &Outcome, member: &str, listed_in: &str) {
     for outcome in [classic, graph] {
         assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
@@ -74,7 +76,9 @@ fn assert_failed_each_its_way(classic: &Outcome, graph: &Outcome, member: &str, 
     );
     let graph_failure = graph.failure.as_deref().unwrap_or_default();
     assert!(
-        graph_failure.starts_with(&format!("SFV recovery failed for 1 set(s): {listed_in}: ")),
+        graph_failure.starts_with(&format!(
+            "SFV recovery failed for 1 set(s): {listed_in} ({member}): "
+        )),
         "{graph_failure:?}"
     );
     assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Health));
@@ -85,7 +89,7 @@ fn assert_failed_each_its_way(classic: &Outcome, graph: &Outcome, member: &str, 
 }
 
 #[tokio::test]
-async fn an_sfv_mismatch_fails_the_job_as_health_under_classic_and_as_repair_under_graph() {
+async fn an_sfv_mismatch_fails_as_health_under_classic_and_ends_partial_as_repair_under_graph() {
     let lantern = payload(3 * ARTICLE, 24);
     let beacon = payload(2 * ARTICLE, 25);
     let scenario = Scenario::new(vec![
@@ -100,7 +104,28 @@ async fn an_sfv_mismatch_fails_the_job_as_health_under_classic_and_as_repair_und
         ),
     ]);
     let (classic, graph) = run_both(&scenario).await;
-    assert_failed_each_its_way(&classic, &graph, "beacon.bin", "lantern.sfv");
+    for outcome in [&classic, &graph] {
+        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
+    }
+    assert_eq!(classic.failure.as_deref(), Some("sfv mismatch: beacon.bin"));
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Health));
+    // Under the graph the file the listing agrees with is delivered whole
+    // beside the one it does not, so the job ends Partial (the
+    // partial-extraction ruling of 2026-10-18), its failure the repair's.
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    // Both files are delivered as posted; the namespace marks the one the
+    // listing found bad.
+    assert!(classic.files.is_empty());
+    assert_eq!(graph.files.len(), 3, "{:?}", graph.files.keys());
+    let view = graph.graph();
+    assert_eq!(view.claims["lantern.bin"], Claim::Complete);
+    assert_eq!(view.claims["beacon.bin"], Claim::Damaged);
 }
 
 // The listing disagrees with the member, so only an entry bound to it across

@@ -7,13 +7,13 @@
 // the bytes pass: every part but the last carries the CRC of its own packed
 // bytes, and the last carries the whole file's, keyed when the header says.
 // A part that fails its own is damaged at its range; a file that fails as a
-// whole is damaged at every part, unless some of its bytes came damaged:
-// those are the cause, already marked where they lie, and the file is
-// judged again when their repair arrives, so no mark is left on a part
-// whose bytes were never bad.
+// whole is damaged at every part. Bytes that came damaged are judged by
+// neither: they are already marked where they lie, the runs give no value
+// over them, and the part or file is judged when their repair arrives, so
+// no mark is left on a part whose bytes were never bad.
 
 use bytes::Bytes;
-use weaver_graph::{ByteRange, Emit, MemberId, Provenance, SliceVerdict, VolumeIndex};
+use weaver_graph::{ByteRange, Emit, MemberId, Placement, Provenance, SliceVerdict, VolumeIndex};
 
 use super::{Lock, RarStore};
 use crate::grid::crc32;
@@ -26,6 +26,7 @@ impl RarStore {
         range: ByteRange,
         bytes: &[u8],
         provenance: Provenance,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
         for (id, part, stream) in self.linked(volume, range) {
@@ -51,14 +52,13 @@ impl RarStore {
                 Lock::Plain => {}
                 Lock::Open(cbc) => {
                     let said = &mut entry.out;
-                    cbc.deliver(
-                        &said.coverage,
-                        &mut said.padding,
-                        stream.start,
-                        slice,
-                        provenance,
-                        &mut plains,
-                    );
+                    let member = MemberId(id as u32);
+                    let mut plain = |range: ByteRange, buffer: &mut Vec<u8>| {
+                        read(&Placement::Member { member, range }, buffer)
+                    };
+                    let (coverage, padding) = (&said.coverage, &mut said.padding);
+                    let arrival = (stream.start, slice, provenance);
+                    cbc.deliver(coverage, padding, arrival, &mut plain, &mut plains);
                     for plain in plains {
                         self.record(id, plain.offset, &plain.bytes, plain.provenance, out);
                     }
@@ -124,9 +124,6 @@ impl RarStore {
         let Some(expected) = entry.crc else {
             return;
         };
-        if entry.out.coverage.damaged_ranges().next().is_some() {
-            return;
-        }
         let hash_key = entry.hash_key.as_deref();
         let (SliceVerdict::Damaged, crc) = gate(
             &entry.plain_runs,

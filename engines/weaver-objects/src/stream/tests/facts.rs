@@ -47,8 +47,8 @@ fn xz_steps(bytes: &[u8], frame: usize) -> Vec<Step<'_>> {
 }
 
 // Cut after the stream header, inside the first block header, mid-member and
-// at the second stream's start: each restores with the same window and
-// frontier, and its run decodes both streams through as one member.
+// at the second stream's start: each restores with the same window, and its
+// run decodes both streams through as one member.
 #[test]
 fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
     let (first, second) = (first_payload(), second_payload());
@@ -71,7 +71,6 @@ fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
     for (steps, cut, frontier) in cuts {
         let (facts, live, again) = restores_alike(Box::new(XzStream::new()), steps, cut, &[]);
         let kept: XzStream = facts.read(Kind::Xz).expect("decodes");
-        assert_eq!(kept.consumed, frontier, "cut {cut}");
         assert_eq!(kept.first.len(), FIRST.min(frontier as usize), "cut {cut}");
         assert_eq!(reserve(live.as_ref()), reserve(again.as_ref()));
         assert_eq!(

@@ -182,6 +182,7 @@ impl Pipeline {
                 | JobStatus::Checking
                 | JobStatus::Moving
                 | JobStatus::Complete
+                | JobStatus::Partial
                 | JobStatus::Failed { .. }
         ) {
             return;
@@ -210,6 +211,7 @@ impl Pipeline {
                 | JobStatus::Checking
                 | JobStatus::Moving
                 | JobStatus::Complete
+                | JobStatus::Partial
                 | JobStatus::Failed { .. }
         ) {
             return;
@@ -251,6 +253,7 @@ impl Pipeline {
             JobStatus::QueuedPostProcessing => "queued_post_processing",
             JobStatus::PostProcessing => "post_processing",
             JobStatus::Complete => "complete",
+            JobStatus::Partial => "partial",
             JobStatus::Failed { .. } => "failed",
             JobStatus::Paused => "paused",
         }
@@ -272,7 +275,10 @@ impl Pipeline {
         ) -> bool {
             matches!(
                 new_status,
-                JobStatus::Complete | JobStatus::Failed { .. } | JobStatus::Paused
+                JobStatus::Complete
+                    | JobStatus::Partial
+                    | JobStatus::Failed { .. }
+                    | JobStatus::Paused
             ) || matches!(
                 (old_run_state, new_run_state),
                 (
@@ -564,7 +570,12 @@ impl Pipeline {
     }
 
     pub(crate) fn transition_completed_runtime(&mut self, job_id: JobId) {
-        self.transition_postprocessing_status(job_id, JobStatus::Complete, Some("complete"));
+        // A graph job rules on what it delivered; a classic job completes.
+        let status = self
+            .graph_terminal_status(job_id)
+            .unwrap_or(JobStatus::Complete);
+        let persisted = status.persisted_status();
+        self.transition_postprocessing_status(job_id, status, Some(persisted));
     }
 
     pub(crate) fn pause_job_runtime(&mut self, job_id: JobId) -> Result<(), crate::SchedulerError> {
@@ -673,7 +684,11 @@ impl Pipeline {
 
         if matches!(
             resume_status,
-            JobStatus::Complete | JobStatus::Failed { .. } | JobStatus::Moving | JobStatus::Paused
+            JobStatus::Complete
+                | JobStatus::Partial
+                | JobStatus::Failed { .. }
+                | JobStatus::Moving
+                | JobStatus::Paused
         ) {
             return Ok(());
         }
@@ -761,6 +776,7 @@ impl Pipeline {
                 | JobStatus::Checking
                 | JobStatus::Moving
                 | JobStatus::Complete
+                | JobStatus::Partial
                 | JobStatus::Failed { .. }
         ) {
             return false;
@@ -809,6 +825,7 @@ impl Pipeline {
                 | JobStatus::Checking
                 | JobStatus::Moving
                 | JobStatus::Complete
+                | JobStatus::Partial
                 | JobStatus::Failed { .. }
                 | JobStatus::Verifying
                 | JobStatus::QueuedRepair

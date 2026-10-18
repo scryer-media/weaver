@@ -32,18 +32,36 @@ fn bind(job: &mut Job<Sfv>) {
     assert!(renamed.is_empty());
 }
 
+// Comments, junk, a BOM, DOS and Unix paths, a short CRC, a size column,
+// a listing repeated verbatim and one that contradicts itself.
 #[test]
-fn entries_skip_comments_and_junk() {
+fn entries_are_keyed_by_lower_cased_basename() {
     let parsed = entries(
-        b"; comment\n\nalpha.bin 0000ABCD\nnot an entry\nname with spaces.bin deadBEEF\r\n",
+        "\u{feff}; comment\n\nAlpha.bin 0000ABCD\nnot an entry\nname with spaces.bin deadBEEF\r\n\
+         sub\\Dos.bin ABC\nsub/unix.bin 00000001\nsize.bin 123456789\n\
+         twice.bin 00000002\nTWICE.bin 00000002\nclash.bin 00000003\nclash.bin 00000004\n"
+            .as_bytes(),
     );
     assert_eq!(
         parsed,
-        vec![
+        BTreeMap::from([
             ("alpha.bin".to_owned(), 0xABCD),
-            ("name with spaces.bin".to_owned(), 0xDEAD_BEEF)
-        ]
+            ("dos.bin".to_owned(), 0xABC),
+            ("name with spaces.bin".to_owned(), 0xDEAD_BEEF),
+            ("twice.bin".to_owned(), 2),
+            ("unix.bin".to_owned(), 1),
+        ])
     );
+}
+
+#[test]
+fn members_whose_names_differ_only_by_case_bind_to_nothing() {
+    let one = payload(6, 2000);
+    let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
+    let lower = job.member("one.bin", &one);
+    let upper = job.member("ONE.bin", &one);
+    bind(&mut job);
+    assert!(!job.object.covers(lower) && !job.object.covers(upper));
 }
 
 #[test]

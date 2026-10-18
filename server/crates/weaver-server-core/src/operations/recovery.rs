@@ -94,7 +94,7 @@ pub async fn recover_server_state(
     for (job_id, recovered) in active_jobs {
         let is_finished = matches!(
             recovered.status.as_str(),
-            "complete" | "failed" | "cancelled"
+            "complete" | "partial" | "failed" | "cancelled"
         );
 
         if is_finished {
@@ -406,6 +406,7 @@ fn archive_unfinished_terminal_job(
 
     let (status_str, error_message) = match status {
         JobStatus::Complete => ("complete", None),
+        JobStatus::Partial => ("partial", None),
         JobStatus::Failed { error } => ("failed", Some(error.clone())),
         // Anything else reaching this branch is a status the active row calls
         // finished but the runtime does not model as terminal; leave it alone.

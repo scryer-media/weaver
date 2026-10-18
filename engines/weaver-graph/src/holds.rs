@@ -481,6 +481,26 @@ impl HoldLedger {
         self.cut(volume, range)
     }
 
+    // The held parts of `range`, in offset order, left held: a repair reads
+    // bytes before any object has given them a home.
+    pub fn peek(&self, volume: VolumeIndex, range: ByteRange) -> Vec<Taken> {
+        self.volumes
+            .get(&volume)
+            .map(|holds| {
+                holds
+                    .range(..range.end)
+                    .filter_map(|(_, hold)| {
+                        let inside = hold.range.intersect(range)?;
+                        Some(Taken {
+                            range: inside,
+                            location: hold.slice(inside),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     // Drop every hold, for a namespace that is going away. The caller
     // removes the scratch file.
     pub fn discard(&mut self) {

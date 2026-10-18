@@ -163,7 +163,7 @@ pub struct SevenZipStore {
 }
 
 impl Durable for SevenZipStore {
-    const VERSION: u16 = 1;
+    const VERSION: u16 = 2;
 
     // The folders and members said are the map's, a cipher only where the
     // map has AES, and the proof is a file of the map.
@@ -174,7 +174,7 @@ impl Durable for SevenZipStore {
                 Some(map) => {
                     map.is_sound()
                         && map.folders.len() == self.folders.len()
-                        && map.members.len() == self.members.len()
+                        && map.entries.len() == self.members.len()
                         && self.folders.iter().zip(&map.folders).all(|(lock, folder)| {
                             matches!(lock, Lock::Plain) == folder.aes.is_none()
                         })
@@ -422,12 +422,7 @@ impl SevenZipStore {
     fn build(&mut self, archive: &sevenz_turbo::Archive, read: &[ByteRange], out: &mut Vec<Emit>) {
         let map = match map::build(archive) {
             Ok(map) => map,
-            Err(map::Shape::Compressed) => {
-                return self.give_up(Emit::NeedsEngine(Why::Compressed), out);
-            }
-            Err(map::Shape::Unsupported) => {
-                return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
-            }
+            Err(why) => return self.give_up(Emit::NeedsEngine(why), out),
         };
         self.basis = read
             .iter()
@@ -441,11 +436,10 @@ impl SevenZipStore {
                 None => Lock::Plain,
             })
             .collect();
-        self.members = map.members.iter().map(|_| Out::default()).collect();
+        self.members = map.entries.iter().map(|_| Out::default()).collect();
         // Every member is announced now, in id order, which is the order the
         // namespace numbers them in.
-        for (id, index) in map.members.iter().enumerate() {
-            let entry = &map.entries[*index];
+        for (id, entry) in map.entries.iter().enumerate() {
             let member = MemberId(id as u32);
             out.push(Emit::Member {
                 member,
@@ -504,7 +498,12 @@ impl Object for SevenZipStore {
         Kind::SevenZipStore
     }
 
-    fn deliver(&mut self, delivery: Delivery<'_>, out: &mut Vec<Emit>) {
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
         if self.gone {
             return;
         }
@@ -532,7 +531,7 @@ impl Object for SevenZipStore {
                 break;
             }
         }
-        self.route(range, bytes, delivery.provenance, out);
+        self.route(range, bytes, delivery.provenance, read, out);
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
@@ -666,20 +665,24 @@ impl Object for SevenZipStore {
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
-        if self.gone
-            || self
-                .candidates
-                .iter()
-                .any(|candidate| candidate.secret.as_str() == secret)
-        {
+        if self.gone {
             return;
         }
-        self.candidates.push(Candidate {
-            secret: Zeroizing::new(secret.to_owned()),
-            password: Password::new(secret),
-            header_wrong: false,
-            folder_wrong: false,
-        });
+        // The offer answers the question the store asked: a candidate that
+        // opens nothing leaves it free to ask for the next one.
+        self.asked = false;
+        if !self
+            .candidates
+            .iter()
+            .any(|candidate| candidate.secret.as_str() == secret)
+        {
+            self.candidates.push(Candidate {
+                secret: Zeroizing::new(secret.to_owned()),
+                password: Password::new(secret),
+                header_wrong: false,
+                folder_wrong: false,
+            });
+        }
         self.stale = true;
         self.settle(out);
     }
