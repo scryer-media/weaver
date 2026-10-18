@@ -172,26 +172,27 @@ async fn subs_srt_beside_subs_srt_gz_delivers_both_and_overwrites_nothing() {
 // A PAR2 set that describes only a file never posted covers nothing here,
 // and an xz whose first article arrived damaged has no recovery behind it.
 // The set rules as soon as its volumes are in, so nothing waits on it: the
-// job ends with the xz delivered as it stands, its stream header unreadable,
-// Partial for unpacking. The file the set describes was never rebuilt, so
-// it is no file; the graph's claim on the xz is what was delivered of it.
+// job ends with the xz short as it stands, its stream header unreadable, and
+// with nothing whole it fails for unpacking, carrying the set's repair
+// failure. The file the set describes was never rebuilt, so it is no file;
+// the graph's claim on the xz is what arrived of it.
 #[tokio::test]
 async fn an_xz_damaged_at_its_front_beside_a_par2_set_covering_nothing_ends_without_waiting() {
     let other = payload(2 * ARTICLE + 7, 65);
     let mut posts = vec![Post::plain("ember.bin.xz", xz(&ember()))];
     posts.extend(par2_set("tinder", &[("tinder.bin", &other)], 2));
     let graph = run(&Scenario::new(posts).damaged(0, 0), Engine::Graph).await;
-    assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
+    assert!(
+        graph.failure.as_deref().is_some_and(
+            |error| error.starts_with("PAR2 recovery failed for 1 set(s): tinder.par2")
+        ),
         "{:?}",
-        graph.failure
+        graph.status
     );
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(graph.files.contains_key(&delivered("ember.bin.xz")));
-    assert!(!graph.files.contains_key(&delivered("ember.bin")));
-    assert!(!graph.files.contains_key(&delivered("tinder.bin")));
-    assert_eq!(graph.claims.get("ember.bin.xz"), Some(&Claim::Damaged));
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    // A failed job ships nothing; the graph's own claim keeps the damage.
+    assert_eq!(graph.claims.get("ember.bin.xz"), Some(&Claim::Missing));
     assert_eq!(
         graph.graph().claims.get("ember.bin.xz"),
         Some(&Claim::Damaged)

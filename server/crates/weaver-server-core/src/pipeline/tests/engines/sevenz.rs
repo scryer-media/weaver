@@ -475,15 +475,15 @@ fn beside_par2(archive: &[u8], blocks: u32) -> Scenario {
 }
 
 // The end header cut short and posted whole: every volume closes and the
-// store never maps. Graph refuses it (`Why::Unmapped`) and delivers the
-// container as it stands in place of its members; the object failed, so the
-// job is Partial for unpacking, never Complete with its members missing.
-// Classic fails the job: it cannot read the archive.
+// store never maps. Graph refuses it (`Why::Unmapped`) and gives the
+// container back as it stands in place of its members; the object failed
+// and nothing is whole, so the job fails for unpacking, never Complete with
+// its members missing. Classic fails the job: it cannot read the archive.
 #[tokio::test]
-async fn a_7z_whose_end_header_is_cut_short_is_refused_with_the_container_delivered_under_graph() {
+async fn a_7z_whose_end_header_is_cut_short_is_refused_and_fails_under_graph() {
     let mut archive = stored(None);
     archive.truncate(archive.len() - 8);
-    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive.clone())]);
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)]);
     let (classic, graph) = run_both(&scenario).await;
     assert!(
         matches!(classic.status, Some(JobStatus::Failed { .. })),
@@ -491,21 +491,10 @@ async fn a_7z_whose_end_header_is_cut_short_is_refused_with_the_container_delive
         classic.status
     );
     assert_eq!(
-        graph.files.keys().cloned().collect::<Vec<_>>(),
-        [delivered("lantern.7z")],
-        "graph: {:?}",
-        graph.status
+        graph.failure.as_deref(),
+        Some("no file was delivered whole; 1 short: lantern.7z")
     );
-    assert!(
-        graph.files[&delivered("lantern.7z")] == archive,
-        "the container as posted"
-    );
-    assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        graph.failure
-    );
+    assert!(graph.files.is_empty(), "graph: {:?}", graph.files.keys());
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
     assert!(
         graph.refetched().is_empty(),

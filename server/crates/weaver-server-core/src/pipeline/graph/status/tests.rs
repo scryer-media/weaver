@@ -487,8 +487,8 @@ fn a_repair_of_one_set_never_excuses_another() {
     );
 }
 
-// The one derivation a job with nothing left to wait for ends by: whole,
-// short beside whole, or nothing but what a repair could not rebuild.
+// The one derivation a job with nothing left to wait for ends by: nothing
+// short, short beside whole, or nothing whole.
 #[test]
 fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
     let names = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -506,13 +506,31 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         delivery(&["ember.bin"], &[], &["ember.dat"]).status(Some(error)),
         JobStatus::Partial
     );
-    // Nothing could have rebuilt it; it is delivered as it stands.
+    assert_eq!(
+        delivery(&["ember.bin"], &["ember.dat"], &[]).status(None),
+        JobStatus::Partial
+    );
+    // Nothing is whole: the job failed, whatever ships as it stands.
     assert_eq!(
         delivery(&[], &["ember.dat"], &[]).status(None),
-        JobStatus::Partial
+        JobStatus::Failed {
+            error: "no file was delivered whole; 1 short: ember.dat".to_string()
+        }
+    );
+    assert_eq!(
+        delivery(&[], &["ember.dat"], &["ember.idx"]).status(None),
+        JobStatus::Failed {
+            error: "no file was delivered whole; 2 short: ember.dat, ember.idx".to_string()
+        }
     );
     assert_eq!(
         delivery(&[], &[], &["ember.dat"]).status(Some(error)),
+        JobStatus::Failed {
+            error: error.to_string()
+        }
+    );
+    assert_eq!(
+        delivery(&[], &["ember.dat"], &[]).status(Some(error)),
         JobStatus::Failed {
             error: error.to_string()
         }

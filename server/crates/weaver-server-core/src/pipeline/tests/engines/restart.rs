@@ -715,14 +715,14 @@ async fn a_buried_refusal_restarted_after_every_article_is_offered_to_no_later_s
 
 // A three-volume set the RAR engine reads, posted without `.r00`. The engine
 // announces the member and never closes it, so its refusal leaves it buried
-// under the engine's node, and that buried member is what makes the job
-// Partial. A refusal of that kind waits for the payload to be in, so it lands
-// in the last settle, after the last checkpoint: restored after every
-// article before it, the job still ends Partial as the run that never
-// restarted does. That a checkpoint carries a buried member back is the
-// tree record's round trip.
+// under the engine's node, and that buried member leaves nothing whole, so
+// the job fails. A refusal of that kind waits for the payload to be in, so it
+// lands in the last settle, after the last checkpoint: restored after every
+// article before it, the job still fails as the run that never restarted
+// does. That a checkpoint carries a buried member back is the tree record's
+// round trip.
 #[tokio::test]
-async fn a_set_missing_a_volume_restarted_after_every_article_still_ends_partial() {
+async fn a_set_missing_a_volume_restarted_after_every_article_still_fails() {
     let body = payload(7 * ARTICLE + 13, 51);
     let posts: Vec<Post> =
         header_encrypted_store_set("beacon.bin", &body, 3, SECRET, HeaderCheck::Absent)
@@ -734,10 +734,8 @@ async fn a_set_missing_a_volume_restarted_after_every_article_still_ends_partial
     let scenario = Scenario::new(posts).password(SECRET);
     let whole = run(&scenario, Engine::Graph).await;
     assert_eq!(
-        whole.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        whole.failure
+        whole.failure.as_deref(),
+        Some("no file was delivered whole; 2 short: ember.rar, ember.r01")
     );
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);

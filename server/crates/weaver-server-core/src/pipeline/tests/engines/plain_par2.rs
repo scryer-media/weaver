@@ -152,10 +152,11 @@ async fn a_lost_recovery_article_short_of_blocks_fails_under_graph_and_completes
     );
 }
 
-// Divergence: the graph keeps a damaged article no recovery covers and
-// delivers it with the damage reported; classic fails the download.
+// A damaged article no recovery covers, in the job's only file. Divergence:
+// the graph keeps the article and claims the file damaged, and since nothing
+// is whole the job fails for the short file; classic fails the download.
 #[tokio::test]
-async fn a_damaged_article_without_par2_is_delivered_under_graph_and_fails_under_classic() {
+async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged_under_graph() {
     let scenario =
         Scenario::new(vec![Post::plain("lantern.bin", payload(10 * ARTICLE, 9))]).damaged(0, 4);
     let (classic, graph) = run_both(&scenario).await;
@@ -170,14 +171,13 @@ async fn a_damaged_article_without_par2_is_delivered_under_graph_and_fails_under
         "{:?}",
         classic.failure
     );
-    // Delivered as it stands, short of whole: the job ends Partial.
+    // Nothing is whole: the job fails, naming the short file.
     assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        graph.failure
+        graph.failure.as_deref(),
+        Some("no file was delivered whole; 1 short: lantern.bin")
     );
-    assert_eq!(graph.claims["lantern.bin"], Claim::Damaged);
+    // A failed job ships nothing; the graph's own claim keeps the damage.
+    assert_eq!(graph.claims["lantern.bin"], Claim::Missing);
     assert_eq!(graph.graph().claims["lantern.bin"], Claim::Damaged);
 }
 

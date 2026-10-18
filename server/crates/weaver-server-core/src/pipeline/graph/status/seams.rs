@@ -53,16 +53,26 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
 }
 
 // What an advance came to, applied to the job. A job with nothing left to
-// wait for ends as its settled claims say: it fails only when the files a
-// recovery object could not rebuild are all it has.
+// wait for ends as its settled claims say: it fails when no file it hands
+// over is whole.
 pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
     match step {
         Step::Wait => {}
         Step::Deliver => match pipeline.graph_terminal_status(job_id) {
             Some(JobStatus::Failed { error }) => {
-                metrics::failed("repair_impossible");
-                // The repair is the stage that broke, whatever the root showed.
-                pipeline.transition_postprocessing_status(job_id, JobStatus::Repairing, None);
+                // The stage that left the delivery short is the one that
+                // broke, whatever the root showed.
+                let stalled = match pipeline.graph_shortfall(job_id).map(|(stage, _)| stage) {
+                    Some(PipelineFailureStage::Repair) => {
+                        metrics::failed("repair_impossible");
+                        JobStatus::Repairing
+                    }
+                    _ => {
+                        metrics::failed("nothing_whole");
+                        JobStatus::Extracting
+                    }
+                };
+                pipeline.transition_postprocessing_status(job_id, stalled, None);
                 pipeline.fail_job(job_id, error);
             }
             _ => {

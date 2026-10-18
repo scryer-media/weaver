@@ -360,9 +360,9 @@ async fn a_header_encrypted_rar5_set_without_a_password_check_goes_to_the_engine
 // A three-volume set the RAR engine reads, posted without one volume. The
 // engine reads volume p as bound volume p, so the member cannot be read
 // whole: its object announced it and never closed it, so the refusal reads
-// the posted volumes back as they were, delivered as they stand, and the
-// job is Partial. Divergence: classic never settles.
-async fn assert_missing_volume_is_partial(missing: &str) {
+// the posted volumes back as they were, short, and with nothing whole the
+// job fails naming them. Divergence: classic never settles.
+async fn assert_missing_volume_fails(missing: &str) {
     let body = body();
     let volumes: Vec<(String, Vec<u8>)> =
         header_encrypted_store_set(MEMBER, &body, 3, SECRET, HeaderCheck::Absent)
@@ -384,32 +384,29 @@ async fn assert_missing_volume_is_partial(missing: &str) {
         "{:?}",
         graph.graph().kinds
     );
+    let short: Vec<&str> = posted.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        graph.failure
+        graph.failure,
+        Some(format!(
+            "no file was delivered whole; {} short: {}",
+            short.len(),
+            short.join(", ")
+        ))
     );
-    let mut names: Vec<String> = posted.iter().map(|(name, _)| delivered(name)).collect();
-    names.sort();
-    assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), names);
-    assert!(!graph.files.contains_key(&delivered(MEMBER)));
-    for (name, bytes) in &posted {
-        assert!(graph.files[&delivered(name)] == *bytes, "{name} as posted");
-    }
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
 // Without `.r01`, the last: the engine finds no volume past `.r00`.
 #[tokio::test]
-async fn a_three_volume_set_the_engine_reads_posted_without_its_r01_is_partial_under_graph() {
-    assert_missing_volume_is_partial("silver.horizon.r01").await;
+async fn a_three_volume_set_the_engine_reads_posted_without_its_r01_fails_under_graph() {
+    assert_missing_volume_fails("silver.horizon.r01").await;
 }
 
 // Without `.r00`, inside the set: the engine reads position 1 as lost.
 #[tokio::test]
-async fn a_three_volume_set_the_engine_reads_posted_without_its_r00_is_partial_under_graph() {
-    assert_missing_volume_is_partial("silver.horizon.r00").await;
+async fn a_three_volume_set_the_engine_reads_posted_without_its_r00_fails_under_graph() {
+    assert_missing_volume_fails("silver.horizon.r00").await;
 }
 
 #[tokio::test]

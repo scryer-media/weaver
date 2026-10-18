@@ -163,20 +163,34 @@ impl Delivery {
         walk.delivery
     }
 
-    // How a job that has nothing left to wait for ends: complete when every
-    // file it hands over is whole, partial while anything is delivered
-    // beside what is short, and failed, for `failure`, when the only files
-    // are ones a recovery object could not rebuild.
+    // How a job that has nothing left to wait for ends: complete when
+    // nothing it hands over is short, partial when some file is whole beside
+    // what is short, and failed when nothing is whole, for `failure` when a
+    // recovery object could not rebuild what it found.
     pub(crate) fn status(&self, failure: Option<&str>) -> JobStatus {
         if self.damaged.is_empty() && self.unrepaired.is_empty() {
             return JobStatus::Complete;
         }
-        match failure {
-            Some(error) if self.whole.is_empty() && self.damaged.is_empty() => JobStatus::Failed {
-                error: error.to_string(),
-            },
-            _ => JobStatus::Partial,
+        if !self.whole.is_empty() {
+            return JobStatus::Partial;
         }
+        let error = match failure {
+            Some(error) => error.to_string(),
+            None => {
+                let short: Vec<&str> = self
+                    .damaged
+                    .iter()
+                    .chain(&self.unrepaired)
+                    .map(String::as_str)
+                    .collect();
+                format!(
+                    "no file was delivered whole; {} short: {}",
+                    short.len(),
+                    short.join(", ")
+                )
+            }
+        };
+        JobStatus::Failed { error }
     }
 
     // The stage a short delivery names as the one that left it short: the
