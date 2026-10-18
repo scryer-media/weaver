@@ -86,24 +86,21 @@ impl Object for Store {
     }
 }
 
-// A 7z signature header: the magic, format version 0.4, and the start
-// header's fields, which nothing here reads. The sniffer reads the whole
-// 32 bytes before it names the kind.
-const SEVEN_Z: &[u8] = &{
+// A 7z signature header: the magic, format version 0.4, the start header's
+// CRC, and a start header of zeros the CRC covers. The sniffer reads the
+// whole 32 bytes and checks that CRC before it names the kind.
+fn seven_z() -> [u8; 32] {
     let mut header = [0u8; 32];
-    let magic = *b"7z\xbc\xaf\x27\x1c\x00\x04";
-    let mut at = 0;
-    while at < magic.len() {
-        header[at] = magic[at];
-        at += 1;
-    }
+    header[..8].copy_from_slice(b"7z\xbc\xaf\x27\x1c\x00\x04");
+    let crc = crc32(&header[12..]);
+    header[8..12].copy_from_slice(&crc.to_le_bytes());
     header
-};
+}
 const MAP: &[u8] = b"MAP";
 // The pretend 7z lays out as signature, body, map: the map at the end says
 // where the body's member lies.
 fn body() -> ByteRange {
-    ByteRange::at(SEVEN_Z.len() as u64, 5)
+    ByteRange::at(seven_z().len() as u64, 5)
 }
 
 fn map_at() -> ByteRange {
@@ -635,7 +632,7 @@ fn directory_members_and_empty_members_exist_once_announced() {
 fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
     let mut job = Job::new(PLENTY);
     let member = job.member("a.7z", Some(map_at().end));
-    let mut front = SEVEN_Z.to_vec();
+    let mut front = seven_z().to_vec();
     front.extend_from_slice(b"hello");
     job.send(member, 0, &front, Provenance::Fresh);
     assert!(!job.tree.is_undecided(NodeId::ROOT, member));
@@ -999,7 +996,7 @@ fn bytes_held_below_the_root_reach_their_member_once_its_store_knows_its_map() {
     job.inner = map_at().end;
     let member = job.member("pack.bin", Some(HEADER + map_at().end));
     let mut front = SIGNATURE.to_vec();
-    front.extend_from_slice(SEVEN_Z);
+    front.extend_from_slice(&seven_z());
     front.extend_from_slice(b"hello");
     job.send(member, 0, &front, Provenance::Fresh);
     let (store, _) = job.tree.child_of(NodeId::ROOT, member).expect("a store");

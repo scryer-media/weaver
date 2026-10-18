@@ -6010,6 +6010,7 @@ name = "weaver-graph"
 version = "0.15.0"
 dependencies = [
  "bytes",
+ "crc-fast",
  "rmp-serde",
  "serde",
  "thiserror 2.0.21",

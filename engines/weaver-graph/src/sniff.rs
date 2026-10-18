@@ -15,6 +15,7 @@
 //   tar 263   the ustar magic at 257 and its terminator; until then any
 //             member might be a tar
 //   7z 32     the signature header, whose major version must be one this reads
+//             and whose start header must match its CRC
 //   PAR2 64   the first packet header, whose length must be a packet's
 //   bzip2 4   `BZh` and a block-size level
 //   RAR5 8, RAR4 7, PAR3 8, xz 6, zip 4, zstd 4, gzip 2   the signature
@@ -167,9 +168,21 @@ const SIGNATURES: &[Signature] = &[
     signature(Kind::Par3, b"PAR3\x00PKT"),
 ];
 
-// A major version this build does not know places its fields elsewhere.
+// A major version this build does not know places its fields elsewhere, and
+// a start header whose CRC fails is bytes that only open like a 7z.
 fn sevenz_header_looks_valid(header: &[u8], _known_file_len: Option<u64>) -> bool {
+    let stated_crc = header
+        .get(8..12)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes);
     header.get(6) == Some(&0)
+        && header
+            .get(12..)
+            .is_some_and(|start_header| stated_crc == Some(crc32(start_header)))
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
 }
 
 // POSIX writes "ustar\0", GNU writes "ustar " before its own version.
@@ -268,12 +281,14 @@ mod tests {
         header
     }
 
-    // A 7z signature header: magic, version 0.4, and the start header's
-    // fields, which the sniffer does not read.
+    // A 7z signature header: magic, version 0.4, the start header's CRC, and
+    // a start header of filler the CRC covers.
     fn seven_z() -> Vec<u8> {
         let mut bytes = SEVEN_Z_SIGNATURE.to_vec();
         bytes.extend_from_slice(&[0, 4]);
         bytes.resize(SEVEN_Z_SIGNATURE_HEADER_LEN, 0xAA);
+        let crc = crc32(&bytes[12..]);
+        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
         bytes
     }
 
@@ -305,6 +320,13 @@ mod tests {
         let head = seven_z();
         assert_eq!(sniff("a.7z", &head[..31], None), Sniff::Pending);
         assert_eq!(sniff("a.7z", &head[..31], Some(31)), Sniff::Leaf);
+    }
+
+    #[test]
+    fn sevenz_start_header_failing_its_crc_is_leaf() {
+        let mut head = seven_z();
+        head[20] ^= 0x01;
+        assert_eq!(sniff("a.7z", &head, Some(32)), Sniff::Leaf);
     }
 
     #[test]
