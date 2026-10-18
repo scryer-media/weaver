@@ -13,7 +13,8 @@
 // bytes changed, so it replaces every run it overlaps, and the parts of those
 // runs outside it are covered by nothing until they are fed again. A range the
 // runs do not tile exactly has no reference value, which is a refusal, never
-// a pass.
+// a pass. The bytes held are counted as runs come and go, so a whole is
+// composed once, when every byte of it is in, and not at every delivery.
 
 use unrar_rs::convert_crc32_to_mac;
 use weaver_graph::{ByteRange, Provenance, SliceVerdict};
@@ -23,6 +24,7 @@ use crate::grid::crc32_combine;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CrcRuns {
     runs: Vec<(u64, u64, u32)>,
+    held: u64,
 }
 
 impl CrcRuns {
@@ -59,6 +61,12 @@ impl CrcRuns {
             }
         }
         self.runs.insert(position, (start, len, crc));
+        self.held += len;
+    }
+
+    // The bytes the runs hold between them.
+    pub(crate) fn held(&self) -> u64 {
+        self.held
     }
 
     // Replaces every run overlapping `[start, start + len)` with a single run
@@ -70,11 +78,13 @@ impl CrcRuns {
         }
         let end = start.saturating_add(len);
         let mut gaps = Vec::new();
+        let held = &mut self.held;
         self.runs.retain(|&(run_start, run_len, _)| {
             let run_end = run_start.saturating_add(run_len);
             if run_end <= start || run_start >= end {
                 return true;
             }
+            *held -= run_len;
             if run_start < start {
                 gaps.push((run_start, start));
             }
@@ -87,6 +97,7 @@ impl CrcRuns {
             .runs
             .partition_point(|(run_start, _, _)| *run_start < start);
         self.runs.insert(position, (start, len, crc));
+        self.held += len;
         gaps
     }
 
@@ -147,6 +158,9 @@ pub(crate) fn gate(
     uses_mac: bool,
     hash_key: Option<&[u8; 32]>,
 ) -> (SliceVerdict, u32) {
+    if runs.held() != length {
+        return (SliceVerdict::Unknown, 0);
+    }
     let Some(composed) = runs.compose(0, length) else {
         return (SliceVerdict::Unknown, 0);
     };

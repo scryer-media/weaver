@@ -96,3 +96,43 @@ fn a_keyed_header_compares_the_folded_crc_and_needs_its_key() {
         SliceVerdict::Unknown
     );
 }
+
+#[test]
+fn held_bytes_count_runs_once_and_follow_a_repair() {
+    let data = bytes();
+    let mut runs = fed(&[(0, 1000), (1000, 3000)], &data, Provenance::Fresh);
+    assert_eq!(runs.held(), 3000);
+    // A duplicate advances nothing.
+    runs.feed(
+        ByteRange::new(0, 1000),
+        crc32(&data[..1000]),
+        Provenance::Fresh,
+    );
+    assert_eq!(runs.held(), 3000);
+    // A repair across two runs holds only the rewritten span.
+    runs.feed(
+        ByteRange::new(500, 1500),
+        crc32(&data[500..1500]),
+        Provenance::Repaired,
+    );
+    assert_eq!(runs.held(), 1000);
+    assert_eq!(
+        gate(&runs, 3000, crc32(&data), false, None).0,
+        SliceVerdict::Unknown
+    );
+    runs.feed(
+        ByteRange::new(0, 500),
+        crc32(&data[..500]),
+        Provenance::Fresh,
+    );
+    runs.feed(
+        ByteRange::new(1500, 3000),
+        crc32(&data[1500..]),
+        Provenance::Fresh,
+    );
+    assert_eq!(runs.held(), 3000);
+    assert_eq!(
+        gate(&runs, 3000, crc32(&data), false, None).0,
+        SliceVerdict::Intact
+    );
+}
