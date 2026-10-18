@@ -194,6 +194,12 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Option<Vec<u32>> {
+        // The hold ends when the classic parse of the index publishes its
+        // grid. A graph job's root reads the index itself and publishes no
+        // grid here, so holding its payload would hold it for ever.
+        if !self.job_engine(job_id).classic_switches_apply() {
+            return None;
+        }
         if self.par2_bypassed.contains(&job_id)
             || self
                 .jobs
