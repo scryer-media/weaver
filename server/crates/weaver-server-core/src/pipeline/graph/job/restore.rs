@@ -163,7 +163,6 @@ impl GraphJob {
                     .writer
                     .read_posted(&self.tree, member, range, &mut bytes)
                 {
-                    eprintln!("TMPREAD missing {volume:?} {ordinal} {range}");
                     missing.push((volume, ordinal, Some(range)));
                     continue;
                 }

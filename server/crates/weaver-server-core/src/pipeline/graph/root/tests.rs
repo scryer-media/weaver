@@ -382,6 +382,26 @@ fn the_window_holds_eight_volumes_and_four_for_an_in_order_reader() {
     );
 }
 
+#[test]
+fn a_bid_the_full_window_has_no_room_for_stands_until_a_place_frees() {
+    let volumes: Vec<Vec<(u32, u32)>> = (0..12).map(|_| vec![(0, 100)]).collect();
+    let mut root = ArticleRoot::new(&volumes);
+    let asks: Vec<Ask> = (0..12)
+        .map(|volume| data_bid(volume, volume + 1, 1, false))
+        .collect();
+    root.answer(&asks, |_| true);
+    assert_eq!(windowed(&root.map.take_moves()), (0..8).collect::<Vec<_>>());
+
+    // Nothing asks again, and the volumes that were drawn have nothing left
+    // queued: the bids that stood take their places.
+    root.answer(&[], |volume| volume.0 >= 8);
+    assert_eq!(windowed(&root.map.take_moves()), vec![8, 9, 10, 11]);
+
+    // Their volumes done too, nothing stands.
+    root.answer(&[], |_| false);
+    assert!(windowed(&root.map.take_moves()).is_empty());
+}
+
 #[tokio::test]
 async fn a_recovery_seek_lands_in_the_promoted_class() {
     // Past the 60 bytes that arrived: the second article holds it.

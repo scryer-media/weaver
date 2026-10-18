@@ -221,30 +221,78 @@ async fn nameless_volumes_renamed_by_par2_deliver_under_both_engines() {
     );
 }
 
-// Nameless, and posted last volume first, so nothing but the headers says
-// which volume comes first, and volume 1's head is fetched before volume
-// 0's. Divergence: the graph builds a store on volume 1 as that store's
-// first volume; volume 0, arriving next, follows nothing the store holds,
-// so it starts a second store, which waits for a volume 1 the first one
-// owns, and the job never leaves Extracting. Classic delivers the member.
-#[tokio::test]
-async fn a_rar5_set_whose_first_volume_arrives_last_stalls_under_graph() {
-    let body = body();
-    let mut volumes = obfuscate_volumes(&single_member_store_set(MEMBER, &body, 2));
+// Posted last volume first, so the store is built on the set's last
+// volume and every earlier one arrives after it. Each takes the position
+// the set gives it, by its name or, nameless, by its headers.
+fn reversed(mut volumes: Vec<(String, Vec<u8>)>) -> Scenario {
     volumes.reverse();
-    let scenario = Scenario::new(posts(volumes));
-    let classic = run(&scenario, Engine::Classic).await;
-    let head = |file: u32| classic.order.iter().position(|ask| *ask == (file, 0));
+    Scenario::new(posts(volumes))
+}
+
+async fn assert_reversed_delivers(scenario: &Scenario, body: &[u8]) {
+    let (classic, graph) = run_both(scenario).await;
+    let head = |file: u32| graph.order.iter().position(|ask| *ask == (file, 0));
     assert!(
         head(0) < head(1),
-        "volume 1's head first: {:?}",
-        classic.order
+        "the last volume's head first: {:?}",
+        graph.order
     );
-    assert_member(&classic, &body);
-    let stall = try_run(&scenario, Engine::Graph)
-        .await
-        .expect_err("the graph settles");
-    assert_eq!(stall.status, Some(JobStatus::Extracting), "{}", stall.state);
+    assert_member(&classic, body);
+    assert_member(&graph, body);
+    assert_same(&classic, &graph);
+}
+
+// Nameless: nothing but the headers says which volume comes first.
+#[tokio::test]
+async fn a_nameless_rar5_set_whose_first_volume_arrives_last_delivers_under_both_engines() {
+    let body = body();
+    let set = obfuscate_volumes(&single_member_store_set(MEMBER, &body, 2));
+    assert_reversed_delivers(&reversed(set), &body).await;
+}
+
+#[tokio::test]
+async fn a_nameless_four_volume_rar5_set_posted_backwards_delivers_under_both_engines() {
+    let body = body();
+    let set = obfuscate_volumes(&single_member_store_set(MEMBER, &body, 4));
+    assert_reversed_delivers(&reversed(set), &body).await;
+}
+
+#[tokio::test]
+async fn a_four_volume_rar5_set_posted_backwards_delivers_under_both_engines() {
+    let body = body();
+    let set = single_member_store_set(MEMBER, &body, 4);
+    assert_reversed_delivers(&reversed(set), &body).await;
+}
+
+#[tokio::test]
+async fn a_four_volume_rar4_set_posted_backwards_delivers_under_both_engines() {
+    let body = body();
+    let set = single_member_rar4_store_set_numbered(MEMBER, &body, 4);
+    assert_reversed_delivers(&reversed(set), &body).await;
+}
+
+#[tokio::test]
+async fn tmp_old_numbering_rar4_backwards() {
+    let body = body();
+    let names = [
+        "silver.horizon.rar",
+        "silver.horizon.r00",
+        "silver.horizon.r01",
+        "silver.horizon.r02",
+    ];
+    let set = single_member_rar4_store_set_numbered(MEMBER, &body, 4)
+        .into_iter()
+        .zip(names)
+        .map(|((_, bytes), name)| (name.to_owned(), bytes))
+        .collect();
+    assert_reversed_delivers(&reversed(set), &body).await;
+}
+
+#[tokio::test]
+async fn tmp_nameless_rar4_backwards() {
+    let body = body();
+    let set = obfuscate_volumes(&single_member_rar4_store_set_numbered(MEMBER, &body, 4));
+    assert_reversed_delivers(&reversed(set), &body).await;
 }
 
 #[tokio::test]

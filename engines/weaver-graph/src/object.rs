@@ -192,8 +192,10 @@ pub trait Object: Send + Sync {
     // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z
     // store claims `.7z.002`, which has no signature of its own. Only an
     // object can say, because only it knows how its volumes chain. Answer
-    // with the volume index the member becomes, or `None` to let the
-    // sniffer decide.
+    // with the volume index the member becomes, its position in the set and
+    // never the order it arrived in, or `None` to let the sniffer decide. A
+    // freshly built object is asked first about the member it was built
+    // for, and `None` makes that member its first volume.
     fn claim(&mut self, _name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
         None
     }

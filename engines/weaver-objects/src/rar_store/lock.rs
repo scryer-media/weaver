@@ -145,7 +145,7 @@ impl RarStore {
         let mut asks = false;
         for index in 0..self.entries.len() {
             let entry = &self.entries[index];
-            let (Lock::Locked, Some(store), Some(length)) =
+            let (Lock::Locked | Lock::Sealed(_), Some(store), Some(length)) =
                 (&entry.lock, &entry.store, entry.length)
             else {
                 continue;
@@ -171,10 +171,17 @@ impl RarStore {
                 asks = true;
                 continue;
             };
-            let Ok(cbc) = Cbc::new(&key.key, key.iv, cipher_len, length) else {
+            let entry = &mut self.entries[index];
+            // Sealed at a restart: the blocks it kept, keyed again.
+            let opened = match std::mem::replace(&mut entry.lock, Lock::Locked) {
+                Lock::Sealed(chain) if chain.fits(cipher_len, length) => {
+                    Cbc::unseal(&key.key, *chain)
+                }
+                _ => Cbc::new(&key.key, key.iv, cipher_len, length),
+            };
+            let Ok(cbc) = opened else {
                 return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
             };
-            let entry = &mut self.entries[index];
             entry.lock = Lock::Open(Box::new(cbc));
             entry.hash_key = key.hash_key;
             self.stale = true;
@@ -205,7 +212,7 @@ impl RarStore {
         if self
             .entries
             .iter()
-            .any(|entry| matches!(entry.lock, Lock::Locked))
+            .any(|entry| matches!(entry.lock, Lock::Locked | Lock::Sealed(_)))
         {
             self.give_up(Emit::Refuse(Why::Encrypted), out);
         }

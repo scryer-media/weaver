@@ -178,6 +178,48 @@ fn rar4_old_numbering_names_its_volumes() {
     posted_whole(&owner);
 }
 
+// The store is built on the set's last volume, and every earlier one
+// arrives after it; each is placed where the set puts it, by its name, or
+// by the number a RAR5 volume's headers state. A nameless RAR4 volume
+// states its number only in its end record, past any front.
+#[test]
+fn a_set_arriving_last_volume_first_places_each_volume_where_the_set_puts_it() {
+    let rar4_old = |index: usize| match index {
+        0 => "alpha.rar".to_owned(),
+        _ => format!("alpha.r{:02}", index - 1),
+    };
+    let nameless = |index: usize| format!("{:x}3c9e1f", index * 7 + 11);
+    let shapes: [(Version, &dyn Fn(usize) -> String); 4] = [
+        (Version::Rar5, &|index| {
+            format!("alpha.part{}.rar", index + 1)
+        }),
+        (Version::Rar4, &|index| {
+            format!("alpha.part{}.rar", index + 1)
+        }),
+        (Version::Rar4, &rar4_old),
+        (Version::Rar5, &nameless),
+    ];
+    for (version, name) in shapes {
+        let volumes = write(&items(), &split(version));
+        let last = volumes.len() - 1;
+        let named = volumes
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| (name(index), bytes))
+            .collect();
+        let mut owner = Owner::founded(store(), named, last);
+        for volume in (0..=last).rev() {
+            owner.frames(volume, 4096);
+        }
+        for volume in (0..=last).rev() {
+            owner.close(volume);
+        }
+        no_trouble(&owner);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
+}
+
 #[test]
 fn nameless_volumes_are_grouped_by_their_headers() {
     for version in [Version::Rar5, Version::Rar4] {

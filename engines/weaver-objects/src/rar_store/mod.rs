@@ -34,7 +34,7 @@ use weaver_graph::{
 };
 use zeroize::Zeroizing;
 
-use crate::crypt::{Cbc, Padding};
+use crate::crypt::{Cbc, Chain, Padding};
 use crate::grid::crc32;
 use crate::kept::Kept;
 use crate::runs::CrcRuns;
@@ -64,11 +64,15 @@ impl Volume {
     }
 }
 
-// A file's cipher, by what the object knows of its key.
+// A file's cipher, by what the object knows of its key. A sealed one was
+// open before a restart: it keeps the cipher blocks it held, which are on
+// no disk, and waits, as a locked one does, for the password that keys it
+// again.
 enum Lock {
     Plain,
     Locked,
     Open(Box<Cbc>),
+    Sealed(Box<Chain>),
 }
 
 // One volume's part of a file: its data area there and where it starts in
@@ -485,9 +489,5 @@ impl Object for RarStore {
             return None;
         }
         self.claim_volume(name, first_bytes)
-    }
-
-    fn reads_in_order(&self) -> bool {
-        true
     }
 }

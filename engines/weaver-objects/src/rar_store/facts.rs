@@ -13,7 +13,8 @@
 // Restore walks the kept header bytes again and requires them to read as
 // recorded, so the layout is rebuilt rather than trusted. A member's CRC
 // runs and an open cipher's seeds are rebuilt by the server's replay of
-// the placed ranges, which every restart does. What came out of the cipher
+// the placed ranges, which every restart does; the cipher blocks it held,
+// parked or partial, are on no disk, so its chain is kept, never its key. What came out of the cipher
 // is the member's coverage, which the cipher reads; the one thing coverage
 // cannot say, the plaintext past the payload, is the member's padding.
 
@@ -27,7 +28,7 @@ use weaver_graph::{ByteRange, Coverage, Durable, Facts, Kind, Object, RestoreErr
 
 use super::walk::Block;
 use super::{Entry, Lock, Out, Piece, RarStore, Volume};
-use crate::crypt::Padding;
+use crate::crypt::{Chain, Padding};
 use crate::kept::Kept;
 use crate::runs::CrcRuns;
 
@@ -67,6 +68,8 @@ pub(super) struct EntryFacts {
     coverage: Coverage,
     closed: bool,
     padding: Padding,
+    // An open cipher's blocks, never its key.
+    chain: Option<Chain>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,6 +160,11 @@ pub(super) fn of(store: &RarStore) -> Facts {
             coverage: entry.out.coverage.clone(),
             closed: entry.out.closed,
             padding: entry.out.padding.clone(),
+            chain: match &entry.lock {
+                Lock::Open(cbc) => Some(cbc.chain()),
+                Lock::Sealed(chain) => Some(Chain::clone(chain)),
+                Lock::Plain | Lock::Locked => None,
+            },
         })
         .collect();
     let facts = StoreFacts {
@@ -249,9 +257,10 @@ fn entry(facts: EntryFacts) -> Entry {
             })
             .collect(),
         complete: facts.complete,
-        lock: match facts.keying {
-            Some(_) => Lock::Locked,
-            None => Lock::Plain,
+        lock: match (facts.keying, facts.chain) {
+            (Some(_), Some(chain)) => Lock::Sealed(Box::new(chain)),
+            (Some(_), None) => Lock::Locked,
+            (None, _) => Lock::Plain,
         },
         hash_key: None,
         out: Out {

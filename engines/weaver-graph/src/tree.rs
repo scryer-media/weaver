@@ -819,7 +819,12 @@ impl Tree {
             }
             Sniff::Object(kind) => {
                 found.undecided.remove(&member);
-                let volumes = BTreeMap::from([(VolumeIndex(0), member)]);
+                // The member is the volume its new object places it at, the
+                // position its set gives it, whichever volume came first.
+                let volumes = |object: &mut dyn Object| {
+                    let volume = object.claim(&name, &prefix).unwrap_or(VolumeIndex(0));
+                    BTreeMap::from([(volume, member)])
+                };
                 match self.attach(node, kind, volumes, builder) {
                     Some(child) => effects.push(Effect::Bound {
                         node,
@@ -838,13 +843,13 @@ impl Tree {
     }
 
     // Bind members of `node`'s namespace, by the volume each becomes, to a
-    // freshly built object of `kind`. `None`, and nothing bound, when no
-    // object of that kind can be built.
+    // freshly built object of `kind`, which `volumes` may ask where they go.
+    // `None`, and nothing bound, when no object of that kind can be built.
     fn attach(
         &mut self,
         node: NodeId,
         kind: Kind,
-        volumes: BTreeMap<VolumeIndex, MemberId>,
+        volumes: impl FnOnce(&mut dyn Object) -> BTreeMap<VolumeIndex, MemberId>,
         builder: &mut dyn Builder,
     ) -> Option<NodeId> {
         let child = NodeId(self.next_node);
@@ -852,6 +857,7 @@ impl Tree {
         let id = ObjectId(child.0);
         let mut object = builder.build(kind, id)?;
         self.next_node += 1;
+        let volumes = volumes(object.as_mut());
         let parent = self.nodes.get_mut(&node)?;
         for (volume, member) in &volumes {
             if let Some(record) = parent.namespace.get(*member) {
@@ -1163,7 +1169,10 @@ impl Tree {
         let engine = kind
             .and_then(Kind::engine_for)
             .filter(|_| engine)
-            .and_then(|kind| self.attach(parent, kind, binding.volumes.clone(), builder));
+            .and_then(|kind| {
+                let volumes = binding.volumes.clone();
+                self.attach(parent, kind, |_| volumes, builder)
+            });
         for member in binding.volumes.into_values() {
             effects.push(match engine {
                 Some(_) => Effect::NeedsEngine {

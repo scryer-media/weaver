@@ -64,6 +64,19 @@ pub(super) fn payload(len: usize, seed: u8) -> Vec<u8> {
 // An index and one volume of `blocks` recovery blocks over `files`, the
 // index first.
 pub(super) fn par2_set(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Vec<Post> {
+    let posts = par2_volumes(base, files, blocks, 1);
+    assert_eq!(posts.len(), 2, "an index and one volume");
+    posts
+}
+
+// An index and `volumes` volumes sharing `blocks` recovery blocks, as the
+// creator spreads them, the index first and the volumes in block order.
+pub(super) fn par2_volumes(
+    base: &str,
+    files: &[(&str, &[u8])],
+    blocks: u32,
+    volumes: u32,
+) -> Vec<Post> {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
 
     let source = tempfile::tempdir().unwrap();
@@ -82,7 +95,7 @@ pub(super) fn par2_set(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Vec<
     );
     options.block_sizing = BlockSizing::Bytes(ARTICLE as u64);
     options.recovery_amount = RecoveryAmount::Count(blocks);
-    options.volume_count = Some(1);
+    options.volume_count = Some(volumes);
     let creator = Par2Creator::new(options);
     let created = creator.create(&creator.plan().unwrap()).unwrap();
     let mut posts: Vec<Post> = created
@@ -96,8 +109,12 @@ pub(super) fn par2_set(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Vec<
             }
         })
         .collect();
-    posts.sort_by_key(|post| !matches!(post.role, FileRole::Par2 { is_index: true, .. }));
-    assert_eq!(posts.len(), 2, "an index and one volume");
+    posts.sort_by(|left, right| {
+        let index = |post: &Post| !matches!(post.role, FileRole::Par2 { is_index: true, .. });
+        index(left)
+            .cmp(&index(right))
+            .then_with(|| left.name.cmp(&right.name))
+    });
     posts
 }
 

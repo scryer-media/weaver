@@ -260,7 +260,7 @@ impl RarStore {
         };
         let member = MemberId(id as u32);
         match &entry.lock {
-            Lock::Locked => push(out, Placement::Held { range: part }),
+            Lock::Locked | Lock::Sealed(_) => push(out, Placement::Held { range: part }),
             Lock::Plain => push(
                 out,
                 Placement::Member {

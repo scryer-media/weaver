@@ -49,6 +49,13 @@ pub(super) struct Owner {
 
 impl Owner {
     pub fn new(object: RarStore, volumes: Vec<(String, Vec<u8>)>) -> Self {
+        Self::founded(object, volumes, 0)
+    }
+
+    // Built for the volume at `first`, the first to arrive. The store is
+    // asked where that volume goes, as the tree asks an object it builds,
+    // and no answer makes it the first.
+    pub fn founded(object: RarStore, volumes: Vec<(String, Vec<u8>)>, first: usize) -> Self {
         let count = volumes.len();
         let mut owner = Self {
             object,
@@ -63,10 +70,14 @@ impl Owner {
             bound: vec![false; count],
             next: 0,
         };
-        let name = owner.volumes[0].0.clone();
-        owner.object.bound(VolumeIndex(0), &name);
-        owner.bound[0] = true;
-        owner.size(0);
+        let (name, bytes) = &owner.volumes[first];
+        let front = &bytes[..bytes.len().min(FRONT)];
+        let volume = owner.object.claim(name, front).unwrap_or(VolumeIndex(0));
+        assert_eq!(volume, VolumeIndex(first as u32), "founds on {name}");
+        let name = name.clone();
+        owner.object.bound(volume, &name);
+        owner.bound[first] = true;
+        owner.size(first);
         owner
     }
 

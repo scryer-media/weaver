@@ -44,7 +44,7 @@ impl RarStore {
             let entry = &mut self.entries[id];
             let mut plains = Vec::new();
             match &mut entry.lock {
-                Lock::Locked => continue,
+                Lock::Locked | Lock::Sealed(_) => continue,
                 Lock::Plain => {}
                 Lock::Open(cbc) => {
                     let said = &mut entry.out;

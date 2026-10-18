@@ -226,6 +226,13 @@ pub struct Chain {
     blocks: BTreeMap<u64, Block>,
 }
 
+impl Chain {
+    // Whether this chain was kept by a cipher over a stream of this shape.
+    pub fn fits(&self, cipher_len: u64, plain_len: u64) -> bool {
+        self.cipher_len == cipher_len && self.plain_len == plain_len
+    }
+}
+
 impl fmt::Debug for Cbc {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -598,7 +605,6 @@ impl Cbc {
             return false;
         }
         let seen = Seen::new(placed, padding);
-        eprintln!("TMPSEAL range={range} kept={:?} came={:?} pad={:?}", self.blocks.keys().collect::<Vec<_>>(), seen.came_out(self.plain_len, ByteRange::new(floor(range.start), ceil(range.end))), padding.blocks.keys().collect::<Vec<_>>());
         let first = floor(range.start);
         let end = ceil(range.end);
         let mut posted: Vec<u8> = Vec::with_capacity((end - first) as usize);
