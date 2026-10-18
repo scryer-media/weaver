@@ -72,6 +72,18 @@ pub(crate) fn segments_covered_by_floor(
     covered
 }
 
+// A redownload throws away every file the last run wrote, so the record of
+// what those files were renamed to starts over from the NZB.
+fn redownload_spec(
+    nzb: &weaver_nzb::Nzb,
+    nzb_path: &std::path::Path,
+    category: Option<String>,
+    mut metadata: Vec<(String, String)>,
+) -> JobSpec {
+    metadata.retain(|(key, _)| key != crate::ingest::FULL_FILE_NAMES_METADATA_KEY);
+    crate::ingest::nzb_to_spec(nzb, nzb_path, category, metadata)
+}
+
 impl Pipeline {
     async fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
         let events = match self
@@ -1427,7 +1439,7 @@ impl Pipeline {
                 .map_err(crate::SchedulerError::State)?
                 .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
             let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-            let mut spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+            let mut spec = redownload_spec(&nzb, &nzb_path, category, metadata);
 
             if let Some(password) = password.clone() {
                 spec.password = Some(password);
@@ -1476,8 +1488,7 @@ impl Pipeline {
                 .as_deref()
                 .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
                 .unwrap_or_default();
-            let mut spec =
-                crate::ingest::nzb_to_spec(&nzb, &nzb_path, row.category.clone(), metadata);
+            let mut spec = redownload_spec(&nzb, &nzb_path, row.category.clone(), metadata);
             if let Some(password) = password.clone() {
                 spec.password = Some(password);
             }
@@ -1530,7 +1541,7 @@ impl Pipeline {
                 )
             });
         let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-        let mut spec = crate::ingest::nzb_to_spec(
+        let mut spec = redownload_spec(
             &nzb,
             &nzb_path,
             info.category.clone(),

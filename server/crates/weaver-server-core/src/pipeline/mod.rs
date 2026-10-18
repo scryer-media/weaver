@@ -396,6 +396,28 @@ impl Pipeline {
             }
         }
     }
+
+    // Bring the job's record of full file names up to date after files were
+    // renamed on disk.
+    pub(crate) fn record_file_renames(
+        &mut self,
+        job_id: JobId,
+        renames: &[crate::ingest::FileRename],
+    ) {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if !crate::ingest::record_file_renames(&mut state.spec.metadata, renames) {
+            return;
+        }
+        let update = crate::jobs::JobUpdate {
+            metadata: crate::jobs::FieldUpdate::Set(state.spec.metadata.clone()),
+            ..Default::default()
+        };
+        if self.db.update_active_job(job_id, &update).is_err() {
+            warn!(job_id = job_id.0, "could not persist renamed file names");
+        }
+    }
 }
 
 pub(super) struct DownloadLaneOwner {
@@ -1719,7 +1741,7 @@ pub(super) enum ExtractionDone {
 pub(super) struct MoveToCompleteResult {
     pub(super) moved_entries: u32,
     // Delivered files the deobfuscation pass renamed on the way out.
-    pub(super) renamed_members: u32,
+    pub(super) renamed_members: Vec<crate::ingest::FileRename>,
 }
 
 // A final-move refusal that must never enter terminal post-processing versus

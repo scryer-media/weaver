@@ -664,6 +664,24 @@ type FirstRunSetup {
 	pending: Boolean!
 }
 
+"""
+A file Weaver named other than its full name, because the full name was
+too long for a filesystem, used characters one refuses, or clashed with
+another file in the job.
+"""
+type FullFileName {
+	"""
+	The name Weaver gave the file last, inside `outputDir`. A file the job
+	deleted after extracting it keeps the name it had then.
+	"""
+	name: String!
+	"""
+	The file's full name: the name it was posted with, or the one PAR2 or
+	the release lookup gave it.
+	"""
+	fullName: String!
+}
+
 type GeneralSettings {
 	dataDir: String!
 	intermediateDir: String!
@@ -863,11 +881,10 @@ type HistoryItem {
 	deleteOperation: HistoryDeleteRowState
 	duplicateSummary: DuplicateSummaryInfo
 	"""
-	The files written under a different name than they were posted with,
-	each with the name the poster gave it. Empty when every file kept its
-	posted name.
+	The files Weaver gave a name other than their full one, each with its
+	full name. Empty when every file carries its full name.
 	"""
-	postedFileNames: [PostedFileName!]!
+	fullFileNames: [FullFileName!]!
 }
 
 type HistoryPage {
@@ -2070,22 +2087,6 @@ input PostProcessingSettingsInput {
 	Omission keeps the present choice.
 	"""
 	globalScriptsRun: GlobalScriptsRun
-}
-
-"""
-A file Weaver wrote under a different name than it was posted with,
-because the posted name was too long for a filesystem, used characters
-one refuses, or clashed with another file in the job.
-"""
-type PostedFileName {
-	"""
-	The file's name on disk, inside `outputDir`.
-	"""
-	name: String!
-	"""
-	The name the file was posted with.
-	"""
-	postedName: String!
 }
 
 """

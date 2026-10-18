@@ -170,8 +170,8 @@ fn history_item_has_password_for_a_submitted_or_validated_password() {
     );
 }
 
-#[test]
-fn history_item_exposes_posted_file_names_but_not_as_an_attribute() {
+#[tokio::test]
+async fn history_item_exposes_full_file_names_but_not_as_an_attribute() {
     let row = JobHistoryRow {
         job_id: 79,
         job_hash: None,
@@ -191,22 +191,47 @@ fn history_item_exposes_posted_file_names_but_not_as_an_attribute() {
         completed_at: 1_700_000_100,
         metadata: Some(
             serde_json::to_string(&vec![(
-                weaver_server_core::ingest::POSTED_FILE_NAMES_METADATA_KEY.to_string(),
-                r#"[{"name":"short.mkv","posted_name":"a much longer posted name.mkv"}]"#
-                    .to_string(),
+                weaver_server_core::ingest::FULL_FILE_NAMES_METADATA_KEY.to_string(),
+                r#"[{"name":"short.mkv","full_name":"a much longer full name.mkv"}]"#.to_string(),
             )])
             .unwrap(),
         ),
         server_attribution: None,
     };
 
-    let item = history_item_from_row(&row, None);
+    struct Query(HistoryItem);
+    #[async_graphql::Object]
+    impl Query {
+        async fn item(&self) -> HistoryItem {
+            self.0.clone()
+        }
+    }
 
-    assert_eq!(item.posted_file_names.len(), 1);
-    assert_eq!(item.posted_file_names[0].name, "short.mkv");
-    assert_eq!(
-        item.posted_file_names[0].posted_name,
-        "a much longer posted name.mkv"
-    );
+    let item = history_item_from_row(&row, None);
     assert!(item.attributes.is_empty());
+    let schema = async_graphql::Schema::new(
+        Query(item.clone()),
+        async_graphql::EmptyMutation,
+        async_graphql::EmptySubscription,
+    );
+    let response = schema
+        .execute("{ item { fullFileNames { name fullName } } }")
+        .await;
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap(),
+        serde_json::json!({
+            "item": {
+                "fullFileNames": [
+                    {"name": "short.mkv", "fullName": "a much longer full name.mkv"}
+                ]
+            }
+        })
+    );
+    let table_item = history_table_item_from_row(&row, None);
+    assert_eq!(
+        table_item.full_file_names_record,
+        item.full_file_names_record
+    );
 }
