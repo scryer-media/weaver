@@ -24,10 +24,16 @@ impl GraphJob {
         }
         let admitted = match said.heard {
             Heard::Emit(emit) => {
-                let mut effects = Vec::new();
-                self.tree
-                    .emitted(node, vec![emit], &mut *self.builder, &mut effects);
-                self.settle(effects)?;
+                let mut out = Vec::new();
+                self.writer.said(
+                    &mut self.tree,
+                    &mut *self.builder,
+                    &self.root,
+                    node,
+                    emit,
+                    &mut out,
+                )?;
+                self.heard(out)?;
                 Vec::new()
             }
             Heard::Ended => {

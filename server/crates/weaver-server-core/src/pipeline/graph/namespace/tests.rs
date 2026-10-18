@@ -9,6 +9,7 @@ use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, Seek};
 
 use super::*;
 
+mod streams;
 mod windows;
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
@@ -177,6 +178,7 @@ impl Builder for Build {
                 length: self.inner,
             })),
             Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
+            Kind::Xz => Some(Box::new(streams::Decoded)),
             Kind::Par2 => Some(Box::new(Par {
                 volume: None,
                 others: Vec::new(),

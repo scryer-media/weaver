@@ -29,8 +29,8 @@ use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location,
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, RecoveryKind, Segment,
-    Tree, VolumeIndex, Why,
+    Builder, ByteRange, Effect, Emit, MemberId, NodeId, Placement, Provenance, RecoveryKind,
+    Segment, Tree, VolumeIndex, Why,
 };
 
 use super::envelope::{Envelopes, Shelf};
@@ -263,6 +263,41 @@ impl NamespaceWriter {
             self.apply(tree, builder, segments, effect, out)?;
         }
         Ok(())
+    }
+
+    // What an engine's run said at `node`. A run is its namespace's source,
+    // as the articles are the root's, so the bytes it produces are a
+    // delivery into that namespace and take the one write path: what an
+    // object below keeps is captured, and a recovery volume is written to
+    // its file, at any depth. Anything else it said is the object's word.
+    pub(crate) fn said(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        node: NodeId,
+        emit: Emit,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Emit::Bytes {
+            member,
+            offset,
+            bytes,
+            provenance,
+        } = emit
+        else {
+            let mut effects = Vec::new();
+            tree.emitted(node, vec![emit], builder, &mut effects);
+            return self.apply_all(tree, builder, segments, effects, out);
+        };
+        let arrival = Arrival {
+            node,
+            member,
+            offset,
+            bytes,
+            provenance,
+        };
+        self.deliver(tree, builder, segments, arrival, out)
     }
 
     // A recovery object recognised the member: the tree's ledger moves its

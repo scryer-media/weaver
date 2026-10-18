@@ -422,34 +422,66 @@ async fn a_store_read_out_of_a_stream_reads_in_stream_order() {
     );
 }
 
-// Row 6b. A PAR2 set inside a store inside an xz stream, over a damaged
-// member beside it: the set's walker finds both volumes, but the repair
-// cannot read the blocks back through a store a stream fed, whose output is
-// not kept, so the graph fails it with no block reachable. Classic stalls
-// at Extracting, as in row 6a.
-#[tokio::test]
-async fn a_par2_set_in_a_store_in_a_stream_cannot_read_its_blocks_back() {
+// Row 6b. A PAR2 set stored beside a damaged member in one RAR volume: the
+// set reads its blocks back from its volumes' files and the member's slices
+// through the store's namespace, and the repaired range is delivered to the
+// member. `wrap` posts the volume plain or inside an xz stream, the one
+// difference between the rows.
+async fn par2_in_a_store(wrap: impl Fn(Vec<u8>) -> Post) -> (Scenario, Vec<u8>, Vec<u8>) {
     let body = payload(6 * ARTICLE, 111);
     let set = par2_set("ember", &[("ember.bin", &body)], 2);
     let mut bad = body.clone();
     bad[2 * ARTICLE + 3] ^= 0x41;
     let inside: Vec<(String, Vec<u8>)> = vec![
         (set[0].name.clone(), set[0].bytes.clone()),
-        ("ember.bin".to_string(), bad),
+        ("ember.bin".to_string(), bad.clone()),
         (set[1].name.clone(), set[1].bytes.clone()),
     ];
     let volume = store_set(&inside, 1).remove(0);
-    let scenario = Scenario::new(vec![Post::plain("silver.horizon.rar.xz", xz(&volume.1))]);
-    let graph = run(&scenario, Engine::Graph).await;
-    assert_failed(&graph, HistoryFailureKind::Repair);
+    (Scenario::new(vec![wrap(volume.1)]), body, bad)
+}
+
+// The graph repaired ember.bin in place, reading back what the evidence did
+// not settle, and asked for nothing twice.
+fn assert_repaired_in_store(graph: &Outcome, body: &[u8], reads: u64) {
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(graph.refetched(), Vec::new());
     assert!(
-        graph
-            .failure
-            .as_deref()
-            .is_some_and(|failure| failure.contains("only 0 recovery blocks reachable")),
-        "{:?}",
-        graph.failure
+        graph.files[&format!("{FOLDER}/ember.bin")] == body,
+        "ember.bin repaired"
     );
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    assert_eq!(graph.reads, reads, "read-backs");
+}
+
+// The plain twin. Classic runs no repair inside an archive: it extracts
+// ember.bin as stored, damaged, and completes.
+#[tokio::test]
+async fn a_par2_set_in_a_plain_store_repairs_the_member_beside_it() {
+    let (scenario, body, bad) =
+        par2_in_a_store(|bytes| Post::plain("silver.horizon.rar", bytes)).await;
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_repaired_in_store(&graph, &body, 11);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert!(classic.completed(), "{:?}", classic.failure);
+    assert!(
+        classic.files[&format!("{FOLDER}/ember.bin")] == bad,
+        "classic: ember.bin as stored"
+    );
+}
+
+// The same volume inside an xz stream: the store reads it as the stream
+// decodes it, and the set repairs exactly as in the plain twin. Classic
+// leaves the job at Extracting, as in row 6a.
+#[tokio::test]
+async fn a_par2_set_in_a_store_in_a_stream_repairs_the_member_beside_it() {
+    let (scenario, body, _) =
+        par2_in_a_store(|bytes| Post::plain("silver.horizon.rar.xz", xz(&bytes))).await;
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_repaired_in_store(&graph, &body, 11);
     assert_stalled(
         try_run(&scenario, Engine::Classic).await,
         Engine::Classic,
