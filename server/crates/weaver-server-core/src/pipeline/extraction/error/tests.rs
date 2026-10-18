@@ -64,16 +64,28 @@ fn an_io_error_is_classed_by_the_typed_error_it_carries() {
 
 #[test]
 fn descriptor_exhaustion_is_capacity_pressure_whatever_its_wording() {
-    for code in [libc::EMFILE, libc::ENFILE] {
+    #[cfg(unix)]
+    let codes = [libc::EMFILE, libc::ENFILE];
+    // Native ERROR_TOO_MANY_OPEN_FILES and the supported CRT fallback.
+    #[cfg(not(unix))]
+    let codes = [4, 24];
+    for code in codes {
         assert_eq!(
             io_error_class(&io::Error::from_raw_os_error(code)),
             ExtractionErrorClass::CapacityPressure
         );
     }
-    assert_eq!(
-        io_error_class(&io::Error::from_raw_os_error(libc::EIO)),
-        ExtractionErrorClass::Terminal
-    );
+    #[cfg(unix)]
+    let terminal = [libc::EIO];
+    // ERROR_INVALID_DATA and ERROR_CRC, not CRT ENFILE despite its value.
+    #[cfg(not(unix))]
+    let terminal = [13, 23];
+    for code in terminal {
+        assert_eq!(
+            io_error_class(&io::Error::from_raw_os_error(code)),
+            ExtractionErrorClass::Terminal
+        );
+    }
 }
 
 #[test]
