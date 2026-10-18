@@ -198,7 +198,7 @@ impl<D: Decoder> Engine for Stream<D> {
 }
 
 // A compression extension and what it leaves behind: `.tgz` held a `.tar`.
-const EXTENSIONS: [(&str, &str); 10] = [
+const EXTENSIONS: [(&str, &str); 11] = [
     (".gz", ""),
     (".tgz", ".tar"),
     (".xz", ""),
@@ -209,6 +209,7 @@ const EXTENSIONS: [(&str, &str); 10] = [
     (".zst", ""),
     (".tzst", ".tar"),
     (".br", ""),
+    (".deflate", ""),
 ];
 
 // The name the one member is announced under: the volume's name with its

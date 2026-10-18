@@ -35,6 +35,12 @@ pub(super) fn gzip(bytes: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+pub(super) fn deflate(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
 pub(super) fn bzip2(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
     encoder.write_all(bytes).unwrap();
@@ -128,6 +134,11 @@ async fn a_zstd_stream_delivers_the_file_it_holds_under_both_engines() {
 #[tokio::test]
 async fn a_brotli_stream_delivers_the_file_it_holds_under_both_engines() {
     one_stream("ember.bin.br", brotli(&ember())).await;
+}
+
+#[tokio::test]
+async fn a_raw_deflate_stream_delivers_the_file_it_holds_under_both_engines() {
+    one_stream("ember.bin.deflate", deflate(&ember())).await;
 }
 
 pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
