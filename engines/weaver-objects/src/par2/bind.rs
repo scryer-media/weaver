@@ -5,8 +5,9 @@
 // by the described name, then by its first 16 KiB and its length. A name that
 // answers to two descriptions binds nothing, unless the member's length rules
 // out all but one, and two members that answer to one description both go
-// unbound. A member that answers in two sets is ambiguous, so neither binds
-// it. A member bound by its content alone takes the described name.
+// unbound. A member that answers in two sets is the first set's: the others
+// count it missing in their arithmetic and never write it. A member bound by
+// its content alone takes the described name.
 
 use std::collections::BTreeMap;
 
@@ -71,11 +72,11 @@ pub(super) fn bind_sets(
             continue;
         }
         let candidate = Candidate::of(member, namespace.first_bytes(member.id));
-        let mut matches = indexes
+        let first = indexes
             .iter()
             .enumerate()
-            .filter_map(|(at, index)| Some((at, match_member(index, &candidate)?)));
-        if let (Some((at, (file, by_content))), None) = (matches.next(), matches.next()) {
+            .find_map(|(at, index)| Some((at, match_member(index, &candidate)?)));
+        if let Some((at, (file, by_content))) = first {
             claims[at]
                 .entry(file)
                 .or_default()

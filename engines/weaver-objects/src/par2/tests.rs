@@ -416,10 +416,10 @@ fn a_shared_members_damage_counts_once() {
 }
 
 // The member is the first set's file to the byte, but the second set
-// describes other bytes under its name: it answers in both, so neither
-// binds it.
+// describes other bytes under its name: it answers in both, and is the
+// first set's alone.
 #[test]
-fn a_name_two_sets_describe_binds_in_neither() {
+fn a_name_two_sets_describe_is_the_first_sets() {
     let quill = payload(21, 5000);
     let other = payload(22, 5000);
     let mut files = par2_set("first", &[("quill.bin", &quill)], BLOCK, 2, 1);
@@ -433,7 +433,7 @@ fn a_name_two_sets_describe_binds_in_neither() {
         .iter()
         .map(|key| job.object.sets[key].bound(member).is_some())
         .collect();
-    assert_eq!(bound, [false, false]);
+    assert_eq!(bound, [true, false]);
     feed(&mut job, member, &quill, None);
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
     assert_eq!(job.store.writes, 0);
