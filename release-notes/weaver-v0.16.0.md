@@ -1,4 +1,4 @@
-# Weaver 0.15.1 release notes
+# Weaver 0.16.0 release notes
 
 Everything below is new since 0.15.0.
 
@@ -201,3 +201,6 @@ Everything below is new since 0.15.0.
 - GraphQL gains full-filename history records and structured proxy-failure
   codes and parameters. The new routing, resolver and speed-test surfaces
   are exposed through the API as well as the interface.
+- `NetworkConsumerKind` gains `OUTBOUND` for Default outbound. GraphQL clients
+  that handle every enum value explicitly need to accept this value; clients
+  generated from the schema should regenerate their types.
