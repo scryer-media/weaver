@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1286,76 +1289,6 @@ pub fn is_blocked_egress_ip(ip: IpAddr) -> bool {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ResolvedFetchTarget {
-    pub url: Url,
-    pub host: String,
-    pub addrs: Vec<SocketAddr>,
-}
-
-impl ResolvedFetchTarget {
-    pub fn apply_dns_override(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-        if self.host.parse::<IpAddr>().is_ok() {
-            builder
-        } else {
-            builder.resolve_to_addrs(&self.host, &self.addrs)
-        }
-    }
-}
-
-pub async fn resolve_fetch_target(
-    url: &Url,
-    allow_private_network: bool,
-) -> Result<ResolvedFetchTarget, String> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("URL must use http or https".to_string());
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| "URL must include a host".to_string())?;
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| "URL must include a valid port".to_string())?;
-
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if !allow_private_network && is_blocked_egress_ip(ip) {
-            return Err(format!("URL destination {ip} is not allowed"));
-        }
-        return Ok(ResolvedFetchTarget {
-            url: url.clone(),
-            host: host.to_string(),
-            addrs: vec![SocketAddr::new(ip, port)],
-        });
-    }
-
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|error| format!("failed to resolve {host}: {error}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(format!("failed to resolve {host}: no addresses returned"));
-    }
-    if !allow_private_network {
-        for addr in &addrs {
-            if is_blocked_egress_ip(addr.ip()) {
-                return Err(format!("URL destination {} is not allowed", addr.ip()));
-            }
-        }
-    }
-
-    Ok(ResolvedFetchTarget {
-        url: url.clone(),
-        host: host.to_string(),
-        addrs,
-    })
-}
-
-pub async fn validate_fetch_egress(url: &Url, allow_private_network: bool) -> Result<(), String> {
-    resolve_fetch_target(url, allow_private_network)
-        .await
-        .map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1982,36 +1915,6 @@ mod tests {
         assert!(!is_blocked_egress_ip(
             "2606:4700:4700::1111".parse().unwrap()
         ));
-    }
-
-    #[tokio::test]
-    async fn fetch_egress_rejects_private_literal_unless_allowed() {
-        let url = Url::parse("http://127.0.0.1:8080/feed.xml").unwrap();
-        assert!(validate_fetch_egress(&url, false).await.is_err());
-        assert!(validate_fetch_egress(&url, true).await.is_ok());
-
-        let bad_scheme = Url::parse("file:///tmp/feed.xml").unwrap();
-        assert!(validate_fetch_egress(&bad_scheme, true).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn fetch_target_accepts_and_pins_public_literal() {
-        let url = Url::parse("http://1.1.1.1/feed.xml").unwrap();
-        let target = resolve_fetch_target(&url, false).await.unwrap();
-
-        assert_eq!(target.host, "1.1.1.1");
-        assert_eq!(target.addrs.len(), 1);
-        assert_eq!(target.addrs[0].ip(), "1.1.1.1".parse::<IpAddr>().unwrap());
-        assert_eq!(target.addrs[0].port(), 80);
-    }
-
-    #[tokio::test]
-    async fn redirect_to_private_target_is_rejected_by_policy() {
-        let public_url = Url::parse("http://1.1.1.1/feed.xml").unwrap();
-        assert!(resolve_fetch_target(&public_url, false).await.is_ok());
-
-        let redirect_url = public_url.join("http://127.0.0.1/private.nzb").unwrap();
-        assert!(resolve_fetch_target(&redirect_url, false).await.is_err());
     }
 
     fn proxied(trusted_cidrs: &[&str], proxies: &[&str]) -> RuntimeSecurityConfig {

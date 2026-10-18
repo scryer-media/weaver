@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Continuation of the `impl DirectSetRouter` block from `direct_store/router.rs`.
 // Split out mechanically to keep the parent file readable; no behavior lives here
 // that is not simply a method of the same type.
@@ -1115,7 +1118,17 @@ impl DirectSetRouter {
                 if self.record_member_checksum_damage(member_id) {
                     return Ok(());
                 }
-                return Err(self.fail(DemotionReason::MemberChecksumMismatch));
+                let reason = if self
+                    .layout
+                    .as_ref()
+                    .and_then(super::SetLayout::sevenz)
+                    .is_some()
+                {
+                    DemotionReason::SevenZipAesChecksumMismatch
+                } else {
+                    DemotionReason::MemberChecksumMismatch
+                };
+                return Err(self.fail(reason));
             }
             if let Some(member) = self.member_mut(member_id) {
                 member.verified = true;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Integration tests for 7z archive support.
 //
 // These tests create real 7z archives using the system `7z` command,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::pipeline::completion::finalize::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 
@@ -398,3 +401,4 @@ mod hex_named_volumes;
 mod no_par2_retry_reclassifies;
 mod par2_metadata_immediately_rebinds;
 mod repaired_rar_set_holds;
+mod typed_error_routes;

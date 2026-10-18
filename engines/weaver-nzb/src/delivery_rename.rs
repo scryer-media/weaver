@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Naming policy for the files a finished job delivers.
 //
 // [`crate::deobfuscate`] answers "is this *posted* file's name meaningless",
@@ -37,6 +40,9 @@ pub struct DeliveredFile<'a> {
 pub struct PlannedRename {
     pub from: String,
     pub to: String,
+    // `to` with the full stem in place of the one written: what the file
+    // would be called with no limit on names and no other file in the way.
+    pub full_to: String,
 }
 
 // A delivered file below this size is never worth naming a release after, no
@@ -211,7 +217,8 @@ pub fn looks_obfuscated_for_delivery(name: &str) -> bool {
 // same-stem helpers that must follow it.
 //
 // `target_stem` is used verbatim: the caller is responsible for making it a
-// legal path component. `files[candidate]` keeps its own extension, and every
+// legal path component. `full_stem` is the name `target_stem` was cleaned or
+// shortened from, and only names each rename's `full_to`. `files[candidate]` keeps its own extension, and every
 // other file whose name begins with the candidate's stem keeps everything
 // after it — that is what carries `-sample` and `.eng.srt` across.
 //
@@ -220,6 +227,7 @@ pub fn plan_renames(
     files: &[DeliveredFile<'_>],
     candidate: usize,
     target_stem: &str,
+    full_stem: &str,
 ) -> Vec<PlannedRename> {
     let Some(candidate_file) = files.get(candidate) else {
         return Vec::new();
@@ -254,6 +262,7 @@ pub fn plan_renames(
     let mut plan = vec![PlannedRename {
         from: candidate_file.relative_path.to_string(),
         to: candidate_to,
+        full_to: join_relative(parent, &format!("{full_stem}{candidate_suffix}")),
     }];
 
     for (index, file) in files.iter().enumerate() {
@@ -283,6 +292,7 @@ pub fn plan_renames(
         plan.push(PlannedRename {
             from: file.relative_path.to_string(),
             to,
+            full_to: join_relative(sibling_parent, &format!("{full_stem}{suffix}")),
         });
     }
 
@@ -551,12 +561,13 @@ mod tests {
                     Some(0),
                     "{executable}"
                 );
-                let plan = plan_renames(&files, 0, "Silver Horizon 2024");
+                let plan = plan_renames(&files, 0, "Silver Horizon 2024", "Silver Horizon 2024");
                 assert_eq!(
                     plan,
                     vec![PlannedRename {
                         from: "Yb5drZSkNi20UCMkb.mkv".into(),
                         to: "Silver Horizon 2024.mkv".into(),
+                        full_to: "Silver Horizon 2024.mkv".into(),
                     }],
                     "{executable}"
                 );
@@ -591,21 +602,24 @@ mod tests {
             file("Yb5drZSkNi20UCMkb.dut.srt", 40 * 1024),
             file("unrelated.nfo", 1024),
         ];
-        let plan = plan_renames(&files, 0, "Silver Horizon 2024");
+        let plan = plan_renames(&files, 0, "Silver Horizon 2024", "Silver Horizon 2024");
         assert_eq!(
             plan,
             vec![
                 PlannedRename {
                     from: "Yb5drZSkNi20UCMkb.mkv".into(),
                     to: "Silver Horizon 2024.mkv".into(),
+                    full_to: "Silver Horizon 2024.mkv".into(),
                 },
                 PlannedRename {
                     from: "Yb5drZSkNi20UCMkb-sample.mkv".into(),
                     to: "Silver Horizon 2024-sample.mkv".into(),
+                    full_to: "Silver Horizon 2024-sample.mkv".into(),
                 },
                 PlannedRename {
                     from: "Yb5drZSkNi20UCMkb.dut.srt".into(),
                     to: "Silver Horizon 2024.dut.srt".into(),
+                    full_to: "Silver Horizon 2024.dut.srt".into(),
                 },
             ]
         );
@@ -617,7 +631,7 @@ mod tests {
             file("Ab5drZSkNi.mkv", 900 * MIB),
             file("Ab5drZSkNiXtra.mkv", 1024),
         ];
-        let plan = plan_renames(&files, 0, "Silver Horizon");
+        let plan = plan_renames(&files, 0, "Silver Horizon", "Silver Horizon");
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].to, "Silver Horizon.mkv");
     }
@@ -628,7 +642,7 @@ mod tests {
             file("Yb5drZSkNi20UCMkb.mkv", 900 * MIB),
             file("Silver Horizon.mkv", 4096),
         ];
-        let plan = plan_renames(&files, 0, "Silver Horizon");
+        let plan = plan_renames(&files, 0, "Silver Horizon", "Silver Horizon");
         assert_eq!(plan[0].to, "Silver Horizon.1.mkv");
     }
 
@@ -638,14 +652,33 @@ mod tests {
             file("payload/Yb5drZSkNi20UCMkb.mkv", 900 * MIB),
             file("subs/Yb5drZSkNi20UCMkb.eng.srt", 40 * 1024),
         ];
-        let plan = plan_renames(&files, 0, "Silver Horizon");
+        let plan = plan_renames(&files, 0, "Silver Horizon", "Silver Horizon");
         assert_eq!(plan[0].to, "payload/Silver Horizon.mkv");
         assert_eq!(plan[1].to, "subs/Silver Horizon.eng.srt");
     }
 
     #[test]
+    fn full_to_carries_the_full_stem_without_a_collision_number() {
+        let files = [
+            file("payload/Yb5drZSkNi20UCMkb.mkv", 900 * MIB),
+            file("payload/Silver Horizon_ Part 2.mkv", 4096),
+            file("subs/Yb5drZSkNi20UCMkb.eng.srt", 40 * 1024),
+        ];
+        let plan = plan_renames(
+            &files,
+            0,
+            "Silver Horizon_ Part 2",
+            "Silver Horizon: Part 2",
+        );
+        assert_eq!(plan[0].to, "payload/Silver Horizon_ Part 2.1.mkv");
+        assert_eq!(plan[0].full_to, "payload/Silver Horizon: Part 2.mkv");
+        assert_eq!(plan[1].to, "subs/Silver Horizon_ Part 2.1.eng.srt");
+        assert_eq!(plan[1].full_to, "subs/Silver Horizon: Part 2.eng.srt");
+    }
+
+    #[test]
     fn a_candidate_already_named_after_the_target_plans_nothing() {
         let files = [file("Silver Horizon.mkv", 900 * MIB)];
-        assert!(plan_renames(&files, 0, "Silver Horizon").is_empty());
+        assert!(plan_renames(&files, 0, "Silver Horizon", "Silver Horizon").is_empty());
     }
 }

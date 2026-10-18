@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::checkpoint::{
     DirectOutputWriter, ExtractionCheckpointState, FinalizeMemberContext, SharedOutputFile,
 };
@@ -532,19 +535,22 @@ pub(crate) fn apply_rar_member_filesystem_metadata(
     Ok(())
 }
 
-fn ensure_unique_sanitized_rar_member_paths(archive: &unrar_rs::RarArchive) -> Result<(), String> {
+fn ensure_unique_sanitized_rar_member_paths(
+    archive: &unrar_rs::RarArchive,
+) -> Result<(), ExtractionError> {
     let mut occupied = std::collections::HashSet::<String>::new();
     for raw_name in archive.started_member_names() {
         let member_name = unrar_rs::sanitize_path(raw_name);
-        let safe_path = validate_sanitized_rar_member_path(&member_name)?;
+        let safe_path = validate_sanitized_rar_member_path(&member_name)
+            .map_err(ExtractionError::structure_refused)?;
         let collision_key = safe_path
             .to_string_lossy()
             .replace('\\', "/")
             .to_ascii_lowercase();
         if !occupied.insert(collision_key) {
-            return Err(format!(
+            return Err(ExtractionError::structure_refused(format!(
                 "RAR archive contains colliding sanitized member path: {member_name}"
-            ));
+            )));
         }
     }
     Ok(())
@@ -593,7 +599,7 @@ impl Pipeline {
         archive: &mut unrar_rs::RarArchive,
         ctx: RarExtractionContext<'_>,
         idx: usize,
-    ) -> Result<(String, u64, u64), String> {
+    ) -> Result<(String, u64, u64), ExtractionError> {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("rar.extract_member");
         let RarExtractionContext {
             volume_paths,
@@ -608,13 +614,15 @@ impl Pipeline {
         } = ctx;
         let root = match root {
             Some(root) => root,
-            None => Arc::new(ExtractionRoot::open(output_dir)?),
+            None => Arc::new(ExtractionRoot::open(output_dir).or_terminal()?),
         };
         let budget = match budget {
             Some(budget) => budget,
             None => {
-                let limits = Arc::new(ExtractionLimits::from_env(output_dir)?);
-                let (initial_entries, initial_bytes) = ExtractionRoot::snapshot_usage(output_dir)?;
+                let limits = Arc::new(ExtractionLimits::from_env(output_dir).or_terminal()?);
+                let (initial_entries, initial_bytes) = ExtractionRoot::snapshot_usage(output_dir)
+                    .map_err(String::from)
+                    .or_terminal()?;
                 JobExtractionBudget::new(
                     limits,
                     output_dir.to_path_buf(),
@@ -627,14 +635,15 @@ impl Pipeline {
                     initial_entries,
                     initial_bytes,
                     PipelineMetrics::new(),
-                )?
+                )
+                .or_terminal()?
             }
         };
         let _member_timer = MemberExtractionTimer::start(Arc::clone(budget.metrics()));
         let phase_guard = PhaseAttemptRollbackGuard::new(phase_attempt);
-        let member = archive
-            .member_info(idx)
-            .ok_or_else(|| format!("member index {idx} missing from archive metadata"))?;
+        let member = archive.member_info(idx).ok_or_else(|| {
+            ExtractionError::terminal(format!("member index {idx} missing from archive metadata"))
+        })?;
         let member_name = member.name.clone();
         let safe_member_path = validate_sanitized_rar_member_path(&member_name)
             .map_err(|error| budget.reject_unsafe_path(error))?;
@@ -648,14 +657,16 @@ impl Pipeline {
         if is_directory {
             let dir_path = output_dir.join(&safe_member_path);
             root.create_dir(&safe_member_path, &budget)?;
-            apply_rar_member_filesystem_metadata(&member, &dir_path)?;
+            apply_rar_member_filesystem_metadata(&member, &dir_path).or_terminal()?;
             return Ok((member_name, 0, unpacked_size));
         }
 
         if member.is_symlink || member.is_hardlink || member.is_file_copy {
-            return Err(budget.reject_unsupported_entry(format!(
-                "RAR member '{member_name}' is a link or file-copy entry"
-            )));
+            return Err(budget
+                .reject_unsupported_entry(format!(
+                    "RAR member '{member_name}' is a link or file-copy entry"
+                ))
+                .into());
         }
 
         // Reserve this member's share of the Extracting total here, at open
@@ -699,7 +710,7 @@ impl Pipeline {
         );
 
         if partial_path.exists() || chunk_dir.exists() {
-            Self::clear_member_extraction_artifacts(&partial_path, &chunk_dir)?;
+            Self::clear_member_extraction_artifacts(&partial_path, &chunk_dir).or_terminal()?;
         }
 
         let partial_relative = partial_path.strip_prefix(output_dir).map_err(|error| {
@@ -761,9 +772,9 @@ impl Pipeline {
             let mut provider_paths = std::collections::HashMap::new();
             for absolute_volume in first_volume..=last_volume {
                 let Some(path) = volume_paths.get(&absolute_volume) else {
-                    return Err(format!(
+                    return Err(ExtractionError::terminal(format!(
                         "missing local RAR volume {absolute_volume} for member {member_name}"
-                    ));
+                    )));
                 };
                 provider_paths.insert(absolute_volume as usize, path.clone());
             }
@@ -808,7 +819,7 @@ impl Pipeline {
         };
         let chunk_records = chunk_records.map_err(|error| {
             let _ = std::fs::remove_file(&partial_path);
-            format!("failed to extract {member_name}: {error}")
+            ExtractionError::from_rar(format!("failed to extract {member_name}: {error}"), &error)
         })?;
         let chunk_total = chunk_records
             .iter()
@@ -839,7 +850,7 @@ impl Pipeline {
 
         if let Some(error) = checkpoint.take_error() {
             let _ = std::fs::remove_file(&partial_path);
-            return Err(error);
+            return Err(ExtractionError::terminal(error));
         }
 
         // Flush only: the buffered tail has to reach the file before finalize
@@ -861,9 +872,12 @@ impl Pipeline {
         // member while writeback of the previous member could have overlapped
         // the next one.
         shared.borrow_mut().inner.flush().map_err(|e| {
-            format!(
-                "failed to flush partial output {}: {e}",
-                partial_path.display()
+            ExtractionError::from_io(
+                format!(
+                    "failed to flush partial output {}: {e}",
+                    partial_path.display()
+                ),
+                &e,
             )
         })?;
         drop(shared);
@@ -880,10 +894,10 @@ impl Pipeline {
             Ok(bytes_written) => bytes_written,
             Err(error) => {
                 let _ = std::fs::remove_file(&partial_path);
-                return Err(error);
+                return Err(ExtractionError::terminal(error));
             }
         };
-        apply_rar_member_filesystem_metadata(&member, &out_path)?;
+        apply_rar_member_filesystem_metadata(&member, &out_path).or_terminal()?;
         info!(
             job_id = job_id.0,
             set_name,
@@ -902,7 +916,8 @@ impl Pipeline {
 
     pub(crate) fn open_rar_archive_from_snapshot_or_disk(
         request: RarArchiveSnapshotOpenRequest<'_>,
-    ) -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, String> {
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, ExtractionError>
+    {
         let RarArchiveSnapshotOpenRequest {
             set_name,
             volume_paths,
@@ -936,7 +951,7 @@ impl Pipeline {
 
     pub(crate) fn open_rar_archive_for_extraction_with_password_candidates(
         request: RarExtractionOpenRequest<'_>,
-    ) -> Result<RarExtractionOpenSelection, String> {
+    ) -> Result<RarExtractionOpenSelection, ExtractionError> {
         let RarExtractionOpenRequest {
             set_name,
             volume_paths,
@@ -988,11 +1003,9 @@ impl Pipeline {
                     Self::open_rar_archive_from_snapshot_or_disk_with_password(&inputs, password)?;
                 let _memory_permit = if let Some(budget) = inputs.budget.as_ref() {
                     let required = rar_decoder_memory_bytes(&probe_archive);
-                    Some(
-                        budget
-                            .reserve_memory_wait(required)
-                            .map_err(crate::pipeline::RarPasswordAttemptError::Fatal)?,
-                    )
+                    Some(budget.reserve_memory_wait(required).map_err(|error| {
+                        crate::pipeline::RarPasswordAttemptError::Fatal(error.into())
+                    })?)
                 } else {
                     None
                 };
@@ -1071,7 +1084,7 @@ impl Pipeline {
         let already_extracted = inputs.already_extracted;
         if let Some(budget) = inputs.budget.as_ref() {
             budget.check_active_io().map_err(|error| {
-                crate::pipeline::RarPasswordAttemptError::Fatal(error.to_string())
+                crate::pipeline::RarPasswordAttemptError::Fatal(ExtractionError::io(&error))
             })?;
         }
         let has_cached_headers = cached_headers.is_some();
@@ -1094,18 +1107,22 @@ impl Pipeline {
                     inputs.shared_kdf_cache.clone(),
                 )
                 .map_err(|error| {
-                    crate::pipeline::RarPasswordAttemptError::Fatal(format!(
-                        "failed to deserialize cached RAR headers for set '{set_name}': {error}"
+                    crate::pipeline::RarPasswordAttemptError::Fatal(ExtractionError::terminal(
+                        format!(
+                            "failed to deserialize cached RAR headers for set '{set_name}': {error}"
+                        ),
                     ))
                 })?
             }
             None => {
                 let first_path = volume_paths.get(&0).ok_or_else(|| {
-                    crate::pipeline::RarPasswordAttemptError::Fatal(format!(
-                        "RAR set '{set_name}' {}; volumes present: {:?}",
-                        crate::pipeline::archive::topology::MISSING_FIRST_RAR_VOLUME_ERROR_MARKER,
-                        volume_paths.keys().collect::<Vec<_>>()
-                    ))
+                    crate::pipeline::RarPasswordAttemptError::Fatal(
+                        ExtractionError::missing_first_volume(format!(
+                            "RAR set '{set_name}' {}; volumes present: {:?}",
+                            crate::pipeline::archive::topology::MISSING_FIRST_RAR_VOLUME_ERROR_MARKER,
+                            volume_paths.keys().collect::<Vec<_>>()
+                        )),
+                    )
                 })?;
                 Self::open_rar_volume_zero_with_password(
                     first_path,
@@ -1188,7 +1205,10 @@ impl Pipeline {
                     let context =
                         format!("failed to open RAR volume {volume_number} for set '{set_name}'");
                     return Err(crate::pipeline::RarPasswordAttemptError::Fatal(
-                        crate::pipeline::capacity::format_fd_capacity_error(&context, &error),
+                        ExtractionError::from_io(
+                            crate::pipeline::capacity::format_fd_capacity_error(&context, &error),
+                            &error,
+                        ),
                     ));
                 }
             };
@@ -1204,8 +1224,11 @@ impl Pipeline {
                 archive
                     .refresh_volume(*volume_number as usize, file)
                     .map_err(|error| {
-                        crate::pipeline::RarPasswordAttemptError::Fatal(format!(
-                            "failed to refresh RAR volume {volume_number} for set '{set_name}': {error}"
+                        crate::pipeline::RarPasswordAttemptError::Fatal(ExtractionError::from_rar(
+                            format!(
+                                "failed to refresh RAR volume {volume_number} for set '{set_name}': {error}"
+                            ),
+                            &error,
                         ))
                     })?;
             } else if archive.has_volume(*volume_number as usize) {
@@ -1253,12 +1276,13 @@ impl Pipeline {
         budget: Option<&Arc<JobExtractionBudget>>,
     ) -> Result<unrar_rs::RarArchive, crate::pipeline::RarPasswordAttemptError> {
         let first_file = std::fs::File::open(first_path).map_err(|e| {
-            crate::pipeline::RarPasswordAttemptError::Fatal(
+            crate::pipeline::RarPasswordAttemptError::Fatal(ExtractionError::from_io(
                 crate::pipeline::capacity::format_fd_capacity_error(
                     "failed to open RAR volume 0",
                     &e,
                 ),
-            )
+                &e,
+            ))
         })?;
         let first_file: Box<dyn unrar_rs::ReadSeek> = if let Some(budget) = budget {
             Box::new(BudgetedReader::new(first_file, Arc::clone(budget)))
@@ -1321,9 +1345,9 @@ impl Pipeline {
         budget: Option<&Arc<JobExtractionBudget>>,
     ) -> Result<(), crate::pipeline::RarPasswordAttemptError> {
         let member = archive.member_info(idx).ok_or_else(|| {
-            crate::pipeline::RarPasswordAttemptError::Fatal(format!(
+            crate::pipeline::RarPasswordAttemptError::Fatal(ExtractionError::terminal(format!(
                 "member index {idx} missing from archive metadata"
-            ))
+            )))
         })?;
         if member.is_directory {
             return Ok(());
@@ -1359,10 +1383,12 @@ impl Pipeline {
         let mut provider_paths = std::collections::HashMap::new();
         for absolute_volume in first_volume..=last_volume {
             let Some(path) = volume_paths.get(&absolute_volume) else {
-                return Err(crate::pipeline::RarPasswordAttemptError::Fatal(format!(
-                    "missing local RAR volume {absolute_volume} for member {}",
-                    member.name
-                )));
+                return Err(crate::pipeline::RarPasswordAttemptError::Fatal(
+                    ExtractionError::terminal(format!(
+                        "missing local RAR volume {absolute_volume} for member {}",
+                        member.name
+                    )),
+                ));
             };
             provider_paths.insert(absolute_volume as usize, path.clone());
         }
@@ -1388,14 +1414,22 @@ impl Pipeline {
         context: &str,
         candidates: &[crate::jobs::ArchivePasswordCandidate],
         mut attempt: F,
-    ) -> Result<crate::pipeline::ArchivePasswordSelection<T>, String>
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<T>, ExtractionError>
     where
         F: FnMut(Option<&str>) -> Result<T, crate::pipeline::RarPasswordAttemptError>,
     {
+        let failed = |error: crate::pipeline::RarPasswordAttemptError| match error {
+            crate::pipeline::RarPasswordAttemptError::Rar(error) => {
+                ExtractionError::from_rar(format!("{context}: {error}"), &error)
+            }
+            crate::pipeline::RarPasswordAttemptError::Fatal(error) => {
+                error.map_message(|message| format!("{context}: {message}"))
+            }
+        };
         if candidates.is_empty() {
             return attempt(None)
                 .map(|value| crate::pipeline::ArchivePasswordSelection::new(value, None))
-                .map_err(|error| format!("{context}: {error}"));
+                .map_err(failed);
         }
 
         let mut last_password_error = None;
@@ -1412,18 +1446,18 @@ impl Pipeline {
                 {
                     last_password_error = Some(error);
                 }
-                Err(error) => return Err(format!("{context}: {error}")),
+                Err(error) => return Err(failed(error)),
             }
         }
 
         let sources = Self::password_candidate_sources(candidates);
-        Err(format!(
+        Err(ExtractionError::password_required(format!(
             "{context}: invalid password for encrypted archive after {} candidate(s) from {sources}: {}",
             candidates.len(),
             last_password_error
                 .map(|error| error.to_string())
                 .unwrap_or_else(|| "password rejected".to_string())
-        ))
+        )))
     }
 
     pub(crate) fn deserialize_rar_headers_with_password_candidates(
@@ -1455,7 +1489,8 @@ impl Pipeline {
         first_path: &PathBuf,
         candidates: &[crate::jobs::ArchivePasswordCandidate],
         shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
-    ) -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, String> {
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, ExtractionError>
+    {
         let context = format!("failed to parse RAR volume 0 for set '{set_name}'");
         Self::try_rar_password_candidates(&context, candidates, |password| {
             Self::open_rar_volume_zero_with_password(
@@ -1657,7 +1692,10 @@ mod tests {
                 Err(error) => error,
             };
 
-        assert!(error.contains("dictionary"), "unexpected error: {error}");
+        assert!(
+            error.message().contains("dictionary"),
+            "unexpected error: {error}"
+        );
         assert!(!temp.path().join("oversized.bin.partial").exists());
     }
 
@@ -1858,7 +1896,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("unsupported_entry"));
+        assert!(error.is(ExtractionErrorClass::Rejected), "{error}");
         assert!(!output_dir.path().join(member_name).exists());
     }
 

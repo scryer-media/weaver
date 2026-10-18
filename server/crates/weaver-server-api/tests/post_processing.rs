@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 mod common;
 
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
@@ -76,6 +79,62 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
     );
     assert_eq!(settings["strictSecurityRefusesExecution"], false);
     assert_eq!(settings["globalScriptsRun"], "ALWAYS");
+}
+
+#[tokio::test]
+async fn the_extension_list_saves_on_its_own_and_leaves_the_script_settings_alone() {
+    let harness = TestHarness::new().await;
+    let denied = harness
+        .execute_as(
+            r#"mutation { setUnacceptableExtensions(extensions: ["iso"]) }"#,
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&denied);
+
+    let response = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: { executionEnabled: false, concurrency: 3, terminationGraceSeconds: 20, pythonInterpreter: "/usr/bin/python3" }) { concurrency } }"#,
+        )
+        .await;
+    assert_no_errors(&response);
+
+    let response = harness
+        .execute(r#"mutation { setUnacceptableExtensions(extensions: [" ISO ", "exe", "iso"]) }"#)
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["setUnacceptableExtensions"],
+        json!(["exe", "iso"])
+    );
+    let response = harness
+        .execute(
+            "{ postProcessingSettings { concurrency terminationGraceSeconds pythonInterpreter unacceptableExtensions } }",
+        )
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["postProcessingSettings"],
+        json!({
+            "concurrency": 3,
+            "terminationGraceSeconds": 20,
+            "pythonInterpreter": "/usr/bin/python3",
+            "unacceptableExtensions": ["exe", "iso"],
+        })
+    );
+
+    // A pattern the check cannot read is refused, and the list stays as it was.
+    let refused = harness
+        .execute(r#"mutation { setUnacceptableExtensions(extensions: ["a/b"]) }"#)
+        .await;
+    assert_has_errors(&refused);
+    let response = harness
+        .execute("{ postProcessingSettings { unacceptableExtensions } }")
+        .await;
+    assert_eq!(
+        response_data(&response)["postProcessingSettings"]["unacceptableExtensions"],
+        json!(["exe", "iso"])
+    );
 }
 
 #[tokio::test]
@@ -1797,6 +1856,7 @@ async fn a_run_of_a_job_still_in_the_queue_shows_the_jobs_name() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             password_override: None,
+            supplied_password_candidates: Vec::new(),
         })
         .unwrap();
     retain_output(

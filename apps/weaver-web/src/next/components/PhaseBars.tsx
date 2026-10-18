@@ -1,4 +1,7 @@
-import { useEffect, useState } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { JobData, JobPhase, JobPhaseProgressData } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
@@ -31,6 +34,8 @@ interface HeldState extends JobProgressState {
   jobId: number;
 }
 
+const NO_BARS: JobPhaseProgressData[] = [];
+
 type ProgressJob = Pick<JobData, "id" | "status" | "phaseProgress"> &
   Partial<Pick<JobData, "downloadedBytes" | "totalBytes" | "progress">>;
 
@@ -54,8 +59,15 @@ function start(job: ProgressJob): HeldState {
 export function useJobProgress(job: ProgressJob): JobProgressView {
   const { id, status, phaseProgress, downloadedBytes, totalBytes, progress } = job;
   const [state, setState] = useState<HeldState>(() => start(job));
+  // The first render's state already holds what it was given, and the same
+  // answer computed again would draw the row twice; time is the timer's job.
+  const started = useRef(true);
 
   useEffect(() => {
+    if (started.current) {
+      started.current = false;
+      return;
+    }
     const current = { id, status, phaseProgress, downloadedBytes, totalBytes, progress };
     setState((previous) =>
       previous.jobId === id
@@ -88,10 +100,12 @@ export function useJobProgress(job: ProgressJob): JobProgressView {
 
   // The render that switches to another job has not been through the effect
   // yet; it shows that job as reported rather than the last one's bars.
-  if (state.jobId !== id) {
-    return { status, bars: [] };
-  }
-  return { status: state.status?.shown ?? status, bars: state.bars };
+  const switching = state.jobId !== id;
+  const shown = switching ? status : (state.status?.shown ?? status);
+  const bars = switching ? NO_BARS : state.bars;
+  // One view for as long as it says the same thing, so a row drawn again for
+  // its estimate alone leaves its bars be.
+  return useMemo(() => ({ status: shown, bars }), [shown, bars]);
 }
 
 const PHASE_LABEL_KEY: Record<JobPhase, string> = {
@@ -110,7 +124,7 @@ const PHASE_LABEL_KEY: Record<JobPhase, string> = {
  * not move sideways when a second phase joins it, and every name in a stack
  * takes the width of the longest, so the bars above and below end together.
  */
-export function PhaseBars({
+export const PhaseBars = memo(function PhaseBars({
   job,
   view,
   height,
@@ -184,4 +198,4 @@ export function PhaseBars({
       })}
     </div>
   );
-}
+});

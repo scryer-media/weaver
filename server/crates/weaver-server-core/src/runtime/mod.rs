@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 pub mod affinity;
 pub mod buffers;
 pub mod environment;
@@ -8,6 +11,8 @@ pub mod hardware_profile;
 pub mod job_debug_ring;
 pub mod kernels;
 pub mod log_buffer;
+pub mod log_delivery;
+pub mod log_file;
 pub mod log_filter;
 pub(crate) mod perf_probe;
 pub mod postprocess_pool;

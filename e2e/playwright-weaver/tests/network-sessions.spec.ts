@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { expect, graphql, test } from "./helpers";
 import { waitTerminal } from "./support/downloads";
 import {
@@ -17,7 +20,7 @@ test.afterEach(async ({}, info) => { await world.cleanup(info); });
 function resaveInput(profile: ProxyProfile, overrides: Partial<ProxyProfileInput> = {}): ProxyProfileInput {
   return {
     name: profile.name, kind: profile.kind, enabled: profile.enabled, host: profile.host, port: profile.port,
-    dnsServers: profile.dnsServers, tunnelAddresses: profile.tunnelAddresses, peerPublicKey: profile.peerPublicKey,
+    resolver: profile.resolver, dnsServers: profile.dnsServers, tunnelAddresses: profile.tunnelAddresses, peerPublicKey: profile.peerPublicKey,
     mtu: profile.mtu, keepaliveSeconds: profile.keepaliveSeconds, timeoutSeconds: profile.timeoutSeconds, ...overrides,
   };
 }
@@ -43,7 +46,7 @@ test("S01 a password-only SSH profile is refused; key auth forwards to the NNTP 
   const before = (await proxyProfiles(request)).length;
   const refused = await graphqlErrors(request,
     "mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }",
-    { input: { name: `s01-password-${Date.now()}`, kind: "SSH", enabled: true, host: hostAddress("tunnel-fixture", "a"), port: TUNNEL_PORTS.ssh1,
+    { input: { name: `s01-password-${Date.now()}`, kind: "SSH", resolver: "PROXY", enabled: true, host: hostAddress("tunnel-fixture", "a"), port: TUNNEL_PORTS.ssh1,
       username: client.username, password: client.password, timeoutSeconds: 5 } });
   expect(refused.join("\n")).toContain("SSH requires an Ed25519 private key");
   expect(await proxyProfiles(request)).toHaveLength(before);
@@ -74,7 +77,7 @@ test("S02 SSH key and passphrase-protected key auth; a wrong passphrase is refus
   const before = await proxyProfiles(request);
   const refused = await graphqlErrors(request,
     "mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }",
-    { input: { name: `s02-wrong-passphrase-${Date.now()}`, kind: "SSH", enabled: true, host: hostAddress("tunnel-fixture", "a"), port: TUNNEL_PORTS.ssh3,
+    { input: { name: `s02-wrong-passphrase-${Date.now()}`, kind: "SSH", resolver: "PROXY", enabled: true, host: hostAddress("tunnel-fixture", "a"), port: TUNNEL_PORTS.ssh3,
       username: client.username, privateKey: client.privateKeyWithPassphrase, passphrase: `${client.passphrase}-wrong`, timeoutSeconds: 5 } });
   expect(refused.join("\n")).toContain("the private key could not be read");
   expect(await proxyProfiles(request)).toEqual(before);

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::manifest::{
     ManifestError, bare_script_options, detect_bare_script_adapter, go_script_header,
     option_name_suggests_secret, parse_nzbget_manifest,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 
 #[test]
@@ -281,4 +284,52 @@ fn retirement_before_socket_registration_is_not_lost() {
         Arc::new(move |id| tx.send(id).unwrap()),
     );
     assert_eq!(rx.try_recv().unwrap(), slot.id());
+}
+
+#[tokio::test]
+async fn a_loan_recalls_idle_sockets_and_gives_them_back_when_dropped() {
+    let budget = SocketBudget::new(3);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut slots: Vec<_> = (0..3).map(|_| budget.try_acquire().unwrap()).collect();
+    for slot in &slots {
+        slot.active();
+        let tx = tx.clone();
+        slot.idle(
+            SocketPhase::OwnedIdle,
+            Arc::new(move |id| tx.send(id).unwrap()),
+        );
+    }
+    budget.lend(2);
+    let loan = ConnectionLoan::new(Arc::clone(&budget), 2);
+    assert_eq!(loan.count(), 2);
+    let recalled: Vec<u64> = rx.try_iter().collect();
+    assert_eq!(
+        recalled.len(),
+        2,
+        "idle sockets above the lowered limit go at once"
+    );
+    assert_eq!(budget.snapshot().limit, 1);
+    assert_eq!(loan.open(), 3, "closing sockets still count as open");
+
+    let waiting = tokio::spawn({
+        let loan = Arc::new(loan);
+        let waiter = Arc::clone(&loan);
+        async move {
+            waiter.wait_open_at_most(1).await;
+            loan
+        }
+    });
+    slots.retain(|slot| !recalled.contains(&slot.id()));
+    let loan = waiting.await.unwrap();
+    assert_eq!(loan.open(), 1);
+    assert!(
+        budget.try_acquire().is_none(),
+        "the lent connections stay lent"
+    );
+
+    budget.configure(4);
+    assert_eq!(budget.snapshot().limit, 2, "a resize keeps the loan out");
+    drop(loan);
+    assert_eq!(budget.snapshot().limit, 4);
+    assert!(budget.try_acquire().is_some());
 }

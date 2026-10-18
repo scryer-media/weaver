@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A cipher block straddling a held neighbour
 //
 // An encrypted member split across volumes has cipher blocks that straddle a

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // `rar_extraction` tests, part of a mechanical split of the original file.
 
 use super::*;
@@ -1739,10 +1742,7 @@ async fn rar_extraction_capacity_pressure_keeps_member_waiting_without_repair_pr
         set_state.in_flight_members.insert("E01.mkv".to_string());
     }
 
-    let capacity_error = format!(
-        "{}: synthetic EMFILE",
-        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
-    );
+    let capacity_error = fd_exhausted_error();
     pipeline
         .handle_extraction_done(ExtractionDone::Batch {
             job_id,
@@ -1858,10 +1858,7 @@ async fn rar_full_set_capacity_pressure_retries_without_failing_job() {
         .or_default()
         .insert(set_name.clone());
 
-    let capacity_error = format!(
-        "{}: synthetic EMFILE",
-        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
-    );
+    let capacity_error = fd_exhausted_error();
     pipeline
         .handle_extraction_done(ExtractionDone::FullSet {
             job_id,
@@ -1932,10 +1929,7 @@ async fn rar_full_set_member_capacity_pressure_retries_without_repair_promotion(
     let set_name =
         setup_extracting_rar_full_set(&mut pipeline, job_id, "RAR Full Set Member Capacity Retry")
             .await;
-    let capacity_error = format!(
-        "{}: synthetic EMFILE during read",
-        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
-    );
+    let capacity_error = fd_exhausted_error();
 
     pipeline
         .handle_extraction_done(ExtractionDone::FullSet {
@@ -1985,10 +1979,7 @@ async fn rar_full_set_mixed_failures_defer_repair_when_capacity_pressure_is_pres
     let set_name =
         setup_extracting_rar_full_set(&mut pipeline, job_id, "RAR Full Set Mixed Capacity Retry")
             .await;
-    let capacity_error = format!(
-        "{}: synthetic EMFILE during read",
-        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
-    );
+    let capacity_error = fd_exhausted_error();
 
     pipeline
         .handle_extraction_done(ExtractionDone::FullSet {
@@ -1998,7 +1989,7 @@ async fn rar_full_set_mixed_failures_defer_repair_when_capacity_pressure_is_pres
                 extracted: Vec::new(),
                 failed: vec![
                     ("E01.mkv".to_string(), capacity_error),
-                    ("E02.mkv".to_string(), "Invalid checksum".to_string()),
+                    ("E02.mkv".to_string(), zip_member_crc_error("E02.mkv")),
                 ],
                 selected_password: None,
             }),
@@ -2562,7 +2553,7 @@ async fn recoverable_full_set_extraction_error_defers_to_repair_flow() {
         .handle_extraction_done(ExtractionDone::FullSet {
             job_id,
             set_name: "archive.zip".to_string(),
-            result: Err("failed to extract sample.mkv: Invalid checksum".to_string()),
+            result: Err(zip_member_crc_error("sample.mkv")),
         })
         .await;
 
@@ -2602,7 +2593,10 @@ async fn nonrecoverable_full_set_extraction_error_fails_job() {
         .handle_extraction_done(ExtractionDone::FullSet {
             job_id,
             set_name: "archive.zip".to_string(),
-            result: Err("failed to parse zip central directory".to_string()),
+            result: Err(crate::pipeline::ExtractionError::from_zip(
+                "unsupported ZIP archive: multi-disk",
+                &zip::result::ZipError::UnsupportedArchive("multi-disk"),
+            )),
         })
         .await;
 
@@ -2632,10 +2626,7 @@ async fn non_rar_full_set_capacity_pressure_still_fails_job() {
         .handle_extraction_done(ExtractionDone::FullSet {
             job_id,
             set_name: "archive.zip".to_string(),
-            result: Err(format!(
-                "{}: synthetic EMFILE",
-                crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
-            )),
+            result: Err(fd_exhausted_error()),
         })
         .await;
 
@@ -3274,10 +3265,32 @@ async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_b
 }
 
 // What a 7z extraction reports for a block whose packed bytes did not decode.
-fn sevenz_corrupted_block_error() -> String {
-    format!(
-        "{}BlockDecode {{ block_index: 0, packed_offset: 32, kind: Corrupted, message: \"data error\" }}",
-        crate::pipeline::completion::finalize::extract::SEVENZ_BLOCK_DATA_ERROR_PREFIX
+fn sevenz_corrupted_block_error() -> crate::pipeline::ExtractionError {
+    sevenz_block_error(sevenz_turbo::Error::Corrupted("data error".into()))
+}
+
+// What sevenz-turbo raises for a block that failed, mapped as the extraction
+// maps it.
+fn sevenz_block_error(cause: sevenz_turbo::Error) -> crate::pipeline::ExtractionError {
+    crate::pipeline::completion::finalize::extract::sevenz_extraction_error(&cause.in_block(0, 32))
+}
+
+// What a worker reports when the process has run out of file descriptors.
+fn fd_exhausted_error() -> crate::pipeline::ExtractionError {
+    crate::pipeline::ExtractionError::from_io(
+        "synthetic EMFILE",
+        &std::io::Error::from_raw_os_error(libc::EMFILE),
+    )
+}
+
+// What a ZIP extraction reports for a member whose CRC-32 does not match.
+fn zip_member_crc_error(member: &str) -> crate::pipeline::ExtractionError {
+    crate::pipeline::ExtractionError::from_zip(
+        format!("failed to extract {member}"),
+        &zip::result::ZipError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid checksum",
+        )),
     )
 }
 
@@ -3436,7 +3449,7 @@ async fn a_strong_decode_verified_7z_whose_extraction_hits_a_damaged_block_is_re
         } => {
             assert_eq!(extracted, set_name);
             assert!(
-                Pipeline::is_recoverable_full_set_extraction_error(error),
+                error.is(crate::pipeline::ExtractionErrorClass::Recoverable),
                 "the damaged block reads as a data error: {error}"
             );
         }
@@ -3724,7 +3737,7 @@ async fn a_gzip_failure_the_recovery_data_finds_clean_is_final_after_one_fallbac
             } => ExtractionDone::FullSet {
                 job_id,
                 set_name,
-                result: Err(injected.to_string()),
+                result: Err(crate::pipeline::ExtractionError::terminal(injected)),
             },
             _ => panic!("expected a full-set gzip extraction"),
         };
@@ -3754,24 +3767,27 @@ async fn a_gzip_failure_the_recovery_data_finds_clean_is_final_after_one_fallbac
 // decode and a missing or wrong password are not, and still end the job.
 #[test]
 fn only_7z_data_errors_are_recoverable_full_set_failures() {
-    let prefix = crate::pipeline::completion::finalize::extract::SEVENZ_BLOCK_DATA_ERROR_PREFIX;
-    assert!(Pipeline::is_recoverable_full_set_extraction_error(
-        &sevenz_corrupted_block_error()
-    ));
-    assert!(Pipeline::is_recoverable_full_set_extraction_error(
-        &format!(
-            "{prefix}BlockDecode {{ block_index: 1, packed_offset: 64, kind: Io, message: \"unexpected end of file\" }}"
-        )
-    ));
-    for terminal in [
-        "7z extraction failed: BlockDecode { block_index: 0, packed_offset: 32, kind: UnsupportedMethod, message: \"UnsupportedCompressionMethod(\\\"ARM64\\\")\" }",
-        "7z extraction failed: BlockDecode { block_index: 0, packed_offset: 32, kind: Password, message: \"PasswordRequired\" }",
-    ] {
-        assert!(
-            !Pipeline::is_recoverable_full_set_extraction_error(terminal),
-            "{terminal}"
-        );
-    }
+    use crate::pipeline::ExtractionErrorClass;
+    use sevenz_turbo::Error;
+    assert_eq!(
+        sevenz_corrupted_block_error().class(),
+        ExtractionErrorClass::Recoverable
+    );
+    assert_eq!(
+        sevenz_block_error(Error::from(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof
+        )))
+        .class(),
+        ExtractionErrorClass::Recoverable
+    );
+    assert_eq!(
+        sevenz_block_error(Error::UnsupportedCompressionMethod("ARM64".into())).class(),
+        ExtractionErrorClass::Terminal
+    );
+    assert_eq!(
+        sevenz_block_error(Error::PasswordRequired).class(),
+        ExtractionErrorClass::PasswordRequired
+    );
 }
 
 // Two file members that sanitize to one destination are refused at open, and
@@ -3829,33 +3845,84 @@ async fn colliding_member_paths_fail_the_job_instead_of_respinning_extraction() 
     );
 }
 
-// The terminal classification is keyed on the exact prefixes the open-time
-// checks produce. Anything a retry or a repair could still turn around —
-// a member CRC, a stale topology, FD pressure, a member whose *name* merely
-// contains one of the phrases — stays on its existing path.
-#[test]
-fn terminal_archive_structure_classification_matches_only_open_time_refusals() {
-    assert!(Pipeline::is_terminal_archive_structure_error(
-        "RAR archive contains colliding sanitized member path: CERTIFICATE/backup/id.bdmv"
-    ));
-    assert!(Pipeline::is_terminal_archive_structure_error(
-        "unsafe RAR member path: ../escape.mkv"
-    ));
-
-    for error in [
-        "checksum mismatch for member show.mkv",
-        "crc mismatch extracting show.mkv",
-        "member not found in archive: show.mkv",
-        "RAR volume show.part02.rar unavailable",
-        "no on-disk rar volumes for set show",
-        "Too many open files (os error 24)",
-        "failed to extract member colliding sanitized member path.mkv",
-        "failed to extract member unsafe RAR member path.mkv",
-        "",
+// Only an open-time structure refusal ends the job from a batch. A member
+// failure stays on its member path whatever its message says, including one
+// whose member name reads like the refusal.
+#[tokio::test]
+async fn only_a_structure_refusal_fails_the_job_from_a_batch() {
+    for (job, error, fails) in [
+        (
+            30090,
+            crate::pipeline::ExtractionError::structure_refused(
+                "RAR archive contains colliding sanitized member path: CERTIFICATE/backup/id.bdmv",
+            ),
+            true,
+        ),
+        (
+            30091,
+            crate::pipeline::ExtractionError::terminal(
+                "failed to extract member colliding sanitized member path.mkv",
+            ),
+            false,
+        ),
+        (
+            30092,
+            crate::pipeline::ExtractionError::terminal(
+                "failed to extract member unsafe RAR member path.mkv",
+            ),
+            false,
+        ),
     ] {
-        assert!(
-            !Pipeline::is_terminal_archive_structure_error(error),
-            "must stay non-terminal: {error:?}"
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(job);
+        let files = build_multifile_multivolume_rar_set();
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            rar_job_spec("Structure Refusal Route", &files),
+        )
+        .await;
+        pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+        for (file_index, (filename, bytes)) in files.iter().enumerate() {
+            write_and_complete_rar_volume(
+                &mut pipeline,
+                job_id,
+                file_index as u32,
+                filename,
+                bytes,
+            )
+            .await;
+        }
+        let key = (job_id, "show".to_string());
+        {
+            let set_state = pipeline
+                .rar_sets
+                .get_mut(&key)
+                .expect("RAR set should exist");
+            set_state.active_workers = 1;
+            set_state.in_flight_members = ["E01.mkv".to_string()].into_iter().collect();
+            set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
+            let plan = set_state.plan.as_mut().expect("RAR plan should exist");
+            plan.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
+        }
+
+        pipeline
+            .handle_extraction_done(ExtractionDone::Batch {
+                job_id,
+                set_name: "show".to_string(),
+                attempted: vec!["E01.mkv".to_string()],
+                result: Err(error.clone()),
+            })
+            .await;
+
+        assert_eq!(
+            matches!(
+                job_status_for_assert(&pipeline, job_id),
+                Some(JobStatus::Failed { .. })
+            ),
+            fails,
+            "{error}"
         );
     }
 }

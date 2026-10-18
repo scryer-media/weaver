@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::proxies::{LegPath, RouteLeg, Rung};
 mod credentials;
@@ -13,6 +16,7 @@ fn profile(id: u32) -> ProxyProfile {
         enabled: true,
         host: "127.0.0.1".into(),
         port: 9,
+        resolver: Resolver::Proxy,
         dns_servers: vec!["192.0.2.53".parse().unwrap()],
         tunnel_addresses: vec![],
         peer_public_key: None,
@@ -91,7 +95,6 @@ fn controlled_route() -> ControlledRoute {
             Arc::new(ProxyHop {
                 profile: profile(provider.id),
                 provider: provider.clone(),
-                wireguard: None,
             }),
         );
     }
@@ -135,7 +138,7 @@ async fn ladder_order_cooldown_and_primary_recovery() {
 #[tokio::test(start_paused = true)]
 async fn one_recovery_probe_and_cancellation_releases_it() {
     let (route, _, _) = controlled_route();
-    route.fail(1, "unreachable");
+    route.fail(1, ProxyFault::ConnectionRefused);
     assert!(route.begin(1).is_none());
     tokio::time::advance(Duration::from_secs(30)).await;
     let attempt = route.begin(1).unwrap();
@@ -244,12 +247,10 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
         host: addr.ip().to_string(),
         port: addr.port(),
         tls: false,
-        dialer: Some(
-            runtime
-                .network
-                .nntp_dialer(1, 1, Duration::from_secs(30))
-                .unwrap(),
-        ),
+        dialer: runtime
+            .network
+            .nntp_dialer(1, 1, Duration::from_secs(30))
+            .unwrap(),
         pipelining: weaver_nntp::PipeliningCapability::Known(false),
         ..Default::default()
     };

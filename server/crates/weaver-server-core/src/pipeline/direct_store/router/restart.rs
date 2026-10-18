@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Continuation of the `impl DirectSetRouter` block from `direct_store/router.rs`.
 // Split out mechanically to keep the parent file readable; no behavior lives here
 // that is not simply a method of the same type.
@@ -188,13 +191,10 @@ impl DirectSetRouter {
 
     // Rebuilds a 7z set's layout from its cached container map.
     //
-    // There is no re-parse here and there deliberately is not one: the header
-    // bytes sit below the published floors, so they are never refetched, and
-    // re-reading them out of the envelopes would make restart depend on a file
-    // whose bytes a demotion is free to have taken away. The map the live
-    // parse produced is cached instead, and this re-resolves it against the
-    // same volume lengths it was resolved against before — which are cached on
-    // the same rows, so the two halves cannot drift apart.
+    // Header bytes sit below the published floors and are never refetched.
+    // The cached map re-resolves against the same cached volume lengths.
+    // For an encrypted header, bounded posted-byte replay also re-proves the
+    // password candidate before any destination coverage is trusted.
     fn restore_sevenz_layout(
         &mut self,
         facts: &BTreeMap<u32, DirectVolumeFacts>,
@@ -231,6 +231,22 @@ impl DirectSetRouter {
         // over its refetched front and tail.
         if !self.declared_volume_sizes.contains_key(&0) || container.total == 0 {
             return Ok(());
+        }
+        let mut passwords = self.header_crypt.candidates();
+        if let Some(secret) = self.crypt.password()
+            && !passwords.contains(&secret)
+        {
+            passwords.push(secret);
+        }
+        let admission = super::sevenz::restore_admission(
+            &container,
+            &passwords,
+            super::MAX_HEADER_PREFIX_BYTES,
+        )
+        .map_err(|refusal| self.fail(DemotionReason::SevenZip(refusal)))?;
+        if let Some(admission) = admission {
+            self.crypt
+                .set_sevenz_password(&admission.secret, admission.password);
         }
         self.adopt_container_facts(container)
     }

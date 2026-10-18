@@ -1,12 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn bottom() -> Arc<Egress> {
-    Arc::new(Egress {
-        id: 4,
-        binding: SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
-        timeout: Duration::from_secs(30),
-    })
+    Arc::new(Egress::new(
+        4,
+        SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
+        Duration::from_secs(30),
+    ))
 }
 fn target(address: SocketAddr) -> Target {
     Target {
@@ -168,6 +171,7 @@ fn hop(id: u32, endpoint: SocketAddr, inner: Arc<dyn Dialer>) -> Arc<TransportHo
         },
         inner,
         timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
         failure: Default::default(),
     })
 }
@@ -259,7 +263,7 @@ async fn a_chain_names_its_first_failing_hop() {
         first,
         &FailingHop {
             proxy: 7,
-            reason: "endpoint unreachable: fixture refusal".into(),
+            fault: ProxyFault::ConnectionRefused,
         }
     );
     assert_eq!(failing[1], None);
@@ -279,12 +283,15 @@ async fn a_hop_is_failing_until_it_carries_a_dial() {
         proxy.dial(&target).await,
         Err(DialError::Hop { proxy: 8, .. })
     ));
-    // The hop is named beside its reason, so the reason is the cause alone.
+    // The hop is named beside its fault, so the fault names the destination
+    // alone.
     assert_eq!(
         proxy.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: "HTTP proxy rejected CONNECT".into(),
+            fault: ProxyFault::DestinationForbidden {
+                target: "192.0.2.9:119".into()
+            },
         })
     );
     *stage.reply.lock().unwrap() = b"HTTP/1.1 200 Connection established\r\n\r\n";
@@ -313,7 +320,10 @@ async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
         chain.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: "endpoint unreachable: bad gateway (502)".into(),
+            fault: ProxyFault::DestinationUnreachable {
+                target: "192.0.2.2:8080".into(),
+                reply: "HTTP 502".into()
+            },
         })
     );
     assert!(matches!(
@@ -324,7 +334,10 @@ async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
         first.failing_hop(),
         Some(FailingHop {
             proxy: 7,
-            reason: "HTTP proxy could not connect to destination: bad gateway (502)".into(),
+            fault: ProxyFault::DestinationUnreachable {
+                target: "192.0.2.9:119".into(),
+                reply: "HTTP 502".into()
+            },
         })
     );
     // A proxy that refuses to forward at all is failing itself, whichever
@@ -338,7 +351,9 @@ async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
         chain.failing_hop(),
         Some(FailingHop {
             proxy: 7,
-            reason: "HTTP proxy rejected CONNECT".into(),
+            fault: ProxyFault::DestinationForbidden {
+                target: "192.0.2.2:8080".into()
+            },
         })
     );
     // Each proxy answers its own request, and no hop is failing any longer.
@@ -368,6 +383,7 @@ async fn a_socks_reply_names_the_hop_that_refused() {
         },
         inner: stage,
         timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
         failure: Default::default(),
     });
     let chain = hop(8, "192.0.2.2:8080".parse().unwrap(), first.clone());
@@ -380,7 +396,9 @@ async fn a_socks_reply_names_the_hop_that_refused() {
         chain.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: "endpoint unreachable: connection refused".into(),
+            fault: ProxyFault::DestinationRefused {
+                target: "192.0.2.2:8080".into()
+            },
         })
     );
     assert!(matches!(
@@ -391,7 +409,9 @@ async fn a_socks_reply_names_the_hop_that_refused() {
         first.failing_hop(),
         Some(FailingHop {
             proxy: 7,
-            reason: "SOCKS proxy could not connect to destination: connection refused".into(),
+            fault: ProxyFault::DestinationRefused {
+                target: "192.0.2.9:119".into()
+            },
         })
     );
 }
@@ -417,7 +437,9 @@ async fn a_silent_proxy_is_charged_to_the_hop_it_was_asked_for() {
         chain.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: "endpoint unreachable: no answer through the hop before it".into(),
+            fault: ProxyFault::DestinationTimedOut {
+                target: "192.0.2.2:8080".into()
+            },
         })
     );
     assert!(matches!(
@@ -466,6 +488,7 @@ async fn a_session_hop_is_failing_only_while_its_own_path_fails() {
         path: DialPath::default(),
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
         resolver: None,
         failure: Default::default(),
     };
@@ -584,6 +607,7 @@ async fn idle_retirement_preserves_channels_shared_by_other_consumers() {
         path: DialPath::default(),
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
         resolver: None,
         failure: Default::default(),
     };
@@ -644,6 +668,7 @@ async fn only_a_path_failure_retires_an_idle_session() {
         path: DialPath::default(),
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
         resolver: None,
         failure: Default::default(),
     };
@@ -772,20 +797,12 @@ fn unresolved_destination_and_bound_route_failures_have_distinct_evidence() {
             SocketEgress::Interface("fixture-link".into()),
             SocketEgress::SourceAddress("192.0.2.1".parse().unwrap()),
         ] {
-            let egress = Egress {
-                id: 1,
-                binding,
-                timeout: Duration::from_secs(1),
-            };
+            let egress = Egress::new(1, binding, Duration::from_secs(1));
             let failure = egress.connect_error(io::Error::from(kind));
             assert!(failure.is_path_evidence());
             assert!(failure.to_string().contains("no route via"));
         }
-        let system = Egress {
-            id: 0,
-            binding: SocketEgress::System,
-            timeout: Duration::from_secs(1),
-        };
+        let system = Egress::new(0, SocketEgress::System, Duration::from_secs(1));
         assert!(
             !system
                 .connect_error(io::Error::from(kind))
@@ -897,6 +914,7 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
             },
             endpoint: Some(endpoint),
             timeout: Duration::from_secs(30),
+            naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
             resolver: Some(provider),
             failure: Default::default(),
         })
@@ -1024,6 +1042,7 @@ fn wireguard_session(
         },
         endpoint: None,
         timeout: Duration::from_secs(30),
+        naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
         resolver: Some(resolver),
         failure: Default::default(),
     })
@@ -1130,4 +1149,589 @@ async fn a_failed_handshake_beneath_a_carried_hop_is_attributed_to_the_hop_benea
         );
     }
     assert_eq!(upper.failing_hop().map(|hop| hop.proxy), Some(1));
+}
+
+// A stage that reaches `to` whatever it is asked for, and keeps what it was
+// asked for: an egress that can reach a DNS double behind a public address.
+struct Mapped {
+    to: SocketAddr,
+    asked: Mutex<Vec<(String, u16)>>,
+}
+#[async_trait::async_trait]
+impl Dialer for Mapped {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((target.host.clone(), target.port));
+        let stream = tokio::net::TcpStream::connect(self.to)
+            .await
+            .map_err(DialError::Destination)?;
+        Ok(Dialed {
+            stream: DialedStream::Socket(stream),
+            outcome: Default::default(),
+            path: DialPath::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn describe(&self) -> String {
+        "mapped".into()
+    }
+}
+
+const ROUTED_DNS: &str = "192.0.2.53";
+const PUBLIC: &str = "93.184.216.34";
+
+fn named_hop(
+    id: u32,
+    host: &str,
+    port: u16,
+    naming: Naming,
+    inner: Arc<dyn Dialer>,
+) -> Arc<TransportHop> {
+    Arc::new(TransportHop {
+        id,
+        spec: TransportProxy {
+            kind: crate::transport::TransportKind::HttpConnect,
+            host: host.into(),
+            port,
+            username: None,
+            password: None,
+        },
+        inner,
+        timeout: Duration::from_secs(30),
+        naming,
+        failure: Default::default(),
+    })
+}
+
+fn named(host: &str, port: u16) -> Target {
+    Target {
+        host: host.into(),
+        port,
+        purpose: Purpose::Probe,
+        addresses: Vec::new(),
+    }
+}
+
+async fn dns_double(names: &[(&str, &str)]) -> crate::test_support::dns::DnsServerDouble {
+    crate::test_support::dns::DnsServerDouble::start(
+        names
+            .iter()
+            .map(|(name, ip)| (name.to_string(), ip.parse().unwrap()))
+            .collect(),
+    )
+    .await
+}
+
+async fn connect_double(
+    mapping: &[((&str, u16), SocketAddr)],
+) -> crate::test_support::proxy::ProxyServerDouble {
+    crate::test_support::proxy::ProxyServerDouble::start(
+        crate::transport::TransportKind::HttpConnect,
+        None,
+        mapping
+            .iter()
+            .map(|((host, port), to)| ((host.to_string(), *port), *to))
+            .collect(),
+    )
+    .await
+}
+
+fn asked(targets: &Mutex<Vec<(String, u16)>>) -> Vec<(String, u16)> {
+    targets.lock().unwrap().clone()
+}
+
+// Each hop resolves the name dialled through it as its own setting says: the
+// first hop asks its DNS servers through itself for the second hop's
+// endpoint, and the second hop is handed the destination's name.
+#[tokio::test]
+async fn each_hop_of_a_chain_resolves_the_next_with_its_own_setting() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns = dns_double(&[("second.invalid", "10.9.9.9")]).await;
+    let second = connect_double(&[(("news.invalid", 119), origin.local_addr().unwrap())]).await;
+    let first = connect_double(&[
+        ((ROUTED_DNS, 53), dns.addr),
+        (("10.9.9.9", second.addr.port()), second.addr),
+    ])
+    .await;
+    let pipe = named_hop(
+        8,
+        "second.invalid",
+        second.addr.port(),
+        Naming::Proxy,
+        named_hop(
+            7,
+            &first.addr.ip().to_string(),
+            first.addr.port(),
+            Naming::proxy_servers(vec![ROUTED_DNS.parse().unwrap()]),
+            bottom(),
+        ),
+    );
+
+    let dialed = pipe.dial(&named("news.invalid", 119)).await.unwrap();
+    let _accepted = origin.accept().await.unwrap();
+
+    assert_eq!(dialed.path.proxies, vec![7, 8]);
+    assert_eq!(
+        dns.queries.lock().unwrap().first().unwrap(),
+        "second.invalid"
+    );
+    assert!(
+        !dns.queries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| name == "news.invalid")
+    );
+    let through_first = asked(&first.targets);
+    assert!(
+        through_first.contains(&(ROUTED_DNS.into(), 53)),
+        "{through_first:?}"
+    );
+    assert_eq!(
+        through_first.last(),
+        Some(&("10.9.9.9".to_string(), second.addr.port()))
+    );
+    assert!(
+        !through_first
+            .iter()
+            .any(|(host, _)| host.ends_with(".invalid"))
+    );
+    assert_eq!(
+        asked(&second.targets),
+        vec![("news.invalid".to_string(), 119)]
+    );
+}
+
+// A hop in the middle of a chain set to have Weaver resolve still has
+// Weaver resolve: the next hop's endpoint is asked of Weaver's servers from
+// the route's egress, never through the hops beneath, and the hop is asked
+// only for the address.
+#[tokio::test]
+async fn a_mid_chain_hop_resolved_by_weaver_has_weaver_resolve_the_next_hop() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns = dns_double(&[("third.invalid", "10.9.9.9")]).await;
+    let egress = Arc::new(Mapped {
+        to: dns.addr,
+        asked: Mutex::new(Vec::new()),
+    });
+    let third = connect_double(&[(("news.invalid", 119), origin.local_addr().unwrap())]).await;
+    let second = connect_double(&[(("10.9.9.9", third.addr.port()), third.addr)]).await;
+    let first = connect_double(&[(("second.invalid", second.addr.port()), second.addr)]).await;
+    let pipe = named_hop(
+        9,
+        "third.invalid",
+        third.addr.port(),
+        Naming::Proxy,
+        named_hop(
+            8,
+            "second.invalid",
+            second.addr.port(),
+            Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress.clone()),
+            named_hop(
+                7,
+                &first.addr.ip().to_string(),
+                first.addr.port(),
+                Naming::Proxy,
+                bottom(),
+            ),
+        ),
+    );
+
+    let dialed = pipe.dial(&named("news.invalid", 119)).await.unwrap();
+    let _accepted = origin.accept().await.unwrap();
+
+    assert_eq!(dialed.path.proxies, vec![7, 8, 9]);
+    assert_eq!(
+        dns.queries.lock().unwrap().first().unwrap(),
+        "third.invalid"
+    );
+    assert!(!asked(&egress.asked).is_empty());
+    assert!(
+        asked(&egress.asked)
+            .iter()
+            .all(|asked| asked == &(ROUTED_DNS.to_string(), 53))
+    );
+    assert_eq!(
+        asked(&first.targets),
+        vec![("second.invalid".to_string(), second.addr.port())]
+    );
+    assert_eq!(
+        asked(&second.targets),
+        vec![("10.9.9.9".to_string(), third.addr.port())]
+    );
+    assert_eq!(
+        asked(&third.targets),
+        vec![("news.invalid".to_string(), 119)]
+    );
+}
+
+// Weaver asks a hop's servers from the route's egress, so the proxy is
+// asked only for the address they answered.
+#[tokio::test]
+async fn a_hop_resolved_by_weavers_servers_asks_them_from_the_egress() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    let egress = Arc::new(Mapped {
+        to: dns.addr,
+        asked: Mutex::new(Vec::new()),
+    });
+    let proxy = connect_double(&[((PUBLIC, 119), origin.local_addr().unwrap())]).await;
+    let pipe = named_hop(
+        7,
+        &proxy.addr.ip().to_string(),
+        proxy.addr.port(),
+        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress.clone()),
+        bottom(),
+    );
+
+    pipe.dial(&named("news.invalid", 119)).await.unwrap();
+    let _accepted = origin.accept().await.unwrap();
+
+    assert_eq!(dns.queries.lock().unwrap().first().unwrap(), "news.invalid");
+    assert!(
+        asked(&egress.asked)
+            .iter()
+            .all(|asked| asked == &(ROUTED_DNS.to_string(), 53))
+    );
+    assert_eq!(asked(&proxy.targets), vec![(PUBLIC.to_string(), 119)]);
+}
+
+// A recorded dial through a hop resolved by Weaver's servers says those
+// servers answered, what they answered and which address the hop reached,
+// and a name they do not know says so.
+#[tokio::test]
+async fn a_recorded_dial_says_weavers_servers_resolved_the_name() {
+    use crate::resolution::record::{
+        HostResolution, LookupError, LookupFailure, Recording, ResolvedBy,
+    };
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    let egress = Arc::new(Mapped {
+        to: dns.addr,
+        asked: Mutex::new(Vec::new()),
+    });
+    let proxy = connect_double(&[((PUBLIC, 119), origin.local_addr().unwrap())]).await;
+    let pipe = named_hop(
+        7,
+        &proxy.addr.ip().to_string(),
+        proxy.addr.port(),
+        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+        bottom(),
+    );
+
+    let recording = Arc::new(Recording::default());
+    recording
+        .scope(pipe.dial(&named("news.invalid", 119)))
+        .await
+        .unwrap();
+    let _accepted = origin.accept().await.unwrap();
+    assert_eq!(
+        recording.finish("news.invalid", 119, None),
+        Some(HostResolution {
+            host: "news.invalid".into(),
+            by: ResolvedBy::Servers,
+            proxy: None,
+            servers: vec![ROUTED_DNS.parse().unwrap()],
+            addresses: vec![PUBLIC.parse().unwrap()],
+            cached: false,
+            connected: Some(PUBLIC.parse().unwrap()),
+            error: None,
+        })
+    );
+
+    let recording = Arc::new(Recording::default());
+    assert!(
+        recording
+            .scope(pipe.dial(&named("missing.invalid", 119)))
+            .await
+            .is_err()
+    );
+    let resolution = recording.finish("missing.invalid", 119, None).unwrap();
+    assert_eq!(resolution.by, ResolvedBy::Servers);
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(resolution.connected, None);
+    assert_eq!(
+        resolution.error,
+        Some(LookupError {
+            failure: LookupFailure::NoSuchName,
+            detail: format!("{ROUTED_DNS}: NXDOMAIN"),
+        })
+    );
+}
+
+fn lookups(dns: &crate::test_support::dns::DnsServerDouble, name: &str) -> usize {
+    dns.queries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|asked| *asked == name)
+        .count()
+}
+
+// A hop holds what its servers answered for as long as they said, so a
+// second dial within that asks them nothing; an answer for no time at all
+// is asked for again. A day's TTL is held for the hour ceiling, past any
+// run of this test.
+#[tokio::test]
+async fn a_hop_holds_its_servers_answer_for_its_ttl() {
+    for (ttl, held) in [(86_400, true), (0, false)] {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+        dns.ttl.store(ttl, std::sync::atomic::Ordering::Relaxed);
+        let egress = Arc::new(Mapped {
+            to: dns.addr,
+            asked: Mutex::new(Vec::new()),
+        });
+        let proxy = connect_double(&[((PUBLIC, 119), origin.local_addr().unwrap())]).await;
+        let pipe = named_hop(
+            7,
+            &proxy.addr.ip().to_string(),
+            proxy.addr.port(),
+            Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+            bottom(),
+        );
+
+        pipe.dial(&named("news.invalid", 119)).await.unwrap();
+        let _first = origin.accept().await.unwrap();
+        let once = lookups(&dns, "news.invalid");
+        assert!(once > 0);
+        pipe.dial(&named("news.invalid", 119)).await.unwrap();
+        let _second = origin.accept().await.unwrap();
+
+        let expected = if held { once } else { 2 * once };
+        assert_eq!(lookups(&dns, "news.invalid"), expected, "TTL {ttl}");
+        assert_eq!(asked(&proxy.targets).len(), 2);
+    }
+}
+
+// An answer whose address the proxy could not reach is dropped, so the next
+// dial asks the servers again rather than reusing it.
+#[tokio::test]
+async fn a_hop_forgets_an_answer_its_proxy_could_not_reach() {
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    dns.ttl.store(86_400, std::sync::atomic::Ordering::Relaxed);
+    let egress = Arc::new(Mapped {
+        to: dns.addr,
+        asked: Mutex::new(Vec::new()),
+    });
+    // A proxy that reaches nothing.
+    let proxy = connect_double(&[]).await;
+    let pipe = named_hop(
+        7,
+        &proxy.addr.ip().to_string(),
+        proxy.addr.port(),
+        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+        bottom(),
+    );
+
+    let Err(error) = pipe.dial(&named("news.invalid", 119)).await else {
+        panic!("a proxy that reaches nothing connected");
+    };
+    assert!(
+        matches!(&error, DialError::Hop { proxy: 7, source } if crate::transport::is_destination_unreachable(source)),
+        "{error:?}"
+    );
+    let once = lookups(&dns, "news.invalid");
+    assert!(once > 0);
+    assert!(pipe.dial(&named("news.invalid", 119)).await.is_err());
+
+    assert_eq!(lookups(&dns, "news.invalid"), 2 * once);
+}
+
+// A failure shared with callers that waited on the same lookup says what
+// the one that asked was told.
+#[test]
+fn a_shared_dial_failure_keeps_its_kind_and_its_hop() {
+    use crate::resolution::Replicate;
+    let hop = DialError::Hop {
+        proxy: 7,
+        source: TunnelError::Engine("proxy refused".into()),
+    };
+    let DialError::Hop { proxy, source } = hop.replicate() else {
+        panic!("a hop failure changed kind");
+    };
+    assert_eq!(proxy, 7);
+    assert_eq!(
+        source.to_string(),
+        TunnelError::Engine("proxy refused".into()).to_string()
+    );
+    let refused = DialError::Refused(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
+    let DialError::Refused(copy) = refused.replicate() else {
+        panic!("a refusal changed kind");
+    };
+    assert_eq!(copy.kind(), io::ErrorKind::ConnectionRefused);
+    assert_eq!(copy.to_string(), "refused");
+    let unresolved = crate::dns::unresolved().replicate();
+    assert!(matches!(&unresolved, DialError::Destination(_)));
+    assert_eq!(unresolved.to_string(), crate::dns::unresolved().to_string());
+}
+
+// The host's own DNS resolves for a hop set to it, and the proxy is asked
+// only for addresses.
+#[tokio::test]
+async fn a_hop_resolved_by_the_hosts_dns_hands_the_proxy_addresses() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let to = origin.local_addr().unwrap();
+    let proxy = connect_double(&[(("127.0.0.1", 119), to), (("::1", 119), to)]).await;
+    let pipe = named_hop(
+        7,
+        &proxy.addr.ip().to_string(),
+        proxy.addr.port(),
+        Naming::Host,
+        bottom(),
+    );
+
+    pipe.dial(&named("localhost", 119)).await.unwrap();
+    let _accepted = origin.accept().await.unwrap();
+
+    let targets = asked(&proxy.targets);
+    assert!(!targets.is_empty());
+    assert!(
+        targets
+            .iter()
+            .all(|(host, _)| host.parse::<IpAddr>().is_ok()),
+        "{targets:?}"
+    );
+}
+
+// Servers asked through a hop that cannot be reached fail the dial as the
+// path failed, not as a name that does not resolve.
+#[tokio::test]
+async fn servers_asked_through_an_unreachable_hop_fail_as_the_path() {
+    let inner = Arc::new(Failure {
+        fatal: false,
+        calls: Default::default(),
+    });
+    let pipe = named_hop(
+        7,
+        "192.0.2.1",
+        8080,
+        Naming::proxy_servers(vec![ROUTED_DNS.parse().unwrap()]),
+        inner,
+    );
+    let Err(error) = pipe.dial(&named("news.invalid", 119)).await else {
+        panic!("a dial through an unreachable hop succeeded");
+    };
+    assert!(error.is_path_evidence(), "{error:?}");
+    assert!(!matches!(error, DialError::Destination(_)), "{error:?}");
+}
+
+// An egress whose DNS server answers each query only after `delay`: `PUBLIC`
+// for an A query, nothing for any other.
+struct SlowDns {
+    delay: Duration,
+}
+#[async_trait::async_trait]
+impl Dialer for SlowDns {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let delay = self.delay;
+        tokio::spawn(async move {
+            let size = far.read_u16().await.unwrap() as usize;
+            let mut reply = vec![0; size];
+            far.read_exact(&mut reply).await.unwrap();
+            tokio::time::sleep(delay).await;
+            let qtype = u16::from_be_bytes([reply[size - 4], reply[size - 3]]);
+            reply[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+            if qtype == 1 {
+                reply[6..8].copy_from_slice(&1u16.to_be_bytes());
+                reply.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4]);
+                reply.extend_from_slice(&PUBLIC.parse::<std::net::Ipv4Addr>().unwrap().octets());
+            }
+            far.write_u16(reply.len() as u16).await.unwrap();
+            far.write_all(&reply).await.unwrap();
+        });
+        Ok(Dialed {
+            stream: DialedStream::Tunnel(Box::new(near)),
+            outcome: Default::default(),
+            path: DialPath::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "slow dns".into()
+    }
+}
+
+// A stage whose proxy answers the request for the next hop only after
+// `delay`.
+struct Late {
+    delay: Duration,
+}
+#[async_trait::async_trait]
+impl Dialer for Late {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let delay = self.delay;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            far.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            // The far end stays open for the stream the hop hands back.
+            std::future::pending::<()>().await;
+        });
+        Ok(Dialed {
+            stream: DialedStream::Tunnel(Box::new(near)),
+            outcome: Default::default(),
+            path: DialPath::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "late".into()
+    }
+}
+
+// A lookup has a window of its own: one that takes 8 s of a hop's 30 still
+// leaves the proxy the whole 30 s to answer, and the hop's budget counts
+// both windows. A hop that hands the name on has no lookup to wait for.
+#[tokio::test(start_paused = true)]
+async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
+    let resolving = named_hop(
+        7,
+        "192.0.2.1",
+        8080,
+        Naming::servers(
+            vec![ROUTED_DNS.parse().unwrap()],
+            Arc::new(SlowDns {
+                delay: Duration::from_secs(4),
+            }),
+        ),
+        Arc::new(Late {
+            delay: Duration::from_secs(25),
+        }),
+    );
+
+    let dialed = resolving.dial(&named("news.invalid", 119)).await;
+
+    assert!(dialed.is_ok(), "{:?}", dialed.err());
+    assert_eq!(resolving.budget(), Duration::from_secs(61));
+    let handing_on = named_hop(
+        8,
+        "192.0.2.1",
+        8080,
+        Naming::Proxy,
+        Arc::new(Late {
+            delay: Duration::ZERO,
+        }),
+    );
+    assert_eq!(handing_on.budget(), Duration::from_secs(31));
 }

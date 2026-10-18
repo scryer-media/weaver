@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The Windows desktop wrapper: a notification-area icon and a WebView2 window.
 //
 // The tray window itself is invisible and exists only to own the shell icon,
@@ -8,7 +11,7 @@
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,6 +48,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     SRCCOPY, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Recovery::{
+    RESTART_NO_CRASH, RESTART_NO_HANG, RegisterApplicationRestart,
+};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
 };
@@ -70,9 +76,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP,
-    WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 // The window class and message ids are shared with weaver.exe, which posts
@@ -82,10 +88,15 @@ use super::tray_ipc::{
     WEBVIEW_FAILED_MESSAGE,
 };
 
-use super::shared::{
-    self, DEFAULT_PORT, PopoverContent, QueueRow, SMOKE_SUCCESS_LINE, SMOKE_TIMEOUT,
-    ServerSupervisor,
+use application_updater::windows_process::{
+    StopPolicy, find_product_processes, stop_product_processes,
 };
+
+use super::shared::{
+    self, DEFAULT_PORT, PopoverContent, QueueRow, SERVER_EXECUTABLE, SMOKE_SUCCESS_LINE,
+    SMOKE_TIMEOUT, ServerSupervisor, WRAPPER_EXECUTABLE,
+};
+use super::windows_process;
 use crate::windows_startup::{register_startup, startup_enabled, unregister_startup};
 
 const MUTEX_NAMESPACE: &str = "Global\\ScryerMedia.Weaver.Desktop.v1.Tray.";
@@ -102,6 +113,38 @@ const FLYOUT_WINDOW_CLASS: &str = "ScryerMedia.Weaver.Desktop.v1.Flyout";
 // How long the tray waits for a server that asked to be restarted to
 // actually exit before it stops waiting and kills the child.
 const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+// `--shutdown` runs before the installer checks for files in use, and the
+// upgrade helper runs it before the installer; both wait on it, so it finishes
+// on its own clock whatever it finds: at most `SHUTDOWN_TRAY_EXIT_WAIT` for
+// the running tray, then `SHUTDOWN_STOP_POLICY`'s budget for whatever is left,
+// nineteen seconds in all.
+//
+// The running tray's own exit stops its server graceful-first within
+// `shared::GRACEFUL_STOP_TIMEOUT`, then an adopted one within
+// `EXIT_STOP_POLICY`'s budget, which this wait covers with time to spare.
+const SHUTDOWN_TRAY_EXIT_WAIT: Duration = Duration::from_secs(13);
+// Ask whatever is still running from the installation to exit, poll eight
+// times half a second apart, then terminate it and give that two seconds.
+const SHUTDOWN_STOP_POLICY: StopPolicy = StopPolicy {
+    ask_attempts: 8,
+    ask_interval: Duration::from_millis(500),
+    terminate_wait: Duration::from_secs(2),
+};
+
+// How a tray that is exiting stops the server it adopted rather than started.
+// Short, because it follows the owned server's graceful stop and
+// `--shutdown` may be waiting on this tray while it runs.
+const EXIT_STOP_POLICY: StopPolicy = StopPolicy {
+    ask_attempts: 4,
+    ask_interval: Duration::from_millis(500),
+    terminate_wait: Duration::from_secs(1),
+};
+
+// The argument Windows restarts the tray with after it closed it for an
+// installer or a restart: the sign-in start, which brings the server back
+// without opening a window over whatever the user is doing.
+const RESTART_ARGUMENT: &str = "--login-start";
 
 // The app window's default size, and the smallest window WebView2 is asked to
 // lay the UI out in. These are logical (96-DPI) pixels; `create_app_window`
@@ -181,6 +224,7 @@ enum LaunchMode {
     Interactive,
     Login,
     Shutdown,
+    RegisterStartup,
     UnregisterStartup,
     UninstallCleanup,
     WebviewSmoke,
@@ -188,6 +232,11 @@ enum LaunchMode {
 
 pub(super) fn run() -> Result<(), String> {
     match launch_mode()? {
+        LaunchMode::RegisterStartup => {
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("failed to resolve weaver-tray.exe path: {error}"))?;
+            return register_startup(&executable);
+        }
         LaunchMode::UnregisterStartup => return unregister_startup(),
         LaunchMode::Shutdown => return shutdown_existing_instance(),
         LaunchMode::UninstallCleanup => {
@@ -256,6 +305,8 @@ pub(super) fn run() -> Result<(), String> {
         ));
     }
 
+    register_for_restart();
+
     let mode = launch_mode()?;
     let state = Box::new(TrayState::new(
         supervisor,
@@ -311,6 +362,7 @@ fn launch_mode() -> Result<LaunchMode, String> {
         None => Ok(LaunchMode::Interactive),
         Some(value) if value == "--login-start" => Ok(LaunchMode::Login),
         Some(value) if value == "--shutdown" => Ok(LaunchMode::Shutdown),
+        Some(value) if value == "--register-startup" => Ok(LaunchMode::RegisterStartup),
         Some(value) if value == "--unregister-startup" => Ok(LaunchMode::UnregisterStartup),
         Some(value) if value == "--uninstall-cleanup" => Ok(LaunchMode::UninstallCleanup),
         Some(value) if value == "--webview-smoke" => Ok(LaunchMode::WebviewSmoke),
@@ -322,6 +374,22 @@ fn launch_mode() -> Result<LaunchMode, String> {
             "unrecognized weaver-tray argument: {}",
             value.to_string_lossy()
         )),
+    }
+}
+
+// Ask Windows to start the tray again when it closes it for an installer
+// (Restart Manager) or for an update restart, as every well-behaved desktop
+// app does. Crashes and hangs are left out: a tray that keeps failing must not
+// be brought back in a loop. A refusal costs only that convenience.
+fn register_for_restart() {
+    let argument = wide(RESTART_ARGUMENT);
+    // SAFETY: `argument` is a nul-terminated UTF-16 string that outlives the
+    // call, which copies it.
+    let result = unsafe {
+        RegisterApplicationRestart(argument.as_ptr(), RESTART_NO_CRASH | RESTART_NO_HANG)
+    };
+    if result < 0 {
+        eprintln!("Weaver: failed to register the tray for restart (HRESULT 0x{result:08X})");
     }
 }
 
@@ -427,23 +495,76 @@ fn signal_existing_instance(message: u32) -> Result<(), String> {
     Err("another Weaver tray instance is starting but did not create its window".to_string())
 }
 
+// `--shutdown`: stop every Weaver process running from this installation.
+//
+// The installer runs this before it checks for files in use, and the upgrade
+// helper runs it before the installer, so the job is to leave nothing behind
+// that holds the installed binaries — not merely to close this user's tray. A
+// server the tray adopted instead of starting, one orphaned by a tray that
+// was ended from Task Manager, another user's tray: each would otherwise keep
+// a file open, and msiexec would answer with a files-in-use prompt that a
+// passive install never shows.
+//
+// The running tray is asked first, because it stops its own server
+// gracefully. Whatever is still running from the install directory after
+// that — this process aside — is asked to exit, then terminated once
+// `SHUTDOWN_STOP_POLICY` runs out. A process this command may not open, such
+// as another user's seen from an unelevated run, is not found at all; the
+// installer runs this elevated, where nothing is out of reach. It succeeds
+// when nothing it found is left running.
 fn shutdown_existing_instance() -> Result<(), String> {
+    let started = Instant::now();
+    // Held until the sweep is done, so a tray launched meanwhile finds an
+    // owner and does not start a server under the stop.
     let instance = InstanceGuard::acquire()?;
-    if instance.is_primary() {
-        return Ok(());
+    if !instance.is_primary() {
+        match signal_existing_instance(SHUTDOWN_MESSAGE) {
+            Ok(()) => wait_for_tray_window_to_close(started + SHUTDOWN_TRAY_EXIT_WAIT),
+            // A tray that holds the mutex but has no window is stuck; the
+            // sweep below ends it.
+            Err(error) => eprintln!("Weaver: {error}"),
+        }
     }
-    signal_existing_instance(SHUTDOWN_MESSAGE)?;
 
+    let install_dir = installation_dir()?;
+    let report = stop_product_processes(
+        &[SERVER_EXECUTABLE, WRAPPER_EXECUTABLE],
+        &install_dir,
+        &[],
+        SHUTDOWN_STOP_POLICY,
+    );
+    drop(instance);
+
+    if report.all_stopped() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Weaver processes {:?} in {} are still running after being asked to stop and terminated",
+            report.remaining,
+            install_dir.display()
+        ))
+    }
+}
+
+// The directory this tray, and the server beside it, are installed in.
+fn installation_dir() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|error| format!("failed to resolve weaver-tray.exe path: {error}"))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "weaver-tray.exe has no parent directory".to_string())
+}
+
+// Wait for this session's tray window to go away, or for `deadline`.
+fn wait_for_tray_window_to_close(deadline: Instant) {
     let class_name = wide(CLASS_NAME);
-    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         // SAFETY: The class name is a valid nul-terminated UTF-16 string.
         if unsafe { FindWindowW(class_name.as_ptr(), ptr::null()) }.is_null() {
-            return Ok(());
+            return;
         }
         thread::sleep(Duration::from_millis(100));
     }
-    Err("timed out waiting for the existing Weaver tray to stop".to_string())
 }
 
 // How often, and how far apart, an uninstall tries to remove the profile.
@@ -1104,6 +1225,40 @@ impl TrayState {
         // SAFETY: The icon belongs to this window and is being removed during teardown.
         unsafe { self.remove_icon(window) };
         let _ = self.supervisor.stop();
+        self.stop_adopted_server();
+        self.supervisor.shutdown_logging();
+    }
+
+    // Stop the installed server answering on the tray's port when the tray
+    // did not start it.
+    //
+    // The tray adopts whatever Weaver already answers on its port, and the
+    // user cannot tell an adopted server from an owned one: both are "Weaver"
+    // in the same window. Exiting the tray has to stop both, or a server left
+    // behind by an earlier tray — one ended from Task Manager during a frozen
+    // upgrade, typically — outlives every exit and holds the installed binary
+    // open through the next upgrade. Only this installation's `weaver.exe` is
+    // touched; anything else listening on the port is someone else's.
+    fn stop_adopted_server(&self) {
+        let Some(owner) = windows_process::listening_port_owner(self.supervisor.port()) else {
+            return;
+        };
+        let Ok(install_dir) = installation_dir() else {
+            return;
+        };
+        // The shared stop takes everything that matches but what it is told to
+        // leave alone, so every other installed server is left alone; when the
+        // port's owner is not among the installed servers, there is nothing to
+        // stop.
+        let names = [SERVER_EXECUTABLE];
+        let others: Vec<u32> = find_product_processes(&names, &install_dir, &[])
+            .into_iter()
+            .filter(|&process_id| process_id != owner)
+            .collect();
+        let report = stop_product_processes(&names, &install_dir, &others, EXIT_STOP_POLICY);
+        if !report.all_stopped() {
+            eprintln!("Weaver: could not stop the server the tray adopted (pid {owner})");
+        }
     }
 }
 
@@ -1121,6 +1276,22 @@ unsafe extern "system" fn window_proc(
         // exist while this one is live.
         let state = unsafe { &mut *state };
         let result = match message {
+            // The session is ending, or Restart Manager is closing the tray
+            // for an installer (`ENDSESSION_CLOSEAPP` in `lparam`). Either
+            // way the tray agrees: it has nothing unsaved, and refusing would
+            // only turn into a files-in-use prompt or a blocked sign-out.
+            WM_QUERYENDSESSION => return 1,
+            // Answered by actually exiting, server included: once this
+            // returns the process may be ended at any moment, and a server
+            // left running would hold the installed binaries open. The
+            // restart registration brings the tray back afterwards.
+            WM_ENDSESSION => {
+                if wparam != 0 {
+                    // SAFETY: This is the live window associated with the tray state.
+                    unsafe { DestroyWindow(window) };
+                }
+                return 0;
+            }
             TRAY_CALLBACK_MESSAGE => tray_callback(state, window, wparam, lparam),
             OPEN_WINDOW_MESSAGE => state.open_weaver(window),
             RESTART_MESSAGE => state.restart_requested_by_server(),

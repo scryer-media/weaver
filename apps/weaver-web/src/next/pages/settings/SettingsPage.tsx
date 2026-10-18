@@ -1,14 +1,17 @@
-import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { memo, useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useNavigate, useParams } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
 import { PasswordManagersKeptOut } from "@/lib/password-manager";
 import { NextShell } from "../../shell/NextShell";
 import { PanelListBlock } from "../../shell/rail-blocks";
-import { useNextData } from "../../data/next-data";
+import { useNextDataSelector } from "../../data/next-data";
 import { BetaTag, EmptyState } from "../../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
 import { SettingsPanelScope, SettingsShellProvider, type PanelFlags } from "./framework";
-import { findPanel, panelSearchTitle, SETTINGS_PANELS, settingsRail } from "./panels";
+import { findPanel, panelSearchTitle, SETTINGS_PANELS, settingsRail, type PanelDefinition } from "./panels";
 import { SearchRegistry, searchOutcome } from "./search";
 
 const PANEL_SLUGS = SETTINGS_PANELS.map((entry) => entry.slug);
@@ -38,7 +41,7 @@ function SearchOutcomeState({ search, registry }: { search: string; registry: Se
  * One panel is mounted at a time; the top bar's Search, Revert and Save and
  * the status bar's dirty line belong to the shell, and the panel publishes
  * what they act on through `usePanelState`. Panels that write immediately —
- * the list-shaped ones — simply never publish, and the two buttons stay in
+ * the list-shaped ones and General — simply never publish, and the two buttons stay in
  * their resting state, which is exactly what the handoff draws.
  *
  * The search box searches every panel, not only the open one: while it holds
@@ -48,14 +51,54 @@ function SearchOutcomeState({ search, registry }: { search: string; registry: Se
 
 const CLEAN: PanelFlags = { dirty: false, busy: false, status: null, failed: false };
 
+/**
+ * One panel's page, apart from the shell's own state: a keystroke in the
+ * search box or a panel reporting itself dirty draws the shell again, not the
+ * page. What a panel reads from the shell reaches it through context.
+ */
+const PanelPage = memo(function PanelPage({ entry }: { entry: PanelDefinition }) {
+  // The grouped screens, Networking and Scripts, hold credentials for other
+  // things and never the Weaver login.
+  return (
+    <PasswordManagersKeptOut value={entry.group !== undefined}>
+      <entry.Component />
+    </PasswordManagersKeptOut>
+  );
+});
+
+/**
+ * One panel's place in the settings area. The shell drawing itself again for
+ * its own state, or for the top bar's slot arriving, does not draw this again.
+ */
+const PanelSlot = memo(function PanelSlot({
+  entry,
+  active,
+  title,
+}: {
+  entry: PanelDefinition;
+  active: boolean;
+  title: string;
+}) {
+  const navigate = useNavigate();
+  return (
+    <SettingsPanelScope
+      slug={entry.slug}
+      active={active}
+      title={title}
+      onOpen={() => navigate(`/settings/${entry.slug}`)}
+    >
+      <PanelPage entry={entry} />
+    </SettingsPanelScope>
+  );
+});
+
 export function SettingsPage() {
   const t = useTranslate();
   const { panel: root, "*": nested } = useParams();
   const slug = nested ? `${root}/${nested}` : root;
   const panel = findPanel(slug);
-  const { providers } = useNextData();
+  const serverCount = useNextDataSelector((data) => data.providers.length);
 
-  const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [registry] = useState(() => new SearchRegistry());
   const [flags, setFlagsState] = useState<PanelFlags>(CLEAN);
@@ -75,7 +118,7 @@ export function SettingsPage() {
     );
   }, []);
 
-  const railItems = useMemo(() => settingsRail(t, providers.length), [providers.length, t]);
+  const railItems = useMemo(() => settingsRail(t, serverCount), [serverCount, t]);
 
   const statusRight =
     flags.status ?? (flags.dirty ? t("next.settings.unsaved") : t("next.settings.allSaved"));
@@ -154,21 +197,12 @@ export function SettingsPage() {
             same instance with or without a query and keeps its unsaved edits.
           */}
           {mounted.map((entry) => (
-            <SettingsPanelScope
+            <PanelSlot
               key={entry.slug}
-              slug={entry.slug}
+              entry={entry}
               active={entry.slug === panel?.slug}
               title={panelSearchTitle(t, entry)}
-              onOpen={() => navigate(`/settings/${entry.slug}`)}
-            >
-              {/*
-                The grouped screens, Networking and Scripts, hold credentials
-                for other things and never the Weaver login.
-              */}
-              <PasswordManagersKeptOut value={entry.group !== undefined}>
-                <entry.Component />
-              </PasswordManagersKeptOut>
-            </SettingsPanelScope>
+            />
           ))}
           {searching ? <SearchOutcomeState search={search.trim()} registry={registry} /> : null}
           {!searching && !panel ? (

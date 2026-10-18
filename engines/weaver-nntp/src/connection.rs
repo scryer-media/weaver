@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -10,7 +13,6 @@ use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use weaver_yenc::CheckpointPlan;
 
-use crate::address_plan::AddressRoute;
 use crate::codec::{NntpCodec, NntpFrame, StreamChunk};
 use crate::commands::Command;
 use crate::error::{NntpError, Result};
@@ -250,7 +252,8 @@ pub enum PipeliningCapability {
 // Configuration for connecting to a single NNTP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    pub dialer: Option<Arc<crate::route_dialer::RouteDialer>>,
+    // The route every connection to this server dials through.
+    pub dialer: Arc<crate::route_dialer::RouteDialer>,
     // Hostname or IP address.
     pub host: String,
     // Port number.
@@ -287,10 +290,21 @@ pub struct ServerConfig {
     pub tls_cipher_preference: crate::tls::TlsCipherPreference,
 }
 
+// Tests build their configs from this. A product build has no default: a
+// config always carries the route it dials through.
+#[cfg(any(test, feature = "test-support"))]
 impl Default for ServerConfig {
     fn default() -> Self {
+        Self::new(crate::route_dialer::RouteDialer::direct_for_tests())
+    }
+}
+
+impl ServerConfig {
+    // A config that dials through `dialer`, with every other setting at its
+    // default.
+    pub fn new(dialer: Arc<crate::route_dialer::RouteDialer>) -> Self {
         ServerConfig {
-            dialer: None,
+            dialer,
             host: String::new(),
             port: 563,
             tls: true,
@@ -388,27 +402,21 @@ impl NntpConnection {
 
     // Connect to an NNTP server, perform TLS negotiation and authentication.
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
-        Self::connect_for_group(config, None, None).await
+        Self::connect_for_group(config, None).await
     }
 
     // Connect and, on servers known to pipeline, select `initial_group` in
     // the same write as the session setup so a BODY lane starts with no
     // extra round trip. An unselectable group is not an error here: the
-    // lane walks its candidate list afterwards. A direct connection dials
-    // the address `route`'s plan picks, or the first resolved address that
-    // answers when there is no route.
+    // lane walks its candidate list afterwards.
     pub(crate) async fn connect_for_group(
         config: &ServerConfig,
-        route: Option<&AddressRoute>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
-        let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT)
-            + config
-                .dialer
-                .as_ref()
-                .map_or(Duration::ZERO, |d| d.inner.budget());
+        let connect_timeout =
+            config.connect_timeout.max(MIN_TIMEOUT) + config.dialer.inner.budget();
         let result = tokio::time::timeout(connect_timeout, async {
-            Self::connect_inner(config, route, initial_group).await
+            Self::connect_inner(config, initial_group).await
         })
         .await;
 
@@ -418,74 +426,41 @@ impl NntpConnection {
         }
     }
 
-    async fn connect_inner(
-        config: &ServerConfig,
-        route: Option<&AddressRoute>,
-        initial_group: Option<&str>,
-    ) -> Result<Self> {
+    async fn connect_inner(config: &ServerConfig, initial_group: Option<&str>) -> Result<Self> {
         debug!(host = %config.host, port = config.port, tls = config.tls, "connecting to NNTP server");
 
-        let mut route_outcome = None;
-        let mut route_path = None;
-        let mut pipe_setup = None;
-        let mut setup = None;
         // Register direct sockets before TLS so revocation also interrupts handshakes.
-        let transport = if let Some(dialer) = &config.dialer {
-            let dialed = dialer.dial(config).await?;
-            let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
-            route_path = Some(dialed.path);
-            route_outcome = Some(dialed.outcome);
-            pipe_setup = dialed.setup;
-            let plain = NntpTransport::Plain {
-                inner: dialed.stream.into(),
-                remote_addr,
-            };
-            if config.tls {
-                crate::tls::upgrade_starttls(
-                    plain,
-                    &config.host,
-                    config.tls_ca_cert.as_deref(),
-                    config.tls_name_mismatch_certificate_der.as_deref(),
-                    config.tls_cipher_preference,
-                )
-                .await?
-            } else {
-                plain
-            }
+        let dialed = config.dialer.dial(config).await?;
+        let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
+        let route_path = Some(dialed.path);
+        let route_outcome = Some(dialed.outcome);
+        let mut pipe_setup = dialed.setup;
+        let plain = NntpTransport::Plain {
+            inner: dialed.stream.into(),
+            remote_addr,
+        };
+        let transport = if config.tls {
+            crate::tls::upgrade_starttls(
+                plain,
+                &config.host,
+                config.tls_ca_cert.as_deref(),
+                config.tls_name_mismatch_certificate_der.as_deref(),
+                config.tls_cipher_preference,
+            )
+            .await?
         } else {
-            let (tcp, remote_addr) =
-                crate::tls::dial_direct(&config.host, config.port, route, config.connect_timeout)
-                    .await?;
-            setup = route
-                .zip(remote_addr)
-                .map(|(route, addr)| route.watch_setup(addr));
-            if config.tls {
-                crate::tls::connect_tls_over(
-                    tcp,
-                    remote_addr,
-                    &config.host,
-                    config.tls_ca_cert.as_deref(),
-                    config.tls_name_mismatch_certificate_der.as_deref(),
-                    config.tls_cipher_preference,
-                )
-                .await?
-            } else {
-                NntpTransport::Plain {
-                    inner: tcp.into(),
-                    remote_addr,
-                }
-            }
+            plain
         };
 
         let now = Instant::now();
         let remote_addr = transport.remote_addr();
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
         let mut conn = NntpConnection {
-            egress_control: route_path.as_ref().and_then(|path| {
-                config.dialer.as_ref().map(|d| {
-                    d.egress_controls
-                        .control(crate::transfer::StableServerId(path.egress))
-                })
+            egress_control: route_path.as_ref().map(|path| {
+                config
+                    .dialer
+                    .egress_controls
+                    .control(crate::transfer::StableServerId(path.egress))
             }),
             route_path,
             route_outcome,
@@ -531,12 +506,6 @@ impl NntpConnection {
             setup.complete(true);
         }
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received greeting");
-        let upgrades = config.starttls && !conn.transport.as_ref().unwrap().is_tls();
-        if (!upgrades || !matches!(greeting.code.raw(), 200 | 201))
-            && let Some(setup) = setup.take()
-        {
-            setup.reached_server();
-        }
 
         match greeting.code.raw() {
             200 | 201 => {} // posting allowed / no posting — both fine for readers
@@ -548,9 +517,6 @@ impl NntpConnection {
         // 3. STARTTLS upgrade if configured and transport is plain
         if config.starttls && !conn.transport.as_ref().unwrap().is_tls() {
             conn.do_starttls().await?;
-            if let Some(setup) = setup.take() {
-                setup.reached_server();
-            }
         }
 
         // 4-5. Session setup: authentication and nothing else, unless this

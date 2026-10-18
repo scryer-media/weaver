@@ -1,6 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 use super::*;
-use crate::pipeline::extraction::{BudgetedReader, MemoryPermit, RarExtractionOpenRequest};
+use crate::pipeline::extraction::{
+    BudgetedReader, MemoryPermit, MemoryWaitError, RarExtractionOpenRequest,
+};
 use crate::runtime::hardware_profile::ChaseWidening;
 use std::collections::HashSet;
 use std::io::Write;
@@ -9,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 mod password_candidates;
+pub(in crate::pipeline) mod positional;
 use password_candidates::extract_7z_with_password_candidates;
 pub(in crate::pipeline) mod sequential;
 
@@ -37,12 +43,14 @@ impl<R: std::io::Read + std::io::Seek> std::io::Read for FilesystemXzDecoder<R> 
 
 // Bytes an extracted member buffers before touching the filesystem.
 //
-// Archive entry readers hand back whatever their decoder produces, and some
-// of them produce very little: a 7z AES entry yields one cipher block group —
-// 512 bytes — per read, and `std::io::copy` turns each of those into its own
-// write. A 158 MB member is then three hundred thousand write calls into the
-// filesystem. A quarter of a megabyte of buffer removes essentially all of
-// them, and costs one allocation per member.
+// Archive entry readers hand back whatever their decoder produces. The 7z
+// reader delivers 64 KiB pieces on the Copy, AES, BCJ, Delta and LZMA paths,
+// a mix of 64 KiB and sub-4 KiB pieces on single-threaded LZMA2, and 1 MiB
+// pieces on parallel LZMA2. Gathering the 64 KiB and smaller pieces into a
+// quarter-megabyte buffer costs one copy but a quarter of the write calls,
+// which measured cheaper than writing each piece as it comes. A piece at
+// least as large as the buffer bypasses it, so the 1 MiB pieces already go
+// straight to the file. It costs one allocation per member.
 const EXTRACT_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
 // Wrap an extraction output so a decoder's small reads do not become small
@@ -53,6 +61,14 @@ fn buffered_extraction_output<W: Write>(writer: W) -> std::io::BufWriter<W> {
     std::io::BufWriter::with_capacity(EXTRACT_WRITE_BUFFER_BYTES, writer)
 }
 
+// The signature header of one candidate part, when its CRC holds.
+//
+// This CRC is not a second check of what the reader verifies on open. It runs
+// before any reader exists, once per candidate file, and decides which file
+// is part one among duplicates and reposts and which UU padding geometry is
+// real. The reader cannot stand in for it: a start header whose CRC fails is
+// not refused on open, the reader goes looking for the end header instead.
+// It reads 20 bytes per candidate.
 fn read_sevenz_start_header(path: &std::path::Path) -> Option<[u8; 32]> {
     use std::io::Read;
     let mut head = [0u8; 32];
@@ -67,13 +83,21 @@ fn read_sevenz_start_header(path: &std::path::Path) -> Option<[u8; 32]> {
 
 // Resolve completed split candidates on the extraction worker. Inputs remain
 // untouched until the selected archive has passed entry length and CRC checks.
-fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, String> {
+//
+// A part one with no CRC-valid start header, and a part with no candidate of
+// the size the container needs, are recoverable: the bytes are wrong or cut
+// short on the wire, and verification and repair can still bring them right.
+// Every other refusal is about which files make up the set, which no repair
+// of their bytes changes.
+fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, ExtractionError> {
     use std::io::Read;
     let mut groups = std::collections::BTreeMap::<u32, Vec<&PathBuf>>::new();
     for (index, path) in parts {
         groups.entry(*index).or_default().push(path);
     }
-    let first = groups.get(&0).ok_or("missing 7z part 1")?;
+    let first = groups
+        .get(&0)
+        .ok_or_else(|| ExtractionError::terminal("missing 7z part 1"))?;
     let mut valid_heads = Vec::new();
     for path in first {
         if let Some(head) = read_sevenz_start_header(path) {
@@ -89,20 +113,24 @@ fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, 
     {
         // A valid start in a later position contradicts the part ordering;
         // it is not evidence of corrupt member bytes to refetch or repair.
-        return Err("7z start header belongs to a different part index".into());
+        return Err(ExtractionError::terminal(
+            "7z start header belongs to a different part index",
+        ));
     }
     let (_, header) = valid_heads
         .first()
-        .ok_or("7z part 1 has no CRC-valid start header")?;
+        .ok_or_else(|| ExtractionError::recoverable("7z part 1 has no CRC-valid start header"))?;
     if valid_heads.iter().any(|(_, other)| other != header) {
-        return Err("ambiguous duplicate 7z start headers".into());
+        return Err(ExtractionError::terminal(
+            "ambiguous duplicate 7z start headers",
+        ));
     }
     let offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
     let size = u64::from_le_bytes(header[20..28].try_into().unwrap());
     let total = 32u64
         .checked_add(offset)
         .and_then(|n| n.checked_add(size))
-        .ok_or("7z container length overflow")?;
+        .ok_or_else(|| ExtractionError::terminal("7z container length overflow"))?;
     let chunk = valid_heads
         .iter()
         .filter_map(|(path, _)| std::fs::metadata(path).ok())
@@ -110,10 +138,12 @@ fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, 
         .filter(|length| *length >= 32 && (*length <= total || groups.len() == 1))
         .map(|length| length.min(total))
         .max()
-        .ok_or("7z part 1 has an invalid length")?;
+        .ok_or_else(|| ExtractionError::terminal("7z part 1 has an invalid length"))?;
     let count = total.div_ceil(chunk);
     if groups.len() as u64 != count || !groups.keys().copied().map(u64::from).eq(0..count) {
-        return Err("missing 7z part or part index past the container end".into());
+        return Err(ExtractionError::terminal(
+            "missing 7z part or part index past the container end",
+        ));
     }
     let mut selected = Vec::new();
     for (index, paths) in groups {
@@ -143,23 +173,29 @@ fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, 
             })
             .collect();
         let chosen = candidates.first().ok_or_else(|| {
-            format!(
+            ExtractionError::recoverable(format!(
                 "7z part {} has no candidate of the required size {expected}",
                 index + 1
-            )
+            ))
         })?;
         for other in candidates.iter().skip(1) {
-            let mut left = std::fs::File::open(chosen).map_err(|e| e.to_string())?;
-            let mut right = std::fs::File::open(other).map_err(|e| e.to_string())?;
+            let mut left = std::fs::File::open(chosen).map_err(|e| ExtractionError::io(&e))?;
+            let mut right = std::fs::File::open(other).map_err(|e| ExtractionError::io(&e))?;
             let mut a = vec![0u8; 64 * 1024];
             let mut b = vec![0u8; a.len()];
             let mut remaining = expected;
             while remaining != 0 {
                 let n = remaining.min(a.len() as u64) as usize;
-                left.read_exact(&mut a[..n]).map_err(|e| e.to_string())?;
-                right.read_exact(&mut b[..n]).map_err(|e| e.to_string())?;
+                left.read_exact(&mut a[..n])
+                    .map_err(|e| ExtractionError::io(&e))?;
+                right
+                    .read_exact(&mut b[..n])
+                    .map_err(|e| ExtractionError::io(&e))?;
                 if a[..n] != b[..n] {
-                    return Err(format!("ambiguous duplicate 7z part {}", index + 1));
+                    return Err(ExtractionError::terminal(format!(
+                        "ambiguous duplicate 7z part {}",
+                        index + 1
+                    )));
                 }
                 remaining -= n as u64;
             }
@@ -192,7 +228,7 @@ impl SevenZipParts {
 fn resolve_sevenz_parts(
     parts: &[(u32, PathBuf)],
     uu_paths: &HashSet<PathBuf>,
-) -> Result<SevenZipParts, String> {
+) -> Result<SevenZipParts, ExtractionError> {
     use std::io::{Read, Seek, SeekFrom};
 
     let original_error = match verified_sevenz_part_paths(parts) {
@@ -229,7 +265,7 @@ fn resolve_sevenz_parts(
         .map(|(_, path)| {
             std::fs::metadata(path)
                 .map(|meta| meta.len())
-                .map_err(|error| error.to_string())
+                .map_err(|error| ExtractionError::io(&error))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut selected = None;
@@ -268,10 +304,12 @@ fn resolve_sevenz_parts(
             paths: parts.iter().map(|(_, path)| path.clone()).collect(),
             lengths: Some(lengths),
         };
-        let mut reader = candidate.open().map_err(|error| error.to_string())?;
+        let mut reader = candidate
+            .open()
+            .map_err(|error| ExtractionError::io(&error))?;
         reader
             .seek(SeekFrom::Start(start))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ExtractionError::io(&error))?;
         let mut remaining = size;
         let mut buffer = [0; 64 * 1024];
         let mut crc = weaver_yenc::crc::Crc32::new();
@@ -279,7 +317,7 @@ fn resolve_sevenz_parts(
             let count = remaining.min(buffer.len() as u64) as usize;
             reader
                 .read_exact(&mut buffer[..count])
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| ExtractionError::io(&error))?;
             crc.update(&buffer[..count]);
             remaining -= count as u64;
         }
@@ -287,20 +325,31 @@ fn resolve_sevenz_parts(
             continue;
         }
         if selected.is_some() {
-            return Err("ambiguous UU 7z part padding".into());
+            return Err(ExtractionError::terminal("ambiguous UU 7z part padding"));
         }
         selected = Some(candidate);
     }
     selected.ok_or(original_error)
 }
 
-// The sink a 7z member is written on through: it counts and checksums what
-// the decoder hands over, and refuses a byte past the declared size before
-// it reaches the file.
+// The sink a 7z member is written on through: it counts what the decoder
+// hands over, and refuses a byte past the declared size before it reaches the
+// file.
+//
+// It computes no CRC of its own. The reader's checksum verification is on
+// (`decode_7z_streaming` sets it), and with it on the reader compares every
+// member that records a CRC against it on every coder path: on the delivering
+// thread through its verifying reader for Copy, AES, filter, LZMA and
+// single-threaded LZMA2 chains; folded from the workers' per-segment
+// checksums for a parallel LZMA2 block; on the folder worker for the
+// parallel folders of a non-solid archive. A mismatch is the reader's
+// `ChecksumMismatch` block error, and a member that matches is reported
+// through the sub-stream completion hook, which `MemberCommits` uses as the
+// commit signal. The value this sink used to compute fed nothing but that one
+// comparison.
 struct VerifiedMemberSink<'a, W> {
     entry: &'a sevenz_turbo::ArchiveEntry,
     writer: &'a mut W,
-    crc: weaver_yenc::crc::Crc32,
     copied: u64,
 }
 
@@ -322,7 +371,6 @@ impl<W: Write> Write for VerifiedMemberSink<'_, W> {
                 ),
             ));
         }
-        self.crc.update(buffer);
         self.writer.write_all(buffer)?;
         self.copied = copied;
         Ok(buffer.len())
@@ -333,8 +381,9 @@ impl<W: Write> Write for VerifiedMemberSink<'_, W> {
     }
 }
 
-// A decoder can reach EOF before its checksum reader reaches the declared
-// length. Verify both facts before committing the member or its counters.
+// A decoder can reach EOF before the declared length. Check that before the
+// member is handed to `MemberCommits`, which commits it once the reader has
+// also matched its CRC.
 //
 // The entry writes itself on from the decoder's own output, so the bytes are
 // handed over in the pieces the decoder made them in rather than read into a
@@ -347,16 +396,10 @@ fn copy_verified_7z_member(
     let mut sink = VerifiedMemberSink {
         entry,
         writer,
-        crc: weaver_yenc::crc::Crc32::new(),
         copied: 0,
     };
     reader.write_rest(&mut sink)?;
-    let VerifiedMemberSink {
-        crc,
-        copied,
-        writer,
-        ..
-    } = sink;
+    let VerifiedMemberSink { copied, writer, .. } = sink;
     if copied != entry.size() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -367,15 +410,151 @@ fn copy_verified_7z_member(
             ),
         ));
     }
-    if entry.has_crc && u64::from(crc.finalize()) != entry.crc {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("7z member {} CRC mismatch", entry.name()),
-        ));
-    }
     writer.flush()?;
     Ok(copied)
 }
+
+// A member whose bytes are all on disk, waiting for the reader's verdict on
+// its CRC before it counts as extracted.
+struct WrittenMember {
+    file_index: usize,
+    name: String,
+    size: u64,
+    bytes_written: u64,
+    attempt: Arc<PhaseAttemptCounters>,
+    committed: bool,
+}
+
+// The members of one decode pass, committed in the order they were written
+// once the reader has vouched for each.
+//
+// A member that records a CRC is committed when the reader's sub-stream
+// completion hook names it: the hook fires only after the reader matched the
+// CRC, and a mismatch is an error instead. On a sequential chain that is
+// right after the member's callback returns; on a parallel LZMA2 block it can
+// be later, after the next member has started or at the end of the block's
+// stream, because the workers' checksums are folded as they arrive. A member
+// with no CRC has nothing to wait for and is committed when written.
+//
+// A member still waiting when the pass fails has its counters rolled back,
+// and no completion event is sent for it.
+struct MemberCommits<'a> {
+    job_id: JobId,
+    set_name: &'a str,
+    event_tx: &'a broadcast::Sender<PipelineEvent>,
+    verified: Arc<std::sync::Mutex<Vec<usize>>>,
+    members: Vec<WrittenMember>,
+    pending: std::collections::HashMap<usize, usize>,
+}
+
+impl<'a> MemberCommits<'a> {
+    fn new(
+        job_id: JobId,
+        set_name: &'a str,
+        event_tx: &'a broadcast::Sender<PipelineEvent>,
+    ) -> Self {
+        Self {
+            job_id,
+            set_name,
+            event_tx,
+            verified: Arc::new(std::sync::Mutex::new(Vec::new())),
+            members: Vec::new(),
+            pending: std::collections::HashMap::new(),
+        }
+    }
+
+    // The hook the reader reports verified members through.
+    fn hook(&self) -> SubStreamHook {
+        let verified = Arc::clone(&self.verified);
+        Box::new(move |completion: sevenz_turbo::SubStreamCompletion| {
+            verified
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(completion.file_index);
+        })
+    }
+
+    // Record a member whose bytes are all written, committing it now when
+    // the archive records no CRC for it.
+    fn written(&mut self, member: WrittenMember, has_crc: bool) {
+        if has_crc {
+            self.pending.insert(member.file_index, self.members.len());
+        }
+        self.members.push(member);
+        if !has_crc {
+            let last = self.members.len() - 1;
+            self.commit(last);
+        }
+    }
+
+    // Commit every member the reader has vouched for since the last call.
+    fn settle(&mut self) {
+        let verified = std::mem::take(
+            &mut *self
+                .verified
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for file_index in verified {
+            if let Some(index) = self.pending.remove(&file_index) {
+                self.commit(index);
+            }
+        }
+    }
+
+    fn commit(&mut self, index: usize) {
+        let member = &mut self.members[index];
+        member.attempt.commit();
+        member.committed = true;
+        tracing::info!(
+            job_id = self.job_id.0,
+            member = member.name.as_str(),
+            bytes_written = member.bytes_written,
+            total_bytes = member.size,
+            "member extracted"
+        );
+        let _ = self.event_tx.send(PipelineEvent::ExtractionProgress {
+            job_id: self.job_id,
+            member: member.name.clone(),
+            bytes_written: member.bytes_written,
+            total_bytes: member.size,
+        });
+        let _ = self.event_tx.send(PipelineEvent::ExtractionMemberFinished {
+            job_id: self.job_id,
+            set_name: self.set_name.to_string(),
+            member: member.name.clone(),
+        });
+    }
+
+    // The members extracted, in the order they were written, once the walk
+    // has ended. A member that records a CRC and was never reported verified
+    // fails the set: with verification on the reader either reports it or
+    // fails, so this is a decode that ended without a verdict.
+    fn finish(mut self) -> Result<Vec<String>, ExtractionError> {
+        self.settle();
+        if let Some(member) = self.members.iter().find(|member| !member.committed) {
+            return Err(ExtractionError::terminal(format!(
+                "7z extraction failed: member {} ended without a CRC verdict from the reader",
+                member.name
+            )));
+        }
+        Ok(std::mem::take(&mut self.members)
+            .into_iter()
+            .map(|member| member.name)
+            .collect())
+    }
+}
+
+impl Drop for MemberCommits<'_> {
+    fn drop(&mut self) {
+        for member in self.members.iter().filter(|member| !member.committed) {
+            member.attempt.rollback();
+        }
+    }
+}
+
+// What the reader's sub-stream completion hook is installed as.
+type SubStreamHook = Box<dyn FnMut(sevenz_turbo::SubStreamCompletion) + Send>;
 
 struct CountingWriter<W> {
     inner: W,
@@ -679,7 +858,7 @@ fn header_exceeded_listing_memory(error: &sevenz_turbo::Error) -> bool {
     match error {
         sevenz_turbo::Error::MaxMemLimited { .. } => true,
         sevenz_turbo::Error::Io(error, _) | sevenz_turbo::Error::MaybeBadPassword(error) => {
-            error.to_string().contains("too much memory")
+            crate::pipeline::extraction::error::zstd_frame_exceeds_window(error)
         }
         error => error.limit_hit() == Some(sevenz_turbo::Limit::HeaderUnpackedBytes),
     }
@@ -725,14 +904,14 @@ fn read_sevenz_archive_for_listing<R, F>(
     password: &sevenz_turbo::Password,
     header_limits: &dyn Fn(u64) -> sevenz_turbo::ArchiveLimits,
     open_reader: &mut F,
-) -> Result<(sevenz_turbo::Archive, MemoryPermit), String>
+) -> Result<(sevenz_turbo::Archive, MemoryPermit), ExtractionError>
 where
     R: std::io::Read + std::io::Seek,
-    F: FnMut() -> Result<R, String>,
+    F: FnMut() -> Result<R, ExtractionError>,
 {
     let ceiling = budget.max_memory_bytes();
     let job_limits = sevenz_archive_limits(budget);
-    let mut read = |limits: &sevenz_turbo::ArchiveLimits| -> Result<_, String> {
+    let mut read = |limits: &sevenz_turbo::ArchiveLimits| -> Result<_, ExtractionError> {
         let mut reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
         Ok(sevenz_turbo::Archive::read_with_limits(
             &mut reader,
@@ -793,7 +972,7 @@ enum SevenZipDecodeReservation {
 
 impl SevenZipDecodeReservation {
     // Reserve it. The permit's bytes are what the decoder may hold.
-    fn reserve(self, budget: &Arc<JobExtractionBudget>) -> Result<MemoryPermit, String> {
+    fn reserve(self, budget: &Arc<JobExtractionBudget>) -> Result<MemoryPermit, MemoryWaitError> {
         match self {
             Self::Measured(bytes) => budget.reserve_memory_wait(bytes),
             Self::UpToCeiling { floor } => budget.reserve_memory_up_to_ceiling_wait(floor),
@@ -804,7 +983,7 @@ impl SevenZipDecodeReservation {
         self,
         budget: &Arc<JobExtractionBudget>,
         cap: u64,
-    ) -> Result<MemoryPermit, String> {
+    ) -> Result<MemoryPermit, MemoryWaitError> {
         match self {
             Self::Measured(bytes) => budget.reserve_memory_wait(bytes),
             Self::UpToCeiling { floor } => {
@@ -1108,9 +1287,14 @@ fn note_adaptive_backlog(_job_id: JobId, _pending_runs: usize) {}
 // The decode pass: the library helper's entry walk, opened under the job's
 // limits and threaded as `threads` says.
 //
-// `extract_fn` receives the output directory where the helper would pass a
-// per-entry destination; the shared extraction body validates every entry
-// path through the extraction root and never reads that argument.
+// `extract_fn` receives each entry with its index in the archive's file
+// table, the coordinate the reader's sub-stream completion hook names a
+// verified member by. The shared extraction body validates every entry path
+// through the extraction root.
+//
+// Checksum verification is set on explicitly: the extraction body computes
+// no member CRC of its own and relies on the reader's, reported through
+// `sub_stream_hook`.
 //
 // An adaptive decode is governed from a thread of its own, because the
 // decoding thread is inside the entry walk — parked on the gated reader, or
@@ -1129,13 +1313,18 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     password: sevenz_turbo::Password,
     limits: sevenz_turbo::ArchiveLimits,
     threads: SevenZipDecodeThreads,
+    sub_stream_hook: Option<SubStreamHook>,
     mut extract_fn: impl FnMut(
         &sevenz_turbo::ArchiveEntry,
+        usize,
         &mut dyn sevenz_turbo::EntryRead,
-        &PathBuf,
     ) -> Result<bool, sevenz_turbo::Error>,
 ) -> Result<SevenZipDecodeReport, sevenz_turbo::Error> {
     let mut archive_reader = sevenz_turbo::ArchiveReader::with_limits(reader, password, limits)?;
+    archive_reader.set_verify_checksums(true);
+    if let Some(hook) = sub_stream_hook {
+        archive_reader.set_sub_stream_complete_hook(hook);
+    }
     // A second handle on the same bytes lets the folders of a non-solid
     // archive decode on parallel workers, each reading at its own offset.
     // The reads take turns on the one handle; the decoding does not.
@@ -1145,11 +1334,25 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir)?;
     }
-    let destination = output_dir.to_path_buf();
+    // Every entry the walk hands over is an element of the reader's own file
+    // table, on every path: sequential, parallel folders and the empty files
+    // walked last. Its index is its offset in that table.
+    let files = archive_reader.archive().files.as_ptr() as usize;
+    let file_count = archive_reader.archive().files.len();
+    let entry_bytes = std::mem::size_of::<sevenz_turbo::ArchiveEntry>().max(1);
     let mut walk =
         |archive_reader: &mut sevenz_turbo::ArchiveReader<R>| -> Result<(), sevenz_turbo::Error> {
-            archive_reader
-                .for_each_entries_direct(|entry, reader| extract_fn(entry, reader, &destination))
+            archive_reader.for_each_entries_direct(|entry, reader| {
+                let offset =
+                    (entry as *const sevenz_turbo::ArchiveEntry as usize).wrapping_sub(files);
+                let file_index = offset / entry_bytes;
+                if !offset.is_multiple_of(entry_bytes) || file_index >= file_count {
+                    return Err(sevenz_turbo::Error::Other(
+                        "7z entry is not in the reader's file table".into(),
+                    ));
+                }
+                extract_fn(entry, file_index, reader)
+            })
         };
 
     let (ceiling, widening, budget) = match threads {
@@ -1233,66 +1436,17 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     Ok(SevenZipDecodeReport { widest_threads })
 }
 
-// Prefix of a 7z extraction error that says the archive's bytes are wrong: a
-// block that did not decode, did not match its CRC, or whose read came back
-// malformed or short. A repair of those bytes can change the answer, so the
-// scheduler keeps the set for the recovery data to rule on. A method this
-// build cannot decode, a missing or wrong password, and any other read
-// failure keep the ordinary wording: no repair changes those.
-pub(in crate::pipeline) const SEVENZ_BLOCK_DATA_ERROR_PREFIX: &str = "7z block data error: ";
-
-fn sevenz_extraction_error(error: &sevenz_turbo::Error) -> String {
-    use sevenz_turbo::BlockErrorKind;
-    if matches!(error, sevenz_turbo::Error::PasswordRequired)
-        || matches!(error, sevenz_turbo::Error::BlockDecode { kind: BlockErrorKind::Password, message, .. } if message == "PasswordRequired")
-    {
-        return "WEAVER_PASSWORD_REQUIRED: the 7z archive requires a valid password".into();
-    }
-
-    let bytes_are_wrong = match error {
-        sevenz_turbo::Error::BlockDecode {
-            kind: BlockErrorKind::Corrupted | BlockErrorKind::ChecksumMismatch,
-            ..
-        } => true,
-        sevenz_turbo::Error::BlockDecode {
-            kind: BlockErrorKind::Io,
-            message,
-            ..
-        } => matches!(
-            block_io_error_kind(message),
-            Some(std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof)
-        ),
-        _ => false,
+// A 7z failure, classed while the reader's error is still in hand.
+pub(in crate::pipeline) fn sevenz_extraction_error(error: &sevenz_turbo::Error) -> ExtractionError {
+    let class = crate::pipeline::extraction::error::sevenz_error_class(error);
+    let message = match class {
+        ExtractionErrorClass::PasswordRequired => {
+            "the 7z archive requires a valid password".to_string()
+        }
+        ExtractionErrorClass::Recoverable => format!("7z block data error: {error}"),
+        _ => format!("7z extraction failed: {error}"),
     };
-    if bytes_are_wrong {
-        format!("{SEVENZ_BLOCK_DATA_ERROR_PREFIX}{error}")
-    } else {
-        format!("7z extraction failed: {error}")
-    }
-}
-
-// The kind of the read failure behind an I/O block error.
-//
-// The block error carries its cause only as rendered text, the debug form of
-// the reader's error, and every shape of that form names the kind before
-// anything else: `Kind(UnexpectedEof)`, or `kind: InvalidData` in the
-// custom, message and OS shapes. The first kind named is the reader's own,
-// never one quoted inside its message. Only the two kinds that say the bytes
-// came back wrong are recognised; anything else is `None` and stays terminal.
-fn block_io_error_kind(message: &str) -> Option<std::io::ErrorKind> {
-    let start = ["kind: ", "Kind("]
-        .iter()
-        .filter_map(|marker| message.find(marker).map(|at| at + marker.len()))
-        .min()?;
-    let rest = &message[start..];
-    let named = &rest[..rest
-        .find(|c: char| !c.is_ascii_alphanumeric())
-        .unwrap_or(rest.len())];
-    match named {
-        "InvalidData" => Some(std::io::ErrorKind::InvalidData),
-        "UnexpectedEof" => Some(std::io::ErrorKind::UnexpectedEof),
-        _ => None,
-    }
+    ExtractionError::new(class, message)
 }
 
 // Decode one 7z set through `open_reader`, writing members under the context's
@@ -1317,10 +1471,10 @@ fn block_io_error_kind(message: &str) -> Option<std::io::ErrorKind> {
 pub(in crate::pipeline) fn extract_7z_stream<R, F>(
     context: &SevenZipExtractionContext,
     mut open_reader: F,
-) -> Result<FullSetExtractionOutcome, String>
+) -> Result<FullSetExtractionOutcome, ExtractionError>
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
-    F: FnMut() -> Result<R, String>,
+    F: FnMut() -> Result<R, ExtractionError>,
 {
     let SevenZipExtractionContext {
         job_id,
@@ -1359,7 +1513,7 @@ where
         let ((archive, _header_permit), encrypted_headers) = match plaintext {
             Ok(archive) => (archive, false),
             Err(error)
-                if error.starts_with("WEAVER_PASSWORD_REQUIRED:") && !password.is_empty() =>
+                if error.is(ExtractionErrorClass::PasswordRequired) && !password.is_empty() =>
             {
                 (
                     read_sevenz_archive_for_listing(
@@ -1405,7 +1559,9 @@ where
             .map(|entry| entry.size())
             .try_fold(0u64, |total, size| total.checked_add(size))
             .ok_or_else(|| {
-                "WEAVER_RESOURCE_LIMIT[job_bytes]: declared 7z output size overflow".to_string()
+                ExtractionError::terminal(
+                    "WEAVER_RESOURCE_LIMIT[job_bytes]: declared 7z output size overflow",
+                )
             })?;
         let entry_count = archive
             .files
@@ -1449,8 +1605,8 @@ where
     };
     let decode_granted = decode_permit.bytes();
 
-    let mut extracted_members = Vec::new();
-    let extracted_members_ref = &mut extracted_members;
+    let mut commits = MemberCommits::new(job_id, set_name, event_tx);
+    let sub_stream_hook = commits.hook();
     // Directory times are stamped after the decode, once nothing more will
     // be created inside them.
     let mut directory_times: Vec<(PathBuf, SevenZipEntryTimes)> = Vec::new();
@@ -1460,9 +1616,12 @@ where
     let budget_ref = budget;
 
     let extract_fn = |entry: &sevenz_turbo::ArchiveEntry,
-                      reader: &mut dyn sevenz_turbo::EntryRead,
-                      _dest: &PathBuf|
+                      file_index: usize,
+                      reader: &mut dyn sevenz_turbo::EntryRead|
      -> Result<bool, sevenz_turbo::Error> {
+        // Members the reader vouched for since the last entry are committed
+        // before anything is said about this one.
+        commits.settle();
         let safe_path = root_ref
             .validate_relative_path(entry.name())
             .map_err(|error| std::io::Error::other(budget_ref.reject_unsafe_path(error)))?;
@@ -1505,12 +1664,13 @@ where
         let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase_counters)));
         let mut file = buffered_extraction_output(CountingWriter::new(file, Arc::clone(&attempt)));
         let copied = copy_verified_7z_member(entry, reader, &mut file);
+        // Committed by `commits` once the reader has matched the CRC.
         let bytes_written = match copied {
-            Ok(bytes) => {
-                attempt.commit();
-                bytes
-            }
+            Ok(bytes) => bytes,
             Err(error) => {
+                // What the buffer still holds is dropped unwritten: a buffer
+                // flushed on drop would count its bytes after the rollback.
+                let _ = file.into_parts();
                 attempt.rollback();
                 return Err(error.into());
             }
@@ -1528,26 +1688,17 @@ where
             );
         }
 
-        tracing::info!(
-            job_id = job_id.0,
-            member = entry.name(),
-            bytes_written,
-            total_bytes = entry.size(),
-            "member extracted"
+        commits.written(
+            WrittenMember {
+                file_index,
+                name: entry.name().to_string(),
+                size: entry.size(),
+                bytes_written,
+                attempt,
+                committed: false,
+            },
+            entry.has_crc,
         );
-        let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
-            job_id,
-            member: entry.name().to_string(),
-            bytes_written,
-            total_bytes: entry.size(),
-        });
-        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
-            job_id,
-            set_name: set_name.clone(),
-            member: entry.name().to_string(),
-        });
-
-        extracted_members_ref.push(entry.name().to_string());
         Ok(true)
     };
 
@@ -1595,9 +1746,11 @@ where
         password.clone(),
         limits,
         threads,
+        Some(sub_stream_hook),
         extract_fn,
     )
     .map_err(|e| sevenz_extraction_error(&e))?;
+    let extracted_members = commits.finish()?;
 
     // Deepest directories first: a directory's own stamp is the last thing
     // to touch it, and nothing below it is touched afterwards.
@@ -1864,12 +2017,13 @@ pub(in crate::pipeline) fn simple_archive_task_memory_permit(
     kind: SimpleArchiveKind,
     path: Option<&Path>,
     budget: &Arc<JobExtractionBudget>,
-) -> Result<Option<MemoryPermit>, String> {
+) -> Result<Option<MemoryPermit>, ExtractionError> {
     if matches!(kind, SimpleArchiveKind::Xz) {
         return Ok(None);
     }
-    let decoder_memory = measured_decoder_memory_bytes(kind, path, budget.max_memory_bytes())?;
-    budget.reserve_memory_wait(decoder_memory).map(Some)
+    let decoder_memory =
+        measured_decoder_memory_bytes(kind, path, budget.max_memory_bytes()).or_terminal()?;
+    Ok(budget.reserve_memory_wait(decoder_memory).map(Some)?)
 }
 
 fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -> u64 {
@@ -1979,7 +2133,7 @@ pub(in crate::pipeline) async fn install_direct_unpack(
         crate::pipeline::direct_unpack::wiring::ChaseDisposition::Ready(outcome) => {
             Some((*outcome).into_installable())
         }
-        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) => {
+        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(mut pending) => {
             // Every part is complete by now, so this is finishing at
             // disk speed rather than at download speed — but "should
             // finish quickly" is not a guarantee, and this await used to
@@ -2044,12 +2198,26 @@ pub(in crate::pipeline) async fn install_direct_unpack(
                     None
                 }
                 Some(joined) => match joined {
-                    Ok(Ok(outcome)) => Some((
-                        outcome,
-                        pending.staging_dir,
-                        pending.counters.total_bytes.load(Ordering::Relaxed),
-                        pending.counters.completed_bytes.load(Ordering::Relaxed),
-                    )),
+                    Ok(Ok(outcome)) => {
+                        // The worker has joined. Keep its guarded positional
+                        // output active through publication; cancellation still
+                        // owns every failure and abandoned handoff above.
+                        let positional = pending
+                            .positional
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .take();
+                        if positional.is_some() {
+                            pending.cancel_on_drop.completed();
+                        }
+                        Some((
+                            outcome,
+                            pending.staging_dir,
+                            pending.counters.total_bytes.load(Ordering::Relaxed),
+                            pending.counters.completed_bytes.load(Ordering::Relaxed),
+                            positional,
+                        ))
+                    }
                     Ok(Err(error)) => {
                         tracing::debug!(
                             job_id = job_id.0,
@@ -2087,7 +2255,7 @@ pub(in crate::pipeline) async fn install_direct_unpack(
     // this whole path already runs on an extraction task shutdown does not
     // join, and the maintenance sweep collects a tree an exit interrupts once
     // its job is gone.
-    if let Some((outcome, chase_staging, total_bytes, completed_bytes)) = chase {
+    if let Some((outcome, chase_staging, total_bytes, completed_bytes, positional)) = chase {
         if expected_names.is_some_and(|expected| {
             outcome.extracted.iter().cloned().collect::<HashSet<_>>() != *expected
         }) {
@@ -2119,7 +2287,16 @@ pub(in crate::pipeline) async fn install_direct_unpack(
         // place, so a failed one leaves it behind for this path to retire.
         let retired_staging = chase_staging.clone();
         let install = tokio::task::spawn_blocking(move || {
-            if let Some(names) = rar_names {
+            if let Some(handoff) = positional {
+                handoff
+                    .manifest
+                    .publish(&handoff.epoch, &staging_for_install)
+                    .map_err(|error| error.to_string())?;
+                // Only this generation's private metadata tree is retired.
+                // Provisional payload was already written in the destination.
+                let _ = std::fs::remove_dir_all(&chase_staging);
+                Ok(())
+            } else if let Some(names) = rar_names {
                 crate::pipeline::direct_unpack::rar::install(
                     &chase_staging,
                     &staging_for_install,
@@ -2180,8 +2357,9 @@ fn extract_zip(
     job_id: JobId,
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
-) -> Result<(Vec<String>, Option<String>), String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
+) -> Result<(Vec<String>, Option<String>), ExtractionError> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| ExtractionError::from_io(format!("failed to open zip: {e}"), &e))?;
     extract_zip_stream_candidates(
         file,
         root,
@@ -2205,7 +2383,7 @@ pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
     job_id: JobId,
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     let passwords = password
         .into_iter()
         .map(|value| {
@@ -2238,10 +2416,21 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
     job_id: JobId,
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
-) -> Result<(Vec<String>, Option<String>), String> {
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
+) -> Result<(Vec<String>, Option<String>), ExtractionError> {
+    let mut file = BudgetedReader::new(file, Arc::clone(budget));
+    // Unless told where the archive starts, zip scans forward from the first
+    // byte for the zip64 end record, which blocks on payload ranges that have
+    // not downloaded yet. Only an archive with data in front of it falls back
+    // to that scan.
+    let starts_at_zero = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let mut archive = match zip::ZipArchive::with_config(starts_at_zero, &mut file) {
+        Ok(archive) => archive,
+        Err(_) => zip::ZipArchive::new(&mut file).map_err(|e| {
+            ExtractionError::from_zip(format!("failed to read zip archive: {e}"), &e)
+        })?,
+    };
     budget.check_archive_metadata(
         archive.len() as u64,
         archive
@@ -2253,7 +2442,10 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
     // header. Opening all members here would block the first extraction on
     // headers in payload ranges that have not downloaded yet.
     for raw_name in archive.file_names() {
-        validate_zip_entry_path(raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
+        let raw_name = raw_name.map_err(|error| {
+            ExtractionError::from_zip(format!("failed to read zip entry name: {error}"), &error)
+        })?;
+        validate_zip_entry_path(&raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
     }
     let known_total = archive
         .decompressed_size()
@@ -2268,7 +2460,12 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
     for i in 0..archive.len() {
         let encrypted = archive
             .by_index_raw(i)
-            .map_err(|error| format!("failed to read zip entry metadata {i}: {error}"))?
+            .map_err(|error| {
+                ExtractionError::from_zip(
+                    format!("failed to read zip entry metadata {i}: {error}"),
+                    &error,
+                )
+            })?
             .encrypted();
         let selected = if encrypted {
             let mut selected = None;
@@ -2278,19 +2475,25 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
             {
                 budget
                     .check_active_io()
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| ExtractionError::io(&error))?;
                 match archive.by_index_decrypt(i, passwords[index].value().as_bytes()) {
                     Ok(_) => {
                         selected = Some(index);
                         break;
                     }
                     Err(zip::result::ZipError::InvalidPassword) => continue,
-                    Err(error) => return Err(format!("failed to read zip entry {i}: {error}")),
+                    Err(error) => {
+                        return Err(ExtractionError::from_zip(
+                            format!("failed to read zip entry {i}: {error}"),
+                            &error,
+                        ));
+                    }
                 }
             }
             Some(selected.ok_or_else(|| {
-                "WEAVER_PASSWORD_REQUIRED: no supplied password could decrypt the ZIP member"
-                    .to_string()
+                ExtractionError::password_required(
+                    "no supplied password could decrypt the ZIP member",
+                )
             })?)
         } else {
             None
@@ -2299,9 +2502,19 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
             Some(index) => archive.by_index_decrypt(i, passwords[index].value().as_bytes()),
             None => archive.by_index(i),
         }
-        .map_err(|error| format!("failed to read zip entry {i}: {error}"))?;
-        budget.check_member_metadata(entry.name(), entry.size())?;
-        let raw_name = entry.name().to_string();
+        .map_err(|error| {
+            ExtractionError::from_zip(format!("failed to read zip entry {i}: {error}"), &error)
+        })?;
+        let raw_name = entry
+            .name()
+            .map_err(|error| {
+                ExtractionError::from_zip(
+                    format!("failed to read zip entry {i} name: {error}"),
+                    &error,
+                )
+            })?
+            .into_owned();
+        budget.check_member_metadata(&raw_name, entry.size())?;
         let safe_path =
             validate_zip_entry_path(&raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
         let name = safe_path.to_string_lossy().replace('\\', "/");
@@ -2347,7 +2560,10 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
                 if let Some(attempt) = &attempt {
                     attempt.rollback();
                 }
-                return Err(format!("failed to extract {name}: {error}"));
+                return Err(ExtractionError::from_io(
+                    format!("failed to extract {name}: {error}"),
+                    &error,
+                ));
             }
         };
 
@@ -2376,7 +2592,7 @@ fn extract_tar(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::Tar,
         archive_path,
@@ -2395,7 +2611,7 @@ fn extract_tar_gz(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::TarGz,
         archive_path,
@@ -2414,7 +2630,7 @@ fn extract_tar_bz2(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::TarBz2,
         archive_path,
@@ -2434,7 +2650,7 @@ fn extract_tar_xz(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::TarXz,
         archive_path,
@@ -2453,18 +2669,19 @@ fn extract_tar_from_reader<R: std::io::Read>(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     let mut archive = tar::Archive::new(reader);
     let mut extracted = Vec::new();
 
     for entry in archive
         .entries()
-        .map_err(|e| format!("failed to read tar entries: {e}"))?
+        .map_err(|e| ExtractionError::from_io(format!("failed to read tar entries: {e}"), &e))?
     {
-        let mut entry = entry.map_err(|e| format!("failed to read tar entry: {e}"))?;
+        let mut entry = entry
+            .map_err(|e| ExtractionError::from_io(format!("failed to read tar entry: {e}"), &e))?;
         let raw_name = entry
             .path()
-            .map_err(|e| format!("invalid tar entry path: {e}"))?
+            .map_err(|e| ExtractionError::from_io(format!("invalid tar entry path: {e}"), &e))?
             .to_string_lossy()
             .to_string();
         if entry.header().entry_type().is_dir() && is_tar_current_dir_entry(&raw_name) {
@@ -2476,25 +2693,33 @@ fn extract_tar_from_reader<R: std::io::Read>(
 
         let entry_type = entry.header().entry_type();
         let mut has_sparse_metadata = false;
-        if let Some(extensions) = entry
-            .pax_extensions()
-            .map_err(|error| format!("failed to inspect tar metadata for {name}: {error}"))?
-        {
+        if let Some(extensions) = entry.pax_extensions().map_err(|error| {
+            ExtractionError::from_io(
+                format!("failed to inspect tar metadata for {name}: {error}"),
+                &error,
+            )
+        })? {
             for extension in extensions {
-                let extension = extension
-                    .map_err(|error| format!("failed to parse tar metadata for {name}: {error}"))?;
+                let extension = extension.map_err(|error| {
+                    ExtractionError::from_io(
+                        format!("failed to parse tar metadata for {name}: {error}"),
+                        &error,
+                    )
+                })?;
                 has_sparse_metadata |= extension.key_bytes().starts_with(b"GNU.sparse");
             }
         }
         if has_sparse_metadata {
-            return Err(budget.reject_unsupported_entry(format!(
-                "tar entry '{name}' uses sparse-file metadata"
-            )));
+            return Err(budget
+                .reject_unsupported_entry(format!("tar entry '{name}' uses sparse-file metadata"))
+                .into());
         }
         if !entry_type.is_file() && !entry_type.is_dir() {
-            return Err(budget.reject_unsupported_entry(format!(
-                "tar entry '{name}' has forbidden type {entry_type:?}"
-            )));
+            return Err(budget
+                .reject_unsupported_entry(format!(
+                    "tar entry '{name}' has forbidden type {entry_type:?}"
+                ))
+                .into());
         }
         budget.check_member_metadata(&name, entry.size())?;
 
@@ -2512,7 +2737,9 @@ fn extract_tar_from_reader<R: std::io::Read>(
             let copied = std::io::copy(&mut entry, &mut output);
             copied
                 .and_then(|bytes| output.flush().map(|()| bytes))
-                .map_err(|e| format!("failed to extract tar entry {name}: {e}"))?
+                .map_err(|e| {
+                    ExtractionError::from_io(format!("failed to extract tar entry {name}: {e}"), &e)
+                })?
         };
         if bytes_written > 0 {
             tracing::debug!(job_id = job_id.0, member = %name, bytes_written, "tar member bytes written");
@@ -2537,7 +2764,7 @@ fn extract_gz(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::Gz,
         archive_path,
@@ -2579,7 +2806,7 @@ fn extract_single_stream_to_file<R: std::io::Read>(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     let archive_name = archive_path
         .file_name()
         .unwrap_or_default()
@@ -2599,7 +2826,9 @@ fn extract_single_stream_to_file<R: std::io::Read>(
     let copied = std::io::copy(&mut reader, &mut outfile);
     let bytes_written = copied
         .and_then(|bytes| outfile.flush().map(|()| bytes))
-        .map_err(|e| format!("failed to decompress {format_name}: {e}"))?;
+        .map_err(|e| {
+            ExtractionError::from_io(format!("failed to decompress {format_name}: {e}"), &e)
+        })?;
 
     let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
         job_id,
@@ -2618,7 +2847,7 @@ fn extract_brotli(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::Brotli,
         archive_path,
@@ -2637,7 +2866,7 @@ fn extract_deflate(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::Deflate,
         archive_path,
@@ -2656,7 +2885,7 @@ fn extract_zstd(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::Zstd,
         archive_path,
@@ -2675,7 +2904,7 @@ fn extract_bzip2(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     sequential::extract_file(&sequential::SequentialExtractionContext {
         kind: SimpleArchiveKind::Bzip2,
         archive_path,
@@ -2695,7 +2924,7 @@ fn extract_xz(
     job_id: JobId,
     set_name: &str,
     xz_worker_threads: usize,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     let xz = open_filesystem_xz_decoder(archive_path, budget, xz_worker_threads)?;
     extract_single_stream_to_file(
         xz,
@@ -2714,17 +2943,18 @@ fn open_filesystem_xz_decoder(
     archive_path: &Path,
     budget: &Arc<JobExtractionBudget>,
     xz_worker_threads: usize,
-) -> Result<FilesystemXzDecoder<BudgetedReader<std::fs::File>>, String> {
-    let mut probe =
-        std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
+) -> Result<FilesystemXzDecoder<BudgetedReader<std::fs::File>>, ExtractionError> {
+    let mut probe = std::fs::File::open(archive_path)
+        .map_err(|error| ExtractionError::from_io(format!("failed to open xz: {error}"), &error))?;
     let memory_limit = crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES.min(budget.max_memory_bytes());
 
     if matches!(
         crate::ingest::xz_filesystem_decoder_kind(&mut probe),
         crate::ingest::XzFilesystemDecoderKind::Parallel
     ) {
-        let file = std::fs::File::open(archive_path)
-            .map_err(|error| format!("failed to open xz: {error}"))?;
+        let file = std::fs::File::open(archive_path).map_err(|error| {
+            ExtractionError::from_io(format!("failed to open xz: {error}"), &error)
+        })?;
         let file = BudgetedReader::new(file, Arc::clone(budget));
         // The parallel reader plans every block from the index before it
         // decodes anything, and trims its thread count until the workers fit
@@ -2743,8 +2973,8 @@ fn open_filesystem_xz_decoder(
         }
     }
 
-    let file =
-        std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
+    let file = std::fs::File::open(archive_path)
+        .map_err(|error| ExtractionError::from_io(format!("failed to open xz: {error}"), &error))?;
     let file = BudgetedReader::new(file, Arc::clone(budget));
     // The sequential decoder's dictionary is bounded by `memory_limit`, and
     // that is what it is charged for. Reserved before the decoder is built, so
@@ -2755,7 +2985,7 @@ fn open_filesystem_xz_decoder(
             decoder: Box::new(decoder),
             _memory: memory,
         })
-        .map_err(|error| format!("failed to open xz decoder: {error}"))
+        .map_err(|error| ExtractionError::terminal(format!("failed to open xz decoder: {error}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2768,7 +2998,7 @@ fn extract_split(
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
     joined_output_already_present: Option<PathBuf>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     // Output filename: the base name from the set (e.g., "movie.mkv" from "movie.mkv.001")
     let first_name = file_paths[0]
         .file_name()
@@ -2812,7 +3042,7 @@ fn extract_split(
     }
 
     let reader = crate::pipeline::archive::split_reader::SplitFileReader::open(file_paths)
-        .map_err(|e| format!("failed to open split files: {e}"))?;
+        .map_err(|e| ExtractionError::from_io(format!("failed to open split files: {e}"), &e))?;
     let mut reader = BudgetedReader::new(reader, Arc::clone(budget));
     let outfile = root.create_file(&safe_path, budget)?;
     let attempt = phase_counters.as_ref().map(|counters| {
@@ -2842,7 +3072,10 @@ fn extract_split(
             if let Some(attempt) = &attempt {
                 attempt.rollback();
             }
-            return Err(format!("failed to concatenate split files: {error}"));
+            return Err(ExtractionError::from_io(
+                format!("failed to concatenate split files: {error}"),
+                &error,
+            ));
         }
     };
 
@@ -2890,12 +3123,12 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_name: &str,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, ExtractionError> {
         let (volume_paths, cached_headers, password_candidates) = {
             let _state = self
                 .jobs
                 .get(&job_id)
-                .ok_or_else(|| format!("job {job_id:?} not found"))?;
+                .ok_or_else(|| ExtractionError::terminal(format!("job {job_id:?} not found")))?;
             (
                 self.volume_paths_for_rar_set(job_id, set_name),
                 self.load_rar_snapshot(job_id, set_name),
@@ -2995,9 +3228,9 @@ impl Pipeline {
                                     .or_default()
                                     .insert(set_name.to_string())
                                 {
-                                    return Err(format!(
+                                    return Err(ExtractionError::terminal(format!(
                                         "no on-disk RAR volumes for set '{set_name}'"
-                                    ));
+                                    )));
                                 }
                             }
                         }
@@ -3036,9 +3269,10 @@ impl Pipeline {
             .unacceptable_extension_policy_snapshot(job_id)
             .await
             .map_err(|error| budget.reject_content_policy(error))?;
-        let root = Arc::new(ExtractionRoot::open(&output_dir)?);
+        let root = Arc::new(ExtractionRoot::open(&output_dir).or_terminal()?);
         let task_permit = budget.task_permit_for_root(root)?;
         let set_name_for_result = set_name_owned.clone();
+        let settle_budget = Arc::clone(&budget);
         let shared_kdf_cache = self
             .rar_sets
             .get(&(job_id, set_name.to_string()))
@@ -3083,7 +3317,9 @@ impl Pipeline {
                 let _task_permit = task_permit;
                 let root = _task_permit.root();
                 if volume_paths.is_empty() {
-                    return Err(format!("no on-disk RAR volumes for set '{set_name_owned}'"));
+                    return Err(ExtractionError::terminal(format!(
+                        "no on-disk RAR volumes for set '{set_name_owned}'"
+                    )));
                 }
 
                 let selection = Self::open_rar_archive_for_extraction_with_password_candidates(
@@ -3100,9 +3336,11 @@ impl Pipeline {
                     },
                 )?;
                 if let Some(member) = Self::blocked_rar_member(&selection.archive, &policy) {
-                    return Err(budget.reject_content_policy(
-                        crate::post_processing::model::unwanted_extension_reason(&member),
-                    ));
+                    return Err(budget
+                        .reject_content_policy(
+                            crate::post_processing::model::unwanted_extension_reason(&member),
+                        )
+                        .into());
                 }
                 let _memory_permit =
                     budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
@@ -3119,7 +3357,7 @@ impl Pipeline {
                 let is_solid = archive.is_solid();
 
                 let mut extracted_members = Vec::new();
-                let mut failed_members: Vec<(String, String)> = Vec::new();
+                let mut failed_members: Vec<(String, ExtractionError)> = Vec::new();
                 let mut validated_password = selection.validated_password;
                 for (idx, member) in meta.members.iter().enumerate() {
                     if already_extracted.contains(&member.name) {
@@ -3162,14 +3400,14 @@ impl Pipeline {
                             extracted_members.push(member_name);
                         }
                         Err(e) => {
-                            let error = e.to_string();
+                            let error = e.settle(&budget);
                             let _ = event_tx.send(PipelineEvent::ExtractionMemberFailed {
                                 job_id,
                                 set_name: set_name_for_task.clone(),
                                 member: member.name.clone(),
-                                error: error.clone(),
+                                error: error.message().to_string(),
                             });
-                            tracing::warn!(member = %member.name, error = %e, "member extraction failed, continuing with remaining members");
+                            tracing::warn!(member = %member.name, error = %error, "member extraction failed, continuing with remaining members");
                             failed_members.push((member.name.clone(), error));
                             if is_solid {
                                 break;
@@ -3188,8 +3426,11 @@ impl Pipeline {
 
             let result = match result {
                 Ok(result) => result,
-                Err(e) => Err(format!("extraction task panicked: {e}")),
-            };
+                Err(e) => Err(ExtractionError::terminal(format!(
+                    "extraction task panicked: {e}"
+                ))),
+            }
+            .map_err(|error| error.settle(&settle_budget));
             let _ = extract_done_tx
                 .send(ExtractionDone::FullSet {
                     job_id,
@@ -3276,11 +3517,8 @@ impl Pipeline {
                 Ok(_) => spawned += 1,
                 Err(e) => {
                     warn!(job_id = job_id.0, archive = %name, error = %e, "failed to start extraction");
-                    if JobExtractionBudget::is_rejection(&e) {
-                        if let Some(budget) = self.extraction_budgets.get(&job_id) {
-                            budget.cancel_with_error(&e);
-                        }
-                        self.fail_job(job_id, e);
+                    if e.is(ExtractionErrorClass::Rejected) {
+                        self.fail_job_on_extraction_error(job_id, e);
                         return spawned;
                     }
                     if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
@@ -3369,8 +3607,10 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_name: &str,
-    ) -> Result<u32, String> {
-        let part_candidates = self.archive_set_indexed_part_paths(job_id, set_name)?;
+    ) -> Result<u32, ExtractionError> {
+        let part_candidates = self
+            .archive_set_indexed_part_paths(job_id, set_name)
+            .or_terminal()?;
         let passwords = self.archive_password_candidates_for_set(job_id, set_name);
         let uu_paths: HashSet<PathBuf> = self
             .jobs
@@ -3391,8 +3631,9 @@ impl Pipeline {
 
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
-        let root = Arc::new(ExtractionRoot::open(&output_dir)?);
+        let root = Arc::new(ExtractionRoot::open(&output_dir).or_terminal()?);
         let task_permit = budget.task_permit_for_root(root)?;
+        let settle_budget = Arc::clone(&budget);
         let event_tx = self.event_tx.clone();
         let set_name_owned = set_name.to_string();
 
@@ -3439,8 +3680,12 @@ impl Pipeline {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
-                    let parts = resolve_sevenz_parts(&part_candidates, &uu_paths)
-                        .map_err(|error| format!("failed to read 7z archive: {error}"))?;
+                    let parts =
+                        resolve_sevenz_parts(&part_candidates, &uu_paths).map_err(|error| {
+                            error.map_message(|message| {
+                                format!("failed to read 7z archive: {message}")
+                            })
+                        })?;
                     let end_header_bytes = sevenz_declared_end_header_bytes(&parts.paths[0]);
 
                     let context = SevenZipExtractionContext {
@@ -3460,9 +3705,12 @@ impl Pipeline {
                     };
 
                     extract_7z_with_password_candidates(context, &passwords, || {
-                        parts
-                            .open()
-                            .map_err(|error| format!("failed to open 7z parts: {error}"))
+                        parts.open().map_err(|error| {
+                            ExtractionError::from_io(
+                                format!("failed to open 7z parts: {error}"),
+                                &error,
+                            )
+                        })
                     })
                 })
             })
@@ -3470,8 +3718,11 @@ impl Pipeline {
 
             let result = match result {
                 Ok(r) => r,
-                Err(e) => Err(format!("7z extraction task panicked: {e}")),
-            };
+                Err(e) => Err(ExtractionError::terminal(format!(
+                    "7z extraction task panicked: {e}"
+                ))),
+            }
+            .map_err(|error| error.settle(&settle_budget));
             let _ = extract_done_tx
                 .send(ExtractionDone::FullSet {
                     job_id,
@@ -3538,8 +3789,10 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
         kind: SimpleArchiveKind,
-    ) -> Result<u32, String> {
-        let file_paths = self.archive_set_part_paths(job_id, set_name)?;
+    ) -> Result<u32, ExtractionError> {
+        let file_paths = self
+            .archive_set_part_paths(job_id, set_name)
+            .or_terminal()?;
         let passwords = self.archive_password_candidates_for_set(job_id, set_name);
         let joined_output_already_present = matches!(kind, SimpleArchiveKind::Split)
             .then(|| self.present_split_join_output(job_id, set_name, &file_paths))
@@ -3552,8 +3805,9 @@ impl Pipeline {
 
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
-        let root = Arc::new(ExtractionRoot::open(&output_dir)?);
+        let root = Arc::new(ExtractionRoot::open(&output_dir).or_terminal()?);
         let task_permit = budget.task_permit_for_root(root)?;
+        let settle_budget = Arc::clone(&budget);
         let event_tx = self.event_tx.clone();
         let set_name_owned = set_name.to_string();
         let extract_done_tx = self.extract_done_tx.clone();
@@ -3592,7 +3846,9 @@ impl Pipeline {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
                     if file_paths.is_empty() {
-                        return Err(format!("no files found for set '{set_name_owned}'"));
+                        return Err(ExtractionError::terminal(format!(
+                            "no files found for set '{set_name_owned}'"
+                        )));
                     }
                     let _memory_permit = simple_archive_task_memory_permit(
                         kind,
@@ -3720,8 +3976,11 @@ impl Pipeline {
 
             let result = match result {
                 Ok(r) => r,
-                Err(e) => Err(format!("{kind:?} extraction task panicked: {e}")),
-            };
+                Err(e) => Err(ExtractionError::terminal(format!(
+                    "{kind:?} extraction task panicked: {e}"
+                ))),
+            }
+            .map_err(|error| error.settle(&settle_budget));
             let _ = extract_done_tx
                 .send(ExtractionDone::FullSet {
                     job_id,

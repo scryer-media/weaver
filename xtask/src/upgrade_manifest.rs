@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Signed upgrade-manifest generation for a release.
 //
 // The manifest is what an installed Weaver reads to decide what to download

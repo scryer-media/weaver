@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use crate::persistence::Refusal;
 use crate::servers::DownloadQuotaFault;
 
@@ -33,6 +36,7 @@ pub enum NetworkRefusal {
     PoolGone,
     PoolInUse,
     PoolEditRepeatsProxy,
+    PoolInUseEmpty,
 
     // Routes.
     RouteLegCount,
@@ -45,14 +49,13 @@ pub enum NetworkRefusal {
     RouteEgressMissing,
     RouteEgressDisabled,
     RoutePoolMissing,
+    RoutePoolEmpty,
     RouteProxyMissing,
     RoutingProxyMissing,
     RouteProxyRepeated,
     RoutingProxyRepeated,
     RoutingProxyCount,
     RouteChainTransport,
-    RouteRssProxyNeedsDns,
-    RssRouteProxyNeedsDns,
     RouteHasAdvancedLegs,
     RouteConsumerGone,
 
@@ -73,6 +76,7 @@ pub enum NetworkRefusal {
     ProxyTimeoutRange,
     ProxyAddressCount,
     ProxyDnsServerInvalid,
+    ProxyWireGuardNeedsDnsServers,
     ProxyCredentialTooLarge,
     ProxySshUsernameRequired,
     ProxySshKeyRequired,
@@ -93,6 +97,39 @@ pub enum NetworkRefusal {
     ProxyInPool,
     ProxyInUse,
     ProxyHostKeyNotSsh,
+
+    // Speed tests.
+    SpeedTestAlreadyRunning {
+        run: u32,
+    },
+    SpeedTestQueueBusy,
+    SpeedTestUsenetNeedsServer,
+    SpeedTestLegDownAll,
+    SpeedTestQuotaBlocked {
+        holder: SpeedTestQuotaHolder,
+        id: u32,
+        name: String,
+    },
+    SpeedTestLeaseRefused {
+        server: u32,
+        name: String,
+        reason: String,
+    },
+
+    // Tests through a drafted route.
+    TestNeedsRoute,
+    TestTargetRequired,
+    TestSubjectInRoute,
+    TestPathCount {
+        limit: usize,
+    },
+}
+
+// Whose download quota keeps a speed test from starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedTestQuotaHolder {
+    Server,
+    Egress,
 }
 
 impl NetworkRefusal {
@@ -128,6 +165,7 @@ impl NetworkRefusal {
             Self::PoolGone => "POOL_NOT_FOUND",
             Self::PoolInUse => "POOL_IN_USE",
             Self::PoolEditRepeatsProxy => "POOL_EDIT_REPEATS_PROXY",
+            Self::PoolInUseEmpty => "POOL_IN_USE_EMPTY",
 
             Self::RouteLegCount => "ROUTE_LEG_COUNT",
             Self::RouteLegWeightRange => "ROUTE_LEG_WEIGHT_RANGE",
@@ -139,13 +177,11 @@ impl NetworkRefusal {
             Self::RouteEgressMissing => "ROUTE_EGRESS_MISSING",
             Self::RouteEgressDisabled => "ROUTE_EGRESS_DISABLED",
             Self::RoutePoolMissing => "ROUTE_POOL_MISSING",
+            Self::RoutePoolEmpty => "ROUTE_POOL_EMPTY",
             Self::RouteProxyMissing | Self::RoutingProxyMissing => "ROUTE_PROXY_MISSING",
             Self::RouteProxyRepeated | Self::RoutingProxyRepeated => "ROUTE_PROXY_REPEATED",
             Self::RoutingProxyCount => "ROUTE_PROXY_COUNT",
             Self::RouteChainTransport => "ROUTE_CHAIN_TRANSPORT",
-            Self::RouteRssProxyNeedsDns | Self::RssRouteProxyNeedsDns => {
-                "ROUTE_RSS_PROXY_NEEDS_DNS"
-            }
             Self::RouteHasAdvancedLegs => "ROUTE_HAS_ADVANCED_LEGS",
             Self::RouteConsumerGone => "ROUTE_CONSUMER_NOT_FOUND",
 
@@ -157,6 +193,7 @@ impl NetworkRefusal {
             Self::ProxyTimeoutRange => "PROXY_TIMEOUT_RANGE",
             Self::ProxyAddressCount => "PROXY_ADDRESS_COUNT",
             Self::ProxyDnsServerInvalid => "PROXY_DNS_SERVER_INVALID",
+            Self::ProxyWireGuardNeedsDnsServers => "PROXY_WIREGUARD_NEEDS_DNS_SERVERS",
             Self::ProxyCredentialTooLarge => "PROXY_CREDENTIAL_TOO_LARGE",
             Self::ProxySshUsernameRequired => "PROXY_SSH_USERNAME_REQUIRED",
             Self::ProxySshKeyRequired => "PROXY_SSH_KEY_REQUIRED",
@@ -174,6 +211,17 @@ impl NetworkRefusal {
             Self::ProxyInPool => "PROXY_IN_POOL",
             Self::ProxyInUse => "PROXY_IN_USE",
             Self::ProxyHostKeyNotSsh => "PROXY_HOST_KEY_NOT_SSH",
+
+            Self::SpeedTestAlreadyRunning { .. } => "SPEED_TEST_ALREADY_RUNNING",
+            Self::SpeedTestQueueBusy => "SPEED_TEST_QUEUE_BUSY",
+            Self::SpeedTestUsenetNeedsServer => "SPEED_TEST_USENET_NEEDS_SERVER",
+            Self::SpeedTestLegDownAll => "SPEED_TEST_LEG_DOWN_ALL",
+            Self::SpeedTestQuotaBlocked { .. } => "SPEED_TEST_QUOTA_BLOCKED",
+            Self::SpeedTestLeaseRefused { .. } => "SPEED_TEST_LEASE_REFUSED",
+            Self::TestNeedsRoute => "TEST_NEEDS_ROUTE",
+            Self::TestTargetRequired => "TEST_TARGET_REQUIRED",
+            Self::TestSubjectInRoute => "TEST_SUBJECT_IN_ROUTE",
+            Self::TestPathCount { .. } => "TEST_PATH_COUNT",
         }
     }
 
@@ -190,6 +238,21 @@ impl NetworkRefusal {
                 "limit": limit,
                 "instanceMib": super::WIREGUARD_INSTANCE_BYTES / (1024 * 1024),
             }),
+            Self::SpeedTestAlreadyRunning { run } => serde_json::json!({ "runId": run }),
+            Self::SpeedTestQuotaBlocked { holder, id, name } => serde_json::json!({
+                "scope": match holder {
+                    SpeedTestQuotaHolder::Server => "server",
+                    SpeedTestQuotaHolder::Egress => "egress",
+                },
+                "id": id,
+                "name": name,
+            }),
+            Self::SpeedTestLeaseRefused {
+                server,
+                name,
+                reason,
+            } => serde_json::json!({ "serverId": server, "name": name, "reason": reason }),
+            Self::TestPathCount { limit } => serde_json::json!({ "limit": limit }),
             _ => return serde_json::Map::new(),
         };
         match value {
@@ -225,13 +288,16 @@ impl std::fmt::Display for NetworkRefusal {
             Self::EgressInUse => "egress is referenced by a server or RSS feed",
 
             Self::PoolNameLength => "pool name must contain 1–128 characters",
-            Self::PoolMemberCount => "a pool requires between two and sixteen members",
+            Self::PoolMemberCount => "a pool takes at most sixteen members",
             Self::PoolProxyRepeated => "a proxy cannot appear twice in a pool",
             Self::PoolProxyMissing => "pool references a missing proxy",
             Self::PoolMemberKindMismatch => "all pool members must have the pool's proxy kind",
             Self::PoolGone => "proxy pool no longer exists",
             Self::PoolInUse => "pool is referenced by a server or RSS feed",
             Self::PoolEditRepeatsProxy => "pool edit would repeat a proxy in an existing ladder",
+            Self::PoolInUseEmpty => {
+                "a pool referenced by a server or RSS feed needs at least one member"
+            }
 
             Self::RouteLegCount => "a route requires between one and eight legs",
             Self::RouteLegWeightRange => "leg weights must be between 1 and 100",
@@ -243,6 +309,7 @@ impl std::fmt::Display for NetworkRefusal {
             Self::RouteEgressMissing => "route references a missing egress",
             Self::RouteEgressDisabled => "route references a disabled egress",
             Self::RoutePoolMissing => "route references a missing pool",
+            Self::RoutePoolEmpty => "route references a pool with no members",
             Self::RouteProxyMissing => "route references a missing proxy",
             Self::RoutingProxyMissing => "routing policy references a missing proxy",
             Self::RouteProxyRepeated => {
@@ -253,8 +320,6 @@ impl std::fmt::Display for NetworkRefusal {
             Self::RouteChainTransport => {
                 "WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress; WireGuard may also sit directly on another WireGuard proxy"
             }
-            Self::RouteRssProxyNeedsDns => "every RSS proxy and pool member requires DNS servers",
-            Self::RssRouteProxyNeedsDns => "RSS proxy routes require configured DNS servers",
             Self::RouteHasAdvancedLegs => {
                 "this route has advanced legs; edit it in Networking instead of replacing its legacy projection"
             }
@@ -293,6 +358,9 @@ impl std::fmt::Display for NetworkRefusal {
             Self::ProxyTimeoutRange => "proxy timeout must be between 1 and 300 seconds",
             Self::ProxyAddressCount => "too many DNS servers or tunnel addresses",
             Self::ProxyDnsServerInvalid => "DNS servers must be IP addresses",
+            Self::ProxyWireGuardNeedsDnsServers => {
+                "a WireGuard proxy resolves names only through DNS servers"
+            }
             Self::ProxyCredentialTooLarge => "proxy credential is too large",
             Self::ProxySshUsernameRequired => "SSH requires a username",
             Self::ProxySshKeyRequired => "SSH requires an Ed25519 private key",
@@ -315,6 +383,47 @@ impl std::fmt::Display for NetworkRefusal {
             Self::ProxyInPool => "proxy belongs to a pool; remove it from the pool first",
             Self::ProxyInUse => "proxy is referenced by a server or RSS feed",
             Self::ProxyHostKeyNotSsh => "only SSH profiles have host-key trust",
+
+            Self::SpeedTestAlreadyRunning { run } => {
+                return write!(
+                    f,
+                    "speed test {run} is still running; cancel it or wait for it to finish"
+                );
+            }
+            Self::SpeedTestQueueBusy => {
+                "the previous speed test is still giving the queue back; start again once it has"
+            }
+            Self::SpeedTestUsenetNeedsServer => {
+                "a Usenet speed test runs on a server; a feed can run a bandwidth test only"
+            }
+            Self::SpeedTestLegDownAll => {
+                "every leg of the route would be down; leave at least one leg up"
+            }
+            Self::SpeedTestQuotaBlocked { holder, name, .. } => {
+                let holder = match holder {
+                    SpeedTestQuotaHolder::Server => "server",
+                    SpeedTestQuotaHolder::Egress => "egress",
+                };
+                return write!(
+                    f,
+                    "{holder} {name} has used its download quota, and a speed test books its bytes against it"
+                );
+            }
+            Self::SpeedTestLeaseRefused { name, reason, .. } => {
+                return write!(f, "server {name} cannot lend its connections: {reason}");
+            }
+
+            Self::TestNeedsRoute => "a test goes through a route drafted for it",
+            Self::TestTargetRequired => "a test of the route alone needs a host and port to reach",
+            Self::TestSubjectInRoute => {
+                "the route a proxy is tested through cannot carry that proxy"
+            }
+            Self::TestPathCount { limit } => {
+                return write!(
+                    f,
+                    "a test tries every path through the route, and at most {limit}; draft a smaller route"
+                );
+            }
         };
         f.write_str(sentence)
     }

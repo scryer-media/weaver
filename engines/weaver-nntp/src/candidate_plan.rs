@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Pure candidate selection shared by address races and proxy-member races.
 use crate::address_plan::{
     DELIVERY_MIN_SAMPLES, DELIVERY_REPIN_RATIO, RaceReason, SHADOW_EVERY_CONNECTS, SHADOW_RETRIES,

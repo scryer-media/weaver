@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,6 +84,10 @@ fn graphql_endpoint(base: &str) -> String {
     format!("{}/graphql", base.trim_end_matches('/'))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the CLI asks the operator's own Weaver server"
+)]
 async fn fetch_job_report(
     base: &str,
     api_key: Option<&str>,

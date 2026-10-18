@@ -1,9 +1,36 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Loopback regressions for mixed backend ownership. No provider is contacted.
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use weaver_nntp::route_dialer::{AddressPlanned, RouteDialer};
 use weaver_nntp::transfer::{ServerTransferRegistry, StableServerId};
 use weaver_nntp::{NntpPool, PoolConfig, ServerConfig, ServerId, ServerPoolConfig};
+
+// The direct route out of the System egress to the loopback fixture.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests reach their loopback servers on the direct route"
+)]
+fn direct_route() -> Arc<RouteDialer> {
+    let planned = Arc::new(AddressPlanned::new(
+        "socket budget fixture".into(),
+        Arc::new(weaver_tunnel::pipe::Egress::new(
+            0,
+            weaver_nntp::egress::SocketEgress::System,
+            Duration::from_secs(30),
+        )),
+    ));
+    Arc::new(RouteDialer {
+        plan: Some(planned.plan.clone()),
+        inner: planned,
+        egress_controls: Arc::new(ServerTransferRegistry::new()),
+        runtime: tokio::runtime::Handle::current(),
+        server: 0,
+    })
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_idle_socket_is_closed_before_blocking_slot_is_reassigned() {
@@ -28,18 +55,18 @@ async fn async_idle_socket_is_closed_before_blocking_slot_is_reassigned() {
     });
     let registry = ServerTransferRegistry::new();
     let control = registry.control(StableServerId(7));
+    let route = direct_route();
     let config = || PoolConfig {
         servers: vec![ServerPoolConfig {
-            server: ServerConfig {
-                host: address.ip().to_string(),
-                port: address.port(),
-                tls: false,
-                ..Default::default()
-            },
             stable_id: StableServerId(7),
             transfer_control: Some(Arc::clone(&control)),
             max_connections: 1,
-            ..Default::default()
+            ..ServerPoolConfig::new(ServerConfig {
+                host: address.ip().to_string(),
+                port: address.port(),
+                tls: false,
+                ..ServerConfig::new(Arc::clone(&route))
+            })
         }],
         ..Default::default()
     };
@@ -63,7 +90,6 @@ async fn async_idle_socket_is_closed_before_blocking_slot_is_reassigned() {
             StableServerId(7),
             None,
             &server_config,
-            None,
             &[],
             Duration::from_secs(2),
             permit,

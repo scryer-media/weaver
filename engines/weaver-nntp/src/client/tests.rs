@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::test_support::{
     ScriptedStep, read_command_line, spawn_scripted_server as spawn_shared_scripted_server,

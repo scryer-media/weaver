@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 
 fn proxy() -> ProxyProfile {
@@ -8,6 +11,7 @@ fn proxy() -> ProxyProfile {
         enabled: true,
         host: "proxy.invalid".into(),
         port: 1080,
+        resolver: Resolver::Proxy,
         dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
@@ -279,7 +283,9 @@ async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_faile
     let unreachable = || DialError::Egress(std::io::Error::other("no route to host"));
 
     // Both proxy rungs fail; the direct fallback has not run yet.
-    let attempts = runtime.feed_attempts(1, legacy.clone()).unwrap();
+    let attempts = runtime
+        .fetch_attempts(Consumer::Rss(1), legacy.clone())
+        .unwrap();
     assert_eq!(attempts.len(), 3, "two rungs and the direct fallback");
     attempts[0].report(Some(&refused(1)));
     attempts[1].report(Some(&refused(2)));
@@ -295,7 +301,7 @@ async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_faile
     // Once the rungs' own cooldowns lapse, the next sync fails the same way;
     // two whole failed syncs cool the leg.
     tokio::time::advance(Duration::from_secs(31)).await;
-    let attempts = runtime.feed_attempts(1, legacy).unwrap();
+    let attempts = runtime.fetch_attempts(Consumer::Rss(1), legacy).unwrap();
     assert_eq!(attempts.len(), 3);
     attempts[0].report(Some(&refused(1)));
     attempts[1].report(Some(&refused(2)));
@@ -689,6 +695,7 @@ fn wireguard_profile(
         kind: ProxyKind::WireGuard,
         host,
         port,
+        resolver: Resolver::Proxy,
         dns_servers: spec.dns_servers.clone(),
         tunnel_addresses: vec![format!(
             "{}/32",
@@ -1184,3 +1191,6 @@ fn a_held_share_on_an_out_of_quota_leg_leaves_no_leg_in_quota() {
         &HashSet::from([1, 2])
     ));
 }
+
+#[path = "network_test_via_tests.rs"]
+mod via;

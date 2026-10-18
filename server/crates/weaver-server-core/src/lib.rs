@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// Tests dial their own loopback fixtures.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod application_upgrade;
 pub mod auth;
 pub mod bandwidth;
@@ -23,6 +29,7 @@ pub mod schema_upgrade;
 pub mod security;
 pub mod servers;
 pub mod settings;
+pub mod speed_test;
 pub mod support;
 pub mod update_check;
 // Transitional, removed in 0.9.1. See the module docs.

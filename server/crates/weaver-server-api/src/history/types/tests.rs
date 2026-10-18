@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::jobs::types::AttributeInput;
 use weaver_server_core::{CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobHistoryRow};
@@ -164,5 +167,71 @@ fn history_item_has_password_for_a_submitted_or_validated_password() {
     assert!(
         item.attributes.is_empty(),
         "the marker is not a public attribute"
+    );
+}
+
+#[tokio::test]
+async fn history_item_exposes_full_file_names_but_not_as_an_attribute() {
+    let row = JobHistoryRow {
+        job_id: 79,
+        job_hash: None,
+        name: "Posted Names".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 2_000,
+        downloaded_bytes: 2_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: Some("/tmp/history".to_string()),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(
+            serde_json::to_string(&vec![(
+                weaver_server_core::ingest::FULL_FILE_NAMES_METADATA_KEY.to_string(),
+                r#"[{"name":"short.mkv","full_name":"a much longer full name.mkv"}]"#.to_string(),
+            )])
+            .unwrap(),
+        ),
+        server_attribution: None,
+    };
+
+    struct Query(HistoryItem);
+    #[async_graphql::Object]
+    impl Query {
+        async fn item(&self) -> HistoryItem {
+            self.0.clone()
+        }
+    }
+
+    let item = history_item_from_row(&row, None);
+    assert!(item.attributes.is_empty());
+    let schema = async_graphql::Schema::new(
+        Query(item.clone()),
+        async_graphql::EmptyMutation,
+        async_graphql::EmptySubscription,
+    );
+    let response = schema
+        .execute("{ item { fullFileNames { name fullName } } }")
+        .await;
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap(),
+        serde_json::json!({
+            "item": {
+                "fullFileNames": [
+                    {"name": "short.mkv", "fullName": "a much longer full name.mkv"}
+                ]
+            }
+        })
+    );
+    let table_item = history_table_item_from_row(&row, None);
+    assert_eq!(
+        table_item.full_file_names_record,
+        item.full_file_names_record
     );
 }

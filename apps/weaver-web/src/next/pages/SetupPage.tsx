@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { BrandLockup, BrandMark } from "@/lib/brand";
 import { PASSWORD_MANAGER_IGNORE } from "@/lib/password-manager";

@@ -1,4 +1,7 @@
-import { useEffect, useRef, type ReactNode } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
 
@@ -39,7 +42,9 @@ export function Dialog({
   // Read through a ref so a re-render with a fresh callback keeps this
   // dialog's place in the stack instead of re-registering it on top.
   const dismissRef = useRef(onDismiss);
-  dismissRef.current = onDismiss;
+  useLayoutEffect(() => {
+    dismissRef.current = onDismiss;
+  });
   useEffect(() => {
     if (!open) {
       return;

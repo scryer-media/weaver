@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 mod passwords;
 mod zip64;
@@ -18,36 +21,265 @@ use lzma_turbo::{LzmaEncProps, XzWriter};
 
 static XZ_MT_DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+fn commit_test_member(index: usize, phase: &Arc<PhaseCounters>) -> WrittenMember {
+    let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase)));
+    attempt.reserve_total(1);
+    attempt.record_completed(1);
+    WrittenMember {
+        file_index: index,
+        name: format!("member-{index}"),
+        size: 1,
+        bytes_written: 1,
+        attempt,
+        committed: false,
+    }
+}
+
 #[test]
-fn sevenz_member_requires_declared_length_and_crc() {
-    let payload = b"verified member";
-    let mut crc = weaver_yenc::crc::Crc32::new();
-    crc.update(payload);
-    let checksum = u64::from(crc.finalize());
-    for has_crc in [false, true] {
-        for size in [payload.len() - 1, payload.len(), payload.len() + 1] {
-            for stored_crc in [checksum, checksum ^ 1] {
-                let entry = sevenz_turbo::ArchiveEntry {
-                    name: "member.bin".into(),
-                    size: size as u64,
-                    has_crc,
-                    crc: stored_crc,
-                    ..Default::default()
-                };
-                let mut output = Vec::new();
-                let result = copy_verified_7z_member(&entry, &mut &payload[..], &mut output);
-                let valid = size == payload.len() && (!has_crc || stored_crc == checksum);
-                assert_eq!(
-                    result.is_ok(),
-                    valid,
-                    "size={size}, crc={stored_crc}, has_crc={has_crc}"
-                );
-                if valid {
-                    assert_eq!(result.unwrap(), payload.len() as u64);
-                    assert_eq!(output, payload);
-                }
-            }
+fn sevenz_member_verdicts_commit_once_and_rollback_only_unverified_members() {
+    let phase = Arc::new(PhaseCounters::default());
+    let (tx, mut rx) = broadcast::channel(16);
+    let mut commits = MemberCommits::new(JobId(1), "archive", &tx);
+    commits.written(commit_test_member(usize::MAX, &phase), true);
+    commits.written(commit_test_member(3, &phase), true);
+    commits.written(commit_test_member(99, &phase), false);
+    commits.verified.lock().unwrap().extend([3, 3, 99]);
+    commits.settle();
+    assert!(
+        commits.finish().is_err(),
+        "missing CRC verdict must fail the set"
+    );
+    assert_eq!(phase.completed_bytes.load(Ordering::Relaxed), 2);
+    assert_eq!(phase.total_bytes.load(Ordering::Relaxed), 2);
+    let mut finished = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let PipelineEvent::ExtractionMemberFinished { member, .. } = event {
+            finished.push(member);
         }
+    }
+    assert_eq!(finished, ["member-99", "member-3"]);
+}
+
+#[test]
+fn sevenz_many_delayed_verdicts_preserve_member_order() {
+    const COUNT: usize = 10_000;
+    let phase = Arc::new(PhaseCounters::default());
+    let (tx, _) = broadcast::channel(16);
+    let mut commits = MemberCommits::new(JobId(1), "archive", &tx);
+    for index in 0..COUNT {
+        commits.written(commit_test_member(index * 2, &phase), true);
+    }
+    commits
+        .verified
+        .lock()
+        .unwrap()
+        .extend((0..COUNT).rev().map(|index| index * 2));
+    let names = commits.finish().unwrap();
+    assert_eq!(
+        names,
+        (0..COUNT)
+            .map(|index| format!("member-{}", index * 2))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(phase.completed_bytes.load(Ordering::Relaxed), COUNT as u64);
+}
+
+// The sink holds a member to its declared length. Its CRC is the reader's to
+// check; see `a_member_failing_the_readers_crc_check_is_never_committed`.
+#[test]
+fn sevenz_member_requires_declared_length() {
+    let payload = b"verified member";
+    for size in [payload.len() - 1, payload.len(), payload.len() + 1] {
+        let entry = sevenz_turbo::ArchiveEntry {
+            name: "member.bin".into(),
+            size: size as u64,
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        let result = copy_verified_7z_member(&entry, &mut &payload[..], &mut output);
+        let valid = size == payload.len();
+        assert_eq!(result.is_ok(), valid, "size={size}");
+        if valid {
+            assert_eq!(result.unwrap(), payload.len() as u64);
+            assert_eq!(output, payload);
+        }
+    }
+}
+
+// Bytes no coder can shrink, so an LZMA2 encoder stores them in uncompressed
+// chunks and a flipped byte decodes as a flipped byte: a CRC mismatch, not a
+// decoder failure.
+fn incompressible(bytes: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..bytes)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+// A 7z archive of `members` in one block coded with `method`.
+fn sevenz_archive_with_method(
+    method: sevenz_turbo::EncoderConfiguration,
+    members: &[(&str, &[u8])],
+) -> Vec<u8> {
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter};
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+    writer.set_content_methods(vec![method]);
+    for (name, bytes) in members {
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(name),
+                Some(Cursor::new(bytes.to_vec())),
+            )
+            .expect("entry");
+    }
+    writer.finish().expect("finish").into_inner()
+}
+
+// The member names the decode announced as finished, in order.
+fn finished_members(events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>) -> Vec<String> {
+    let mut finished = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let PipelineEvent::ExtractionMemberFinished { member, .. } = event {
+            finished.push(member);
+        }
+    }
+    finished
+}
+
+// Weaver computes no member CRC of its own: the reader's verdict is the
+// commit signal. A member whose bytes do not match its CRC fails the set as a
+// block data error, which keeps the set for the recovery data to rule on, and
+// it is never announced as extracted nor counted as completed. The member
+// before it, which matched, is committed.
+//
+// Every place the reader checks a CRC: Copy, by its verifying reader on the
+// delivering thread; and a multi-run LZMA2 archive on four threads, whose
+// small first block decodes on a folder worker and whose second, too large to
+// stage, decodes alone in parallel with its checksums folded from the
+// workers, so its verdict can arrive after its callback has returned.
+#[test]
+fn a_member_failing_the_readers_crc_check_is_never_committed() {
+    let good = incompressible(3 * 1024 * 1024, 7);
+    let bad = incompressible(9 * 1024 * 1024, 11);
+    let members: [(&str, &[u8]); 2] = [
+        ("Silver.Horizon/good.bin", &good),
+        ("Silver.Horizon/bad.bin", &bad),
+    ];
+    let cases = [
+        (
+            "copy",
+            sevenz_archive_with_method(
+                sevenz_turbo::EncoderConfiguration::new(sevenz_turbo::EncoderMethod::COPY),
+                &members,
+            ),
+            1,
+        ),
+        (
+            "parallel lzma2",
+            sevenz_multi_run_archive(1024 * 1024, &members),
+            4,
+        ),
+    ];
+    for (label, mut archive, threads) in cases {
+        // Packed bytes of the block start right after the signature header,
+        // the two members in order; the middle of the second member's
+        // stretch is its own payload, whatever chunk framing surrounds it.
+        let flip = 32 + good.len() + bad.len() / 2;
+        archive[flip] ^= 0x40;
+
+        let temp = TempDir::new().unwrap();
+        let out_dir = temp.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let (root, budget) = test_extraction_security_with_memory(&out_dir, 1024 * 1024 * 1024);
+        let mut context = conventional_7z_context(&out_dir, root, budget, &archive, threads);
+        let (event_tx, mut events) = tokio::sync::broadcast::channel(64);
+        context.event_tx = event_tx;
+        let Err(error) = extract_7z_stream(&context, || Ok(Cursor::new(archive.clone()))) else {
+            panic!("{label}: a member that fails its CRC fails the set");
+        };
+
+        assert_eq!(
+            error.class(),
+            ExtractionErrorClass::Recoverable,
+            "{label}: the reader's CRC verdict keeps the set for repair: {error}"
+        );
+        assert_eq!(
+            finished_members(&mut events),
+            vec!["Silver.Horizon/good.bin".to_string()],
+            "{label}: only the member that matched its CRC is announced"
+        );
+        assert_eq!(
+            context
+                .phase_counters
+                .completed_bytes
+                .load(Ordering::Relaxed),
+            good.len() as u64,
+            "{label}: the failed member's bytes are rolled back"
+        );
+    }
+}
+
+// Every member that records a CRC is committed only on the reader's report,
+// and every one is reported: an intact archive extracts in full, in order, on
+// both coder paths.
+#[test]
+fn members_are_committed_on_the_readers_crc_report() {
+    let first = incompressible(3 * 1024 * 1024, 5);
+    let second = incompressible(9 * 1024 * 1024, 9);
+    let members: [(&str, &[u8]); 2] = [
+        ("Silver.Horizon/first.bin", &first),
+        ("Silver.Horizon/second.bin", &second),
+    ];
+    let cases = [
+        (
+            "copy",
+            sevenz_archive_with_method(
+                sevenz_turbo::EncoderConfiguration::new(sevenz_turbo::EncoderMethod::COPY),
+                &members,
+            ),
+            1,
+        ),
+        (
+            "parallel lzma2",
+            sevenz_multi_run_archive(1024 * 1024, &members),
+            4,
+        ),
+    ];
+    for (label, archive, threads) in cases {
+        let temp = TempDir::new().unwrap();
+        let out_dir = temp.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let (root, budget) = test_extraction_security_with_memory(&out_dir, 1024 * 1024 * 1024);
+        let mut context = conventional_7z_context(&out_dir, root, budget, &archive, threads);
+        let (event_tx, mut events) = tokio::sync::broadcast::channel(64);
+        context.event_tx = event_tx;
+        let outcome =
+            extract_7z_stream(&context, || Ok(Cursor::new(archive.clone()))).expect(label);
+        let names = vec![
+            "Silver.Horizon/first.bin".to_string(),
+            "Silver.Horizon/second.bin".to_string(),
+        ];
+        assert_eq!(outcome.extracted, names, "{label}");
+        assert_eq!(finished_members(&mut events), names, "{label}");
+        assert_eq!(
+            context
+                .phase_counters
+                .completed_bytes
+                .load(Ordering::Relaxed),
+            (first.len() + second.len()) as u64,
+            "{label}"
+        );
+        assert_eq!(fs::read(out_dir.join(&names[0])).unwrap(), first, "{label}");
+        assert_eq!(
+            fs::read(out_dir.join(&names[1])).unwrap(),
+            second,
+            "{label}"
+        );
     }
 }
 
@@ -290,6 +522,7 @@ fn extract_with_weaver_zip_result(
         None,
     )
     .map(|(members, _)| members)
+    .map_err(String::from)
 }
 
 fn extract_with_weaver_zip_result_with_phase(
@@ -318,7 +551,8 @@ fn extract_with_weaver_zip_result_with_phase(
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
         Some(Arc::clone(&phase_counters)),
     )
-    .map(|(members, _)| members);
+    .map(|(members, _)| members)
+    .map_err(String::from);
     (result, phase_counters)
 }
 
@@ -414,6 +648,7 @@ fn extract_with_weaver_tar_result(
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
     )
+    .map_err(String::from)
 }
 
 fn extract_with_weaver_xz_result(
@@ -432,6 +667,7 @@ fn extract_with_weaver_xz_result(
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
         2,
     )
+    .map_err(String::from)
 }
 
 fn extract_with_weaver_tar_xz_result(
@@ -448,6 +684,7 @@ fn extract_with_weaver_tar_xz_result(
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
     )
+    .map_err(String::from)
 }
 
 fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
@@ -1028,7 +1265,7 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
         decode_threads: 1,
     };
     let outcome = extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("7z extraction");
 
@@ -1226,7 +1463,7 @@ fn conventional_7z_metadata_pass_reserves_what_its_reader_is_limited_to() {
             .lock()
             .unwrap()
             .push(budget.memory_reserved_bytes());
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("7z extraction");
 
@@ -1564,14 +1801,14 @@ fn conventional_7z_extraction_refuses_a_dictionary_the_memory_ceiling_cannot_hol
     let (root, budget) = test_extraction_security_with_memory(&out_dir, 8 * 1024 * 1024);
     let context = conventional_7z_context(&out_dir, root, budget, &archive, 1);
     let error = match extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     }) {
         Ok(_) => panic!("a 16 MiB dictionary was decoded under an 8 MiB ceiling"),
         Err(error) => error,
     };
 
     assert!(
-        error.contains("MemoryLimited"),
+        error.message().contains("MemoryLimited"),
         "the refusal names the memory limit: {error}"
     );
     assert!(
@@ -1603,7 +1840,7 @@ fn conventional_7z_extraction_decodes_with_the_threads_it_is_given() {
     let (root, budget) = test_extraction_security(&out_dir);
     let context = conventional_7z_context(&out_dir, root, Arc::clone(&budget), &archive, 4);
     let outcome = extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("7z extraction");
 
@@ -1680,7 +1917,7 @@ fn conventional_7z_extraction_admits_beside_a_peer_job_retained_state() {
 
     let context = conventional_7z_context(&out_dir, root, Arc::clone(&budget), &archive, 4);
     let outcome = extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("the decode is admitted while the peer's state is still held");
 
@@ -1761,30 +1998,19 @@ fn conventional_7z_decode_reservation_is_sized_from_the_archive_and_its_threads(
     );
 }
 
-// A 7z block whose bytes are wrong is worded for the scheduler to keep for
+// A 7z block whose bytes are wrong is classed for the scheduler to keep for
 // the recovery data; a method this build cannot decode, a password problem,
-// and a read that failed for any reason but malformed or short bytes keep the
-// ordinary wording, which ends the job. The I/O cases are rendered the way
-// the decoder renders them, from the reader's own error.
+// a fault in the decoder, and a read that failed for any reason but malformed
+// or short bytes are terminal.
 #[test]
 fn sevenz_extraction_error_marks_only_data_errors() {
-    use sevenz_turbo::BlockErrorKind;
+    use sevenz_turbo::Error;
 
-    let block = |kind, message: String| sevenz_turbo::Error::BlockDecode {
-        block_index: 0,
-        packed_offset: 32,
-        kind,
-        message,
-    };
-    let read_failure = |error: std::io::Error| {
-        block(
-            BlockErrorKind::Io,
-            sevenz_turbo::Error::Io(error, "".into()).to_string(),
-        )
-    };
+    let block = |cause: Error| cause.in_block(0, 32);
+    let read_failure = |error: std::io::Error| block(Error::Io(error, "".into()));
     let data_errors = [
-        block(BlockErrorKind::Corrupted, "detail".to_string()),
-        block(BlockErrorKind::ChecksumMismatch, "detail".to_string()),
+        block(Error::Corrupted("detail".into())),
+        block(Error::ChecksumVerificationFailed),
         read_failure(std::io::ErrorKind::UnexpectedEof.into()),
         read_failure(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1796,16 +2022,18 @@ fn sevenz_extraction_error_marks_only_data_errors() {
         )),
     ];
     for error in &data_errors {
-        let worded = sevenz_extraction_error(error);
-        assert!(
-            worded.starts_with(SEVENZ_BLOCK_DATA_ERROR_PREFIX),
-            "{worded}"
+        let classed = sevenz_extraction_error(error);
+        assert_eq!(
+            classed.class(),
+            ExtractionErrorClass::Recoverable,
+            "{classed}"
         );
     }
     let terminal = [
-        block(BlockErrorKind::UnsupportedMethod, "detail".to_string()),
-        block(BlockErrorKind::Password, "detail".to_string()),
-        block(BlockErrorKind::Io, "detail".to_string()),
+        block(Error::UnsupportedCompressionMethod("detail".into())),
+        block(Error::MaybeBadPassword(std::io::Error::other("detail"))),
+        block(Error::Internal("detail".into())),
+        block(Error::Cancelled),
         read_failure(std::io::Error::from_raw_os_error(5)),
         read_failure(std::io::ErrorKind::PermissionDenied.into()),
         read_failure(std::io::Error::new(
@@ -1814,9 +2042,13 @@ fn sevenz_extraction_error_marks_only_data_errors() {
         )),
     ];
     for error in &terminal {
-        let worded = sevenz_extraction_error(error);
-        assert!(worded.starts_with("7z extraction failed: "), "{worded}");
+        let classed = sevenz_extraction_error(error);
+        assert_eq!(classed.class(), ExtractionErrorClass::Terminal, "{classed}");
     }
+    assert!(
+        sevenz_extraction_error(&sevenz_turbo::Error::PasswordRequired)
+            .is(ExtractionErrorClass::PasswordRequired)
+    );
 }
 
 // `bytes` of word salad: compressible enough that decoding it takes real
@@ -2074,7 +2306,8 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
             },
             budget: Arc::clone(&budget),
         },
-        |entry, reader, _dest| {
+        None,
+        |entry, _file_index, reader| {
             assert_eq!(entry.name(), "Silver.Horizon/reel.txt");
             let mut chunk = vec![0u8; 64 * 1024];
             loop {
@@ -2151,7 +2384,7 @@ fn chase_7z_extraction_decodes_a_multi_run_block_adaptively() {
         decode_threads: 4,
     };
     let outcome = extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("7z chase extraction");
 

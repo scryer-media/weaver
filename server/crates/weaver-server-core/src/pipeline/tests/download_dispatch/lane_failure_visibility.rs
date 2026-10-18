@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A lane that cannot be acquired must be visible, and must be retried.
 //
 // The acquire-failure handler keeps the download running either way — the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Side-by-side parity bench against rapidyenc (RQ2's parity harness).
 //
 // Gated on `WEAVER_RAPIDYENC_LIB` pointing at a rapidyenc shared library

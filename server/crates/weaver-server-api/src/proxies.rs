@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use crate::{
     auth::AdminGuard,
     observability::{refusal_error, spawn_blocking_db},
@@ -45,6 +48,29 @@ impl From<proxies::ProxyKind> for ProxyKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "ProxyResolver")]
+pub enum ProxyResolver {
+    Weaver,
+    Proxy,
+}
+impl From<ProxyResolver> for proxies::Resolver {
+    fn from(v: ProxyResolver) -> Self {
+        match v {
+            ProxyResolver::Weaver => Self::Weaver,
+            ProxyResolver::Proxy => Self::Proxy,
+        }
+    }
+}
+impl From<proxies::Resolver> for ProxyResolver {
+    fn from(v: proxies::Resolver) -> Self {
+        match v {
+            proxies::Resolver::Weaver => Self::Weaver,
+            proxies::Resolver::Proxy => Self::Proxy,
+        }
+    }
+}
+
 #[derive(Clone, Debug, InputObject)]
 pub struct RoutingPolicyInput {
     pub proxy_ids: Vec<u32>,
@@ -84,7 +110,21 @@ pub enum RoutingState {
 #[derive(SimpleObject)]
 pub struct RoutingFailure {
     pub proxy_id: u32,
+    // The failure in English, for a client with no sentence for its code.
     pub message: String,
+    pub code: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
+}
+impl RoutingFailure {
+    fn new(proxy_id: u32, fault: &proxies::ProxyFault) -> Self {
+        Self {
+            proxy_id,
+            message: fault.to_string(),
+            code: fault.code().into(),
+            params: async_graphql::Json(proxies::fault_params(fault)),
+        }
+    }
 }
 #[derive(SimpleObject)]
 pub struct RoutingStatus {
@@ -103,6 +143,7 @@ pub struct ProxyProfileGql {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
+    pub resolver: ProxyResolver,
     pub dns_servers: Vec<String>,
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
@@ -131,6 +172,7 @@ impl From<ProxyProfile> for ProxyProfileGql {
             enabled: p.enabled,
             host: p.host,
             port: p.port,
+            resolver: p.resolver.into(),
             dns_servers: p.dns_servers.iter().map(ToString::to_string).collect(),
             tunnel_addresses: p.tunnel_addresses,
             peer_public_key: p.peer_public_key,
@@ -155,6 +197,9 @@ pub struct ProxyProfileInput {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
+    // Omitted by a client written before a proxy named its resolver: a saved
+    // proxy keeps its own, and a new one resolves as every proxy did then.
+    pub resolver: Option<ProxyResolver>,
     #[graphql(default)]
     pub dns_servers: Vec<String>,
     #[graphql(default)]
@@ -194,6 +239,23 @@ impl ProxyProfileInput {
         secret_update(&mut secrets.private_key, self.private_key);
         secret_update(&mut secrets.passphrase, self.passphrase);
         secret_update(&mut secrets.preshared_key, self.preshared_key);
+        let dns_servers: Vec<std::net::IpAddr> = self
+            .dns_servers
+            .iter()
+            .map(|s| s.trim().parse())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| refusal_error(NetworkRefusal::ProxyDnsServerInvalid))?;
+        let resolver = match (self.resolver, existing) {
+            (Some(resolver), _) => resolver.into(),
+            (None, Some(existing)) => existing.resolver,
+            // A WireGuard tunnel cannot take a name, so without servers of
+            // its own Weaver resolved for it; every other proxy resolved for
+            // itself, through its servers when it had them.
+            (None, None) if self.kind == ProxyKind::WireGuard && dns_servers.is_empty() => {
+                proxies::Resolver::Weaver
+            }
+            (None, None) => proxies::Resolver::Proxy,
+        };
         let profile = ProxyProfile {
             id,
             name: self.name.trim().into(),
@@ -201,12 +263,8 @@ impl ProxyProfileInput {
             enabled: self.enabled,
             host: self.host.trim().trim_matches(['[', ']']).into(),
             port: self.port,
-            dns_servers: self
-                .dns_servers
-                .iter()
-                .map(|s| s.trim().parse())
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|_| refusal_error(NetworkRefusal::ProxyDnsServerInvalid))?,
+            resolver,
+            dns_servers,
             tunnel_addresses: self.tunnel_addresses,
             peer_public_key: self.peer_public_key,
             mtu: self.mtu,
@@ -232,25 +290,18 @@ pub(crate) fn draft_route(
     ctx: &Context<'_>,
     consumer: Consumer,
     input: Option<RoutingPolicy>,
-) -> Result<Option<Arc<proxies::DraftNetworkRoute>>> {
-    let handle = ctx.data::<SchedulerHandle>()?;
-    let Some(runtime) = handle.proxy_runtime() else {
-        if input.as_ref().is_none_or(RoutingPolicy::is_direct) {
-            return Ok(None);
-        }
-        return Err("proxy runtime unavailable".into());
-    };
+) -> Result<Arc<proxies::DraftNetworkRoute>> {
+    let runtime = runtime(ctx)?;
     let policy = input.unwrap_or_else(|| runtime.policy(consumer));
     // A route the operator may not save is refused by its code; a draft that
     // cannot be built for any other reason is reported as it stands.
     runtime
         .network
-        .validate_policy(consumer, &policy)
+        .validate_policy(&policy)
         .map_err(refusal_error)?;
     runtime
         .network
         .draft_route(consumer, policy, Duration::from_secs(30))
-        .map(Some)
         .map_err(async_graphql::Error::new)
 }
 pub(crate) fn refresh<'a>(
@@ -299,7 +350,11 @@ impl ProxiesQuery {
 #[derive(SimpleObject)]
 pub struct ProxyTestResult {
     pub success: bool,
+    pub code: String,
+    // The outcome in English, for a client with no sentence for its code.
     pub message: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Default)]
@@ -340,19 +395,6 @@ impl ProxiesMutation {
                 .ok_or("proxy IDs exhausted")?,
         );
         let profile = input.profile(id, existing)?;
-        // Removing DNS from an RSS-assigned profile would invalidate its policy.
-        if profile.dns_servers.is_empty() {
-            let read_db = db.clone();
-            let routes =
-                spawn_blocking_db("proxies.references", move || read_db.list_proxy_routes())
-                    .await?;
-            if routes
-                .iter()
-                .any(|(key, policy)| key.starts_with("rss:") && policy.proxy_ids.contains(&id))
-            {
-                return Err(refusal_error(NetworkRefusal::RssRouteProxyNeedsDns));
-            }
-        }
         let saved = profile.clone();
         let profile =
             spawn_blocking_db("proxies.save", move || db.save_proxy_profile(&saved)).await?;
@@ -395,29 +437,15 @@ impl ProxiesMutation {
         refresh_nntp(ctx).await?;
         Ok(profile.into())
     }
-    #[graphql(guard = "AdminGuard")]
-    async fn test_proxy_profile(&self, ctx: &Context<'_>, id: u32) -> Result<ProxyTestResult> {
-        let runtime = runtime(ctx)?;
-        let _guard = runtime.mutations.lock().await;
-        let db = ctx.data::<Database>()?.clone();
-        let profile = spawn_blocking_db("proxies.load", move || db.list_proxy_profiles())
-            .await?
-            .into_iter()
-            .find(|p| p.id == id)
-            .ok_or("proxy not found")?;
-        let test: std::pin::Pin<
-            Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>,
-        > = Box::pin(runtime.test_profile(&profile));
-        Ok(match test.await {
-            Ok(message) => ProxyTestResult {
-                success: true,
-                message,
-            },
-            Err(message) => ProxyTestResult {
-                success: false,
-                message,
-            },
-        })
+    // A test names the route it goes through; this one names none, so it is
+    // refused.
+    #[graphql(
+        guard = "AdminGuard",
+        deprecation = "Use testVia with the route the proxy is tested through."
+    )]
+    async fn test_proxy_profile(&self, id: u32) -> Result<ProxyTestResult> {
+        let _ = id;
+        Err(refusal_error(NetworkRefusal::TestNeedsRoute))
     }
 }
 
@@ -477,7 +505,7 @@ fn status_for(ctx: &Context<'_>, consumer: Consumer) -> Result<RoutingStatus> {
         failures: status
             .failures
             .into_iter()
-            .map(|(proxy_id, message)| RoutingFailure { proxy_id, message })
+            .map(|(proxy_id, fault)| RoutingFailure::new(proxy_id, &fault))
             .collect(),
     })
 }

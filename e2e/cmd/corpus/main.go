@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Command corpus manages the harness's signed, content-addressed fixture
 // corpus: it builds and verifies the manifest, hydrates fixtures from the
 // published bucket, and (in the publish workflow) signs and uploads a corpus

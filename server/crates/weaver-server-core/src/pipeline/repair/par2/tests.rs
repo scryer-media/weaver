@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::{
     RecoveryCandidate, RecoveryCountSource, is_terminal_status, par2_prefix_set_ids,
     par2_recovery_packet_size, par2_set_base_name, parse_stateful_par2_session_enabled,

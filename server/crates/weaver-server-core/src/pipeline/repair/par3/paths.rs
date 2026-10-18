@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Whether an authenticated PAR3 path may become a file on this machine.
 //
 // A set's File and Directory packets carry paths chosen by whoever built the

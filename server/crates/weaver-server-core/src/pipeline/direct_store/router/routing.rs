@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Continuation of the `impl DirectSetRouter` block from `direct_store/router.rs`.
 // Split out mechanically to keep the parent file readable; no behavior lives here
 // that is not simply a method of the same type.
@@ -30,11 +33,7 @@ impl DirectSetRouter {
         // Every volume, not just this one: a header landing here is exactly what
         // resolves a *later* volume's split-continuation offset, so its holds
         // become routable in the same call.
-        let volumes: Vec<u32> = self.staging.keys().copied().collect();
-        let mut spans = self.take_migrated_spans();
-        for volume in volumes {
-            spans.extend(self.drain_volume(volume)?);
-        }
+        let spans = self.drain_staged_volumes()?;
 
         // A breach — of this set's budget, or of the process-wide limit every
         // set shares — pages rather than demoting. Demotion is what is left
@@ -468,11 +467,7 @@ impl DirectSetRouter {
             }
         }
         self.check_eligibility()?;
-        let volumes: Vec<u32> = self.staging.keys().copied().collect();
-        let mut spans = self.take_migrated_spans();
-        for volume in volumes {
-            spans.extend(self.drain_volume(volume)?);
-        }
+        let spans = self.drain_staged_volumes()?;
         Ok(spans)
     }
 
@@ -657,6 +652,23 @@ impl DirectSetRouter {
     }
 
     pub(super) fn fail(&mut self, reason: DemotionReason) -> DemotionReason {
+        if self.demoted.is_none()
+            && self
+                .sevenz_facts
+                .as_ref()
+                .is_some_and(|facts| facts.entries.iter().any(|entry| entry.aes.is_some()))
+        {
+            crate::runtime::perf_probe::record(
+                "direct_store.sevenz.aes_demoted",
+                std::time::Duration::from_nanos(1),
+            );
+            if reason == DemotionReason::SevenZipAesChecksumMismatch {
+                crate::runtime::perf_probe::record(
+                    "direct_store.sevenz.aes_plaintext_checksum_demoted",
+                    std::time::Duration::from_nanos(1),
+                );
+            }
+        }
         self.demoted.get_or_insert(reason);
         reason
     }
@@ -1395,6 +1407,29 @@ impl DirectSetRouter {
         // build cannot use, and the set demotes here rather than writing
         // anything.
         let keys = self.admit_encrypted()?;
+        let aes_members: Vec<_> = self
+            .layout
+            .as_ref()
+            .and_then(SetLayout::sevenz)
+            .map(|layout| {
+                layout
+                    .members()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, member)| {
+                        Some((member.name.clone(), layout.aes(index)?.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut sevenz_keys = HashMap::with_capacity(aes_members.len());
+        for (name, facts) in aes_members {
+            let keys = self
+                .crypt
+                .admit_sevenz(&facts)
+                .map_err(|refusal| self.fail(DemotionReason::EncryptedMemberRefused(refusal)))?;
+            sevenz_keys.insert(name, (keys, facts));
+        }
 
         let routable: Vec<(String, u64, Option<unrar_rs::EncryptedStore>)> = self
             .layout_members()
@@ -1444,12 +1479,18 @@ impl DirectSetRouter {
                 Ok(path) => path,
                 Err(()) => return Err(self.fail(DemotionReason::UnsafeDestination)),
             };
-            let crypt = encrypted.and_then(|facts| {
-                let (member_keys, keying) = keys.get(&name)?;
-                let mut crypt = MemberCrypt::new(*member_keys, keying);
-                crypt.observe(&facts);
-                Some(crypt)
-            });
+            let crypt = encrypted
+                .and_then(|facts| {
+                    let (member_keys, keying) = keys.get(&name)?;
+                    let mut crypt = MemberCrypt::new(*member_keys, keying);
+                    crypt.observe(&facts);
+                    Some(crypt)
+                })
+                .or_else(|| {
+                    sevenz_keys
+                        .get(&name)
+                        .map(|(keys, facts)| MemberCrypt::new_sevenz(*keys, facts, unpacked_size))
+                });
             let member_id = self.next_member_id;
             self.next_member_id = self.next_member_id.saturating_add(1);
             self.member_ids.insert(name.clone(), member_id);
@@ -1959,11 +2000,71 @@ impl DirectSetRouter {
         names.into_iter().map(|(_, _, member)| member).collect()
     }
 
+    // A later volume can fail the 7z plaintext CRC after an earlier volume
+    // released cipher holds into spans that the caller has not placed yet.
+    // Keep the original staging until the entire drain succeeds. Only range
+    // metadata is cloned: ciphertext stays in its existing RAM/scratch slots,
+    // and the decryptor still transforms its usual contiguous buffer in place.
+    // Cipher chunks overlap emitted plaintext for this drain only; resident
+    // accounting counts chunks, regardless of their pending/routed markers.
+    fn drain_staged_volumes(&mut self) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        let preserve_cipher = self.plan.format == SetFormat::SevenZip
+            && self.members.values().any(|member| member.crypt.is_some());
+        let before: Vec<_> = if preserve_cipher {
+            self.staging
+                .iter()
+                .map(|(&volume, staging)| (volume, staging.pending.clone(), staging.routed.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let volumes: Vec<u32> = self.staging.keys().copied().collect();
+        let mut spans = self.take_migrated_spans();
+        for (index, &volume) in volumes.iter().enumerate() {
+            match self.drain_volume_inner(volume, !preserve_cipher) {
+                Ok(drained) => spans.extend(drained),
+                Err(reason) => {
+                    if preserve_cipher {
+                        if reason == DemotionReason::SevenZipAesChecksumMismatch {
+                            for (volume, pending, routed) in before {
+                                if let Some(staging) = self.staging.get_mut(&volume) {
+                                    staging.pending = pending;
+                                    staging.routed = routed;
+                                }
+                            }
+                        } else {
+                            // Match the existing early-return lifetime for all
+                            // other failures: completed drains already trimmed.
+                            for &completed in &volumes[..index] {
+                                self.trim_volume(completed);
+                            }
+                        }
+                    }
+                    return Err(reason);
+                }
+            }
+        }
+        if preserve_cipher {
+            for volume in volumes {
+                self.trim_volume(volume);
+            }
+        }
+        Ok(spans)
+    }
+
     // Maps and emits every pending byte of one volume whose destination the
     // layout can now name.
     pub(super) fn drain_volume(
         &mut self,
         volume_index: u32,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        self.drain_volume_inner(volume_index, true)
+    }
+
+    fn drain_volume_inner(
+        &mut self,
+        volume_index: u32,
+        trim: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         let Some(staging) = self.staging.get(&volume_index) else {
             return Ok(Vec::new());
@@ -2149,7 +2250,9 @@ impl DirectSetRouter {
             }
             staging.pending = still_pending;
         }
-        self.trim_volume(volume_index);
+        if trim {
+            self.trim_volume(volume_index);
+        }
         Ok(spans)
     }
 
@@ -2698,7 +2801,13 @@ impl DirectSetRouter {
             sevenz::ParseOutcome::Refused(refusal) => {
                 Err(self.fail(DemotionReason::SevenZip(refusal)))
             }
-            sevenz::ParseOutcome::Facts(facts) => self.adopt_container_facts(*facts),
+            sevenz::ParseOutcome::Facts(facts, admission) => {
+                if let Some(admission) = admission {
+                    self.crypt
+                        .set_sevenz_password(&admission.secret, admission.password);
+                }
+                self.adopt_container_facts(*facts)
+            }
         }
     }
 
@@ -2795,6 +2904,16 @@ impl DirectSetRouter {
             self.try_verify_member(member_id)?;
         }
         self.check_eligibility()?;
+        if self
+            .sevenz_facts
+            .as_ref()
+            .is_some_and(|facts| facts.entries.iter().any(|entry| entry.aes.is_some()))
+        {
+            crate::runtime::perf_probe::record(
+                "direct_store.sevenz.aes_routed",
+                std::time::Duration::from_nanos(1),
+            );
+        }
         crate::runtime::perf_probe::record(
             "direct_store.sevenz.layout_adopted",
             std::time::Duration::from_nanos(1),

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -506,12 +509,14 @@ impl Pipeline {
             let budget = self.extraction_budget(job_id, &scan_root)?;
             let root_for_scan = scan_root.clone();
             tokio::task::spawn_blocking(move || {
-                ExtractionRoot::open(&root_for_scan)?.scan_no_links(&budget)
+                ExtractionRoot::open(&root_for_scan)?
+                    .scan_no_links(&budget)
+                    .map_err(String::from)
             })
             .await
             .map_err(|error| format!("extraction root link scan task failed: {error}"))??;
         }
-        let password_candidates = self.archive_password_candidates_for_job(job_id);
+        let password_candidates = self.archive_password_candidates_for_job(job_id).candidates;
         let scanned_files = Self::scan_extraction_root(&scan_root, password_candidates).await?;
         let nested_archives: Vec<NestedArchiveFile> = scanned_files
             .iter()

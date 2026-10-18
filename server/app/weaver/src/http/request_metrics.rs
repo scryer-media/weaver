@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // HTTP request counters and latency, keyed by **route template**.
 //
 // Raw request paths are never used as a label: `/api/jobs/{job_id}/nzb` would
@@ -116,6 +119,9 @@ impl RouteLabel {
             "/healthz" | "/readyz" => return Self::Other,
             _ => {}
         }
+        if let Some(label) = Self::classify_nzbget_rpc(path) {
+            return label;
+        }
 
         if path.starts_with("/api/backup") {
             return Self::Backup;
@@ -136,6 +142,31 @@ impl RouteLabel {
         }
         // Everything else is served by the SPA asset fallback.
         Self::Static
+    }
+}
+
+impl RouteLabel {
+    // The NZBGet-compatible endpoints also answer with a trailing slash, with
+    // credentials in a leading path segment (`/<user>:<pass>/jsonrpc`) and,
+    // for JSON-RPC, with the method as a trailing segment. None of those
+    // segments may reach a label.
+    fn classify_nzbget_rpc(path: &str) -> Option<Self> {
+        let mut segments = path.trim_start_matches('/').split('/');
+        let mut rpc = segments.next()?;
+        if rpc.contains(':') {
+            rpc = segments.next()?;
+        }
+        let label = match rpc {
+            "jsonrpc" => Self::JsonRpc,
+            "xmlrpc" => Self::XmlRpc,
+            _ => return None,
+        };
+        let rest = segments.collect::<Vec<_>>();
+        match rest.as_slice() {
+            [] | [""] => Some(label),
+            [method] | [method, ""] if label == Self::JsonRpc && !method.is_empty() => Some(label),
+            _ => None,
+        }
     }
 }
 
@@ -364,6 +395,36 @@ mod tests {
             RouteLabel::Static
         );
         assert_eq!(RouteLabel::classify("/", ""), RouteLabel::Static);
+    }
+
+    #[test]
+    fn nzbget_rpc_variants_never_put_credentials_or_methods_in_a_label() {
+        for (path, label) in [
+            ("/jsonrpc/", RouteLabel::JsonRpc),
+            ("/xmlrpc/", RouteLabel::XmlRpc),
+            ("/arr:secret-key/jsonrpc", RouteLabel::JsonRpc),
+            ("/arr:secret-key/jsonrpc/", RouteLabel::JsonRpc),
+            ("/arr:secret-key/xmlrpc", RouteLabel::XmlRpc),
+            ("/jsonrpc/status", RouteLabel::JsonRpc),
+            ("/arr:secret-key/jsonrpc/history", RouteLabel::JsonRpc),
+        ] {
+            let classified = RouteLabel::classify(path, "");
+            assert_eq!(classified, label, "{path}");
+            assert!(!classified.as_str().contains("secret"), "{path}");
+            assert!(!classified.as_str().contains("status"), "{path}");
+        }
+        assert_eq!(
+            RouteLabel::classify("/weaver/arr:secret-key/jsonrpc", "/weaver"),
+            RouteLabel::JsonRpc
+        );
+        assert_eq!(
+            RouteLabel::classify("/assets/jsonrpc", ""),
+            RouteLabel::Static
+        );
+        assert_eq!(
+            RouteLabel::classify("/xmlrpc/status", ""),
+            RouteLabel::Static
+        );
     }
 
     #[test]

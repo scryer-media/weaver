@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Integration tests for deobfuscation heuristics and subject line parsing.
 //
 // Test cases sourced from NZBGet (tests/queue/Deobfuscation.cpp) and

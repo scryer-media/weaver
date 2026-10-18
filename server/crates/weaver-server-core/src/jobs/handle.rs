@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -108,6 +111,7 @@ pub struct SharedPipelineState {
     jobs: Arc<RwLock<PublishedJobs>>,
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
+    speed_test_paused: Arc<AtomicBool>,
     schedule_replay_paused: Arc<AtomicBool>,
     // Why the schedule evaluator is holding download admission, while it is.
     schedule_hold_reason: Arc<RwLock<Option<String>>>,
@@ -151,6 +155,8 @@ pub struct SharedPipelineState {
     // persistence, the queue replay producer) was woken for each one only to
     // discard it. Nothing is even built here unless someone is listening.
     segment_events: broadcast::Sender<PipelineEvent>,
+    // The speed test service, held weakly: the service holds this handle.
+    speed_test: Arc<std::sync::Mutex<std::sync::Weak<crate::speed_test::ServiceInner>>>,
     // Metrics snapshot refreshes, counted so tests can observe the cadence of
     // the orchestrator's periodic tick.
     #[cfg(test)]
@@ -188,6 +194,7 @@ impl SharedPipelineState {
             })),
             job_revision,
             paused: Arc::new(AtomicBool::new(false)),
+            speed_test_paused: Arc::new(AtomicBool::new(false)),
             schedule_replay_paused: Arc::new(AtomicBool::new(false)),
             schedule_hold_reason: Arc::new(RwLock::new(None)),
             post_processing_paused: Arc::new(AtomicBool::new(false)),
@@ -209,6 +216,7 @@ impl SharedPipelineState {
             hardware_profile: Arc::new(RwLock::new(None)),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
+            speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
             #[cfg(test)]
             metrics_refreshes: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -272,7 +280,15 @@ impl SharedPipelineState {
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        self.paused.load(Ordering::Relaxed) || self.speed_test_paused()
+    }
+
+    pub(crate) fn speed_test_paused(&self) -> bool {
+        self.speed_test_paused.load(Ordering::Acquire)
+    }
+
+    pub fn set_speed_test_paused(&self, paused: bool) {
+        self.speed_test_paused.store(paused, Ordering::Release);
     }
 
     pub(crate) fn schedule_replay_paused(&self) -> bool {
@@ -742,7 +758,7 @@ pub struct RestoreJobRequest {
     pub working_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddJobOptions {
     pub initially_paused: bool,
     // SCORE admission generation that must still be authoritative when the
@@ -752,6 +768,10 @@ pub struct AddJobOptions {
     // Unlike admission generations, this must also still hold an unexpired
     // durable promotion lease when the active job row is inserted.
     pub semantic_promotion_generation: Option<i64>,
+    // Archive passwords supplied beside the job's own (`Integration`, then
+    // `DnzbHeader`), persisted with it so a restart still offers them: they are
+    // not in the NZB bytes.
+    pub supplied_password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
 }
 
 // Internal provenance for cancellation. Semantic cancellation is intentionally
@@ -759,8 +779,16 @@ pub struct AddJobOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancellationOrigin {
     User,
+    // A user cancel that leaves the job's files on disk.
+    UserKeepingFiles,
     SemanticBad,
     SemanticSuperseded,
+}
+
+impl CancellationOrigin {
+    pub fn is_user(self) -> bool {
+        matches!(self, Self::User | Self::UserKeepingFiles)
+    }
 }
 
 // Which hardware profile's limits the pipeline is running under, and why.
@@ -828,6 +856,12 @@ pub enum SchedulerCommand {
         update: JobUpdate,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
+    // Rename, recategorise or re-parameterise a finished job's history row.
+    UpdateHistory {
+        job_id: JobId,
+        update: JobUpdate,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
     // Move a job within the manual queue order.
     ReorderJob {
         job_id: JobId,
@@ -844,6 +878,11 @@ pub enum SchedulerCommand {
     },
     // Pause all jobs globally (pipeline-wide).
     PauseAll {
+        reply: oneshot::Sender<()>,
+    },
+    // An in-memory hold independent of operator and schedule pauses.
+    SetSpeedTestPause {
+        paused: bool,
         reply: oneshot::Sender<()>,
     },
     // Resume all jobs globally.
@@ -1133,6 +1172,12 @@ impl SchedulerHandle {
             .await
     }
 
+    // Cancel a job and keep whatever it has written so far.
+    pub async fn cancel_job_keeping_files(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::UserKeepingFiles)
+            .await
+    }
+
     pub async fn cancel_semantic_bad(&self, job_id: JobId) -> Result<(), SchedulerError> {
         self.cancel_job_with_origin(job_id, CancellationOrigin::SemanticBad)
             .await
@@ -1148,7 +1193,7 @@ impl SchedulerHandle {
         job_id: JobId,
         origin: CancellationOrigin,
     ) -> Result<(), SchedulerError> {
-        if matches!(origin, CancellationOrigin::User) {
+        if origin.is_user() {
             self.state.cancel_active_job_work(job_id);
         }
         let (tx, rx) = oneshot::channel();
@@ -1168,6 +1213,24 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::UpdateJob {
+                job_id,
+                update,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    // Update a finished job's history row. The password field is ignored.
+    pub async fn update_history(
+        &self,
+        job_id: JobId,
+        update: JobUpdate,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::UpdateHistory {
                 job_id,
                 update,
                 reply: tx,
@@ -1334,6 +1397,16 @@ impl SchedulerHandle {
         self.state.metrics_snapshot()
     }
 
+    // The live pipeline counters the download workers book into.
+    pub fn pipeline_metrics(&self) -> Arc<PipelineMetrics> {
+        Arc::clone(self.state.metrics())
+    }
+
+    // How long this process has spent downloading.
+    pub fn download_time(&self) -> std::time::Duration {
+        self.state.metrics().download_time()
+    }
+
     pub fn get_extraction_rejections(&self) -> [u64; 9] {
         self.state.metrics().extraction_rejections()
     }
@@ -1427,6 +1500,20 @@ impl SchedulerHandle {
         rx.await
             .map(|diagnostics| *diagnostics)
             .map_err(|_| SchedulerError::ChannelClosed)
+    }
+
+    // Change only the speed test's transient download hold.
+    pub(crate) async fn set_speed_test_pause(&self, paused: bool) -> Result<(), SchedulerError> {
+        let (reply, received) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::SetSpeedTestPause { paused, reply })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        received.await.map_err(|_| SchedulerError::ChannelClosed)
+    }
+
+    pub(crate) fn clear_speed_test_pause(&self) {
+        self.state.set_speed_test_paused(false);
     }
 
     // Pause all download dispatch globally.
@@ -1596,6 +1683,30 @@ impl SchedulerHandle {
         &self,
     ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
         self.state.server_transfer_policy()
+    }
+
+    // The speed test service while something holds it.
+    pub fn speed_test_service(&self) -> Option<crate::speed_test::SpeedTestService> {
+        self.state
+            .speed_test
+            .lock()
+            .expect("speed test slot")
+            .upgrade()
+            .map(crate::speed_test::SpeedTestService::from_inner)
+    }
+
+    // The speed test service, created by `init` when none is held.
+    pub fn speed_test_service_or_init(
+        &self,
+        init: impl FnOnce() -> crate::speed_test::SpeedTestService,
+    ) -> crate::speed_test::SpeedTestService {
+        let mut slot = self.state.speed_test.lock().expect("speed test slot");
+        if let Some(inner) = slot.upgrade() {
+            return crate::speed_test::SpeedTestService::from_inner(inner);
+        }
+        let service = init();
+        *slot = service.downgrade();
+        service
     }
 
     pub fn set_proxy_runtime(&self, runtime: Arc<crate::proxies::ProxyRuntime>) {

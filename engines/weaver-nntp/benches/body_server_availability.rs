@@ -1,18 +1,47 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use weaver_nntp::connection::ServerConfig;
 use weaver_nntp::health::HealthConfig;
 use weaver_nntp::pool::{NntpPool, PoolConfig, ServerPoolConfig};
-use weaver_nntp::transfer::StableServerId;
+use weaver_nntp::route_dialer::{AddressPlanned, RouteDialer};
+use weaver_nntp::transfer::{ServerTransferRegistry, StableServerId};
 
-fn test_pool(server_count: usize) -> NntpPool {
+// A route for configs the bench never dials.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a bench pool that never dials needs a route to hold"
+)]
+fn idle_route(runtime: &tokio::runtime::Runtime) -> Arc<RouteDialer> {
+    let planned = Arc::new(AddressPlanned::new(
+        "bench".into(),
+        Arc::new(weaver_tunnel::pipe::Egress::new(
+            0,
+            weaver_nntp::egress::SocketEgress::System,
+            Duration::from_secs(30),
+        )),
+    ));
+    Arc::new(RouteDialer {
+        plan: Some(planned.plan.clone()),
+        inner: planned,
+        egress_controls: Arc::new(ServerTransferRegistry::new()),
+        runtime: runtime.handle().clone(),
+        server: 0,
+    })
+}
+
+fn test_pool(server_count: usize, runtime: &tokio::runtime::Runtime) -> NntpPool {
+    let route = idle_route(runtime);
     let servers = (0..server_count)
         .map(|index| ServerPoolConfig {
             server: ServerConfig {
                 host: format!("server-{index}.example.com"),
-                ..Default::default()
+                ..ServerConfig::new(Arc::clone(&route))
             },
             stable_id: StableServerId(index as u32 + 1),
             max_connections: 1,
@@ -40,7 +69,7 @@ fn bench_body_server_availability(c: &mut Criterion) {
         .unwrap();
     let mut group = c.benchmark_group("body_server_availability");
     for server_count in [1_usize, 8, 64] {
-        let pool = test_pool(server_count);
+        let pool = test_pool(server_count, &runtime);
         group.bench_with_input(
             BenchmarkId::from_parameter(server_count),
             &server_count,

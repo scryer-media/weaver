@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A `Read + Seek` view of a 7z set that is still downloading.
 //
 // Same shape as [`SplitFileReader`](crate::pipeline::archive::split_reader::SplitFileReader):

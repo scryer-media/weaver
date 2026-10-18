@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # Regenerate the committed macOS brand assets.
 #
 # This is NOT run in CI. weaver.icns and dmg-background.tiff are committed

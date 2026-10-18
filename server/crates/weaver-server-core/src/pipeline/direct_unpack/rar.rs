@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // RAR member extraction shared by disk-backed and mixed direct-store chases.
 
 use std::collections::HashSet;
@@ -112,9 +115,11 @@ pub(crate) fn extract(
                     ));
                 }
                 if !info.is_directory && policy.unacceptable_extension_match(&name).is_some() {
-                    return Err(budget.reject_content_policy(
-                        crate::post_processing::model::unwanted_extension_reason(&name),
-                    ));
+                    return Err(budget
+                        .reject_content_policy(
+                            crate::post_processing::model::unwanted_extension_reason(&name),
+                        )
+                        .into());
                 }
                 if !should_extract(&name)? {
                     if archive.is_solid() {

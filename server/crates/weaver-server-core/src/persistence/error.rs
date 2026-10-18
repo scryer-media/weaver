@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // An operator's input that was refused. `code` is stable and part of the API;
 // `message` is the plain sentence; `params` holds the values the sentence
 // names, for a client that words the refusal itself.

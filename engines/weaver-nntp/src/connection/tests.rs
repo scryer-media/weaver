@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::io::{self, Cursor, Read};
 use std::sync::Arc;
 
@@ -861,10 +864,9 @@ async fn known_pipelining_servers_authenticate_then_get_the_group_in_one_write()
     .await;
     crate::server_caps::note_group_required("127.0.0.1", port);
 
-    let conn =
-        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.test"))
-            .await
-            .unwrap();
+    let conn = NntpConnection::connect_for_group(&pipelined_setup_config(port), Some("alt.test"))
+        .await
+        .unwrap();
 
     assert!(conn.is_healthy());
     assert_eq!(conn.current_group(), Some("alt.test"));
@@ -887,7 +889,7 @@ async fn an_unproven_server_gets_no_mode_reader_and_no_group() {
     .await;
 
     let mut conn =
-        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.test"))
+        NntpConnection::connect_for_group(&pipelined_setup_config(port), Some("alt.test"))
             .await
             .unwrap();
 
@@ -918,7 +920,7 @@ async fn a_500_after_setup_surfaces_as_an_error_and_teaches_nothing() {
     )
     .await;
 
-    let mut conn = NntpConnection::connect_for_group(&pipelined_setup_config(port), None, None)
+    let mut conn = NntpConnection::connect_for_group(&pipelined_setup_config(port), None)
         .await
         .unwrap();
 
@@ -950,7 +952,7 @@ async fn a_412_after_setup_teaches_the_process_to_select_a_group() {
     .await;
 
     let mut conn =
-        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.test"))
+        NntpConnection::connect_for_group(&pipelined_setup_config(port), Some("alt.test"))
             .await
             .unwrap();
     assert!(!conn.needs_group_prologue());
@@ -977,10 +979,9 @@ async fn pipelined_setup_skips_the_password_after_281_on_user() {
     .await;
     crate::server_caps::note_group_required("127.0.0.1", port);
 
-    let conn =
-        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.test"))
-            .await
-            .unwrap();
+    let conn = NntpConnection::connect_for_group(&pipelined_setup_config(port), Some("alt.test"))
+        .await
+        .unwrap();
 
     assert_eq!(conn.current_group(), Some("alt.test"));
     crate::server_caps::forget("127.0.0.1", port);
@@ -1021,10 +1022,9 @@ async fn pipelined_setup_leaves_a_missing_group_unselected() {
     )
     .await;
 
-    let conn =
-        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.gone"))
-            .await
-            .unwrap();
+    let conn = NntpConnection::connect_for_group(&pipelined_setup_config(port), Some("alt.gone"))
+        .await
+        .unwrap();
 
     assert!(conn.is_healthy());
     assert_eq!(conn.current_group(), None);

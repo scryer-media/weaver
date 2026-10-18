@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { expect, graphql, resetNntpMetrics, test } from "./helpers";
 import { ifaceFor, packetCount, startCapture, stopCapture } from "./support/capture";
 import { waitTerminal } from "./support/downloads";
@@ -231,7 +234,9 @@ test("L09 a black-holed proxy times out, takes its leg Down and cools its rung",
   await addToxic(request, "connect2", { name: "l09-blackhole", type: "timeout", attributes: { timeout: 0 } });
   await controlRoute(request, { route: "connect2", cut: true });
   const flow = await flowAfter(request, mark, sample => legOn(sample, serverKey(server), b.id)?.state === "DOWN" && legOn(sample, serverKey(server), b.id)?.rungStates[0] === "COOLDOWN", "leg B Down with rung 0 cooling");
-  expect(legOn(flow, serverKey(server), b.id)?.reason ?? "").toMatch(/tim(ed|e) ?out/i);
+  // The ladder cools on its first timed-out dial, before the leg reaches
+  // its own failure threshold. Both report the same unavailable path.
+  expect(legOn(flow, serverKey(server), b.id)?.reason ?? "").toMatch(/every rung is cooling down|tim(ed|e) ?out/i);
   await removeToxic(request, "connect2", "l09-blackhole");
   expect(await download.release()).toBe("COMPLETED");
 });

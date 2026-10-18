@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Two facts about a job that a support reader needs and nothing else keeps.
 //
 // A direct-store demotion and a job's article gaps are both logged as they

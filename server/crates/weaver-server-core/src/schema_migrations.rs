@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,6 +18,7 @@ use crate::migration_hook_ids;
 use crate::persistence::sql_runtime::SqlConn;
 
 pub(crate) mod egress_quotas_v53;
+pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
 pub(crate) mod script_instances_v55;
@@ -29,7 +33,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 59;
+const CURRENT_SCHEMA_VERSION: i64 = 64;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -806,6 +810,9 @@ async fn run_rust_hook(
         }
         script_concurrency_v58::HOOK_ID => {
             script_concurrency_v58::raise_script_concurrency(&mut SqlConn::Sqlite(tx)).await
+        }
+        proxy_resolver_v64::HOOK_ID => {
+            proxy_resolver_v64::name_proxy_resolvers(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import net from "node:net";
 import { expect, test as base, type APIRequestContext, type Page } from "@playwright/test";
 

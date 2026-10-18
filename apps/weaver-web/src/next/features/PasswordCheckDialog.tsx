@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useRef, useState, type ReactNode } from "react";
 import type { CombinedError } from "urql";
 import { authHeaders } from "@/graphql/client";
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { Dialog } from "../components/Dialog";
 import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
 
@@ -14,6 +17,26 @@ export type CheckedOutcome = "done" | "password";
 /** Whether a GraphQL failure is the server asking for a recent password check. */
 export function needsPasswordCheck(error: CombinedError | undefined): boolean {
   return Boolean(error?.graphQLErrors.some((entry) => entry.extensions?.code === "REAUTH_REQUIRED"));
+}
+
+/** Has the server check the password; resolves to why it refused, or null once it accepted. */
+async function verifyPassword(t: Translate, password: string): Promise<string | null> {
+  try {
+    const response = await fetch(new URL("api/auth/verify", document.baseURI), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      credentials: "include",
+      body: JSON.stringify({ password }),
+    });
+    if (!response.ok) {
+      return response.status === 429
+        ? t("next.security.checkBusy")
+        : t("next.security.checkFailed");
+    }
+    return null;
+  } catch {
+    return t("next.security.checkUnreachable");
+  }
 }
 
 /**
@@ -53,27 +76,13 @@ export function usePasswordCheck(): {
     }
     setChecking(true);
     setError(null);
-    try {
-      const response = await fetch(new URL("api/auth/verify", document.baseURI), {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        credentials: "include",
-        body: JSON.stringify({ password }),
-      });
-      if (!response.ok) {
-        setError(
-          response.status === 429
-            ? t("next.security.checkBusy")
-            : t("next.security.checkFailed"),
-        );
-        return;
-      }
-    } catch {
-      setError(t("next.security.checkUnreachable"));
-      return;
-    } finally {
+    const refusal = await verifyPassword(t, password);
+    if (refusal !== null) {
+      setError(refusal);
       setChecking(false);
+      return;
     }
+    setChecking(false);
     const attempt = pending.current;
     dismiss();
     if (attempt) {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The decode matrix's own budget
 // What the quick pass is allowed to be blocked by
 // The whole-file-CRC quick-verification arm.

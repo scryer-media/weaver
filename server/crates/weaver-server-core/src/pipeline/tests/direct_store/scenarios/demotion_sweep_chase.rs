@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A demoted set whose reconstruction sweep is still running, and the chase
 // that set's handback could arm while it is.
 

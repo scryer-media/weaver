@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Retained ownership and bounded dispatch for PAR3 blocking work.
 
 use super::*;
@@ -115,13 +118,13 @@ impl EngineCounters {
     fn capture(runtime: &Par3Job) -> Self {
         let diagnostics = &runtime.options.diagnostics;
         let source = diagnostics.source_io();
-        let sync = diagnostics.file_sync();
         let (reader_cache_hits, reader_cache_evictions) = runtime.virtual_readers.counters();
         let mut counters = Self {
             source_read_bytes: source.read_bytes,
             source_reads: source.read_calls,
-            file_sync_calls: sync.calls,
-            file_sync_millis: as_millis(sync.elapsed),
+            // Retain legacy metric fields at zero: PAR3 repair is buffered.
+            file_sync_calls: 0,
+            file_sync_millis: 0,
             donor_read_bytes: runtime.donor_search.read_bytes,
             donor_time_cap_hits: runtime.donor_search.time_cap_hits,
             reader_cache_hits,

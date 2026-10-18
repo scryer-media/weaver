@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -119,7 +122,10 @@ impl unrar_rs::VolumeProvider for ReadaheadVolumeProvider {
                 })?;
         let file = match self.take_prefetched(index) {
             Some(file) => file,
-            None => File::open(path).map_err(unrar_rs::VolumeProviderError::Io)?,
+            None => File::open(path).map_err(|error| unrar_rs::VolumeProviderError::Io {
+                volume: index,
+                error,
+            })?,
         };
         self.schedule(index + 1);
         Ok(Box::new(file))
@@ -216,7 +222,10 @@ mod tests {
         let Err(error) = provider.get_volume(1) else {
             panic!("expected missing volume file to fail the open");
         };
-        assert!(matches!(error, unrar_rs::VolumeProviderError::Io(_)));
+        assert!(matches!(
+            error,
+            unrar_rs::VolumeProviderError::Io { volume: 1, .. }
+        ));
         assert_eq!(provider.prefetch_hits(), 0);
     }
 }

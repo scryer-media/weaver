@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -67,6 +70,18 @@ pub(crate) fn segments_covered_by_floor(
         covered.floor = segment_end;
     }
     covered
+}
+
+// A redownload throws away every file the last run wrote, so the record of
+// what those files were renamed to starts over from the NZB.
+fn redownload_spec(
+    nzb: &weaver_nzb::Nzb,
+    nzb_path: &std::path::Path,
+    category: Option<String>,
+    mut metadata: Vec<(String, String)>,
+) -> JobSpec {
+    metadata.retain(|(key, _)| key != crate::ingest::FULL_FILE_NAMES_METADATA_KEY);
+    crate::ingest::nzb_to_spec(nzb, nzb_path, category, metadata)
 }
 
 impl Pipeline {
@@ -734,6 +749,7 @@ impl Pipeline {
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle.as_str()),
             password_override: Some(spec.password.clone().unwrap_or_default()),
+            supplied_password_candidates: options.supplied_password_candidates.clone(),
         };
         // Biggest single write on the add-job path: keep it off the
         // orchestrator loop, but never create an in-memory job without durable
@@ -757,7 +773,13 @@ impl Pipeline {
                 &active_job.nzb_path,
                 &active_job.nzb_zstd,
             )
-            .ok();
+            .ok()
+            .map(|nzb| {
+                crate::pipeline::job_carried_password_candidates(
+                    &active_job.supplied_password_candidates,
+                    nzb,
+                )
+            });
             (persisted, nzb_password_candidates)
         })
         .await
@@ -1242,6 +1264,7 @@ impl Pipeline {
                     paused_resume_download_state: None,
                     paused_resume_post_state: None,
                     password_override: Some(spec.password.clone().unwrap_or_default()),
+                    supplied_password_candidates: Vec::new(),
                 })
                 .map_err(crate::SchedulerError::State)?;
 
@@ -1416,7 +1439,7 @@ impl Pipeline {
                 .map_err(crate::SchedulerError::State)?
                 .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
             let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-            let mut spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+            let mut spec = redownload_spec(&nzb, &nzb_path, category, metadata);
 
             if let Some(password) = password.clone() {
                 spec.password = Some(password);
@@ -1465,8 +1488,7 @@ impl Pipeline {
                 .as_deref()
                 .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
                 .unwrap_or_default();
-            let mut spec =
-                crate::ingest::nzb_to_spec(&nzb, &nzb_path, row.category.clone(), metadata);
+            let mut spec = redownload_spec(&nzb, &nzb_path, row.category.clone(), metadata);
             if let Some(password) = password.clone() {
                 spec.password = Some(password);
             }
@@ -1519,7 +1541,7 @@ impl Pipeline {
                 )
             });
         let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-        let mut spec = crate::ingest::nzb_to_spec(
+        let mut spec = redownload_spec(
             &nzb,
             &nzb_path,
             info.category.clone(),
@@ -2042,16 +2064,23 @@ impl Pipeline {
         let support_facts = self
             .db_blocking(move |db| db.load_job_support_facts(job_id))
             .await?;
-        // One read and parse of the persisted NZB per restored job, off the
-        // pipeline thread, instead of one per archive file. Anything short of
-        // a parsed NZB leaves the harvest to read the row itself, as before.
+        // One read of the row, decrypt of the supplied passwords and parse of
+        // the persisted NZB per restored job, off the pipeline thread, instead
+        // of one per archive file. Anything short of a parsed NZB leaves the
+        // harvest to read the row itself, as before.
         let nzb_password_candidates = self
-            .db_blocking(move |db| match db.load_active_job_persisted_nzb(job_id) {
-                Ok(Some((nzb_path, Some(nzb_zstd)))) => {
-                    crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd).ok()
-                }
-                _ => None,
-            })
+            .db_blocking(
+                move |db| match db.load_active_job_password_sources(job_id) {
+                    Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
+                        crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd)
+                            .ok()
+                            .map(|nzb| {
+                                crate::pipeline::job_carried_password_candidates(&supplied, nzb)
+                            })
+                    }
+                    _ => None,
+                },
+            )
             .await;
 
         let _ = self.event_tx.send(PipelineEvent::JobCreated {

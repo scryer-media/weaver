@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::ffi::OsStr;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -10,8 +13,13 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use tracing::{info, warn};
 
+use super::error::ExtractionError;
+
 use crate::operations::disk::{Capacity, CapacityDebits, CapacityReader, probe_nearest_disk_space};
 use crate::operations::metrics::PipelineMetrics;
+
+mod positional;
+pub(crate) use positional::PositionalOutput;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -163,10 +171,88 @@ impl ExtractionRejectionReason {
     }
 }
 
+// A refusal by the job's extraction budget: which limit or policy, and what
+// it refused. Carried typed by `ExtractionError` so a consumer never has to
+// recognise it from its rendering.
 #[derive(Debug, Clone)]
-struct ExtractionFailure {
+pub(crate) struct ExtractionFailure {
     reason: ExtractionRejectionReason,
     detail: String,
+}
+
+impl ExtractionFailure {
+    pub(crate) fn reason(&self) -> ExtractionRejectionReason {
+        self.reason
+    }
+
+    // The reason a job keeps when it fails on this refusal. A content-policy
+    // refusal is kept as its own sentence, without the marker, because the
+    // consumer app and the Jobs screen show it as it stands. Every other
+    // refusal keeps the whole rendering.
+    pub(crate) fn job_failure_reason(&self) -> String {
+        match self.reason {
+            ExtractionRejectionReason::ContentPolicy => self.detail.clone(),
+            _ => self.to_string(),
+        }
+    }
+}
+
+impl std::error::Error for ExtractionFailure {}
+
+// Why a decoder's memory was not granted: the budget refused it, or the chase
+// that asked gave its decoder up to a request waiting for memory.
+#[derive(Debug, Clone)]
+pub(crate) enum MemoryWaitError {
+    Refused(ExtractionFailure),
+    Yielded(String),
+}
+
+impl std::fmt::Display for MemoryWaitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(failure) => failure.fmt(formatter),
+            Self::Yielded(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for MemoryWaitError {}
+
+impl From<MemoryWaitError> for String {
+    fn from(error: MemoryWaitError) -> Self {
+        error.to_string()
+    }
+}
+
+impl From<MemoryWaitError> for super::ExtractionError {
+    fn from(error: MemoryWaitError) -> Self {
+        match error {
+            MemoryWaitError::Refused(failure) => Self::rejected(failure),
+            MemoryWaitError::Yielded(message) => Self::terminal(message),
+        }
+    }
+}
+
+// The process stage's answer to a request it did not grant.
+enum ProcessMemoryRefusal {
+    Refused(String),
+    Yielded(String),
+}
+
+impl From<ProcessMemoryRefusal> for String {
+    fn from(refusal: ProcessMemoryRefusal) -> Self {
+        match refusal {
+            ProcessMemoryRefusal::Refused(message) | ProcessMemoryRefusal::Yielded(message) => {
+                message
+            }
+        }
+    }
+}
+
+impl From<ExtractionFailure> for String {
+    fn from(failure: ExtractionFailure) -> Self {
+        failure.to_string()
+    }
 }
 
 impl std::fmt::Display for ExtractionFailure {
@@ -570,6 +656,7 @@ impl ProcessMemoryBudget {
         F: FnMut() -> Result<(), String>,
     {
         self.reserve_wait_request(DecoderRequest::Exact(bytes), retained, order, check_active)
+            .map_err(String::from)
     }
 
     // What `request` asks for now: an exact request its bytes, a ceiling
@@ -597,7 +684,7 @@ impl ProcessMemoryBudget {
         retained: bool,
         order: AdmissionOrder,
         mut check_active: F,
-    ) -> Result<ProcessMemoryPermit, String>
+    ) -> Result<ProcessMemoryPermit, ProcessMemoryRefusal>
     where
         F: FnMut() -> Result<(), String>,
     {
@@ -609,10 +696,10 @@ impl ProcessMemoryBudget {
             DecoderRequest::UpToCeiling { floor, .. } => floor,
         };
         if required > self.limit {
-            return Err(format!(
+            return Err(ProcessMemoryRefusal::Refused(format!(
                 "decoder requires {required} bytes, process limit is {}",
                 self.limit
-            ));
+            )));
         }
 
         struct Waiting<'a>(&'a AtomicU64);
@@ -649,7 +736,7 @@ impl ProcessMemoryBudget {
         let mut announced = false;
         let outcome = loop {
             if let Err(error) = check_active() {
-                break Err(error);
+                break Err(ProcessMemoryRefusal::Refused(error));
             }
             // Only this owner's metadata makes the request intrinsically too
             // large. Other jobs can release their retained state while we wait.
@@ -657,7 +744,7 @@ impl ProcessMemoryBudget {
                 .limit
                 .saturating_sub(self.retained.load(Ordering::Acquire));
             if required > own_available {
-                break Err("WEAVER_RESOURCE_LIMIT[memory]: decoder and retained job state exceed the process limit".to_string());
+                break Err(ProcessMemoryRefusal::Refused("WEAVER_RESOURCE_LIMIT[memory]: decoder and retained job state exceed the process limit".to_string()));
             }
             // A ceiling request shrinks to what retained state leaves rather
             // than waiting for it: that state lives as long as its jobs do.
@@ -723,10 +810,10 @@ impl ProcessMemoryBudget {
                 .saturating_sub(self.limit);
             if held != 0 {
                 if self.claim_yield_beyond(u64::from(ticket.is_some())) {
-                    break Err(format!(
+                    break Err(ProcessMemoryRefusal::Yielded(format!(
                         "{}: it was waiting for {bytes} more bytes with {held} in hand",
                         crate::pipeline::direct_unpack::coverage::MEMORY_YIELD_ABORT
-                    ));
+                    )));
                 }
                 if parked.is_none() {
                     self.parked.fetch_add(held, Ordering::AcqRel);
@@ -848,6 +935,7 @@ impl JobExtractionBudget {
             initial_bytes,
             metrics,
         )
+        .map_err(String::from)
     }
 
     // [`Self::with_capacity`] reading the root's free space itself, on the
@@ -873,6 +961,7 @@ impl JobExtractionBudget {
             initial_bytes,
             metrics,
         )
+        .map_err(String::from)
     }
 
     // `capacity` reads the extraction root's free space. On the pipeline it
@@ -887,7 +976,7 @@ impl JobExtractionBudget {
         initial_entries: u64,
         initial_bytes: u64,
         metrics: Arc<PipelineMetrics>,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Arc<Self>, ExtractionFailure> {
         let ratio_limit_bytes = declared_archive_bytes
             .saturating_mul(limits.max_ratio)
             .max(GIB);
@@ -933,20 +1022,16 @@ impl JobExtractionBudget {
         });
 
         if initial_entries > budget.limits.max_entries {
-            return Err(budget
-                .reject(
-                    ExtractionRejectionReason::Entries,
-                    format!(
-                        "staging tree contains {initial_entries} entries, limit is {}",
-                        budget.limits.max_entries
-                    ),
-                )
-                .to_string());
+            return Err(budget.reject(
+                ExtractionRejectionReason::Entries,
+                format!(
+                    "staging tree contains {initial_entries} entries, limit is {}",
+                    budget.limits.max_entries
+                ),
+            ));
         }
         if initial_bytes > budget.effective_job_limit_bytes {
-            return Err(budget
-                .reject_job_bytes(initial_bytes, "existing staging output")
-                .to_string());
+            return Err(budget.reject_job_bytes(initial_bytes, "existing staging output"));
         }
         Ok(budget)
     }
@@ -958,49 +1043,47 @@ impl JobExtractionBudget {
         disk.capacity.current() != Capacity::Unknown
     }
 
-    pub(crate) fn is_rejection(error: &str) -> bool {
-        error.contains("WEAVER_EXTRACTION_REJECTED[")
+    // The refusal the budget is stopped on, if it is stopped. Every check a
+    // worker passes through fails with this once the budget refuses work or
+    // is cancelled, so a worker that ends while it is set ended on it.
+    pub(crate) fn stopped_failure(&self) -> Option<ExtractionFailure> {
+        self.cancelled
+            .load(Ordering::Acquire)
+            .then(|| self.current_failure())
     }
 
-    // The reason a job keeps when it fails on `error`. A content-policy
-    // refusal is kept as its own sentence, without the marker that routed it
-    // through the pipeline, because the consumer app and the Jobs screen
-    // show it as it stands. Every other error is kept whole.
-    pub(crate) fn job_failure_reason(error: String) -> String {
-        let marker = ExtractionFailure {
-            reason: ExtractionRejectionReason::ContentPolicy,
-            detail: String::new(),
-        }
-        .to_string();
-        match error.find(&marker) {
-            Some(start) => error[start + marker.len()..].to_string(),
-            None => error,
-        }
+    // The refusal the budget recorded, if a limit or policy refused work. A
+    // plain cancellation records none.
+    pub(crate) fn rejection(&self) -> Option<ExtractionFailure> {
+        self.failure
+            .lock()
+            .expect("extraction failure state poisoned")
+            .clone()
     }
 
     #[cfg(test)]
-    pub(crate) fn task_permit(self: &Arc<Self>) -> Result<TaskPermit, String> {
+    pub(crate) fn task_permit(self: &Arc<Self>) -> Result<TaskPermit, ExtractionFailure> {
         self.task_permit_inner(None)
     }
 
     pub(crate) fn task_permit_for_root(
         self: &Arc<Self>,
         root: Arc<ExtractionRoot>,
-    ) -> Result<TaskPermit, String> {
+    ) -> Result<TaskPermit, ExtractionFailure> {
         self.task_permit_inner(Some(root))
     }
 
     fn task_permit_inner(
         self: &Arc<Self>,
         root: Option<Arc<ExtractionRoot>>,
-    ) -> Result<TaskPermit, String> {
-        self.check_active().map_err(|error| error.to_string())?;
+    ) -> Result<TaskPermit, ExtractionFailure> {
+        self.check_active()?;
         let mut active = self
             .active
             .lock()
             .expect("extraction active state poisoned");
         if self.cancelled.load(Ordering::Acquire) {
-            return Err(self.current_failure().to_string());
+            return Err(self.current_failure());
         }
         active.tasks = active.tasks.saturating_add(1);
         Ok(TaskPermit {
@@ -1012,7 +1095,7 @@ impl JobExtractionBudget {
     pub(crate) fn reserve_memory_wait(
         self: &Arc<Self>,
         bytes: u64,
-    ) -> Result<MemoryPermit, String> {
+    ) -> Result<MemoryPermit, MemoryWaitError> {
         self.reserve_memory(DecoderRequest::Exact(bytes), false)
     }
 
@@ -1028,7 +1111,7 @@ impl JobExtractionBudget {
     pub(crate) fn reserve_more_memory_wait(
         self: &Arc<Self>,
         bytes: u64,
-    ) -> Result<MemoryPermit, String> {
+    ) -> Result<MemoryPermit, MemoryWaitError> {
         self.reserve_memory(DecoderRequest::Exact(bytes), true)
     }
 
@@ -1045,7 +1128,7 @@ impl JobExtractionBudget {
     pub(crate) fn reserve_memory_up_to_ceiling_wait(
         self: &Arc<Self>,
         floor: u64,
-    ) -> Result<MemoryPermit, String> {
+    ) -> Result<MemoryPermit, MemoryWaitError> {
         self.reserve_memory_up_to_ceiling_wait_capped(floor, u64::MAX)
     }
 
@@ -1054,7 +1137,7 @@ impl JobExtractionBudget {
         self: &Arc<Self>,
         floor: u64,
         cap: u64,
-    ) -> Result<MemoryPermit, String> {
+    ) -> Result<MemoryPermit, MemoryWaitError> {
         self.reserve_memory(
             DecoderRequest::UpToCeiling {
                 ceiling: self.max_memory_bytes().min(cap.max(1)).max(floor),
@@ -1092,7 +1175,7 @@ impl JobExtractionBudget {
         self: &Arc<Self>,
         request: DecoderRequest,
         growth: bool,
-    ) -> Result<MemoryPermit, String> {
+    ) -> Result<MemoryPermit, MemoryWaitError> {
         let (required, bytes) = match request {
             DecoderRequest::Exact(bytes) => (bytes, bytes),
             // The job stage holds the whole ceiling until the process stage
@@ -1100,15 +1183,13 @@ impl JobExtractionBudget {
             DecoderRequest::UpToCeiling { ceiling, floor } => (floor, ceiling),
         };
         if required > self.limits.max_memory_bytes {
-            return Err(self
-                .reject(
-                    ExtractionRejectionReason::Memory,
-                    format!(
-                        "decoder requires {required} bytes, limit is {}",
-                        self.limits.max_memory_bytes
-                    ),
-                )
-                .to_string());
+            return Err(MemoryWaitError::Refused(self.reject(
+                ExtractionRejectionReason::Memory,
+                format!(
+                    "decoder requires {required} bytes, limit is {}",
+                    self.limits.max_memory_bytes
+                ),
+            )));
         }
         let bytes = bytes.min(self.limits.max_memory_bytes);
 
@@ -1119,7 +1200,7 @@ impl JobExtractionBudget {
         let started = Instant::now();
         let mut announced = false;
         loop {
-            self.check_active().map_err(|error| error.to_string())?;
+            self.check_active().map_err(MemoryWaitError::Refused)?;
             if reserve_atomic(&self.memory_reserved, bytes, self.limits.max_memory_bytes).is_ok() {
                 if announced {
                     info!(
@@ -1157,15 +1238,16 @@ impl JobExtractionBudget {
                     .map_err(|error| {
                         self.memory_reserved.fetch_sub(bytes, Ordering::AcqRel);
                         self.idle.notify_all();
-                        // A yield is the chase stepping aside, not a limit
-                        // the archive ran into.
-                        if error
-                            .contains(crate::pipeline::direct_unpack::coverage::MEMORY_YIELD_ABORT)
-                        {
-                            return error;
+                        match error {
+                            // A yield is the chase stepping aside, not a
+                            // limit the archive ran into.
+                            ProcessMemoryRefusal::Yielded(message) => {
+                                MemoryWaitError::Yielded(message)
+                            }
+                            ProcessMemoryRefusal::Refused(detail) => MemoryWaitError::Refused(
+                                self.reject(ExtractionRejectionReason::Memory, detail),
+                            ),
                         }
-                        self.reject(ExtractionRejectionReason::Memory, error)
-                            .to_string()
                     })?;
                 let granted = process_memory.bytes;
                 if granted < bytes {
@@ -1221,18 +1303,20 @@ impl JobExtractionBudget {
         self.effective_job_limit_bytes
     }
 
-    pub(crate) fn check_member_metadata(&self, member: &str, bytes: u64) -> Result<(), String> {
-        self.check_active().map_err(|error| error.to_string())?;
+    pub(crate) fn check_member_metadata(
+        &self,
+        member: &str,
+        bytes: u64,
+    ) -> Result<(), ExtractionFailure> {
+        self.check_active()?;
         if bytes > self.limits.max_member_bytes {
-            return Err(self
-                .reject(
-                    ExtractionRejectionReason::MemberBytes,
-                    format!(
-                        "archive member '{member}' declares {bytes} bytes, limit is {}",
-                        self.limits.max_member_bytes
-                    ),
-                )
-                .to_string());
+            return Err(self.reject(
+                ExtractionRejectionReason::MemberBytes,
+                format!(
+                    "archive member '{member}' declares {bytes} bytes, limit is {}",
+                    self.limits.max_member_bytes
+                ),
+            ));
         }
         Ok(())
     }
@@ -1243,20 +1327,18 @@ impl JobExtractionBudget {
         &self,
         entries: u64,
         bytes: Option<u64>,
-    ) -> Result<(), String> {
-        self.check_active().map_err(|error| error.to_string())?;
+    ) -> Result<(), ExtractionFailure> {
+        self.check_active()?;
         if self
             .entry_count
             .load(Ordering::Acquire)
             .checked_add(entries)
             .is_none_or(|count| count > self.limits.max_entries)
         {
-            return Err(self
-                .reject(
-                    ExtractionRejectionReason::Entries,
-                    "declared archive entries exceed the remaining job budget".to_string(),
-                )
-                .to_string());
+            return Err(self.reject(
+                ExtractionRejectionReason::Entries,
+                "declared archive entries exceed the remaining job budget".to_string(),
+            ));
         }
         if let Some(bytes) = bytes {
             let total = self
@@ -1264,16 +1346,16 @@ impl JobExtractionBudget {
                 .load(Ordering::Acquire)
                 .checked_add(bytes);
             if total.is_none_or(|total| total > self.effective_job_limit_bytes) {
-                return Err(self
-                    .reject_job_bytes(total.unwrap_or(u64::MAX), "declared archive output")
-                    .to_string());
+                return Err(
+                    self.reject_job_bytes(total.unwrap_or(u64::MAX), "declared archive output")
+                );
             }
         }
         Ok(())
     }
 
-    pub(crate) fn note_entry(&self, name: &Path) -> Result<(), String> {
-        self.check_active().map_err(|error| error.to_string())?;
+    pub(crate) fn note_entry(&self, name: &Path) -> Result<(), ExtractionFailure> {
+        self.check_active()?;
         reserve_atomic(&self.entry_count, 1, self.limits.max_entries).map_err(|requested| {
             self.reject(
                 ExtractionRejectionReason::Entries,
@@ -1283,32 +1365,27 @@ impl JobExtractionBudget {
                     self.limits.max_entries
                 ),
             )
-            .to_string()
         })
     }
 
-    pub(crate) fn reject_unsafe_path(&self, detail: impl Into<String>) -> String {
+    pub(crate) fn reject_unsafe_path(&self, detail: impl Into<String>) -> ExtractionFailure {
         self.reject(ExtractionRejectionReason::UnsafePath, detail.into())
-            .to_string()
     }
 
-    pub(crate) fn reject_unsupported_entry(&self, detail: impl Into<String>) -> String {
+    pub(crate) fn reject_unsupported_entry(&self, detail: impl Into<String>) -> ExtractionFailure {
         self.reject(ExtractionRejectionReason::UnsupportedEntry, detail.into())
-            .to_string()
     }
 
     // Reject material that policy must not permit to reach publication. This
     // shares the extraction budget's cancellation signal so sibling workers
     // stop at their next checkpoint.
-    pub(crate) fn reject_content_policy(&self, detail: impl Into<String>) -> String {
+    pub(crate) fn reject_content_policy(&self, detail: impl Into<String>) -> ExtractionFailure {
         self.reject(ExtractionRejectionReason::ContentPolicy, detail.into())
-            .to_string()
     }
 
-    pub(crate) fn cancel_with_error(&self, error: &str) {
-        if !Self::is_rejection(error) {
-            return;
-        }
+    // Stop this budget's workers at their next checkpoint because the job is
+    // failing on an extraction refusal, possibly one another budget raised.
+    pub(crate) fn stop_for_rejection(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
@@ -1360,13 +1437,19 @@ impl JobExtractionBudget {
     }
 
     pub(crate) fn check_active_io(&self) -> io::Result<()> {
-        self.check_active()
-            .map_err(|error| io::Error::other(error.to_string()))
+        self.check_active().map_err(io::Error::other)
     }
 
     fn reserve_write(&self, member_written: u64, bytes: usize) -> Result<(), ExtractionFailure> {
+        self.reserve_write_bytes(member_written, u64::try_from(bytes).unwrap_or(u64::MAX))
+    }
+
+    fn reserve_write_bytes(
+        &self,
+        member_written: u64,
+        bytes: u64,
+    ) -> Result<(), ExtractionFailure> {
         self.check_active()?;
-        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         let requested_member = member_written.saturating_add(bytes);
         if requested_member > self.limits.max_member_bytes {
             return Err(self.reject(
@@ -1849,7 +1932,7 @@ impl ExtractionRoot {
         &self,
         relative: &Path,
         budget: &Arc<JobExtractionBudget>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExtractionError> {
         budget.note_entry(relative)?;
         self.ensure_parents(relative, budget)?;
         match self.dir.create_dir(relative) {
@@ -1864,15 +1947,20 @@ impl ExtractionRoot {
                 if metadata.is_dir() && !metadata.file_type().is_symlink() {
                     Ok(())
                 } else {
-                    Err(budget.reject_unsafe_path(format!(
-                        "archive directory '{}' collides with a non-directory entry",
-                        relative.display()
-                    )))
+                    Err(budget
+                        .reject_unsafe_path(format!(
+                            "archive directory '{}' collides with a non-directory entry",
+                            relative.display()
+                        ))
+                        .into())
                 }
             }
-            Err(error) => Err(format!(
-                "failed to create archive directory '{}': {error}",
-                relative.display()
+            Err(error) => Err(ExtractionError::from_io(
+                format!(
+                    "failed to create archive directory '{}': {error}",
+                    relative.display()
+                ),
+                &error,
             )),
         }
     }
@@ -1907,7 +1995,7 @@ impl ExtractionRoot {
         &self,
         relative: &Path,
         budget: &Arc<JobExtractionBudget>,
-    ) -> Result<BudgetedWriter<cap_std::fs::File>, String> {
+    ) -> Result<BudgetedWriter<cap_std::fs::File>, ExtractionError> {
         budget.note_entry(relative)?;
         self.ensure_parents(relative, budget)?;
         let mut options = OpenOptions::new();
@@ -1922,28 +2010,39 @@ impl ExtractionRoot {
                     ))
                 })?;
                 if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(budget.reject_unsafe_path(format!(
-                        "archive file '{}' collides with a non-regular entry",
-                        relative.display()
-                    )));
+                    return Err(budget
+                        .reject_unsafe_path(format!(
+                            "archive file '{}' collides with a non-regular entry",
+                            relative.display()
+                        ))
+                        .into());
                 }
                 self.dir.remove_file(relative).map_err(|error| {
-                    format!(
-                        "failed to replace archive output '{}': {error}",
-                        relative.display()
+                    ExtractionError::from_io(
+                        format!(
+                            "failed to replace archive output '{}': {error}",
+                            relative.display()
+                        ),
+                        &error,
                     )
                 })?;
                 self.dir.open_with(relative, &options).map_err(|error| {
-                    format!(
-                        "failed to create archive output '{}': {error}",
-                        relative.display()
+                    ExtractionError::from_io(
+                        format!(
+                            "failed to create archive output '{}': {error}",
+                            relative.display()
+                        ),
+                        &error,
                     )
                 })?
             }
             Err(error) => {
-                return Err(format!(
-                    "failed to create archive output '{}': {error}",
-                    relative.display()
+                return Err(ExtractionError::from_io(
+                    format!(
+                        "failed to create archive output '{}': {error}",
+                        relative.display()
+                    ),
+                    &error,
                 ));
             }
         };
@@ -1954,26 +2053,27 @@ impl ExtractionRoot {
         &self,
         relative: &Path,
         budget: &Arc<JobExtractionBudget>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExtractionError> {
         let Some(parent) = relative.parent() else {
             return Ok(());
         };
         let mut current = PathBuf::new();
         for component in parent.components() {
             let Component::Normal(part) = component else {
-                return Err(budget.reject_unsafe_path(format!(
-                    "unsafe parent path for '{}'",
-                    relative.display()
-                )));
+                return Err(budget
+                    .reject_unsafe_path(format!("unsafe parent path for '{}'", relative.display()))
+                    .into());
             };
             current.push(part);
             match self.dir.symlink_metadata(&current) {
                 Ok(metadata) => {
                     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                        return Err(budget.reject_unsafe_path(format!(
-                            "archive parent '{}' is not a real directory",
-                            current.display()
-                        )));
+                        return Err(budget
+                            .reject_unsafe_path(format!(
+                                "archive parent '{}' is not a real directory",
+                                current.display()
+                            ))
+                            .into());
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1988,24 +2088,32 @@ impl ExtractionRoot {
                                     ))
                                 })?;
                             if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                                return Err(budget.reject_unsafe_path(format!(
-                                    "archive parent '{}' is not a real directory",
-                                    current.display()
-                                )));
+                                return Err(budget
+                                    .reject_unsafe_path(format!(
+                                        "archive parent '{}' is not a real directory",
+                                        current.display()
+                                    ))
+                                    .into());
                             }
                         }
                         Err(error) => {
-                            return Err(format!(
-                                "failed to create archive parent '{}': {error}",
-                                current.display()
+                            return Err(ExtractionError::from_io(
+                                format!(
+                                    "failed to create archive parent '{}': {error}",
+                                    current.display()
+                                ),
+                                &error,
                             ));
                         }
                     }
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "failed to inspect archive parent '{}': {error}",
-                        current.display()
+                    return Err(ExtractionError::from_io(
+                        format!(
+                            "failed to inspect archive parent '{}': {error}",
+                            current.display()
+                        ),
+                        &error,
                     ));
                 }
             }
@@ -2016,18 +2124,12 @@ impl ExtractionRoot {
     pub(crate) fn scan_no_links(
         &self,
         budget: &Arc<JobExtractionBudget>,
-    ) -> Result<(u64, u64), String> {
-        scan_capability_tree(&self.dir, &self.path).map_err(|detail| {
-            if detail.contains("symlink") || detail.contains("reparse") {
-                budget.reject_unsafe_path(detail)
-            } else {
-                budget.reject_unsupported_entry(detail)
-            }
-        })
+    ) -> Result<(u64, u64), ExtractionFailure> {
+        scan_capability_tree(&self.dir, &self.path).map_err(|error| error.reject(budget))
     }
 
-    pub(crate) fn snapshot_usage(path: &Path) -> Result<(u64, u64), String> {
-        let root = Self::open(path)?;
+    pub(crate) fn snapshot_usage(path: &Path) -> Result<(u64, u64), StagingScanError> {
+        let root = Self::open(path).map_err(StagingScanError::Unsupported)?;
         scan_capability_tree(&root.dir, path)
     }
 }
@@ -2096,7 +2198,41 @@ fn is_windows_drive_component(value: &OsStr) -> bool {
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
-fn scan_capability_tree(root: &Dir, display_root: &Path) -> Result<(u64, u64), String> {
+// Why a staging scan refused the tree: a link that could lead a write
+// outside it, or anything else it cannot account for.
+#[derive(Debug, Clone)]
+pub(crate) enum StagingScanError {
+    Link(String),
+    Unsupported(String),
+}
+
+impl std::fmt::Display for StagingScanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Link(detail) | Self::Unsupported(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl From<StagingScanError> for String {
+    fn from(error: StagingScanError) -> Self {
+        error.to_string()
+    }
+}
+
+impl StagingScanError {
+    // The budget's refusal for this scan failure.
+    pub(crate) fn reject(self, budget: &JobExtractionBudget) -> ExtractionFailure {
+        match self {
+            Self::Link(detail) => budget.reject(ExtractionRejectionReason::UnsafePath, detail),
+            Self::Unsupported(detail) => {
+                budget.reject(ExtractionRejectionReason::UnsupportedEntry, detail)
+            }
+        }
+    }
+}
+
+fn scan_capability_tree(root: &Dir, display_root: &Path) -> Result<(u64, u64), StagingScanError> {
     let mut entries = 0u64;
     let mut bytes = 0u64;
     scan_capability_directory(root, Path::new(""), display_root, &mut entries, &mut bytes)?;
@@ -2109,12 +2245,12 @@ fn scan_capability_directory(
     display_root: &Path,
     entries: &mut u64,
     bytes: &mut u64,
-) -> Result<(), String> {
+) -> Result<(), StagingScanError> {
     let children = directory.entries().map_err(|error| {
-        format!(
+        StagingScanError::Unsupported(format!(
             "failed to scan '{}': {error}",
             display_root.join(relative).display()
-        )
+        ))
     })?;
     scan_capability_children(directory, relative, display_root, entries, bytes, children)
 }
@@ -2126,13 +2262,13 @@ fn scan_capability_children(
     entries: &mut u64,
     bytes: &mut u64,
     children: impl IntoIterator<Item = io::Result<cap_std::fs::DirEntry>>,
-) -> Result<(), String> {
+) -> Result<(), StagingScanError> {
     for child in children {
         let child = child.map_err(|error| {
-            format!(
+            StagingScanError::Unsupported(format!(
                 "failed to read entry beneath '{}': {error}",
                 display_root.join(relative).display()
-            )
+            ))
         })?;
         let name = child.file_name();
         let child_relative = relative.join(&name);
@@ -2143,25 +2279,25 @@ fn scan_capability_children(
             // after enumeration; it contributes nothing to this snapshot.
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(format!(
+                return Err(StagingScanError::Unsupported(format!(
                     "failed to inspect '{}': {error}",
                     display_path.display()
-                ));
+                )));
             }
         };
         *entries = entries.saturating_add(1);
         if metadata.file_type().is_symlink() {
-            return Err(format!(
+            return Err(StagingScanError::Link(format!(
                 "staging tree contains symlink '{}'",
                 display_path.display()
-            ));
+            )));
         }
         #[cfg(target_os = "windows")]
         if is_windows_cap_reparse_point(&metadata) {
-            return Err(format!(
+            return Err(StagingScanError::Link(format!(
                 "staging tree contains reparse point '{}'",
                 display_path.display()
-            ));
+            )));
         }
         if metadata.is_dir() {
             scan_capability_subdirectory(
@@ -2175,10 +2311,10 @@ fn scan_capability_children(
         } else if metadata.is_file() {
             *bytes = bytes.saturating_add(metadata.len());
         } else {
-            return Err(format!(
+            return Err(StagingScanError::Unsupported(format!(
                 "staging tree contains non-file/non-directory entry '{}'",
                 display_path.display()
-            ));
+            )));
         }
     }
     Ok(())
@@ -2191,16 +2327,16 @@ fn scan_capability_subdirectory(
     display_root: &Path,
     entries: &mut u64,
     bytes: &mut u64,
-) -> Result<(), String> {
+) -> Result<(), StagingScanError> {
     let child_dir = match directory.open_dir_nofollow(name) {
         Ok(child_dir) => child_dir,
         // The directory may disappear after its metadata was inspected too.
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(format!(
+            return Err(StagingScanError::Unsupported(format!(
                 "failed to open staging directory '{}' without following links: {error}",
                 display_root.join(relative).display()
-            ));
+            )));
         }
     };
     scan_capability_directory(&child_dir, relative, display_root, entries, bytes)
@@ -2309,6 +2445,7 @@ mod tests {
             entry_budget
                 .note_entry(Path::new("two"))
                 .unwrap_err()
+                .to_string()
                 .contains("entries")
         );
     }
@@ -2359,6 +2496,7 @@ mod tests {
             memory_budget
                 .reserve_memory_wait(65 * MIB)
                 .unwrap_err()
+                .to_string()
                 .contains("memory")
         );
 
@@ -2380,6 +2518,7 @@ mod tests {
             deadline_budget
                 .task_permit()
                 .unwrap_err()
+                .to_string()
                 .contains("deadline")
         );
 
@@ -2765,8 +2904,6 @@ mod tests {
     // and is extracted conventionally; the other gets its memory.
     #[test]
     fn of_two_chases_growing_at_once_one_yields_to_the_other() {
-        use crate::pipeline::direct_unpack::coverage::MEMORY_YIELD_ABORT;
-
         let pool = Arc::new(ProcessMemoryBudget::new(1024));
         let mut chases = Vec::new();
         for job in 1..3u64 {
@@ -2804,7 +2941,7 @@ mod tests {
             .collect();
         let grown = outcomes
             .iter()
-            .filter(|(outcome, _)| *outcome == Ok(256))
+            .filter(|(outcome, _)| matches!(outcome, Ok(256)))
             .count();
         let yielded = outcomes
             .iter()
@@ -2812,7 +2949,7 @@ mod tests {
                 !cancelled
                     && outcome
                         .as_ref()
-                        .is_err_and(|error| error.contains(MEMORY_YIELD_ABORT))
+                        .is_err_and(|error| matches!(error, MemoryWaitError::Yielded(_)))
             })
             .count();
         assert_eq!((grown, yielded), (1, 1), "{outcomes:?}");
@@ -3258,7 +3395,7 @@ mod tests {
             .recv()
             .expect("cancelled job should leave the shared-memory wait")
             .unwrap_err();
-        assert!(error.contains("job extraction was cancelled"));
+        assert!(error.to_string().contains("job extraction was cancelled"));
         assert_eq!(process_memory.reserved_bytes(), 6 * GIB);
 
         waiter.join().unwrap();
@@ -3448,7 +3585,7 @@ mod tests {
             children.into_iter().map(Ok),
         )
         .unwrap_err();
-        assert!(error.contains("symlink"), "{error}");
+        assert!(error.to_string().contains("symlink"), "{error}");
         assert_eq!(bytes, 0);
     }
 
@@ -3499,7 +3636,10 @@ mod tests {
                 &mut bytes,
             )
             .unwrap_err();
-            assert!(error.contains("without following links"), "{error}");
+            assert!(
+                error.to_string().contains("without following links"),
+                "{error}"
+            );
             assert_eq!((entries, bytes), (1, 0));
             assert_eq!(
                 std::fs::read(outside.path().join("untouched")).unwrap(),
@@ -3526,7 +3666,10 @@ mod tests {
                 [Err(io::Error::new(kind, "entry enumeration failed"))],
             )
             .unwrap_err();
-            assert!(error.contains("entry enumeration failed"), "{error}");
+            assert!(
+                error.to_string().contains("entry enumeration failed"),
+                "{error}"
+            );
             assert_eq!((entries, bytes), (0, 0));
         }
     }
@@ -3540,7 +3683,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), temp.path().join("link")).unwrap();
         let error = root.scan_no_links(&budget).unwrap_err();
-        assert!(error.contains("unsafe_path"));
+        assert!(error.to_string().contains("unsafe_path"));
         assert!(outside.path().exists());
     }
 

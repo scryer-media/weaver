@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The private window class and messages the Windows tray listens on.
 //
 // Compiled into both `weaver.exe` and `weaver-tray.exe`, which must agree on

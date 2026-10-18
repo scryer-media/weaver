@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // `tests` tests, part of a mechanical split of the original file.
 
 use super::*;
@@ -1513,7 +1516,13 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
         &rendered,
         "weaver_network_dns_resolutions_total",
         "resolver",
-        &["routed", "wireguard"],
+        &["host", "routed", "wireguard"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_network_dns_cache_total",
+        "outcome",
+        &["hit", "joined", "miss"],
     );
 
     assert!(rendered.contains(
@@ -1539,4 +1548,42 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     assert!(!rendered.contains("member_id=\"12\""));
     assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
     assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
+}
+
+#[test]
+fn speed_tests_render_every_kind_and_status_and_the_last_rate() {
+    let speed_tests = sample_speed_tests();
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.speed_tests = Some(&speed_tests);
+    let rendered = render_area(&input);
+
+    use weaver_server_core::speed_test::{SpeedTestKindLabel, SpeedTestStatus};
+    let kinds: Vec<&str> = SpeedTestKindLabel::ALL.iter().map(|k| k.as_str()).collect();
+    let statuses: Vec<&str> = SpeedTestStatus::FINISHED
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    assert_label_set(&rendered, "weaver_speed_test_runs_total", "kind", &kinds);
+    assert_label_set(
+        &rendered,
+        "weaver_speed_test_runs_total",
+        "status",
+        &statuses,
+    );
+    assert!(
+        rendered.contains("weaver_speed_test_runs_total{kind=\"usenet\",status=\"completed\"} 3")
+    );
+    assert!(
+        rendered
+            .contains("weaver_speed_test_runs_total{kind=\"bandwidth\",status=\"cancelled\"} 1")
+    );
+    assert!(
+        rendered.contains("weaver_speed_test_runs_total{kind=\"bandwidth\",status=\"failed\"} 0")
+    );
+    assert!(
+        rendered.contains(
+            "weaver_speed_test_last_bps{consumer=\"server:4\",kind=\"usenet\"} 125000000"
+        )
+    );
 }

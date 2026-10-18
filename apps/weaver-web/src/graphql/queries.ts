@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { gql } from "urql";
 
 const FACADE_QUEUE_ITEM_FIELDS = `
@@ -173,7 +176,7 @@ export const PARSED_RELEASE_FIELDS = `
 const SERVER_FIELDS = `
   fragment ServerFields on Server {
     routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
-    routingStatus { state selectedProxyId failures { proxyId message } }
+    routingStatus { state selectedProxyId failures { proxyId message code params } }
     id
     host
     port
@@ -209,7 +212,7 @@ const SERVER_FIELDS = `
 const SERVER_DETAILS_FIELDS = `
   fragment ServerDetailsFields on ServerDetails {
     routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
-    routingStatus { state selectedProxyId failures { proxyId message } }
+    routingStatus { state selectedProxyId failures { proxyId message code params } }
     id
     host
     port
@@ -594,7 +597,7 @@ const RSS_RULE_FIELDS = `
 const RSS_FEED_FIELDS = `
   fragment RssFeedFields on RssFeed {
     routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
-    routingStatus { state selectedProxyId failures { proxyId message } }
+    routingStatus { state selectedProxyId failures { proxyId message code params } }
     id
     name
     url
@@ -2332,12 +2335,38 @@ export const ARCHIVE_PASSWORD_SETTINGS_QUERY = gql`
   }
 `;
 
+// Omit the file argument entirely when changing only the list. An absent
+// variable referenced by that argument is resolved as null by the server.
+export const UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION = gql`
+  mutation UpdateArchivePasswordSettings($passwords: [String!]!) {
+    updateArchivePasswordSettings(passwords: $passwords) {
+      hasPasswords
+      passwordFile
+    }
+  }
+`;
+
 export const UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION = gql`
   mutation UpdateArchivePasswordSettings($passwords: [String!], $passwordFile: String) {
     updateArchivePasswordSettings(passwords: $passwords, passwordFile: $passwordFile) {
       hasPasswords
       passwordFile
     }
+  }
+`;
+
+/** The unwanted extension list, which General edits apart from the script settings it is stored with. */
+export const UNACCEPTABLE_EXTENSIONS_QUERY = gql`
+  query UnacceptableExtensions {
+    postProcessingSettings {
+      unacceptableExtensions
+    }
+  }
+`;
+
+export const SET_UNACCEPTABLE_EXTENSIONS_MUTATION = gql`
+  mutation SetUnacceptableExtensions($extensions: [String!]!) {
+    setUnacceptableExtensions(extensions: $extensions)
   }
 `;
 

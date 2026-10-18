@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use weaver_server_core::{
     COUNTER_METRIC_KEYS, GAUGE_METRIC_KEYS, JOB_STATUS_KEYS, MetricsHistoryQueryData,
     MetricsHistoryQueryResult, MetricsHistoryTier,

@@ -50,8 +50,28 @@
       <ComponentRef Id="StartMenuShortcuts" />
     </Feature>
 
-    <!-- Interactive installs start the user-session tray. Silent MSI and WinGet installs
-         have UILevel < 4, so they never launch a process or a browser. -->
+    <!-- Capture the invoking user's preference before the cached old MSI removes
+         its Run entry. Versions before 0.15.1 remove it even on a major upgrade. -->
+    <Property Id="WEAVERSTARTUPCOMMAND" Secure="yes">
+      <RegistrySearch Id="ExistingTrayStartup" Root="HKCU"
+                      Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                      Name="ScryerMedia.Weaver" Type="raw" Bitness="always64" />
+    </Property>
+    <CustomAction
+        Id="RestoreTrayStartupAfterUpgrade"
+        FileRef="WeaverTrayExe"
+        ExeCommand="--register-startup"
+        Execute="immediate"
+        Return="check"
+        Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="RestoreTrayStartupAfterUpgrade"
+              After="InstallFinalize"
+              Condition="WIX_UPGRADE_DETECTED AND WEAVERSTARTUPCOMMAND" />
+    </InstallExecuteSequence>
+
+    <!-- Interactive installs start the user-session tray. Silent MSI and WinGet
+         installs restore an existing startup preference without opening the UI. -->
     <CustomAction
         Id="LaunchTrayAfterInteractiveInstall"
         FileRef="WeaverTrayExe"
@@ -61,12 +81,76 @@
         Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="LaunchTrayAfterInteractiveInstall"
-              After="InstallFinalize"
+              After="RestoreTrayStartupAfterUpgrade"
               Condition="NOT Installed AND UILevel &gt;= 4" />
     </InstallExecuteSequence>
 
+    <!-- A major upgrade removes the old product only after the new package's InstallValidate
+         has checked for files in use. With the old tray (and the server it supervises) still
+         running, that check raises the "applications should be closed" prompt from a hidden
+         msiexec window, so the in-app and MSI upgrades look frozen, and a silent upgrade
+         leaves the old binaries running. The old product's own StopTrayBeforeRemoval runs too
+         late to help, so locate the installed tray and ask it to shut down before validation.
+         The tray's shutdown command returns success when no tray is running.
+
+         That command is the installed product's code, not this package's, and in releases
+         that predate its stop-by-name sweep it stops only the tray of the session the
+         installer runs in and the server that tray started: an orphaned server, or a tray in
+         another session, survives it.
+         So a second step, which runs no Weaver code, force-stops the weaver.exe and
+         weaver-tray.exe processes that are still running once the graceful request has had
+         its chance. It is scoped to executables inside the installed folder (the folder of
+         INSTALLEDTRAYEXE), so a portable or development copy running elsewhere survives; a
+         process whose path cannot be read (another user's) is skipped and left to Restart
+         Manager. The folder is read into a variable outside the script block because MSI
+         formatting strips braces around a resolved property. There is no tree kill: the
+         upgrade helper that may have started this install is a child of weaver.exe, runs as
+         weaver-upgrade-helper.exe, which is not in the name list, and must outlive the server.
+         Both steps run before InstallValidate, which precedes InstallInitialize, so they are
+         immediate actions and run at every UI level, /passive and /qn included. The stop's
+         result is ignored. -->
+    <Property Id="INSTALLEDTRAYEXE">
+      <DirectorySearch Id="InstalledWeaverFolder" Path="[ProgramFiles64Folder]Scryer Media\Weaver">
+        <FileSearch Id="InstalledWeaverTrayExe" Name="weaver-tray.exe" />
+      </DirectorySearch>
+    </Property>
+    <CustomAction
+        Id="StopInstalledTrayBeforeValidate"
+        Property="INSTALLEDTRAYEXE"
+        ExeCommand="--shutdown"
+        Execute="immediate"
+        Return="ignore"
+        Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="StopInstalledTrayBeforeValidate"
+              Before="InstallValidate"
+              Condition="WIX_UPGRADE_DETECTED AND INSTALLEDTRAYEXE" />
+    </InstallExecuteSequence>
+    <SetProperty
+        Id="STOPLEFTOVERWEAVERPOWERSHELLEXE"
+        Value="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
+        Before="StopLeftoverWeaverProcessesBeforeValidate"
+        Sequence="execute"
+        Condition="WIX_UPGRADE_DETECTED AND INSTALLEDTRAYEXE" />
+    <CustomAction
+        Id="StopLeftoverWeaverProcessesBeforeValidate"
+        Property="STOPLEFTOVERWEAVERPOWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command &quot;$folder = (Split-Path -Parent '[INSTALLEDTRAYEXE]') + '\'; Get-Process weaver,weaver-tray -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($folder, 'OrdinalIgnoreCase') } | Stop-Process -Force&quot;"
+        Execute="immediate"
+        Return="ignore"
+        Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="StopLeftoverWeaverProcessesBeforeValidate"
+              After="StopInstalledTrayBeforeValidate"
+              Condition="WIX_UPGRADE_DETECTED AND INSTALLEDTRAYEXE AND STOPLEFTOVERWEAVERPOWERSHELLEXE" />
+    </InstallExecuteSequence>
+
     <!-- These commands affect only the uninstalling user: their HKCU Run entry, the
-         tray process they own, and their Weaver profile. -->
+         tray process they own, and their Weaver profile. A major upgrade removes the old
+         product as part of installing the new one; UPGRADINGPRODUCTCODE is set only in that
+         removal, so the startup preference and the profile both survive an upgrade and are
+         cleared only by a real uninstall. The Run entry points at the install path, which
+         the upgrade keeps. -->
     <CustomAction
         Id="StopTrayBeforeRemoval"
         FileRef="WeaverTrayExe"
@@ -94,7 +178,7 @@
         Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="StopTrayBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="RemoveTrayStartupBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveTrayStartupBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveProfileOnUninstall" After="StopTrayBeforeRemoval" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
   </Package>

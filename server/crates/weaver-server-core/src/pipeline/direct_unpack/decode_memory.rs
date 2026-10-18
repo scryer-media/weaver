@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // How much decoder memory a 7z archive actually needs, read off its coders.
 //
 // A chase used to reserve the whole configured decoder allowance for its

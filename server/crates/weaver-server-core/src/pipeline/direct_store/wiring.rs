@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Where direct-store meets the download pipeline.
 //
 // Three seams, and nothing else:
@@ -217,10 +220,12 @@ pub(crate) struct DirectStoreRuntime {
     accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
     // Jobs whose spec has already been examined for candidate sets.
     examined: HashSet<JobId>,
-    // Each job's archive-password harvest, once one has run, for the `-hp`
-    // gates of its sets. Kept rather than only offered because a set can be
-    // admitted after the harvest ran — identity admission binds sets as
-    // volumes are recognised — and it needs the same candidates. Separate from
+    // Each job's archive-password harvest
+    // (`Pipeline::archive_password_candidates_for_job`), once one has run with
+    // every source read, for the `-hp` and `-mhe` gates of its sets. Kept
+    // rather than only offered because a set can be admitted after the
+    // harvest ran — identity admission binds sets as volumes are recognised —
+    // and it needs the same candidates. Separate from
     // [`Self::examined`] because a **restored** job is examined without ever
     // passing through the admission seam, and its sets still need candidates.
     header_harvest: HashMap<JobId, Vec<crate::jobs::model::ArchivePasswordCandidate>>,
@@ -3645,17 +3650,19 @@ impl Pipeline {
         // The harvest `offer_direct_header_passwords` hands out is memoized per
         // job, and every set wants a header password from creation, so it is
         // taken on the job's first article and never re-run. That is fine
-        // for `NzbMeta` and `FilenameConvention`, which are immutable per job —
-        // and not fine for the spec's password, which is not. This line is its
-        // only route into the `-hp` ring afterwards, and without it a password
-        // supplied mid-download reaches the *file* key and never the archive
-        // one, so a `-hp` set that had a password all along still refuses under
-        // `NoPassword`. Normalization and labelling live in
+        // for `NzbMeta` and `FilenameConvention`, which are immutable per job,
+        // and for the global `Settings` and `PasswordFile` entries within the
+        // staleness window `harvest_direct_header_passwords` states. It is not
+        // fine for the spec's password, which an operator can change. This
+        // line is its only route into the `-hp` ring afterwards, and without it
+        // a password supplied mid-download reaches the *file* key and never
+        // the archive one, so a `-hp` set that had a password all along still
+        // refuses under `NoPassword`. Normalization and labelling live in
         // `offer_direct_header_candidates`, shared with the restart seam.
         for set in self.direct_store.sets_mut(job_id) {
             set.router.set_password(Some(password.as_str()));
             // Offering is a no-op once the ring has verified or refused, and a
-            // string compare against at most three held candidates otherwise.
+            // string compare against the held candidates otherwise.
             offer_direct_header_candidates(set, Some(password.as_str()), &[]);
         }
     }
@@ -3672,9 +3679,13 @@ impl Pipeline {
     // being enough the moment an operator supplies an explicit password:
     // that one takes priority in the spec, and a set whose archive key is the
     // NZB-meta password would then refuse for a password the job was holding
-    // all along. The list is bounded by construction — `Explicit`, `NzbMeta`,
-    // `FilenameConvention`, at most one each — so this bounds the `-hp` gate's
-    // KDF work at three derivations however deep the archive asks for.
+    // all along. The same goes for a set whose key lives only in the global
+    // `Settings` list or the password file, which finalize would try anyway.
+    // The harvest is `Pipeline::archive_password_candidates_for_job`, the
+    // same list every other archive consumer takes, offered whole: the
+    // harvest caps it at 80 entries across its four buckets
+    // (`MAX_ARCHIVE_PASSWORDS` and its neighbours), so the gate's
+    // key-derivation work is bounded there, once, for every consumer alike.
     //
     // # Why here rather than in `ensure_direct_sets`
     //
@@ -3687,12 +3698,12 @@ impl Pipeline {
     //
     // # Cost
     //
-    // One persisted-NZB read per job that admitted a direct set, ever — the
-    // `-hp` gate has to hold its candidates *before* the first header parse,
-    // because that parse is where admission happens, and nothing cheaper than
-    // the parse itself can say whether a set is `-hp`. That is strictly less
-    // than the conventional path already pays: `try_update_archive_topology`
-    // harvests once **per volume parse**.
+    // One persisted-NZB read and one global-list read per job that admitted a
+    // direct set, ever — the `-hp` gate has to hold its candidates *before*
+    // the first header parse, because that parse is where admission happens,
+    // and nothing cheaper than the parse itself can say whether a set is
+    // `-hp`. That is strictly less than the conventional path already pays:
+    // `try_update_archive_topology` harvests once **per volume parse**.
     fn offer_direct_header_passwords(&mut self, job_id: JobId) {
         if self.direct_store.header_harvest.contains_key(&job_id) {
             return;
@@ -3706,17 +3717,20 @@ impl Pipeline {
             return;
         }
         // Armed on the harvest having **run**, not on it having run *first*.
-        // The NZB half is a database read and a parse, and both
-        // warn-and-continue with an empty list; memoizing before that meant one
-        // transient error at exactly this instant cost the job its `NzbMeta`
-        // and `FilenameConvention` candidates for the rest of its life, with no
-        // second chance — `wants_header_password()` is the only other gate and
-        // it is still true. A harvest that ran and found nothing is a *fact*
-        // about the job and is remembered; one that failed is not.
+        // The NZB half is a database read and a parse and the global half is a
+        // settings read, and all of them warn-and-continue without their
+        // candidates; memoizing before that meant one transient error at
+        // exactly this instant cost the job those candidates for the rest of
+        // its life, with no second chance — `wants_header_password()` is the
+        // only other gate and it is still true. A harvest that ran and found
+        // nothing is a *fact* about the job and is remembered; one that failed
+        // is not, so only while a read keeps failing does this re-read per
+        // article.
         //
         // Deliberately not "arm only when candidates were found": for the
         // overwhelming majority of jobs there is no password anywhere, and that
-        // would re-read and re-parse the persisted NZB on **every article**.
+        // would re-read the persisted NZB and the settings on **every
+        // article**.
         let candidates = self.harvest_direct_header_passwords(job_id);
         if candidates.is_empty() {
             return;
@@ -3727,9 +3741,17 @@ impl Pipeline {
     }
 
     // The job's archive-password harvest for the `-hp` gate: the kept one when
-    // a harvest already ran, otherwise a fresh harvest, kept when it ran (see
-    // [`Self::offer_direct_header_passwords`] for why a failed read is not
-    // remembered).
+    // a harvest already ran, otherwise a fresh
+    // `Pipeline::archive_password_candidates_for_job`, kept when every source
+    // was read (see [`Self::offer_direct_header_passwords`] for why a failed
+    // read is not remembered). The per-article path is therefore one map
+    // lookup.
+    //
+    // Staleness: the global `Settings` list and the password file are read
+    // once, at the job's first harvest. A global password added or removed
+    // after that is not seen by this job's direct sets; finalize re-reads the
+    // list, so such a set demotes and is still tried with it there. A restart
+    // clears the kept harvest and reads the list again.
     //
     // Shared by the live seam and the restart seam. A restored set rebuilds
     // its layout by re-running the header parse, and that parse is where
@@ -3743,13 +3765,13 @@ impl Pipeline {
         if let Some(kept) = self.direct_store.header_harvest.get(&job_id) {
             return kept.clone();
         }
-        let (candidates, harvested) = self.harvest_archive_password_candidates(job_id);
-        if harvested {
+        let harvest = self.archive_password_candidates_for_job(job_id);
+        if harvest.complete {
             self.direct_store
                 .header_harvest
-                .insert(job_id, candidates.clone());
+                .insert(job_id, harvest.candidates.clone());
         }
-        candidates
+        harvest.candidates
     }
 
     // What to do with one NZB file's decoded bytes.
@@ -3781,7 +3803,17 @@ impl Pipeline {
     }
 }
 
-// Offers one set's `-hp` gate the job spec's password and the job's harvest.
+// Offers one set's `-hp` gate the job spec's password and the job's whole
+// harvest, in the harvest's own priority order.
+//
+// Every candidate the gate tries costs a key derivation: a RAR5 PBKDF2 per
+// candidate at the `-hp` check, and for a 7z `-mhe` end header a SHA-256
+// chain of 2^19 rounds per candidate on every parse attempt until the
+// container opens. That work is bounded by the list, not here: the harvest
+// caps it at 80 entries across its four buckets (`MAX_ARCHIVE_PASSWORDS` and
+// its neighbours). Offering a prefix instead would send a set whose key sits
+// past the prefix through a demotion and a full redownload to reach the same
+// list at finalize.
 //
 // The one implementation behind both the live seam and the restart seam, so a
 // set rebuilt at restore holds exactly the candidates a live set would.

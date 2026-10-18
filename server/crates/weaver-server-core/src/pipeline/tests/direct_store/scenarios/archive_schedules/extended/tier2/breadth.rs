@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The wider shapes of real posts, one small family each: a PAR2 index that
 // lies about its files, archives nested in archives, posts at the far ends
 // of the size axes, passwords right, wrong and missing over every locked

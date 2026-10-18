@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
@@ -127,6 +130,7 @@ fn active_backfill_job(job_id: u64, nzb_zstd: Vec<u8>) -> ActiveJob {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     }
 }
 
@@ -215,6 +219,43 @@ fn user_history_deletion_forgets_identity_and_allows_resubmission() {
             .unwrap(),
         DuplicateAdmission::Accepted { .. }
     ));
+}
+
+#[test]
+fn nzbget_hidden_history_keeps_duplicate_identity() {
+    let db = Database::open_in_memory().unwrap();
+    let original = spec(vec![vec![("hidden@example", 10)]]);
+    let (job_id, _) = accepted(
+        db.admit_duplicate_submission(&request(&original, 13))
+            .unwrap(),
+    );
+    db.activate_duplicate_admission(job_id).unwrap();
+    db.insert_job_history(&history(job_id.0, "complete"))
+        .unwrap();
+
+    assert!(db.set_nzbget_history_hidden(job_id.0, true).unwrap());
+    assert!(
+        !db.set_nzbget_history_hidden(job_id.0 + 1_000, true)
+            .unwrap()
+    );
+    let states = db.nzbget_history_states(&[job_id.0]).unwrap();
+    assert!(states[&job_id.0].hidden);
+
+    // The hidden row is still history: the web listing keeps it and the
+    // duplicate identity it owns still blocks the same release.
+    assert!(db.get_job_history(job_id.0).unwrap().is_some());
+    assert!(db.duplicate_snapshot(job_id).unwrap().is_some());
+    assert!(matches!(
+        db.admit_duplicate_submission(&request(&original, 14))
+            .unwrap(),
+        DuplicateAdmission::Blocked { .. }
+    ));
+
+    assert!(
+        db.delete_job_history_and_forget_duplicate_identity(job_id.0)
+            .unwrap()
+    );
+    assert!(db.nzbget_history_states(&[job_id.0]).unwrap().is_empty());
 }
 
 #[test]

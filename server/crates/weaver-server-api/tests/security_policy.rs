@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The browser-admission and bind-address surface: who may read or change it,
 // and which combinations the server refuses outright rather than storing a
 // setting the next start will reject.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Composable outbound paths shared by NNTP, feeds and connectivity probes.
 #[path = "pipe_revocable.rs"]
 mod revocable;
@@ -27,8 +30,19 @@ use crate::{
     bridge::ConnectionOutcome,
     egress::SocketEgress,
     endpoint::{DatagramTransport, EndpointStream, EndpointTransport, UdpSocketFactory},
-    transport::{ConnectFailure, TransportProxy},
+    fault::{self, ProxyFault},
+    metrics::Resolver,
+    resolution::{
+        Lookup, Replicate, ResolutionCache, Ttl,
+        record::{self, Asker, LookupFailure},
+    },
+    transport::{ConnectFailure, Reply, TransportProxy},
 };
+
+// What a lookup or an egress says when it fails, and `fault` reads back.
+pub(crate) const NO_ADDRESS_RESOLVED: &str = "no address resolved for the destination";
+pub(crate) const RESOLVE_TIMED_OUT: &str = "name resolution timed out";
+pub(crate) const NO_ROUTE_VIA: &str = "no route via ";
 
 #[derive(Clone, Debug)]
 pub enum Purpose {
@@ -36,7 +50,11 @@ pub enum Purpose {
     NntpProbe { server: u32, leg: usize },
     ProxyEndpoint { proxy: u32 },
     Feed { feed: u32 },
+    // Any other fetch Weaver makes over HTTP.
+    Outbound,
     Probe,
+    // A DNS query a hop asks to resolve a name dialled through it.
+    Dns,
 }
 
 #[derive(Clone, Debug)]
@@ -46,20 +64,177 @@ pub struct Target {
     pub purpose: Purpose,
     // The addresses `host` resolved to when the caller checked them, so a
     // dial connects exactly those instead of resolving `host` again; empty
-    // when the dial, or the proxy it goes through, resolves for itself.
+    // when the dial, or the hop it goes through, resolves for itself.
     pub addresses: Vec<IpAddr>,
 }
-impl Target {
-    // The destinations a hop asks its proxy for, in order: each checked
-    // address when the caller pinned them, so the proxy never resolves
-    // `host` itself, else `host`.
-    fn hop_destinations(&self) -> Vec<String> {
-        if self.addresses.is_empty() {
-            vec![self.host.clone()]
-        } else {
-            self.addresses.iter().map(|ip| ip.to_string()).collect()
+
+// How a proxy hop resolves a name dialled through it: the next hop's
+// endpoint, or the destination when the hop is the last. Answers from DNS
+// servers are held by the hop that asked for them, for as long as their TTL
+// allows, and go with it when the hop is rebuilt.
+#[derive(Clone)]
+pub enum Naming {
+    // Weaver resolves the name with the host's own DNS.
+    Host,
+    // Weaver asks these servers in order, from the route's egress.
+    Servers {
+        servers: Vec<IpAddr>,
+        egress: Arc<dyn Dialer>,
+        answers: Arc<ResolutionCache<DialError>>,
+    },
+    // The proxy is handed the name and resolves it.
+    Proxy,
+    // These servers are asked in order, through the proxy.
+    ProxyServers {
+        servers: Vec<IpAddr>,
+        answers: Arc<ResolutionCache<DialError>>,
+    },
+}
+
+impl Naming {
+    pub fn servers(servers: Vec<IpAddr>, egress: Arc<dyn Dialer>) -> Self {
+        Self::Servers {
+            servers,
+            egress,
+            answers: Default::default(),
         }
     }
+    pub fn proxy_servers(servers: Vec<IpAddr>) -> Self {
+        Self::ProxyServers {
+            servers,
+            answers: Default::default(),
+        }
+    }
+    // How long a lookup may take on top of a hop's connect: the same bound
+    // `resolve` is given, and nothing when the proxy is handed the name.
+    fn window(&self, timeout: Duration) -> Duration {
+        match self {
+            Self::Proxy => Duration::ZERO,
+            Self::Host | Self::Servers { .. } | Self::ProxyServers { .. } => timeout,
+        }
+    }
+    // What `host` resolves to for a dial through `hop`, the hop of proxy
+    // `proxy`, or `Unresolved` when the proxy is handed the name.
+    async fn resolve(
+        &self,
+        hop: &dyn Dialer,
+        proxy: u32,
+        host: &str,
+        timeout: Duration,
+    ) -> Result<Resolution, DialError> {
+        if let Ok(ip) = host.parse() {
+            return Ok(Resolution::Addresses(vec![ip]));
+        }
+        record::asking(host, || match self {
+            Self::Host => Asker::host(),
+            Self::Servers { servers, .. } => Asker::servers(servers),
+            Self::Proxy => Asker::proxy(proxy),
+            Self::ProxyServers { servers, .. } => Asker::proxy_servers(proxy, servers),
+        });
+        let resolving = async {
+            match self {
+                Self::Proxy => Ok(None),
+                Self::Host => lookup(host).await.map(Some),
+                Self::Servers {
+                    servers,
+                    egress,
+                    answers,
+                } => answers
+                    .resolve(Resolver::Routed, host, || {
+                        crate::dns::resolve_through(egress.as_ref(), servers, host)
+                    })
+                    .await
+                    .and_then(routed)
+                    .map(Some),
+                Self::ProxyServers { servers, answers } => answers
+                    .resolve(Resolver::Routed, host, || {
+                        crate::dns::resolve_through(hop, servers, host)
+                    })
+                    .await
+                    .and_then(routed)
+                    .map(Some),
+            }
+        };
+        let resolved = match tokio::time::timeout(timeout, resolving).await {
+            Ok(resolved) => resolved.inspect_err(|error| record::failed_saying(host, error))?,
+            Err(_) => {
+                let said = format!("{RESOLVE_TIMED_OUT}: {host}");
+                record::failed(host, LookupFailure::TimedOut, || said.clone());
+                return Err(DialError::Destination(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    said,
+                )));
+            }
+        };
+        Ok(match resolved {
+            None => Resolution::Unresolved,
+            Some(addresses) if addresses.is_empty() => {
+                record::failed(host, LookupFailure::NoAddress, || {
+                    NO_ADDRESS_RESOLVED.to_owned()
+                });
+                return Err(DialError::Destination(io::Error::other(ResolutionFailed)));
+            }
+            Some(addresses) => {
+                record::found(host, &addresses);
+                Resolution::Addresses(addresses)
+            }
+        })
+    }
+    // Drops what this naming holds for `host`, after none of the addresses
+    // it gave could be reached.
+    fn forget(&self, host: &str) {
+        match self {
+            Self::Host => crate::resolution::forget_host(host),
+            Self::Servers { answers, .. } | Self::ProxyServers { answers, .. } => {
+                answers.forget(host)
+            }
+            Self::Proxy => {}
+        }
+    }
+}
+
+// DNS servers that all say the name has no address fail as one that
+// answered nothing would.
+fn routed(addresses: Vec<IpAddr>) -> Result<Vec<IpAddr>, DialError> {
+    if addresses.is_empty() {
+        return Err(crate::dns::unresolved());
+    }
+    Ok(addresses)
+}
+
+// What the host's own DNS resolves `host` to.
+#[expect(clippy::disallowed_methods, reason = "a Host-resolved leg")]
+async fn lookup(host: &str) -> Result<Vec<IpAddr>, DialError> {
+    let mut addresses = crate::resolution::host_lookup(host)
+        .await
+        .map_err(DialError::Destination)?;
+    addresses.sort();
+    Ok(addresses)
+}
+
+// Whether a dial that resolved `target` itself failed at the destination,
+// so the addresses it was given may be stale.
+fn unreached(target: &Target, error: &DialError) -> bool {
+    target.addresses.is_empty()
+        && match error {
+            DialError::Destination(_) | DialError::Refused(_) => true,
+            // A proxy answered that it could not reach an address it was handed.
+            DialError::Hop { source, .. } => crate::transport::is_destination_unreachable(source),
+            _ => false,
+        }
+}
+
+// The destinations a hop asks its proxy for, in order: each address the
+// caller pinned, else each address the hop resolves the host to, else the
+// host itself, for the proxy to resolve.
+async fn hop_destinations(hop: &dyn Dialer, target: &Target) -> Result<Vec<String>, DialError> {
+    if !target.addresses.is_empty() {
+        return Ok(target.addresses.iter().map(ToString::to_string).collect());
+    }
+    Ok(match hop.resolve(&target.host).await? {
+        Resolution::Addresses(addresses) => addresses.iter().map(ToString::to_string).collect(),
+        Resolution::Unresolved => vec![target.host.clone()],
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,7 +345,7 @@ impl Dialed {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("no address resolved for the destination")]
+#[error("{}", NO_ADDRESS_RESOLVED)]
 pub struct ResolutionFailed;
 
 #[derive(Debug, thiserror::Error)]
@@ -246,9 +421,30 @@ impl DialError {
     }
 }
 
+impl Replicate for DialError {
+    fn replicate(&self) -> Self {
+        match self {
+            Self::Skipped(reason) => Self::Skipped(reason.clone()),
+            Self::AtCapacity(waits) => Self::AtCapacity(waits.clone()),
+            Self::Bind(error) => Self::Bind(error.replicate()),
+            Self::Egress(error) => Self::Egress(error.replicate()),
+            Self::Hop { proxy, source } => Self::Hop {
+                proxy: *proxy,
+                source: source.clone(),
+            },
+            Self::Destination(error) => Self::Destination(error.replicate()),
+            Self::Refused(error) => Self::Refused(error.replicate()),
+            Self::Timeout { stage } => Self::Timeout {
+                stage: stage.clone(),
+            },
+            Self::Fatal(source) => Self::Fatal(source.clone()),
+        }
+    }
+}
+
 // An SSH server refuses a forwarding request it will not serve with
 // `administratively prohibited`; the destination was never tried.
-fn is_forwarding_refusal(detail: &str) -> bool {
+pub(crate) fn is_forwarding_refusal(detail: &str) -> bool {
     detail.contains("AdministrativelyProhibited")
 }
 
@@ -256,49 +452,44 @@ fn is_forwarding_refusal(detail: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailingHop {
     pub proxy: u32,
-    pub reason: String,
+    pub fault: ProxyFault,
 }
 
 // What a proxy hop's own last attempt came to. The hop keeps it itself, so
 // a path can name its first failing hop however the failure travelled up: a
 // hop stacked on a broken one fails too, and its error names only itself.
+// `wait` is the hop's own timeout, which a fault that ran out of time names.
 #[derive(Default)]
-pub struct HopFailure(Mutex<Option<String>>);
+pub struct HopFailure(Mutex<Option<ProxyFault>>);
 impl HopFailure {
     // Records `error` when it is evidence against the hop. A destination
     // the hop answered for clears the record, and an attempt that was never
     // made, such as one skipped for capacity, says nothing either way.
-    fn note(&self, error: &DialError) {
+    fn note(&self, error: &DialError, wait: Duration) {
         match error {
-            // The hop is named beside its reason, so the reason leaves it out.
-            DialError::Hop { source, .. } => self.blame(source),
-            error if error.is_path_evidence() => self.record(error.to_string()),
+            DialError::Hop { source, .. } => self.blame(source, wait),
+            error if error.is_path_evidence() => self.record(error.fault(wait)),
             error if error.is_evidence() => self.clear(),
             _ => {}
         }
     }
     // The hop's own endpoint could not be reached from the stage beneath.
-    fn unreachable(&self, source: &io::Error) {
-        self.record(format!("endpoint unreachable: {source}"));
+    fn unreachable(&self, source: &io::Error, wait: Duration) {
+        self.record(fault::from_io(source, wait));
     }
-    // Records what the hop's tunnel said. A stream proxy reports through
-    // the engine variant, whose own wording is about an engine that could
-    // not start, so what the proxy said stands alone.
-    fn blame(&self, source: &TunnelError) {
-        self.record(match source {
-            TunnelError::Engine(said) => said.clone(),
-            source => source.to_string(),
-        });
+    // Records what the hop's tunnel said.
+    fn blame(&self, source: &TunnelError, wait: Duration) {
+        self.record(fault::classify(source, wait));
     }
-    fn record(&self, reason: String) {
-        *self.0.lock().expect("hop failure") = Some(reason);
+    fn record(&self, fault: ProxyFault) {
+        *self.0.lock().expect("hop failure") = Some(fault);
     }
     fn clear(&self) {
         self.0.lock().expect("hop failure").take();
     }
     fn of(&self, proxy: u32) -> Option<FailingHop> {
-        let reason = self.0.lock().expect("hop failure").clone()?;
-        Some(FailingHop { proxy, reason })
+        let fault = self.0.lock().expect("hop failure").clone()?;
+        Some(FailingHop { proxy, fault })
     }
 }
 
@@ -349,12 +540,30 @@ pub trait Dialer: Send + Sync {
 }
 
 pub struct Egress {
-    pub id: u32,
-    pub binding: SocketEgress,
-    pub timeout: Duration,
+    id: u32,
+    binding: SocketEgress,
+    timeout: Duration,
 }
 
 impl Egress {
+    // The egress a route leaves on. Only the proxy runtime builds one, from a
+    // saved egress; a dialer that builds its own takes no route.
+    pub fn new(id: u32, binding: SocketEgress, timeout: Duration) -> Self {
+        Self {
+            id,
+            binding,
+            timeout,
+        }
+    }
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+    pub fn binding(&self) -> &SocketEgress {
+        &self.binding
+    }
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
     pub fn connect_error(&self, error: io::Error) -> DialError {
         if !matches!(self.binding, SocketEgress::System)
             && matches!(
@@ -369,11 +578,15 @@ impl Egress {
             };
             return DialError::Egress(io::Error::new(
                 error.kind(),
-                format!("no route via {via}: {error}"),
+                format!("{NO_ROUTE_VIA}{via}: {error}"),
             ));
         }
         DialError::destination(error)
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an egress leg dials the destination"
+    )]
     pub async fn connect_address(&self, peer: SocketAddr) -> Result<Dialed, DialError> {
         let stream = tokio::time::timeout(self.timeout, self.binding.connect(peer))
             .await
@@ -400,22 +613,27 @@ impl Egress {
 }
 
 impl UdpSocketFactory for Egress {
+    #[expect(clippy::disallowed_methods, reason = "an egress leg's datagram socket")]
     fn bind(&self, peer: SocketAddr) -> io::Result<std::net::UdpSocket> {
-        self.binding.bind_udp(peer)
+        self.binding
+            .bind_udp(peer)
+            .inspect(|_| record::bound(peer, false))
     }
 }
 
 #[async_trait::async_trait]
 impl Dialer for Egress {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an egress leg resolves with the host resolver"
+    )]
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let started = tokio::time::Instant::now();
         let attempt = async {
             let peers: Vec<_> = if target.addresses.is_empty() {
-                tokio::net::lookup_host((target.host.as_str(), target.port))
+                crate::resolution::host_lookup(&target.host)
                     .await
                     .map_err(DialError::Destination)?
-                    .map(|peer| peer.ip())
-                    .collect()
             } else {
                 target.addresses.clone()
             };
@@ -434,7 +652,10 @@ impl Dialer for Egress {
                     timeout: remaining / (peers.len() - index) as u32,
                 };
                 match attempt.connect_address(*peer).await {
-                    Ok(stream) => return Ok(stream),
+                    Ok(stream) => {
+                        record::connected(&target.host, peer.ip());
+                        return Ok(stream);
+                    }
                     Err(error) => last = error,
                 }
             }
@@ -448,6 +669,11 @@ impl Dialer for Egress {
                     "destination resolution or connect timed out",
                 )))
             });
+        if let Err(error) = &result
+            && unreached(target, error)
+        {
+            crate::resolution::forget_host(&target.host);
+        }
         match (&target.purpose, result) {
             // Failure to reach a proxy endpoint is evidence about the route itself.
             (
@@ -457,22 +683,25 @@ impl Dialer for Egress {
             (_, result) => result,
         }
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an egress leg resolves with the host resolver"
+    )]
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        let peers = tokio::time::timeout(self.timeout, tokio::net::lookup_host((host, 0)))
+        let peers = tokio::time::timeout(self.timeout, crate::resolution::host_lookup(host))
             .await
             .map_err(|_| {
                 DialError::Destination(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "local DNS timed out",
+                    format!("{RESOLVE_TIMED_OUT}: {host}"),
                 ))
             })?
             .map_err(DialError::Destination)?;
         let mut addresses: Vec<_> = peers
-            .map(|p| p.ip())
+            .into_iter()
             .filter(|ip| self.binding.supports_address(*ip))
             .collect();
         addresses.sort();
-        addresses.dedup();
         Ok(Resolution::Addresses(addresses))
     }
     fn offers(&self) -> Transports {
@@ -491,6 +720,7 @@ pub struct TransportHop {
     pub spec: TransportProxy,
     pub inner: Arc<dyn Dialer>,
     pub timeout: Duration,
+    pub naming: Naming,
     pub failure: HopFailure,
 }
 
@@ -520,9 +750,9 @@ impl TransportHop {
             Purpose::ProxyEndpoint { proxy } => Some(proxy),
             _ => None,
         };
-        let unreachable = |proxy, reason: &str| DialError::Hop {
+        let unreachable = |proxy, reply| DialError::Hop {
             proxy,
-            source: TunnelError::Engine(format!("endpoint unreachable: {reason}")),
+            source: crate::transport::hop_before(destination, target.port, reply),
         };
         let connected = tokio::time::timeout_at(
             deadline,
@@ -532,14 +762,15 @@ impl TransportHop {
         match (connected, next) {
             (Ok(Ok(())), _) => Ok(()),
             (Ok(Err(ConnectFailure::Proxy(error))), _) => Err(DialError::hop(self.id, error)),
-            (Ok(Err(ConnectFailure::Unreachable(reason))), Some(proxy)) => {
-                Err(unreachable(proxy, reason))
+            (Ok(Err(ConnectFailure::Unreachable(reply))), Some(proxy)) => {
+                Err(unreachable(proxy, reply))
             }
-            (Ok(Err(ConnectFailure::Unreachable(reason))), None) => Err(DialError::hop(
+            (Ok(Err(ConnectFailure::Unreachable(reply))), None) => Err(DialError::hop(
                 self.id,
-                self.spec.destination_unreachable(reason),
+                self.spec
+                    .destination_unreachable(destination, target.port, reply),
             )),
-            (Err(_), Some(proxy)) => Err(unreachable(proxy, "no answer through the hop before it")),
+            (Err(_), Some(proxy)) => Err(unreachable(proxy, Reply::Silent)),
             (Err(_), None) => Err(timed_out()),
         }
     }
@@ -554,7 +785,9 @@ impl Dialer for TransportHop {
             purpose: Purpose::ProxyEndpoint { proxy: self.id },
             addresses: Vec::new(),
         };
-        let destinations = target.hop_destinations();
+        // The lookup has a window of its own in `budget`, so a slow one
+        // leaves the connect its whole timeout.
+        let destinations = hop_destinations(self, target).await?;
         let started = tokio::time::Instant::now();
         let mut last = None;
         for (index, destination) in destinations.iter().enumerate() {
@@ -567,11 +800,11 @@ impl Dialer for TransportHop {
                     // dial, so failing to reach it is this hop's failure.
                     DialError::Egress(source)
                     | DialError::Destination(source)
-                    | DialError::Refused(source) => self.failure.unreachable(source),
+                    | DialError::Refused(source) => self.failure.unreachable(source, self.timeout),
                     // The proxy hop beneath was reached and could not reach
                     // this endpoint through its own proxy.
                     DialError::Hop { proxy, source } if *proxy == self.id => {
-                        self.failure.blame(source)
+                        self.failure.blame(source, self.timeout)
                     }
                     // Any other failure belongs to the stage beneath.
                     _ => {}
@@ -591,20 +824,30 @@ impl Dialer for TransportHop {
                 Ok(()) => self.failure.clear(),
                 // The proxy answered for the next hop, so it is working.
                 Err(DialError::Hop { proxy, .. }) if *proxy != self.id => self.failure.clear(),
-                Err(error) => self.failure.note(error),
+                Err(error) => self.failure.note(error, self.timeout),
             }
             match negotiated {
                 Ok(()) => {
                     // A negotiated socket carries proxy framing and cannot use NNTP's raw TCP fast path.
                     dialed.stream = DialedStream::Tunnel(dialed.stream.into_tunnel());
                     dialed.path.proxies.push(self.id);
+                    if let Ok(ip) = destination.parse() {
+                        record::connected(&target.host, ip);
+                    }
                     return Ok(dialed);
                 }
                 Err(error @ DialError::Fatal(_)) => return Err(error),
                 Err(error) => last = Some(error),
             }
         }
-        Err(last.expect("a hop dials at least one destination"))
+        let error = last.expect("a hop dials at least one destination");
+        if unreached(target, &error) {
+            self.naming.forget(&target.host);
+        }
+        Err(error)
+    }
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.naming.resolve(self, self.id, host, self.timeout).await
     }
     fn failing_hop(&self) -> Option<FailingHop> {
         self.inner
@@ -612,7 +855,10 @@ impl Dialer for TransportHop {
             .or_else(|| self.failure.of(self.id))
     }
     fn budget(&self) -> Duration {
-        self.inner.budget().saturating_add(self.timeout)
+        self.inner
+            .budget()
+            .saturating_add(self.timeout)
+            .saturating_add(self.naming.window(self.timeout))
     }
     // No shutdown: a stream proxy hop holds nothing of its own, and the
     // stage beneath belongs to whoever built it.
@@ -772,6 +1018,7 @@ pub struct SessionHop {
     pub path: DialPath,
     pub endpoint: Option<SocketAddr>,
     pub timeout: Duration,
+    pub naming: Naming,
     pub resolver: Option<Arc<crate::WireGuardTunnelProvider>>,
     pub failure: HopFailure,
 }
@@ -815,7 +1062,7 @@ impl Dialer for SessionHop {
         }
         match &result {
             Ok(()) => self.failure.clear(),
-            Err(error) => self.failure.note(error),
+            Err(error) => self.failure.note(error, self.timeout),
         }
         if result.is_err() {
             self.retire_idle().await;
@@ -842,14 +1089,23 @@ impl Dialer for SessionHop {
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let started = tokio::time::Instant::now();
         self.prepare_carrier().await?;
+        // Resolving through the proxy dials it, so the name is resolved
+        // before this dial holds the session. The lookup has a window of its
+        // own in `budget`, so a slow one does not shorten the connect.
+        let resolving = tokio::time::Instant::now();
+        let destinations = hop_destinations(self, target).await?;
+        let resolved = resolving.elapsed();
         let activity = self.activity.clone().read_owned().await;
         let capacity = self.capacity.acquire()?;
         let outcome = Arc::new(ConnectionOutcome::default());
-        let destinations = target.hop_destinations();
         let mut connected = Err(DialError::Skipped("no destination".into()));
         for (index, destination) in destinations.iter().enumerate() {
             // Reserve part of the remaining budget for every other address.
-            let remaining = self.budget().saturating_sub(started.elapsed());
+            let remaining = self
+                .inner
+                .budget()
+                .saturating_add(self.timeout)
+                .saturating_sub(started.elapsed().saturating_sub(resolved));
             connected = tokio::time::timeout(
                 remaining / (destinations.len() - index) as u32,
                 self.provider
@@ -860,6 +1116,11 @@ impl Dialer for SessionHop {
                 stage: self.describe(),
             })
             .and_then(|result| result.map_err(|error| DialError::hop(self.id, error)));
+            if connected.is_ok()
+                && let Ok(ip) = destination.parse()
+            {
+                record::connected(&target.host, ip);
+            }
             if matches!(connected, Ok(_) | Err(DialError::Fatal(_))) {
                 break;
             }
@@ -873,7 +1134,10 @@ impl Dialer for SessionHop {
                 stream
             }
             Err(error) => {
-                self.failure.note(&error);
+                self.failure.note(&error, self.timeout);
+                if unreached(target, &error) {
+                    self.naming.forget(&target.host);
+                }
                 drop(capacity);
                 drop(activity);
                 // A destination that refuses says nothing about the tunnel.
@@ -910,24 +1174,49 @@ impl Dialer for SessionHop {
         })
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        self.prepare_carrier().await?;
-        let _activity = self.activity.read().await;
-        let _capacity = self.capacity.acquire()?;
-        match &self.resolver {
-            Some(provider) => provider
-                .resolve_host(host)
-                .await
-                .inspect(|_| {
-                    crate::metrics::record_resolution(crate::metrics::Resolver::WireGuard, true)
-                })
-                .inspect_err(|_| {
-                    crate::metrics::record_resolution(crate::metrics::Resolver::WireGuard, false)
-                })
-                .map(Resolution::Addresses)
-                .map_err(|error| DialError::hop(self.id, error))
-                .inspect_err(|error| self.failure.note(error)),
-            None => Ok(Resolution::Unresolved),
+        // A WireGuard tunnel asks its DNS servers from inside the tunnel. It
+        // was built with the same servers this naming lists, so it asks
+        // them itself.
+        let (Naming::ProxyServers { servers, answers }, Some(provider)) =
+            (&self.naming, &self.resolver)
+        else {
+            return self.naming.resolve(self, self.id, host, self.timeout).await;
+        };
+        if host.parse::<IpAddr>().is_err() {
+            record::asking(host, || Asker::proxy_servers(self.id, servers));
         }
+        answers
+            .resolve(Resolver::WireGuard, host, || async {
+                self.prepare_carrier().await?;
+                let _activity = self.activity.read().await;
+                let _capacity = self.capacity.acquire()?;
+                provider
+                    .resolve_host(host)
+                    .await
+                    .inspect(|_| crate::metrics::record_resolution(Resolver::WireGuard, true))
+                    .inspect_err(|_| crate::metrics::record_resolution(Resolver::WireGuard, false))
+                    .inspect_err(|error| match error {
+                        // The tunnel's resolver asked, and says why it found nothing.
+                        TunnelError::Dial { detail, .. } => record::failed_saying(host, detail),
+                        TunnelError::Configuration(said) => {
+                            record::failed(host, LookupFailure::Other, || said.clone())
+                        }
+                        // The tunnel never came up to ask.
+                        error => record::failed(host, LookupFailure::NoReply, || error.to_string()),
+                    })
+                    // The tunnel's resolver gives no TTL.
+                    .map(|addresses| Lookup {
+                        addresses,
+                        ttl: Ttl::Unknown,
+                        nonexistent: false,
+                    })
+                    .map_err(|error| DialError::hop(self.id, error))
+                    .inspect_err(|error| self.failure.note(error, self.timeout))
+            })
+            .await
+            .inspect(|addresses| record::found(host, addresses))
+            .inspect_err(|error| record::failed_saying(host, error))
+            .map(Resolution::Addresses)
     }
     fn failing_hop(&self) -> Option<FailingHop> {
         self.inner
@@ -940,7 +1229,10 @@ impl Dialer for SessionHop {
             .then(|| Arc::new(datagram::SessionDatagrams::new(self)) as Arc<dyn DatagramTransport>)
     }
     fn budget(&self) -> Duration {
-        self.inner.budget().saturating_add(self.timeout)
+        self.inner
+            .budget()
+            .saturating_add(self.timeout)
+            .saturating_add(self.naming.window(self.timeout))
     }
     // Stops this hop's own session only. The stage beneath may be another
     // session shared with other routes, or one a probe runtime borrowed;
@@ -1088,6 +1380,13 @@ impl Dialer for Fallback {
             return Err(DialError::AtCapacity(capacity_changes));
         }
         Err(last)
+    }
+    // What the first rung a dial would try resolves `host` to.
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        match (0..self.rungs.len()).find(|index| self.allows_rung(*index, false)) {
+            Some(index) => self.rungs[index].resolve(host).await,
+            None => Ok(Resolution::Unresolved),
+        }
     }
     fn budget(&self) -> Duration {
         self.rungs.iter().fold(Duration::ZERO, |sum, rung| {

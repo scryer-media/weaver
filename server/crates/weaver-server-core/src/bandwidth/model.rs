@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use serde::{Deserialize, Serialize};
 
 // A time-based rule that pauses, resumes, changes speed limits, or puts a

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // An explicitly owned, revocable loopback bridge for socket-based consumers.
 use crate::{NoopTunnelObserver, TunnelError, TunnelProvider, socks5::Socks5Front};
 use std::{

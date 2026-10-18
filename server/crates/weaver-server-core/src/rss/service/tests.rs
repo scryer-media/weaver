@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use std::time::Duration;
 mod proxy_body;
@@ -278,6 +281,8 @@ async fn run_sync_uses_conditional_get_and_basic_auth() {
     assert_eq!(first.items_submitted, 1);
     let second = service.run_all_sync().await.unwrap();
     assert_eq!(second.items_fetched, 0);
+    // A 304 is the feed unchanged, not a redirect.
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
     assert_eq!(state.conditional_hits.load(Ordering::SeqCst), 1);
     assert_eq!(state.auth_failures.load(Ordering::SeqCst), 0);
     server_task.abort();
@@ -501,21 +506,19 @@ async fn rss_private_network_hardening_rejects_loopback_feed() {
     let temp = TempDir::new().unwrap();
     let mut security = RuntimeSecurityConfig::default();
     security.rss_allow_private_network = false;
+    let mut db = Database::open(&temp.path().join("rss-private-disabled.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let feed = basic_auth_feed("http://127.0.0.1:8080/feed.xml".to_string());
+    db.insert_rss_feed(&feed).unwrap();
     let service = build_service_with_security(
         temp.path(),
-        Database::open(&temp.path().join("rss-private-disabled.sqlite")).unwrap(),
+        db,
         Arc::new(StdMutex::new(Vec::new())),
         security,
     );
 
-    assert!(
-        service
-            .fetch_feed_response(&basic_auth_feed(
-                "http://127.0.0.1:8080/feed.xml".to_string()
-            ))
-            .await
-            .is_err()
-    );
+    let error = service.fetch_feed_response(&feed).await.unwrap_err();
+    assert!(error.to_string().contains("not allowed"), "{error}");
 }
 
 #[tokio::test]
@@ -523,12 +526,11 @@ async fn rss_basic_auth_is_sent_to_same_origin_feed_and_item_requests() {
     let temp = TempDir::new().unwrap();
     let state = AuthOriginState::new(true);
     let (base_url, server_task) = start_auth_origin_server(state.clone()).await;
-    let service = build_service(
-        temp.path(),
-        Database::open(&temp.path().join("rss-auth-origin.sqlite")).unwrap(),
-        Arc::new(StdMutex::new(Vec::new())),
-    );
+    let mut db = Database::open(&temp.path().join("rss-auth-origin.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = basic_auth_feed(format!("{base_url}/resource"));
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
 
     service.fetch_feed_response(&feed).await.unwrap();
     service
@@ -548,12 +550,11 @@ async fn rss_basic_auth_is_not_sent_to_cross_origin_items() {
     let item_state = AuthOriginState::new(false);
     let (feed_url, feed_task) = start_auth_origin_server(feed_state.clone()).await;
     let (item_url, item_task) = start_auth_origin_server(item_state.clone()).await;
-    let service = build_service(
-        temp.path(),
-        Database::open(&temp.path().join("rss-cross-origin.sqlite")).unwrap(),
-        Arc::new(StdMutex::new(Vec::new())),
-    );
+    let mut db = Database::open(&temp.path().join("rss-cross-origin.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = basic_auth_feed(format!("{feed_url}/resource"));
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
 
     service.fetch_feed_response(&feed).await.unwrap();
     service
@@ -575,12 +576,11 @@ async fn rss_basic_auth_follows_same_origin_redirects_and_strips_cross_origin_re
     let (same_origin_url, same_origin_task) =
         start_auth_origin_server(same_origin_state.clone()).await;
     *same_origin_state.redirect_to.lock().unwrap() = Some(format!("{same_origin_url}/resource"));
-    let service = build_service(
-        temp.path(),
-        Database::open(&temp.path().join("rss-redirect-origin.sqlite")).unwrap(),
-        Arc::new(StdMutex::new(Vec::new())),
-    );
+    let mut db = Database::open(&temp.path().join("rss-redirect-origin.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = basic_auth_feed(format!("{same_origin_url}/resource"));
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
 
     service
         .send_rss_request(&feed, &format!("{same_origin_url}/redirect"), false)
@@ -769,7 +769,16 @@ fn build_service_with_security(
     }));
     let handle = test_scheduler_handle(submissions);
     crate::ingest::init_job_counter(20_000);
-    RssService::new_with_security(handle, config, db, security)
+    let service = RssService::new_with_security(handle, config, db.clone(), security);
+    route_feeds(&service, &db);
+    service
+}
+
+// Routes every feed saved so far, direct: a feed is fetched only on a route.
+fn route_feeds(service: &RssService, db: &Database) {
+    service.inner.handle.set_proxy_runtime(
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap(),
+    );
 }
 
 fn test_scheduler_handle(submissions: Arc<StdMutex<Vec<CapturedSubmission>>>) -> SchedulerHandle {
@@ -960,6 +969,7 @@ async fn due_sync_uses_a_cached_schedule_until_the_actual_deadline() {
     let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
     db.insert_rss_feed(&scheduled_feed(1, Some(service.now())))
         .unwrap();
+    route_feeds(&service, &db);
     // The feed is 900 s away; the poller still looks again within one tick.
     assert_eq!(
         service.next_due_sync_delay(),
@@ -1043,6 +1053,7 @@ async fn a_scheduled_pause_parks_the_due_timer_until_resume() {
     let db = Database::open_in_memory().unwrap();
     let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
     db.insert_rss_feed(&scheduled_feed(1, None)).unwrap();
+    route_feeds(&service, &db);
     service.set_scheduled_paused(true);
     let mut resumed = service.inner.scheduled_paused.subscribe();
     assert_eq!(service.next_due_sync_delay(), None);

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use weaver_model::files::{
     DOWNLOAD_FILENAME_MAX_BYTES, FileRole, archive_base_name, path_component_with_suffix,
     sanitize_download_filename, unique_download_filenames,

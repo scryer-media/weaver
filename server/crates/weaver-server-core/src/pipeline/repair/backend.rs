@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Operation boundary for native repair engines, above their block I/O paths.
 //
 // Each backend keeps its own evidence, assessment, recovery geometry, errors,

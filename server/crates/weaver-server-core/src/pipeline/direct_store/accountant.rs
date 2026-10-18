@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Process-wide accounting of what direct-store holds cost the host.
 //
 // Every set bounds its own holds twice — a RAM budget that pages to scratch

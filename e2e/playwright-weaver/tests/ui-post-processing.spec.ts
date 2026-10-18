@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { randomBytes } from "node:crypto";
 import type { Locator, Page } from "@playwright/test";
 
@@ -89,8 +92,8 @@ test("Configuration saves execution, ordering policy, limits and interpreters", 
     const grace = page.getByRole("spinbutton", { name: "Termination grace", exact: true });
     await grace.fill("5");
     await grace.press("Tab");
-    const extensions = page.getByRole("textbox", { name: "Unacceptable extensions", exact: true });
-    await extensions.fill("EXE, r??");
+    // The unwanted extension list lives under General downloads, not here.
+    await expect(page.getByRole("textbox", { name: "Unacceptable extensions", exact: true })).toHaveCount(0);
     const python = page.getByRole("textbox", { name: "Python", exact: true });
     await python.fill("/usr/bin/python3");
     await saveSettings(page);
@@ -100,7 +103,6 @@ test("Configuration saves execution, ordering policy, limits and interpreters", 
     await expect(settings.getByRole("button", { name: "Global scripts run", exact: true })).toHaveText("For every download");
     await expect(concurrency).toHaveValue("2");
     await expect(grace).toHaveValue("5");
-    await expect(extensions).toHaveValue("exe, r??");
     await expect(python).toHaveValue("/usr/bin/python3");
 
     // Back on, so the restore below and the other tests find execution as they left it.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A holding page while a database upgrade runs.
 //
 // Migrations finish before the real server binds, so a long upgrade used to

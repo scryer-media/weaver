@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { BIND_CHOICES, CONTAINER_BIND_NOTE, MODES, NO_LOGIN_NETWORK_WARNING } from "@/lib/setup-flow";
 import { useSecurityUpgradeForm, type SecurityUpgradeState } from "@/lib/security-upgrade";
 import { Eyebrow } from "../components/chrome";

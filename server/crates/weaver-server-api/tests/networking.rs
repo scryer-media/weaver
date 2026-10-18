@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 mod common;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use weaver_server_api::auth::CallerScope;
@@ -144,7 +147,7 @@ fn refusal(response: &async_graphql::Response) -> (String, String, serde_json::V
 
 // A feed to route, and a proxy to route it through.
 async fn feed_and_proxy(h: &TestHarness) -> (u64, u64) {
-    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}){id}}"#).await;
+    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}){id}}"#).await;
     assert_no_errors(&result);
     let proxy = response_data(&result)["saveProxyProfile"]["id"]
         .as_u64()
@@ -246,7 +249,10 @@ async fn egress_and_pool_refusals_carry_their_codes() {
             "EGRESS_NOT_FOUND",
         ),
         (
-            format!(r#"createProxyPool(input:{{name:"Alone",kind:SOCKS5,memberIds:[{proxy}]}}){{id}}"#),
+            format!(
+                r#"createProxyPool(input:{{name:"Crowded",kind:SOCKS5,memberIds:[{}]}}){{id}}"#,
+                vec![proxy.to_string(); 17].join(",")
+            ),
             "POOL_MEMBER_COUNT",
         ),
         (
@@ -269,6 +275,18 @@ async fn egress_and_pool_refusals_carry_their_codes() {
     let (message, code, _) = refusal(&response);
     assert_eq!(code, "PROXY_IN_USE");
     assert_eq!(message, "proxy is referenced by a server or RSS feed");
+    // A pool saves empty, but no route can name it until it has a member.
+    let response = h
+        .execute(r#"mutation{createProxyPool(input:{name:"Empty",kind:SOCKS5,memberIds:[]}){id}}"#)
+        .await;
+    assert_no_errors(&response);
+    let pool = response_data(&response)["createProxyPool"]["id"]
+        .as_u64()
+        .unwrap();
+    let response = h.execute(&format!("mutation{{saveNetworkRoute(kind:RSS,id:{feed},input:{{legs:[{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{pool:{pool}}}],directFallback:false}}}}}}]}}){{consumer}}}}")).await;
+    let (message, code, _) = refusal(&response);
+    assert_eq!(code, "ROUTE_POOL_EMPTY");
+    assert_eq!(message, "route references a pool with no members");
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 #[tokio::test]
@@ -316,8 +334,12 @@ async fn advanced_route_round_trip_refuses_lossy_legacy_writes_and_preserves_unr
     let query=h.execute("{egressInterfaces{id name health} platformNetworking{egressBindingKinds} networkFlow{consumers{key id name kind cap route{failover legs{egressId weight}}} legs{consumer state} pools{poolId}}}").await;
     assert_no_errors(&query);
     let graph = response_data(&query);
-    let consumer = &graph["networkFlow"]["consumers"][0];
-    assert_eq!(consumer["key"], format!("rss:{feed}"));
+    let consumer = graph["networkFlow"]["consumers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|consumer| consumer["key"] == format!("rss:{feed}").as_str())
+        .unwrap();
     assert_eq!(consumer["name"], "Renamed");
     assert_eq!(consumer["route"]["failover"], "HOLD");
     assert_eq!(consumer["route"]["legs"].as_array().unwrap().len(), 2);
@@ -346,7 +368,7 @@ async fn pool_route_keeps_member_projection_and_prevents_pool_deletion() {
     let h = harness().await;
     let mut ids = Vec::new();
     for name in ["Primary", "Secondary"] {
-        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}}){{id}}}}"#)).await;
+        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}}){{id}}}}"#)).await;
         assert_no_errors(&result);
         ids.push(
             response_data(&result)["saveProxyProfile"]["id"]
@@ -443,6 +465,96 @@ async fn network_flow_subscription_sends_changes_and_otherwise_a_slow_heartbeat(
             .iter()
             .any(|egress| egress["name"] == "Second path"),
         "the frame after a change carries it: {egresses}"
+    );
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+// Default outbound is listed before anything is saved for it, takes and
+// refuses a route as a feed does, and goes back to direct on the direct leg.
+#[tokio::test]
+async fn default_outbound_is_listed_and_routed_like_a_feed() {
+    let h = harness().await;
+    let (feed, proxy) = feed_and_proxy(&h).await;
+    let outbound = || async {
+        let response = h
+            .execute("{networkFlow{consumers{key id name kind cap route{legs{egressId weight path{kind directFallback}}}}}}")
+            .await;
+        assert_no_errors(&response);
+        response_data(&response)["networkFlow"]["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|consumer| consumer["key"] == "outbound")
+            .cloned()
+            .unwrap()
+    };
+    let listed = outbound().await;
+    assert_eq!(
+        (
+            &listed["id"],
+            &listed["name"],
+            &listed["kind"],
+            &listed["cap"]
+        ),
+        (
+            &serde_json::json!(0),
+            &serde_json::json!("Default outbound"),
+            &serde_json::json!("OUTBOUND"),
+            &serde_json::json!(1)
+        )
+    );
+    assert_eq!(listed["route"]["legs"][0]["path"]["kind"], "DIRECT");
+    assert!(h.db.list_proxy_routes().unwrap().is_empty());
+
+    let ladder = format!(
+        "{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{proxy:{proxy}}}],directFallback:false}}}}}}"
+    );
+    let response = h
+        .execute(&format!(
+            "mutation{{saveNetworkRoute(kind:OUTBOUND,id:0,input:{{legs:[{ladder}]}}){{consumer}}}}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["saveNetworkRoute"]["consumer"],
+        "outbound"
+    );
+    let saved =
+        h.db.proxy_routing_policy(weaver_server_core::proxies::Consumer::Outbound)
+            .unwrap();
+    assert_eq!(saved.legs.len(), 1);
+    assert_eq!(
+        outbound().await["route"]["legs"][0]["path"],
+        serde_json::json!({"kind": "LADDER", "directFallback": false})
+    );
+
+    // Refused as a feed's route is, and nothing stored changes.
+    let repeated = format!(
+        "{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{proxy:{proxy}}},{{proxy:{proxy}}}],directFallback:false}}}}}}"
+    );
+    let mut answers = Vec::new();
+    for consumer in [format!("RSS,id:{feed}"), "OUTBOUND,id:0".to_owned()] {
+        let response = h
+            .execute(&format!("mutation{{saveNetworkRoute(kind:{consumer},input:{{legs:[{repeated}]}}){{consumer}}}}"))
+            .await;
+        let (message, code, _) = refusal(&response);
+        answers.push((message, code));
+    }
+    assert_eq!(answers[0].1, "ROUTE_PROXY_REPEATED");
+    assert_eq!(answers[0], answers[1]);
+    assert_eq!(
+        h.db.proxy_routing_policy(weaver_server_core::proxies::Consumer::Outbound)
+            .unwrap(),
+        saved
+    );
+
+    let response = h
+        .execute("mutation{saveNetworkRoute(kind:OUTBOUND,id:0,input:{legs:[{egressId:0,weight:100,path:{direct:true}}]}){consumer}}")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        outbound().await["route"]["legs"][0]["path"]["kind"],
+        "DIRECT"
     );
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }

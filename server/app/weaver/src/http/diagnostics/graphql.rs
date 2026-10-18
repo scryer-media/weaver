@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Runs the diagnostics package's GraphQL reads in-process.
 //
 // The selection sets are derived from the schema's own SDL rather than written

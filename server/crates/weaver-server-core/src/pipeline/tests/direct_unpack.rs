@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Controller tests: what gets admitted, what gets refused, what a chase
 // produces, and what ends one.
 //
@@ -2997,8 +3000,9 @@ fn spawn_chase_extraction(
                 std::sync::Arc::clone(&coverage),
             )
             .map(|reader| std::io::BufReader::with_capacity(128 * 1024, reader))
-            .map_err(|error| format!("open: {error}"))
+            .map_err(|error| crate::pipeline::ExtractionError::io(&error))
         })
+        .map_err(String::from)
     })
 }
 

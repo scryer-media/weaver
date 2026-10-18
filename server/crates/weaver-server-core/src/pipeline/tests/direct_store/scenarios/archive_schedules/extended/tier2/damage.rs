@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The damage axis: articles that arrive wrong rather than not at all.
 //
 // A cell is a damage kind, where it lands, how many articles carry it, the

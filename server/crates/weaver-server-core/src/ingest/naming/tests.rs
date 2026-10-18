@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::{completed_folder_name, derive_release_name, strip_nzb_source_suffix};
 use crate::ingest::append_original_title_metadata;
 

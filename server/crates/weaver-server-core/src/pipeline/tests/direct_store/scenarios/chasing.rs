@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Chasing the compressed member of the existing RARLAB mixed-member fixture.
 
 use super::*;
@@ -99,10 +102,10 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
             .as_ref()
             .err()
             .expect("chase must reject the blocked member");
-        assert!(crate::pipeline::JobExtractionBudget::is_rejection(error));
+        // A chase reports its failure as text, for its demotion record only.
         assert_eq!(
-            crate::pipeline::JobExtractionBudget::job_failure_reason(error.clone()),
-            "unwanted extension '.bin' in 'zeros_64k.bin'"
+            error,
+            "WEAVER_EXTRACTION_REJECTED[content_policy]: unwanted extension '.bin' in 'zeros_64k.bin'"
         );
         assert!(!outcome.staging_dir.join("zeros_64k.bin").exists());
     }

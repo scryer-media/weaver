@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::io::Read;
 
 use crate::jobs::model::{ArchivePasswordCandidate, ArchivePasswordSource};
@@ -9,6 +12,23 @@ const PASSWORDS: &str = "archive_passwords";
 const PASSWORD_FILE: &str = "archive_password_file";
 const MAX_PASSWORD_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+// A job's archive-password candidate list is four buckets in this order, each
+// with its own cap, so no job is ever offered more than 80 candidates: every
+// candidate costs a key derivation at every archive gate the job reaches.
+// - integration, 10: the job's own password first, then the passwords a
+//   calling integration handed over beside it;
+// - header, 10: `X-DNZB-Password` values from weaver's own NZB fetch, in the
+//   order received;
+// - NZB, 10: the NZB's `<meta type="password">` entries in document order,
+//   then its file name's `{{password}}`;
+// - global, 50: the Settings list, then the password file. The Settings list
+//   refuses to save past it and the password file fills what the list leaves.
+// The buckets are de-duplicated by value across the list, the earliest keeping
+// its label, and a value dropped as a repeat does not take a slot.
+pub(crate) const MAX_INTEGRATION_ARCHIVE_PASSWORDS: usize = 10;
+pub(crate) const MAX_HEADER_ARCHIVE_PASSWORDS: usize = 10;
+pub(crate) const MAX_NZB_ARCHIVE_PASSWORDS: usize = 10;
+pub(crate) const MAX_ARCHIVE_PASSWORDS: usize = 50;
 
 impl Database {
     pub fn archive_password_settings(&self) -> Result<(bool, Option<String>), StateError> {
@@ -24,6 +44,11 @@ impl Database {
         let sealed = passwords
             .map(|passwords| {
                 let passwords = ordered_passwords(passwords);
+                if passwords.len() > MAX_ARCHIVE_PASSWORDS {
+                    return Err(StateError::Conflict(format!(
+                        "archive password list holds more than {MAX_ARCHIVE_PASSWORDS} entries"
+                    )));
+                }
                 let value = serde_json::to_string(&passwords)
                     .map_err(|_| StateError::Conflict("invalid archive passwords".into()))?;
                 if value.len() > MAX_PASSWORD_BYTES {
@@ -97,9 +122,17 @@ impl Database {
     pub(crate) fn global_archive_password_candidates(
         &self,
     ) -> Result<Vec<ArchivePasswordCandidate>, StateError> {
+        // Read past the global cap by the three job buckets' caps, so the
+        // harvest still fills its global bucket after dropping the values a job
+        // bucket already holds; the harvest applies `MAX_ARCHIVE_PASSWORDS`.
+        let keep = MAX_ARCHIVE_PASSWORDS
+            + MAX_INTEGRATION_ARCHIVE_PASSWORDS
+            + MAX_HEADER_ARCHIVE_PASSWORDS
+            + MAX_NZB_ARCHIVE_PASSWORDS;
         let (passwords, file) = self.load_archive_password_settings()?;
         let mut candidates: Vec<_> = passwords
             .into_iter()
+            .take(keep)
             .map(|password| {
                 ArchivePasswordCandidate::new(ArchivePasswordSource::Settings, password)
             })
@@ -108,6 +141,9 @@ impl Database {
             match read_password_file(&file) {
                 Ok(passwords) => {
                     for password in passwords {
+                        if candidates.len() >= keep {
+                            break;
+                        }
                         if !candidates
                             .iter()
                             .any(|candidate| candidate.value() == password)
@@ -203,5 +239,54 @@ mod tests {
         db.save_archive_password_settings(Some(vec![]), Some(None))
             .unwrap();
         assert_eq!(db.archive_password_settings().unwrap(), (false, None));
+    }
+
+    #[test]
+    fn global_archive_passwords_are_bounded_at_fifty_across_both_sources() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passwords.txt");
+        let numbered = |prefix: &str, count: usize| -> Vec<String> {
+            (0..count)
+                .map(|index| format!("{prefix}-{index}"))
+                .collect()
+        };
+
+        let too_many = numbered("settings", MAX_ARCHIVE_PASSWORDS + 1);
+        let error = db
+            .save_archive_password_settings(Some(too_many), None)
+            .unwrap_err();
+        assert!(matches!(error, StateError::Conflict(_)));
+
+        // Duplicates and blanks are dropped before the count is taken.
+        let mut padded = numbered("settings", MAX_ARCHIVE_PASSWORDS);
+        padded.push("settings-0".into());
+        padded.push("   ".into());
+        db.save_archive_password_settings(Some(padded), None)
+            .unwrap();
+        assert_eq!(
+            db.global_archive_password_candidates().unwrap().len(),
+            MAX_ARCHIVE_PASSWORDS
+        );
+
+        // The file fills what the Settings list leaves, and no more.
+        std::fs::write(&path, numbered("file", 40).join("\n")).unwrap();
+        db.save_archive_password_settings(
+            Some(numbered("settings", 30)),
+            Some(Some(path.to_str().unwrap().into())),
+        )
+        .unwrap();
+        let loaded = db.global_archive_password_candidates().unwrap();
+        assert_eq!(loaded.len(), 70);
+        let candidates = crate::pipeline::assemble_archive_password_candidates(None, &[], &loaded);
+        assert_eq!(candidates.len(), MAX_ARCHIVE_PASSWORDS);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.source() == ArchivePasswordSource::PasswordFile)
+                .count(),
+            MAX_ARCHIVE_PASSWORDS - 30
+        );
+        assert_eq!(candidates.last().unwrap().value(), "file-19");
     }
 }

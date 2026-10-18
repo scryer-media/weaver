@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Which compute kernel each hot-path library dispatches to on this host.
 //
 // Every library resolves its tiers once, from CPU feature probes and a few

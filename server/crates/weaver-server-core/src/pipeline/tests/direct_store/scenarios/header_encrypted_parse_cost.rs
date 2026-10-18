@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // What a header-encrypted (`-hp`) set pays to learn its own layout.
 //
 // A volume's headers are parsed out of the image its articles stage, and the

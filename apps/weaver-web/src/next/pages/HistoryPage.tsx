@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useCallback, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { useMutation, useQuery } from "urql";
@@ -78,6 +81,8 @@ const COLUMNS = {
 const PAGE_SIZES = [25, 50, 100] as const;
 /** Deep enough to cover a busy day, cheap enough to ask for on every visit. */
 const SAMPLE_SIZE = 200;
+const NO_COUNTS = { all: 0, success: 0, failure: 0 };
+const NO_VOLUMES: StorageVolume[] = [];
 
 type TabId = "all" | "success" | "failure";
 type SortId = "newest" | "largest" | "integrity";
@@ -177,7 +182,7 @@ export function HistoryPage() {
   const t = useTranslate();
   const navigate = useNavigate();
   const statusLabel = useStatusLabel();
-  const { categories: configured, refreshHistoryCount } = useNextData();
+  const { categories: configured, refreshHistoryCount } = useNextData("categories", "refreshHistoryCount");
 
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("newest");
@@ -239,7 +244,7 @@ export function HistoryPage() {
 
   const page = data?.historyPage;
   const pageRows = useMemo(() => page?.items ?? [], [page?.items]);
-  const counts = page?.counts ?? { all: 0, success: 0, failure: 0 };
+  const counts = page?.counts ?? NO_COUNTS;
   const totalCount = page?.totalCount ?? 0;
   const pageCount = Math.max(1, Math.ceil(totalCount / pageSize));
 
@@ -315,7 +320,7 @@ export function HistoryPage() {
     [configured, page],
   );
 
-  const volumes = systemInfo?.systemInfo?.configuredStorage ?? [];
+  const volumes = systemInfo?.systemInfo?.configuredStorage ?? NO_VOLUMES;
   const mounts = storageMounts(volumes);
   const freeAcross = mounts.reduce(
     (total, mount) => total + (mount.capacity?.freeBytes ?? 0),

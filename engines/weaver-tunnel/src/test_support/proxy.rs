@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Strict local HTTP CONNECT/SOCKS5 fixture with an explicit destination map.
 use crate::transport::TransportKind;
 use std::{

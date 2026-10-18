@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Package corpus implements the signed, content-addressed fixture corpus for
 // the Weaver e2e harness: a checked-in ledger (test-corpus/sources.json)
 // describes every fixture path, its size, its BLAKE3 digest and the generator

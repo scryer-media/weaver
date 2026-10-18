@@ -1,4 +1,7 @@
-import type { ReactNode } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { memo, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { COLS_CLASS, columnStyle, type Columns } from "./columns";
 import { Eyebrow } from "./chrome";
@@ -97,7 +100,7 @@ export function ListRow({
 }
 
 /** Right-aligned mono value inside a `ListRow` cluster. */
-export function ValueCell({
+export const ValueCell = memo(function ValueCell({
   children,
   width = 62,
   className,
@@ -117,7 +120,7 @@ export function ValueCell({
       {children}
     </div>
   );
-}
+});
 
 /**
  * A settings row: a label column and a control column.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Move the 0.14.7 shared pause/resume/speed track to independent tracks.
 // Called only by the v55 upgrade hook and older logical-backup imports.
 use crate::persistence::sql_runtime::{SqlArg, SqlConn};

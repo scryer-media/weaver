@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Whether direct unpack is switched on, resolved once.
 //
 // Precedence is **environment, then config, then default** — the same rule and

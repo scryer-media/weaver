@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -384,6 +387,10 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     shared_state.set_paused(true);
                     let _ = reply.send(());
                 }
+                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
+                    shared_state.set_speed_test_paused(paused);
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::ResumeAll { reply } => {
                     shared_state.set_paused(false);
                     let _ = reply.send(());
@@ -542,6 +549,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::UpdateHistory { job_id, reply, .. } => {
+                    let _ = reply.send(Err(SchedulerError::JobNotFound(job_id)));
+                }
                 SchedulerCommand::ReorderJob { job_id, reply, .. } => {
                     let result = if jobs.contains_key(&job_id) {
                         Ok(())
@@ -668,6 +678,7 @@ async fn add_job_with_options_can_start_paused_and_resume_to_queued() {
                 initially_paused: true,
                 semantic_materialization_generation: None,
                 semantic_promotion_generation: None,
+                supplied_password_candidates: Vec::new(),
             },
         )
         .await
@@ -801,6 +812,7 @@ async fn update_job_applies_explicit_patch() {
                 category: FieldUpdate::Set("movies".to_string()),
                 metadata: FieldUpdate::Set(vec![("priority".to_string(), "high".to_string())]),
                 password: FieldUpdate::Unchanged,
+                name: None,
             },
         )
         .await
@@ -820,6 +832,7 @@ async fn update_job_applies_explicit_patch() {
                 category: FieldUpdate::Clear,
                 metadata: FieldUpdate::Clear,
                 password: FieldUpdate::Unchanged,
+                name: None,
             },
         )
         .await

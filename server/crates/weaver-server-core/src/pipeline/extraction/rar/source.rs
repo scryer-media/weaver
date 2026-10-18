@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -99,13 +102,11 @@ impl BoundedRarSourceInner {
         if self.open.as_ref().is_none_or(|open| open.id != id) {
             self.open = None;
             let mut file = File::open(path).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    crate::pipeline::capacity::format_fd_capacity_error(
-                        &format!("failed to lazily open RAR source {}", path.display()),
-                        &error,
-                    ),
+                crate::pipeline::capacity::SourceOpenError::new(
+                    format!("failed to lazily open RAR source {}", path.display()),
+                    error,
                 )
+                .into_io_error()
             })?;
             file.seek(SeekFrom::Start(position))?;
             self.open = Some(OpenRarSource { id, file, position });

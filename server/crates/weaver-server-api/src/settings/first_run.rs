@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The first-run setup wizard's one piece of server state.
 //
 // The wizard walks a new install through its first provider and a look at its

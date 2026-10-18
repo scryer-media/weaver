@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -8,6 +11,7 @@ use crate::jobs::ids::JobId;
 use crate::jobs::{
     ArchivePasswordCandidate, ArchivePasswordSource, FileSpec, JobSpec, SegmentSpec,
 };
+use crate::settings::archive_passwords;
 use weaver_model::files::{FileRole, unique_download_filenames};
 use weaver_nzb::{Nzb, parse_nzb};
 
@@ -51,21 +55,62 @@ pub fn nzb_to_spec(
         nzb.meta.title.as_deref(),
     );
 
-    let name = derive_release_name(
-        nzb_path.file_stem().and_then(|stem| stem.to_str()),
-        nzb.meta.title.as_deref(),
-    );
+    let name = crate::ingest::renamed_title(&metadata)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            derive_release_name(
+                nzb_path.file_stem().and_then(|stem| stem.to_str()),
+                nzb.meta.title.as_deref(),
+            )
+        });
 
     let password = first_password_candidate(nzb, nzb_path, None);
 
-    let mut files = Vec::with_capacity(nzb.files.len());
-    let mut total_bytes: u64 = 0;
-    let filenames = unique_download_filenames(
-        nzb.files
+    let (files, total_bytes, metadata) = nzb_file_specs(nzb, metadata);
+
+    JobSpec {
+        name,
+        password,
+        files,
+        total_bytes,
+        category,
+        metadata,
+    }
+}
+
+// The files of a job built from `nzb`, their total size, and `metadata` with
+// the record of every file written under a name other than its full one.
+// Every job built from an NZB, first or again, names its files here, so a
+// rebuilt job finds them under the names the first run gave them.
+pub(super) fn nzb_file_specs(
+    nzb: &Nzb,
+    metadata: Vec<(String, String)>,
+) -> (Vec<FileSpec>, u64, Vec<(String, String)>) {
+    let full_names = nzb
+        .files
+        .iter()
+        .map(|nzb_file| {
+            // Prefer the enhanced extraction (handles PRiVATE format, higher confidence).
+            // If the extracted name is obfuscated, keep it - PAR2 deobfuscation will
+            // rename it post-repair using 16KB hash matching.
+            nzb_file
+                .extract_filename()
+                .map(|(name, _confidence)| name)
+                .or_else(|| nzb_file.filename().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+        .collect::<Vec<_>>();
+    let filenames = unique_download_filenames(full_names.iter().map(String::as_str));
+    let metadata = super::append_full_file_names_metadata(
+        metadata,
+        full_names
             .iter()
-            .map(|nzb_file| nzb_file.filename().unwrap_or("unknown")),
+            .map(String::as_str)
+            .zip(filenames.iter().map(String::as_str)),
     );
 
+    let mut files = Vec::with_capacity(nzb.files.len());
+    let mut total_bytes: u64 = 0;
     for (nzb_file, filename) in nzb.files.iter().zip(filenames) {
         let role = FileRole::from_filename(&filename);
 
@@ -93,19 +138,68 @@ pub fn nzb_to_spec(
         });
     }
 
-    JobSpec {
-        name,
-        password,
-        files,
-        total_bytes,
-        category,
-        metadata,
-    }
+    (files, total_bytes, metadata)
 }
 
 pub fn normalize_archive_password_candidate(raw: Option<&str>) -> Option<String> {
     raw.filter(|value| !value.trim().is_empty())
         .map(str::to_string)
+}
+
+// Passwords a calling integration handed over beside the job's own one, in
+// the order given: normalized the way the spec password is, blanks and repeats
+// dropped, at most the integration bucket's cap kept.
+pub fn integration_archive_password_candidates<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<ArchivePasswordCandidate> {
+    bounded_password_candidates(
+        ArchivePasswordSource::Integration,
+        values,
+        archive_passwords::MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+    )
+}
+
+// `X-DNZB-Password` values from weaver's own NZB fetch, in the order received,
+// normalized and de-duplicated the same way. It keeps the header bucket's cap
+// plus the integration bucket's, so the bucket still fills when the harvest
+// drops values the integration already handed over.
+pub fn header_archive_password_candidates<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<ArchivePasswordCandidate> {
+    bounded_password_candidates(
+        ArchivePasswordSource::DnzbHeader,
+        values,
+        archive_passwords::MAX_HEADER_ARCHIVE_PASSWORDS
+            + archive_passwords::MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+    )
+}
+
+fn bounded_password_candidates<'a>(
+    source: ArchivePasswordSource,
+    values: impl IntoIterator<Item = &'a str>,
+    keep: usize,
+) -> Vec<ArchivePasswordCandidate> {
+    let mut candidates: Vec<ArchivePasswordCandidate> = Vec::new();
+    for value in values {
+        if candidates.len() >= keep {
+            break;
+        }
+        push_password_candidate(&mut candidates, source, Some(value));
+    }
+    candidates
+}
+
+// Every `X-DNZB-Password` value on an indexer's NZB response, in the order
+// received. The header is repeatable and each occurrence is one password; a
+// value is never split on commas, because a password may contain one. Header
+// names are case-insensitive, which `HeaderMap` already guarantees.
+pub fn dnzb_header_passwords(headers: &reqwest::header::HeaderMap) -> Vec<String> {
+    headers
+        .get_all("x-dnzb-password")
+        .iter()
+        .filter_map(|value| std::str::from_utf8(value.as_bytes()).ok())
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn nzb_password_candidates(
@@ -119,17 +213,28 @@ pub fn nzb_password_candidates(
         ArchivePasswordSource::Explicit,
         explicit_password,
     );
-    push_password_candidate(
-        &mut candidates,
-        ArchivePasswordSource::NzbMeta,
-        nzb.meta.password.as_deref(),
+    // The parsed NZB stays faithful; the bound applies here, so a restart that
+    // re-harvests the persisted NZB keeps the same entries. It is the NZB
+    // bucket's cap plus the two buckets ahead of it, so the bucket still fills
+    // when the harvest drops values those buckets already hold.
+    let keep = archive_passwords::MAX_NZB_ARCHIVE_PASSWORDS
+        + archive_passwords::MAX_INTEGRATION_ARCHIVE_PASSWORDS
+        + archive_passwords::MAX_HEADER_ARCHIVE_PASSWORDS;
+    let meta_passwords = std::iter::once(nzb.meta.password.as_deref()).chain(
+        nzb.meta
+            .passwords
+            .iter()
+            .map(|password| Some(password.as_str())),
     );
-    for password in &nzb.meta.passwords {
-        push_password_candidate(
-            &mut candidates,
-            ArchivePasswordSource::NzbMeta,
-            Some(password),
-        );
+    for password in meta_passwords {
+        let kept = candidates
+            .iter()
+            .filter(|candidate| candidate.source() == ArchivePasswordSource::NzbMeta)
+            .count();
+        if kept >= keep {
+            break;
+        }
+        push_password_candidate(&mut candidates, ArchivePasswordSource::NzbMeta, password);
     }
 
     if let Some(stem) = nzb_path.file_stem().and_then(|segment| segment.to_str())

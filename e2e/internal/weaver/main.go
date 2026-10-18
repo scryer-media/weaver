@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // weaver-e2e is the CLI tool for the Weaver end-to-end test environment.
 //
 // It orchestrates Nyuu (real usenet poster) for article posting and NZB generation.

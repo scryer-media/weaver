@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // `weaver-tray`: the desktop wrapper around the Weaver server.
 //
 // The wrapper is not a second implementation of Weaver. It starts and stops
@@ -31,6 +34,11 @@ mod shared;
 #[cfg(windows)]
 #[path = "tray/windows.rs"]
 mod windows;
+
+// The server's kill-on-close job and the lookup of the tray port's owner.
+#[cfg(windows)]
+#[path = "tray/windows_process.rs"]
+mod windows_process;
 
 #[cfg(target_os = "macos")]
 #[path = "tray/macos.rs"]

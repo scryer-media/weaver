@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # c7a-bootstrap.sh — idempotent one-shot setup for the weaver-yenc AVX-512/VBMI2
 # differential + parity bench (and the rarpar GFNI/AVX-512 GF16 phase) on an AWS
 # c7a.xlarge (AMD Zen 4) Ubuntu 24.04 box.

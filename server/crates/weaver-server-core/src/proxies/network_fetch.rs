@@ -1,20 +1,22 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use std::net::IpAddr;
 use weaver_tunnel::{
     TunnelError, TunnelStream,
-    bridge::{Bridge, ConnectionOutcome},
+    bridge::ConnectionOutcome,
     pipe::{Purpose, Resolution},
 };
 
-// A feed attempt owns one concrete path for both DNS validation and HTTP.
-pub struct FeedAttempt {
+// A fetch attempt owns one concrete path for both DNS validation and HTTP.
+pub struct FetchAttempt {
     route: Arc<LiveNetworkRoute>,
     guard: Arc<Revocable>,
     stage: Arc<dyn Dialer>,
     position: usize,
-    feed: u32,
+    purpose: Purpose,
     pacing: Option<Arc<weaver_nntp::transfer::ServerTransferControl>>,
-    dns_servers: Vec<IpAddr>,
     legacy_status: Arc<ConsumerRoute>,
     selected_proxy: Option<u32>,
     ladder: Option<Arc<Fallback>>,
@@ -25,29 +27,25 @@ pub struct FeedAttempt {
     // The leg's final attempt this sync: no later rung, and no direct
     // fallback, remains after it.
     last_attempt: bool,
-    // The addresses the fetch checked for its host, so a direct dial uses
-    // exactly those instead of resolving again.
-    addresses: Mutex<Option<(String, Vec<IpAddr>)>>,
+    // The addresses the fetch checked for each host, so a dial uses exactly
+    // those instead of resolving again.
+    addresses: Mutex<HashMap<String, Vec<IpAddr>>>,
 }
-impl FeedAttempt {
-    // Pins the checked addresses a direct dial of `host` uses.
-    pub fn pin_addresses(&self, host: &str, addresses: Vec<IpAddr>) {
-        *self.addresses.lock().expect("feed addresses") = Some((host.to_owned(), addresses));
-    }
+impl FetchAttempt {
     pub async fn cancelled(&self) {
         self.guard.cancelled().await;
     }
     pub fn take_transport_error(&self) -> Option<Arc<DialError>> {
         self.transport_error
             .lock()
-            .expect("feed transport error")
+            .expect("fetch transport error")
             .take()
     }
     pub fn report(&self, error: Option<&DialError>) {
         if self.guard.is_revoked() {
             return;
         }
-        for setup in std::mem::take(&mut *self.setups.lock().expect("feed setup")) {
+        for setup in std::mem::take(&mut *self.setups.lock().expect("fetch setup")) {
             setup.complete(error.is_none());
         }
         self.stage.report_request(error);
@@ -60,7 +58,7 @@ impl FeedAttempt {
         }
         match (error, self.selected_proxy) {
             (Some(error), Some(id)) if error.is_path_evidence() => {
-                self.legacy_status.fail(id, &error.to_string())
+                self.legacy_status.fail_dial(id, error)
             }
             (None, id) => self.legacy_status.success(id),
             _ => {}
@@ -68,7 +66,7 @@ impl FeedAttempt {
         // A failed rung is not a failed leg while a later rung, or the direct
         // fallback, is still to be tried this sync. A connection's dialer
         // reports one outcome to its leg after every rung has had its turn;
-        // the feed's attempts report the same way, or two cooling rungs would
+        // a fetch's attempts report the same way, or two cooling rungs would
         // take the leg down before the fallback behind them ever ran.
         if error.is_some() && !self.last_attempt {
             return;
@@ -79,31 +77,33 @@ impl FeedAttempt {
             error,
         );
     }
-    pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, DialError> {
+}
+#[async_trait::async_trait]
+impl FetchPath for FetchAttempt {
+    // The addresses `host` is reached at, as the attempt's exit resolves
+    // it, or `Unresolved` when the exit proxy is handed the name.
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
         if self.guard.is_revoked() {
             return Err(DialError::Skipped("leg revoked".into()));
         }
-        match self.stage.resolve(host).await? {
-            Resolution::Addresses(addresses) => Ok(addresses),
-            Resolution::Unresolved => weaver_tunnel::dns::resolve(self, &self.dns_servers, host)
-                .await
-                .map_err(|source| DialError::Destination(std::io::Error::other(source))),
-        }
+        self.stage.resolve(host).await
     }
-    pub fn bridge(self: &Arc<Self>) -> Result<Arc<Bridge>, String> {
-        let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret).map_err(|_| "could not generate bridge credentials")?;
-        Bridge::start(
-            &tokio::runtime::Handle::current(),
-            self.clone(),
-            self.stage.budget(),
-            ("weaver".into(), hex::encode(secret)),
-        )
-        .map_err(|e| e.to_string())
+    // Pins the checked addresses a direct dial of `host` uses.
+    fn pin(&self, host: &str, addresses: Vec<IpAddr>) {
+        self.addresses
+            .lock()
+            .expect("fetch addresses")
+            .insert(host.to_owned(), addresses);
+    }
+    fn budget(&self) -> Duration {
+        self.stage.budget()
+    }
+    fn body_failed(&self, error: &DialError) {
+        self.report(Some(error));
     }
 }
 #[async_trait::async_trait]
-impl TunnelProvider for FeedAttempt {
+impl TunnelProvider for FetchAttempt {
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
         self.dial_observed(host, port, Arc::default()).await
     }
@@ -117,15 +117,14 @@ impl TunnelProvider for FeedAttempt {
         let addresses = self
             .addresses
             .lock()
-            .expect("feed addresses")
-            .as_ref()
-            .filter(|(pinned, _)| pinned == host)
-            .map(|(_, addresses)| addresses.clone())
+            .expect("fetch addresses")
+            .get(host)
+            .cloned()
             .unwrap_or_default();
         let target = Target {
             host: host.into(),
             port,
-            purpose: Purpose::Feed { feed: self.feed },
+            purpose: self.purpose.clone(),
             addresses,
         };
         let mut dialed = self
@@ -134,7 +133,8 @@ impl TunnelProvider for FeedAttempt {
             .await
             .map_err(|error| {
                 let message = error.to_string();
-                *self.transport_error.lock().expect("feed transport error") = Some(Arc::new(error));
+                *self.transport_error.lock().expect("fetch transport error") =
+                    Some(Arc::new(error));
                 TunnelError::Engine(message)
             })?;
         dialed.path.rung = self.selected_proxy.map(|_| self.rung);
@@ -151,10 +151,10 @@ impl TunnelProvider for FeedAttempt {
         let outcome = dialed.outcome.clone();
         observed.on_close(move || outcome.closed());
         if let Some(setup) = dialed.setup.take() {
-            self.setups.lock().expect("feed setup").push(setup);
+            self.setups.lock().expect("fetch setup").push(setup);
         }
         // Keep connection accounting alive until the bridge releases its stream.
-        Ok(Box::new(FeedStream {
+        Ok(Box::new(FetchStream {
             inner: weaver_tunnel::direct::DirectStream::from_stream(dialed.stream.into_tunnel()),
             outcome: dialed.outcome,
             pacing: self.pacing.clone(),
@@ -167,7 +167,7 @@ impl TunnelProvider for FeedAttempt {
         self.stage.describe()
     }
 }
-struct FeedStream {
+struct FetchStream {
     inner: weaver_tunnel::direct::DirectStream,
     outcome: Arc<ConnectionOutcome>,
     pacing: Option<Arc<weaver_nntp::transfer::ServerTransferControl>>,
@@ -175,12 +175,12 @@ struct FeedStream {
     pending: Vec<u8>,
     offset: usize,
 }
-impl Drop for FeedStream {
+impl Drop for FetchStream {
     fn drop(&mut self) {
         self.outcome.closed();
     }
 }
-impl tokio::io::AsyncRead for FeedStream {
+impl tokio::io::AsyncRead for FetchStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -232,7 +232,7 @@ impl tokio::io::AsyncRead for FeedStream {
         }
     }
 }
-impl tokio::io::AsyncWrite for FeedStream {
+impl tokio::io::AsyncWrite for FetchStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -254,12 +254,19 @@ impl tokio::io::AsyncWrite for FeedStream {
     }
 }
 impl NetworkRuntime {
-    pub fn feed_attempts(
+    // The paths one HTTP fetch for `consumer` may take, in the order it
+    // tries them.
+    pub fn fetch_attempts(
         &self,
-        feed: u32,
+        consumer: Consumer,
         legacy_status: Arc<ConsumerRoute>,
-    ) -> Result<Vec<Arc<FeedAttempt>>, String> {
-        let route = self.route(Consumer::Rss(feed), 1, Duration::from_secs(30))?;
+    ) -> Result<Vec<Arc<FetchAttempt>>, String> {
+        let purpose = match consumer {
+            Consumer::Rss(feed) => Purpose::Feed { feed },
+            Consumer::Outbound => Purpose::Outbound,
+            Consumer::Server(_) => return Err("a server's route does not carry fetches".into()),
+        };
+        let route = self.route(consumer, 1, Duration::from_secs(30))?;
         let config = self.configuration.read().expect("network configuration");
         let legs = route.legs.read().expect("route legs");
         let health = route.weighted.allocations();
@@ -308,7 +315,7 @@ impl NetworkRuntime {
                         }
                         self.pool(&config, id, bottom.clone())?;
                         let pools = self.pools.lock().expect("network pools");
-                        let Some(pool) = pools.get(&(id, bottom.id)) else {
+                        let Some(pool) = pools.get(&(id, bottom.id())) else {
                             continue;
                         };
                         pool.lease_members()
@@ -319,22 +326,17 @@ impl NetworkRuntime {
                 };
                 let count = stages.len();
                 for (member_index, (stage, last)) in stages.into_iter().enumerate() {
-                    leg_attempts.push(FeedAttempt {
+                    leg_attempts.push(FetchAttempt {
                         route: route.clone(),
                         guard: leg.stage.clone(),
                         stage,
                         position,
-                        feed,
+                        purpose: purpose.clone(),
                         pacing: self
                             .egress_controls
                             .get(weaver_nntp::transfer::StableServerId(
                                 leg.definition.egress_id,
                             )),
-                        dns_servers: config
-                            .profiles
-                            .get(&last)
-                            .map(|p| p.dns_servers.clone())
-                            .unwrap_or_default(),
                         legacy_status: legacy_status.clone(),
                         selected_proxy: Some(last),
                         ladder: leg.ladder.clone(),
@@ -343,7 +345,7 @@ impl NetworkRuntime {
                         setups: Mutex::new(Vec::new()),
                         last_member: member_index + 1 == count,
                         last_attempt: false,
-                        addresses: Mutex::new(None),
+                        addresses: Mutex::default(),
                     });
                 }
             }
@@ -353,18 +355,17 @@ impl NetworkRuntime {
                     .as_ref()
                     .is_none_or(|ladder| ladder.allows_rung(direct_rung, probing))
             {
-                leg_attempts.push(FeedAttempt {
+                leg_attempts.push(FetchAttempt {
                     route: route.clone(),
                     guard: leg.stage.clone(),
                     stage: bottom,
                     position,
-                    feed,
+                    purpose: purpose.clone(),
                     pacing: self
                         .egress_controls
                         .get(weaver_nntp::transfer::StableServerId(
                             leg.definition.egress_id,
                         )),
-                    dns_servers: Vec::new(),
                     legacy_status: legacy_status.clone(),
                     selected_proxy: None,
                     ladder: leg.ladder.clone(),
@@ -373,7 +374,7 @@ impl NetworkRuntime {
                     setups: Mutex::new(Vec::new()),
                     last_member: true,
                     last_attempt: false,
-                    addresses: Mutex::new(None),
+                    addresses: Mutex::default(),
                 });
             }
             if let Some(last) = leg_attempts.last_mut() {

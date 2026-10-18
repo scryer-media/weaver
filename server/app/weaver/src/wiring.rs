@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -76,7 +79,7 @@ pub(crate) fn build_nntp_client(
         weaver_nntp::connection::NntpBufferProfile::adaptive(effective_memory, total_connections);
     let servers = weaver_server_core::runtime::reload::nntp_server_pool_configs(
         &config.servers,
-        Some(proxies),
+        proxies,
         &policy_registry.transfer_registry(),
         buffer_profile,
     )?;
@@ -310,7 +313,6 @@ mod tests {
         let client = build_nntp_client(&config, &test_profile(), &registry, &proxies).unwrap();
 
         let server = &client.pool().server_configs()[0];
-        assert!(server.dialer.is_some(), "startup must use the route dialer");
         assert_eq!(server.pipelining_depth, Some(4));
         assert_eq!(
             server.tls_name_mismatch_certificate_der.as_deref(),

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # c7a-run.sh — run the weaver-yenc AVX-512/VBMI2 differential + parity bench AND
 # the rarpar GFNI/AVX-512 GF16 phase on a real AMD Zen 4 (AWS c7a). Re-runnable.
 # Tees everything to a timestamped results dir and prints a parsed summary.

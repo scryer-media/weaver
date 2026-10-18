@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::time::Duration;
 
 use crate::servers::ServerConfig;
@@ -29,13 +32,73 @@ pub struct ServerConnectivityResult {
     pub tls_honors_client_cipher_order: Option<bool>,
 }
 
-pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivityResult {
-    probe_server_connection_with_route(config, None).await
+impl ServerConnectivityResult {
+    pub fn failed(message: String) -> Self {
+        Self {
+            success: false,
+            message,
+            latency_ms: None,
+            first_byte_latency_ms: None,
+            first_byte_latency_band: None,
+            supports_pipelining: false,
+            adoptable_tls_name_mismatch_certificate_der: None,
+            tls_cipher_suite: None,
+            tls_honors_client_cipher_order: None,
+        }
+    }
 }
 
-pub async fn probe_server_connection_with_route(
+// Probe a server over each leg of its drafted route, in leg order, then
+// revoke the draft. Nothing live changes.
+pub async fn probe_server_route(
     config: &ServerConfig,
-    dialer: Option<std::sync::Arc<weaver_nntp::route_dialer::RouteDialer>>,
+    route: &crate::proxies::DraftNetworkRoute,
+) -> Result<Vec<ServerConnectivityResult>, String> {
+    let mut results = Vec::new();
+    for position in 0..route.leg_count() {
+        match route.nntp_dialer_for_leg(position, config.id) {
+            Ok(dialer) => results.push(probe_server_connection(config, dialer).await),
+            Err(error) => {
+                route.revoke().await;
+                return Err(error);
+            }
+        }
+    }
+    route.revoke().await;
+    Ok(results)
+}
+
+// Probe a server that is not saved yet over the route its policy drafts: the
+// saved route for its id, or the default one. The first leg that answers
+// speaks for the server.
+pub async fn probe_unsaved_server(
+    proxies: &crate::proxies::ProxyRuntime,
+    config: &ServerConfig,
+) -> ServerConnectivityResult {
+    let consumer = crate::proxies::Consumer::Server(config.id);
+    let probed = match proxies.network.draft_route(
+        consumer,
+        proxies.policy(consumer),
+        SERVER_CONNECT_TIMEOUT,
+    ) {
+        Ok(route) => probe_server_route(config, &route).await,
+        Err(error) => Err(error),
+    };
+    match probed {
+        Ok(mut results) => match results.iter().position(|result| result.success) {
+            Some(answered) => results.swap_remove(answered),
+            None if results.is_empty() => {
+                ServerConnectivityResult::failed("route has no legs to test".into())
+            }
+            None => results.swap_remove(0),
+        },
+        Err(message) => ServerConnectivityResult::failed(message),
+    }
+}
+
+pub async fn probe_server_connection(
+    config: &ServerConfig,
+    dialer: std::sync::Arc<weaver_nntp::route_dialer::RouteDialer>,
 ) -> ServerConnectivityResult {
     // Every check happens on the one real connection. Its handshake verifies
     // the certificate against the hostname, so a mismatch fails there, before
@@ -44,25 +107,6 @@ pub async fn probe_server_connection_with_route(
     // on a distant server each extra handshake or command is a full round
     // trip, and a seeded server's probe must finish inside a fixed deadline.
     let nntp_config = weaver_nntp::ServerConfig {
-        dialer: Some(dialer.unwrap_or_else(|| {
-            std::sync::Arc::new(weaver_nntp::route_dialer::RouteDialer {
-                inner: std::sync::Arc::new(weaver_nntp::route_dialer::AddressPlanned::new(
-                    "server connectivity probe".into(),
-                    std::sync::Arc::new(weaver_tunnel::pipe::Egress {
-                        id: 0,
-                        binding: weaver_tunnel::egress::SocketEgress::System,
-                        timeout: SERVER_CONNECT_TIMEOUT,
-                    }),
-                )),
-                egress_controls: std::sync::Arc::new(
-                    weaver_nntp::transfer::ServerTransferRegistry::with_scope(
-                        weaver_nntp::transfer::TransferScope::Egress,
-                    ),
-                ),
-                runtime: tokio::runtime::Handle::current(),
-                server: config.id,
-            })
-        })),
         host: config.host.clone(),
         port: config.port,
         tls: config.tls,
@@ -72,7 +116,7 @@ pub async fn probe_server_connection_with_route(
         tls_name_mismatch_certificate_der: config.tls_name_mismatch_certificate_der.clone(),
         pipelining: weaver_nntp::PipeliningCapability::Probe,
         connect_timeout: SERVER_CONNECT_TIMEOUT,
-        ..Default::default()
+        ..weaver_nntp::ServerConfig::new(dialer)
     };
     let start = std::time::Instant::now();
     match weaver_nntp::NntpConnection::connect(&nntp_config).await {
@@ -107,7 +151,7 @@ pub async fn probe_server_connection_with_route(
                     &config.host,
                     config.port,
                     config.tls_ca_cert.as_deref(),
-                    nntp_config.dialer.as_ref(),
+                    &nntp_config.dialer,
                 )
                 .await
                 .ok()

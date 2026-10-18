@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The tracing layer that feeds each job's debug ring.
 //
 // It carries its own filter, so it sees a job's DEBUG and TRACE events

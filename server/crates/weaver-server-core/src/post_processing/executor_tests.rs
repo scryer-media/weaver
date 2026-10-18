@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::executor::{PostProcessingExecutor, execution_refusal};
 use super::instances::{
     InstanceInputDraft, InstanceTrigger, ScriptInstance, ScriptInstanceDraft, ScriptInstanceError,
@@ -1227,6 +1230,7 @@ fn interrupted_job(
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     })
     .unwrap();
     let instances = ["one.sh", "two.sh", "three.sh", "four.sh", "five.sh"]

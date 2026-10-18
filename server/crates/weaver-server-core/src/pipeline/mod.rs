@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 pub mod archive;
 #[cfg(test)]
 pub(crate) use archive::rar_state;
@@ -67,6 +70,7 @@ use weaver_nntp::NntpClient;
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 pub(crate) use self::extraction::safety::ProcessMemoryPermit;
+pub(crate) use self::extraction::{ExtractionError, ExtractionErrorClass, OrTerminal};
 use self::extraction::{
     ExtractionLimits, ExtractionRoot, JobExtractionBudget, ProcessMemoryBudget,
 };
@@ -127,54 +131,130 @@ pub(crate) fn persisted_nzb_password_candidates(
     Ok(crate::ingest::nzb_password_candidates(&nzb, nzb_path, None))
 }
 
-impl Pipeline {
-    pub(super) fn archive_password_candidates_for_job(
-        &self,
-        job_id: JobId,
-    ) -> Vec<ArchivePasswordCandidate> {
-        let mut candidates = self.harvest_archive_password_candidates(job_id).0;
-        match self.db.global_archive_password_candidates() {
-            Ok(global) => {
-                for candidate in global {
-                    if !candidates
-                        .iter()
-                        .any(|existing| existing.value() == candidate.value())
-                    {
-                        candidates.push(candidate);
-                    }
-                }
-            }
-            Err(_) => warn!(job_id = job_id.0, "could not load global archive passwords"),
-        }
-        candidates
-    }
+// The candidates a job carries, as `JobState::nzb_password_candidates` holds
+// them: those supplied with the job (`Integration`, `DnzbHeader`), then its
+// NZB's. The harvest sorts them into buckets by label.
+pub(crate) fn job_carried_password_candidates(
+    supplied: &[ArchivePasswordCandidate],
+    nzb: Vec<ArchivePasswordCandidate>,
+) -> Vec<ArchivePasswordCandidate> {
+    let mut carried = supplied.to_vec();
+    carried.extend(nzb);
+    carried
+}
 
-    // [`Self::archive_password_candidates_for_job`] plus whether the job's
-    // persisted NZB was actually **read**.
+// Builds the list from the job's carried candidates and the global ones, in
+// four buckets, each capped as
+// `settings::archive_passwords` states: integration (`Explicit` from the spec,
+// then `Integration`), header (`DnzbHeader`), NZB (`NzbMeta`, then
+// `FilenameConvention`), and global (`Settings`, then `PasswordFile`). A value
+// already in the list is skipped without taking a slot, so the earliest
+// source keeps its label.
+pub(crate) fn assemble_archive_password_candidates(
+    spec_password: Option<&str>,
+    carried: &[ArchivePasswordCandidate],
+    global: &[ArchivePasswordCandidate],
+) -> Vec<ArchivePasswordCandidate> {
+    use crate::settings::archive_passwords::{
+        MAX_ARCHIVE_PASSWORDS, MAX_HEADER_ARCHIVE_PASSWORDS, MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+        MAX_NZB_ARCHIVE_PASSWORDS,
+    };
+
+    let spec = crate::ingest::normalize_archive_password_candidate(spec_password)
+        .map(|value| ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, value));
+    let job = || carried.iter();
+    let with = |sources: &'static [ArchivePasswordSource]| {
+        move |candidate: &&ArchivePasswordCandidate| sources.contains(&candidate.source())
+    };
+    let buckets: [(Vec<&ArchivePasswordCandidate>, usize); 4] = [
+        (
+            spec.iter()
+                .chain(job().filter(with(&[ArchivePasswordSource::Integration])))
+                .collect(),
+            MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+        ),
+        (
+            job()
+                .filter(with(&[ArchivePasswordSource::DnzbHeader]))
+                .collect(),
+            MAX_HEADER_ARCHIVE_PASSWORDS,
+        ),
+        (
+            job()
+                .filter(with(&[ArchivePasswordSource::NzbMeta]))
+                .chain(job().filter(with(&[ArchivePasswordSource::FilenameConvention])))
+                .collect(),
+            MAX_NZB_ARCHIVE_PASSWORDS,
+        ),
+        (global.iter().collect(), MAX_ARCHIVE_PASSWORDS),
+    ];
+
+    let mut candidates: Vec<ArchivePasswordCandidate> = Vec::new();
+    for (bucket, cap) in buckets {
+        let mut kept = 0;
+        for candidate in bucket {
+            if kept >= cap {
+                break;
+            }
+            if candidates
+                .iter()
+                .any(|existing| existing.value() == candidate.value())
+            {
+                continue;
+            }
+            candidates.push(candidate.clone());
+            kept += 1;
+        }
+    }
+    candidates
+}
+
+// A job's archive-password candidates, and whether every source behind them
+// was actually read.
+pub(crate) struct ArchivePasswordHarvest {
+    // In trial order, at most 80: the integration bucket (`Explicit`, the
+    // spec's password, then `Integration`), the header bucket (`DnzbHeader`),
+    // the NZB bucket (`NzbMeta`, then `FilenameConvention`), then the global
+    // bucket (`Settings`, then `PasswordFile`). De-duplicated by value, the
+    // earliest source keeping its label.
+    pub(crate) candidates: Vec<ArchivePasswordCandidate>,
+    // `false` when the job's row or the global list could not be read this
+    // time. Both of those warn and continue without their half, so an empty or
+    // short list is two different facts: "the job carries nothing more", which
+    // is permanent, and "a read failed this once", which is not. A caller that
+    // memoizes the list must not remember an incomplete one.
+    pub(crate) complete: bool,
+}
+
+impl Pipeline {
+    // The one place a job's archive-password candidate list is built. Every
+    // consumer takes it from here: the direct store's `-hp` and `-mhe` header
+    // admission, the restart seam, archive probe and topology, finalize and
+    // nested extraction.
     //
-    // The harvest's two halves fail differently. `spec.password` is already in
-    // memory and cannot fail; the NZB half is a database read followed by a
-    // parse, and both of those warn-and-continue with an empty list. So an
-    // empty result is two different facts — *"this job carries no password
-    // anywhere"*, which is permanent, and *"the read failed this once"*, which
-    // is not — and any caller that **memoizes** the harvest has to tell them
-    // apart. `false` here means the second: nothing about the job was learned,
-    // so nothing about it may be remembered.
-    fn harvest_archive_password_candidates(
+    // The job half (the passwords supplied with the job and its NZB's) is a
+    // database read, a decrypt and a parse, memoized per job in
+    // `nzb_password_candidates` once it has been read (a missing row or NZB is
+    // remembered as empty, a failed read or parse is retried). The global half
+    // is read fresh on every call, so a caller on a per-article path must
+    // memoize the result itself; the direct store keeps it per job in
+    // `header_harvest`.
+    pub(crate) fn archive_password_candidates_for_job(
         &self,
         job_id: JobId,
-    ) -> (Vec<ArchivePasswordCandidate>, bool) {
+    ) -> ArchivePasswordHarvest {
         let state = self.jobs.get(&job_id);
         let spec_password = state.and_then(|state| state.spec.password.as_deref());
-        let (mut candidates, harvested) =
+        let (carried, mut complete) =
             match state.and_then(|state| state.nzb_password_candidates.get()) {
                 Some(cached) => (cached.clone(), true),
                 None => {
-                    let (candidates, harvested) = self.load_nzb_password_candidates(job_id);
+                    let (candidates, harvested) = self.load_job_password_candidates(job_id);
                     // A job in the pipeline already has its row, and nothing
-                    // adds NZB bytes to a row later, so a missing row or NZB
-                    // stays missing and its empty list is remembered too. A
-                    // failed read or parse is not, so it is retried.
+                    // adds NZB bytes or supplied passwords to a row later, so a
+                    // missing row or NZB stays missing and its list is
+                    // remembered too. A failed read or parse is not, so it is
+                    // retried.
                     if harvested && let Some(state) = state {
                         let _ = state.nzb_password_candidates.set(candidates.clone());
                     }
@@ -182,24 +262,29 @@ impl Pipeline {
                 }
             };
 
-        if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password) {
-            candidates.retain(|candidate| candidate.value() != value);
-            candidates.insert(
-                0,
-                ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, value),
-            );
-        }
+        let global = match self.db.global_archive_password_candidates() {
+            Ok(global) => global,
+            Err(_) => {
+                warn!(job_id = job_id.0, "could not load global archive passwords");
+                complete = false;
+                Vec::new()
+            }
+        };
 
-        (candidates, harvested)
+        ArchivePasswordHarvest {
+            candidates: assemble_archive_password_candidates(spec_password, &carried, &global),
+            complete,
+        }
     }
 
-    // The NZB half of the harvest, read from the database: the candidates,
-    // and whether the read and parse succeeded (`harvested`).
-    fn load_nzb_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
-        match self.db.load_active_job_persisted_nzb(job_id) {
-            Ok(Some((nzb_path, Some(nzb_zstd)))) => {
+    // The job half of the harvest, read from the database: the passwords
+    // supplied with the job, then its persisted NZB's, and whether the read,
+    // decrypt and parse succeeded (`harvested`).
+    fn load_job_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
+        match self.db.load_active_job_password_sources(job_id) {
+            Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
                 match persisted_nzb_password_candidates(&nzb_path, &nzb_zstd) {
-                    Ok(candidates) => (candidates, true),
+                    Ok(nzb) => (job_carried_password_candidates(&supplied, nzb), true),
                     Err(error) => {
                         warn!(
                             job_id = job_id.0,
@@ -210,12 +295,13 @@ impl Pipeline {
                     }
                 }
             }
-            Ok(_) => (Vec::new(), true),
+            Ok(Some(((_, None), supplied))) => (supplied, true),
+            Ok(None) => (Vec::new(), true),
             Err(error) => {
                 warn!(
                     job_id = job_id.0,
                     error = %error,
-                    "failed to load persisted NZB for password candidates"
+                    "failed to load password candidates for job"
                 );
                 (Vec::new(), false)
             }
@@ -224,6 +310,7 @@ impl Pipeline {
 
     pub(super) fn primary_archive_password_for_job(&self, job_id: JobId) -> Option<String> {
         self.archive_password_candidates_for_job(job_id)
+            .candidates
             .into_iter()
             .next()
             .map(|candidate| candidate.value().to_string())
@@ -234,7 +321,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Vec<ArchivePasswordCandidate> {
-        let candidates = self.archive_password_candidates_for_job(job_id);
+        let candidates = self.archive_password_candidates_for_job(job_id).candidates;
         let Some(winner) = self
             .archive_password_winners
             .get(&(job_id, set_name.to_string()))
@@ -307,6 +394,28 @@ impl Pipeline {
                     "could not persist validated archive password"
                 );
             }
+        }
+    }
+
+    // Bring the job's record of full file names up to date after files were
+    // renamed on disk.
+    pub(crate) fn record_file_renames(
+        &mut self,
+        job_id: JobId,
+        renames: &[crate::ingest::FileRename],
+    ) {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if !crate::ingest::record_file_renames(&mut state.spec.metadata, renames) {
+            return;
+        }
+        let update = crate::jobs::JobUpdate {
+            metadata: crate::jobs::FieldUpdate::Set(state.spec.metadata.clone()),
+            ..Default::default()
+        };
+        if self.db.update_active_job(job_id, &update).is_err() {
+            warn!(job_id = job_id.0, "could not persist renamed file names");
         }
     }
 }
@@ -788,25 +897,38 @@ impl RarRefreshRequest {
 #[derive(Debug, Clone)]
 pub(super) enum RarRefreshError {
     CapacityPressure(String),
+    // The rebuilt plan waits on members with no volume missing, which no
+    // refresh can resolve.
+    IncoherentWaitingState(String),
     Other(String),
 }
 
-impl RarRefreshError {
-    fn from_message(message: String) -> Self {
-        if capacity::is_fd_capacity_error_message(&message) {
-            Self::CapacityPressure(message)
+impl From<String> for RarRefreshError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<ExtractionError> for RarRefreshError {
+    fn from(error: ExtractionError) -> Self {
+        if error.is(ExtractionErrorClass::CapacityPressure) {
+            Self::CapacityPressure(error.into())
         } else {
-            Self::Other(message)
+            Self::Other(error.into())
         }
     }
+}
 
+impl RarRefreshError {
     fn is_capacity_pressure(&self) -> bool {
         matches!(self, Self::CapacityPressure(_))
     }
 
     fn message(&self) -> &str {
         match self {
-            Self::CapacityPressure(message) | Self::Other(message) => message,
+            Self::CapacityPressure(message)
+            | Self::IncoherentWaitingState(message)
+            | Self::Other(message) => message,
         }
     }
 }
@@ -874,7 +996,7 @@ pub(in crate::pipeline) struct RarCapacityRetry {
 
 pub(crate) enum RarPasswordAttemptError {
     Rar(unrar_rs::RarError),
-    Fatal(String),
+    Fatal(ExtractionError),
 }
 
 pub(crate) struct ArchivePasswordSelection<T> {
@@ -895,7 +1017,7 @@ impl std::fmt::Display for RarPasswordAttemptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rar(error) => write!(f, "{error}"),
-            Self::Fatal(error) => f.write_str(error),
+            Self::Fatal(error) => write!(f, "{error}"),
         }
     }
 }
@@ -909,14 +1031,14 @@ impl From<unrar_rs::RarError> for RarPasswordAttemptError {
 // Result of a background extraction task.
 pub(super) struct BatchExtractionOutcome {
     pub(super) extracted: Vec<String>,
-    pub(super) failed: Vec<(String, String)>,
+    pub(super) failed: Vec<(String, ExtractionError)>,
     pub(super) selected_password: Option<String>,
     pub(super) phase_completed_bytes: u64,
 }
 
 pub(super) struct FullSetExtractionOutcome {
     pub(super) extracted: Vec<String>,
-    pub(super) failed: Vec<(String, String)>,
+    pub(super) failed: Vec<(String, ExtractionError)>,
     pub(super) selected_password: Option<String>,
 }
 
@@ -1605,13 +1727,13 @@ pub(super) enum ExtractionDone {
         job_id: JobId,
         set_name: String,
         attempted: Vec<String>,
-        result: Result<BatchExtractionOutcome, String>,
+        result: Result<BatchExtractionOutcome, ExtractionError>,
     },
     // Full set extraction completed (all volumes present).
     FullSet {
         job_id: JobId,
         set_name: String,
-        result: Result<FullSetExtractionOutcome, String>,
+        result: Result<FullSetExtractionOutcome, ExtractionError>,
     },
 }
 
@@ -1619,7 +1741,7 @@ pub(super) enum ExtractionDone {
 pub(super) struct MoveToCompleteResult {
     pub(super) moved_entries: u32,
     // Delivered files the deobfuscation pass renamed on the way out.
-    pub(super) renamed_members: u32,
+    pub(super) renamed_members: Vec<crate::ingest::FileRename>,
 }
 
 // A final-move refusal that must never enter terminal post-processing versus
@@ -2451,6 +2573,10 @@ pub struct Pipeline {
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
+    // The stage a failed job was in when it failed, kept until its history
+    // row records the failure kind.
+    pub(super) pipeline_failure_stages:
+        HashMap<JobId, crate::post_processing::model::PipelineFailureStage>,
     // Winning archive password candidate per job/RAR set, kept process-local and redacted.
     pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
     // Job dispatch order (FIFO by submission). First Downloading job is active.

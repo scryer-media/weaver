@@ -1,4 +1,8 @@
 #!/bin/sh
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # Selects one of the UUDeview suite's two binaries. The remaining arguments are
 # exec'd as the tool's own argument vector: nothing here is re-parsed, expanded
 # or passed through a shell.

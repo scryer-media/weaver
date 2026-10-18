@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The hybrid virtual-volume provider.
 //
 // A direct set has no volume files, and several things downstream of routing

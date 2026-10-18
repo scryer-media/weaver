@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The metric catalogue: every family `/metrics` can emit, as data.
 //
 // Nothing outside this file may invent a metric name. Because the encoder
@@ -37,6 +40,10 @@ macro_rules! metric_families {
 }
 
 metric_families! {
+    LOG_DROPPED_EVENTS = ("weaver_log_dropped_events_total", Counter, ["sink"],
+        "Whole log events dropped because of size, queue pressure, or shutdown.");
+    LOG_WRITE_ERRORS = ("weaver_log_write_errors_total", Counter, ["sink"],
+        "Log events whose sink write failed.");
     // ---- process / build ------------------------------------------------
     BUILD_INFO = ("weaver_build_info", Gauge,
         ["version", "commit", "target_arch", "target_os", "decoder_tier", "database_backend",
@@ -490,13 +497,21 @@ metric_families! {
     NETWORK_PROXIES = ("weaver_network_proxies", Gauge, ["kind", "enabled"],
         "Configured proxy profiles by kind and whether they are enabled.");
     NETWORK_DNS_RESOLUTIONS = ("weaver_network_dns_resolutions_total", Counter, ["resolver", "result"],
-        "Host name lookups made for routed connections, by resolver and result.");
+        "Host name lookups Weaver made, by resolver and result; answers taken from the cache are not counted.");
+    NETWORK_DNS_CACHE = ("weaver_network_dns_cache_total", Counter, ["resolver", "outcome"],
+        "Host names resolved, by resolver and whether a held answer served them, they joined a lookup already asking, or they asked.");
     NETWORK_RUNG_COOLDOWNS = ("weaver_network_rung_cooldowns_total", Counter, ["rung"],
         "Times a ladder rung entered a cooldown, by rung position.");
     NETWORK_RUNG_FALLBACKS = ("weaver_network_rung_fallbacks_total", Counter, ["rung"],
         "Connections a ladder made on a rung past the first, by the rung that connected.");
     NETWORK_LEG_REVOCATIONS = ("weaver_network_leg_revocations_total", Counter, [],
         "Route stages revoked, closing the connections that ran over them.");
+
+    // ---- speed tests -------------------------------------------------------
+    SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],
+        "Speed tests that finished, by kind and final status. Every combination is emitted, so the series pre-exist at zero.");
+    SPEED_TEST_LAST_BPS = ("weaver_speed_test_last_bps", Gauge, ["consumer", "kind"],
+        "Average bytes per second of the last completed speed test, by consumer and kind; absent until one completes.");
     TUNNEL_STREAMS = ("weaver_tunnel_streams_total", Counter, ["kind", "result"],
         "Streams opened through a proxy hop, by proxy kind and result.");
     TUNNEL_SESSION_PREPARES = ("weaver_tunnel_session_prepares_total", Counter, ["kind", "result"],

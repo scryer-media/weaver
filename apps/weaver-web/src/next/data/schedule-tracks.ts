@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 /** The groups the schedule list is broken into, in the order it draws them. */
 export const SCHEDULE_TRACKS = [
   { value: "DOWNLOADS", label: "next.schedules.trackDownloads" },

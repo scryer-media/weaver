@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::{HashMap, HashSet};
 
 use async_graphql::{Context, Object, Result, UploadValue};
@@ -1126,6 +1129,14 @@ async fn submit_from_facade_input(
     let config = ctx.data::<SharedConfig>()?;
     let caller = caller_identity(ctx)?;
     let source_url = input.url.clone();
+    let mut supplied_password_candidates =
+        weaver_server_core::ingest::integration_archive_password_candidates(
+            input
+                .password_candidates
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        );
     let (nzb_bytes, upload, filename) = match (input.nzb_base64, input.url, input.nzb_upload) {
         (Some(b64), None, None) => {
             crate::jobs::staging::inline_nzb_base64_fits(b64.len())
@@ -1136,14 +1147,24 @@ async fn submit_from_facade_input(
             (Some(bytes), None, input.filename)
         }
         (None, Some(url), None) => {
-            let client = ctx.data::<reqwest::Client>()?;
-            let fetched = fetch_nzb_from_url(client, &url).await;
+            let fetched = match handle.proxy_runtime() {
+                Some(runtime) => fetch_nzb_from_url(&runtime, &url).await,
+                None => Err(SubmitNzbError::Fetch("NZB request has no route".into())),
+            };
             if fetched.is_err() {
                 raise_url_completed(db, &url, input.category.as_deref(), UrlStatus::Failure).await;
             }
-            let (bytes, url_filename) =
-                fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
-            (Some(bytes), None, input.filename.or(url_filename))
+            let fetched = fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+            supplied_password_candidates.extend(
+                weaver_server_core::ingest::header_archive_password_candidates(
+                    fetched.header_passwords.iter().map(String::as_str),
+                ),
+            );
+            (
+                Some(fetched.bytes),
+                None,
+                input.filename.or(fetched.filename),
+            )
         }
         (None, None, Some(upload)) => {
             let upload = upload
@@ -1164,7 +1185,7 @@ async fn submit_from_facade_input(
     let client_request_id = input.client_request_id.clone();
     let category = input.category.clone();
     let url_event = source_url.clone().map(|url| (url, category.clone()));
-    let options = graphql_submission_options(
+    let mut options = graphql_submission_options(
         &caller,
         client_request_id.as_deref(),
         input.idempotency_key.as_deref(),
@@ -1173,6 +1194,7 @@ async fn submit_from_facade_input(
         input.dupe_score,
         input.dupe_mode,
     );
+    options.supplied_password_candidates = supplied_password_candidates;
     let mut metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
     if let Some(url) = source_url {

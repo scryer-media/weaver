@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import { appendProxy, chainHopProfiles, moveProxy, directRouting, proxyLabels, withChainHop } from "../src/lib/proxies.ts";
@@ -58,16 +61,6 @@ test("a chain hop never offers a proxy the chain or its ladder already uses", ()
   // Another rung's proxy, or a pool's member, is the ladder's already.
   assert.deepEqual(ids(chainHopProfiles(profiles, [1], 1, { taken: new Set([2, 5]) })), [3]);
   assert.deepEqual(ids(chainHopProfiles(profiles, [], 0, { taken: new Set([1]) })), [2, 3, 5]);
-});
-test("a feed's chain offers only proxies that have DNS servers", () => {
-  const profiles = [
-    { id: 1, kind: "SOCKS5" as const, dnsServers: ["192.0.2.53"] },
-    { id: 2, kind: "SOCKS5" as const, dnsServers: [] },
-    { id: 3, kind: "SSH" as const, dnsServers: ["192.0.2.53"] },
-  ];
-  const ids = (list: { id: number }[]) => list.map((profile) => profile.id);
-  assert.deepEqual(ids(chainHopProfiles(profiles, [], 0, { needsDns: true })), [1, 3]);
-  assert.deepEqual(ids(chainHopProfiles(profiles, [], 0)), [1, 2, 3]);
 });
 test("changing a chain hop keeps the hops above it only while they can still follow", () => {
   const profiles = [

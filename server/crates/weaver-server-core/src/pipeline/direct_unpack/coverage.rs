@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // How much of an archive set is on disk, and the parking spot for a reader that has
 // run ahead of it.
 //
@@ -24,6 +27,10 @@
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
+
+mod replay;
+use replay::ReplayState;
+pub(crate) use replay::RunEpoch;
 
 // Per-part progress, as the writer side has reported it so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -129,6 +136,7 @@ struct CoverageState {
     gated: bool,
     // Freeze consumption before taking the repair vouching snapshot.
     repair_paused: bool,
+    replay: ReplayState,
     parts: Vec<PartProgress>,
     // Part boundaries already used to map the concatenated stream.
     mapped_lengths: Vec<Option<u64>>,
@@ -182,6 +190,7 @@ impl SetCoverage {
             state: Mutex::new(CoverageState {
                 gated: false,
                 repair_paused: false,
+                replay: ReplayState::default(),
                 parts: vec![PartProgress::default(); part_count],
                 mapped_lengths: vec![None; part_count],
                 ranges: vec![std::collections::BTreeMap::new(); part_count],
@@ -402,12 +411,22 @@ impl SetCoverage {
 
     // Freeze both new reads and publication of reads already in flight.
     pub fn pause_for_repair(&self) {
-        self.lock().repair_paused = true;
+        let mut state = self.lock();
+        if !state.repair_paused && state.replay.enabled {
+            let vouched = std::sync::Arc::from(state.parts.clone());
+            state.replay.invalidate(vouched);
+        }
+        state.repair_paused = true;
+        drop(state);
+        self.advanced.notify_all();
     }
 
     // Resume only after every repaired part has been reconciled.
     pub fn resume_after_repair(&self) {
-        self.lock().repair_paused = false;
+        let mut state = self.lock();
+        state.repair_paused = false;
+        state.replay.resume();
+        drop(state);
         self.advanced.notify_all();
     }
 
@@ -580,6 +599,7 @@ impl SetCoverage {
             self.advanced.notify_all();
             return;
         }
+        let replay = state.replay.selected;
         let Some(part) = state.parts.get_mut(index) else {
             debug_assert!(false, "part index {index} out of range");
             return;
@@ -590,8 +610,10 @@ impl SetCoverage {
         // its described length. If that cut lands below what the decoder has
         // already read, the vouch this release rests on was about bytes that no
         // longer exist, and resuming would splice a repaired tail onto a stale
-        // head. There is no recovering from that here.
-        if len < part.consumed_high_water {
+        // head. Ordered decoders cannot recover. Positional replay has already
+        // invalidated its old epoch and must rescan/redecode affected runs;
+        // the used part-boundary check above still applies to both modes.
+        if !replay && len < part.consumed_high_water {
             let reason = format!(
                 "repair left part {index} at {len} bytes, below the {} already read from it",
                 part.consumed_high_water
@@ -666,6 +688,7 @@ impl SetCoverage {
     }
 
     fn abort_locked(state: &mut CoverageState, reason: String) {
+        state.replay.cancel();
         if state.aborted.is_none() {
             state.aborted = Some(reason);
         }
@@ -816,6 +839,8 @@ impl SetCoverage {
         state: std::sync::MutexGuard<'a, CoverageState>,
     ) -> std::sync::MutexGuard<'a, CoverageState> {
         self.parks.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.advanced.notify_all();
         if let Some(pressure) = self.memory.get() {
             let mut state = state;
             let held = (pressure.held_bytes)();
@@ -823,7 +848,7 @@ impl SetCoverage {
             // a chase already aborted, or holding nothing a waiter could use,
             // leaves the ticket for another.
             if state.aborted.is_none() && held != 0 && pressure.memory.claim_yield() {
-                state.aborted = Some(MEMORY_YIELD_ABORT.to_string());
+                Self::abort_locked(&mut state, MEMORY_YIELD_ABORT.to_string());
                 self.advanced.notify_all();
                 return state;
             }

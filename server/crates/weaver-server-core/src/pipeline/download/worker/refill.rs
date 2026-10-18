@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A live lane asking for its next articles.
 //
 // The worker owns the socket and the ring; the actor owns the queues. When

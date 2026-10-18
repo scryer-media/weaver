@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +51,7 @@ mod decode_and_files;
 mod direct_store;
 mod direct_unpack;
 mod download_dispatch;
+mod full_file_names;
 mod hardware_profile;
 mod health_probe;
 mod idle;
@@ -1941,6 +1945,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             password_override: None,
+            supplied_password_candidates: Vec::new(),
         })
         .unwrap();
     let (assembly, download_queue, recovery_queue) =

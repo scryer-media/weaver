@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Sequential archive adapters shared by download-time and completed-file extraction.
 
 use super::*;
@@ -36,9 +39,13 @@ pub(in crate::pipeline) struct SequentialExtractionContext<'a> {
 
 pub(super) fn extract_file(
     context: &SequentialExtractionContext<'_>,
-) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(context.archive_path)
-        .map_err(|error| format!("failed to open {:?}: {error}", context.kind))?;
+) -> Result<Vec<String>, ExtractionError> {
+    let file = std::fs::File::open(context.archive_path).map_err(|error| {
+        ExtractionError::from_io(
+            format!("failed to open {:?}: {error}", context.kind),
+            &error,
+        )
+    })?;
     extract_sequential_stream(file, context)
 }
 
@@ -47,7 +54,7 @@ pub(super) fn extract_file(
 pub(in crate::pipeline) fn extract_sequential_stream<R: Read>(
     reader: R,
     context: &SequentialExtractionContext<'_>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ExtractionError> {
     let SequentialExtractionContext {
         kind,
         archive_path,
@@ -69,23 +76,30 @@ pub(in crate::pipeline) fn extract_sequential_stream<R: Read>(
         SimpleArchiveKind::TarXz | SimpleArchiveKind::Xz => {
             let limit = crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES.min(budget.max_memory_bytes());
             Box::new(
-                crate::ingest::xz_multistream_decoder(reader, limit)
-                    .map_err(|error| format!("failed to open xz decoder: {error}"))?,
+                crate::ingest::xz_multistream_decoder(reader, limit).map_err(|error| {
+                    ExtractionError::terminal(format!("failed to open xz decoder: {error}"))
+                })?,
             )
         }
         SimpleArchiveKind::Deflate => Box::new(flate2::read::DeflateDecoder::new(reader)),
         SimpleArchiveKind::Brotli => Box::new(brotli::Decompressor::new(reader, 4096)),
         SimpleArchiveKind::Zstd => {
-            let mut decoder = zstd::stream::read::Decoder::new(reader)
-                .map_err(|error| format!("failed to open zstd: {error}"))?;
+            let mut decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
+                ExtractionError::from_io(format!("failed to open zstd: {error}"), &error)
+            })?;
             let window_log =
                 (63 - budget.max_memory_bytes().max(1024).leading_zeros()).clamp(10, 31);
-            decoder
-                .window_log_max(window_log)
-                .map_err(|error| format!("failed to apply zstd memory limit: {error}"))?;
+            decoder.window_log_max(window_log).map_err(|error| {
+                ExtractionError::from_io(
+                    format!("failed to apply zstd memory limit: {error}"),
+                    &error,
+                )
+            })?;
             Box::new(decoder)
         }
-        SimpleArchiveKind::Zip => return Err("ZIP requires a seekable reader".to_string()),
+        SimpleArchiveKind::Zip => {
+            return Err(ExtractionError::terminal("ZIP requires a seekable reader"));
+        }
     };
     if matches!(
         kind,
@@ -103,16 +117,19 @@ pub(in crate::pipeline) fn extract_sequential_stream<R: Read>(
         loop {
             budget
                 .check_active_io()
-                .map_err(|error| error.to_string())?;
-            let read = decoded
-                .read(&mut buffer)
-                .map_err(|error| format!("failed to finish compressed tar stream: {error}"))?;
+                .map_err(|error| ExtractionError::io(&error))?;
+            let read = decoded.read(&mut buffer).map_err(|error| {
+                ExtractionError::from_io(
+                    format!("failed to finish compressed tar stream: {error}"),
+                    &error,
+                )
+            })?;
             if read == 0 {
                 break;
             }
             trailing_bytes = trailing_bytes
                 .checked_add(read as u64)
-                .ok_or_else(|| "tar trailing length overflow".to_string())?;
+                .ok_or_else(|| ExtractionError::terminal("tar trailing length overflow"))?;
             budget.check_member_metadata("tar trailing data", trailing_bytes)?;
         }
         return Ok(extracted);

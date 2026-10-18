@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
@@ -206,6 +209,16 @@ fn nzbget_test_router(
     config: SharedConfig,
     api_key_cache: ApiKeyCache,
 ) -> Router {
+    nzbget_test_router_with_base_url(db, handle, config, api_key_cache, "")
+}
+
+fn nzbget_test_router_with_base_url(
+    db: Database,
+    handle: SchedulerHandle,
+    config: SharedConfig,
+    api_key_cache: ApiKeyCache,
+    base_url: &str,
+) -> Router {
     // Production initializes the scripts directory before constructing HTTP
     // routes. Mirror that bootstrap contract for the in-memory facade fixture.
     let data_dir = std::env::temp_dir().join("weaver-nzbget-http-tests");
@@ -246,7 +259,13 @@ fn nzbget_test_router(
         weaver_server_core::operations::CapacityReader::unknown(),
     );
 
-    routes::build_nzbget_rpc_routes(context)
+    if base_url.is_empty() {
+        routes::build_nzbget_rpc_routes(context)
+    } else {
+        Router::new()
+            .nest(base_url, routes::build_nzbget_rpc_routes(context.clone()))
+            .merge(routes::build_script_callback_routes(context))
+    }
 }
 
 async fn post_nzbget_xmlrpc(app: Router, body: &str, auth_value: &str) -> (StatusCode, String) {
@@ -356,7 +375,26 @@ fn scheduler_handle_with_mock_commands_with_db(
                                 job.password = Some(password.clone());
                             }
                         }
+                        if let Some(name) = &update.name {
+                            job.name = name.clone();
+                            weaver_server_core::ingest::set_renamed_title(&mut job.metadata, name);
+                        }
                     });
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::UpdateHistory {
+                    job_id,
+                    update,
+                    reply,
+                } => {
+                    let result = match &db {
+                        Some(db) => match db.update_job_history_fields(job_id.0, &update) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(SchedulerError::JobNotFound(job_id)),
+                            Err(error) => Err(SchedulerError::State(error)),
+                        },
+                        None => Err(SchedulerError::JobNotFound(job_id)),
+                    };
                     let _ = reply.send(result);
                 }
                 SchedulerCommand::ReorderJob {
@@ -1280,7 +1318,7 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
 
 fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::TunnelMetricsSnapshot {
     use weaver_server_core::proxies::network_metrics::tunnel::{
-        DialResult, RUNGS, Resolver, TunnelKind, TunnelMetricsSnapshot,
+        CacheOutcome, DialResult, RUNGS, Resolver, TunnelKind, TunnelMetricsSnapshot,
     };
     TunnelMetricsSnapshot {
         streams: TunnelKind::ALL
@@ -1297,6 +1335,10 @@ fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::Tunn
             .collect(),
         session_retirements: TunnelKind::SESSIONS.into_iter().map(|k| (k, 2)).collect(),
         resolutions: Resolver::ALL.into_iter().map(|r| (r, 10, 2)).collect(),
+        cache: Resolver::ALL
+            .into_iter()
+            .flat_map(|r| CacheOutcome::ALL.into_iter().map(move |o| (r, o, 4)))
+            .collect(),
         rung_cooldowns: vec![1; RUNGS],
         rung_fallbacks: vec![2; RUNGS],
         revocations: 3,
@@ -1631,6 +1673,18 @@ impl CollectionFixtures {
 
 // Build the most complete render the exporter can produce, so the catalogue
 // comparison sees every family.
+fn sample_speed_tests() -> weaver_server_core::speed_test::SpeedTestMetricsSnapshot {
+    use weaver_server_core::speed_test::SpeedTestKindLabel;
+    let mut metrics = weaver_server_core::speed_test::SpeedTestMetricsSnapshot::default();
+    metrics.runs[SpeedTestKindLabel::Usenet.index()][0] = 3;
+    metrics.runs[SpeedTestKindLabel::Bandwidth.index()][1] = 1;
+    metrics.last_bps.insert(
+        ("server:4".into(), SpeedTestKindLabel::Usenet),
+        125_000_000.0,
+    );
+    metrics
+}
+
 fn fully_populated_render() -> String {
     let snapshot = populated_metrics_snapshot();
     let block = manual_pause_block();
@@ -1645,6 +1699,7 @@ fn fully_populated_render() -> String {
     let schedules = sample_schedules();
     let network = sample_network();
     let tunnel = sample_tunnel();
+    let speed_tests = sample_speed_tests();
     let collection = CollectionFixtures::new();
 
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
@@ -1660,6 +1715,7 @@ fn fully_populated_render() -> String {
     input.schedules = Some(&schedules);
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
+    input.speed_tests = Some(&speed_tests);
     input.runtime_generation = 3;
     input.start_time_seconds = 1_700_000_000.0;
     collection.apply(&mut input);

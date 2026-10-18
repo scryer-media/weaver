@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -649,7 +652,7 @@ async fn run_move_to_claimed_destination(
         Some(naming) => {
             deobfuscate::rename_obfuscated_members(job_id, &dest, &naming, &policy).await
         }
-        None => 0,
+        None => Vec::new(),
     };
 
     let output_dir = dest.clone();
@@ -947,6 +950,7 @@ impl Pipeline {
         let srrdb = srrdb_from_config.then(|| SrrdbInputs {
             base_url: deobfuscate::SRRDB_API_BASE.to_string(),
             crc32_by_member_path: HashMap::new(),
+            proxies: self.shared_state.proxy_runtime(),
         });
         let srrdb = match srrdb {
             Some(mut inputs) => {
@@ -1173,11 +1177,12 @@ impl Pipeline {
 
         match result {
             Ok(outcome) => {
-                if outcome.renamed_members > 0 {
+                if !outcome.renamed_members.is_empty() {
                     self.metrics
                         .deobfuscated_members_renamed
-                        .fetch_add(u64::from(outcome.renamed_members), Ordering::Relaxed);
+                        .fetch_add(outcome.renamed_members.len() as u64, Ordering::Relaxed);
                 }
+                self.record_file_renames(job_id, &outcome.renamed_members);
                 let Some(state) = self.jobs.get_mut(&job_id) else {
                     warn!(
                         job_id = job_id.0,
@@ -1583,6 +1588,13 @@ impl Pipeline {
                 None
             }
         };
+        // The failing stage survives the restart here too, so the history row
+        // still records why the job failed.
+        if let Some(crate::post_processing::model::PipelineOutcome::Failed { stage, .. }) =
+            facts.as_ref().map(|facts| &facts.outcome)
+        {
+            self.pipeline_failure_stages.entry(job_id).or_insert(*stage);
+        }
         let summary = self
             .db
             .job_post_processing_summary(job_id.0)

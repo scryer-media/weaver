@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // PAR3 reads the posted image of a direct volume, including encrypted members.
 // Snapshot checks run on blocking workers and include every backing file.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { expect, test } from "./helpers";
 import { waitTerminal } from "./support/downloads";
 import {
@@ -15,6 +18,8 @@ test.beforeEach(async ({ request }) => { world = await NetworkWorld.create(reque
 test.afterEach(async ({}, info) => { await world.cleanup(info); });
 
 const CREATE_POOL = `mutation($input: ProxyPoolInput!) { createProxyPool(input: $input) { id } }`;
+const UPDATE_POOL = `mutation($id: Int!, $input: ProxyPoolInput!) { updateProxyPool(id: $id, input: $input) { id } }`;
+const SAVE_ROUTE = `mutation($kind: NetworkConsumerKind!, $id: Int!, $input: RouteInput!) { saveNetworkRoute(kind: $kind, id: $id, input: $input) { consumer } }`;
 const PINNED_STATES = ["LEADER", "PINNED"];
 const FAILED_STATES = ["FAILING", "SUSPECT"];
 
@@ -43,8 +48,12 @@ test("P01 a pool pins its fastest member and prewarms the rest", async ({ reques
   const download = await world.pacedDownload("p01-fastest", { parts: 64, slowMs: 500 });
   const flow = await flowAfter(request, await flowMark(request), sample => {
     const pool = view(sample);
-    return pool?.pinnedMember === connect1.id && [connect1, connect2, connect3].every(profile => member(pool, profile.id)?.warmed && member(pool, profile.id)?.connectMs !== null);
-  }, "connect1 pinned, every member warmed and measured");
+    // A selected member is still PROBING while its connections are opening.
+    // Wait for the displayed pin state that the assertion below checks.
+    return pool?.pinnedMember === connect1.id
+      && PINNED_STATES.includes(member(pool, connect1.id)?.state ?? "")
+      && [connect1, connect2, connect3].every(profile => member(pool, profile.id)?.warmed && member(pool, profile.id)?.connectMs !== null);
+  }, "connect1 pinned with connections settled, every member warmed and measured");
   const pool = view(flow)!;
   await saveEvidence(info, "P01", pool);
   const ms = [connect1, connect2, connect3].map(profile => member(pool, profile.id)!.connectMs!);
@@ -178,21 +187,30 @@ test("P08 a pool test reports every member, and needs a target for CONNECT", asy
   expect(errors.join("\n")).toContain("host and port are required for a SOCKS5 or HTTP CONNECT pool test");
 });
 
-test("P09 pool shape rules reject undersized, oversized, duplicated and mixed pools", async ({ request }) => {
+test("P09 pool shape rules reject oversized, duplicated and mixed pools, and a route takes only a pool with a member", async ({ request }) => {
   const connects = [];
   for (const name of ["connect1", "connect2", "connect3", "connect4", "connect5", "connect6"]) connects.push(await world.connect(name));
   const socks1 = await world.socks("socks1");
   const many = [];
   for (let index = 0; index < 17; index += 1) many.push((await world.connect(`connect${(index % 6) + 1}`)).id);
   const cases: Array<[string, number[], "HTTP_CONNECT", string]> = [
-    ["one member", [connects[0]!.id], "HTTP_CONNECT", "a pool requires between two and sixteen members"],
-    ["seventeen members", many, "HTTP_CONNECT", "a pool requires between two and sixteen members"],
+    ["seventeen members", many, "HTTP_CONNECT", "a pool takes at most sixteen members"],
     ["a duplicated member", [connects[0]!.id, connects[0]!.id], "HTTP_CONNECT", "a proxy cannot appear twice in a pool"],
     ["mixed kinds", [connects[0]!.id, socks1.id], "HTTP_CONNECT", "all pool members must have the pool's proxy kind"],
   ];
   for (const [label, memberIds, kind, message] of cases) {
     expect((await graphqlErrors(request, CREATE_POOL, { input: { name: `p09-${Date.now()}`, kind, memberIds } })).join("\n"), label).toContain(message);
   }
+  // A pool saves empty or with one member, to be filled later; a route needs a member in it, and keeps it.
+  const a = await world.egress("a");
+  const empty = await world.pool("HTTP_CONNECT", []);
+  const single = await world.pool("HTTP_CONNECT", [connects[0]!.id]);
+  const server = await world.server({ host: PROXIED_HOST });
+  const route = (pool: number) => graphqlErrors(request, SAVE_ROUTE, { kind: "SERVER", id: server, input: { legs: [ladderLeg(a.id, [rung.pool(pool)], 100)] } });
+  expect((await route(empty)).join("\n"), "a route on an empty pool").toContain("route references a pool with no members");
+  expect(await route(single), "a route on a one-member pool").toEqual([]);
+  expect((await graphqlErrors(request, UPDATE_POOL, { id: single, input: { name: `p09-${Date.now()}`, kind: "HTTP_CONNECT", memberIds: [] } })).join("\n"), "emptying a pool a route uses")
+    .toContain("a pool referenced by a server or RSS feed needs at least one member");
 });
 
 test("P10 an RSS fetch through a pool resolves and fetches on one member", async ({ request }) => {

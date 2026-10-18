@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::io;
 
 pub(in crate::pipeline) const FD_CAPACITY_ERROR_MARKER: &str = "RAR source FD capacity pressure";
@@ -8,13 +11,6 @@ pub(in crate::pipeline) fn is_fd_capacity_io_error(error: &io::Error) -> bool {
         .is_some_and(is_fd_capacity_raw_os_error)
 }
 
-pub(in crate::pipeline) fn is_fd_capacity_error_message(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    message.contains(FD_CAPACITY_ERROR_MARKER)
-        || lower.contains("too many open files")
-        || lower.contains("file table overflow")
-}
-
 pub(in crate::pipeline) fn format_fd_capacity_error(context: &str, error: &io::Error) -> String {
     if is_fd_capacity_io_error(error) {
         format!("{FD_CAPACITY_ERROR_MARKER}: {context}: {error}")
@@ -23,13 +19,49 @@ pub(in crate::pipeline) fn format_fd_capacity_error(context: &str, error: &io::E
     }
 }
 
+// A source file that would not open, kept typed inside the `io::Error` the
+// reader returns so the extraction that reads through it still sees the OS
+// error code. It renders as it always has: the capacity marker when the code
+// is file-descriptor exhaustion, then the context and the OS error.
+#[derive(Debug)]
+pub(in crate::pipeline) struct SourceOpenError {
+    context: String,
+    cause: io::Error,
+}
+
+impl SourceOpenError {
+    pub(in crate::pipeline) fn new(context: String, cause: io::Error) -> Self {
+        Self { context, cause }
+    }
+
+    pub(in crate::pipeline) fn cause(&self) -> &io::Error {
+        &self.cause
+    }
+
+    pub(in crate::pipeline) fn into_io_error(self) -> io::Error {
+        io::Error::new(self.cause.kind(), self)
+    }
+}
+
+impl std::fmt::Display for SourceOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&format_fd_capacity_error(&self.context, &self.cause))
+    }
+}
+
+impl std::error::Error for SourceOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 #[cfg(unix)]
-fn is_fd_capacity_raw_os_error(code: i32) -> bool {
+pub(in crate::pipeline) fn is_fd_capacity_raw_os_error(code: i32) -> bool {
     code == libc::EMFILE || code == libc::ENFILE
 }
 
 #[cfg(not(unix))]
-fn is_fd_capacity_raw_os_error(code: i32) -> bool {
+pub(in crate::pipeline) fn is_fd_capacity_raw_os_error(code: i32) -> bool {
     // Windows commonly reports ERROR_TOO_MANY_OPEN_FILES (4). Keep EMFILE's
     // conventional value as a fallback for C runtime surfaced errors.
     code == 4 || code == 24

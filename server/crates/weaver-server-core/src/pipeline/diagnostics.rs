@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A read-only snapshot of pipeline state that no other surface exposes.
 //
 // Everything here is copied out of the pipeline actor while it is blocked on

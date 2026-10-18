@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
@@ -764,6 +767,7 @@ enum DbWriteCommand {
         job_id: crate::jobs::ids::JobId,
         history: Box<crate::history::JobHistoryRow>,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
         // Fired once the archive transaction has committed and the row has
         // been re-cached, so callers can hold a terminal event until the
         // history row is queryable through the read paths.
@@ -857,6 +861,7 @@ async fn execute_write_command(
             job_id,
             history,
             typed_terminal_cause,
+            failure_kind,
             committed,
         } => {
             let writer = writer.clone();
@@ -870,6 +875,7 @@ async fn execute_write_command(
                     job_id,
                     history.as_ref(),
                     typed_terminal_cause,
+                    failure_kind,
                 ) {
                     Ok(Some(row)) => writer.cache_job_history_at(row, observed_generation),
                     Ok(None) => {}
@@ -1435,6 +1441,7 @@ impl Database {
             job_id,
             history: Box::new(history),
             typed_terminal_cause: None,
+            failure_kind: None,
             committed: None,
         };
         self.try_send_with_retry(command, "archive")
@@ -1449,6 +1456,7 @@ impl Database {
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
     ) -> Result<oneshot::Receiver<()>, StateError> {
         let (committed_tx, committed_rx) = oneshot::channel();
         self.try_send_with_retry(
@@ -1456,6 +1464,7 @@ impl Database {
                 job_id,
                 history: Box::new(history),
                 typed_terminal_cause,
+                failure_kind,
                 committed: Some(committed_tx),
             },
             "archive",
@@ -1585,6 +1594,7 @@ impl Database {
             job_id,
             history: Box::new(history),
             typed_terminal_cause: None,
+            failure_kind: None,
             committed: None,
         });
         self.writer_tx
@@ -1651,6 +1661,7 @@ impl Database {
                 "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
                 "SELECT password FROM proxy_profiles WHERE password IS NOT NULL",
                 "SELECT password FROM active_jobs WHERE password IS NOT NULL",
+                "SELECT password_candidates AS password FROM active_jobs WHERE password_candidates IS NOT NULL",
                 "SELECT source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
                 "SELECT value AS password FROM secrets",
                 "SELECT value AS password FROM settings WHERE key = 'archive_passwords'",
@@ -1721,6 +1732,10 @@ impl Database {
                 (
                     "archive job",
                     "SELECT job_id AS id, password FROM active_jobs WHERE password IS NOT NULL",
+                ),
+                (
+                    "archive job candidates",
+                    "SELECT job_id AS id, password_candidates AS password FROM active_jobs WHERE password_candidates IS NOT NULL",
                 ),
                 (
                     "archive candidate",

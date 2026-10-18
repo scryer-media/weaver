@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Matched PAR2 command-line measurements; pipeline/download acceptance is separate.
 
 use anyhow::{Context, Result, bail, ensure};

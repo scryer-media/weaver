@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Package containerengine resolves the container engine the e2e harness
 // drives (Docker or Podman) and builds every engine and Compose command line.
 // Nothing else in the harness names an engine binary.

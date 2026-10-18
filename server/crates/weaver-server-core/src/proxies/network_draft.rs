@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use weaver_tunnel::{
     TunnelError, TunnelStream,
@@ -19,6 +22,18 @@ impl DraftNetworkRoute {
     pub fn leg_count(&self) -> usize {
         self.legs.len()
     }
+    // The dialing stage of one leg, as drafted.
+    pub fn leg_stage(&self, position: usize) -> Result<Arc<dyn Dialer>, String> {
+        Ok(self
+            .legs
+            .get(position)
+            .ok_or("draft leg does not exist")?
+            .stage
+            .clone())
+    }
+    pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
+        &self.handle
+    }
     pub fn nntp_dialer_for_leg(
         &self,
         position: usize,
@@ -27,6 +42,7 @@ impl DraftNetworkRoute {
         let leg = self.legs.get(position).ok_or("draft leg does not exist")?;
         Ok(Arc::new(weaver_nntp::route_dialer::RouteDialer {
             inner: leg.stage.clone(),
+            plan: leg.address_plan.as_ref().map(|plan| plan.plan.clone()),
             egress_controls: self.isolated.egress_controls.clone(),
             runtime: self.handle.clone(),
             server,
@@ -150,22 +166,15 @@ impl NetworkRuntime {
             ),
         })
     }
-    pub fn validate_policy(
-        &self,
-        consumer: Consumer,
-        policy: &RoutingPolicy,
-    ) -> Result<(), NetworkRefusal> {
+    pub fn validate_policy(&self, policy: &RoutingPolicy) -> Result<(), NetworkRefusal> {
         policy.validate()?;
         let config = self.configuration.read().expect("network configuration");
         if policy.legs.is_empty() && policy.proxy_ids.is_empty() && !policy.allow_direct {
             return Ok(());
         }
-        policy.route().validate_references(
-            &config.egresses,
-            &config.profiles,
-            &config.pools,
-            matches!(consumer, Consumer::Rss(_)),
-        )
+        policy
+            .route()
+            .validate_references(&config.egresses, &config.profiles, &config.pools)
     }
     pub fn draft_route(
         &self,
@@ -173,10 +182,30 @@ impl NetworkRuntime {
         policy: RoutingPolicy,
         timeout: Duration,
     ) -> Result<Arc<DraftNetworkRoute>, String> {
-        self.validate_policy(consumer, &policy)?;
+        self.draft_route_without_members(consumer, policy, timeout, &[])
+    }
+    // A draft whose pools leave out `removed` proxies. Only the draft's own
+    // copy of the configuration changes.
+    pub fn draft_route_without_members(
+        &self,
+        consumer: Consumer,
+        policy: RoutingPolicy,
+        timeout: Duration,
+        removed: &[u32],
+    ) -> Result<Arc<DraftNetworkRoute>, String> {
+        self.validate_policy(&policy)?;
         // Drafts share unchanged live carriers. Carried tunnels are sized
         // by the provider in the same way before and after saving the route.
         let isolated = self.isolated_probe_runtime();
+        if !removed.is_empty() {
+            let mut config = isolated
+                .configuration
+                .write()
+                .expect("network configuration");
+            for pool in config.pools.values_mut() {
+                pool.member_ids.retain(|id| !removed.contains(id));
+            }
+        }
         let config = isolated
             .configuration
             .read()

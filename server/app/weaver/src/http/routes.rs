@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -72,7 +75,7 @@ async fn enforce_http_host(security: &RuntimeSecurityConfig, req: Request, next:
     }
 }
 
-fn build_backup_routes(backup_request_limit: usize) -> Router {
+pub(super) fn build_backup_routes(backup_request_limit: usize) -> Router {
     let uploads = Router::new()
         .route("/inspect", post(super::backup::backup_inspect_handler))
         .route("/restore", post(super::backup::backup_restore_handler))
@@ -174,6 +177,8 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         scheduled_resume,
         disk_space.reader(weaver_server_core::operations::StorageRoot::Complete),
     );
+    let script_callbacks =
+        (!base_url.is_empty()).then(|| build_script_callback_routes(nzbget_context.clone()));
     let nzbget_rpc_routes = build_nzbget_rpc_routes(nzbget_context);
 
     let inner = Router::new()
@@ -266,6 +271,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
                 get(move || async move { axum::response::Redirect::permanent(&bare) }),
             )
             .nest(&base_url, inner)
+            .merge(script_callbacks.expect("nonempty base URL has script callback routes"))
     }
 }
 
@@ -301,14 +307,46 @@ pub(super) fn with_response_hardening(router: Router) -> Router {
 pub(super) fn build_nzbget_rpc_routes(
     nzbget_context: super::nzbget::NzbgetFacadeContext,
 ) -> Router {
+    build_rpc_routes(nzbget_context, false)
+}
+
+pub(super) fn build_script_callback_routes(
+    nzbget_context: super::nzbget::NzbgetFacadeContext,
+) -> Router {
+    build_rpc_routes(nzbget_context, true)
+}
+
+fn build_rpc_routes(
+    nzbget_context: super::nzbget::NzbgetFacadeContext,
+    script_only: bool,
+) -> Router {
     // 32 MiB of JSON/XML envelope carries roughly 24 MiB of decoded base64 NZB
     // data, comfortably above observed real-world payloads while keeping the
     // fully-buffered RPC surface bounded independently of the core upload cap.
     let rpc_buffer_gate = Arc::new(tokio::sync::Semaphore::new(6));
     let nzbget_auth_context = nzbget_context.clone();
-    Router::new()
-        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
-        .route("/xmlrpc", post(super::nzbget::xmlrpc_handler))
+    let mut router = Router::new();
+    // NZBGet answers with and without a trailing slash, and with the
+    // credentials as a leading path segment; JSON-RPC also answers GET with
+    // the method as a trailing segment.
+    for prefix in ["", "/{credentials}"] {
+        for slash in ["", "/"] {
+            router = router
+                .route(
+                    &format!("{prefix}/jsonrpc{slash}"),
+                    post(super::nzbget::jsonrpc_handler),
+                )
+                .route(
+                    &format!("{prefix}/xmlrpc{slash}"),
+                    post(super::nzbget::xmlrpc_handler),
+                );
+        }
+        router = router.route(
+            &format!("{prefix}/jsonrpc/{{method}}"),
+            get(super::nzbget::jsonrpc_get_handler),
+        );
+    }
+    router
         .route_layer(axum::extract::DefaultBodyLimit::max(
             NZBGET_RPC_BODY_LIMIT_BYTES,
         ))
@@ -316,6 +354,11 @@ pub(super) fn build_nzbget_rpc_routes(
             let rpc_buffer_gate = Arc::clone(&rpc_buffer_gate);
             let nzbget_auth_context = nzbget_auth_context.clone();
             async move {
+                let path = req.uri().path().to_owned();
+                if let Err(status) = super::nzbget::apply_path_credentials(&path, req.headers_mut())
+                {
+                    return super::nzbget::authentication_error_response(&path, status);
+                }
                 let scope = match super::nzbget::resolve_scope_for_facade(
                     &nzbget_auth_context,
                     req.headers(),
@@ -330,6 +373,12 @@ pub(super) fn build_nzbget_rpc_routes(
                         );
                     }
                 };
+                if script_only && scope != weaver_server_core::auth::CallerScope::ScriptRun {
+                    return super::nzbget::authentication_error_response(
+                        &path,
+                        StatusCode::FORBIDDEN,
+                    );
+                }
                 req.extensions_mut()
                     .insert(super::nzbget::NzbgetCallerScope(scope));
                 let Ok(_permit) = rpc_buffer_gate.acquire().await else {

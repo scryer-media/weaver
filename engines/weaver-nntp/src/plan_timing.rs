@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Process-wide timing of the connection plans: how long a pin lives, how
 // often its delivery is judged and a challenger is tried, and how long a
 // refused or failed route is left alone.

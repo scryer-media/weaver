@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Offline analysis of an NZB into a report that is safe to paste in public.
 //
 // An NZB cannot be shared where support happens, yet nearly every question

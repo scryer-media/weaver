@@ -7,6 +7,12 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# A direct route dialer, and server configs built on it, for other crates'
+# tests that have no route of their own. Never enabled in a product build.
+test-support = []
+
 [dependencies]
 async-trait = "0.1"
 weaver-tunnel = { path = "../weaver-tunnel" }

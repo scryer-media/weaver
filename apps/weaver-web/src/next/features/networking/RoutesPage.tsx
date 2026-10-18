@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useState } from "react";
-import { useLocation } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { SAVE_ROUTE } from "@/graphql/networking";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { routeInput, routeProblem, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
@@ -8,16 +11,26 @@ import { PrimaryButton, SecondaryButton } from "../../components/controls";
 import { Cell } from "../../components/rows";
 import { countLabel } from "../../i18n/labels";
 import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
-import { defaultRoute, type Consumer, type NetworkingAction, type NetworkingData } from "./data";
+import { defaultRoute, speedPage, type Consumer, type NetworkingAction, type NetworkingData } from "./data";
 import { RouteEditor } from "./RouteEditor";
 import { stateLabel, StatusMark } from "./presentation";
 
-/** "20 NNTP connections · 2 legs": what a consumer is, and how its route splits it. */
+/**
+ * "20 NNTP connections · 2 legs": what a consumer is, and how its route splits
+ * it. A route of one leg splits nothing, so says nothing about legs, and
+ * Default outbound's name already says what it is.
+ */
 export function consumerSummary(t: Translate, consumer: Consumer): string {
-  const legs = countLabel(t, "next.networking.legCount", consumer.route?.legs.length ?? 1);
-  return consumer.kind === "SERVER"
-    ? `${countLabel(t, "next.networking.routes.connections", consumer.cap)} · ${legs}`
-    : `${t("next.networking.routes.rssFeed")} · ${legs}`;
+  const count = consumer.route?.legs.length ?? 1;
+  const legs = count > 1 ? [countLabel(t, "next.networking.legCount", count)] : [];
+  switch (consumer.kind) {
+    case "SERVER":
+      return [countLabel(t, "next.networking.routes.connections", consumer.cap), ...legs].join(" · ");
+    case "RSS":
+      return [t("next.networking.routes.rssFeed"), ...legs].join(" · ");
+    case "OUTBOUND":
+      return legs.join(" · ");
+  }
 }
 
 /** The state a consumer's legs add up to: carrying, broken, or waiting. */
@@ -47,6 +60,7 @@ export function RoutesPage({
 }) {
   const t = useTranslate();
   const location = useLocation();
+  const navigate = useNavigate();
   const requested = new URLSearchParams(location.search).get("consumer");
   const preselected = consumers.find((consumer) => consumer.key === requested) ?? null;
   const [editing, setEditing] = useState<Consumer | null>(preselected);
@@ -57,7 +71,7 @@ export function RoutesPage({
       id: "routes",
       title: t("next.networking.routes.title"),
       note: t("next.networking.routes.note"),
-      columns: "minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1fr) 112px",
+      columns: "minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1fr) 208px",
       headers: [
         t("next.networking.routes.consumer"),
         t("next.networking.routes.route"),
@@ -91,9 +105,16 @@ export function RoutesPage({
               label={stateLabel(t, state)}
               detail={consumer.kind === "SERVER" ? `${openCount} / ${consumer.cap}` : undefined}
             />,
-            <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
-              <SecondaryButton size="compact" onClick={() => setEditing(consumer)}>
-                {t("next.networking.routes.edit")}
+            <span key="edit" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
+              <SecondaryButton
+                size="compact"
+                icon="speedTest"
+                onClick={() => void navigate(speedPage(consumer.key))}
+              >
+                {t("next.networking.speed.title")}
+              </SecondaryButton>
+              <SecondaryButton size="compact" icon="edit" onClick={() => setEditing(consumer)}>
+                {t("next.common.edit")}
               </SecondaryButton>
             </span>,
           ],
@@ -121,7 +142,7 @@ export function RoutesPage({
 }
 
 /**
- * One server's or feed's route in its editor, mounted while it is open. The
+ * One consumer's route in its editor, mounted while it is open. The
  * routes table opens it, and so does a route leg or an endpoint picked in the
  * network flow.
  */
@@ -159,7 +180,7 @@ export function RouteDialog({
     <Dialog
       open
       title={t("next.networking.routes.editorTitle", { name: consumer.name })}
-      note={consumerSummary(t, { ...consumer, route })}
+      note={consumerSummary(t, { ...consumer, route }) || undefined}
       width={720}
       onDismiss={onClose}
       footer={
@@ -179,7 +200,7 @@ export function RouteDialog({
           profiles={data.proxyProfiles}
           pools={data.proxyPools}
           cap={consumer.cap}
-          rss={consumer.kind === "RSS"}
+          kind={consumer.kind}
           status={flow.legs.filter((leg) => leg.consumer === consumer.key)}
         />
       </div>
@@ -191,3 +212,4 @@ export function RouteDialog({
     </Dialog>
   );
 }
+

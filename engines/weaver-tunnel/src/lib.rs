@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Weaver adapters for shared tunnels and consumer routing.
 //
 // SSH, WireGuard and HTTP/3 protocols live in the Git-pinned `proxy-tunnels` crate.
@@ -6,12 +9,17 @@
 // revocable streams. NNTP uses direct in-process I/O; RSS uses authenticated
 // loopback SOCKS bridges. The server owns policy, persistence and the runtime.
 
+// Tests dial their own loopback fixtures.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod bridge;
 pub mod direct;
 pub mod dns;
 pub mod egress;
+pub mod fault;
 pub mod metrics;
 pub mod pipe;
+pub mod resolution;
 pub mod revocation;
 pub use proxy_tunnels::endpoint;
 mod error;
@@ -28,6 +36,8 @@ pub mod transport;
 #[path = "shared_wireguard.rs"]
 pub mod wireguard;
 
+// Fixtures dial their own loopback listeners.
+#[allow(clippy::disallowed_methods)]
 #[cfg(any(test, feature = "test-support"))]
 #[path = "shared_test_support.rs"]
 pub mod test_support;
@@ -40,10 +50,9 @@ pub use provider::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use registry::TunnelRegistry;
-pub use ssh::{SshTunnelProvider, TunnelHandshake, validate_private_key};
+pub use ssh::{SshTunnelProvider, validate_private_key};
 pub use wireguard::{
     DEFAULT_WIREGUARD_KEEPALIVE, DEFAULT_WIREGUARD_MTU, IpCidr, MAX_WIREGUARD_MTU,
-    MIN_WIREGUARD_MTU, WIREGUARD_KEY_MESSAGE, WgStack, WgTcpStream, WgUdpSocket,
-    WireGuardHandshake, WireGuardSpec, WireGuardTunnelProvider, parse_key, public_key_of,
-    validate_wireguard_keys,
+    MIN_WIREGUARD_MTU, WIREGUARD_KEY_MESSAGE, WgStack, WgTcpStream, WgUdpSocket, WireGuardSpec,
+    WireGuardTunnelProvider, parse_key, public_key_of, validate_wireguard_keys,
 };

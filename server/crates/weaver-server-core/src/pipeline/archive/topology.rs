@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::rar_state::{self, RarDerivedPlan, RarSetPhase, RarSetState};
 use crate::jobs::assembly::{
     ArchiveMember as JobArchiveMember, ArchivePendingSpan as JobArchivePendingSpan,
@@ -6,8 +9,8 @@ use crate::jobs::assembly::{
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::direct_store::restart::DirectVolumeFacts;
 use crate::pipeline::{
-    ComputedRarSetState, Pipeline, RarCapacityRetryKind, RarRefreshDone, RarRefreshError,
-    RarRefreshRequest, RefreshReason,
+    ComputedRarSetState, ExtractionError, Pipeline, RarCapacityRetryKind, RarRefreshDone,
+    RarRefreshError, RarRefreshRequest, RefreshReason,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -938,15 +941,11 @@ pub(in crate::pipeline) fn present_waiting_rar_volumes(
     volumes
 }
 
-// The text every "this set has no volume 0 to open from" refusal carries, so
-// the scheduler can route it to the missing-volume path instead of failing
-// the job outright.
+// The text every "this set has no volume 0 to open from" refusal carries.
+// The refusal is routed on `ExtractionErrorClass::MissingFirstVolume`; the
+// text only reads the same wherever it is reported.
 pub(in crate::pipeline) const MISSING_FIRST_RAR_VOLUME_ERROR_MARKER: &str =
     "has no first volume (volume 0) to open from";
-
-pub(in crate::pipeline) fn is_missing_first_rar_volume_error(error: &str) -> bool {
-    error.contains(MISSING_FIRST_RAR_VOLUME_ERROR_MARKER)
-}
 
 const INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER: &str =
     "produced incoherent waiting state with no missing volumes after rebuild";
@@ -969,10 +968,6 @@ struct RarSetComputeInput {
     cached_headers: Option<Vec<u8>>,
     extraction_generation: u64,
     reason: RefreshReason,
-}
-
-pub(in crate::pipeline) fn is_incoherent_rar_waiting_state_error(error: &str) -> bool {
-    error.contains(INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER)
 }
 
 // Formats the error `ownerless_live_rar_plan_error_for_set` fails a job with.
@@ -1006,15 +1001,16 @@ impl Pipeline {
             let context = format!("failed to parse RAR volume facts from {}", path.display());
             Self::try_rar_password_candidates(&context, &password_candidates, |password| {
                 let file = std::fs::File::open(&path).map_err(|e| {
-                    crate::pipeline::RarPasswordAttemptError::Fatal(format!(
-                        "failed to open {}: {e}",
-                        path.display()
+                    crate::pipeline::RarPasswordAttemptError::Fatal(ExtractionError::from_io(
+                        format!("failed to open {}: {e}", path.display()),
+                        &e,
                     ))
                 })?;
                 unrar_rs::RarArchive::parse_volume_facts(file, password)
                     .map_err(crate::pipeline::RarPasswordAttemptError::from)
             })
             .map(|selection| selection.value)
+            .map_err(String::from)
         })
         .await
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
@@ -1250,6 +1246,18 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<(), String> {
+        self.recompute_rar_set_state_classified(job_id, set_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    // `recompute_rar_set_state`, with the failure kept typed for a caller that
+    // routes on it.
+    pub(in crate::pipeline) async fn recompute_rar_set_state_classified(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<(), RarRefreshError> {
         let Some(input) =
             self.prepare_rar_set_compute_input(job_id, set_name, RefreshReason::ValidationFailure)
         else {
@@ -1280,7 +1288,13 @@ impl Pipeline {
                 Ok(())
             }
             Err(error) => {
-                self.apply_failed_rar_set_compute(job_id, set_name, existing, error.to_string())
+                let _ = self.apply_failed_rar_set_compute(
+                    job_id,
+                    set_name,
+                    existing,
+                    error.to_string(),
+                );
+                Err(error)
             }
         }
     }
@@ -1339,12 +1353,11 @@ impl Pipeline {
         tokio::task::spawn_blocking(move || Self::compute_rar_set_state_blocking(input))
             .await
             .map_err(|e| RarRefreshError::Other(format!("RAR plan task panicked: {e}")))?
-            .map_err(RarRefreshError::from_message)
     }
 
     fn compute_rar_set_state_blocking(
         input: RarSetComputeInput,
-    ) -> Result<ComputedRarSetState, String> {
+    ) -> Result<ComputedRarSetState, RarRefreshError> {
         let RarSetComputeInput {
             job_id,
             set_name: set_name_owned,
@@ -1362,7 +1375,10 @@ impl Pipeline {
         } = input;
 
         let open_from_volume_zero =
-            || -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, String> {
+            || -> Result<
+                crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>,
+                RarRefreshError,
+            > {
             let first_path = volume_paths.get(&0).ok_or_else(|| {
                 format!(
                     "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
@@ -1374,13 +1390,14 @@ impl Pipeline {
                 &password_candidates,
                 std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             )
+            .map_err(RarRefreshError::from)
         };
 
         let attach_volumes_and_build_plan = |mut archive: unrar_rs::RarArchive,
                                              rebuild_source: RarTopologyRebuildSource,
                                              using_cached_headers: bool,
                                              force_refresh_all_volumes: bool|
-         -> Result<_, String> {
+         -> Result<_, RarRefreshError> {
             for (volume_number, path) in &volume_paths {
                 let volume_needs_refresh =
                     force_refresh_all_volumes || !facts.contains_key(volume_number);
@@ -1403,9 +1420,11 @@ impl Pipeline {
                         let context = format!(
                             "failed to open RAR volume {volume_number} for set '{set_name_owned}'"
                         );
-                        return Err(crate::pipeline::capacity::format_fd_capacity_error(
-                            &context, &error,
-                        ));
+                        return Err(ExtractionError::from_io(
+                            crate::pipeline::capacity::format_fd_capacity_error(&context, &error),
+                            &error,
+                        )
+                        .into());
                     }
                 };
                 if using_cached_headers
@@ -1415,8 +1434,11 @@ impl Pipeline {
                     archive
                         .refresh_volume(*volume_number as usize, volume_file)
                         .map_err(|e| {
-                            format!(
-                                "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                            ExtractionError::from_rar(
+                                format!(
+                                    "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                                ),
+                                &e,
                             )
                         })?;
                 } else if archive.has_volume(*volume_number as usize) {
@@ -1425,8 +1447,11 @@ impl Pipeline {
                     archive
                         .add_volume(*volume_number as usize, volume_file)
                         .map_err(|e| {
-                            format!(
-                                "failed to integrate RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                            ExtractionError::from_rar(
+                                format!(
+                                    "failed to integrate RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                                ),
+                                &e,
                             )
                         })?;
                 }
@@ -1641,9 +1666,9 @@ impl Pipeline {
         }
 
         if cached_rar_plan_is_incoherent(&plan, &failed, worker_active, &facts, &volume_paths) {
-            return Err(format!(
+            return Err(RarRefreshError::IncoherentWaitingState(format!(
                 "RAR set '{set_name_owned}' {INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER}"
-            ));
+            )));
         }
 
         let _ = used_cached_headers;
@@ -2426,7 +2451,7 @@ impl Pipeline {
     }
 
     pub(crate) async fn restore_rar_state_for_job(&mut self, job_id: JobId) {
-        let password_candidates = self.archive_password_candidates_for_job(job_id);
+        let password_candidates = self.archive_password_candidates_for_job(job_id).candidates;
         match self
             .db_blocking(move |db| db.load_all_archive_headers(job_id))
             .await

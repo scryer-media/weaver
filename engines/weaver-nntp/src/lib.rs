@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // `weaver-nntp` — Async NNTP protocol client for the Weaver Usenet downloader.
 //
 // This crate provides a single-connection NNTP client that supports:
@@ -38,6 +41,9 @@
 // # }
 // ```
 
+// Tests dial their own loopback fixtures.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 mod address_plan;
 pub mod blocking;
 pub mod candidate_plan;
@@ -68,8 +74,8 @@ mod test_support;
 
 // Re-export primary types for convenience.
 pub use address_plan::{
-    ADDRESS_ATTEMPT_LIMIT, ADDRESS_REPLAN_INTERVAL, AddressPlanSnapshot, AddressRoute,
-    AddressSnapshot, RaceReason,
+    ADDRESS_ATTEMPT_LIMIT, ADDRESS_REPLAN_INTERVAL, AddressPlanSnapshot, AddressSnapshot,
+    RaceReason,
 };
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{

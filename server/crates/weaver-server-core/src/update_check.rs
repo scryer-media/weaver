@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Background release checker.
 //
 // Polls the project's public GitHub releases API on a conservative cadence and
@@ -27,6 +30,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::persistence::Database;
+use crate::proxies::{Consumer, FetchOptions, ProxyRuntime, read_body, routed_fetch};
 
 // Releases API for this project's public repository.
 //
@@ -110,12 +114,6 @@ impl UpdateStatus {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum UpdateCheckError {
-    #[error("failed to build update-check HTTP client: {0}")]
-    HttpClient(String),
-}
-
 // The subset of [`UpdateStatus`] that survives a restart.
 //
 // Transient fields (`checking`, `last_error`) are deliberately excluded, and
@@ -195,9 +193,14 @@ struct UpdateCheckInner {
 }
 
 impl UpdateCheckService {
-    pub fn new(db: Database) -> Result<Self, UpdateCheckError> {
-        let fetcher = GithubReleaseFetcher::new()?;
-        Ok(Self::with_fetcher(db, Arc::new(fetcher)))
+    // Checks over Default outbound, and fails closed with it: a route that
+    // carries nothing hides a release.
+    pub fn new(db: Database, proxies: Arc<ProxyRuntime>) -> Self {
+        let fetcher = GithubReleaseFetcher {
+            proxies,
+            endpoint: GITHUB_LATEST_RELEASE_ENDPOINT.to_string(),
+        };
+        Self::with_fetcher(db, Arc::new(fetcher))
     }
 
     pub(crate) fn with_fetcher(db: Database, fetcher: Arc<dyn ReleaseFetcher>) -> Self {
@@ -538,26 +541,10 @@ pub(crate) fn is_newer_than_current(candidate: Option<&str>, current_version: &s
     candidate > current
 }
 
-// Reqwest-backed [`ReleaseFetcher`] pointed at the public GitHub API.
+// [`ReleaseFetcher`] pointed at the public GitHub API.
 struct GithubReleaseFetcher {
-    client: reqwest::Client,
+    proxies: Arc<ProxyRuntime>,
     endpoint: String,
-}
-
-impl GithubReleaseFetcher {
-    fn new() -> Result<Self, UpdateCheckError> {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(concat!("weaver/", env!("CARGO_PKG_VERSION")))
-            .gzip(true)
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(|error| UpdateCheckError::HttpClient(error.to_string()))?;
-        Ok(Self {
-            client,
-            endpoint: GITHUB_LATEST_RELEASE_ENDPOINT.to_string(),
-        })
-    }
 }
 
 impl ReleaseFetcher for GithubReleaseFetcher {
@@ -566,16 +553,31 @@ impl ReleaseFetcher for GithubReleaseFetcher {
         etag: Option<&'a str>,
     ) -> BoxFuture<'a, Result<FetchOutcome, String>> {
         Box::pin(async move {
-            let mut request = self
-                .client
-                .get(&self.endpoint)
-                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28");
-            if let Some(etag) = etag {
-                request = request.header(reqwest::header::IF_NONE_MATCH, etag);
-            }
-
-            let response = request.send().await.map_err(|error| error.to_string())?;
+            let url = reqwest::Url::parse(&self.endpoint).map_err(|error| error.to_string())?;
+            let options = FetchOptions {
+                label: "Release check",
+                timeout: REQUEST_TIMEOUT,
+                redirects: 5,
+                user_agent: concat!("weaver/", env!("CARGO_PKG_VERSION")),
+                https_only: false,
+                allow_private_network: self.proxies.allow_private_network(),
+            };
+            let response = routed_fetch(
+                &self.proxies,
+                Consumer::Outbound,
+                &url,
+                &options,
+                |request, _, _| {
+                    let request = request
+                        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                        .header("X-GitHub-Api-Version", "2022-11-28");
+                    match etag {
+                        Some(etag) => request.header(reqwest::header::IF_NONE_MATCH, etag),
+                        None => request,
+                    }
+                },
+            )
+            .await?;
             let status = response.status();
 
             if status == reqwest::StatusCode::NOT_MODIFIED {
@@ -595,7 +597,9 @@ impl ReleaseFetcher for GithubReleaseFetcher {
                 .get(reqwest::header::ETAG)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            let body = read_body_with_limit(response).await?;
+            let body = read_body(response, MAX_RESPONSE_BYTES as u64)
+                .await
+                .map_err(|error| format!("release API {error}"))?;
             let release = parse_release_payload(&body)?;
             Ok(FetchOutcome::Fetched { release, etag })
         })
@@ -647,23 +651,6 @@ pub(crate) fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> 
             .unwrap_or_default()
             .min(MAX_RETRY_AFTER),
     )
-}
-
-async fn read_body_with_limit(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("release API body read failed: {error}"))?
-    {
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err(format!(
-                "release API response exceeds {MAX_RESPONSE_BYTES} bytes"
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 // Extract the stable release from a `releases/latest` payload.

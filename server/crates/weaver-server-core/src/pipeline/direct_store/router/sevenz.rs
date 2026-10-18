@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The 7z half of the layout seam: reading one container's map out of its end
 // header, and answering physical ranges from it.
 //
@@ -360,6 +363,38 @@ impl ContainerGeometry {
     }
 }
 
+// Public header facts only; reconstructed through the library parser before
+// deriving, including when these fields came from a restart row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SevenZipAesFacts {
+    pub(crate) cycles_power: u8,
+    pub(crate) salt: Vec<u8>,
+    pub(crate) iv: [u8; 16],
+}
+
+impl SevenZipAesFacts {
+    fn of(properties: sevenz_turbo::AesProperties) -> Self {
+        Self {
+            cycles_power: properties.cycles_power(),
+            salt: properties.salt().to_vec(),
+            iv: *properties.iv(),
+        }
+    }
+
+    pub(crate) fn properties(&self) -> Result<sevenz_turbo::AesProperties, SevenZipRefusal> {
+        if self.cycles_power > 63 || self.salt.len() > 16 {
+            return Err(SevenZipRefusal::Geometry);
+        }
+        let mut bytes = [0u8; 34];
+        bytes[0] = self.cycles_power | 0x40 | if self.salt.is_empty() { 0 } else { 0x80 };
+        bytes[1] = 15 | (self.salt.len().saturating_sub(1) as u8) << 4;
+        bytes[2..2 + self.salt.len()].copy_from_slice(&self.salt);
+        bytes[2 + self.salt.len()..18 + self.salt.len()].copy_from_slice(&self.iv);
+        sevenz_turbo::AesProperties::parse(&bytes[..18 + self.salt.len()])
+            .map_err(|_| SevenZipRefusal::Geometry)
+    }
+}
+
 // One entry the end header names, in container coordinates.
 //
 // This is the durable form: it is what the restart cache stores and what the
@@ -388,6 +423,26 @@ pub(crate) struct SevenZipEntryFacts {
     // that recorded none has none to restore.
     #[serde(default)]
     pub(crate) accessed: Option<u64>,
+    #[serde(default)]
+    pub(crate) aes: Option<SevenZipAesFacts>,
+}
+
+impl SevenZipEntryFacts {
+    fn packed_size(&self) -> Result<u64, SevenZipRefusal> {
+        match &self.aes {
+            Some(aes) => {
+                aes.properties()?;
+                if self.crc32.is_none() || self.start.is_none() || self.size == 0 {
+                    return Err(SevenZipRefusal::Coder);
+                }
+                self.size
+                    .checked_add(15)
+                    .map(|n| n & !15)
+                    .ok_or(SevenZipRefusal::Geometry)
+            }
+            None => Ok(self.size),
+        }
+    }
 }
 
 // Everything one 7z container's end header states, plus the volume lengths the
@@ -413,6 +468,10 @@ pub(crate) struct SevenZipContainerFacts {
     // than refusing its own posted length as a wrong one.
     #[serde(default)]
     pub(crate) embedded_tail: u64,
+    #[serde(default)]
+    pub(crate) header_replay: Vec<(u64, Vec<u8>)>,
+    #[serde(default)]
+    pub(crate) header_encrypted: bool,
 }
 
 // What an admitted tail opens with: the packet signature of a recovery set
@@ -453,6 +512,7 @@ pub(super) struct SevenZipLayout {
     members: Vec<StoredMember>,
     // Entries with no bytes at all, in header order.
     dataless: Vec<SevenZipDatalessEntry>,
+    aes: Vec<Option<SevenZipAesFacts>>,
 }
 
 impl SevenZipLayout {
@@ -488,6 +548,7 @@ impl SevenZipLayout {
 
         let mut members = Vec::new();
         let mut dataless = Vec::new();
+        let mut aes = Vec::new();
         // The container order the entries have to be disjoint and ascending in.
         // Sorted here rather than trusted from the header: block order is the
         // header's, and two blocks whose packed ranges cross would otherwise
@@ -509,7 +570,7 @@ impl SevenZipLayout {
         for entry in placed {
             let start = entry.start.unwrap_or(0);
             let end = start
-                .checked_add(entry.size)
+                .checked_add(entry.packed_size()?)
                 .ok_or(SevenZipRefusal::Geometry)?;
             // The container's own end as well as the volumes': an admitted
             // tail follows the container, and no member may claim it.
@@ -519,17 +580,23 @@ impl SevenZipLayout {
             }
             frontier = end;
             members.push(member_over(&bases, &sizes, entry, start)?);
+            aes.push(entry.aes.clone());
         }
         Ok(Self {
             bases,
             lengths: sizes,
             members,
             dataless,
+            aes,
         })
     }
 
     pub(super) fn members(&self) -> &[StoredMember] {
         &self.members
+    }
+
+    pub(super) fn aes(&self, index: usize) -> Option<&SevenZipAesFacts> {
+        self.aes.get(index).and_then(Option::as_ref)
     }
 
     pub(super) fn dataless(&self) -> &[SevenZipDatalessEntry] {
@@ -572,7 +639,8 @@ impl SevenZipLayout {
             let Some(member_start) = self.member_start(member) else {
                 continue;
             };
-            let member_end = member_start.saturating_add(member.unpacked_size.unwrap_or(0));
+            let member_end = member_start
+                .saturating_add(member.parts.iter().map(|part| part.data_size).sum::<u64>());
             if member_end <= cursor {
                 continue;
             }
@@ -584,10 +652,18 @@ impl SevenZipLayout {
                 cursor = member_start;
             }
             let take = member_end.min(end) - cursor;
-            slices.push(MappedSlice::Member {
-                member_index,
-                logical_offset: cursor - member_start,
-                len: take,
+            slices.push(if self.aes(member_index).is_some() {
+                MappedSlice::EncryptedMember {
+                    member_index,
+                    logical_offset: cursor - member_start,
+                    len: take,
+                }
+            } else {
+                MappedSlice::Member {
+                    member_index,
+                    logical_offset: cursor - member_start,
+                    len: take,
+                }
             });
             cursor += take;
         }
@@ -633,7 +709,7 @@ fn member_over(
     start: u64,
 ) -> Result<StoredMember, SevenZipRefusal> {
     let end = start
-        .checked_add(entry.size)
+        .checked_add(entry.packed_size()?)
         .ok_or(SevenZipRefusal::Geometry)?;
     let mut parts: Vec<StoredMemberPart> = Vec::new();
     let mut logical = 0u64;
@@ -707,16 +783,65 @@ pub(super) fn container_facts(
 
     // Per block: the container offset its single pack stream begins at.
     let mut block_start = Vec::with_capacity(archive.blocks.len());
+    let mut block_aes = Vec::with_capacity(archive.blocks.len());
+    let mut member_counts = vec![0usize; archive.blocks.len()];
+    for (file, block) in archive
+        .files
+        .iter()
+        .zip(&archive.stream_map.file_block_index)
+    {
+        if file.has_stream {
+            let count = block
+                .and_then(|index| member_counts.get_mut(index))
+                .ok_or(SevenZipRefusal::Geometry)?;
+            *count += 1;
+        }
+    }
     for (index, block) in archive.blocks.iter().enumerate() {
-        if block.coders.len() != 1 {
-            // More than one coder is a filter chain — BCJ over LZMA, delta over
-            // LZMA2 — and the outer coder's output is not the file's bytes.
+        if block
+            .coders
+            .iter()
+            .any(|coder| coder.num_input_streams() != 1 || coder.num_output_streams() != 1)
+        {
             return Err(coder_refusal(block));
         }
-        let coder = &block.coders[0];
-        if coder.encoder_method_id() != COPY_METHOD_ID {
+        let methods: Vec<_> = block
+            .ordered_coder_iter()
+            .map(|(_, coder)| coder.encoder_method_id())
+            .collect();
+        let aes = if block.coders.len() == 1 && methods == [COPY_METHOD_ID] {
+            None
+        } else if block.coders.len() == 2
+            && (methods
+                == [
+                    sevenz_turbo::EncoderMethod::ID_AES256_SHA256,
+                    COPY_METHOD_ID,
+                ]
+                || methods
+                    == [
+                        COPY_METHOD_ID,
+                        sevenz_turbo::EncoderMethod::ID_AES256_SHA256,
+                    ])
+        {
+            if member_counts[index] != 1 {
+                return Err(SevenZipRefusal::Coder);
+            }
+            let coder = block
+                .coders
+                .iter()
+                .find(|coder| {
+                    coder.encoder_method_id() == sevenz_turbo::EncoderMethod::ID_AES256_SHA256
+                })
+                .ok_or(SevenZipRefusal::Coder)?;
+            Some(SevenZipAesFacts::of(
+                coder
+                    .aes_properties()
+                    .map_err(|_| SevenZipRefusal::Geometry)?
+                    .ok_or(SevenZipRefusal::Coder)?,
+            ))
+        } else {
             return Err(coder_refusal(block));
-        }
+        };
         let stream = *first_pack.get(index).ok_or(SevenZipRefusal::Geometry)?;
         // Exactly one pack stream. A Copy block with several would still be
         // contiguous, but nothing in the format says the streams are adjacent,
@@ -732,9 +857,38 @@ pub(super) fn container_facts(
         let size = *pack_sizes.get(stream).ok_or(SevenZipRefusal::Geometry)?;
         // Copy is the identity, so a block whose packed and unpacked lengths
         // differ is not the block its coder claims to be.
-        if size != block.get_unpack_size() {
+        let unpacked = block.get_unpack_size();
+        let expected = if aes.is_some() {
+            unpacked
+                .checked_add(15)
+                .map(|n| n & !15)
+                .ok_or(SevenZipRefusal::Geometry)?
+        } else {
+            unpacked
+        };
+        if size != expected {
             return Err(SevenZipRefusal::Coder);
         }
+        let mut input_size = size;
+        for (_, coder) in block.ordered_coder_iter() {
+            let output_size = block.get_unpack_size_for_coder(coder);
+            let required_input = if coder.encoder_method_id() == COPY_METHOD_ID {
+                output_size
+            } else {
+                output_size
+                    .checked_add(15)
+                    .map(|n| n & !15)
+                    .ok_or(SevenZipRefusal::Geometry)?
+            };
+            if input_size != required_input {
+                return Err(SevenZipRefusal::Coder);
+            }
+            input_size = output_size;
+        }
+        if input_size != unpacked {
+            return Err(SevenZipRefusal::Coder);
+        }
+        block_aes.push(aes);
         let offset = *offsets.get(stream).ok_or(SevenZipRefusal::Geometry)?;
         block_start.push(
             pack_base
@@ -786,6 +940,7 @@ pub(super) fn container_facts(
                 is_directory: file.is_directory,
                 modified,
                 accessed,
+                aes: None,
             });
             continue;
         }
@@ -815,7 +970,12 @@ pub(super) fn container_facts(
             is_directory: false,
             modified,
             accessed,
+            aes: block_aes[block].clone(),
         });
+        entries
+            .last()
+            .ok_or(SevenZipRefusal::Geometry)?
+            .packed_size()?;
     }
 
     // Every block's packed bytes must be claimed by its entries. Bytes inside a
@@ -838,6 +998,8 @@ pub(super) fn container_facts(
         entries,
         total: 0,
         embedded_tail: 0,
+        header_replay: Vec::new(),
+        header_encrypted: false,
     })
 }
 
@@ -943,10 +1105,192 @@ impl Seek for ContainerImage {
     }
 }
 
+// The winning password remains process-local. Its cache and round accounting
+// move from the header parse into member admission without cloning.
+pub(super) struct SevenZipAdmission {
+    pub(super) secret: String,
+    pub(super) password: sevenz_turbo::Password,
+}
+
+fn password_for(secret: &str, limits: &sevenz_turbo::ArchiveLimits) -> sevenz_turbo::Password {
+    let entries = limits
+        .max_total_coders
+        .saturating_mul(u64::from(limits.max_header_depth) + 1);
+    sevenz_turbo::Password::new(secret)
+        .with_aes_key_cache_capacity(entries.min(usize::MAX as u64) as usize)
+}
+
+// Retains only bytes the successful encrypted-header parse read, all in their
+// posted form. Restart can prove the winning candidate again without a key,
+// password, decrypted header, or new password verifier in the snapshot.
+struct HeaderCapture<'a> {
+    image: &'a mut ContainerImage,
+    chunks: BTreeMap<u64, Vec<u8>>,
+    budget: u64,
+    enabled: bool,
+}
+
+impl Read for HeaderCapture<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let offset = self.image.stream_position()?;
+        let count = self.image.read(out)?;
+        if count != 0 && self.enabled {
+            let old = self.chunks.get(&offset).map_or(0, Vec::len);
+            if count > old {
+                let extra = (count - old) as u64;
+                self.budget = self.budget.checked_sub(extra).ok_or_else(|| {
+                    std::io::Error::other("encrypted header replay exceeds its memory bound")
+                })?;
+                self.chunks.insert(offset, out[..count].to_vec());
+            }
+        }
+        Ok(count)
+    }
+}
+
+impl Seek for HeaderCapture<'_> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.image.seek(from)
+    }
+}
+
+fn normalize_replay(
+    chunks: BTreeMap<u64, Vec<u8>>,
+) -> Result<Vec<(u64, Vec<u8>)>, SevenZipRefusal> {
+    let mut result: Vec<(u64, Vec<u8>)> = Vec::with_capacity(chunks.len());
+    for (offset, bytes) in chunks {
+        if let Some((previous, held)) = result.last_mut() {
+            let end = previous
+                .checked_add(held.len() as u64)
+                .ok_or(SevenZipRefusal::Geometry)?;
+            if offset <= end {
+                let at =
+                    usize::try_from(offset - *previous).map_err(|_| SevenZipRefusal::Geometry)?;
+                let overlap = bytes.len().min(held.len() - at);
+                if held[at..at + overlap] != bytes[..overlap] {
+                    return Err(SevenZipRefusal::Geometry);
+                }
+                held.extend_from_slice(&bytes[overlap..]);
+                continue;
+            }
+        }
+        result.push((offset, bytes));
+    }
+    Ok(result)
+}
+
+struct HeaderReplay<'a> {
+    chunks: &'a [(u64, Vec<u8>)],
+    position: u64,
+    total: u64,
+}
+
+impl Read for HeaderReplay<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let end = self
+            .chunks
+            .partition_point(|(offset, _)| *offset <= self.position);
+        let Some((offset, bytes)) = self.chunks[..end]
+            .iter()
+            .rev()
+            .find(|(offset, bytes)| self.position - offset < bytes.len() as u64)
+        else {
+            return Ok(0);
+        };
+        let start = (self.position - offset) as usize;
+        let count = out.len().min(bytes.len() - start);
+        out[..count].copy_from_slice(&bytes[start..start + count]);
+        self.position += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for HeaderReplay<'_> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.position = match from {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+            SeekFrom::End(offset) => self.total.checked_add_signed(offset),
+        }
+        .ok_or_else(|| std::io::Error::other("invalid header replay seek"))?;
+        Ok(self.position)
+    }
+}
+
+pub(super) fn restore_admission(
+    facts: &SevenZipContainerFacts,
+    passwords: &[&str],
+    max_end_header_bytes: u64,
+) -> Result<Option<SevenZipAdmission>, SevenZipRefusal> {
+    if !facts.entries.iter().any(|entry| entry.aes.is_some()) {
+        return Ok(None);
+    }
+    let limits = sevenz_turbo::ArchiveLimits {
+        max_end_header_bytes,
+        ..Default::default()
+    };
+    if !facts.header_encrypted {
+        if !facts.header_replay.is_empty() {
+            return Err(SevenZipRefusal::Geometry);
+        }
+        return Ok(passwords
+            .iter()
+            .find(|secret| !secret.is_empty())
+            .map(|secret| SevenZipAdmission {
+                secret: (*secret).to_string(),
+                password: password_for(secret, &limits),
+            }));
+    }
+    let budget = limits
+        .max_header_unpacked_bytes
+        .saturating_add(max_end_header_bytes)
+        .saturating_add(32);
+    let held = facts
+        .header_replay
+        .iter()
+        .try_fold(0u64, |sum, (offset, bytes)| {
+            let end = offset.checked_add(bytes.len() as u64)?;
+            if bytes.is_empty() || end > facts.total {
+                return None;
+            }
+            sum.checked_add(bytes.len() as u64)
+        })
+        .ok_or(SevenZipRefusal::Geometry)?;
+    if held == 0
+        || held > budget
+        || facts
+            .header_replay
+            .windows(2)
+            .any(|pair| pair[0].0.saturating_add(pair[0].1.len() as u64) > pair[1].0)
+    {
+        return Err(SevenZipRefusal::Geometry);
+    }
+    for secret in passwords.iter().filter(|secret| !secret.is_empty()) {
+        let password = password_for(secret, &limits);
+        let mut replay = HeaderReplay {
+            chunks: &facts.header_replay,
+            position: 0,
+            total: facts.total,
+        };
+        if let Ok(archive) =
+            sevenz_turbo::Archive::read_with_limits(&mut replay, &password, &limits)
+        {
+            if container_facts(&archive)?.entries != facts.entries {
+                return Err(SevenZipRefusal::Geometry);
+            }
+            return Ok(Some(SevenZipAdmission {
+                secret: (*secret).to_string(),
+                password,
+            }));
+        }
+    }
+    Err(SevenZipRefusal::EncryptedHeader)
+}
+
 // What one attempt at reading a container's map produced.
 pub(super) enum ParseOutcome {
     // The end header parsed and every entry passed the coder gate.
-    Facts(Box<SevenZipContainerFacts>),
+    Facts(Box<SevenZipContainerFacts>, Option<SevenZipAdmission>),
     // Not enough of the container has arrived yet. The next article retries.
     Incomplete,
     // A verdict about the container. No further byte changes it.
@@ -976,9 +1320,11 @@ pub(super) enum ParseOutcome {
 // entirely, so the no-key attempt is not a special case so much as the first
 // candidate.
 //
-// The list is bounded at four by construction — `Explicit`, `NzbMeta`,
-// `FilenameConvention`, at most one each, plus the no-key attempt — so the
-// work this loop can do is bounded however many times the reader is asked.
+// Every keyed attempt costs the reader a key derivation, and this loop runs on
+// every parse attempt until the container opens, so its length is the cost.
+// The list is the set's header ring: the job's whole candidate list, which the
+// harvest caps at 80 entries across its four buckets (`MAX_ARCHIVE_PASSWORDS`
+// and its neighbours), plus the spec's password and the no-key attempt.
 pub(super) fn parse_container(
     mut image: ContainerImage,
     total: u64,
@@ -1024,7 +1370,7 @@ pub(super) fn parse_container(
     let mut opened = None;
     for attempt in std::iter::once(None).chain(passwords.iter().copied().map(Some)) {
         let key = match attempt {
-            Some(secret) if !secret.is_empty() => sevenz_turbo::Password::new(secret),
+            Some(secret) if !secret.is_empty() => password_for(secret, &limits),
             _ => sevenz_turbo::Password::empty(),
         };
         // Each attempt reads the image from the top, and reads its own answer
@@ -1033,9 +1379,23 @@ pub(super) fn parse_container(
         if image.restart().is_err() {
             return ParseOutcome::Refused(SevenZipRefusal::Geometry);
         }
-        match sevenz_turbo::Archive::read_with_limits(&mut image, &key, &limits) {
+        let mut capture = HeaderCapture {
+            image: &mut image,
+            enabled: attempt.is_some(),
+            chunks: BTreeMap::new(),
+            budget: limits
+                .max_header_unpacked_bytes
+                .saturating_add(max_end_header_bytes)
+                .saturating_add(32),
+        };
+        let parsed = sevenz_turbo::Archive::read_with_limits(&mut capture, &key, &limits);
+        let replay = match normalize_replay(capture.chunks) {
+            Ok(replay) => replay,
+            Err(reason) => return ParseOutcome::Refused(reason),
+        };
+        match parsed {
             Ok(archive) => {
-                opened = Some(archive);
+                opened = Some((archive, attempt, key, replay));
                 break;
             }
             // `-mhe`: the end header is itself an encrypted block, so nothing in
@@ -1063,7 +1423,7 @@ pub(super) fn parse_container(
     // verdict: it is a property of the archive that no further byte changes,
     // and it is the one refusal an operator can act on. Stated once, for the
     // list as a whole, exactly as the `-hp` gate states it for a RAR set.
-    let Some(archive) = opened else {
+    let Some((archive, attempt, key, replay)) = opened else {
         return ParseOutcome::Refused(SevenZipRefusal::EncryptedHeader);
     };
     match container_facts(&archive) {
@@ -1071,7 +1431,27 @@ pub(super) fn parse_container(
         // end header and never sees the start header's coordinates.
         Ok(mut facts) => {
             facts.total = total;
-            ParseOutcome::Facts(Box::new(facts))
+            let admission = if facts.entries.iter().any(|entry| entry.aes.is_some()) {
+                if let Some(secret) = attempt {
+                    facts.header_replay = replay;
+                    facts.header_encrypted = true;
+                    Some(SevenZipAdmission {
+                        secret: secret.to_string(),
+                        password: key,
+                    })
+                } else {
+                    passwords
+                        .iter()
+                        .find(|secret| !secret.is_empty())
+                        .map(|secret| SevenZipAdmission {
+                            secret: (*secret).to_string(),
+                            password: password_for(secret, &limits),
+                        })
+                }
+            } else {
+                None
+            };
+            ParseOutcome::Facts(Box::new(facts), admission)
         }
         Err(refusal) => ParseOutcome::Refused(refusal),
     }
@@ -1080,6 +1460,151 @@ pub(super) fn parse_container(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encrypted_fixture(solid: bool, encrypted_header: bool) -> Vec<u8> {
+        encrypted_fixture_order(solid, encrypted_header, false)
+    }
+
+    fn encrypted_fixture_order(solid: bool, encrypted_header: bool, reverse: bool) -> Vec<u8> {
+        use sevenz_turbo::{
+            ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password,
+        };
+        use std::io::Cursor;
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        let mut methods = vec![
+            EncoderConfiguration::from(sevenz_turbo::encoder_options::AesEncoderOptions::new(
+                Password::new("fixture-key"),
+            )),
+            EncoderConfiguration::new(EncoderMethod::COPY),
+        ];
+        if reverse {
+            methods.reverse();
+        }
+        writer.set_content_methods(methods);
+        writer.set_encrypt_header(encrypted_header);
+        let entries: Vec<_> = ["one.bin", "two.bin"]
+            .iter()
+            .map(|name| {
+                let mut entry = ArchiveEntry::new_file(name);
+                entry.size = 19;
+                entry
+            })
+            .collect();
+        if solid {
+            writer
+                .push_archive_entries(
+                    entries,
+                    vec![
+                        Cursor::new(vec![7; 19]).into(),
+                        Cursor::new(vec![8; 19]).into(),
+                    ],
+                )
+                .unwrap();
+        } else {
+            for entry in entries {
+                writer
+                    .push_archive_entry(entry, Some(Cursor::new(vec![7; 19])))
+                    .unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn sevenz_aes_copy_folder_gate_and_padding_geometry() {
+        let password = sevenz_turbo::Password::new("fixture-key");
+        let bytes = encrypted_fixture(false, false);
+        let mut archive =
+            sevenz_turbo::Archive::read(&mut std::io::Cursor::new(&bytes), &password).unwrap();
+        let facts = container_facts(&archive).unwrap();
+        assert_eq!(facts.entries.len(), 2);
+        assert!(facts.entries.iter().all(|entry| entry.aes.is_some()));
+        let layout =
+            SevenZipLayout::build(&BTreeMap::from([(0, bytes.len() as u64)]), &facts).unwrap();
+        let slices = layout.map_physical_range(0, 0, bytes.len() as u64);
+        assert_eq!(
+            slices
+                .iter()
+                .filter_map(|slice| match slice {
+                    MappedSlice::EncryptedMember { len, .. } => Some(*len),
+                    _ => None,
+                })
+                .sum::<u64>(),
+            64
+        );
+        let mut invalid_streams = archive.clone();
+        invalid_streams.blocks[0].coders[1] = sevenz_turbo::Coder::default();
+        assert_eq!(invalid_streams.blocks[0].coders[1].num_input_streams(), 0);
+        assert_eq!(
+            container_facts(&invalid_streams),
+            Err(SevenZipRefusal::EncryptedContent)
+        );
+        let reverse = encrypted_fixture_order(false, false, true);
+        let reversed =
+            sevenz_turbo::Archive::read(&mut std::io::Cursor::new(reverse), &password).unwrap();
+        assert_eq!(
+            reversed.blocks[0].coders[0].encoder_method_id(),
+            COPY_METHOD_ID
+        );
+        assert!(container_facts(&reversed).is_ok());
+        archive.files[0].has_crc = false;
+        assert_eq!(container_facts(&archive), Err(SevenZipRefusal::Coder));
+        let solid = encrypted_fixture(true, false);
+        let archive =
+            sevenz_turbo::Archive::read(&mut std::io::Cursor::new(solid), &password).unwrap();
+        assert_eq!(archive.blocks.len(), 1);
+        assert_eq!(container_facts(&archive), Err(SevenZipRefusal::Coder));
+    }
+
+    #[test]
+    fn sevenz_aes_header_replay_reproves_reordered_candidates_and_refuses_damage() {
+        let bytes = encrypted_fixture(false, true);
+        let archive = sevenz_turbo::Archive::read(
+            &mut std::io::Cursor::new(&bytes),
+            &sevenz_turbo::Password::new("fixture-key"),
+        )
+        .unwrap();
+        let mut facts = container_facts(&archive).unwrap();
+        facts.total = bytes.len() as u64;
+        facts.header_replay = vec![(0, bytes.clone())];
+        facts.header_encrypted = true;
+        for candidates in [["wrong", "fixture-key"], ["fixture-key", "wrong"]] {
+            let admitted = restore_admission(&facts, &candidates, 1 << 20)
+                .unwrap()
+                .unwrap();
+            assert!(admitted.secret.as_str() == "fixture-key");
+        }
+        assert!(matches!(
+            restore_admission(&facts, &["wrong"], 1 << 20),
+            Err(SevenZipRefusal::EncryptedHeader)
+        ));
+        let mut damaged = facts.clone();
+        *damaged.header_replay[0].1.last_mut().unwrap() ^= 1;
+        assert!(restore_admission(&damaged, &["fixture-key"], 1 << 20).is_err());
+        let mut missing = facts.clone();
+        missing.header_replay.clear();
+        assert!(restore_admission(&missing, &["fixture-key"], 1 << 20).is_err());
+        let mut truncated = facts.clone();
+        truncated.header_replay[0].1.pop();
+        assert!(restore_admission(&truncated, &["fixture-key"], 1 << 20).is_err());
+        let mut overlapping = facts.clone();
+        overlapping.header_replay.push((1, vec![0]));
+        assert!(matches!(
+            restore_admission(&overlapping, &["fixture-key"], 1 << 20),
+            Err(SevenZipRefusal::Geometry)
+        ));
+        let mut altered_map = facts.clone();
+        altered_map.entries[0].size += 1;
+        assert!(matches!(
+            restore_admission(&altered_map, &["fixture-key"], 1 << 20),
+            Err(SevenZipRefusal::Geometry)
+        ));
+        assert_eq!(
+            normalize_replay(BTreeMap::from([(0, vec![1, 2, 3]), (2, vec![3, 4])])).unwrap(),
+            vec![(0, vec![1, 2, 3, 4])]
+        );
+        assert!(normalize_replay(BTreeMap::from([(0, vec![1, 2, 3]), (2, vec![9])])).is_err());
+    }
 
     #[test]
     fn a_one_volume_tail_is_its_own_length_not_a_second_part() {

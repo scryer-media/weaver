@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Continuation of the `impl Pipeline` block from `direct_store/wiring.rs`.
 // Split out mechanically to keep the parent file readable; no behavior lives here
 // that is not simply a method of the same type.
@@ -388,8 +391,13 @@ impl Pipeline {
                 | DemotionReason::HoldsScratchCeiling
                 | DemotionReason::HoldsScratchDiskReserve
         );
+        // A failed 7z plaintext CRC does not refute the posted ciphertext.
+        // Preserve its held bytes under the same article-CRC checks, excluding
+        // the current decode handoff so only its owner writes that article.
+        let preserve_unhanded_holds =
+            out_of_holds_room || matches!(reason, DemotionReason::SevenZipAesChecksumMismatch);
         let preserve_holds =
-            out_of_holds_room || matches!(reason, DemotionReason::Par3MemoryPressure);
+            preserve_unhanded_holds || matches!(reason, DemotionReason::Par3MemoryPressure);
         if !preserve_holds && set.router.member_partials().is_empty() {
             // Nothing was ever routed to a member, so there is nothing to
             // reconstruct *from* beyond headers. Refetching is both correct and
@@ -438,7 +446,8 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
-            // Placed bytes only, unless the demotion is for room. The provider
+            // Placed bytes only, unless room or a 7z plaintext CRC caused the
+            // demotion. The provider
             // can serve holds too, but this sweep hands the set to the
             // conventional path, whose decode handoff owns the article that
             // was routing when demotion struck and whose targeted requeue owns
@@ -446,14 +455,14 @@ impl Pipeline {
             // materialized here would be written twice and counted against a
             // completion gate nothing then clears.
             //
-            // A demotion for room keeps its holds: they are posted bytes,
+            // A room or 7z plaintext-CRC demotion keeps its holds: posted bytes,
             // checked by their own article CRCs, and fetching them again is
             // the cost the demotion exists to avoid. What it must not keep is
             // a handed-off article's range, held or placed, so that range is
             // cut out and left to its owner. A PAR3 spill keeps its holds only
             // when it starts outside a handoff, as it always has.
             let extents = set.segment_extents(*volume_index);
-            let physical_coverage = if out_of_holds_room {
+            let physical_coverage = if preserve_unhanded_holds {
                 let mut coverage = set.volume_coverage_with_holds(*volume_index);
                 for (offset, len) in handoffs
                     .iter()

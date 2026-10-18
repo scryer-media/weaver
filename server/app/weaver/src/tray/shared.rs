@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The parts of the Weaver desktop wrapper that are the same on every platform.
 //
 // Both wrappers supervise the same `weaver` server process, poll the same
@@ -10,13 +13,17 @@
     reason = "the Windows and macOS wrappers each use a subset of this module, and neither is compiled on other platforms"
 )]
 
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use weaver_server_core::runtime::{
+    log_delivery::{DeliveryGuard, LogDelivery},
+    log_file::{LogCheckpoint, LogFilePolicy, open_log_delivery},
+};
 
 // The port `weaver serve` is started on, and the port the wrapper expects the
 // UI to answer on. Users who want a different port run the server themselves;
@@ -27,25 +34,26 @@ pub(crate) const DEFAULT_PORT: u16 = 9090;
 // wrapper reports the failure to the user.
 pub(crate) const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-// How long a Unix stop waits after `SIGTERM` before escalating to `SIGKILL`.
-// The server's own graceful teardown is what needs the time here; a process
-// that ignores the signal must not be able to strand the wrapper.
+// How long a stop waits after asking the server to exit — `SIGTERM` on Unix,
+// a console Ctrl+C on Windows — before it kills the process. The server's own
+// graceful teardown is what needs the time here; a process that ignores the
+// request must not be able to strand the wrapper.
 #[cfg(unix)]
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+// Shorter on Windows, where the stop also runs inside the installer's
+// shutdown command and while the session ends, and both of those are bounded
+// by someone else.
+#[cfg(windows)]
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 // The names the wrapper and the server are installed under. Both binaries
 // ship in the same directory, which is what lets the wrapper find the server
 // without a configured path.
 #[cfg(windows)]
-const SERVER_EXECUTABLE: &str = "weaver.exe";
-
-// Size past which the captured stderr log is rotated on the next server
-// start. What lands there is sparse — a setup code, a runtime's last words —
-// so this is a bound against a server that spews, not a budget.
-const STDERR_LOG_ROTATE_BYTES: u64 = 1 << 20;
+pub(crate) const SERVER_EXECUTABLE: &str = "weaver.exe";
 
 #[cfg(windows)]
-const WRAPPER_EXECUTABLE: &str = "weaver-tray.exe";
+pub(crate) const WRAPPER_EXECUTABLE: &str = "weaver-tray.exe";
 #[cfg(not(windows))]
 const SERVER_EXECUTABLE: &str = "weaver";
 #[cfg(not(windows))]
@@ -357,6 +365,10 @@ fn post_graphql(port: u16, cookie: Option<&str>) -> Option<HttpResponse> {
 //
 // `Connection: close` is what makes reading to EOF a complete response, so
 // this needs no keep-alive framing of its own.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the tray asks the local Weaver over loopback"
+)]
 fn http_exchange(port: u16, request: &[u8], timeout: Duration) -> Option<HttpResponse> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;
@@ -725,14 +737,21 @@ pub(crate) struct ServerSupervisor {
     port: u16,
     server: Option<Child>,
     setup_code: Arc<Mutex<Option<String>>>,
-    // How long the log was when the owned server was started, so a failed
+    // The active offset and rotation sequence when the server started, so a failed
     // start is reported with its own error rather than an earlier run's.
-    log_offset: u64,
+    log_checkpoint: LogCheckpoint,
+    stderr_log: Option<(LogDelivery, DeliveryGuard)>,
+    stderr_readers: Vec<std::sync::mpsc::Receiver<()>>,
     // The owned server exited asking for a bundle relaunch, and whichever
     // path reaped it was not the supervision poll. Held until the poll
     // reports it, so a start or readiness wait that happens to reap the exit
     // first cannot turn the relaunch into an ordinary server restart.
     relaunch_pending: bool,
+    // The kill-on-close job every server this wrapper starts runs in, created
+    // with the first one and held until the wrapper exits. Closing it — by
+    // exiting, crashing or being ended — takes the server with it.
+    #[cfg(windows)]
+    job: Option<crate::windows_process::KillOnCloseJob>,
 }
 
 // Reads the server's stderr to its end. Setup codes are kept for the UI;
@@ -741,7 +760,7 @@ pub(crate) struct ServerSupervisor {
 fn forward_server_stderr(
     stderr: impl Read,
     setup_code: Arc<Mutex<Option<String>>>,
-    mut capture: Option<std::fs::File>,
+    capture: Option<LogDelivery>,
 ) {
     let mut captured = false;
     for line in BufReader::new(stderr).lines() {
@@ -753,7 +772,8 @@ fn forward_server_stderr(
             }
             continue;
         }
-        if let Some(capture) = capture.as_mut() {
+        if let Some(capture) = capture.as_ref() {
+            let mut capture = capture.make_writer();
             let _ = writeln!(capture, "{line}");
         }
         let _ = writeln!(std::io::stderr(), "{line}");
@@ -784,8 +804,12 @@ impl ServerSupervisor {
             port,
             server: None,
             setup_code: Arc::new(Mutex::new(None)),
-            log_offset: 0,
+            log_checkpoint: LogCheckpoint::default(),
+            stderr_log: None,
+            stderr_readers: Vec::new(),
             relaunch_pending: false,
+            #[cfg(windows)]
+            job: None,
         }
     }
 
@@ -812,19 +836,19 @@ impl ServerSupervisor {
         weaver_server_core::runtime::log_buffer::stderr_capture_path(&self.log_file())
     }
 
-    // Opens the stderr capture for appending, rotating it first once it has
-    // outgrown its bound. Failing to open it only loses the capture: the
-    // wrapper still starts the server.
-    fn open_stderr_log(&self) -> Option<std::fs::File> {
-        let path = self.stderr_log_file();
-        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > STDERR_LOG_ROTATE_BYTES) {
-            let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    // One writer survives child restarts; all producers share its event queue.
+    fn open_stderr_log(&mut self) -> Option<LogDelivery> {
+        if self.stderr_log.is_none() {
+            let policy = LogFilePolicy::from_env().ok()?;
+            self.stderr_log = open_log_delivery(&self.stderr_log_file(), policy, "stderr").ok();
         }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
+        self.stderr_log.as_ref().map(|(writer, _)| writer.clone())
+    }
+
+    pub(crate) fn shutdown_logging(&mut self) {
+        if let Some((_, guard)) = self.stderr_log.take() {
+            guard.shutdown_after(std::mem::take(&mut self.stderr_readers));
+        }
     }
 
     // Records how the owned server exited, next to whatever it said last.
@@ -832,11 +856,11 @@ impl ServerSupervisor {
         if is_bundle_relaunch_exit(status) {
             self.relaunch_pending = true;
         }
-        let Some(mut capture) = self.open_stderr_log() else {
+        let Some(capture) = self.open_stderr_log() else {
             return;
         };
         let _ = writeln!(
-            capture,
+            capture.make_writer(),
             "{} [wrapper] the server exited: {}",
             wrapper_timestamp(),
             describe_exit(status)
@@ -870,6 +894,7 @@ impl ServerSupervisor {
     // here — but it is also why a caller that has just torn the server down
     // must wait for the old process to disappear first.
     pub(crate) fn start(&mut self) -> Result<(), String> {
+        LogFilePolicy::from_env()?;
         match probe_port(self.port) {
             PortProbe::Weaver => return Ok(()),
             // Spawning a server here would only make it fail to bind, and the
@@ -902,7 +927,7 @@ impl ServerSupervisor {
 
         let server_executable = self.server_executable()?;
         let log_file = self.log_file();
-        self.log_offset = std::fs::metadata(&log_file).map_or(0, |metadata| metadata.len());
+        self.log_checkpoint = LogCheckpoint::capture(&log_file);
         let mut command =
             build_server_command(&server_executable, &self.profile_dir, &log_file, self.port);
         configure_server_command(&mut command);
@@ -913,21 +938,52 @@ impl ServerSupervisor {
                 server_executable.display()
             )
         })?;
+        #[cfg(windows)]
+        let contained = self.contain_in_job(&child);
         if let Some(stderr) = child.stderr.take() {
             let setup_code = self.setup_code.clone();
-            let mut capture = self.open_stderr_log();
-            if let Some(capture) = capture.as_mut() {
+            let capture = self.open_stderr_log();
+            if let Some(capture) = capture.as_ref() {
+                let mut capture = capture.make_writer();
                 let _ = writeln!(
                     capture,
                     "{} [wrapper] started the server (pid {})",
                     wrapper_timestamp(),
                     child.id()
                 );
+                // The server still runs without the job; it only loses the
+                // guarantee that it stops with the wrapper, so this is a note
+                // in the capture rather than a failed start.
+                #[cfg(windows)]
+                if let Err(error) = &contained {
+                    let _ = writeln!(capture, "{} [wrapper] {error}", wrapper_timestamp());
+                }
             }
-            thread::spawn(move || forward_server_stderr(stderr, setup_code, capture));
+            self.stderr_readers.retain(|reader| {
+                matches!(reader.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+            });
+            let (finished, completion) = std::sync::mpsc::channel();
+            self.stderr_readers.push(completion);
+            thread::spawn(move || {
+                forward_server_stderr(stderr, setup_code, capture);
+                let _ = finished.send(());
+            });
         }
         self.server = Some(child);
         Ok(())
+    }
+
+    // Put a just-spawned server in the wrapper's kill-on-close job, creating
+    // the job with the first server.
+    #[cfg(windows)]
+    fn contain_in_job(&mut self, child: &Child) -> Result<(), String> {
+        if self.job.is_none() {
+            self.job = Some(crate::windows_process::KillOnCloseJob::create()?);
+        }
+        match self.job.as_ref() {
+            Some(job) => job.assign(child),
+            None => Ok(()),
+        }
     }
 
     // Stop the server this wrapper started. A server it did not start is left
@@ -942,7 +998,7 @@ impl ServerSupervisor {
             .map_err(|error| format!("failed to check Weaver server status: {error}"))?
             .is_none()
         {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             if request_graceful_stop(&mut child)? {
                 return Ok(());
             }
@@ -1026,7 +1082,7 @@ impl ServerSupervisor {
 
     fn start_failure(&self, status: ExitStatus) -> String {
         let log_file = self.log_file();
-        let reason = last_logged_error(&log_file, self.log_offset)
+        let reason = last_logged_error(&log_file, &self.log_checkpoint)
             .unwrap_or_else(|| format!("the server exited ({status})"));
         format!(
             "Weaver could not start: {reason}\n\nThe log is at {}",
@@ -1083,22 +1139,12 @@ impl ServerSupervisor {
 // stopped the server is the last thing it wrote.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
-// The last error the server logged at or after `offset` in `log_file`.
-fn last_logged_error(log_file: &Path, offset: u64) -> Option<String> {
-    let mut file = std::fs::File::open(log_file).ok()?;
-    let len = file.metadata().ok()?.len();
-    // A log the server rotated as it opened it starts again at zero.
-    let offset = if offset > len { 0 } else { offset };
-    file.seek(SeekFrom::Start(
-        offset.max(len.saturating_sub(LOG_TAIL_BYTES)),
-    ))
-    .ok()?;
-    let mut tail = Vec::new();
-    file.read_to_end(&mut tail).ok()?;
-    String::from_utf8_lossy(&tail)
-        .lines()
-        .rev()
-        .find_map(logged_error_message)
+// Search this launch's tails even if its active log was rotated while starting.
+fn last_logged_error(log_file: &Path, checkpoint: &LogCheckpoint) -> Option<String> {
+    checkpoint
+        .tails(log_file, LOG_TAIL_BYTES as usize)
+        .iter()
+        .find_map(|tail| tail.lines().rev().find_map(logged_error_message))
 }
 
 // The message of a log line written at ERROR, without its timestamp, level
@@ -1206,6 +1252,10 @@ fn configure_server_command(command: &mut Command) {
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
     command.creation_flags(CREATE_NO_WINDOW);
+    // A tray relaunched by the upgrade helper inherits its ignore-Ctrl+C flag;
+    // clear it so the server does not inherit it and ignore its stop request.
+    // SAFETY: A null handler with FALSE only clears this process's flag.
+    unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) };
 }
 
 #[cfg(not(windows))]
@@ -1216,11 +1266,11 @@ fn configure_server_command(_command: &mut Command) {}
 // The server writes a database on every job; killing it outright is safe but
 // throws away the flush it would otherwise do, so the signal comes first and
 // the caller only escalates when this returns false.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn request_graceful_stop(child: &mut Child) -> Result<bool, String> {
-    // SAFETY: `child` is a live process this wrapper started, so its PID is
-    // still ours to signal and cannot have been recycled.
-    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    if !send_stop_request(child) {
+        return Ok(false);
+    }
 
     let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
     while Instant::now() < deadline {
@@ -1232,6 +1282,29 @@ fn request_graceful_stop(child: &mut Child) -> Result<bool, String> {
         thread::sleep(Duration::from_millis(100));
     }
     Ok(false)
+}
+
+// Ask the server to exit, and report whether the request was delivered.
+#[cfg(unix)]
+fn send_stop_request(child: &Child) -> bool {
+    // SAFETY: `child` is a live process this wrapper started, so its PID is
+    // still ours to signal and cannot have been recycled.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    true
+}
+
+// The server has a console of its own, windowless, and answers Ctrl+C on it
+// with its graceful teardown.
+#[cfg(windows)]
+fn send_stop_request(child: &Child) -> bool {
+    application_updater::windows_process::request_console_interrupt(child.id())
+}
+
+// The port in a `GetExtendedTcpTable` row. The table stores it in network
+// byte order in the low 16 bits of a `u32`, which Windows, always
+// little-endian, reads back byte-swapped.
+pub(crate) fn tcp_table_port(raw: u32) -> u16 {
+    ((raw & 0xFFFF) as u16).swap_bytes()
 }
 
 // A single-page HTTP server used only by `--webview-smoke`.
@@ -1296,9 +1369,20 @@ mod tests {
         http_origin, is_weaver_document, last_logged_error, logged_error_message,
         note_version_change, opens_in_external_browser, parse_http_response, parse_setup_code_line,
         popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
+        tcp_table_port,
     };
     #[cfg(unix)]
     use super::{RELAUNCH_PENDING_MESSAGE, ServerSupervisor, SupervisedServer};
+
+    #[test]
+    fn a_tcp_table_port_is_read_out_of_network_byte_order() {
+        // 9090 is 0x2382; the table holds the bytes 0x23 0x82, which a
+        // little-endian `u32` read gives back as 0x8223.
+        assert_eq!(tcp_table_port(0x0000_8223), 9090);
+        // Only the low 16 bits carry the port.
+        assert_eq!(tcp_table_port(0xFFFF_8223), 9090);
+        assert_eq!(tcp_table_port(0x0000_5000), 80);
+    }
 
     #[test]
     fn the_spawn_command_marks_the_server_as_tray_supervised() {
@@ -1336,6 +1420,31 @@ mod tests {
     }
 
     #[test]
+    fn stderr_forwarding_filters_secrets_across_child_restarts() {
+        use super::{LogDelivery, forward_server_stderr};
+        use std::sync::{Arc, Mutex};
+        use weaver_server_core::auth::SETUP_CODE_MARKER;
+        let (sent, received) = std::sync::mpsc::channel();
+        let (writer, guard) = LogDelivery::new("stderr-fixture", move |bytes| {
+            sent.send(bytes.to_vec()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let setup = Arc::new(Mutex::new(None));
+        for child in 0..2 {
+            let input = format!("{SETUP_CODE_MARKER}K7P-M2X\nchild {child}\n");
+            forward_server_stderr(input.as_bytes(), setup.clone(), Some(writer.clone()));
+            assert_eq!(
+                received.recv().unwrap(),
+                format!("child {child}\n").as_bytes()
+            );
+            assert_eq!(setup.lock().unwrap().as_deref(), Some("K7P-M2X"));
+        }
+        drop(guard);
+        assert!(received.recv().is_err());
+    }
+
+    #[test]
     fn desktop_profile_is_isolated_from_legacy_portable_state() {
         let local_app_data = Path::new(r"C:\\")
             .join("Users")
@@ -1362,10 +1471,12 @@ mod tests {
             "\n",
             "2026-09-11T10:00:00.200-04:00  INFO weaver: shutting down\n",
         );
+        std::fs::write(&log_file, EARLIER_RUN).unwrap();
+        let checkpoint = weaver_server_core::runtime::log_file::LogCheckpoint::capture(&log_file);
         std::fs::write(&log_file, format!("{EARLIER_RUN}{this_run}")).unwrap();
 
         assert_eq!(
-            last_logged_error(&log_file, EARLIER_RUN.len() as u64).as_deref(),
+            last_logged_error(&log_file, &checkpoint).as_deref(),
             Some(r"failed to open database (C:\Weaver\weaver.db): database is locked")
         );
     }
@@ -1375,23 +1486,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_file = dir.path().join("weaver.log");
         let this_run = "2026-09-11T10:00:00.000-04:00  INFO weaver: opening database\n";
+        std::fs::write(&log_file, EARLIER_RUN).unwrap();
+        let checkpoint = weaver_server_core::runtime::log_file::LogCheckpoint::capture(&log_file);
         std::fs::write(&log_file, format!("{EARLIER_RUN}{this_run}")).unwrap();
 
-        assert_eq!(last_logged_error(&log_file, EARLIER_RUN.len() as u64), None);
+        assert_eq!(last_logged_error(&log_file, &checkpoint), None);
     }
 
     #[test]
     fn a_log_rotated_by_the_failed_start_is_read_from_its_beginning() {
+        use std::io::Write;
+        use weaver_server_core::runtime::log_file::{LogCheckpoint, LogFilePolicy, open_log_file};
         let dir = tempfile::tempdir().unwrap();
-        let log_file = dir.path().join("weaver.log");
-        std::fs::write(
-            &log_file,
-            "2026-09-11T10:00:00.000-04:00 ERROR weaver: the port is in use\n",
+        let path = dir.path().join("weaver.log");
+        std::fs::write(&path, EARLIER_RUN).unwrap();
+        let checkpoint = LogCheckpoint::capture(&path);
+        let (writer, guard) = open_log_file(
+            &path,
+            LogFilePolicy {
+                max_bytes: 1,
+                max_files: 5,
+            },
         )
         .unwrap();
-
+        writer
+            .make_writer()
+            .write_all(b"2026-09-11T10:00:00.000-04:00 ERROR weaver: the port is in use\n")
+            .unwrap();
+        // Force the next rollover even if compression is still pending.
+        writer.make_writer().write_all(&vec![b' '; 1024]).unwrap();
+        writer
+            .make_writer()
+            .write_all(b"2026-09-11T10:00:00.100-04:00 INFO weaver: stopped\n")
+            .unwrap();
+        drop(guard);
         assert_eq!(
-            last_logged_error(&log_file, 10 * 1024 * 1024).as_deref(),
+            last_logged_error(&path, &checkpoint).as_deref(),
             Some("the port is in use")
         );
     }

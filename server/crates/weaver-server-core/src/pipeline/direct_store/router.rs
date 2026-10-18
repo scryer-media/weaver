@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The range router.
 //
 // One [`DirectSetRouter`] owns one archive set. It learns the set's stored
@@ -335,6 +338,8 @@ pub(crate) enum DemotionReason {
     PartChecksumMismatch,
     // The composed whole-member CRC32 did not match the final part's header.
     MemberChecksumMismatch,
+    // Plaintext failed its CRC; CBC still reproduces the posted ciphertext.
+    SevenZipAesChecksumMismatch,
     // Two volumes of the set disagree about the archive format.
     FormatMismatch,
     // The set's signature names a format direct-store does not route (RAR
@@ -500,7 +505,9 @@ impl DemotionReason {
             // extractor asks the job's whole password-candidate list — a
             // superset of the one direct-store is handed — and it can ask it of
             // the overlay just as well as of a file.
-            Self::EncryptedMemberRefused(_) => VolumeDemand::Virtual,
+            Self::EncryptedMemberRefused(_) | Self::SevenZipAesChecksumMismatch => {
+                VolumeDemand::Virtual
+            }
             // `-hp`: the headers themselves are sealed, so no layout was ever
             // learned and there is nothing to overlay. The volume must
             // materialize byte-exactly for the conventional extractor to open
@@ -656,6 +663,7 @@ impl DemotionReason {
             Self::UnparsableVolume => "unparsable_volume",
             Self::PartChecksumMismatch => "part_checksum_mismatch",
             Self::MemberChecksumMismatch => "member_checksum_mismatch",
+            Self::SevenZipAesChecksumMismatch => "sevenz_aes_plaintext_checksum_mismatch",
             Self::FormatMismatch => "format_mismatch",
             Self::UnsupportedFormat => "unsupported_format",
             Self::UnsafeDestination => "unsafe_destination",
@@ -2909,6 +2917,12 @@ impl DirectSetRouter {
     #[cfg(test)]
     pub(crate) fn header_candidate_count(&self) -> usize {
         self.header_crypt.candidate_count()
+    }
+
+    // The sources of this set's `-hp` candidates, in trial order.
+    #[cfg(test)]
+    pub(crate) fn header_candidate_sources(&self) -> Vec<&'static str> {
+        self.header_crypt.offered_sources()
     }
 
     // The key ring's own `Debug`, for the test that proves a password cannot

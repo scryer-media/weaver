@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Encryption at rest for credentials, including NNTP, RSS and archive passwords.
 //
 // Uses AES-256-GCM with a 32-byte master key stored in platform-native secure storage.

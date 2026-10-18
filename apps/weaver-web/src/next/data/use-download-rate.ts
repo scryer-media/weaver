@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useLiveJobDownloadRate } from "@/lib/context/live-data-context";
 import type { JobData } from "@/lib/job-types";
 
@@ -9,10 +12,6 @@ import type { JobData } from "@/lib/job-types";
  * phase, which lags it by up to a second.
  */
 export function useDownloadRate(job: Pick<JobData, "id" | "phaseProgress">): number {
-  const live = useLiveJobDownloadRate(job.id);
-  if (live !== undefined) {
-    return live ?? 0;
-  }
   const phase = job.phaseProgress.find((candidate) => candidate.phase === "DOWNLOADING");
-  return phase?.rateBps ?? 0;
+  return useLiveJobDownloadRate(job.id, phase?.rateBps ?? 0);
 }

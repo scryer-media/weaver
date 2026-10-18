@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The archive sets tier two posts, built by the matrix's synthetic stored
 // volume writers and the 7z writer.
 use super::super::super::super::sevenz_store::schedules::unrepeated_payload;

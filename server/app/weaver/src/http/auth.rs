@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use axum::Json;
 use axum::extract::{ConnectInfo, Extension};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -469,8 +472,9 @@ pub(super) async fn resolve_caller(
 // when the request carries no such token or the run it names has ended, in
 // which case the request is whatever its other credentials make it.
 //
-// Only the GraphQL endpoint asks this: the token is no credential anywhere
-// else, and it is never kept past the request it came with.
+// Only the GraphQL endpoint and the NZBGet facade ask this: the token is no
+// credential anywhere else, and it is never kept past the request it came
+// with.
 pub(super) async fn resolve_script_run(
     db: &Database,
     headers: &HeaderMap,

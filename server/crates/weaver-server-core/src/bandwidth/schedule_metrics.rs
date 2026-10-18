@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Process-local counters for the schedule evaluator.
 //
 // Action kinds, tracks, outcomes and hold reasons are closed sets held in

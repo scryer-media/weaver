@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 /**
  * Value formatting for the Next UI.
  *
@@ -50,12 +53,16 @@ export function formatRate(bytesPerSecond: number): string {
   return `${value} ${unit}`;
 }
 
+// One formatter for every count: `toLocaleString` builds a new one per call,
+// which is most of what formatting a count costs.
+const COUNT_FORMAT = new Intl.NumberFormat("en-US");
+
 /** Counts in this design are grouped and never abbreviated: `31,408`. */
 export function formatCount(value: number): string {
   if (!Number.isFinite(value)) {
     return "0";
   }
-  return Math.round(value).toLocaleString("en-US");
+  return COUNT_FORMAT.format(Math.round(value));
 }
 
 /** Chart axis labels compress instead: `40k`, `1.2M`. */

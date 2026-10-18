@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Running a script instance on request against made-up inputs.
 //
 // A test run hands the script what a real run of the instance would:

@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use async_graphql::{Schema, SchemaBuilder};
 use weaver_nntp::pool::NntpPool;
@@ -123,16 +125,6 @@ pub fn build_schema_with_backup(
         history_delete_manager.spawn_worker();
     }
 
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent("weaver/0.1")
-        .gzip(true)
-        .brotli(true)
-        .deflate(true)
-        .zstd(true)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .expect("http client build should succeed");
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
     let post_processing_executor = context.post_processing_executor.clone().unwrap_or_else(|| {
@@ -152,6 +144,12 @@ pub fn build_schema_with_backup(
         )
     });
 
+    let speed_test = weaver_server_core::speed_test::SpeedTestService::for_handle(
+        &context.handle,
+        context.config.clone(),
+        context.db.clone(),
+        context.security.rss_allow_private_network,
+    );
     let schema = apply_graphql_query_guards(Schema::build(
         QueryRoot::default(),
         MutationRoot::default(),
@@ -171,13 +169,13 @@ pub fn build_schema_with_backup(
     .data(context.update_check)
     .data(context.application_upgrade)
     .data(context.schedules)
-    .data(http_client)
     .data(context.log_buffer)
     .data(context.system_runtime)
     .data(context.nntp_pool)
     .data(replay)
     .data(history_delete_manager)
-    .data(staged_upload_manager);
+    .data(staged_upload_manager)
+    .data(speed_test);
     let schema = schema.data(post_processing_executor);
     schema.finish()
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 
 const UU_SPOOL_MIN_BYTES: usize = 64 * 1024 * 1024;
@@ -244,6 +247,7 @@ impl Pipeline {
             metrics,
             jobs: HashMap::new(),
             semantic_terminal_causes: HashMap::new(),
+            pipeline_failure_stages: HashMap::new(),
             archive_password_winners: HashMap::new(),
             job_order: Vec::new(),
             active_downloads: 0,
@@ -1492,7 +1496,8 @@ impl Pipeline {
     pub(crate) fn pause_barrier_scope(command: &SchedulerCommand) -> Option<Option<JobId>> {
         match command {
             SchedulerCommand::PauseJob { job_id, .. } => Some(Some(*job_id)),
-            SchedulerCommand::PauseAll { .. } => Some(None),
+            SchedulerCommand::PauseAll { .. }
+            | SchedulerCommand::SetSpeedTestPause { paused: true, .. } => Some(None),
             _ => None,
         }
     }

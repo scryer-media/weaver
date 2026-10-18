@@ -47,11 +47,6 @@
       "oracle": "browser"
     },
     {
-      "path": "/settings/networking/bandwidth",
-      "owner": "ui-settings-crud",
-      "oracle": "browser"
-    },
-    {
       "path": "/settings/security",
       "owner": "ui-security",
       "oracle": "browser"
@@ -79,6 +74,11 @@
     {
       "path": "/settings/networking/routes",
       "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/networking/speed",
+      "owner": "speed-test",
       "oracle": "browser"
     },
     {
@@ -169,12 +169,6 @@
       "owner": "proxy-routing",
       "oracle": "unit-only",
       "rationale": "SSH host-key trust uses the Rust SSH fixtures; this application flow uses HTTP CONNECT and SOCKS5."
-    },
-    {
-      "name": "testProxyProfile",
-      "owner": "proxy-routing",
-      "oracle": "unit-only",
-      "rationale": "The flow exercises configured-server connection tests and actual consumer traffic rather than profile-level diagnostics."
     },
     {
       "name": "resetServerDownloadQuotaUsage",
@@ -628,6 +622,11 @@
       "oracle": "browser"
     },
     {
+      "name": "setUnacceptableExtensions",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
       "name": "toggleSchedule",
       "owner": "ui-settings-crud",
       "oracle": "browser"
@@ -698,19 +697,34 @@
       "oracle": "api-metrics"
     },
     {
-      "name": "testEgressInterface",
-      "owner": "advanced-networking-egress",
+      "name": "testVia",
+      "owner": "advanced-networking-routes",
       "oracle": "api-metrics"
     },
     {
-      "name": "testProxyPool",
-      "owner": "advanced-networking-pools",
-      "oracle": "api-metrics"
+      "name": "startSpeedTest",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "cancelSpeedTest",
+      "owner": "speed-test",
+      "oracle": "browser"
     }
   ],
   "behaviors": [
     {
       "name": "proxy-ladder-fallback-and-no-host-bypass",
+      "owner": "proxy-routing",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "proxy-weaver-resolves-and-hands-the-address",
+      "owner": "proxy-routing",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "proxy-hop-holds-dns-answers-for-their-ttl",
       "owner": "proxy-routing",
       "oracle": "api-metrics"
     },
@@ -763,6 +777,41 @@
       "name": "proxy-pool-delivery-reselection",
       "owner": "advanced-networking-pool-reselection",
       "oracle": "api-metrics"
+    },
+    {
+      "name": "speed-test-route-overrides-queue-gate-and-job-agreement",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-bandwidth-run-against-cloudflare",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-leg-split-leg-down-all-down-refusal-and-compare",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-seeded-100mb-posting-plaintext-direct",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-failed-nzb-fetch",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-max-duration-deadline",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-server-quota-booking-and-refusal",
+      "owner": "speed-test",
+      "oracle": "browser"
     },
     {
       "name": "schedule-hold-and-one-shot-evaluators",

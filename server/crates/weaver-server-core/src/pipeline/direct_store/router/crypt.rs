@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Encrypted direct-store.
 //
 // An encrypted `Store` member's packed bytes are its plaintext as one
@@ -244,17 +247,20 @@ impl HeaderCryptRefusal {
 // # Why this is a candidate *list* and not the one password `KeyRing` holds
 //
 // `KeyRing` is fed `spec.password`, which is the job's *first* candidate. The
-// `-hp` gate is offered the whole harvest — `Explicit`, `NzbMeta`,
-// `FilenameConvention`, at most one each — because a set whose header key is
-// the NZB-meta password but whose spec carries an operator's guess would
-// otherwise refuse for a password that was sitting right there. The list is
-// bounded by construction at three, so the KDF work is bounded at three
-// derivations however deep the archive asks for.
+// `-hp` gate is offered the job's archive-password list — `Explicit` and
+// `Integration`, `DnzbHeader`, `NzbMeta` and `FilenameConvention`, then the
+// global `Settings` list and the password file — because a set whose header
+// key is any of the others but whose spec carries an operator's guess would
+// otherwise refuse for a password that was sitting right there. The ring does
+// not bound itself: it holds the job's whole list, which the harvest caps at
+// 80 entries across its four buckets (`MAX_ARCHIVE_PASSWORDS` and its
+// neighbours), plus the spec's password if it changes before the first parse,
+// and the KDF work here is one derivation per held candidate.
 //
 // # The password is never persisted
 //
 // It lives here, in memory, for the life of the set. A restart re-harvests the
-// candidates from the job's NZB and re-proves them; nothing is carried across.
+// candidates and re-proves them; nothing is carried across.
 pub(crate) struct HeaderKeyRing {
     // In offer order, which is the harvest's own priority order.
     candidates: Vec<HeaderPasswordCandidate>,
@@ -544,6 +550,7 @@ impl CryptTuple {
 // password demotes the set by name rather than trying to carry one across.
 pub(crate) struct KeyRing {
     password: Option<String>,
+    sevenz_password: Option<sevenz_turbo::Password>,
     // `unrar-rs`'s own KDF cache. Two members of one set nearly always
     // share a tuple, and a set with 200 members would otherwise pay 200
     // PBKDF2 runs at admission.
@@ -591,11 +598,43 @@ impl KeyRing {
     pub(crate) fn with_shared_kdf_cache(cache: std::sync::Arc<KdfCache>) -> Self {
         Self {
             password: None,
+            sevenz_password: None,
             cache,
             keys: BTreeMap::new(),
             refusal: None,
             admitted: false,
         }
+    }
+
+    pub(crate) fn set_sevenz_password(&mut self, secret: &str, password: sevenz_turbo::Password) {
+        if self.wants_password() {
+            self.set_password(Some(secret));
+            self.sevenz_password = Some(password);
+        }
+    }
+
+    pub(crate) fn admit_sevenz(
+        &mut self,
+        facts: &super::sevenz::SevenZipAesFacts,
+    ) -> Result<MemberKeys, CryptRefusal> {
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
+        }
+        let Some(password) = &self.sevenz_password else {
+            return Err(self.refuse(CryptRefusal::NoPassword));
+        };
+        let properties = facts.properties().map_err(|_| CryptRefusal::Unkeyable)?;
+        let began = std::time::Instant::now();
+        let key = properties
+            .derive_key(password, &sevenz_turbo::ArchiveLimits::default())
+            .map_err(|_| CryptRefusal::Unkeyable)?;
+        crate::runtime::perf_probe::record("direct_store.sevenz.kdf", began.elapsed());
+        self.admitted = true;
+        Ok(MemberKeys {
+            key: MemberCipherKey::Aes256(*key.as_bytes()),
+            hash_key: None,
+            iv: facts.iv,
+        })
     }
 
     // Whether the set is still willing to take a password.
@@ -820,6 +859,12 @@ pub(crate) enum MemberCryptKeying {
     // over the password and this optional per-file salt.
     Rar4 {
         salt: Option<[u8; 8]>,
+    },
+    SevenZip {
+        cycles_power: u8,
+        salt: [u8; 16],
+        salt_len: u8,
+        iv: [u8; 16],
     },
 }
 
@@ -1270,10 +1315,36 @@ impl std::fmt::Debug for MemberCrypt {
 
 impl MemberCrypt {
     pub(crate) fn new(keys: MemberKeys, keying: &MemberKeying) -> Self {
+        Self::new_keyed(keys, MemberCryptKeying::of(keying))
+    }
+
+    pub(crate) fn new_sevenz(
+        keys: MemberKeys,
+        facts: &super::sevenz::SevenZipAesFacts,
+        unpacked: u64,
+    ) -> Self {
+        let mut salt = [0; 16];
+        salt[..facts.salt.len()].copy_from_slice(&facts.salt);
+        let mut crypt = Self::new_keyed(
+            keys,
+            MemberCryptKeying::SevenZip {
+                cycles_power: facts.cycles_power,
+                salt,
+                salt_len: facts.salt.len() as u8,
+                iv: facts.iv,
+            },
+        );
+        let size = unpacked.div_ceil(AES_BLOCK) * AES_BLOCK;
+        crypt.cipher_size = Some(size);
+        crypt.tail_padding = (size - unpacked) as u8;
+        crypt
+    }
+
+    fn new_keyed(keys: MemberKeys, keying: MemberCryptKeying) -> Self {
         Self {
             iv: keys.iv,
             keys,
-            keying: MemberCryptKeying::of(keying),
+            keying,
             cipher_size: None,
             tail_padding: 0,
             edge_plain: BTreeMap::new(),
@@ -1788,6 +1859,83 @@ mod tests {
     use unrar_rs::{RarVolumeMemberEncryptionFacts, derive_rar5_material};
 
     use super::*;
+
+    #[test]
+    fn sevenz_aes_checkpoints_padding_wrong_keys_and_repair_preserve_ciphertext() {
+        let facts = super::super::sevenz::SevenZipAesFacts {
+            cycles_power: 2,
+            salt: vec![3, 7],
+            iv: [0x51; 16],
+        };
+        let length = CHECKPOINT_STRIDE as usize + 29;
+        let mut padded: Vec<_> = (0..length).map(|index| (index % 251) as u8).collect();
+        padded.resize(length.div_ceil(16) * 16, 0xA7);
+        let key = facts
+            .properties()
+            .unwrap()
+            .derive_key(
+                &sevenz_turbo::Password::new("fixture-key"),
+                &sevenz_turbo::ArchiveLimits::default(),
+            )
+            .unwrap();
+        let mut posted = padded.clone();
+        MemberCipherKey::Aes256(*key.as_bytes())
+            .encrypt_range(&facts.iv, &mut posted)
+            .unwrap();
+        for secret in ["fixture-key", "wrong-key"] {
+            let mut ring = KeyRing::new();
+            ring.set_sevenz_password(secret, sevenz_turbo::Password::new(secret));
+            let keys = ring.admit_sevenz(&facts).unwrap();
+            let mut crypt = MemberCrypt::new_sevenz(keys, &facts, length as u64);
+            let mut decoded = vec![0; posted.len()];
+            for start in (0..posted.len()).step_by(64 * 1024).rev() {
+                let end = (start + 64 * 1024).min(posted.len());
+                let preceding = if start == 0 {
+                    facts.iv
+                } else {
+                    posted[start - 16..start].try_into().unwrap()
+                };
+                decoded[start..end].copy_from_slice(&posted[start..end]);
+                assert!(crypt.decrypt_range(start as u64, &preceding, &mut decoded[start..end]));
+                crypt.retain_tail_padding(length as u64, start as u64, &decoded[start..end]);
+            }
+            if secret == "fixture-key" {
+                assert_eq!(decoded, padded);
+            } else {
+                assert_ne!(decoded, padded);
+            }
+            let mut covered = ByteRanges::new();
+            covered.insert(0, length as u64);
+            let snapshot = crypt.snapshot(false).unwrap();
+            assert_eq!(snapshot.tail_plain.len(), posted.len() - length);
+            assert!(
+                snapshot
+                    .checkpoints
+                    .iter()
+                    .any(|(at, _)| *at == CHECKPOINT_STRIDE)
+            );
+            let mut restored = MemberCrypt::new_sevenz(keys, &facts, length as u64);
+            restored.restore(&snapshot, false).unwrap();
+            let overlay = restored.cipher_facts(length as u64, &covered).unwrap();
+            let mut reproduced = decoded.clone();
+            overlay.encrypt(&facts.iv, &mut reproduced).unwrap();
+            assert_eq!(reproduced, posted);
+            let repair_at = CHECKPOINT_STRIDE - 16;
+            restored.retain_edge(repair_at, [0xFF; 16]);
+            restored.invalidate_repaired(repair_at, 16);
+            assert!(restored.preceding_block(CHECKPOINT_STRIDE).is_none());
+            assert!(restored.edge_plain(repair_at).is_none());
+            let mut fixed = posted[repair_at as usize..CHECKPOINT_STRIDE as usize].to_vec();
+            let preceding = posted[repair_at as usize - 16..repair_at as usize]
+                .try_into()
+                .unwrap();
+            assert!(restored.decrypt_range(repair_at, &preceding, &mut fixed));
+            assert_eq!(
+                fixed,
+                decoded[repair_at as usize..CHECKPOINT_STRIDE as usize]
+            );
+        }
+    }
 
     // Key equality without a `Debug` bound: [`MemberCipherKey`] deliberately
     // has none, so `assert_eq!` cannot be used on one — a key that reaches a

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Locator, Page } from "@playwright/test";
@@ -22,6 +25,21 @@ async function saveSettings(page: Page) {
   await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
 }
 
+/** A General field saves itself: do `action` and wait for its own mutation to answer without errors. */
+async function savedBy(page: Page, mutation: string, action: () => Promise<void>) {
+  const saved = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname.endsWith("/graphql")
+      && response.request().method() === "POST"
+      && response.request().postData()?.includes(`mutation ${mutation}`) === true,
+  );
+  await action();
+  const response = await saved;
+  expect(response.ok()).toBeTruthy();
+  const payload = await response.json();
+  expect(payload.errors ?? [], JSON.stringify(payload.errors ?? [])).toEqual([]);
+}
+
 async function confirmRemoval(page: Page, label: string) {
   const confirm = page.getByRole("dialog", { name: label, exact: true });
   await confirm.getByRole("button", { name: label, exact: true }).click();
@@ -43,7 +61,7 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await expect(srrdbLookup).toBeVisible();
   if (afterRestart) {
     await expect(srrdbLookup).toBeChecked();
-    await page.goto("/settings/bandwidth");
+    await page.goto("/settings/networking/egress");
     await expect(page.getByRole("spinbutton", { name: "Download ceiling", exact: true })).toHaveValue("8");
     const editor = await openSystemEgress(page);
     await expect(editor.getByRole("switch", { name: "Enforce a download quota", exact: true })).toBeChecked();
@@ -54,13 +72,13 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   }
 
   await expect(srrdbLookup).not.toBeChecked();
-  await srrdbLookup.click();
-  await expect(page.getByText("Unsaved changes", { exact: true })).toBeVisible();
-  await saveSettings(page);
+  // The switch saves as it changes; the top bar has nothing to save.
+  await savedBy(page, "UpdateSettings", () => srrdbLookup.click());
+  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
   await page.reload();
   await expect(srrdbLookup).toBeChecked();
 
-  await page.goto("/settings/bandwidth");
+  await page.goto("/settings/networking/egress");
   const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
   await ceiling.fill("8");
   await ceiling.press("Tab");
@@ -94,48 +112,93 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await expect(editor).toBeHidden();
 });
 
+test("the unacceptable extension list saves under General downloads, normalized", async ({ cleanPage: page }) => {
+  test.skip(afterRestart, "the list is put back before restart");
+  await page.goto("/settings/general");
+  const extensions = page
+    .getByRole("region", { name: "Downloads", exact: true })
+    .getByRole("textbox", { name: "Unacceptable extensions", exact: true });
+  await expect(extensions).toBeVisible();
+  const original = await extensions.inputValue();
+  try {
+    // The list saves when Enter commits it.
+    await extensions.fill("EXE, r??");
+    await savedBy(page, "SetUnacceptableExtensions", () => extensions.press("Enter"));
+    await page.reload();
+    await expect(extensions).toHaveValue("exe, r??");
+  } finally {
+    // A commit that changes nothing sends nothing, so only a changed list is put back.
+    await page.reload();
+    if ((await extensions.inputValue()) !== original) {
+      await extensions.fill(original);
+      await savedBy(page, "SetUnacceptableExtensions", () => extensions.press("Enter"));
+      await page.reload();
+    }
+    await expect(extensions).toHaveValue(original);
+  }
+});
+
 test("archive passwords and the password file save, clear and persist without echoing the list", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
   const section = page.getByRole("region", { name: "Archive passwords", exact: true });
   const list = section.getByRole("textbox", { name: "Passwords (one per line)", exact: true });
   const file = section.getByRole("textbox", { name: "Password file", exact: true });
   const clear = section.getByRole("button", { name: "Clear", exact: true });
+  // The list stays behind Edit passwords until asked for, so a shared screen never shows it.
+  const edit = section.getByRole("button", { name: "Edit passwords", exact: true });
   const passwordFile = "/data/e2e-archive-passwords.txt";
   if (afterRestart) {
     // The daemon reports only that a list is stored; the list never comes back.
     await expect(clear).toBeVisible();
+    await expect(list).toHaveCount(0);
+    await edit.click();
     await expect(list).toHaveValue("");
     await expect(file).toHaveValue(passwordFile);
     return;
   }
 
   await expect(clear).toHaveCount(0);
+  await expect(list).toHaveCount(0);
+  await edit.click();
   writeFileSync("/weaver-data/e2e-archive-passwords.txt", "fixture-password\n", { mode: 0o644 });
   await list.fill("first-secret\nsecond-secret");
+  // Leaving the box stores the list, and the box shuts.
+  await savedBy(page, "UpdateArchivePasswordSettings", () => list.blur());
+  await expect(list).toHaveCount(0);
+  await expect(clear).toBeVisible();
+  // A file picked through Browse is stored as it is picked.
   await file.click();
   const picker = page.getByRole("dialog", { name: "Password file", exact: true });
   await expect(picker).toBeVisible();
   await picker.getByRole("button", { name: "e2e-archive-passwords.txt", exact: true }).click();
-  await picker.getByRole("button", { name: "Use this file", exact: true }).click();
+  await savedBy(page, "UpdateArchivePasswordSettings", () =>
+    picker.getByRole("button", { name: "Use this file", exact: true }).click(),
+  );
   await expect(picker).toBeHidden();
   await expect(file).toHaveValue(passwordFile);
-  await saveSettings(page);
   await page.reload();
   await expect(clear).toBeVisible();
+  await expect(list).toHaveCount(0);
+  await edit.click();
   await expect(list).toHaveValue("");
   await expect(file).toHaveValue(passwordFile);
 
-  // Clearing removes the stored list on save and keeps the file.
+  // Clearing asks first, then removes the stored list and keeps the file.
   await clear.click();
-  await expect(section.getByRole("button", { name: "Keep", exact: true })).toBeVisible();
-  await saveSettings(page);
+  const confirm = page.getByRole("dialog", { name: "Clear stored passwords", exact: true });
+  await savedBy(page, "UpdateArchivePasswordSettings", () =>
+    confirm.getByRole("button", { name: "Clear", exact: true }).click(),
+  );
+  await expect(confirm).toHaveCount(0);
+  await expect(clear).toHaveCount(0);
   await page.reload();
   await expect(clear).toHaveCount(0);
   await expect(file).toHaveValue(passwordFile);
 
   // Leave a list stored for the restart stage.
+  await edit.click();
   await list.fill("third-secret");
-  await saveSettings(page);
+  await savedBy(page, "UpdateArchivePasswordSettings", () => list.blur());
   await page.reload();
   await expect(clear).toBeVisible();
 });
@@ -366,7 +429,7 @@ test("the performance profile saves the moment one is picked and keeps it", asyn
   expect(recommendedName, `unknown profile ${offered.recommended}`).toBeTruthy();
   const profile = page
     .getByRole("region", { name: "Performance", exact: true })
-    .getByRole("button", { name: "Profile", exact: true });
+    .getByRole("button", { name: "Hardware profile", exact: true });
   const unconfirmed = page.getByText("Running the recommended profile, not yet confirmed.", { exact: true });
   if (afterRestart) {
     await expect(profile).toHaveText(recommendedName);
@@ -382,7 +445,7 @@ test("the performance profile saves the moment one is picked and keeps it", asyn
   );
   await profile.click();
   await page
-    .getByRole("menu", { name: "Profile", exact: true })
+    .getByRole("menu", { name: "Hardware profile", exact: true })
     .getByRole("menuitemradio", { name: recommendedName, exact: true })
     .click();
   const response = await saved;

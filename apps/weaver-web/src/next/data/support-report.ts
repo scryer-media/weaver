@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useCallback, useState } from "react";
-import { useClient } from "urql";
+import { useClient, type Client } from "urql";
 import { JOB_SUPPORT_REPORT_QUERY } from "@/graphql/queries";
 import { saveBlobAsDownload } from "@/lib/download";
 
@@ -73,24 +76,33 @@ export function useJobSupportReport(jobId: number) {
   const client = useClient();
   const [busy, setBusy] = useState(false);
 
-  const fetchReport = useCallback(async (): Promise<SupportReport> => {
-    setBusy(true);
-    try {
-      const result = await client
-        .query<JobSupportReportResponse>(
-          JOB_SUPPORT_REPORT_QUERY,
-          { jobId },
-          { requestPolicy: "network-only" },
-        )
-        .toPromise();
-      if (result.error || !result.data?.jobSupportReport) {
-        throw new Error(result.error?.message ?? "no report");
-      }
-      return result.data.jobSupportReport;
-    } finally {
-      setBusy(false);
-    }
-  }, [client, jobId]);
+  const fetchReport = useCallback(
+    () => fetchJobSupportReport(client, jobId, setBusy),
+    [client, jobId],
+  );
 
   return { busy, fetchReport };
+}
+
+async function fetchJobSupportReport(
+  client: Client,
+  jobId: number,
+  setBusy: (busy: boolean) => void,
+): Promise<SupportReport> {
+  setBusy(true);
+  try {
+    const result = await client
+      .query<JobSupportReportResponse>(
+        JOB_SUPPORT_REPORT_QUERY,
+        { jobId },
+        { requestPolicy: "network-only" },
+      )
+      .toPromise();
+    if (result.error || !result.data?.jobSupportReport) {
+      throw new Error(result.error?.message ?? "no report");
+    }
+    return result.data.jobSupportReport;
+  } finally {
+    setBusy(false);
+  }
 }

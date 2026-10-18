@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::BTreeMap;
 use std::range::Range;
 use std::time::{Duration as StdDuration, Instant};
@@ -321,7 +324,7 @@ impl Pipeline {
     // The current global-pause origin, so every download-block refresh reports
     // a consistent Scheduled vs ManualPause kind.
     pub(crate) fn global_pause(&self) -> GlobalPause {
-        if !self.global_paused {
+        if !self.global_paused && !self.shared_state.speed_test_paused() {
             GlobalPause::Running
         } else if self.scheduled_pause {
             GlobalPause::Scheduled

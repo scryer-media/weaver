@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Renaming the members a finished job delivers.
 //
 // The PAR2 rename pass fixes *posted* filenames, which is enough when the
@@ -20,15 +23,18 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
 use weaver_nzb::delivery_rename::{DeliveredFile, PlannedRename};
 
+use crate::ingest::FileRename;
 use crate::jobs::ids::JobId;
 use crate::jobs::working_dir::OUTPUT_DIR_MARKER;
 use crate::post_processing::model::PostProcessingSettings;
+use crate::proxies::{Consumer, FetchOptions, ProxyRuntime, RoutedBody, routed_fetch};
 
 // Public release index, queried by the CRC32 of a file inside the archives.
 pub(super) const SRRDB_API_BASE: &str = "https://api.srrdb.com/v1";
@@ -49,7 +55,7 @@ const MAX_SCAN_FILES: usize = 10_000;
 
 // Everything the pass needs, resolved on the pipeline task before the move
 // worker is spawned. The worker owns no handles to pipeline state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct DeliveryNamingPlan {
     // The job's display name — the fallback rename target, and the name the
     // refusal gate judges.
@@ -62,14 +68,16 @@ pub(crate) struct DeliveryNamingPlan {
 // normalized, lowercased delivery-relative path. Both delivery routes learn
 // these from the same headers, so the map covers extraction and direct-store
 // alike without collapsing members in different directories.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct SrrdbInputs {
     pub(crate) base_url: String,
     pub(crate) crc32_by_member_path: HashMap<String, u32>,
+    // Carries the lookup over Default outbound.
+    pub(crate) proxies: Option<Arc<ProxyRuntime>>,
 }
 
 // Renames the delivery's payload when it still wears an obfuscated name.
-// Returns how many files were renamed.
+// Returns the renames applied, each with the full name it gave.
 //
 // `policy` is the unwanted extension policy the delivery was scanned under.
 // A payload it refuses, or an executable, is never named after the job.
@@ -78,7 +86,7 @@ pub(super) async fn rename_obfuscated_members(
     root: &Path,
     plan: &DeliveryNamingPlan,
     policy: &PostProcessingSettings,
-) -> u32 {
+) -> Vec<FileRename> {
     let files = {
         let root = root.to_path_buf();
         match tokio::task::spawn_blocking(move || scan_delivery(&root)).await {
@@ -89,12 +97,12 @@ pub(super) async fn rename_obfuscated_members(
                     error = %error,
                     "delivery scan worker failed; leaving delivered names as they are"
                 );
-                return 0;
+                return Vec::new();
             }
         }
     };
     if files.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     let entries: Vec<DeliveredFile<'_>> = files
@@ -107,22 +115,22 @@ pub(super) async fn rename_obfuscated_members(
     let Some(candidate) = weaver_nzb::select_rename_candidate(&entries, |name| {
         policy.unacceptable_extension_match(name).is_some()
     }) else {
-        return 0;
+        return Vec::new();
     };
     let candidate_path = entries[candidate].relative_path;
 
     let target = resolve_target_name(job_id, candidate_path, plan).await;
-    let Some(target_stem) = target else {
-        return 0;
+    let Some((target_stem, full_stem)) = target else {
+        return Vec::new();
     };
 
-    let renames = weaver_nzb::plan_renames(&entries, candidate, &target_stem);
+    let renames = weaver_nzb::plan_renames(&entries, candidate, &target_stem, &full_stem);
     if renames.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     let root = root.to_path_buf();
-    match tokio::task::spawn_blocking(move || apply_renames(job_id, &root, &renames)).await {
+    match tokio::task::spawn_blocking(move || apply_renames(job_id, &root, renames)).await {
         Ok(renamed) => renamed,
         Err(error) => {
             warn!(
@@ -130,7 +138,7 @@ pub(super) async fn rename_obfuscated_members(
                 error = %error,
                 "delivery rename worker failed; some members may keep their obfuscated names"
             );
-            0
+            Vec::new()
         }
     }
 }
@@ -139,7 +147,8 @@ pub(super) async fn rename_obfuscated_members(
 // release name when the operator enabled the lookup and it answered
 // unambiguously, the job's own display name otherwise.
 //
-// `None` means the pass refuses itself. That happens when the name it would
+// Returns the stem to write and the full name it was cleaned or shortened
+// from. `None` means the pass refuses itself. That happens when the name it would
 // write is no more readable than the one already on disk — renaming one
 // unreadable name to another helps nobody and destroys the only handle an
 // operator has for correlating the file with its post.
@@ -147,14 +156,19 @@ async fn resolve_target_name(
     job_id: JobId,
     candidate_path: &str,
     plan: &DeliveryNamingPlan,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let from_srrdb = match plan.srrdb.as_ref() {
         Some(inputs) => srrdb_target(job_id, candidate_path, inputs).await,
         None => None,
     };
 
-    let target = from_srrdb
-        .unwrap_or_else(|| crate::jobs::working_dir::sanitize_dirname(&plan.job_display_name));
+    let (target, full_name) = match from_srrdb {
+        Some(release) => (release.clone(), release),
+        None => (
+            crate::jobs::working_dir::sanitize_dirname(&plan.job_display_name),
+            plan.job_display_name.trim().to_string(),
+        ),
+    };
 
     if weaver_nzb::looks_obfuscated_for_delivery(&target) {
         debug!(
@@ -164,13 +178,15 @@ async fn resolve_target_name(
         );
         return None;
     }
-    Some(target)
+    Some((target, full_name))
 }
 
 async fn srrdb_target(job_id: JobId, candidate_path: &str, inputs: &SrrdbInputs) -> Option<String> {
     let crc32 = *inputs
         .crc32_by_member_path
         .get(&candidate_path.to_ascii_lowercase())?;
+    // The lookup leaves only on a route.
+    let proxies = inputs.proxies.as_deref()?;
 
     // The request body is the checksum and nothing else — no filename, no job
     // name, no post identity.
@@ -179,7 +195,7 @@ async fn srrdb_target(job_id: JobId, candidate_path: &str, inputs: &SrrdbInputs)
         crc32 = format!("{crc32:08x}"),
         "querying the release index for an obfuscated member's checksum"
     );
-    let release = fetch_srrdb_release(&inputs.base_url, crc32).await;
+    let release = fetch_srrdb_release(proxies, &inputs.base_url, crc32).await;
     match release.as_deref() {
         Some(release) => info!(
             job_id = job_id.0,
@@ -335,17 +351,44 @@ impl std::io::Read for SrrdbBodyReader {
     }
 }
 
-async fn fetch_srrdb_release(base_url: &str, crc32: u32) -> Option<String> {
-    let url = srrdb_search_url(base_url, crc32);
-    let client = reqwest::Client::builder()
-        .timeout(SRRDB_TIMEOUT)
-        .user_agent("weaver-srrdb/1")
-        .build()
-        .ok()?;
-    let mut response = client.get(url).send().await.ok()?;
+async fn fetch_srrdb_release(proxies: &ProxyRuntime, base_url: &str, crc32: u32) -> Option<String> {
+    // One bound however many routes are tried.
+    tokio::time::timeout(
+        SRRDB_TIMEOUT,
+        fetch_srrdb_release_on(proxies, base_url, crc32),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn fetch_srrdb_release_on(
+    proxies: &ProxyRuntime,
+    base_url: &str,
+    crc32: u32,
+) -> Option<String> {
+    let url = reqwest::Url::parse(&srrdb_search_url(base_url, crc32)).ok()?;
+    let options = FetchOptions {
+        label: "srrdb",
+        timeout: SRRDB_TIMEOUT,
+        redirects: 5,
+        user_agent: "weaver-srrdb/1",
+        https_only: false,
+        allow_private_network: proxies.allow_private_network(),
+    };
+    let mut response = routed_fetch(
+        proxies,
+        Consumer::Outbound,
+        &url,
+        &options,
+        |request, _, _| request,
+    )
+    .await
+    .ok()?;
     if !response.status().is_success() {
         return None;
     }
+    let route = response.extensions().get::<RoutedBody>().cloned();
 
     // Feed the response through a small channel into serde's reader-based
     // parser. The body is never buffered in full, and decoded bytes are counted
@@ -375,6 +418,9 @@ async fn fetch_srrdb_release(base_url: &str, crc32: u32) -> Option<String> {
             }
             Ok(None) => break,
             Err(_) => {
+                if let Some(route) = &route {
+                    route.failed();
+                }
                 drop(body_tx);
                 let _ = parse_task.await;
                 return None;
@@ -433,8 +479,8 @@ fn scan_delivery(root: &Path) -> Vec<(String, u64)> {
     files
 }
 
-fn apply_renames(job_id: JobId, root: &Path, renames: &[PlannedRename]) -> u32 {
-    let mut applied = 0u32;
+fn apply_renames(job_id: JobId, root: &Path, renames: Vec<PlannedRename>) -> Vec<FileRename> {
+    let mut applied = Vec::new();
     for rename in renames {
         let from = root.join(&rename.from);
         let to = root.join(&rename.to);
@@ -457,7 +503,11 @@ fn apply_renames(job_id: JobId, root: &Path, renames: &[PlannedRename]) -> u32 {
                     to = %rename.to,
                     "renamed an obfuscated delivered member"
                 );
-                applied += 1;
+                applied.push(FileRename {
+                    from: rename.from,
+                    to: rename.to,
+                    full_name: rename.full_to,
+                });
             }
             Err(error) => warn!(
                 job_id = job_id.0,
@@ -493,6 +543,7 @@ mod tests {
                 // the machine.
                 base_url: "http://127.0.0.1:1/v1".to_string(),
                 crc32_by_member_path: HashMap::from([(member.to_ascii_lowercase(), crc32)]),
+                proxies: Some(crate::proxies::direct_runtime()),
             }),
         }
     }
@@ -577,7 +628,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let release = fetch_srrdb_release(&base_url, 0x0a1b_2c3d).await;
+        let release =
+            fetch_srrdb_release(&crate::proxies::direct_runtime(), &base_url, 0x0a1b_2c3d).await;
         served.abort();
 
         assert_eq!(
@@ -608,7 +660,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let release = fetch_srrdb_release(&base_url, 0x0a1b_2c3d).await;
+        let release =
+            fetch_srrdb_release(&crate::proxies::direct_runtime(), &base_url, 0x0a1b_2c3d).await;
         served.abort();
 
         assert_eq!(release, None);
@@ -631,7 +684,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 3);
+        assert_eq!(renamed.len(), 3);
         assert_eq!(
             delivered_names(root.path()),
             vec![
@@ -639,6 +692,33 @@ mod tests {
                 "Silver Horizon 2024.dut.srt".to_string(),
                 "Silver Horizon 2024.mkv".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_named_after_a_cleaned_job_name_reports_the_full_name() {
+        let root = tempfile::tempdir().unwrap();
+        write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 64 * MIB);
+
+        let renamed = rename_obfuscated_members(
+            JobId(11),
+            root.path(),
+            &plan("Silver Horizon: Part 2"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
+
+        assert_eq!(
+            renamed,
+            vec![FileRename {
+                from: "Yb5drZSkNi20UCMkb.mkv".to_string(),
+                to: "Silver Horizon_ Part 2.mkv".to_string(),
+                full_name: "Silver Horizon: Part 2.mkv".to_string(),
+            }]
+        );
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Silver Horizon_ Part 2.mkv".to_string()]
         );
     }
 
@@ -655,7 +735,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Silver.Horizon.2024.1080p.mkv".to_string()]
@@ -675,7 +755,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Yb5drZSkNi20UCMkb.mkv".to_string()]
@@ -696,7 +776,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec![
@@ -722,7 +802,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 1);
+        assert_eq!(renamed.len(), 1);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Silver Horizon 2024.mkv".to_string()]
@@ -795,7 +875,7 @@ mod tests {
             "the request carries the checksum and nothing else"
         );
         assert_eq!(index.calls.load(Ordering::SeqCst), 1, "exactly one attempt");
-        assert_eq!(renamed, 2);
+        assert_eq!(renamed.len(), 2);
         assert_eq!(
             delivered_names(root.path()),
             vec![
@@ -819,7 +899,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
     }
 
     #[tokio::test]
@@ -835,7 +915,7 @@ mod tests {
             rename_obfuscated_members(JobId(9), root.path(), &plan("Silver Horizon"), &policy_off)
                 .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Yb5drZSkNi20UCMkb.exe".to_string()]
@@ -855,7 +935,7 @@ mod tests {
             rename_obfuscated_members(JobId(10), root.path(), &plan("Silver Horizon"), &policy)
                 .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Yb5drZSkNi20UCMkb.iso".to_string()]
@@ -877,8 +957,49 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 1);
+        assert_eq!(renamed.len(), 1);
         assert!(root.path().join(OUTPUT_DIR_MARKER).is_file());
         assert!(root.path().join(".hidden-scratch").is_file());
+    }
+
+    #[tokio::test]
+    async fn the_release_index_lookup_goes_through_the_outbound_proxy() {
+        use axum::Router;
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/v1/search/{query}",
+            get(|| async {
+                r#"{"results":[{"release":"Silver.Horizon.2024.1080p.WEB-DL.x264-CREW"}]}"#
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let proxy = weaver_tunnel::test_support::proxy::ProxyServerDouble::start(
+            weaver_tunnel::transport::TransportKind::HttpConnect,
+            None,
+            [(("srrdb.invalid".to_owned(), 80), origin)].into(),
+        )
+        .await;
+        let runtime = crate::proxies::outbound_only_through(
+            crate::proxies::ProxyKind::HttpConnect,
+            proxy.addr.port(),
+        );
+
+        let release = fetch_srrdb_release(&runtime, "http://srrdb.invalid/v1", 0x0a1b_2c3d).await;
+
+        assert_eq!(
+            release.as_deref(),
+            Some("Silver.Horizon.2024.1080p.WEB-DL.x264-CREW")
+        );
+        assert_eq!(
+            proxy.targets.lock().unwrap().clone(),
+            [("srrdb.invalid".to_owned(), 80)]
+        );
+        runtime.stop_all().await;
+        served.abort();
     }
 }

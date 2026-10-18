@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Mutable Windows files use identity and change-time fences between reads.
 // No retained sharing lock may prevent the next decoded article from writing.
 

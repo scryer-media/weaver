@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { useClient, useMutation, useQuery } from "urql";
 import {
   ADD_SERVER_MUTATION,
@@ -19,7 +22,7 @@ import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { RouteView } from "../../../features/networking/RouteView";
+import { speedPage } from "../../../features/networking/data";
 import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
@@ -225,6 +228,7 @@ export function ProvidersPanel() {
   const [, resetQuota] = useMutation(RESET_SERVER_DOWNLOAD_QUOTA_USAGE_MUTATION);
   const [, testConnection] = useMutation(TEST_CONNECTION_MUTATION);
   const client = useClient();
+  const navigate = useNavigate();
 
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
   const editorSession = useRef(0);
@@ -435,28 +439,32 @@ export function ProvidersPanel() {
     setEditingId("new");
   };
 
+  const editProvider = (id: number) => {
+    closeEditor();
+    setForm(null);
+    setTestResult(null);
+    setEditingId(id);
+  };
+
   const blocks: SettingsBlock[] = [
     {
       kind: "table",
       id: "servers",
       title: t("next.providers.servers"),
       note: t("next.settings.panel.serversNote"),
-      columns: "minmax(0, 1fr) 132px 190px 150px 44px",
+      columns: "minmax(0, 1.2fr) 132px minmax(0, 1fr) minmax(0, 0.8fr) 92px 208px",
+      centered: [4],
       headers: [
         t("next.providers.host"),
         t("next.providers.connections"),
         t("next.providers.transport"),
         t("next.providers.role"),
+        t("next.providers.enabled"),
         "",
       ],
       empty: t("next.providers.empty"),
       add: { label: t("next.providers.add"), onClick: addProvider },
-      onRowClick: (id) => {
-        closeEditor();
-        setForm(null);
-        setTestResult(null);
-        setEditingId(Number(id));
-      },
+      onRowClick: (id) => editProvider(Number(id)),
       rows: servers.map((server) => ({
         id: String(server.id),
         searchText: `${server.host} ${server.port} ${roleLabel(t, server)} ${transportLabel(t, server)}`,
@@ -480,6 +488,18 @@ export function ProvidersPanel() {
               onChange={(next) => void setActive(server, next)}
               label={t("next.providers.enabledAria", { host: server.host })}
             />
+          </span>,
+          <span key="actions" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
+            <SecondaryButton
+              size="compact"
+              icon="speedTest"
+              onClick={() => void navigate(speedPage(`server:${server.id}`))}
+            >
+              {t("next.networking.speed.title")}
+            </SecondaryButton>
+            <SecondaryButton size="compact" icon="edit" onClick={() => editProvider(server.id)}>
+              {t("next.common.edit")}
+            </SecondaryButton>
           </span>,
         ],
       })),
@@ -646,31 +666,27 @@ export function ProvidersPanel() {
             }),
           ],
         },
-        {
-          id: "routing",
-          title: t("next.providers.networkRoute"),
-          fields:
-            editingId === "new"
-              ? [
+        // A server's route is drawn and edited under Networking; only a new server sets something here.
+        ...(editingId === "new"
+          ? [
+              {
+                id: "routing",
+                title: t("next.providers.networkRoute"),
+                fields: [
                   {
                     id: "killSwitch",
                     label: t("next.networking.killSwitch"),
                     help: t("next.providers.killSwitchHelp"),
                     control: {
-                      kind: "toggle",
+                      kind: "toggle" as const,
                       value: values.killSwitch,
-                      onChange: (next) => patch({ killSwitch: next }),
+                      onChange: (next: boolean) => patch({ killSwitch: next }),
                     },
                   },
-                ]
-              : [],
-          body: (
-            <RouteView
-              consumer={typeof editingId === "number" ? `server:${editingId}` : undefined}
-              killSwitch={values.killSwitch}
-            />
-          ),
-        },
+                ],
+              },
+            ]
+          : []),
       ]
     : [];
 

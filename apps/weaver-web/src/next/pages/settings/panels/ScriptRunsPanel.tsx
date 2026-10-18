@@ -1,4 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import { gql, useClient } from "urql";
 import { SCRIPT_RUNS_QUERY } from "@/graphql/queries";
@@ -191,7 +194,9 @@ export function ScriptRunsPanel() {
   // screen is up, and opening the row again does not ask for it again.
   const [outputs, setOutputs] = useState<ReadonlyMap<string, RunOutput>>(new Map());
   const outputsRef = useRef(outputs);
-  outputsRef.current = outputs;
+  useLayoutEffect(() => {
+    outputsRef.current = outputs;
+  }, [outputs]);
   // Where each page starts: the first at the top, every other below the last
   // run of the one before it. Only the pages reached so far are known.
   const cursorsRef = useRef<(string | null)[]>([null]);
@@ -207,7 +212,7 @@ export function ScriptRunsPanel() {
       setError(null);
       setCopied(null);
       let index = Math.min(target, cursorsRef.current.length - 1);
-      for (;;) {
+      while (true) {
         const result = await client
           .query<{ scriptRuns: ScriptRunPage }>(
             SCRIPT_RUNS_QUERY,

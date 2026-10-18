@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Per-user Windows startup registration shared by the tray and the upgrade helper.
 //
 // The tray owns the "start Weaver when I sign in" preference, and the temporary

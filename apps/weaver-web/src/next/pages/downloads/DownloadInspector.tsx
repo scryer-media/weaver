@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
@@ -91,7 +94,7 @@ export function DownloadInspector({
   const [cancelState, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
   const [stopState, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
-  const { categories, queue } = useNextData();
+  const { categories, queue } = useNextData("categories", "queue");
   // What was just picked, shown until the queue carries it back; the daemon's
   // answer can take a refresh to arrive, and a select that snaps back to the
   // old value in the meantime reads as a refusal.

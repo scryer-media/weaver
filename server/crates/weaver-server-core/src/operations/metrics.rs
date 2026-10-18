@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -266,6 +269,11 @@ struct SpeedTracker {
     segments_downloaded: RateSeries,
     bytes_decoded: RateSeries,
     last: CurrentRates,
+    // Time spent downloading: the sum of the tick intervals in which bytes
+    // arrived. Idle and paused stretches add nothing.
+    download_time: Duration,
+    // The previous tick and the downloaded total it saw.
+    previous: Option<(Instant, u64)>,
 }
 
 impl SpeedTracker {
@@ -275,6 +283,8 @@ impl SpeedTracker {
             segments_downloaded: RateSeries::new(),
             bytes_decoded: RateSeries::new(),
             last: CurrentRates::default(),
+            download_time: Duration::ZERO,
+            previous: None,
         }
     }
 
@@ -286,6 +296,12 @@ impl SpeedTracker {
         segments_downloaded: u64,
         bytes_decoded: u64,
     ) -> CurrentRates {
+        if let Some((at, downloaded)) = self.previous
+            && bytes_downloaded > downloaded
+        {
+            self.download_time += now.saturating_duration_since(at);
+        }
+        self.previous = Some((now, bytes_downloaded));
         // The byte rate keeps its historical rounding: sub-1 B/s reads as idle.
         let download_bytes = self.bytes_downloaded.update(now, bytes_downloaded);
         let download_bytes = if download_bytes < 1.0 {
@@ -327,6 +343,8 @@ pub struct PipelineMetrics {
     // Queue depths
     pub download_queue_depth: AtomicUsize,
     pub active_downloads: AtomicUsize,
+    // Woken when `active_downloads` is published at zero after being above it.
+    pub downloads_drained: tokio::sync::Notify,
     pub active_decodes: AtomicUsize,
     // Raw article bodies waiting for decode scheduling.
     pub decode_pending: AtomicUsize,
@@ -487,6 +505,27 @@ pub struct PipelineMetrics {
 }
 
 impl PipelineMetrics {
+    // Publish the in-flight article count; waiters on a drain wake at zero.
+    pub fn set_active_downloads(&self, active: usize) {
+        let previous = self.active_downloads.swap(active, Ordering::AcqRel);
+        if active == 0 && previous != 0 {
+            self.downloads_drained.notify_waiters();
+        }
+    }
+
+    // Wait until no article is in flight. The gauge is the condition.
+    pub async fn wait_downloads_drained(&self) {
+        loop {
+            let drained = self.downloads_drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.active_downloads.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             bytes_downloaded: AtomicU64::new(0),
@@ -494,6 +533,7 @@ impl PipelineMetrics {
             bytes_committed: AtomicU64::new(0),
             download_queue_depth: AtomicUsize::new(0),
             active_downloads: AtomicUsize::new(0),
+            downloads_drained: tokio::sync::Notify::new(),
             active_decodes: AtomicUsize::new(0),
             decode_pending: AtomicUsize::new(0),
             decode_pending_bytes: AtomicU64::new(0),
@@ -870,6 +910,12 @@ impl PipelineMetrics {
         let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
         let rates = self.speed_tracker.lock().unwrap().last();
         self.snapshot_with_speed(bytes_downloaded, rates)
+    }
+
+    // How long this process has spent downloading, counted on the metrics
+    // tick: only the intervals in which bytes arrived.
+    pub fn download_time(&self) -> Duration {
+        self.speed_tracker.lock().unwrap().download_time
     }
 
     // Forget every rate sample, so a test can start the global window at a

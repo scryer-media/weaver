@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 package weaver
 
 import (
@@ -279,7 +282,7 @@ func TestWeaverReleasePhasesHaveIndependentOwnership(t *testing.T) {
 		t.Fatalf("create Weaver release phases: %v", err)
 	}
 
-	const wantPhaseCount = 45
+	const wantPhaseCount = 47
 	if len(phases) != wantPhaseCount {
 		t.Fatalf("release phase count = %d, want %d", len(phases), wantPhaseCount)
 	}

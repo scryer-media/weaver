@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { defineConfig, type Plugin, type ResolvedConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import react, { reactCompilerPreset } from "@vitejs/plugin-react";
+import babel from "@rolldown/plugin-babel";
 import { compression } from "vite-plugin-compression2";
 import path from "path";
 
@@ -219,12 +223,10 @@ export default defineConfig(({ mode }) => ({
       mode === "development" ? JSON.stringify(BACKEND_ORIGIN) : "undefined",
   },
   plugins: [
-    react({
-      babel:
-        mode === "production"
-          ? { plugins: ["babel-plugin-react-compiler"] }
-          : undefined,
-    }),
+    react(),
+    ...(mode === "production"
+      ? [babel({ presets: [reactCompilerPreset()] })]
+      : []),
     compression({
       include: /\.(js|css|svg|webmanifest|json)$/i,
       exclude: /sw\.js$/,
