@@ -2699,7 +2699,7 @@ async fn arming_stops_at_the_number_of_chase_workers() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     enable_direct_unpack(&mut pipeline);
-    let set_name = "silver_horizon.7z";
+    let set_name = "capacity.bin.gz";
     let workers = pipeline.chase_pool.current_num_threads();
 
     // Hold every chase-pool thread for the length of the assertions, so each
@@ -2725,11 +2725,16 @@ async fn arming_stops_at_the_number_of_chase_workers() {
             .expect("every chase-pool thread reports that it is held");
     }
 
-    let archive = std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
-    )
-    .unwrap();
+    // Sequential decoding enters `install` before it reads coverage. A 7z
+    // coordinator checks coverage outside the pool, so it can observe the
+    // abort and return while every chase thread is held by the barrier.
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    std::io::Write::write_all(&mut encoder, &vec![0x3b; 128 * 1024]).unwrap();
+    let archive = encoder.finish().unwrap();
+    assert!(
+        archive.len() > 64 * 1024,
+        "the committed prefix is incomplete"
+    );
     let files = vec![(set_name.to_string(), archive.clone())];
 
     // Arm one more job than there are workers, none of them ever completing.
@@ -2740,7 +2745,7 @@ async fn arming_stops_at_the_number_of_chase_workers() {
         insert_active_job(
             &mut pipeline,
             job_id,
-            rar_job_spec("Silver Horizon Capacity", &files),
+            rar_job_spec("Chase Capacity", &files),
         )
         .await;
         stop_competing_for_dispatch(&mut pipeline, job_id);
