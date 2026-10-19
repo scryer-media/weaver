@@ -31,16 +31,21 @@ impl NamespaceWriter {
     }
 
     // A member's file as it was left. Nothing on disk is touched: the file
-    // opens on the next write or read.
+    // opens on the next write or read, and counts against the job's budget
+    // as far as the tree's coverage of it reaches.
     pub(crate) fn restore_file(
         &mut self,
+        tree: &Tree,
         node: NodeId,
         member: MemberId,
-        output_name: &str,
         state: FileState,
     ) -> Result<(), WriteError> {
+        let Some(record) = tree.namespace(node).and_then(|found| found.get(member)) else {
+            return Ok(());
+        };
         if state.has_file {
-            self.leaf(node, member, output_name)?;
+            self.leaf(node, member, &record.output_name)?;
+            self.caps.restore(tree, node, member);
         }
         if let Some(why) = state.refused {
             self.files_mut(node).refused.insert(member, why);

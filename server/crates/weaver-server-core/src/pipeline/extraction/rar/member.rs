@@ -1661,6 +1661,7 @@ mod tests {
                 max_member_bytes: 16 * GIB,
                 max_entries: 16,
                 max_ratio: 1,
+                ratio_floor_bytes: 1 << 30,
                 max_seconds: 60,
                 min_free_bytes: 0,
                 max_memory_bytes: 4 * GIB,

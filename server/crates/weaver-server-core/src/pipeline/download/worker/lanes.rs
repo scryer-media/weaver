@@ -1116,10 +1116,11 @@ impl Pipeline {
             }
         }
 
+        let parks = self.requeue_parks(&work);
         if let Some(state) = self.jobs.get_mut(&job_id)
             && !is_terminal_status(&state.status)
         {
-            if work.is_recovery && !work.completion_critical {
+            if parks {
                 state.recovery_queue.push(work);
             } else {
                 state.download_queue.push(work);

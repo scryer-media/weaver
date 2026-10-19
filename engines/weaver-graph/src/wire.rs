@@ -63,6 +63,7 @@ enum WhyMirror {
     HoldsBreached,
     Unsupported,
     Unmapped,
+    TooDeep,
 }
 through!(Why, WhyMirror);
 

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use weaver_graph::{Member, MemberId, NodeId, Tree};
+use weaver_graph::{Member, MemberId, NodeId, Tree, Why};
 
 use crate::jobs::model::JobStatus;
 use crate::post_processing::model::PipelineFailureStage;
@@ -122,7 +122,9 @@ pub(crate) fn refused<'c>(
 // unpacked from: those are the bytes the repair could not rebuild. A
 // volume of an object refused after announcing a member it never closed is
 // delivered as it stands, never whole, however clean its bytes: the object
-// failed, not the post.
+// failed, not the post. A member given back for a reason that withholds it
+// (`Why::withholds`) delivered nothing: its bytes are a container nothing
+// opened, neither whole nor short, and stay as they stand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delivery {
     pub(crate) whole: Vec<String>,
@@ -132,26 +134,43 @@ pub(crate) struct Delivery {
     // A recovery object that covers them could not rebuild them. Left as
     // they stand, and not a delivery.
     pub(crate) unrepaired: Vec<String>,
+    // Given back withheld, with the reason its object refused it.
+    pub(crate) withheld: Vec<(String, Why)>,
+    // Every file delivered, whole or as it stands, as the walk met it.
+    pub(crate) files: Vec<Delivered>,
+}
+
+// One file the job hands over, under the name the tree placed it at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Delivered {
+    pub(crate) name: String,
+    // The name the member wanted before the tree placed it.
+    pub(crate) from: String,
+    pub(crate) depth: u32,
+    pub(crate) whole: bool,
 }
 
 impl Delivery {
     // `payload` picks the root members that are the post's files,
     // `furniture` the names whose state never decides a job, and `failed`
     // the recovery objects whose repair could not rebuild what they found.
-    // `unmapped` picks the members given back by an object refused after
-    // announcing a member it never closed, or for never placing any.
+    // `left_open` picks the members given back by an object refused after
+    // announcing a member it never closed, and `refused` says why an object
+    // gave a member back.
     pub(crate) fn read(
         tree: &Tree,
         payload: impl Fn(MemberId) -> bool,
         furniture: impl Fn(&str) -> bool,
         failed: impl Fn(NodeId) -> bool,
-        unmapped: impl Fn(NodeId, MemberId) -> bool,
+        left_open: impl Fn(NodeId, MemberId) -> bool,
+        refused: impl Fn(NodeId, MemberId) -> Option<Why>,
     ) -> Self {
         let mut walk = Walk {
             tree,
             furniture: &furniture,
             failed: &failed,
-            unmapped: &unmapped,
+            left_open: &left_open,
+            refused: &refused,
             opened: BTreeSet::new(),
             delivery: Self::default(),
         };
@@ -163,20 +182,59 @@ impl Delivery {
         walk.delivery
     }
 
-    // How a job that has nothing left to wait for ends: complete when every
-    // file it hands over is whole, partial while anything is delivered
-    // beside what is short, and failed, for `failure`, when the only files
-    // are ones a recovery object could not rebuild.
+    // How a job that has nothing left to wait for ends: complete when
+    // nothing it hands over is short or withheld, partial when some file is
+    // whole beside what is not, and failed when nothing is whole, for
+    // `failure` when a recovery object could not rebuild what it found, and
+    // otherwise for what was withheld.
     pub(crate) fn status(&self, failure: Option<&str>) -> JobStatus {
-        if self.damaged.is_empty() && self.unrepaired.is_empty() {
+        if self.damaged.is_empty() && self.unrepaired.is_empty() && self.withheld.is_empty() {
             return JobStatus::Complete;
         }
-        match failure {
-            Some(error) if self.whole.is_empty() && self.damaged.is_empty() => JobStatus::Failed {
-                error: error.to_string(),
-            },
-            _ => JobStatus::Partial,
+        if !self.whole.is_empty() {
+            return JobStatus::Partial;
         }
+        let error = match failure
+            .map(str::to_string)
+            .or_else(|| self.withheld_error())
+        {
+            Some(error) => error,
+            None => {
+                let short: Vec<&str> = self
+                    .damaged
+                    .iter()
+                    .chain(&self.unrepaired)
+                    .map(String::as_str)
+                    .collect();
+                format!(
+                    "no file was delivered whole; {} short: {}",
+                    short.len(),
+                    short.join(", ")
+                )
+            }
+        };
+        JobStatus::Failed { error }
+    }
+
+    // What was withheld, worded by why its object refused it: the names
+    // one reason withheld, then the reason, for each reason in the order
+    // the walk met it. `None` when nothing was.
+    pub(crate) fn withheld_error(&self) -> Option<String> {
+        let mut reasons: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (name, why) in &self.withheld {
+            let reason = withheld_because(*why);
+            match reasons.iter_mut().find(|(seen, _)| *seen == reason) {
+                Some((_, names)) => names.push(name),
+                None => reasons.push((reason, vec![name])),
+            }
+        }
+        (!reasons.is_empty()).then(|| {
+            reasons
+                .iter()
+                .map(|(reason, names)| format!("{} {reason}", names.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
     }
 
     // The stage a short delivery names as the one that left it short: the
@@ -195,7 +253,8 @@ struct Walk<'t, F, R> {
     tree: &'t Tree,
     furniture: &'t F,
     failed: &'t R,
-    unmapped: &'t dyn Fn(NodeId, MemberId) -> bool,
+    left_open: &'t dyn Fn(NodeId, MemberId) -> bool,
+    refused: &'t dyn Fn(NodeId, MemberId) -> Option<Why>,
     // Every volume of a set opens the same namespace; it is read once.
     opened: BTreeSet<NodeId>,
     delivery: Delivery,
@@ -211,23 +270,42 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId) -> bool> Walk<'_, F, R> {
             Some((child, _)) => self.namespace(child, short),
             None => {
                 if !(self.furniture)(&member.output_name) {
-                    let into = match Claim::of(member) {
-                        Claim::Complete if !(self.unmapped)(node, member.id) => {
-                            &mut self.delivery.whole
-                        }
-                        Claim::Complete => &mut self.delivery.damaged,
-                        _ if short || self.unrepaired(node, member) => {
-                            &mut self.delivery.unrepaired
-                        }
-                        Claim::Damaged { .. } | Claim::Missing { .. } => &mut self.delivery.damaged,
-                    };
-                    into.push(member.output_name.clone());
+                    self.leaf(node, member, short);
                 }
                 for kept in tree.kept(node, member.id) {
                     self.namespace(kept, short);
                 }
             }
         }
+    }
+
+    // A file of the delivery. Short where a failed repair covers it, it is
+    // unrepaired, since that is what left it so; given back for a reason
+    // that withholds it, it is withheld; and otherwise it is whole or
+    // delivered as it stands.
+    fn leaf(&mut self, node: NodeId, member: &Member, short: bool) {
+        let claim = Claim::of(member);
+        let name = member.output_name.clone();
+        if claim != Claim::Complete && (short || self.unrepaired(node, member)) {
+            self.delivery.unrepaired.push(name);
+            return;
+        }
+        if let Some(why) = (self.refused)(node, member.id).filter(|why| why.withholds()) {
+            self.delivery.withheld.push((name, why));
+            return;
+        }
+        let whole = claim == Claim::Complete && !(self.left_open)(node, member.id);
+        let delivery = &mut self.delivery;
+        match whole {
+            true => delivery.whole.push(name.clone()),
+            false => delivery.damaged.push(name.clone()),
+        }
+        delivery.files.push(Delivered {
+            name,
+            from: member.name.clone(),
+            depth: self.tree.depth(node),
+            whole,
+        });
     }
 
     fn namespace(&mut self, node: NodeId, short: bool) {
@@ -271,6 +349,18 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId) -> bool> Walk<'_, F, R> {
                     .recovery(object)
                     .is_some_and(|recovery| recovery.covers(member.id))
         })
+    }
+}
+
+// Why a member was withheld, as a job's error words it after its names. A
+// password the object needed is one reason, whether it shut the member's
+// bytes or the headers naming them.
+fn withheld_because(why: Why) -> &'static str {
+    match why {
+        Why::Encrypted | Why::EncryptedHeader => "needs a password and none was given",
+        Why::Compressed => "is compressed and no engine reads it",
+        Why::Unmapped => "never placed every member it named",
+        _ => "was refused",
     }
 }
 

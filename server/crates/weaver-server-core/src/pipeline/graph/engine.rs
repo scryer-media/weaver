@@ -156,6 +156,14 @@ impl Runs {
         self.runs.contains_key(&node)
     }
 
+    // Whether the node's run is waiting for a slot, waiting for memory, or
+    // running: it may still announce members, or close them.
+    pub(crate) fn reading(&self, node: NodeId) -> bool {
+        self.runs
+            .get(&node)
+            .is_some_and(|run| !matches!(run.life, Life::Ended { .. }))
+    }
+
     // The resident bytes reserved for the node's run.
     #[cfg(test)]
     pub(crate) fn reserved(&self, node: NodeId) -> u64 {

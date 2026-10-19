@@ -102,6 +102,29 @@ pub enum Why {
     // never placed every member it named: its map never came, or never
     // closed what it announced.
     Unmapped,
+    // The object would sit deeper than a job's namespaces may nest. What
+    // the member holds is the container, delivered as it is.
+    TooDeep,
+}
+
+impl Why {
+    // Whether a member given back for this reason is withheld rather than
+    // delivered: its bytes are a container nothing opened, not the output.
+    // A member given back for any other reason is a file, its bytes the
+    // output as they stand.
+    pub fn withholds(self) -> bool {
+        match self {
+            Why::Encrypted | Why::EncryptedHeader | Why::Compressed | Why::Unmapped => true,
+            Why::TailUnreachable
+            | Why::UnboundedEntry
+            | Why::NotAFile
+            | Why::Unrepairable
+            | Why::FirstBytesLost
+            | Why::HoldsBreached
+            | Why::Unsupported
+            | Why::TooDeep => false,
+        }
+    }
 }
 
 // What a child says back when bytes arrive.
@@ -144,4 +167,35 @@ pub enum Emit {
     NeedsEngine(Why),
     // "Nothing here can read this; make it a plain file."
     Refuse(Why),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Why;
+
+    #[test]
+    fn a_refusal_withholds_its_member_only_when_the_bytes_are_not_the_output() {
+        let withheld = [
+            Why::Encrypted,
+            Why::EncryptedHeader,
+            Why::Compressed,
+            Why::Unmapped,
+        ];
+        let delivered = [
+            Why::TailUnreachable,
+            Why::UnboundedEntry,
+            Why::NotAFile,
+            Why::Unrepairable,
+            Why::FirstBytesLost,
+            Why::HoldsBreached,
+            Why::Unsupported,
+            Why::TooDeep,
+        ];
+        for why in withheld {
+            assert!(why.withholds(), "{why:?}");
+        }
+        for why in delivered {
+            assert!(!why.withholds(), "{why:?}");
+        }
+    }
 }

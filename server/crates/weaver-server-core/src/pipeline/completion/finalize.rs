@@ -4,6 +4,10 @@
 use super::*;
 
 const MAX_NESTED_EXTRACTION_DEPTH: u32 = 3;
+// The deepest a graph job's namespaces may nest: the ten-deep chain the
+// one-engine plan delivers, with headroom. A child bound below it is
+// refused, and the job fails naming depth.
+pub(in crate::pipeline) const MAX_GRAPH_NESTING_DEPTH: u32 = 16;
 const MAX_CONCURRENT_REPAIRS: usize = 1;
 
 #[derive(Debug, Clone)]

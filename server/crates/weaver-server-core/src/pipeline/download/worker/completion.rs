@@ -116,36 +116,16 @@ impl Pipeline {
         exclude_servers: Vec<usize>,
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let file_idx = segment_id.file_id.file_index as usize;
-        let completion_critical = self.segment_is_completion_critical(segment_id);
+        // Built as a retry is: park/restore drops any rotation hint, which
+        // is advisory, and the next transport failure recomputes it.
+        let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
+            return false;
+        };
+        let parks = self.requeue_parks(&work);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return false;
         };
-        let Some(file_spec) = state.spec.files.get(file_idx) else {
-            return false;
-        };
-        let Some(seg_spec) = file_spec
-            .segments
-            .iter()
-            .find(|seg| seg.ordinal == segment_id.segment_number)
-        else {
-            return false;
-        };
-        let work = DownloadWork {
-            segment_id,
-            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
-            priority: file_spec.role.download_priority(),
-            byte_estimate: seg_spec.bytes,
-            retry_count,
-            is_recovery: file_spec.role.is_recovery(),
-            completion_critical,
-            exclude_servers,
-            // Park/restore drops any rotation hint: it is advisory, and the
-            // next transport failure recomputes it.
-            avoid_server: None,
-        };
-        if work.is_recovery && !work.completion_critical {
+        if parks {
             state.recovery_queue.push(work);
         } else {
             state.download_queue.push(work);

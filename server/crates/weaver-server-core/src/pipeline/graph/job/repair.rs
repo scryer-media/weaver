@@ -45,7 +45,8 @@ impl GraphJob {
         {
             walked = Some(node);
             self.announce_absent(node)?;
-            if !self.due(node) {
+            let due = self.due(node);
+            if due.is_empty() {
                 continue;
             }
             let mut out = Vec::new();
@@ -54,6 +55,7 @@ impl GraphJob {
                 &mut *self.builder,
                 &self.root,
                 node,
+                &due,
                 &mut out,
             )?;
             for (recovery, _) in outcomes {
@@ -65,7 +67,8 @@ impl GraphJob {
         Ok(())
     }
 
-    // A recovery object that has not ruled rules once every member it
+    // The namespace's recovery objects due to rule, each judged alone. A
+    // recovery object that has not ruled rules once every member it
     // covers is closed and the namespace has announced every member it
     // will get, since a volume of its own may still be on its way behind
     // them; one waiting on recovery bytes rules again once more of its
@@ -74,12 +77,13 @@ impl GraphJob {
     // volume of its own is in: a verdict on nothing would read as settled
     // to every member beside it, and a member it binds after would never
     // be repaired before an engine reads it.
-    fn due(&self, node: NodeId) -> bool {
+    fn due(&self, node: NodeId) -> Vec<NodeId> {
         let tree = &self.tree;
         let Some(namespace) = tree.namespace(node) else {
-            return false;
+            return Vec::new();
         };
-        tree.recovery_nodes(node).into_iter().any(|recovery_node| {
+        let mut due = tree.recovery_nodes(node);
+        due.retain(|&recovery_node| {
             let Some(recovery) = tree.recovery(recovery_node) else {
                 return false;
             };
@@ -98,7 +102,8 @@ impl GraphJob {
                 }
                 Some(_) => false,
             }
-        })
+        });
+        due
     }
 
     fn closed_volumes(&self, recovery: NodeId) -> usize {
@@ -119,7 +124,7 @@ impl GraphJob {
                 .values()
                 .all(|member| self.closed_in(parent, *member))
         });
-        volumes_in && !self.runs.has(node)
+        volumes_in && !self.runs.reading(node)
     }
 
     // Everything the namespace will get is in: every member is announced,
@@ -178,7 +183,8 @@ impl GraphJob {
     // was bound in. A leaf that is itself a refused member refuses nothing
     // more, so a refusal stops where the damage first had no cover. An
     // object that never placed every member it named is refused the same
-    // way, since what it holds would otherwise ship as nothing. The root
+    // way, since what it holds would otherwise ship as nothing, and so is
+    // one still asking for a password the job has none left to give. The root
     // came out of no object, and keeps its damaged leaves. Asked only once
     // every run is started, since a repair's bytes reach a namespace below
     // by its run reading them again. Parents come first, and a refusal
@@ -194,6 +200,8 @@ impl GraphJob {
             }
             let why = if self.unrepaired(node) {
                 Why::Unrepairable
+            } else if self.passwords.unanswered(node) {
+                Why::EncryptedHeader
             } else if self.unmapped(node) {
                 Why::Unmapped
             } else {

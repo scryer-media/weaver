@@ -22,7 +22,7 @@ mod summary;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
@@ -31,21 +31,20 @@ use weaver_graph::{Kind, MemberId, Namespace, NodeId};
 use super::job::GraphJob;
 use super::root::phase::RootPhase;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::extraction::ExtractionFailure;
 
+#[cfg(test)]
+pub(crate) use claims::Delivered;
 pub(crate) use claims::Delivery;
 pub(in crate::pipeline) use seams::advance;
 pub(crate) use slots::RepairSlots;
 pub(crate) use summary::{RecoverySummary, SetSummary};
 
-use crate::jobs::ids::JobId;
-
 // The pipeline's part of graph status: the repair slots every graph job
-// shares, and what each job's recovery objects said when it last advanced,
-// for the readers that hold the pipeline only to look.
+// shares.
 #[derive(Debug, Default)]
 pub(crate) struct GraphStatus {
     pub(crate) repairs: RepairSlots,
-    pub(crate) summaries: HashMap<JobId, RecoverySummary>,
 }
 
 // What status reads of a graph job and the one thing it asks of it.
@@ -59,6 +58,8 @@ pub(crate) trait RootJob {
     fn repair(&mut self) -> Vec<RepairOutcome>;
     // An object below the root produced members.
     fn unpacked(&self) -> bool;
+    // The breach of the job's extraction budget, once one stands.
+    fn refusal(&self) -> Option<&ExtractionFailure>;
 }
 
 // The job's own seams. GraphJob repairs inside its article path, once the
@@ -108,15 +109,15 @@ impl RootJob for GraphJob {
             .filter_map(|(node, member)| tree.namespace(*node)?.get(*member))
             .map(|member| member.output_name.clone())
             .collect();
-        RecoverySummary { sets, unusable }
+        RecoverySummary {
+            sets,
+            unusable,
+            forming: self.recovery_may_form(),
+        }
     }
 
     fn repair(&mut self) -> Vec<RepairOutcome> {
-        RootJob::recovery_summary(self)
-            .sets
-            .into_iter()
-            .map(|set| set.outcome.unwrap_or(RepairOutcome::Waiting))
-            .collect()
+        RootJob::recovery_summary(self).outcomes()
     }
 
     fn unpacked(&self) -> bool {
@@ -126,6 +127,10 @@ impl RootJob for GraphJob {
                 .and_then(|(child, _)| tree.namespace(child))
                 .is_some_and(|namespace| !namespace.is_empty())
         })
+    }
+
+    fn refusal(&self) -> Option<&ExtractionFailure> {
+        self.writer().refusal()
     }
 }
 
@@ -156,7 +161,6 @@ pub(crate) fn drive(
             return Step::Wait;
         };
         let outcomes = job.repair();
-        metrics::repaired(&summary, &outcomes);
         // The job ends at the first object that could not rebuild what it
         // found, as it did when that failed it: blocks another object still
         // waits on are not held for.
@@ -173,16 +177,37 @@ pub(crate) fn drive(
     }
 }
 
+// What the job's repair came to once every object has ruled: the slices
+// its objects rebuilt, when at least one rebuilt any and none fell short.
+// One still waiting has not ruled, and one that could not rebuild means the
+// repair did not hold, whatever the others did.
+pub(crate) fn repaired_slices(outcomes: &[RepairOutcome]) -> Option<u32> {
+    let mut repaired: Option<u64> = None;
+    for outcome in outcomes {
+        match outcome {
+            RepairOutcome::Waiting | RepairOutcome::Impossible { .. } => return None,
+            RepairOutcome::Repaired { slices } => {
+                repaired = Some(repaired.unwrap_or(0).saturating_add(*slices));
+            }
+            RepairOutcome::Clean => {}
+        }
+    }
+    repaired.map(|slices| u32::try_from(slices).unwrap_or(u32::MAX))
+}
+
 // The objects that could not rebuild what they found, and that failure
 // worded as a recovery failure reads today, unless another object of its
 // namespace vouched for that namespace and left no damage in it: an object
 // that only checks never overrules one that repaired, but a repair of one
 // set never excuses another's. Each set is judged in the namespace it lives
-// in, at whatever depth.
+// in, at whatever depth. A breach of the job's extraction budget fails the
+// job before any of that: it carries the budget's refusal, worded as the
+// job's failure reason, and names no object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Failure {
     pub(crate) objects: Vec<NodeId>,
     pub(crate) message: String,
+    pub(crate) rejection: Option<ExtractionFailure>,
 }
 
 pub(crate) fn failure(
@@ -190,6 +215,13 @@ pub(crate) fn failure(
     outcomes: &[RepairOutcome],
     job: &dyn RootJob,
 ) -> Option<Failure> {
+    if let Some(rejection) = job.refusal() {
+        return Some(Failure {
+            objects: Vec::new(),
+            message: rejection.job_failure_reason(),
+            rejection: Some(rejection.clone()),
+        });
+    }
     let ruled: Vec<(&SetSummary, RepairOutcome)> =
         summary.sets.iter().zip(outcomes.iter().copied()).collect();
     let excused = |set: &SetSummary| {
@@ -235,6 +267,7 @@ pub(crate) fn failure(
     Some(Failure {
         objects: failed.iter().map(|(set, _, _)| set.node).collect(),
         message,
+        rejection: None,
     })
 }
 

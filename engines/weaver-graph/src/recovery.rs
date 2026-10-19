@@ -43,6 +43,21 @@ pub enum RepairOutcome {
     Waiting,
 }
 
+// One recovery set an object holds, as its last repair left it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetRuling {
+    // The set's own identifier as its format spells it, in lowercase hex.
+    pub id: String,
+    pub slice_size: u64,
+    pub blocks_reachable: u64,
+    pub damaged_slices: u64,
+    // `None` until the set has ruled on the members bound now.
+    pub outcome: Option<RepairOutcome>,
+    // The ruling read member bytes back; a clean one that did not was
+    // vouched for by the evidence fed as bytes passed.
+    pub read: bool,
+}
+
 // The namespace's face toward a recovery object: read a member's bytes and
 // write repaired ones. Positional, in member coordinates. The namespace
 // resolves where the bytes actually live through the owner's inverse map.
@@ -104,6 +119,10 @@ pub trait Recovery {
     // after a bind changed which members this object covers: the verdict
     // was on other members.
     fn outcome(&self) -> Option<RepairOutcome>;
+
+    // Each set the object holds, in the order it repairs them. An object
+    // with no sets of its own to name says nothing.
+    fn sets(&self, _out: &mut Vec<SetRuling>) {}
 
     // Recovery blocks reachable right now, for health and for the
     // impossible verdict. A lost recovery article lowers it.

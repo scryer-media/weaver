@@ -1784,6 +1784,8 @@ impl Pipeline {
         let completion_critical =
             work.completion_critical || self.segment_is_completion_critical(segment_id);
         let promoted_recovery = work.is_recovery && completion_critical;
+        // Not promoted, so nothing waits on it: `work`'s own flag says so.
+        let parks = !promoted_recovery && self.requeue_parks(&work);
         let mark_rar_unlock_dirty =
             !promoted_recovery && self.rar_unlock_requeued_work_is_relevant(&work);
         if let Some(state) = self.jobs.get_mut(&job_id) {
@@ -1792,7 +1794,7 @@ impl Pipeline {
                 work.priority = crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY;
                 work.completion_critical = true;
                 state.download_queue.push(work);
-            } else if work.is_recovery {
+            } else if parks {
                 state.recovery_queue.push(work);
             } else {
                 state.download_queue.push(work);

@@ -8,6 +8,7 @@ use weaver_graph::recovery::{Recovery, SliceVerdict};
 use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, Seek};
 
 use super::*;
+use crate::pipeline::graph::lines::Lines;
 
 mod streams;
 mod windows;
@@ -187,6 +188,7 @@ struct Build {
     par: Arc<Mutex<Seen>>,
     fix: Option<Fix>,
     inner: u64,
+    heard: Arc<Mutex<Vec<u64>>>,
 }
 
 impl Builder for Build {
@@ -197,7 +199,7 @@ impl Builder for Build {
                 length: self.inner,
             })),
             Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
-            Kind::Xz => Some(Box::new(streams::Decoded)),
+            Kind::Xz => Some(Box::new(streams::Decoded::new(Arc::clone(&self.heard)))),
             Kind::Par2 => Some(Box::new(Par {
                 volume: None,
                 others: Vec::new(),
@@ -328,14 +330,17 @@ impl Recovery for Par {
             .fix
             .and_then(|fix| namespace.find_by_name(fix.name))
             .map(|member| member.id);
-        self.others = namespace
-            .members()
-            .filter(|member| member.name.starts_with("other."))
-            .map(|member| member.id)
-            .collect();
         let recognised: Vec<MemberId> = namespace
             .members()
             .filter(|member| member.name == "3f9a.bin" && member.coverage.bytes_covered() > 0)
+            .map(|member| member.id)
+            .collect();
+        // What it does not describe, and the obfuscated member until its
+        // bytes say what it is.
+        self.others = namespace
+            .members()
+            .filter(|member| member.name.starts_with("other.") || member.name == "3f9a.bin")
+            .filter(|member| !recognised.contains(&member.id))
             .map(|member| member.id)
             .collect();
         for member in recognised {
@@ -397,6 +402,9 @@ struct Job {
     fix: Option<Fix>,
     // The length of the member the pretend store holds.
     inner: u64,
+    // What every pretend stream had been delivered each time it heard its
+    // volume closed.
+    heard: Arc<Mutex<Vec<u64>>>,
     out: Vec<Effect>,
 }
 
@@ -418,6 +426,7 @@ impl Job {
             par: Arc::new(Mutex::new(Seen::default())),
             fix: None,
             inner: 5,
+            heard: Arc::default(),
             out: Vec::new(),
         }
     }
@@ -490,6 +499,7 @@ impl Job {
             par: Arc::clone(&self.par),
             fix: self.fix,
             inner: self.inner,
+            heard: Arc::clone(&self.heard),
         }
     }
 
@@ -705,6 +715,7 @@ fn damaged_bytes_are_written_and_marked_and_a_repair_overwrites_them() {
     );
 
     let mut build = job.build();
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
     let outcomes = job
         .writer
         .repair(
@@ -712,6 +723,7 @@ fn damaged_bytes_are_written_and_marked_and_a_repair_overwrites_them() {
             &mut build,
             &Source,
             NodeId::ROOT,
+            &due,
             &mut job.out,
         )
         .expect("repair");
@@ -1058,5 +1070,83 @@ fn bytes_the_source_has_no_checksums_for_are_checked_as_they_are_in_hand() {
                 verified: false,
             },
         ]
+    );
+}
+
+// A binding is said once, by the object's node and kind, over the member's
+// name, at the member's depth.
+#[test]
+fn a_store_bound_over_a_member_logs_object_bound() {
+    let (lines, _guard) = Lines::capture();
+    let mut job = Job::new(PLENTY);
+    let (_, child) = bound_store(&mut job);
+    assert_eq!(
+        lines.of("object bound"),
+        [format!(
+            "object bound job_id=1 node={} kind=rar_store over=pack.bin depth=0",
+            child.0
+        )]
+    );
+}
+
+// A member given back is said once, with the object that gave it back and
+// why; one no object held names none.
+#[test]
+fn a_member_given_back_logs_object_refused() {
+    let (lines, _guard) = Lines::capture();
+    let mut job = Job::new(PLENTY);
+    let (_, child) = bound_store(&mut job);
+    let mut build = job.build();
+    job.writer
+        .said(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            child,
+            Emit::Refuse(Why::Compressed),
+            &mut job.out,
+        )
+        .expect("refuse");
+    assert_eq!(
+        lines.of("object refused"),
+        ["object refused job_id=1 node=0 kind=rar_store member=pack.bin why=compressed"]
+    );
+
+    let (lines, _guard) = Lines::capture();
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 4,
+        scratch_total: 0,
+        scratch_ceiling: 0,
+        disk_reserve: 0,
+    });
+    let member = job.member("notes.bin", None);
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 10, b"tail..", Provenance::Fresh);
+    job.send(member, 2, b"r! mid.", Provenance::Fresh);
+    assert_eq!(
+        lines.of("object refused"),
+        ["object refused job_id=1 node=0 kind= member=notes.bin why=holds_breached"]
+    );
+}
+
+// A set binding a member by what its bytes told it is said once, as the
+// name the set describes it by.
+#[test]
+fn a_set_binding_a_member_by_content_logs_recovery_bound() {
+    let (lines, _guard) = Lines::capture();
+    let mut job = Job::new(PLENTY);
+    let set = job.member("set.par2", None);
+    job.send(set, 0, PAR2_SIGNATURE, Provenance::Fresh);
+    let (node, _) = job.tree.child_of(NodeId::ROOT, set).expect("the set");
+    let member = job.member("3f9a.bin", Some(8));
+    job.send(member, 0, b"data", Provenance::Fresh);
+    job.send(member, 4, b"more", Provenance::Fresh);
+    assert_eq!(
+        lines.of("recovery bound"),
+        [format!(
+            "recovery bound job_id=1 node={} kind=par2 set=set.par2 member=3f9a.bin \
+             as=show.mkv by=content",
+            node.0
+        )]
     );
 }

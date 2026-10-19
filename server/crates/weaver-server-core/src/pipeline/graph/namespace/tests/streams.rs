@@ -11,8 +11,21 @@ use super::*;
 const XZ: &[u8] = &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04];
 
 // A pretend stream: its volume is its envelope, and its one member comes
-// from its run, which the test plays by saying the run's emits.
-pub(super) struct Decoded;
+// from its run, which the test plays by saying the run's emits. Each time it
+// hears its volume closed it says how many bytes it had been delivered.
+pub(super) struct Decoded {
+    delivered: u64,
+    heard: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Decoded {
+    pub(super) fn new(heard: Arc<Mutex<Vec<u64>>>) -> Self {
+        Self {
+            delivered: 0,
+            heard,
+        }
+    }
+}
 
 impl Object for Decoded {
     fn kind(&self) -> Kind {
@@ -21,12 +34,17 @@ impl Object for Decoded {
 
     fn deliver(
         &mut self,
-        _: Delivery<'_>,
+        delivery: Delivery<'_>,
         _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
         _: &mut Vec<Emit>,
     ) {
+        self.delivered += delivery.bytes.len() as u64;
     }
-    fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+
+    fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {
+        self.heard.lock().unwrap().push(self.delivered);
+    }
+
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&mut self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
@@ -130,12 +148,54 @@ fn a_set_a_stream_feeds_reads_its_volume_back_from_its_file() {
     assert_eq!(job.file("set.par2"), PAR2_SIGNATURE);
 
     let mut build = job.build();
+    let due = job.tree.recovery_nodes(node);
     job.writer
-        .repair(&mut job.tree, &mut build, &Source, node, &mut job.out)
+        .repair(&mut job.tree, &mut build, &Source, node, &due, &mut job.out)
         .expect("repair");
     assert_eq!(
         job.par.lock().unwrap().volume.as_deref(),
         Some(PAR2_SIGNATURE),
         "the set reads its own volume back"
     );
+}
+
+// A stream says a member's bytes in two pieces and closes it in one pass,
+// and the first piece binds a stream below: the member's object hears its
+// volume closed once, after it has every byte the member received.
+#[test]
+#[ignore = "the object hears its volume closed twice: `Tree::close` tells it, then `hand_over` at the end of the pass tells it again"]
+fn a_stream_bound_and_closed_in_one_pass_hears_its_volume_closed_once_after_its_bytes() {
+    let mut job = Job::new(PLENTY);
+    let node = stream(&mut job);
+    job.say_member(node, 0, "inner.xz", None);
+    let mut build = job.build();
+    let mut effects = Vec::new();
+    job.tree.emitted(
+        node,
+        vec![
+            Emit::Bytes {
+                member: MemberId(0),
+                offset: 0,
+                bytes: Bytes::from_static(&XZ[..6]),
+                provenance: Provenance::Fresh,
+            },
+            Emit::Bytes {
+                member: MemberId(0),
+                offset: 6,
+                bytes: Bytes::from_static(&XZ[6..]),
+                provenance: Provenance::Fresh,
+            },
+            Emit::MemberClosed(MemberId(0)),
+        ],
+        &mut job.writer.placing(&mut build),
+        &mut effects,
+    );
+    job.writer
+        .apply_all(&mut job.tree, &mut build, &Source, effects, &mut job.out)
+        .expect("applied");
+    assert!(
+        job.tree.child_of(node, MemberId(0)).is_some(),
+        "a stream below"
+    );
+    assert_eq!(*job.heard.lock().unwrap(), [XZ.len() as u64]);
 }

@@ -31,7 +31,7 @@ use par3_rs::layout::{BlockLayout, FileLayout};
 use par3_rs::runtime::ExecutionOptions;
 use par3_rs::{MAGIC, Packet, Par3Set, ScanLimits};
 use serde::{Deserialize, Serialize};
-use weaver_graph::recovery::{MemberAccess, RepairOutcome};
+use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Namespace, Object, ObjectId,
     Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
@@ -81,6 +81,8 @@ pub struct Par3 {
     needed: u64,
     // What the last repair came to, for the members bound then.
     outcome: Option<RepairOutcome>,
+    // Each set as the last repair ruled it.
+    ruled: Vec<SetRuling>,
     memory_limit: u64,
 }
 
@@ -95,6 +97,7 @@ impl Par3 {
             identified: BTreeMap::new(),
             needed: 0,
             outcome: None,
+            ruled: Vec::new(),
             memory_limit: REPAIR_MEMORY_LIMIT,
         }
     }
@@ -420,6 +423,7 @@ impl Recovery for Par3 {
         let coming = self.coming();
         let mut outcome = RepairOutcome::Clean;
         let mut waiting = 0;
+        self.ruled.clear();
         for set in sets {
             let result = if self.identifying(&set) {
                 rebuild::SetRepair {
@@ -432,6 +436,21 @@ impl Recovery for Par3 {
             if result.outcome == RepairOutcome::Waiting {
                 waiting += result.lost;
             }
+            // A PAR3 repair reads every bound member back to rule.
+            self.ruled.push(SetRuling {
+                // The digest of the set's root packet, which its recovery
+                // packets name it by.
+                id: set
+                    .root_hash()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                slice_size: set.block_size(),
+                blocks_reachable: rebuild::usable_recovery(&set).len() as u64,
+                damaged_slices: result.lost,
+                outcome: Some(result.outcome),
+                read: true,
+            });
             outcome = combine(outcome, result.outcome);
         }
         self.needed = waiting;
@@ -441,6 +460,15 @@ impl Recovery for Par3 {
 
     fn outcome(&self) -> Option<RepairOutcome> {
         self.outcome
+    }
+
+    fn sets(&self, out: &mut Vec<SetRuling>) {
+        // A bind since the last repair voids its rulings with its outcome.
+        let current = self.outcome.is_some();
+        out.extend(self.ruled.iter().map(|ruled| SetRuling {
+            outcome: ruled.outcome.filter(|_| current),
+            ..ruled.clone()
+        }));
     }
 
     // What the kept fronts carry, past any hole in them.

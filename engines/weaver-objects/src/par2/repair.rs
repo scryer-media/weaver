@@ -31,13 +31,18 @@ pub(super) struct SetRepair {
     pub(super) outcome: RepairOutcome,
     // Damaged slices it found, for the recovery it asks for while waiting.
     pub(super) damaged: u64,
+    // It read member bytes back to rule: what the grid proved was not
+    // enough. A clean ruling without a read is the grid's alone.
+    #[serde(default)]
+    pub(super) read: bool,
 }
 
 impl SetRepair {
-    fn clean() -> Self {
+    fn clean(read: bool) -> Self {
         Self {
             outcome: RepairOutcome::Clean,
             damaged: 0,
+            read,
         }
     }
 }
@@ -53,13 +58,22 @@ pub(super) fn repair_set(
     access: &mut dyn MemberAccess,
 ) -> SetRepair {
     let Some(index) = state.usable() else {
-        return SetRepair::clean();
+        return SetRepair::clean(false);
     };
     let slice_size = index.slice_size;
+    let mut read = false;
+    // The slices the bytes proved bad, which a repair that cannot rebuild
+    // them reports to the namespace, so the members' coverage says what the
+    // set found: damage only the set's checksums can see arrived marked
+    // clean.
+    let mut proven = Vec::new();
     let validity: Vec<(FileId, Vec<bool>)> = index
         .recovery_file_ids
         .iter()
-        .map(|file| (*file, slice_validity(index, state, grid, *file, access)))
+        .map(|file| {
+            let valid = slice_validity(index, state, grid, *file, access, &mut read, &mut proven);
+            (*file, valid)
+        })
         .collect();
     let invalid = |valid: &Vec<bool>| valid.iter().filter(|valid| !**valid).count() as u64;
     // Only damage in a bound member starts a repair; a described file no
@@ -70,30 +84,39 @@ pub(super) fn repair_set(
         .map(|(_, valid)| invalid(valid))
         .sum();
     if own == 0 {
-        return SetRepair::clean();
+        return SetRepair::clean(read);
     }
     let damaged = validity.iter().map(|(_, valid)| invalid(valid)).sum();
-    let short = |reachable: u64| SetRepair {
-        outcome: if coming > 0 {
-            RepairOutcome::Waiting
-        } else {
-            RepairOutcome::Impossible { damaged, reachable }
-        },
-        damaged,
+    let short = |reachable: u64, access: &mut dyn MemberAccess| {
+        if coming > 0 {
+            return SetRepair {
+                outcome: RepairOutcome::Waiting,
+                damaged,
+                read,
+            };
+        }
+        for &(member, range) in &proven {
+            access.found_damaged(member, range);
+        }
+        SetRepair {
+            outcome: RepairOutcome::Impossible { damaged, reachable },
+            damaged,
+            read,
+        }
     };
     let slices = spend(state, slice_size, damaged as usize, access);
     if (slices.len() as u64) < damaged {
-        return short(slices.len() as u64);
+        return short(slices.len() as u64, access);
     }
     let Some(index) = state.usable() else {
-        return SetRepair::clean();
+        return SetRepair::clean(read);
     };
     let mut set = index.clone();
     set.recovery_slices = slices;
     let verification = verification(&set, &validity, damaged);
     let available = set.recovery_slices.len() as u64;
     let Ok(plan) = plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) else {
-        return short(available);
+        return short(available, access);
     };
     let members: BTreeMap<FileId, MemberId> = state.members().clone();
     let mut files = Files {
@@ -106,22 +129,27 @@ pub(super) fn repair_set(
         ..Default::default()
     };
     if execute_repair_with_options(&plan, &set, &mut files, &options).is_err() {
-        return short(available);
+        return short(available, files.access.into_inner());
     }
     SetRepair {
         outcome: RepairOutcome::Repaired { slices: damaged },
         damaged,
+        read,
     }
 }
 
 // Which slices of a described file are good, reading back only the ones the
-// evidence did not settle.
+// evidence did not settle; `read` says one was. The member range of each
+// slice its bytes proved bad, by the evidence or the read, goes in `proven`;
+// one that could not be read is not proven anything.
 fn slice_validity(
     index: &Par2FileSet,
     state: &SetState,
     grid: &Grid,
     file: FileId,
     access: &mut dyn MemberAccess,
+    read: &mut bool,
+    proven: &mut Vec<(MemberId, ByteRange)>,
 ) -> Vec<bool> {
     let count = index.file_description(&file).map_or(0, |description| {
         index.slice_count_for_file(description.length)
@@ -136,15 +164,41 @@ fn slice_validity(
     let verdicts: Vec<SliceVerdict> = evidence.vetoed().collect();
     let mut buffer = Vec::new();
     (0..count)
-        .map(|slice| match verdicts.get(slice) {
-            Some(SliceVerdict::Intact) => true,
-            Some(SliceVerdict::Damaged) => false,
-            _ => read_slice(index, file, member, slice, access, &mut buffer),
+        .map(|slice| {
+            let good = match verdicts.get(slice) {
+                Some(SliceVerdict::Intact) => Some(true),
+                Some(SliceVerdict::Damaged) => Some(false),
+                _ => {
+                    *read = true;
+                    read_slice(index, file, member, slice, access, &mut buffer)
+                }
+            };
+            if good == Some(false)
+                && let Some(range) = slice_range(index, file, slice, access.length(member))
+            {
+                proven.push((member, range));
+            }
+            good == Some(true)
         })
         .collect()
 }
 
-// Read one slice back and check it against both of its checksums.
+// The member range of one slice: its share of the described file, as far
+// as the member reaches.
+fn slice_range(
+    index: &Par2FileSet,
+    file: FileId,
+    slice: usize,
+    length: Option<u64>,
+) -> Option<ByteRange> {
+    let described = index.file_description(&file)?.length;
+    let start = slice as u64 * index.slice_size;
+    let end = (start + index.slice_size).min(described).min(length?);
+    (start < end).then(|| ByteRange::new(start, end))
+}
+
+// Read one slice back and check it against both of its checksums: `None`
+// when it could not be read, so nothing is proven of it.
 fn read_slice(
     index: &Par2FileSet,
     file: FileId,
@@ -152,31 +206,27 @@ fn read_slice(
     slice: usize,
     access: &mut dyn MemberAccess,
     buffer: &mut Vec<u8>,
-) -> bool {
-    let (Some(description), Some(expected)) = (
-        index.file_description(&file),
-        index
-            .file_checksums(&file)
-            .and_then(|checksums| checksums.get(slice)),
-    ) else {
-        return false;
-    };
+) -> Option<bool> {
+    let description = index.file_description(&file)?;
+    let expected = index
+        .file_checksums(&file)
+        .and_then(|checksums| checksums.get(slice))?;
     let block = index.slice_size;
     let start = slice as u64 * block;
     let end = (start + block).min(description.length);
     if access.length(member).is_none_or(|length| length < end) {
-        return false;
+        return None;
     }
     buffer.clear();
     if !access.read(member, ByteRange::new(start, end), buffer)
         || buffer.len() as u64 != end - start
     {
-        return false;
+        return None;
     }
     let mut state = SliceChecksumState::new();
     state.update(buffer);
     let (crc32, md5) = state.finalize(Some(block));
-    crc32 == expected.crc32 && md5 == expected.md5
+    Some(crc32 == expected.crc32 && md5 == expected.md5)
 }
 
 // Read recovery packets back from the volumes, in exponent order, until

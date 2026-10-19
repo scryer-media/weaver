@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use par2_rs::Par2FileSet;
 use par2_rs::packet::{HEADER_SIZE, MAGIC};
-use weaver_graph::recovery::{MemberAccess, RepairOutcome};
+use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
     ByteRange, Delivery, Emit, Extent, Kind, MemberId, Namespace, Object, ObjectId, Placement,
     Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
@@ -438,6 +438,21 @@ impl Recovery for Par2 {
 
     fn outcome(&self) -> Option<RepairOutcome> {
         self.outcome
+    }
+
+    fn sets(&self, out: &mut Vec<SetRuling>) {
+        for key in self.ordered() {
+            let state = &self.sets[&key];
+            let last = state.last;
+            out.push(SetRuling {
+                id: par2_rs::RecoverySetId::from_bytes(key).to_string(),
+                slice_size: state.index.as_ref().map_or(0, |index| index.slice_size),
+                blocks_reachable: state.recovery.len() as u64 + self.coming(&key),
+                damaged_slices: last.map_or(0, |last| last.damaged),
+                outcome: last.map(|last| last.outcome),
+                read: last.is_some_and(|last| last.read),
+            });
+        }
     }
 
     fn blocks_reachable(&self) -> u64 {

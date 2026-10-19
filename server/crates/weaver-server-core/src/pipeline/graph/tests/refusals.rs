@@ -85,7 +85,7 @@ fn refusing(mode: Mode, count: u32, candidates: &[&str]) -> Refusing {
     );
     let mail = RunMail::default();
     let runs = Runs::new(1, 1, mail.sender(), accountant);
-    let job = GraphJob::new(&files, Box::new(fakes), writer, runs).offering(
+    let job = GraphJob::new(&files, Box::new(fakes), writer, runs, u32::MAX).offering(
         candidates
             .iter()
             .map(|candidate| candidate.to_string())
@@ -225,6 +225,7 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
         |_| false,
         |_| false,
         |_, _| false,
+        |_, _| None,
     );
     assert_eq!(
         delivery,
@@ -234,6 +235,12 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
                 "inner-0.bin".to_string(),
                 "inner-1.bin".to_string(),
                 "lantern.part2.rar".to_string(),
+            ],
+            files: vec![
+                super::delivered("lantern.part1.rar", 0, true),
+                super::delivered("inner-0.bin", 1, true),
+                super::delivered("inner-1.bin", 1, true),
+                super::delivered("lantern.part2.rar", 0, true),
             ],
             ..Delivery::default()
         }

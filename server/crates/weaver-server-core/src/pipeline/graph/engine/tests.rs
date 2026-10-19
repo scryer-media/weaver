@@ -443,7 +443,7 @@ fn echoing_within(count: u32, window: u64, accountant: Arc<HoldsAccountant>) -> 
     );
     let mail = RunMail::default();
     let runs = Runs::new(1, 1, mail.sender(), Arc::clone(&accountant));
-    let job = GraphJob::new(&files, Box::new(echoes), writer, runs);
+    let job = GraphJob::new(&files, Box::new(echoes), writer, runs, u32::MAX);
     Echoing {
         job,
         mail,

@@ -554,6 +554,7 @@ mod tests {
             max_member_bytes: 16 << 20,
             max_entries: 64,
             max_ratio: 10000,
+            ratio_floor_bytes: 1 << 30,
             max_seconds: 60,
             min_free_bytes: 1,
             max_memory_bytes: 256 << 20,

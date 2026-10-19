@@ -35,7 +35,12 @@ impl Pipeline {
                 .is_some_and(|file| file.promoted)
     }
 
+    // A graph job's root says which of its articles it waits on; the
+    // classic promotion state below is a classic job's.
     pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
+        if let Some(waited_on) = self.graph_article_waited_on(segment_id) {
+            return waited_on;
+        }
         self.par3_runtime.as_ref().is_some_and(|runtime| {
             runtime.article_promoted(
                 segment_id.file_id.job_id,

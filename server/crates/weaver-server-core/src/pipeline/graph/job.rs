@@ -29,11 +29,12 @@ use self::passwords::Passwords;
 use super::Engine;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
+use super::limits::Caps;
 use super::namespace::{NamespaceWriter, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, RootPhase};
 use super::root::sample;
-use super::root::source::Move;
+use super::root::source::{Class, Move};
 use super::root::{ArticleRoot, Ask};
 use crate::operations::disk::CapacityReader;
 
@@ -46,7 +47,7 @@ pub(crate) enum GraphError {
 // Where a graph job writes and what it may hold: its working directory, the
 // process-wide holds accountant every job shares, the free space of the
 // volume its scratch lives on, how many engines it may run at once, and
-// where their runs speak.
+// where their runs speak, and the extraction budget its writes are held to.
 pub(crate) struct Storage {
     pub(crate) working_dir: PathBuf,
     pub(crate) accountant: Arc<HoldsAccountant>,
@@ -55,6 +56,10 @@ pub(crate) struct Storage {
     pub(crate) mail: mpsc::Sender<Said>,
     // The job's password candidates, in the order they are tried.
     pub(crate) passwords: Vec<String>,
+    // The job's extraction budget.
+    pub(crate) caps: Caps,
+    // How deep the job's namespaces may nest, the root's being 0.
+    pub(crate) nesting: u32,
 }
 
 // What one recovery object says of the members it covers.
@@ -120,9 +125,16 @@ impl GraphJob {
                 storage.working_dir,
                 storage.accountant,
                 storage.free_disk,
-            );
-            Self::new(files, Box::new(weaver_objects::Objects), writer, runs)
-                .offering(storage.passwords)
+            )
+            .capped(storage.caps);
+            Self::new(
+                files,
+                Box::new(weaver_objects::Objects),
+                writer,
+                runs,
+                storage.nesting,
+            )
+            .offering(storage.passwords)
         })
     }
 
@@ -131,8 +143,10 @@ impl GraphJob {
         mut builder: Box<dyn Builder + Send + Sync>,
         mut writer: NamespaceWriter,
         runs: Runs,
+        nesting: u32,
     ) -> Self {
         let mut tree = Tree::new();
+        tree.nest_at_most(nesting);
         let root = ArticleRoot::new(files);
         let mut out = Vec::new();
         for file in files {
@@ -268,6 +282,17 @@ impl GraphJob {
     // Articles the queues do not hold were fetched by an earlier run.
     pub(crate) fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool) {
         self.root.map.arrived_before(queued);
+    }
+
+    // A recovery object may still form: an object is known by its opening
+    // bytes, and some member's have yet to arrive.
+    pub(crate) fn recovery_may_form(&self) -> bool {
+        self.root.map.any_head_waiting()
+    }
+
+    // The class the root fetches an article under now.
+    pub(crate) fn article_class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
+        self.root.map.class(volume, ordinal)
     }
 
     // The first article of every member leads the payload.

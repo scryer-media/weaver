@@ -16,6 +16,9 @@ pub(crate) struct RecoverySummary {
     // Members that carry recovery data nothing here reads, by name: it is
     // there, and no repair counts on it.
     pub(crate) unusable: Vec<String>,
+    // A member's opening bytes can still arrive, so it may yet turn out to
+    // be a recovery object no set here counts.
+    pub(crate) forming: bool,
 }
 
 // One recovery object of the namespace.
@@ -54,6 +57,15 @@ pub(crate) fn vouches(outcome: Option<RepairOutcome>) -> bool {
 }
 
 impl RecoverySummary {
+    // What each object last ruled, in order; one that has not ruled yet
+    // waits.
+    pub(crate) fn outcomes(&self) -> Vec<RepairOutcome> {
+        self.sets
+            .iter()
+            .map(|set| set.outcome.unwrap_or(RepairOutcome::Waiting))
+            .collect()
+    }
+
     pub(crate) fn blocks_reachable(&self) -> u64 {
         self.sets.iter().map(|set| set.blocks_reachable).sum()
     }
@@ -71,10 +83,18 @@ impl RecoverySummary {
         !self.sets.is_empty() && !self.sets.iter().any(SetSummary::short)
     }
 
-    // Health's question: whether recovery can still arrive. No object says
-    // nothing either way, as with a job that declared no recovery.
+    // Health's question: whether recovery can still arrive. Blocks an
+    // object can still reach, or an object that can still form; with
+    // neither, waiting for recovery cannot change the verdict.
     pub(crate) fn obtainable(&self) -> bool {
-        self.sets.is_empty() || self.blocks_reachable() > 0
+        self.forming || self.blocks_reachable() > 0
+    }
+
+    // A recovery object rebuilt something.
+    pub(crate) fn repaired(&self) -> bool {
+        self.sets
+            .iter()
+            .any(|set| matches!(set.outcome, Some(RepairOutcome::Repaired { .. })))
     }
 
     // What the scripts are told: a recovery object vouched for the job.

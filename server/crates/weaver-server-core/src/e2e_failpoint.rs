@@ -20,6 +20,11 @@ pub const DIRECT_STORE_BARRIER_SYNC: &str = "direct_store.barrier.sync";
 pub const DIRECT_STORE_BARRIER_PERSIST: &str = "direct_store.barrier.persist";
 pub const DIRECT_STORE_BARRIER_PUBLISH: &str = "direct_store.barrier.publish";
 
+// After a recovery set's repair has ruled and before the job's delivery
+// moves anything, off the pipeline's loop: whichever engine owns that moment
+// holds here, so a held job stands still while the queue keeps moving.
+pub const DIRECT_STORE_POST_REPAIR_VERIFY: &str = "direct_store.post_repair_verify";
+
 struct ConfiguredFailpoint {
     name: String,
     fired: AtomicBool,

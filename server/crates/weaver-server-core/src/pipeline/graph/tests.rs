@@ -21,7 +21,7 @@ use crate::pipeline::download::queue::DownloadQueue;
 use crate::pipeline::graph::engine::Heard;
 use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::graph::status::Delivery;
+use crate::pipeline::graph::status::{Delivered, Delivery};
 use crate::pipeline::tests::{insert_active_job, new_direct_pipeline, retire_pipeline_database};
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -53,6 +53,16 @@ impl Post {
 }
 
 // Bytes no format sniffs as its own.
+// A file delivered under the name it wanted.
+fn delivered(name: &str, depth: u32, whole: bool) -> Delivered {
+    Delivered {
+        name: name.to_string(),
+        from: name.to_string(),
+        depth,
+        whole,
+    }
+}
+
 fn payload(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed) | 0x80)
@@ -550,6 +560,12 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
             whole: vec!["echo-0.bin".to_string(), "echo-1.bin".to_string()],
             damaged: vec!["lantern.dat".to_string()],
             unrepaired: Vec::new(),
+            withheld: Vec::new(),
+            files: vec![
+                delivered("echo-0.bin", 1, true),
+                delivered("echo-1.bin", 1, true),
+                delivered("lantern.dat", 0, false),
+            ],
         })
     );
     assert_eq!(

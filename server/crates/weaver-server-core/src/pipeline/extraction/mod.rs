@@ -10,8 +10,8 @@ pub(crate) mod safety;
 pub(crate) use error::{ExtractionError, ExtractionErrorClass, OrTerminal};
 pub(crate) use rar::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};
 pub(crate) use safety::{
-    BudgetedReader, BudgetedWriter, ExtractionFailure, ExtractionLimits, ExtractionRoot,
-    JobExtractionBudget, MemoryPermit, MemoryWaitError, ProcessMemoryBudget,
+    BudgetedReader, BudgetedWriter, ExtractionFailure, ExtractionLimits, ExtractionRejectionReason,
+    ExtractionRoot, JobExtractionBudget, MemoryPermit, MemoryWaitError, ProcessMemoryBudget,
 };
 
 // Re-exported so the direct-store coverage snapshot gates its destination

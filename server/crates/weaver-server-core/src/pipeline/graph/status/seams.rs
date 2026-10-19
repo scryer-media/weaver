@@ -5,17 +5,22 @@
 // of these first and keeps its own path when the job has no graph runtime.
 
 use tracing::{info, warn};
-use weaver_graph::recovery::RepairOutcome;
+use weaver_graph::recovery::{RepairOutcome, SetRuling};
 use weaver_graph::slots::AskerId;
-use weaver_graph::{MemberId, NodeId, Why};
+use weaver_graph::{MemberId, NodeId};
 
 use super::claims::{self, Claim, ClaimedMember};
 use super::{
-    Delivery, Failure, RecoverySummary, RootJob, Step, drive, failure, metrics, shown_status,
+    Delivery, Failure, RecoverySummary, RootJob, Step, drive, failure, metrics, repaired_slices,
+    shown_status,
 };
+use crate::events::model::PipelineEvent;
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::JobStatus;
+use crate::operations::instrumentation::StageOutcomeKind;
 use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
+use crate::pipeline::extraction::ExtractionError;
+use crate::pipeline::graph::job::GraphJob;
 use crate::pipeline::graph::limits;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{Pipeline, TerminalReconciliation, health_milli};
@@ -40,11 +45,12 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     let Some(job) = pipeline.graph_jobs.get_mut(&job_id) else {
         return;
     };
-    let status = &mut pipeline.graph_status;
-    let step = drive(job, &mut status.repairs, asker(job_id), limit);
-    status
-        .summaries
-        .insert(job_id, RootJob::recovery_summary(job));
+    let step = drive(
+        job,
+        &mut pipeline.graph_status.repairs,
+        asker(job_id),
+        limit,
+    );
     pipeline.report_graph_phase(job_id);
     for woken in pipeline.graph_status.repairs.take_woken() {
         pipeline.schedule_job_completion_check(JobId(woken.0));
@@ -53,25 +59,87 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
 }
 
 // What an advance came to, applied to the job. A job with nothing left to
-// wait for ends as its settled claims say: it fails only when the files a
-// recovery object could not rebuild are all it has.
+// wait for ends as its settled claims say: it fails when no file it hands
+// over is whole.
 pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
+    if pipeline.fail_graph_job_on_breach(job_id) {
+        return;
+    }
     match step {
         Step::Wait => {}
         Step::Deliver => match pipeline.graph_terminal_status(job_id) {
             Some(JobStatus::Failed { error }) => {
-                metrics::failed("repair_impossible");
-                // The repair is the stage that broke, whatever the root showed.
-                pipeline.transition_postprocessing_status(job_id, JobStatus::Repairing, None);
+                // The stage that left the delivery short is the one that
+                // broke, whatever the root showed.
+                let stalled = match pipeline.graph_shortfall(job_id).map(|(stage, _)| stage) {
+                    Some(PipelineFailureStage::Repair) => {
+                        metrics::failed("repair_impossible");
+                        JobStatus::Repairing
+                    }
+                    _ => {
+                        metrics::failed("nothing_whole");
+                        JobStatus::Extracting
+                    }
+                };
+                pipeline.transition_postprocessing_status(job_id, stalled, None);
                 pipeline.fail_job(job_id, error);
             }
             _ => {
+                pipeline.log_deliveries(job_id);
                 pipeline.remove_recovery_volumes(job_id).await;
-                if let Err(error) = pipeline.start_move_to_complete(job_id).await {
+                // A repair ruled before this delivery: the moment the e2e
+                // post-repair hook names, between the ruling and the move.
+                let hold = pipeline
+                    .graph_recovery_summary(job_id)
+                    .is_some_and(|summary| summary.repaired())
+                    .then_some(crate::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY);
+                if let Err(error) = pipeline.start_move_to_complete_held(job_id, hold).await {
                     pipeline.fail_job(job_id, error);
                 }
             }
         },
+    }
+}
+
+// Every recovery set's ruling, said once, when the root is done and no set
+// will rule again.
+fn log_set_rulings(job_id: JobId, job: &GraphJob) {
+    let mut rulings = Vec::new();
+    for object in RootJob::recovery_summary(job).sets {
+        rulings.clear();
+        if let Some(recovery) = job.tree().recovery(object.node) {
+            recovery.sets(&mut rulings);
+        }
+        for ruling in &rulings {
+            let SetRuling {
+                outcome: Some(outcome),
+                ..
+            } = ruling
+            else {
+                continue;
+            };
+            let (outcome, slices_repaired, verification) = match *outcome {
+                RepairOutcome::Waiting => continue,
+                RepairOutcome::Clean if ruling.read => ("clean", 0, "read"),
+                RepairOutcome::Clean => ("clean", 0, "grid"),
+                RepairOutcome::Repaired { slices } => ("repaired", slices, ""),
+                RepairOutcome::Impossible { .. } => ("impossible", 0, ""),
+            };
+            info!(
+                job_id = job_id.0,
+                node = object.node.0,
+                kind = %object.kind,
+                set = %object.name,
+                recovery_set_id = %ruling.id,
+                slice_size = ruling.slice_size,
+                blocks_reachable = ruling.blocks_reachable,
+                damaged_slices = ruling.damaged_slices,
+                outcome = %outcome,
+                slices_repaired = slices_repaired,
+                verification = %verification,
+                "recovery set ruled"
+            );
+        }
     }
 }
 
@@ -80,6 +148,34 @@ fn asker(job_id: JobId) -> AskerId {
 }
 
 impl Pipeline {
+    // A graph job its extraction budget refused fails now, as classic fails
+    // a job whose extraction budget refused it: at the extraction stage,
+    // with the refusal as its reason. Asked after every step, so nothing
+    // more is fetched or decoded for it. True when it failed.
+    pub(in crate::pipeline::graph) fn fail_graph_job_on_breach(&mut self, job_id: JobId) -> bool {
+        let breached = self
+            .graph_jobs
+            .get(&job_id)
+            .is_some_and(|job| RootJob::refusal(job).is_some());
+        if !breached {
+            return false;
+        }
+        let Some((
+            _,
+            Some(Failure {
+                rejection: Some(rejection),
+                ..
+            }),
+        )) = self.graph_ruling(job_id)
+        else {
+            return false;
+        };
+        metrics::failed(rejection.reason().as_str());
+        self.transition_postprocessing_status(job_id, JobStatus::Extracting, None);
+        self.fail_job_on_extraction_error(job_id, ExtractionError::rejected(rejection));
+        true
+    }
+
     // PAR2 and PAR3 files, indexes and volumes alike, are spent once the job
     // delivers and are not part of the release, so they are left out of it
     // as a classic job's are. Root members are numbered as the posted files
@@ -112,19 +208,14 @@ impl Pipeline {
         self.graph_jobs.contains_key(&job_id)
     }
 
-    // What the root's recovery objects said when a graph job last
-    // advanced; nothing yet until it first does.
+    // What the root's recovery objects can say of a graph job now, read
+    // off the tree whenever it is asked: health asks it between articles,
+    // and the tree is what changed since.
     pub(in crate::pipeline) fn graph_recovery_summary(
         &self,
         job_id: JobId,
     ) -> Option<RecoverySummary> {
-        self.graph_jobs.contains_key(&job_id).then(|| {
-            self.graph_status
-                .summaries
-                .get(&job_id)
-                .cloned()
-                .unwrap_or_default()
-        })
+        self.graph_jobs.get(&job_id).map(RootJob::recovery_summary)
     }
 
     // The scripts' PAR status: a recovery object vouched for the job.
@@ -140,7 +231,6 @@ impl Pipeline {
 
     pub(in crate::pipeline) fn forget_graph_repair(&mut self, job_id: JobId) {
         self.graph_status.repairs.forget(asker(job_id));
-        self.graph_status.summaries.remove(&job_id);
     }
 
     // The census of a graph job, from the root namespace's marks: the
@@ -244,6 +334,21 @@ impl Pipeline {
         Some(Ok(()))
     }
 
+    // Each file the job hands over, said once, as the job delivers: the
+    // tree places names until then.
+    fn log_deliveries(&self, job_id: JobId) {
+        for file in self.graph_delivery(job_id).unwrap_or_default().files {
+            info!(
+                job_id = job_id.0,
+                name = %file.name,
+                from = %file.from,
+                depth = file.depth,
+                whole = file.whole,
+                "member delivered"
+            );
+        }
+    }
+
     // What a graph job hands over, file by file at every depth, off its
     // settled claims, with the repair failure that left any of it short.
     // `None` for a classic job.
@@ -251,11 +356,7 @@ impl Pipeline {
         let job = self.graph_jobs.get(&job_id)?;
         let state = self.jobs.get(&job_id)?;
         let summary = RootJob::recovery_summary(job);
-        let outcomes: Vec<RepairOutcome> = summary
-            .sets
-            .iter()
-            .map(|set| set.outcome.unwrap_or(RepairOutcome::Waiting))
-            .collect();
+        let outcomes = summary.outcomes();
         let failure = failure(&summary, &outcomes, job);
         let ignore = self.par2_ignore_extensions();
         // Root members are numbered as the posted files they are.
@@ -277,12 +378,9 @@ impl Pipeline {
             |name| par2_damage_ignorable(name, &ignore),
             failed,
             // Refused after announcing a member it never closed, which the
-            // tree keeps buried under the member; an object refused for
-            // never placing any announced nothing to keep, so its why says.
-            |node, member| {
-                job.tree().left_open(node, member)
-                    || job.writer().refused(node, member) == Some(Why::Unmapped)
-            },
+            // tree keeps buried under the member.
+            |node, member| job.tree().left_open(node, member),
+            |node, member| job.writer().refused(node, member),
         );
         Some((delivery, failure))
     }
@@ -293,7 +391,8 @@ impl Pipeline {
 
     // Why a graph job delivered short of whole, for its terminal record: the
     // stage that left it short, and the error a recovery object that could
-    // not rebuild what it found words. `None` for a classic job.
+    // not rebuild what it found words, or else what was withheld. `None`
+    // for a classic job.
     pub(in crate::pipeline) fn graph_shortfall(
         &self,
         job_id: JobId,
@@ -301,7 +400,9 @@ impl Pipeline {
         let (delivery, failure) = self.graph_ruling(job_id)?;
         Some((
             delivery.shortfall_stage(),
-            failure.map(|failure| failure.message),
+            failure
+                .map(|failure| failure.message)
+                .or_else(|| delivery.withheld_error()),
         ))
     }
 
@@ -316,15 +417,20 @@ impl Pipeline {
                 whole = ?delivery.whole,
                 damaged = ?delivery.damaged,
                 unrepaired = ?delivery.unrepaired,
+                withheld = ?delivery.withheld,
                 "the job delivered in part"
             );
         }
         Some(status)
     }
 
-    // Show the root's phase as the job's status when it changed, the way an
-    // article arriving does, and keep it with the job.
-    fn report_graph_phase(&mut self, job_id: JobId) {
+    // Show the root's phase as the job's status when it changed, and keep
+    // it with the job. Reaching Done is the one moment every recovery object
+    // that will ever rule has ruled: nothing waits on bytes, none is still
+    // to rule, and no object below the root is still producing members that
+    // could bring another. Each set's ruling and what the repair came to are
+    // said then, once, as the phase is.
+    pub(in crate::pipeline::graph) fn report_graph_phase(&mut self, job_id: JobId) {
         let (Some(graph), Some(state)) =
             (self.graph_jobs.get_mut(&job_id), self.jobs.get_mut(&job_id))
         else {
@@ -334,6 +440,21 @@ impl Pipeline {
             return;
         };
         metrics::phase(phase);
+        if phase == RootPhase::Done {
+            log_set_rulings(job_id, graph);
+            let summary = RootJob::recovery_summary(&*graph);
+            let outcomes = summary.outcomes();
+            metrics::repaired(&summary, &outcomes);
+            if let Some(slices_repaired) = repaired_slices(&outcomes) {
+                self.metrics
+                    .job_lifecycle
+                    .note_repair(StageOutcomeKind::Complete, u64::from(slices_repaired));
+                let _ = self.event_tx.send(PipelineEvent::RepairComplete {
+                    job_id,
+                    slices_repaired,
+                });
+            }
+        }
         if let Some(status) = shown_status(phase, &state.status) {
             state.status = status;
             state.refresh_runtime_lanes_from_status();

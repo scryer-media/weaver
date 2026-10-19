@@ -95,6 +95,21 @@ pub enum Effect {
         bytes: Bytes,
         provenance: Provenance,
     },
+    // These bytes of a member of `node`'s namespace reached `child`, the
+    // object the member is a volume of, as that volume, or the retired
+    // object it was one of until the owner buries it. What the object
+    // keeps of them for no member of its own is the owner's to keep,
+    // whoever sent them: a source, or an object above that places them
+    // only now, read back from what it was handed before.
+    Reached {
+        node: NodeId,
+        member: MemberId,
+        child: NodeId,
+        volume: VolumeIndex,
+        offset: u64,
+        bytes: Bytes,
+        provenance: Provenance,
+    },
     // A new member of `node`'s namespace was announced.
     Announced {
         node: NodeId,
@@ -197,6 +212,9 @@ pub struct Tree {
     // all.
     names: NameLedger,
     next_node: u32,
+    // How deep a namespace may sit: an object that would open one deeper is
+    // never built, and its member is refused as the container it is.
+    nesting: u32,
     emits: Vec<Emit>,
     extents: Vec<Extent>,
     placements: Vec<Placement>,
@@ -217,6 +235,7 @@ impl Tree {
             retired: BTreeMap::new(),
             names: NameLedger::new(),
             next_node: 1,
+            nesting: u32::MAX,
             emits: Vec::new(),
             extents: Vec::new(),
             placements: Vec::new(),
@@ -225,6 +244,27 @@ impl Tree {
 
     pub fn namespace(&self, node: NodeId) -> Option<&Namespace> {
         self.nodes.get(&node).map(|found| &found.namespace)
+    }
+
+    // The deepest a namespace may sit, the root's being 0. The owner sets
+    // it, as it sets the hold budgets; a tree it never set nests freely.
+    pub fn nest_at_most(&mut self, depth: u32) {
+        self.nesting = depth;
+    }
+
+    // How deep the namespace of `node` sits: 0 for the root's, one more per
+    // object above it.
+    pub fn depth(&self, mut node: NodeId) -> u32 {
+        let mut depth = 0;
+        while let Some(binding) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+        {
+            depth += 1;
+            node = binding.parent;
+        }
+        depth
     }
 
     // Run `act` on the recovery object at `node` together with the namespace
@@ -937,6 +977,22 @@ impl Tree {
         let Some(found) = self.nodes.get(&node) else {
             return;
         };
+        let owner = found
+            .children
+            .get(&member)
+            .copied()
+            .or_else(|| self.retired(node, member));
+        if let Some((child, volume)) = owner {
+            effects.push(Effect::Reached {
+                node,
+                member,
+                child,
+                volume,
+                offset,
+                bytes: bytes.clone(),
+                provenance,
+            });
+        }
         match found.children.get(&member).copied() {
             Some((child, volume)) => {
                 let length = found.namespace.get(member).and_then(|record| record.length);
@@ -1029,7 +1085,7 @@ impl Tree {
                     BTreeMap::from([(volume, member)])
                 };
                 match self.attach(node, kind, volumes, builder) {
-                    Some(child) => {
+                    Ok(child) => {
                         effects.push(Effect::Bound {
                             node,
                             member,
@@ -1038,11 +1094,7 @@ impl Tree {
                         });
                         self.offer_unowned(node, child, effects);
                     }
-                    None => effects.push(Effect::Refused {
-                        node,
-                        member,
-                        why: Why::Unsupported,
-                    }),
+                    Err(why) => effects.push(Effect::Refused { node, member, why }),
                 }
             }
         }
@@ -1154,21 +1206,26 @@ impl Tree {
 
     // Bind members of `node`'s namespace, by the volume each becomes, to a
     // freshly built object of `kind`, which `volumes` may ask where they go.
-    // `None`, and nothing bound, when no object of that kind can be built.
+    // The one place an object comes to own members, and so where the
+    // nesting limit is held: nothing is bound, and why, when the object
+    // would open a namespace past it or no object of that kind can be built.
     fn attach(
         &mut self,
         node: NodeId,
         kind: Kind,
         volumes: impl FnOnce(&mut dyn Object) -> BTreeMap<VolumeIndex, MemberId>,
         builder: &mut dyn Builder,
-    ) -> Option<NodeId> {
+    ) -> Result<NodeId, Why> {
+        if self.depth(node) >= self.nesting {
+            return Err(Why::TooDeep);
+        }
         let child = NodeId(self.next_node);
         // Object ids are node ids: one object per node, for life.
         let id = ObjectId(child.0);
-        let mut object = builder.build(kind, id)?;
+        let mut object = builder.build(kind, id).ok_or(Why::Unsupported)?;
         self.next_node += 1;
         let volumes = volumes(object.as_mut());
-        let parent = self.nodes.get_mut(&node)?;
+        let parent = self.nodes.get_mut(&node).ok_or(Why::Unsupported)?;
         for (volume, member) in &volumes {
             if let Some(record) = parent.namespace.get(*member) {
                 object.bound(*volume, &record.name);
@@ -1183,7 +1240,7 @@ impl Tree {
         };
         self.nodes
             .insert(child, Node::new(Some(object), Some(binding)));
-        Some(child)
+        Ok(child)
     }
 
     // Bind `range` of a member of `node`'s namespace, as volume 0, to a
@@ -1462,7 +1519,7 @@ impl Tree {
             .filter(|_| engine)
             .and_then(|kind| {
                 let volumes = binding.volumes.clone();
-                self.attach(parent, kind, |_| volumes, builder)
+                self.attach(parent, kind, |_| volumes, builder).ok()
             });
         for member in binding.volumes.into_values() {
             effects.push(match engine {
@@ -1978,6 +2035,36 @@ mod tests {
     }
 
     #[test]
+    fn a_member_past_the_nesting_limit_is_refused_as_the_container_it_is() {
+        let mut tree = Tree::new();
+        tree.nest_at_most(0);
+        let mut effects = Vec::new();
+        let first = tree.announce_root("show.rar", None, &mut Vec::new());
+        let mut bytes = SIGNATURE.to_vec();
+        bytes.extend_from_slice(b"hello");
+        tree.deliver(
+            NodeId::ROOT,
+            first,
+            0,
+            bytes.into(),
+            Provenance::Fresh,
+            &mut Build,
+            &mut effects,
+        );
+        assert!(tree.child_of(NodeId::ROOT, first).is_none());
+        assert!(effects.contains(&Effect::Refused {
+            node: NodeId::ROOT,
+            member: first,
+            why: Why::TooDeep,
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Bound { .. }))
+        );
+    }
+
+    #[test]
     fn a_plain_member_is_a_leaf_of_the_root() {
         let mut tree = Tree::new();
         let mut effects = Vec::new();
@@ -2330,9 +2417,20 @@ mod tests {
             &mut Build,
             &mut effects,
         );
+        // The bytes reached the store before it gave its volumes up, so
+        // the owner keeps what it placed of them for its refusal to read.
         assert_eq!(
             effects,
             vec![
+                Effect::Reached {
+                    node: NodeId::ROOT,
+                    member: first,
+                    child,
+                    volume: VolumeIndex(0),
+                    offset: 20,
+                    bytes: Bytes::from_static(b"REFUSE"),
+                    provenance: Provenance::Fresh,
+                },
                 Effect::Refused {
                     node: NodeId::ROOT,
                     member: first,
@@ -2613,9 +2711,20 @@ mod tests {
             &mut Build,
             &mut effects,
         );
+        // The bytes reached the store before it gave its volumes up, so
+        // the owner keeps what it placed of them for its refusal to read.
         assert_eq!(
             effects,
             vec![
+                Effect::Reached {
+                    node: NodeId::ROOT,
+                    member: first,
+                    child,
+                    volume: VolumeIndex(0),
+                    offset: 20,
+                    bytes: Bytes::from_static(b"ENGINE"),
+                    provenance: Provenance::Fresh,
+                },
                 Effect::NeedsEngine {
                     node: NodeId::ROOT,
                     member: first,

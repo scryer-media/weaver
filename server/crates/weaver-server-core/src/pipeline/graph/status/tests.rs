@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::pipeline::extraction::ExtractionFailure;
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
-use weaver_graph::{ByteRange, Kind, Member, MemberId, Namespace, NodeId, Provenance};
+use weaver_graph::{ByteRange, Kind, Member, MemberId, Namespace, NodeId, Provenance, Why};
 
 use super::claims::{Claim, ClaimedMember, refused};
 use super::{
@@ -85,6 +86,10 @@ impl RootJob for Prepared {
     fn unpacked(&self) -> bool {
         false
     }
+
+    fn refusal(&self) -> Option<&ExtractionFailure> {
+        None
+    }
 }
 
 fn namespace(members: &[(&str, u64, &[(u64, u64, Provenance)])]) -> Namespace {
@@ -122,6 +127,7 @@ fn summary(sets: Vec<SetSummary>) -> RecoverySummary {
     RecoverySummary {
         sets,
         unusable: Vec::new(),
+        forming: false,
     }
 }
 
@@ -364,7 +370,13 @@ fn only_a_payload_that_delivered_nothing_is_refused() {
 fn health_reads_capacity_from_every_recovery_object() {
     let none = RecoverySummary::default();
     assert!(!none.repairs_all(), "no recovery covers nothing");
-    assert!(none.obtainable(), "no recovery says nothing either way");
+    assert!(!none.obtainable(), "no recovery and none to come");
+    let forming = RecoverySummary {
+        forming: true,
+        ..RecoverySummary::default()
+    };
+    assert!(forming.obtainable(), "a member yet to open may be recovery");
+    assert!(!forming.repairs_all());
 
     let fits = summary(vec![set(Kind::Par2, "a", 4, 3), set(Kind::Par3, "b", 2, 2)]);
     assert!(fits.repairs_all());
@@ -487,8 +499,8 @@ fn a_repair_of_one_set_never_excuses_another() {
     );
 }
 
-// The one derivation a job with nothing left to wait for ends by: whole,
-// short beside whole, or nothing but what a repair could not rebuild.
+// The one derivation a job with nothing left to wait for ends by: nothing
+// short, short beside whole, or nothing whole.
 #[test]
 fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
     let names = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -496,6 +508,8 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         whole: names(whole),
         damaged: names(damaged),
         unrepaired: names(unrepaired),
+        withheld: Vec::new(),
+        files: Vec::new(),
     };
     let error = "PAR2 recovery failed for 1 set(s)";
     assert_eq!(
@@ -506,13 +520,83 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         delivery(&["ember.bin"], &[], &["ember.dat"]).status(Some(error)),
         JobStatus::Partial
     );
-    // Nothing could have rebuilt it; it is delivered as it stands.
+    assert_eq!(
+        delivery(&["ember.bin"], &["ember.dat"], &[]).status(None),
+        JobStatus::Partial
+    );
+    // Nothing is whole: the job failed, whatever ships as it stands.
     assert_eq!(
         delivery(&[], &["ember.dat"], &[]).status(None),
-        JobStatus::Partial
+        JobStatus::Failed {
+            error: "no file was delivered whole; 1 short: ember.dat".to_string()
+        }
+    );
+    assert_eq!(
+        delivery(&[], &["ember.dat"], &["ember.idx"]).status(None),
+        JobStatus::Failed {
+            error: "no file was delivered whole; 2 short: ember.dat, ember.idx".to_string()
+        }
     );
     assert_eq!(
         delivery(&[], &[], &["ember.dat"]).status(Some(error)),
+        JobStatus::Failed {
+            error: error.to_string()
+        }
+    );
+    assert_eq!(
+        delivery(&[], &["ember.dat"], &[]).status(Some(error)),
+        JobStatus::Failed {
+            error: error.to_string()
+        }
+    );
+}
+
+// A member withheld by its object's refusal is neither whole nor short:
+// nothing whole beside it fails the job, worded by the refusal, one wording
+// for a password whether it shut the bytes or the headers.
+#[test]
+fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
+    let withheld = |whole: &[&str], withheld: &[(&str, Why)]| Delivery {
+        whole: whole.iter().map(ToString::to_string).collect(),
+        withheld: withheld
+            .iter()
+            .map(|(name, why)| (name.to_string(), *why))
+            .collect(),
+        ..Delivery::default()
+    };
+    let password = "lantern.rar needs a password and none was given";
+    for why in [Why::Encrypted, Why::EncryptedHeader] {
+        assert_eq!(
+            withheld(&[], &[("lantern.rar", why)]).status(None),
+            JobStatus::Failed {
+                error: password.to_string()
+            }
+        );
+    }
+    assert_eq!(
+        withheld(
+            &[],
+            &[
+                ("lantern.part1.rar", Why::EncryptedHeader),
+                ("lantern.part2.rar", Why::Encrypted),
+                ("ember.7z", Why::Unmapped),
+            ]
+        )
+        .withheld_error()
+        .as_deref(),
+        Some(
+            "lantern.part1.rar, lantern.part2.rar needs a password and none was given; \
+             ember.7z never placed every member it named"
+        )
+    );
+    assert_eq!(
+        withheld(&["ember.bin"], &[("lantern.rar", Why::Encrypted)]).status(None),
+        JobStatus::Partial
+    );
+    // A recovery object's failure is the one that left the job short.
+    let error = "PAR2 recovery failed for 1 set(s)";
+    assert_eq!(
+        withheld(&[], &[("lantern.rar", Why::Encrypted)]).status(Some(error)),
         JobStatus::Failed {
             error: error.to_string()
         }

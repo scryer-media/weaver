@@ -6,14 +6,17 @@
 // is the job's to remember, not the tree's: the tree is format-blind and
 // knows no secrets. An object asks again only after it tried the last offer,
 // so one is in flight per node, and the cursor moving on is what keeps any
-// candidate from being offered twice to the same node.
+// candidate from being offered twice to the same node. A node that asks
+// with none left is not refused then: more of it may still arrive, and an
+// object that can tell refuses itself once all of it has. The job refuses
+// what is left asking only when nothing more can change.
 //
 // The values are secrets. Nothing here prints them; Debug says how many.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use weaver_graph::{Builder, Effect, Emit, NodeId, Why};
+use weaver_graph::{Builder, Effect, NodeId};
 
 use super::GraphJob;
 
@@ -21,6 +24,8 @@ use super::GraphJob;
 pub(super) struct Passwords {
     candidates: Vec<String>,
     offered: BTreeMap<NodeId, usize>,
+    // The nodes that asked once every candidate was spent on them.
+    unanswered: BTreeSet<NodeId>,
 }
 
 impl fmt::Debug for Passwords {
@@ -29,6 +34,7 @@ impl fmt::Debug for Passwords {
             .debug_struct("Passwords")
             .field("candidates", &self.candidates.len())
             .field("offered", &self.offered)
+            .field("unanswered", &self.unanswered)
             .finish()
     }
 }
@@ -37,7 +43,7 @@ impl Passwords {
     pub(super) fn new(candidates: Vec<String>) -> Self {
         Self {
             candidates,
-            offered: BTreeMap::new(),
+            ..Self::default()
         }
     }
 
@@ -58,6 +64,11 @@ impl Passwords {
         Some(candidate)
     }
 
+    // The node asked with no candidate left to give it.
+    pub(super) fn unanswered(&self, node: NodeId) -> bool {
+        self.unanswered.contains(&node)
+    }
+
     // The candidate after the one the node was offered last, if any is left.
     fn next(&mut self, node: NodeId) -> Option<&str> {
         let offered = self.offered.entry(node).or_default();
@@ -76,17 +87,11 @@ impl GraphJob {
 
     // The object at `node` asked for a password: it gets the next candidate,
     // and an engine's run starts over under it, by the transition a repair
-    // behind the run takes. With none left, the object refuses, as it would
-    // have had the job no candidates at all.
+    // behind the run takes. With none left, the node is left asking.
     pub(super) fn offer_password(&mut self, node: NodeId, effects: &mut Vec<Effect>) {
         let builder: &mut dyn Builder = &mut *self.builder;
         let Some(secret) = self.passwords.next(node) else {
-            self.tree.emitted(
-                node,
-                vec![Emit::Refuse(Why::EncryptedHeader)],
-                &mut self.writer.placing(builder),
-                effects,
-            );
+            self.passwords.unanswered.insert(node);
             return;
         };
         self.tree

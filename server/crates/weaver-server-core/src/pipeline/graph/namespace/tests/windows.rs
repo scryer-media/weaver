@@ -322,6 +322,7 @@ fn recovery_data_inside_a_volume_gets_a_window_fed_what_passed_and_what_passes()
     assert!(carried.tape().closed);
 
     let job = &mut carried.job;
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
     let outcomes = job
         .writer
         .repair(
@@ -329,6 +330,7 @@ fn recovery_data_inside_a_volume_gets_a_window_fed_what_passed_and_what_passes()
             &mut carried.build,
             &Source,
             NodeId::ROOT,
+            &due,
             &mut job.out,
         )
         .expect("repair");

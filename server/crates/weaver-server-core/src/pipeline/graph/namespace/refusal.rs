@@ -34,6 +34,14 @@ impl NamespaceWriter {
         let Some((retired, volume)) = tree.retired(node, member) else {
             return Ok(());
         };
+        // What the member's holds carry never reached the object, whatever
+        // its map has since come to say of those bytes: they go on from the
+        // holds, and the object is asked only for the rest.
+        let held = self
+            .files
+            .get(&node)
+            .map(|files| files.holds.held_ranges(super::held_volume(member)))
+            .unwrap_or_default();
         if tree.child_of(node, member).is_some() {
             self.replay(tree, builder, segments, node, member, super::ALL, out)?;
         } else {
@@ -44,29 +52,31 @@ impl NamespaceWriter {
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
             .ok_or(WriteError::UnknownMember { node, member })?;
-        let runs: Vec<_> = record.coverage.runs().copied().collect();
-        for run in runs {
-            let mut at = run.range.start;
-            while at < run.range.end {
-                let chunk = ByteRange::new(at, run.range.end.min(at.saturating_add(READ_BACK)));
+        let runs: Vec<_> = record
+            .coverage
+            .runs()
+            .flat_map(|run| outside(run.range, &held).map(move |range| (range, run.provenance)))
+            .collect();
+        for (range, provenance) in runs {
+            let mut at = range.start;
+            while at < range.end {
+                let chunk = ByteRange::new(at, range.end.min(at.saturating_add(READ_BACK)));
                 at = chunk.end;
                 for (piece, bytes) in self.read_back(tree, retired, volume, chunk) {
                     let arrival = Arrival {
                         node,
                         member,
                         offset: piece.start,
-                        provenance: bytes
-                            .as_ref()
-                            .map_or(Provenance::Damaged, |_| run.provenance),
+                        provenance: bytes.as_ref().map_or(Provenance::Damaged, |_| provenance),
                         bytes: bytes
                             .unwrap_or_else(|| Bytes::from(vec![0; super::index(piece.len())])),
                     };
                     // Reproduced bytes were evidence when they first came;
                     // damage is new, and the recovery objects hear it.
-                    if arrival.provenance == run.provenance {
+                    if arrival.provenance == provenance {
                         self.route(tree, builder, segments, arrival, out)?;
                     } else {
-                        self.deliver(tree, builder, segments, arrival, out)?;
+                        self.arrive(tree, builder, segments, arrival, out)?;
                     }
                 }
             }
@@ -147,4 +157,23 @@ impl NamespaceWriter {
         }
         Ok(())
     }
+}
+
+// The parts of `range` no held range covers, in order.
+fn outside(range: ByteRange, held: &[ByteRange]) -> impl Iterator<Item = ByteRange> + '_ {
+    let mut cuts: Vec<ByteRange> = held
+        .iter()
+        .filter_map(|hold| hold.intersect(range))
+        .collect();
+    cuts.sort_by_key(|cut| cut.start);
+    let mut at = range.start;
+    cuts.into_iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .filter_map(move |cut| {
+            let end = cut.map_or(range.end, |cut| cut.start);
+            let part = ByteRange::new(at, end.max(at));
+            at = at.max(cut.map_or(range.end, |cut| cut.end));
+            (!part.is_empty()).then_some(part)
+        })
 }

@@ -184,6 +184,33 @@ impl Pipeline {
         Ok(Some(work))
     }
 
+    // Whether work going back on the queue waits in the recovery queue
+    // until something asks for it. Classic parks the recovery nothing waits
+    // on, for its completion check to promote. A graph job parks only what
+    // it has never asked for, when the job is assembled, and its root's
+    // moves are the one way out: work coming back was dispatched, so it was
+    // asked for, and it goes back on the download queue whatever server
+    // failed it.
+    pub(in crate::pipeline) fn requeue_parks(&self, work: &DownloadWork) -> bool {
+        work.is_recovery
+            && !work.completion_critical
+            && self
+                .job_engine(work.segment_id.file_id.job_id)
+                .classic_switches_apply()
+    }
+
+    // Whether the job has recovery work parked for its completion check to
+    // promote. A graph job's root raises the recovery articles it wants into
+    // the download queue itself, so what its recovery queue still holds is
+    // what nothing has asked for, and no completion check changes that.
+    pub(in crate::pipeline::download) fn parked_recovery(&self, job_id: JobId) -> bool {
+        self.job_engine(job_id).classic_switches_apply()
+            && self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| !state.recovery_queue.is_empty())
+    }
+
     // Hold payload work only while declared PAR2 indexes are unresolved.
     //
     // Checkpoint cuts are fixed when a batch is leased, so an index already

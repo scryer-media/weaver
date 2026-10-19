@@ -32,6 +32,15 @@ pub(crate) enum Class {
     Ordinary,
 }
 
+impl Class {
+    // Whether something is waiting on the article: the queue fetches it as
+    // completion work, ahead of the payload and never parked, on every
+    // attempt until it lands or every server has failed it.
+    pub(crate) fn waited_on(self) -> bool {
+        matches!(self, Self::Critical | Self::Recovery)
+    }
+}
+
 // A change of class the download queue has to apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Move {
@@ -263,6 +272,23 @@ impl ArticleMap {
                 }
             }
         }
+    }
+
+    // The class the article is fetched under now.
+    pub(crate) fn class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
+        let found = self.volumes.get(volume.0 as usize)?;
+        Some(found.articles[found.index(ordinal)?].class)
+    }
+
+    // Whether some volume's opening article can still arrive: until it
+    // does, nothing is known of what the volume is.
+    pub(crate) fn any_head_waiting(&self) -> bool {
+        self.volumes.iter().any(|found| {
+            found
+                .articles
+                .first()
+                .is_some_and(|article| article.state == State::Waiting)
+        })
     }
 
     pub(crate) fn volume_waiting(&self, volume: VolumeIndex) -> bool {

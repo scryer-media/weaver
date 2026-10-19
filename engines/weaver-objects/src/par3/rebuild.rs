@@ -57,30 +57,45 @@ pub(super) fn repair_set(
     memory_limit: u64,
     access: &mut dyn MemberAccess,
 ) -> SetRepair {
-    let failed = |lost: u64, reachable: u64| SetRepair {
-        outcome: RepairOutcome::Impossible {
-            damaged: lost,
-            reachable,
-        },
-        lost,
+    // The ranges the bytes proved bad, which a repair that cannot rebuild
+    // them reports to the namespace, so the members' coverage says what the
+    // set found: damage only the set's fingerprints can see arrived marked
+    // clean.
+    let mut proven: Vec<(MemberId, ByteRange)> = Vec::new();
+    let failed = |lost: u64,
+                  reachable: u64,
+                  proven: &[(MemberId, ByteRange)],
+                  access: &mut dyn MemberAccess| {
+        for &(member, range) in proven {
+            access.found_damaged(member, range);
+        }
+        SetRepair {
+            outcome: RepairOutcome::Impossible {
+                damaged: lost,
+                reachable,
+            },
+            lost,
+        }
     };
     let options = ExecutionOptions::default();
     let Ok(layout) = BlockLayout::new(set, &options).map(Arc::new) else {
-        return failed(0, 0);
+        return failed(0, 0, &proven, access);
     };
     let mut lost = BTreeSet::new();
     let mut rewrite = BTreeSet::new();
     for (index, file) in set.files().iter().enumerate() {
         let Some(shape) = layout.files().get(index) else {
-            return failed(0, 0);
+            return failed(0, 0, &proven, access);
         };
-        let evidence = bound
-            .get(file.path())
-            .and_then(|&member| evidence(&layout, index, member, &options, access));
-        match evidence {
-            Some(evidence) if evidence.protected_complete() => continue,
-            Some(evidence) => lost.extend(unresolved(shape, &evidence)),
-            None => lost.extend(shape.extents.iter().filter_map(|extent| block(&extent))),
+        let member = bound.get(file.path()).copied();
+        let evidence = member.and_then(|member| evidence(&layout, index, member, &options, access));
+        match (member, evidence) {
+            (_, Some(evidence)) if evidence.protected_complete() => continue,
+            (Some(member), Some(evidence)) => {
+                proven.extend(damaged(shape, &evidence).map(|range| (member, range)));
+                lost.extend(unresolved(shape, &evidence));
+            }
+            _ => lost.extend(shape.extents.iter().filter_map(|extent| block(&extent))),
         }
         rewrite.insert(index);
     }
@@ -99,7 +114,7 @@ pub(super) fn repair_set(
                 lost: count,
             };
         }
-        return failed(count, available.len() as u64);
+        return failed(count, available.len() as u64, &proven, access);
     }
     let lost: Vec<u64> = lost.into_iter().collect();
     let rows = &available[..lost.len()];
@@ -113,7 +128,7 @@ pub(super) fn repair_set(
         limits: CodecLimits::new(memory_limit),
     };
     if solve.run(access).is_none() {
-        return failed(count, available.len() as u64);
+        return failed(count, available.len() as u64, &proven, access);
     }
     write_tails(&layout, set, bound, &rewrite, access);
     SetRepair {
@@ -165,6 +180,19 @@ fn unresolved<'a>(
         .zip(evidence.verdicts().iter())
         .filter(|(_, verdict)| matches!(verdict, ExtentVerdict::Unknown | ExtentVerdict::Damaged))
         .filter_map(|(extent, _)| block(&extent))
+}
+
+// The member ranges of the file whose bytes disagreed with the set.
+fn damaged<'a>(
+    shape: &'a FileLayout,
+    evidence: &'a FileEvidence,
+) -> impl Iterator<Item = ByteRange> + 'a {
+    shape
+        .extents
+        .iter()
+        .zip(evidence.verdicts().iter())
+        .filter(|(_, verdict)| matches!(verdict, ExtentVerdict::Damaged))
+        .map(|(extent, _)| ByteRange::new(extent.range.start, extent.range.end))
 }
 
 fn block(extent: &FileExtent) -> Option<u64> {

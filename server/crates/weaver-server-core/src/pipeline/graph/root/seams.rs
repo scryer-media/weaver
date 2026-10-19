@@ -25,7 +25,6 @@ use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
-use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{DecodedChunk, Pipeline};
 
 // The best priority a window volume is raised to: ahead of every ordinary
@@ -58,7 +57,7 @@ impl Pipeline {
             Vec::new()
         };
         let slots = self.graph_slot_limit();
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
         let files: Vec<RootFile> = state
@@ -74,6 +73,10 @@ impl Pipeline {
                     .collect(),
             })
             .collect();
+        let caps = self.graph_caps(&files);
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
         let storage = Storage {
             working_dir: state.working_dir.clone(),
             accountant: Arc::clone(&self.graph_holds),
@@ -83,6 +86,8 @@ impl Pipeline {
             slots,
             mail: self.graph_runs.sender(),
             passwords,
+            caps,
+            nesting: limits::NESTING,
         };
         let Some(mut graph) = GraphJob::for_engine(engine, job_id.0, &files, storage) else {
             return;
@@ -149,6 +154,26 @@ impl Pipeline {
         true
     }
 
+    // Whether the root is waiting on an article of a graph job, which is
+    // the whole of whether the queue fetches it as completion work: every
+    // path that rebuilds or requeues the article asks this, so a retry on
+    // another server keeps the class the root gave it. `None` for a classic
+    // job.
+    pub(in crate::pipeline) fn graph_article_waited_on(
+        &self,
+        segment_id: SegmentId,
+    ) -> Option<bool> {
+        let graph = self.graph_jobs.get(&segment_id.file_id.job_id)?;
+        Some(
+            graph
+                .article_class(
+                    VolumeIndex(segment_id.file_id.file_index),
+                    segment_id.segment_number,
+                )
+                .is_some_and(Class::waited_on),
+        )
+    }
+
     // Every server failed an article of a graph job.
     pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
@@ -190,6 +215,11 @@ impl Pipeline {
         if let Err(error) = result {
             warn!(job_id = job_id.0, error = %error, "graph job step failed");
         }
+        // A step the job's extraction budget refused ends the job here, so
+        // nothing more is fetched or decoded for it.
+        if self.fail_graph_job_on_breach(job_id) {
+            return;
+        }
         self.after_graph_step(job_id);
         // The step's bytes are written: the checkpoint can say so.
         self.checkpoint_graph_job(job_id);
@@ -215,24 +245,7 @@ impl Pipeline {
             Ok(moves) => apply_moves(state, &moves),
             Err(error) => warn!(job_id = job_id.0, error = %error, "graph seek round failed"),
         }
-        let Some(phase) = graph.phase_change() else {
-            return;
-        };
-        if let Some(status) = phase.job_status()
-            && RootPhase::may_replace(&state.status)
-            && state.status != status
-        {
-            state.status = status;
-            state.refresh_runtime_lanes_from_status();
-        }
-        if let Err(error) =
-            self.db
-                .try_queue_job_write(job_id, "save_active_job_root_phase", move |db| {
-                    db.save_active_job_root_phase(job_id, phase.as_str())
-                })
-        {
-            warn!(job_id = job_id.0, error = %error, "could not queue the root phase write");
-        }
+        self.report_graph_phase(job_id);
     }
 }
 
@@ -288,14 +301,8 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
 
 // The queue flags a class is fetched under.
 fn classify(work: &mut DownloadWork, class: Class) {
-    match class {
-        Class::Critical => work.completion_critical = true,
-        Class::Recovery => {
-            work.completion_critical = true;
-            work.is_recovery = true;
-        }
-        Class::FirstArticle | Class::Window(_) | Class::Ordinary => {}
-    }
+    work.completion_critical |= class.waited_on();
+    work.is_recovery |= class == Class::Recovery;
 }
 
 fn file(job_id: JobId, volume: VolumeIndex) -> NzbFileId {

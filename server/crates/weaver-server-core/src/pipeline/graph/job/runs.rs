@@ -39,25 +39,9 @@ impl GraphJob {
                 Vec::new()
             }
             Heard::Ended => {
-                // The run was the only producer of its members, so nothing
-                // more will arrive for any of them.
-                let open: Vec<MemberId> = self
-                    .members(node)
-                    .into_iter()
-                    .filter(|member| !self.closed_in(node, *member))
-                    .collect();
-                for member in open {
-                    let mut out = Vec::new();
-                    self.writer.close(
-                        &mut self.tree,
-                        &mut *self.builder,
-                        &self.root,
-                        node,
-                        member,
-                        &mut out,
-                    )?;
-                    self.heard(out)?;
-                }
+                // A member is closed by its engine alone, once it verified
+                // every byte of it: one a run left open stays open, and
+                // nothing more is announced, so the namespace is in.
                 self.runs.ended(node, said.generation, limit)
             }
         };

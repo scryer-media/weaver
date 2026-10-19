@@ -69,7 +69,8 @@ impl GraphJob {
         storage: Storage,
         limit: usize,
     ) -> Result<Restored, RestoreFailure> {
-        let tree = Tree::rebuild(&snapshot.tree, &weaver_objects::Objects)?;
+        let mut tree = Tree::rebuild(&snapshot.tree, &weaver_objects::Objects)?;
+        tree.nest_at_most(storage.nesting);
         let root = ArticleRoot::restore(files, &snapshot.root)?;
         same_post(&tree, files)?;
         let runs = Runs::new(
@@ -83,13 +84,18 @@ impl GraphJob {
             storage.working_dir,
             storage.accountant,
             storage.free_disk,
-        );
+        )
+        .capped(storage.caps);
         let mut unusable = Vec::new();
         for ((node, member), state) in &snapshot.files {
-            let Some(record) = tree.namespace(*node).and_then(|found| found.get(*member)) else {
+            if tree
+                .namespace(*node)
+                .and_then(|found| found.get(*member))
+                .is_none()
+            {
                 continue;
-            };
-            writer.restore_file(*node, *member, &record.output_name, *state)?;
+            }
+            writer.restore_file(&tree, *node, *member, *state)?;
             if let Some(at) = state.unusable_at {
                 unusable.push((at, (*node, *member)));
             }

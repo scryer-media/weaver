@@ -143,7 +143,7 @@ fn job_with(
         CapacityReader::unknown(),
     );
     let runs = Runs::new(1, 1, RunMail::default().sender(), accountant);
-    let job = GraphJob::new(files, Box::new(builder), writer, runs);
+    let job = GraphJob::new(files, Box::new(builder), writer, runs, u32::MAX);
     (job, dir, answers)
 }
 
