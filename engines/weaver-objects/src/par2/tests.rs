@@ -388,17 +388,38 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
     assert!(job.store.members[&member] == data);
 }
 
-// An object that holds no set has nothing to rule on: it is Clean, not due
-// again every step, and a set found later makes it due once.
+// An object that has found no set has not ruled while its volume's bytes
+// may still hold one: the front of an index is only a packet header. Once
+// the volume is read through with no set in it, there is nothing to rule
+// on: it is Clean, not due again every step, and a set found later makes it
+// due once.
 #[test]
-fn an_object_with_no_sets_is_clean_until_a_set_is_found() {
+fn an_object_with_no_sets_rules_clean_once_a_volume_is_read_through() {
     let data = payload(18, 5000);
     let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
     let mut job = Job::new(Par2::new(OWN), OWN);
+    assert_eq!(job.object.outcome(), None);
+    let (name, bytes) = &files[0];
+    let header = &bytes[..par2_rs::packet::HEADER_SIZE];
+    let volume = job.name(name, header);
+    let mut out = Vec::new();
+    job.object.deliver(
+        weaver_graph::Delivery {
+            volume,
+            offset: 0,
+            bytes: header,
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut out,
+    );
+    assert!(job.object.sets.is_empty());
+    assert_eq!(job.object.outcome(), None);
+    job.object.volume_closed(volume, &mut out);
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
-    job.volume(&files[0].0, &files[0].1, ARTICLE as usize, false);
+    job.volume(&files[1].0, &files[1].1, ARTICLE as usize, false);
     assert_eq!(job.object.outcome(), None);
 }
 

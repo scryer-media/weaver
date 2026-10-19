@@ -478,8 +478,14 @@ impl Recovery for Par2 {
     // What the sets ruled, folded from Clean as `repair` folds it, each
     // that came up short waiting while it still does. `None` while a set
     // has not ruled since its bindings changed, or once one no longer waits,
-    // so it is tried again. No sets is Clean: there is nothing to rule on.
+    // so it is tried again. With no set found there is nothing to rule on
+    // once a volume of its own is read through: Clean. Before that a set
+    // may still be found in the bytes to come, and it has not ruled.
     fn outcome(&self) -> Option<RepairOutcome> {
+        if self.sets.is_empty() {
+            let read_through = self.volumes.iter().any(|volume| volume.closed);
+            return read_through.then_some(RepairOutcome::Clean);
+        }
         let mut outcome = RepairOutcome::Clean;
         for key in self.ordered() {
             let last = self.sets[&key].last?;
