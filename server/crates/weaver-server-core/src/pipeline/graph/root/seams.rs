@@ -208,6 +208,18 @@ impl Pipeline {
         }
     }
 
+    // Everything the runs said since the last turn. A turn hears the mail
+    // whole, not one piece of a run's output in a turn's spare moment: a run
+    // paced by the pipeline's turns runs as slowly as they are busy.
+    pub(in crate::pipeline) fn hear_graph_runs(&mut self) -> bool {
+        let waiting = self.graph_runs.waiting();
+        let heard = !waiting.is_empty();
+        for said in waiting {
+            self.graph_run_said(said);
+        }
+        heard
+    }
+
     // How many runs a graph job may hold now: the extraction concurrency the
     // tuner allows at this moment, the limit the repair slots follow too.
     pub(in crate::pipeline::graph) fn graph_slot_limit(&self) -> usize {

@@ -18,8 +18,8 @@ use crate::jobs::model::JobStatus;
 use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
 use crate::pipeline::PipelineEvent;
 use crate::pipeline::download::queue::DownloadQueue;
-use crate::pipeline::graph::engine::Heard;
 use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
+use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::{Delivered, Delivery};
 use crate::pipeline::tests::{insert_active_job, new_direct_pipeline, retire_pipeline_database};
@@ -500,6 +500,33 @@ async fn drain_runs(pipeline: &mut Pipeline, job_id: JobId) {
             return;
         }
     }
+}
+
+// A turn hears everything the runs said since the last one, not one piece:
+// a run speaks its output 64 KiB at a time, so one heard a turn runs as
+// slowly as the pipeline's turns are busy with everything else.
+#[tokio::test]
+async fn a_turn_hears_all_the_run_mail_waiting() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mail = pipeline.graph_runs.sender();
+    for generation in 0..mail.max_capacity() as u64 {
+        let said = Said {
+            scope: 92_099,
+            node: weaver_graph::NodeId(1),
+            generation,
+            heard: Heard::Ended,
+        };
+        mail.try_send(said).unwrap();
+    }
+    assert!(pipeline.hear_graph_runs());
+    assert_eq!(
+        mail.capacity(),
+        mail.max_capacity(),
+        "the mail is heard whole"
+    );
+    assert!(!pipeline.hear_graph_runs(), "nothing is heard twice");
+    retire_pipeline_database(pipeline).await;
 }
 
 #[tokio::test]
