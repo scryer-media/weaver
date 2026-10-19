@@ -155,6 +155,11 @@ type ApplicationUpgradeRunPayload {
 	error: String
 	startedAtEpochMs: Int!
 	completedAtEpochMs: Int
+	"""
+	Where the Windows installer wrote its verbose log for this run, once it
+	has written one.
+	"""
+	installerLogPath: String
 }
 
 """
@@ -266,6 +271,39 @@ enum BackupTrigger {
 	AUTO
 }
 
+type BandwidthProvider {
+	id: String!
+	name: String!
+	host: String
+	needsServer: Boolean!
+}
+
+type BandwidthProviderServer {
+	id: String!
+	name: String!
+	location: String
+	host: String!
+}
+
+type BandwidthResult {
+	providerId: String
+	server: String
+	url: String!
+	connections: Int!
+}
+
+input BandwidthTestInput {
+	providerId: String
+	server: String
+	customUrl: String
+}
+
+type BandwidthTestRequest {
+	providerId: String
+	server: String
+	customUrl: String
+}
+
 type Category {
 	id: Int!
 	name: String!
@@ -283,6 +321,16 @@ type ConfiguredStorage {
 	labels: [String!]!
 	path: String!
 	capacity: DiskCapacity
+	error: String
+}
+
+type ConnectionResult {
+	leg: Int!
+	connectMs: Int!
+	path: DialPath!
+	sourceAddress: String
+	bytes: Float!
+	bytesPerSecond: Float!
 	error: String
 }
 
@@ -327,6 +375,14 @@ limit. The numbers the profile requirements are judged against.
 type DetectedHardware {
 	memoryBytes: Int!
 	cores: Int!
+}
+
+type DialPath {
+	egressId: Int!
+	rung: Int
+	poolId: Int
+	memberId: Int
+	proxyIds: [Int!]!
 }
 
 type DirectoryBrowseEntry {
@@ -948,6 +1004,17 @@ enum HistoryStatusFilter {
 	FAILURE
 }
 
+type HostResolution {
+	host: String!
+	resolvedBy: ResolvedBy!
+	proxyId: Int
+	dnsServers: [String!]!
+	addresses: [String!]!
+	cached: Boolean!
+	connectedAddress: String
+	error: LookupError
+}
+
 """
 Which layer decided the address Weaver is listening on.
 """
@@ -1202,6 +1269,25 @@ enum LegPathKind {
 	LADDER
 }
 
+type LegResult {
+	position: Int!
+	bytes: Float!
+	averageBps: Float!
+	peakBps: Float!
+	connections: Int!
+	sourceAddresses: [String!]!
+}
+
+type LegRung {
+	leg: Int!
+	rung: Int!
+}
+
+input LegRungInput {
+	leg: Int!
+	rung: Int!
+}
+
 type LiveScriptRun {
 	"""
 	The same value the script was handed as `WEAVER_RUN_ID`.
@@ -1250,6 +1336,20 @@ type LogFilter {
 type LoginStatusResult {
 	enabled: Boolean!
 	username: String
+}
+
+type LookupError {
+	code: LookupErrorCode!
+	detail: String!
+}
+
+enum LookupErrorCode {
+	NO_SUCH_NAME
+	NO_ADDRESS
+	TIMED_OUT
+	SERVER_FAILURE
+	NO_REPLY
+	OTHER
 }
 
 type MetadataEntry {
@@ -1399,12 +1499,15 @@ type MutationRoot {
 	updateProxyPool(id: Int!, input: ProxyPoolInput!): ProxyPool!
 	deleteProxyPool(id: Int!): Boolean!
 	saveNetworkRoute(kind: NetworkConsumerKind!, id: Int!, input: RouteInput!): NetworkRoute!
-	testEgressInterface(id: Int!, proxyId: Int, host: String!, port: Int!): EgressTestResult!
-	testProxyPool(id: Int!, egressId: Int!, host: String, port: Int): [EgressTestResult!]!
+	testVia(route: RouteInput!, subject: TestSubjectInput, target: TestTargetInput): [PathTestResult!]!
+	testEgressInterface(id: Int!, proxyId: Int, host: String!, port: Int!): EgressTestResult! @deprecated(reason: "Use testVia with a direct route on the egress.")
+	testProxyPool(id: Int!, egressId: Int!, host: String, port: Int): [EgressTestResult!]! @deprecated(reason: "Use testVia with a direct route on the egress.")
 	saveProxyProfile(id: Int, input: ProxyProfileInput!): ProxyProfile!
 	deleteProxyProfile(id: Int!): Boolean!
 	resetProxyHostKey(id: Int!): ProxyProfile!
-	testProxyProfile(id: Int!): ProxyTestResult!
+	testProxyProfile(id: Int!): ProxyTestResult! @deprecated(reason: "Use testVia with the route the proxy is tested through.")
+	startSpeedTest(input: SpeedTestInput!): SpeedTestRun!
+	cancelSpeedTest(id: Int!): Boolean!
 	"""
 	Create a new API key. Returns the raw key (shown only once).
 	"""
@@ -1658,6 +1761,11 @@ type MutationRoot {
 	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
 	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
 	"""
+	Replace the unwanted extension list and nothing else. An empty list
+	turns the check off. Returns the list as saved, normalized.
+	"""
+	setUnacceptableExtensions(extensions: [String!]!): [String!]!
+	"""
 	Select the sole live source of scripts. Changing it turns every
 	script job off, because a name in the new directory is not the script
 	that was wired up. What was saved in them is kept, and script files
@@ -1795,6 +1903,12 @@ type MutationRoot {
 	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
 }
 
+type NamedId {
+	kind: String!
+	id: Int!
+	name: String!
+}
+
 """
 A draft for validating the two network settings before a later mutation
 persists either one. An empty trusted-network list permits remembered
@@ -1892,6 +2006,7 @@ type NetworkConsumerFlow {
 enum NetworkConsumerKind {
 	SERVER
 	RSS
+	OUTBOUND
 }
 
 """
@@ -1955,6 +2070,7 @@ type NetworkPoolMemberFlow {
 	bytesPerSecond: Float
 	samples: Int!
 	failures: Int!
+	liveBytesPerSecond: Int!
 }
 
 type NetworkRoute {
@@ -2008,6 +2124,36 @@ type ParsedRelease {
 	animeVersion: Int
 	episode: ParsedEpisode
 	parseConfidence: Float!
+}
+
+type PathOverride {
+	downLegs: [Int!]!
+	downRungs: [LegRung!]!
+	downProxies: [Int!]!
+	downEgresses: [Int!]!
+}
+
+input PathOverrideInput {
+	downLegs: [Int!]! = []
+	downRungs: [LegRungInput!]! = []
+	downProxies: [Int!]! = []
+	downEgresses: [Int!]! = []
+}
+
+type PathTestResult {
+	leg: Int!
+	egressId: Int!
+	carrierIds: [Int!]!
+	proxyId: Int
+	poolId: Int
+	success: Boolean!
+	code: String!
+	message: String!
+	params: JSON!
+	failingProxyId: Int
+	sourceAddress: String
+	connectMillis: Float!
+	resolution: HostResolution
 }
 
 type PipelineEventGql {
@@ -2159,6 +2305,7 @@ type ProxyProfile {
 	enabled: Boolean!
 	host: String!
 	port: Int!
+	resolver: ProxyResolver!
 	dnsServers: [String!]!
 	tunnelAddresses: [String!]!
 	peerPublicKey: String
@@ -2180,6 +2327,7 @@ input ProxyProfileInput {
 	enabled: Boolean!
 	host: String!
 	port: Int!
+	resolver: ProxyResolver
 	dnsServers: [String!]! = []
 	tunnelAddresses: [String!]! = []
 	peerPublicKey: String
@@ -2191,6 +2339,11 @@ input ProxyProfileInput {
 	privateKey: String
 	passphrase: String
 	presharedKey: String
+}
+
+enum ProxyResolver {
+	WEAVER
+	PROXY
 }
 
 type ProxyTestResult {
@@ -2211,6 +2364,10 @@ type QueryRoot {
 	networkRoutes: [NetworkRoute!]!
 	networkFlow: NetworkFlow!
 	proxyProfiles: [ProxyProfile!]!
+	bandwidthProviders: [BandwidthProvider!]!
+	bandwidthProviderServers(providerId: String!, kind: NetworkConsumerKind!, id: Int!): [BandwidthProviderServer!]!
+	speedTestRuns: [SpeedTestRun!]!
+	speedTestRun(id: Int!): SpeedTestRun
 	"""
 	Admin-facing auth status moved to query semantics.
 	"""
@@ -2743,6 +2900,14 @@ enum QueueWaitReason {
 	POST_PROCESSING_CAPACITY
 }
 
+enum ResolvedBy {
+	LITERAL
+	HOST
+	SERVERS
+	PROXY
+	PROXY_SERVERS
+}
+
 type Route {
 	legs: [RouteLeg!]!
 	failover: RouteFailover!
@@ -2933,6 +3098,19 @@ enum RungKind {
 	PROXY
 	POOL
 	CHAIN
+}
+
+enum SabTestSize {
+	MB_100
+	GB_1
+	GB_10
+}
+
+type Sample {
+	atMs: Int!
+	leg: Int!
+	bytes: Float!
+	decodedBytes: Float!
 }
 
 type Schedule {
@@ -3925,6 +4103,81 @@ type ServiceLogsPayload {
 	count: Int!
 }
 
+type SpeedTestFailure {
+	code: SpeedTestFailureCode!
+	message: String!
+	params: JSON!
+}
+
+enum SpeedTestFailureCode {
+	RATE_LIMITED
+	HTTP_STATUS
+	TLS_VERIFICATION
+	UNRESOLVED
+	ADDRESS_NOT_ALLOWED
+	EGRESS_QUOTA_USED
+	NO_LEG_UP
+	LEASE_REFUSED
+	SERVER_LEFT_POOL
+	STOPPED
+	STOPPED_UNEXPECTEDLY
+	NO_BYTES
+	OTHER
+}
+
+input SpeedTestInput {
+	kind: NetworkConsumerKind!
+	id: Int!
+	route: RouteInput
+	overrides: PathOverrideInput
+	bandwidth: BandwidthTestInput
+	usenet: UsenetTestInput
+}
+
+enum SpeedTestKind {
+	BANDWIDTH
+	USENET
+}
+
+type SpeedTestRequest {
+	bandwidth: BandwidthTestRequest
+	usenet: UsenetTestRequest
+}
+
+type SpeedTestResult {
+	bytes: Float!
+	elapsedMs: Int!
+	averageBps: Float!
+	peakBps: Float!
+	legs: [LegResult!]!
+	connections: [ConnectionResult!]!
+	usenet: UsenetResult
+	bandwidth: BandwidthResult
+	samples: [Sample!]!
+}
+
+type SpeedTestRun {
+	id: Int!
+	consumer: String!
+	consumerName: String!
+	kind: SpeedTestKind!
+	request: SpeedTestRequest!
+	status: SpeedTestStatus!
+	phase: String
+	startedAt: Float!
+	finishedAt: Float
+	failure: SpeedTestFailure
+	tested: TestedRoute!
+	result: SpeedTestResult
+}
+
+enum SpeedTestStatus {
+	RUNNING
+	COMPLETED
+	CANCELLED
+	FAILED
+}
+
 input StageNzbUploadInput {
 	nzbUpload: Upload!
 	filename: String
@@ -3991,6 +4244,7 @@ input SubmitNzbInput {
 	nzbUpload: Upload
 	filename: String
 	password: String
+	passwordCandidates: [String!]
 	category: String
 	attributes: [AttributeInput!]
 	clientRequestId: String
@@ -4181,6 +4435,33 @@ type TestConnectionResult {
 	tlsHonorsClientCipherOrder: Boolean
 }
 
+input TestSubjectInput @oneOf {
+	proxy: Int
+	pool: Int
+}
+
+input TestTargetInput {
+	host: String!
+	port: Int!
+}
+
+type TestedLeg {
+	position: Int!
+	egressId: Int!
+	weight: Int!
+	down: Boolean!
+	downReason: String
+	path: LegPath!
+	target: Int!
+}
+
+type TestedRoute {
+	legs: [TestedLeg!]!
+	failover: RouteFailover!
+	overrides: PathOverride!
+	names: [NamedId!]!
+}
+
 enum TimelineSpanState {
 	RUNNING
 	COMPLETE
@@ -4218,6 +4499,36 @@ type UpdateStatus {
 A multipart file upload
 """
 scalar Upload
+
+type UsenetResult {
+	articlesRequested: Int!
+	delivered: Int!
+	missing: Int!
+	failed: Int!
+	declaredBytes: Float!
+	decodedBytes: Float!
+	pipelining: Boolean!
+	tls: Boolean!
+	tlsCipherSuite: String
+}
+
+input UsenetTestInput {
+	sabSize: SabTestSize
+	nzbUrl: String
+	nzbUpload: Upload
+	nzbRunId: Int
+	connections: Int
+	maxDurationSeconds: Int! = 120
+}
+
+type UsenetTestRequest {
+	sabSize: SabTestSize
+	nzbUrl: String
+	nzbFilename: String
+	nzbRunId: Int
+	connections: Int
+	maxDurationSeconds: Int!
+}
 
 type WatchFolderMarkerRename {
 	from: String!
