@@ -30,9 +30,10 @@ fn rev5(data: u16, rec: u16, row: u16, sizes: &[u64]) -> Vec<u8> {
     rev
 }
 
-// A RAR3 recovery volume: parity, then the footer.
+// A RAR3 recovery volume as wide as its data volumes: parity, the footer in
+// place of its last seven bytes.
 fn rev3(data: u8, width: usize) -> Vec<u8> {
-    let mut rev = payload(3, width);
+    let mut rev = payload(3, width - RAR3_FOOTER);
     rev.extend_from_slice(&[data - 1, 0, 0]);
     let crc = crc32(&rev);
     rev.extend_from_slice(&crc.to_le_bytes());

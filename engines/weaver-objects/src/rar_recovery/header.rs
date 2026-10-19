@@ -114,7 +114,9 @@ impl<'a> Reader<'a> {
 
 // A RAR3 recovery volume's footer, its last seven bytes: the counts less
 // one and the CRC32 of everything before the CRC, which the restore checks.
-// Every data volume but the last is as wide as the parity.
+// Every data volume but the last is as long as the recovery volume: RAR
+// reserves the footer's seven bytes at the end of each, so the parity of
+// those zeros gives way to the footer and the restore writes zeros back.
 pub(super) fn rar3(footer: &[u8; RAR3_FOOTER], length: u64) -> Option<Header> {
     let data_count = u32::from(footer[0]) + 1;
     let rec_count = u32::from(footer[1]) + 1;
@@ -122,7 +124,7 @@ pub(super) fn rar3(footer: &[u8; RAR3_FOOTER], length: u64) -> Option<Header> {
     if data_count + rec_count > 255 || position > rec_count {
         return None;
     }
-    let width = length.checked_sub(RAR3_FOOTER as u64)?;
+    let width = length;
     Some(Header {
         data_count,
         rec_count,

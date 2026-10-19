@@ -44,6 +44,11 @@ pub trait Format: Send + Sync {
     fn front(_first_bytes: &[u8]) -> Option<Self::Front> {
         None
     }
+    // Whether the front states the volume's place itself, rather than only
+    // linking it to the volumes beside it.
+    fn states_place(_front: &Self::Front) -> bool {
+        false
+    }
     // The index the fronts of the volumes bound give a volume whose front
     // is `front`: each bound volume by index, with its front when it states
     // one.
@@ -215,28 +220,33 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         }
     }
 
-    // A volume is placed by what its front states, beside what the fronts
-    // of the volumes bound state. Only where the fronts place nothing, as
-    // for a format whose volumes state no place, does a name in the set's
-    // own numbering give its place: a posted name is a label, which a
-    // recovery set may change later, not the volume's identity.
+    // A volume's place is what states it, as the RAR store places one: the
+    // number its front gives, beside what the fronts of the volumes bound
+    // state; else its name in the set's own numbering; and only a volume
+    // that states neither by the fronts it links to beside it, which guess
+    // wrong across a volume not yet bound. A posted name is a label, which
+    // a recovery set may change later, so a stated number outranks it.
     fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
         let bound = self
             .bound
             .iter()
             .map(|volume| (*volume, self.fronts.get(volume)))
             .collect();
-        let placed = F::front(first_bytes).and_then(|front| F::place(&bound, &front));
-        let index = match placed {
-            Some(index) => index,
-            None => F::parse(name)
-                .filter(|candidate| {
-                    self.names
-                        .values()
-                        .next()
-                        .is_some_and(|first| first.same_set(candidate))
-                })?
-                .slot(&self.names)?,
+        let front = F::front(first_bytes);
+        let stated = front.as_ref().is_some_and(F::states_place);
+        let placed = front.and_then(|front| F::place(&bound, &front));
+        let named = F::parse(name)
+            .filter(|candidate| {
+                self.names
+                    .values()
+                    .next()
+                    .is_some_and(|first| first.same_set(candidate))
+            })
+            .and_then(|candidate| candidate.slot(&self.names));
+        let index = match (placed, named) {
+            (Some(index), _) if stated => index,
+            (_, Some(named)) => named,
+            (linked, None) => linked?,
         };
         (!self.bound.contains(&index)).then_some(VolumeIndex(index))
     }

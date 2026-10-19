@@ -6,6 +6,7 @@
 // rebuild them, or too few that cannot. The set is stored, so the member is
 // whole only when every volume is.
 
+use sha2::Digest;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run, try_run};
@@ -158,6 +159,79 @@ async fn rar_rev_rebuilds_one_absent_rar4_volume_from_its_recovery_volume() {
     );
     let scenario = Scenario::new(posted(volumes, &[2], vec![rev]));
     assert_rebuilt(&run_each(&scenario).await, &body, 1);
+}
+
+// A RAR3 recovery volume as RAR writes it beside volumes whose end headers
+// reserve seven zero bytes for it (REVSPACE): the set's parity, as wide as
+// the widest volume, the footer in place of the parity of those zeros.
+fn rar3_rev(volumes: &[&[u8]]) -> Vec<u8> {
+    const FOOTER: usize = 7;
+    let width = volumes.iter().map(|volume| volume.len()).max().unwrap_or(0);
+    let coder = reedsolomon_rs::rar3::Rar3RsCoder::new(1).expect("one recovery volume");
+    let mut column = vec![0u8; volumes.len()];
+    let mut parity = [0u8; 1];
+    let mut rev = Vec::with_capacity(width);
+    for position in 0..width - FOOTER {
+        for (slot, volume) in column.iter_mut().zip(volumes) {
+            *slot = volume.get(position).copied().unwrap_or(0);
+        }
+        coder.encode(&column, &mut parity);
+        rev.push(parity[0]);
+    }
+    rev.extend_from_slice(&[(volumes.len() - 1) as u8, 0, 0]);
+    let crc = crc(&rev);
+    rev.extend_from_slice(&crc.to_le_bytes());
+    rev
+}
+
+// A compressed RAR4 set as RAR writes it, under part numbering, its third
+// volume never posted, beside the one RAR3 recovery volume RAR names
+// `.part1.rev`. Its fronts state no volume number, so the fourth volume is
+// placed by its name, not beside the second it would link to across the
+// hole, and the rebuilt third takes the place its name gives it.
+#[tokio::test]
+async fn rar_rev_rebuilds_an_absent_volume_of_a_compressed_part_numbered_rar4_set() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles"
+    );
+    let volumes: Vec<(String, Vec<u8>)> = (1..=4)
+        .map(|part| {
+            let bytes = std::fs::read(format!("{dir}/rar4_lz_four.part0{part}.rar")).unwrap();
+            (format!("silver.horizon.part{part}.rar"), bytes)
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let rev = Post::plain("silver.horizon.part1.rev", rar3_rev(&bytes));
+    let mut scenario = Scenario::new(posted(volumes, &[2], vec![rev]));
+    // Each volume over a few articles, as a post carries it: the fourth
+    // volume's front reaches the engine before the third is rebuilt.
+    scenario.article = 4096;
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    let member = delivered("compressible.txt");
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec![member.clone()]
+    );
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/expected.json"
+    )))
+    .unwrap();
+    let expected = &oracle["archives"]["rar4_lz_four"]["compressible.txt"];
+    assert_eq!(
+        graph.files[&member].len() as u64,
+        expected["size"].as_u64().unwrap()
+    );
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&graph.files[&member])),
+        expected["sha256"].as_str().unwrap()
+    );
 }
 
 #[tokio::test]

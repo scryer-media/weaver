@@ -37,6 +37,10 @@ impl Format for Rar {
         claim::front_facts(first_bytes, None, Arc::new(KdfCache::new()))
     }
 
+    fn states_place(front: &RarVolumeFacts) -> bool {
+        claim::states_position(front)
+    }
+
     // A front states nothing of whether a volume follows it: that is in the
     // end record, past the front of all but the smallest volume.
     fn place(

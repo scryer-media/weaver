@@ -186,7 +186,7 @@ impl RarStore {
         // numbers is placed by the members that link it to those held,
         // which never fix a position on their own: one member may span
         // every volume, and then it links each to all the others.
-        let stated = facts.is_some_and(|facts| Nameless { facts }.position().is_some());
+        let stated = facts.is_some_and(states_position);
         let named = wanted
             .filter(|_| named)
             .map(|wanted| VolumeIndex(wanted.index()));
@@ -232,6 +232,14 @@ impl RarStore {
             .collect();
         place(facts, &held).map(VolumeIndex)
     }
+}
+
+// Whether a volume's headers state its position: a number, or the first
+// volume's mark. One that states none is placed by its name in the set's
+// numbering before it is placed by the members that link it to its
+// neighbours.
+pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
+    Nameless { facts }.position().is_some()
 }
 
 // The position a volume's headers give it beside the volumes held, by
