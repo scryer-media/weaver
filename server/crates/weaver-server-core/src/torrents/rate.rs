@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-//! The torrents' download rate under the global download limit, laid over
-//! their open sessions.
+//! The torrents' rates under the global limits, laid over their open
+//! sessions.
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use librqbit::Session;
 use librqbit::limits::LimitKind;
 
-/// The download rate torrents may move at, shared between the open
-/// sessions by the same work-conserving predicate that shares the global
-/// limit between usenet and torrents.
+use crate::bandwidth::TorrentRates;
+
+/// The download and upload rates torrents may move at, each shared between
+/// the open sessions by the same work-conserving predicate that shares the
+/// global download limit between usenet and torrents.
 #[derive(Default)]
 pub struct SessionRates {
     state: Mutex<State>,
@@ -19,12 +21,12 @@ pub struct SessionRates {
 
 #[derive(Default)]
 struct State {
-    rate: Option<u64>,
+    rates: TorrentRates,
     sessions: Vec<Weak<Session>>,
 }
 
 impl SessionRates {
-    /// Put the torrents' rate in force on a session that just opened.
+    /// Put the torrents' rates in force on a session that just opened.
     pub fn add(&self, session: &Arc<Session>) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.sessions.push(Arc::downgrade(session));
@@ -34,39 +36,64 @@ impl SessionRates {
     /// What the open sessions downloaded at over the last second, in bytes
     /// per second.
     pub fn download_bps(&self) -> u64 {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state
-            .sessions
+            .open()
             .iter()
-            .filter_map(Weak::upgrade)
-            .map(|session| download_bps(&session))
+            .map(|session| moved(session).download)
             .sum()
     }
 
-    /// Put `rate` in force across the open sessions. `None` is no limit.
-    pub fn set(&self, rate: Option<u64>) {
+    /// Put `rates` in force across the open sessions. `None` is no limit.
+    pub fn set(&self, rates: TorrentRates) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.rate = rate;
+        state.rates = rates;
         state.lay_over();
     }
 }
 
 impl State {
+    // The sessions still open. A closed session stops its tasks, the one that
+    // measures its speed among them, so what it last moved at stays frozen
+    // while anything, a closing tracker announce say, still holds it.
+    fn open(&mut self) -> Vec<Arc<Session>> {
+        self.sessions.retain(|session| {
+            session
+                .upgrade()
+                .is_some_and(|session| !session.cancellation_token().is_cancelled())
+        });
+        self.sessions.iter().filter_map(Weak::upgrade).collect()
+    }
+
     fn lay_over(&mut self) {
-        self.sessions.retain(|session| session.strong_count() > 0);
-        let sessions: Vec<Arc<Session>> = self.sessions.iter().filter_map(Weak::upgrade).collect();
-        let used: Vec<u64> = sessions
-            .iter()
-            .map(|session| download_bps(session))
-            .collect();
-        for (session, rate) in sessions.iter().zip(session_rates(self.rate, &used)) {
-            apply_torrent_rate(session, rate);
+        let sessions = self.open();
+        let used: Vec<Moved> = sessions.iter().map(|session| moved(session)).collect();
+        let download = session_rates(
+            self.rates.download,
+            &used.iter().map(|used| used.download).collect::<Vec<_>>(),
+        );
+        let upload = session_rates(
+            self.rates.upload,
+            &used.iter().map(|used| used.upload).collect::<Vec<_>>(),
+        );
+        for ((session, download), upload) in sessions.iter().zip(download).zip(upload) {
+            apply_torrent_rates(session, TorrentRates { download, upload });
         }
     }
 }
 
-fn download_bps(session: &Session) -> u64 {
-    session.stats_snapshot().download_speed.as_bytes()
+// What a session moved at over the last second, in bytes per second.
+struct Moved {
+    download: u64,
+    upload: u64,
+}
+
+fn moved(session: &Session) -> Moved {
+    let stats = session.stats_snapshot();
+    Moved {
+        download: stats.download_speed.as_bytes(),
+        upload: stats.upload_speed.as_bytes(),
+    }
 }
 
 /// Each session's share of `rate`, given what each moved at. The sessions
@@ -89,18 +116,28 @@ pub fn session_rates(rate: Option<u64>, used: &[u64]) -> Vec<Option<u64>> {
         .collect()
 }
 
-/// Put `rate` in force on `session`'s downloads. `None` is no limit, and
-/// zero closes them: nothing moves until the rate opens again.
+/// Put `rates` in force on `session`'s downloads and uploads. `None` is no
+/// limit, and zero closes that direction: nothing moves until the rate opens
+/// again.
 ///
-/// The session's limiter is read on every block request, so the rate is live
-/// on the session as it is: nothing is rebuilt or reattached, and the
-/// limiter is replaced only when the rate changes, since replacing it starts
-/// a fresh burst.
-pub fn apply_torrent_rate(session: &Session, rate: Option<u64>) {
-    let kind = LimitKind::from(rate.map(|rate| u32::try_from(rate).unwrap_or(u32::MAX)));
-    if session.ratelimits.get_download_bps() != kind {
-        session.ratelimits.set_download_bps(kind);
+/// The session's limiters are read on every block requested and sent, so a
+/// rate is live on the session as it is: nothing is rebuilt or reattached,
+/// and a limiter is replaced only when its rate changes, since replacing it
+/// starts a fresh burst.
+pub fn apply_torrent_rates(session: &Session, rates: TorrentRates) {
+    let limits = &session.ratelimits;
+    let download = limit(rates.download);
+    if limits.get_download_bps() != download {
+        limits.set_download_bps(download);
     }
+    let upload = limit(rates.upload);
+    if limits.get_upload_bps() != upload {
+        limits.set_upload_bps(upload);
+    }
+}
+
+fn limit(rate: Option<u64>) -> LimitKind {
+    LimitKind::from(rate.map(|rate| u32::try_from(rate).unwrap_or(u32::MAX)))
 }
 
 #[cfg(test)]
@@ -123,5 +160,82 @@ mod tests {
         assert_eq!(rates, vec![Some(1_000_000), Some(500_000)]);
         let rates = session_rates(Some(1_000_000), &[500_000, 500_000]);
         assert_eq!(rates, vec![Some(500_000), Some(500_000)]);
+    }
+
+    async fn session(dir: &std::path::Path) -> Arc<Session> {
+        Session::new_with_opts(
+            dir.to_path_buf(),
+            librqbit::SessionOptions {
+                dht: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: None,
+                persistence: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn limits(session: &Session) -> (Option<u32>, Option<u32>) {
+        (
+            session.ratelimits.get_download_bps().into(),
+            session.ratelimits.get_upload_bps().into(),
+        )
+    }
+
+    fn both(download: Option<u64>, upload: Option<u64>) -> TorrentRates {
+        TorrentRates { download, upload }
+    }
+
+    #[tokio::test]
+    async fn both_rates_are_shared_over_the_open_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let rates = SessionRates::default();
+        let one = session(&dir.path().join("one")).await;
+        rates.add(&one);
+        assert_eq!(limits(&one), (None, None));
+
+        rates.set(both(Some(1_000_000), Some(400_000)));
+        assert_eq!(limits(&one), (Some(1_000_000), Some(400_000)));
+
+        let two = session(&dir.path().join("two")).await;
+        rates.add(&two);
+        assert_eq!(limits(&one), (Some(500_000), Some(200_000)));
+        assert_eq!(limits(&two), (Some(500_000), Some(200_000)));
+
+        // An upload limit of zero closes the uploads alone.
+        rates.set(both(None, Some(0)));
+        assert_eq!(limits(&one), (None, Some(0)));
+        assert_eq!(limits(&two), (None, Some(0)));
+        rates.set(both(None, None));
+        assert_eq!(limits(&one), (None, None));
+        assert_eq!(limits(&two), (None, None));
+
+        one.stop().await;
+        two.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_still_held_takes_no_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let rates = SessionRates::default();
+        let one = session(&dir.path().join("one")).await;
+        let two = session(&dir.path().join("two")).await;
+        rates.add(&one);
+        rates.add(&two);
+        rates.set(both(Some(1_000_000), Some(400_000)));
+        assert_eq!(limits(&one), (Some(500_000), Some(200_000)));
+
+        // Closed, yet still referenced: the open session gets the whole of
+        // both rates, and the closed one is left as it was.
+        two.cancellation_token().cancel();
+        rates.set(both(Some(800_000), Some(300_000)));
+        assert_eq!(limits(&one), (Some(800_000), Some(300_000)));
+        assert_eq!(limits(&two), (Some(500_000), Some(200_000)));
+        assert_eq!(rates.download_bps(), 0);
+
+        one.stop().await;
     }
 }

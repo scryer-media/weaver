@@ -149,6 +149,15 @@ pub struct SplitRates {
     pub torrent: Option<u64>,
 }
 
+// The rates torrents move at, one per direction: their side of the download
+// split, and the whole upload limit, since usenet uploads nothing. `None` is
+// no limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TorrentRates {
+    pub download: Option<u64>,
+    pub upload: Option<u64>,
+}
+
 // The split as it stands, as the API shows it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SplitState {
@@ -424,6 +433,29 @@ mod tests {
         );
         let (moved, _) = sim.tick(both(u64::MAX, u64::MAX));
         assert_eq!(moved.usenet + moved.torrent, 100 * MB);
+    }
+
+    #[test]
+    fn a_borrower_that_goes_idle_hands_the_lent_share_back_on_the_next_tick() {
+        for pct in [20, 50, 80] {
+            let mut sim = Sim::new(100 * MB, split(pct));
+            for _ in 0..3 {
+                sim.tick(both(0, u64::MAX));
+            }
+            assert_eq!(sim.rates.torrent, Some(100 * MB), "{pct}%");
+            // Holding the whole limit while moving nothing is no demand.
+            let (_, rates) = sim.tick(both(0, 0));
+            let [usenet, torrent] = BandwidthSplit::new(pct).unwrap().shares(100 * MB);
+            let shares = SplitRates {
+                usenet: Some(usenet),
+                torrent: Some(torrent),
+            };
+            assert_eq!(rates, shares, "{pct}%");
+            let (_, rates) = sim.tick(both(0, 0));
+            assert_eq!(rates, shares, "{pct}%");
+        }
+        // The same for the sessions sharing the torrents' rate.
+        assert_eq!(share_out(90, &[30, 30, 30], &[0, 0, 0]), vec![30, 30, 30]);
     }
 
     #[test]

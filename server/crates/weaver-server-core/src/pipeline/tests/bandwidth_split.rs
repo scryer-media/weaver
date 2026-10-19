@@ -9,18 +9,18 @@ use super::*;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64 as StdAtomicU64;
 
-use crate::bandwidth::{BandwidthSplit, ScheduleAction, SplitRates, SplitState};
+use crate::bandwidth::{BandwidthSplit, ScheduleAction, SplitRates, SplitState, TorrentRates};
 use crate::jobs::handle::TorrentRate;
 use crate::jobs::{HoldOwner, HoldSet};
 
 const MB: u64 = 1_000_000;
 
-// Torrents downloading at a rate the test sets, recording the rate they are
-// given.
+// Torrents downloading at a rate the test sets, recording the rates they
+// are given.
 #[derive(Default)]
 struct Torrents {
     used: StdAtomicU64,
-    given: StdMutex<Vec<Option<u64>>>,
+    given: StdMutex<Vec<TorrentRates>>,
 }
 
 impl TorrentRate for Torrents {
@@ -28,14 +28,22 @@ impl TorrentRate for Torrents {
         self.used.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn set_download_rate(&self, rate: Option<u64>) {
-        self.given.lock().unwrap().push(rate);
+    fn set_rates(&self, rates: TorrentRates) {
+        self.given.lock().unwrap().push(rates);
     }
 }
 
 impl Torrents {
+    fn rates(&self) -> TorrentRates {
+        *self.given.lock().unwrap().last().expect("rates were given")
+    }
+
     fn given(&self) -> Option<u64> {
-        *self.given.lock().unwrap().last().expect("a rate was given")
+        self.rates().download
+    }
+
+    fn downloading(&self, used: u64) {
+        self.used.store(used, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -49,6 +57,25 @@ fn bandwidth(download_bps: Option<u64>, usenet_pct: Option<u8>) -> crate::proxie
         upload_bps: None,
         split: usenet_pct.and_then(split),
     }
+}
+
+fn speed_limit(download: Option<u64>, upload: Option<u64>) -> ScheduleAction {
+    ScheduleAction::SpeedLimit {
+        limits: vec![crate::bandwidth::SpeedLimitChange {
+            target: crate::bandwidth::SpeedTarget::Global,
+            bytes_per_sec: download,
+            upload_bytes_per_sec: upload,
+        }],
+    }
+}
+
+async fn seated(temp_dir: &tempfile::TempDir) -> (Pipeline, Arc<Torrents>) {
+    let (pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    let torrents = Arc::new(Torrents::default());
+    pipeline
+        .shared_state
+        .seat_torrent_rate(Arc::clone(&torrents) as Arc<dyn TorrentRate>);
+    (pipeline, torrents)
 }
 
 async fn set_bandwidth(pipeline: &mut Pipeline, bandwidth: crate::proxies::Bandwidth) {
@@ -180,6 +207,93 @@ async fn editing_the_limit_keeps_a_scheduled_split_and_setting_a_split_lifts_it(
     set_bandwidth(&mut pipeline, bandwidth(Some(200 * MB), Some(60))).await;
     assert_eq!(rates(&pipeline, &torrents), (Some(120 * MB), Some(80 * MB)));
     assert_eq!(pipeline.shared_state.bandwidth_split().in_force, split(60));
+}
+
+#[tokio::test]
+async fn the_whole_upload_limit_is_the_torrents() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, torrents) = seated(&temp_dir).await;
+
+    // The operator's upload limit reaches the torrents whole, beside their
+    // side of the download split.
+    set_bandwidth(
+        &mut pipeline,
+        crate::proxies::Bandwidth {
+            upload_bps: Some(3 * MB),
+            ..bandwidth(Some(100 * MB), Some(80))
+        },
+    )
+    .await;
+    assert_eq!(
+        torrents.rates(),
+        TorrentRates {
+            download: Some(20 * MB),
+            upload: Some(3 * MB),
+        }
+    );
+    // The bandwidth tick keeps it in force.
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(torrents.rates().upload, Some(3 * MB));
+
+    // A speed rule's upload limit lowers it, and a looser one does not lift
+    // it past the operator's.
+    schedule(&mut pipeline, speed_limit(None, Some(MB))).await;
+    assert_eq!(torrents.rates().upload, Some(MB));
+    schedule(&mut pipeline, speed_limit(None, Some(9 * MB))).await;
+    assert_eq!(torrents.rates().upload, Some(3 * MB));
+
+    // An upload limit of zero is passed on as zero.
+    schedule(&mut pipeline, speed_limit(None, Some(0))).await;
+    assert_eq!(torrents.rates().upload, Some(0));
+
+    // With no upload limit anywhere, the torrents upload unlimited.
+    set_bandwidth(&mut pipeline, bandwidth(Some(100 * MB), Some(80))).await;
+    assert_eq!(torrents.rates().upload, None);
+    schedule(&mut pipeline, speed_limit(Some(10 * MB), Some(2 * MB))).await;
+    assert_eq!(
+        torrents.rates(),
+        TorrentRates {
+            download: Some(2 * MB),
+            upload: Some(2 * MB),
+        }
+    );
+    // A speed rule with no upload limit lifts the scheduled one.
+    schedule(&mut pipeline, speed_limit(Some(10 * MB), None)).await;
+    assert_eq!(torrents.rates().upload, None);
+}
+
+#[tokio::test]
+async fn the_published_split_settles_back_to_the_shares_once_both_sides_idle() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, torrents) = seated(&temp_dir).await;
+    let shares = SplitRates {
+        usenet: Some(80 * MB),
+        torrent: Some(20 * MB),
+    };
+    set_bandwidth(&mut pipeline, bandwidth(Some(100 * MB), Some(80))).await;
+    assert_eq!(pipeline.shared_state.bandwidth_split().rates, shares);
+
+    // Torrents busy while usenet idles: they are lent the whole limit.
+    torrents.downloading(20 * MB);
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(
+        pipeline.shared_state.bandwidth_split().rates.torrent,
+        Some(100 * MB)
+    );
+    torrents.downloading(100 * MB);
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(
+        pipeline.shared_state.bandwidth_split().rates.torrent,
+        Some(100 * MB)
+    );
+
+    // Both idle: the next tick hands the lent limit back.
+    torrents.downloading(0);
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(pipeline.shared_state.bandwidth_split().rates, shares);
+    assert_eq!(torrents.given(), Some(20 * MB));
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(pipeline.shared_state.bandwidth_split().rates, shares);
 }
 
 // What a hold set stops: usenet downloads, torrent downloads, seeding.

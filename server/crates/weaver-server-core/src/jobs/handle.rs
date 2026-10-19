@@ -872,12 +872,12 @@ impl HoldSet {
     }
 }
 
-// The torrent side of the global download limit.
+// The torrent side of the global limits.
 pub trait TorrentRate: Send + Sync {
     // What torrents downloaded at over the last second, in bytes per second.
     fn download_bps(&self) -> u64;
-    // Put the torrents' download rate in force. `None` is no limit.
-    fn set_download_rate(&self, rate: Option<u64>);
+    // Put the torrents' download and upload rates in force.
+    fn set_rates(&self, rates: crate::bandwidth::TorrentRates);
 }
 
 // Splice `job_id` to its new position in the manual queue order. Pure so the

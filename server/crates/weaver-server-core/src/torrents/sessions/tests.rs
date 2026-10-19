@@ -431,7 +431,10 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
         .await
         .unwrap();
     assert_eq!(rate(&one), None);
-    sessions.rates().set(Some(1_000_000));
+    sessions.rates().set(crate::bandwidth::TorrentRates {
+        download: Some(1_000_000),
+        upload: None,
+    });
     assert_eq!(rate(&one), Some(1_000_000));
 
     let two = sessions
@@ -442,9 +445,15 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
     assert_eq!(sessions.rates().download_bps(), 0);
 
     // Nothing closes the sessions.
-    sessions.rates().set(Some(0));
+    sessions.rates().set(crate::bandwidth::TorrentRates {
+        download: Some(0),
+        upload: None,
+    });
     assert_eq!((rate(&one), rate(&two)), (Some(0), Some(0)));
-    sessions.rates().set(None);
+    sessions.rates().set(crate::bandwidth::TorrentRates {
+        download: None,
+        upload: None,
+    });
     assert_eq!((rate(&one), rate(&two)), (None, None));
     sessions.stop_all().await;
 }

@@ -343,9 +343,10 @@ impl Pipeline {
         self.scheduled_split.or(self.configured_bandwidth.split)
     }
 
-    // Put the global download rate in force, shared between usenet and
-    // torrents by the split in force from what each moved at over the last
-    // tick. Run on every change to the limit or the split and on the
+    // Put the global rates in force: the download rate shared between
+    // usenet and torrents by the split in force from what each moved at over
+    // the last tick, and the upload rate, all of it the torrents' since usenet
+    // uploads nothing. Run on every change to a limit or the split and on the
     // bandwidth tick, so the shares follow throughput.
     pub(crate) fn apply_global_rate(&mut self) {
         let cap = self.global_rate(crate::bandwidth::Direction::Download);
@@ -371,7 +372,10 @@ impl Pipeline {
             self.rate_limiter.set_rate(rates.usenet);
         }
         if let Some(torrents) = torrents {
-            torrents.set_download_rate(rates.torrent);
+            torrents.set_rates(crate::bandwidth::TorrentRates {
+                download: rates.torrent,
+                upload: self.global_rate(crate::bandwidth::Direction::Upload),
+            });
         }
         self.shared_state
             .set_bandwidth_split(crate::bandwidth::SplitState {

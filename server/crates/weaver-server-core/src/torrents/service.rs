@@ -2284,9 +2284,9 @@ impl TorrentRate for Seat {
             .map_or(0, |inner| inner.sessions.rates().download_bps())
     }
 
-    fn set_download_rate(&self, rate: Option<u64>) {
+    fn set_rates(&self, rates: crate::bandwidth::TorrentRates) {
         if let Some(inner) = self.0.upgrade() {
-            inner.sessions.rates().set(rate);
+            inner.sessions.rates().set(rates);
         }
     }
 }
