@@ -219,10 +219,13 @@ fn binds(ip: IpAddr) -> bool {
     TcpListener::bind(SocketAddr::new(ip, 0)).is_ok()
 }
 
-/// How the session treats peer encryption. Nothing at this librqbit: the
-/// fork's `SessionOptions::encryption`, a `librqbit::EncryptionPolicy`, is
-/// set here from `policy`.
-fn apply_encryption(_options: &mut SessionOptions, _policy: TorrentEncryption) {}
+/// How the session treats peer encryption.
+fn apply_encryption(options: &mut SessionOptions, policy: TorrentEncryption) {
+    options.encryption = match policy {
+        TorrentEncryption::Prefer => librqbit::EncryptionPolicy::Prefer,
+        TorrentEncryption::Require => librqbit::EncryptionPolicy::Require,
+    };
+}
 
 /// The options of a session on `leg`, listening on `port` when it listens.
 pub fn session_options(

@@ -2259,12 +2259,11 @@ fn top_priority(value: &str) -> bool {
 }
 
 // The pieces the session starts from, so it does not check the files.
-// Nothing at this librqbit: the fork's `AddTorrentOptions::initial_have` is
-// set here, `options.initial_have = Some(have)`.
 fn apply_initial_have(
-    _options: &mut AddTorrentOptions,
-    _have: bitvec::boxed::BitBox<u8, bitvec::order::Msb0>,
+    options: &mut AddTorrentOptions,
+    have: bitvec::boxed::BitBox<u8, bitvec::order::Msb0>,
 ) {
+    options.initial_have = Some(have);
 }
 
 // Why a session refusal leaves a torrent without one.

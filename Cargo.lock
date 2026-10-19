@@ -1814,7 +1814,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3239,7 +3239,7 @@ dependencies = [
 [[package]]
 name = "librqbit"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3302,7 +3302,7 @@ dependencies = [
 [[package]]
 name = "librqbit-bencode"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -3318,7 +3318,7 @@ dependencies = [
 [[package]]
 name = "librqbit-buffers"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "bytes",
  "librqbit-clone-to-owned",
@@ -3329,7 +3329,7 @@ dependencies = [
 [[package]]
 name = "librqbit-clone-to-owned"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "bytes",
 ]
@@ -3337,7 +3337,7 @@ dependencies = [
 [[package]]
 name = "librqbit-core"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3366,7 +3366,7 @@ dependencies = [
 [[package]]
 name = "librqbit-dht"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "anyhow",
  "backon",
@@ -3413,7 +3413,7 @@ dependencies = [
 [[package]]
 name = "librqbit-lsd"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "anyhow",
  "atoi 3.1.1",
@@ -3432,7 +3432,7 @@ dependencies = [
 [[package]]
 name = "librqbit-peer-protocol"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -3452,7 +3452,7 @@ dependencies = [
 [[package]]
 name = "librqbit-sha1-wrapper"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "assert_cfg",
  "aws-lc-rs",
@@ -3461,7 +3461,7 @@ dependencies = [
 [[package]]
 name = "librqbit-tracker-comms"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3489,7 +3489,7 @@ dependencies = [
 [[package]]
 name = "librqbit-upnp"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=c3466968bf94b556211ab670ec5ba3cadf444681#c3466968bf94b556211ab670ec5ba3cadf444681"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=f65331486010e3460345f0fcf0a41dd4c4cb3248#f65331486010e3460345f0fcf0a41dd4c4cb3248"
 dependencies = [
  "anyhow",
  "bstr",
@@ -5476,7 +5476,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a481130a6f913ccb75deb9105b1eafdfbbe78d654cd41fff2407c2ff226562de"
 dependencies = [
  "aws-lc-rs",
- "brotli 9.0.0",
+ "brotli 8.0.4",
  "bzip2",
  "cap-std",
  "flate2",
