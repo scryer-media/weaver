@@ -1221,11 +1221,14 @@ func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t 
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("WEAVER_RAR_DIRECT_STORE", "1")
+	t.Setenv(weaverEngineEnv, "")
 	assertion := &ScenarioDirectStoreAssertion{
 		ExpectedDemotionReason:           "member_malformed_chain",
 		RequireRoutedByteMaterialization: true,
 		ForbidVolumeRefetch:              true,
 	}
+	scenario := &Scenario{Slug: "direct-store-malformed-chain", RuntimeAssertions: &ScenarioRuntimeAssertions{DirectStore: assertion}}
 
 	for _, test := range []struct {
 		name    string
@@ -1261,7 +1264,7 @@ func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t 
 			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			err := assertDirectStoreScenario(81, assertion)
+			err := assertDirectStoreScenario(81, scenario)
 			if test.wantErr == "" && err != nil {
 				t.Fatalf("assertion failed: %v", err)
 			}

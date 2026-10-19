@@ -48,7 +48,7 @@ func cmdChaosTest() {
 	var scenarios []*Scenario
 	for _, s := range allScenarios {
 		// Only use scenarios that expect success — skip error/failure scenarios
-		if s.ExpectedOutcome == "success" || s.ExpectedOutcome == "repair_then_success" {
+		if s.expectedOutcome() == "success" || s.expectedOutcome() == "repair_then_success" {
 			scenarios = append(scenarios, s)
 		}
 	}
@@ -534,7 +534,7 @@ func cmdTcpChaosTest() {
 	// Load canonical success-path scenarios
 	var scenarios []*Scenario
 	for _, s := range loadCanonicalScenarios() {
-		if s.ExpectedOutcome == "success" || s.ExpectedOutcome == "repair_then_success" {
+		if s.expectedOutcome() == "success" || s.expectedOutcome() == "repair_then_success" {
 			scenarios = append(scenarios, s)
 		}
 	}
@@ -905,8 +905,8 @@ func cmdAdaptiveDispatchTest() {
 	if err != nil {
 		log.Fatalf("load adaptive-dispatch scenario %s: %v", scenarioSlug, err)
 	}
-	if scenario.ExpectedOutcome != "success" {
-		log.Fatalf("adaptive-dispatch scenario %s must be a success-path fixture, got %q", scenario.Slug, scenario.ExpectedOutcome)
+	if scenario.expectedOutcome() != "success" {
+		log.Fatalf("adaptive-dispatch scenario %s must be a success-path fixture, got %q", scenario.Slug, scenario.expectedOutcome())
 	}
 	if err := seedFixtureWithRetry(scenarioDir, envInt("ADAPTIVE_DISPATCH_SEED_RETRIES", 3)); err != nil {
 		log.Fatalf("seed adaptive-dispatch scenario %s: %v", scenario.Slug, err)

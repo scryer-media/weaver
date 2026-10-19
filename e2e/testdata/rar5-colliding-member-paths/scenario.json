@@ -3,5 +3,12 @@
   "title": "E2E.Test.RAR5.CollidingMemberPaths.2026.1080p-TESTGRP",
   "description": "One stored RAR5 whose two members differ only by case (CERTIFICATE/BACKUP/id.bdmv and CERTIFICATE/backup/id.bdmv). Extraction folds case before it writes, so the archive is refused at open; the job must fail promptly with that refusal instead of re-scheduling the same member forever.",
   "category": "2000",
-  "expected_outcome": "extraction_failure"
+  "expected_outcome": "extraction_failure",
+  "expectedOutcomeByEngine": {
+    "graph": "success"
+  },
+  "expectedOutputBLAKE3": {
+    "CERTIFICATE/BACKUP/id.bdmv": "e01c256bf6dbe7d4820c23d094a2875e04e3e9da1d5e2bc4eccd8b1c4074211d",
+    "CERTIFICATE/backup/id (1).bdmv": "eb1a449fe0a827e2582e9146d02e6f12d5f2ed0c7c579cbc4557f985af558586"
+  }
 }

@@ -65,9 +65,14 @@ type fileIdentityRewriteObservation struct {
 	ObservedCurrentFilenames     []string
 }
 
+// fileIdentityRewriteObserver reads how weaver named a job's files. The classic
+// engine records it in active_file_identities, which a trigger mirrors so the
+// rows survive the job's archive; the graph engine logs it, and an observer
+// opened under graph holds the weaver log as it stood when opened.
 type fileIdentityRewriteObserver struct {
 	db        *sql.DB
 	datastore weaverDatastore
+	graphLog  *string
 }
 
 func localWeaverDBPath() string {
@@ -75,6 +80,10 @@ func localWeaverDBPath() string {
 }
 
 func installFileIdentityRewriteObserver(dbPath string) error {
+	if engineUnderTest() == engineGraph {
+		// The graph writes no active_file_identities row to mirror.
+		return nil
+	}
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("open weaver state db: %w", err)
@@ -94,6 +103,14 @@ func installFileIdentityRewriteObserver(dbPath string) error {
 }
 
 func openFileIdentityRewriteObserver(dbPath string) (*fileIdentityRewriteObserver, error) {
+	if engineUnderTest() == engineGraph {
+		raw, err := os.ReadFile(localWeaverLogPath())
+		if err != nil {
+			return nil, fmt.Errorf("read weaver log: %w", err)
+		}
+		graphLog := string(raw)
+		return &fileIdentityRewriteObserver{graphLog: &graphLog}, nil
+	}
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open weaver state db: %w", err)
@@ -105,7 +122,11 @@ func openFileIdentityRewriteObserver(dbPath string) (*fileIdentityRewriteObserve
 }
 
 func (o *fileIdentityRewriteObserver) Close() error {
-	if o == nil || o.db == nil {
+	if o == nil {
+		return nil
+	}
+	o.graphLog = nil
+	if o.db == nil {
 		return nil
 	}
 	db := o.db
@@ -118,8 +139,14 @@ func (o *fileIdentityRewriteObserver) Observe(
 	jobID int,
 	assertion *ScenarioFileIdentityRewriteAssertion,
 ) (fileIdentityRewriteObservation, error) {
-	if o == nil || o.db == nil {
+	switch {
+	case o == nil || (o.db == nil && o.graphLog == nil):
 		return newFileIdentityRewriteObservation(assertion), fmt.Errorf("file identity rewrite observer is closed")
+	case o.graphLog != nil:
+		if jobID <= 0 {
+			return newFileIdentityRewriteObservation(assertion), nil
+		}
+		return graphFileIdentityRewrite(*o.graphLog, jobID, assertion), nil
 	}
 	return evaluateActiveFileIdentityRewrite(o.db, o.datastore, jobID, assertion)
 }
@@ -698,14 +725,14 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 				return "PAR2_SETTLEMENT_ERROR", err.Error()
 			}
 		}
-		if err == nil && directStoreEnabledForPhase() && scenario.directStoreAssertion() != nil {
-			if err := assertDirectStoreScenario(jobID, scenario.directStoreAssertion()); err != nil {
+		if err == nil && scenario.directStoreAssertion() != nil {
+			if err := assertDirectStoreScenario(jobID, scenario); err != nil {
 				log.Printf("  %s: direct-store runtime assertion failed after %s: %v", slug, status, err)
 				return "DIRECT_STORE_ASSERTION_ERROR", err.Error()
 			}
 		}
 		if err == nil && scenario.directUnpackAssertion() != nil {
-			if err := assertDirectUnpackScenario(jobID, scenario.directUnpackAssertion()); err != nil {
+			if err := assertDirectUnpackScenario(dbPath, jobID, scenario.directUnpackAssertion()); err != nil {
 				log.Printf("  %s: direct-unpack runtime assertion failed after %s: %v", slug, status, err)
 				return "DIRECT_UNPACK_ASSERTION_ERROR", err.Error()
 			}
@@ -859,19 +886,42 @@ func splitWeaverLogLine(clean string) (level string, payload string) {
 	return level, payload
 }
 
-func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertion) error {
+// assertDirectStoreScenario judges a scenario's direct-store assertion by the
+// engine under test. Classic judges it only in a phase that ran with the
+// direct-store gate on; the graph has no gate and always routes stored
+// members, so it is always judged there.
+func assertDirectStoreScenario(jobID int, scenario *Scenario) error {
+	assertion := scenario.directStoreAssertion()
 	if assertion == nil {
+		return nil
+	}
+	engine := engineUnderTest()
+	if engine == engineClassic && !directStoreEnabledForPhase() {
 		return nil
 	}
 	raw, err := os.ReadFile(localWeaverLogPath())
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
 	}
+	if engine == engineGraph {
+		localFiles, err := dataFiles(filepath.Join(testdataDir(), scenario.Slug))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("list scenario files: %w", err)
+		}
+		volumes, err := scenarioArchiveVolumes(scenario, localFiles)
+		if err != nil {
+			return err
+		}
+		return graphDirectStoreVerdict(string(raw), jobID, assertion, volumes)
+	}
+	return classicDirectStoreVerdict(string(raw), jobID, assertion)
+}
 
+func classicDirectStoreVerdict(raw string, jobID int, assertion *ScenarioDirectStoreAssertion) error {
 	wantJobID := strconv.Itoa(jobID)
 	seenDemotion := false
 	seenMaterialization := false
-	for _, rawLine := range strings.Split(string(raw), "\n") {
+	for _, rawLine := range strings.Split(raw, "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
 		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
 			continue
@@ -911,13 +961,29 @@ const (
 	directUnpackMemoryYielded = "memory_yielded"
 )
 
-func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssertion) error {
+// assertDirectUnpackScenario judges a direct-unpack assertion by the engine
+// under test: classic by its chase's lines, the graph by its archive objects
+// and deliveries together with the job's output directory.
+func assertDirectUnpackScenario(dbPath string, jobID int, assertion *ScenarioDirectUnpackAssertion) error {
 	if assertion == nil {
 		return nil
 	}
 	raw, err := os.ReadFile(localWeaverLogPath())
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
+	}
+	if engineUnderTest() == engineGraph {
+		outputDir, err := loadJobOutputDir(dbPath, jobID)
+		if err != nil {
+			return err
+		}
+		delivered, err := listOutputFiles(outputDir)
+		if err != nil {
+			return fmt.Errorf("read output directory for job %d: %w", jobID, err)
+		}
+		// No flow that judges runtime assertions relaunches weaver into the
+		// phase's log, so there is no restart point to hand the verdict.
+		return graphDirectUnpackVerdict(string(raw), jobID, assertion, delivered, graphNoRelaunch)
 	}
 	return directUnpackVerdict(string(raw), jobID, assertion, directUnpackEnabledForPhase())
 }
@@ -1017,6 +1083,9 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 	raw, err := os.ReadFile(localWeaverLogPath())
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
+	}
+	if engineUnderTest() == engineGraph {
+		return graphPar2CleanSettlementVerdict(string(raw), jobID, assertion)
 	}
 	wantJobID := strconv.Itoa(jobID)
 	observedModes := make(map[string]string, len(assertion.ExpectedSetVerificationModes))
@@ -1265,19 +1334,9 @@ func assertMaxJobEventCounts(dbPath string, jobID int, maximums map[string]int) 
 }
 
 func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[string]string) error {
-	db, datastore, err := openWeaverStateDB(dbPath)
+	outputDir, err := loadJobOutputDir(dbPath, jobID)
 	if err != nil {
-		return fmt.Errorf("open weaver state db: %w", err)
-	}
-	defer closeWeaverStateDB(db, datastore)
-
-	var outputDir string
-	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
-	if err := db.QueryRow(query, jobID).Scan(&outputDir); err != nil {
-		return fmt.Errorf("load output directory for job %d: %w", jobID, err)
-	}
-	if outputDir == "" {
-		return fmt.Errorf("job %d has no output directory", jobID)
+		return err
 	}
 
 	relativePaths := make([]string, 0, len(expectedByRelativePath))
@@ -1322,29 +1381,31 @@ func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[str
 	return nil
 }
 
-// assertForbiddenOutputPaths fails when the job's completed output still holds
-// a file the scenario says is not part of the release. It is the counterpart of
-// assertOutputBLAKE3: that one says the release is right, this one says nothing
-// the pipeline used along the way was handed over with it — split parts a join
-// consumed, backups a repair wrote, an archive an extraction opened.
-func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) error {
+// loadJobOutputDir is the directory a finished job delivered into, from its
+// history row.
+func loadJobOutputDir(dbPath string, jobID int) (string, error) {
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
-		return fmt.Errorf("open weaver state db: %w", err)
+		return "", fmt.Errorf("open weaver state db: %w", err)
 	}
 	defer closeWeaverStateDB(db, datastore)
 
 	var outputDir string
 	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
 	if err := db.QueryRow(query, jobID).Scan(&outputDir); err != nil {
-		return fmt.Errorf("load output directory for job %d: %w", jobID, err)
+		return "", fmt.Errorf("load output directory for job %d: %w", jobID, err)
 	}
 	if outputDir == "" {
-		return fmt.Errorf("job %d has no output directory", jobID)
+		return "", fmt.Errorf("job %d has no output directory", jobID)
 	}
+	return outputDir, nil
+}
 
+// listOutputFiles is every file under an output directory, as slash-relative
+// paths.
+func listOutputFiles(outputDir string) ([]string, error) {
 	var delivered []string
-	walkErr := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
+	err := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -1358,8 +1419,22 @@ func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) err
 		delivered = append(delivered, filepath.ToSlash(relative))
 		return nil
 	})
-	if walkErr != nil {
-		return fmt.Errorf("read output directory for job %d: %w", jobID, walkErr)
+	return delivered, err
+}
+
+// assertForbiddenOutputPaths fails when the job's completed output still holds
+// a file the scenario says is not part of the release. It is the counterpart of
+// assertOutputBLAKE3: that one says the release is right, this one says nothing
+// the pipeline used along the way was handed over with it — split parts a join
+// consumed, backups a repair wrote, an archive an extraction opened.
+func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) error {
+	outputDir, err := loadJobOutputDir(dbPath, jobID)
+	if err != nil {
+		return err
+	}
+	delivered, err := listOutputFiles(outputDir)
+	if err != nil {
+		return fmt.Errorf("read output directory for job %d: %w", jobID, err)
 	}
 
 	found, err := matchForbiddenOutputPaths(patterns, delivered)
@@ -1471,7 +1546,29 @@ func (a *ScenarioFileIdentityRewriteAssertion) enabled() bool {
 		len(normalizeManifestFilenames(a.ForbiddenCurrentFilenames)) > 0
 }
 
+// fileIdentityRewriteEvidence is where an engine's file identity observation
+// comes from, as the failure message names it: the classic engine's
+// active_file_identities rows, or the graph's log lines.
+type fileIdentityRewriteEvidence struct {
+	// none says no evidence matched; seen prefixes the names that were seen.
+	none, seen string
+}
+
+func fileIdentityRewriteEvidenceOf(engine weaverEngine) fileIdentityRewriteEvidence {
+	if engine == engineGraph {
+		return fileIdentityRewriteEvidence{
+			none: "no matching graph log lines (recovery bound, member delivered, object bound) were observed",
+			seen: "file identities in the graph log",
+		}
+	}
+	return fileIdentityRewriteEvidence{
+		none: "no matching active_file_identities rows were observed",
+		seen: "effective file identity rows",
+	}
+}
+
 func (o fileIdentityRewriteObservation) terminalFailureMessage(status string, lastQueryError string) string {
+	evidence := fileIdentityRewriteEvidenceOf(engineUnderTest())
 	parts := []string{fmt.Sprintf(
 		"job reached %s before file identity rewrite oracle observed",
 		normalizeFacadeState(status),
@@ -1497,10 +1594,10 @@ func (o fileIdentityRewriteObservation) terminalFailureMessage(status string, la
 		}
 	}
 	if len(parts) == 1 {
-		parts = append(parts, "no matching active_file_identities rows were observed")
+		parts = append(parts, evidence.none)
 	}
 	if len(o.ObservedCurrentFilenames) > 0 {
-		parts = append(parts, "effective file identity rows: "+strings.Join(o.ObservedCurrentFilenames, ", "))
+		parts = append(parts, evidence.seen+": "+strings.Join(o.ObservedCurrentFilenames, ", "))
 	}
 	if strings.TrimSpace(lastQueryError) != "" {
 		parts = append(parts, "last oracle query error: "+strings.TrimSpace(lastQueryError))

@@ -190,6 +190,7 @@ type childRunResult struct {
 type phaseRunStatus struct {
 	Phase            string         `json:"phase"`
 	Command          string         `json:"command"`
+	Engine           weaverEngine   `json:"engine"`
 	Datastore        string         `json:"datastore"`
 	Project          string         `json:"project"`
 	RootDir          string         `json:"root_dir"`
@@ -217,6 +218,7 @@ type fullRunManifest struct {
 	OwnerPID  int                 `json:"owner_pid"`
 	StartedAt time.Time           `json:"started_at"`
 	TempRoot  string              `json:"temp_root"`
+	Engine    weaverEngine        `json:"engine"`
 	Phases    []fullRunPhaseEntry `json:"phases"`
 	// KeepStacks records E2E_KEEP_STACKS: the stacks were left up on purpose
 	// and stay up while the bundle is retained.
@@ -804,6 +806,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	if err := writeFullRunManifest(manifestPath, tempRoot, phases); err != nil {
 		log.Fatalf("write full-run manifest: %v", err)
 	}
+	log.Printf("engine under test: %s (%s)", engineUnderTest(), weaverEngineEnv)
 	if err := cleanupAbandonedFullRuns(); err != nil {
 		log.Printf("warning: cleanup abandoned full runs: %v", err)
 	}
@@ -1732,6 +1735,7 @@ func newPhaseRunRecorderAt(
 		state: phaseRunStatus{
 			Phase:            phase.Name,
 			Command:          command,
+			Engine:           engineUnderTest(),
 			Datastore:        normalizedWeaverDatastoreForPhase(phase.Datastore),
 			Project:          phase.Project,
 			RootDir:          phase.RootDir,
@@ -1863,6 +1867,7 @@ func writeFullRunManifest(path, tempRoot string, phases []*fullPhaseContext) err
 		OwnerPID:   os.Getpid(),
 		StartedAt:  time.Now(),
 		TempRoot:   tempRoot,
+		Engine:     engineUnderTest(),
 		Phases:     make([]fullRunPhaseEntry, 0, len(phases)),
 		KeepStacks: envBool("E2E_KEEP_STACKS", false),
 	}

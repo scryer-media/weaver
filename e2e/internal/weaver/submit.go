@@ -129,8 +129,8 @@ func cmdSubmit(slug string) {
 				errMsg = "unknown"
 			}
 			log.Printf("job %d FAILED: %s", jobID, errMsg)
-			if scenario.ExpectedOutcome == "health_failure" {
-				expected := scenario.ExpectedErrorContains
+			if scenario.expectedOutcome() == "health_failure" {
+				expected := scenario.expectedErrorContains()
 				if expected != "" &&
 					!strings.Contains(strings.ToLower(errMsg), strings.ToLower(expected)) {
 					log.Printf("expected the failure to mention %q, got %q", expected, errMsg)

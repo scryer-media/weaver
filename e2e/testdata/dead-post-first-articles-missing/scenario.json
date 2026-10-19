@@ -5,6 +5,9 @@
   "category": "2000",
   "expected_outcome": "health_failure",
   "expectedErrorContains": "first articles are missing",
+  "expectedErrorContainsByEngine": {
+    "graph": "payload file(s) were never delivered and no verification, repair or discard accounts for them"
+  },
   "fixtureAssets": [
     "par2-rar-placement-normalization-multi-swap/fixture_rar5_lz_plain.part1.rar",
     "par2-rar-placement-normalization-multi-swap/fixture_rar5_lz_plain.part2.rar",

@@ -628,6 +628,7 @@ func runTests(slugs []string) {
 	weaverURL := defaultWeaverURL()
 	prepareStandardTestRun(weaverURL, true)
 	emitProgressEvent(progressEvent{Kind: "phase_total", Total: len(slugs), Detail: "functional fixtures"})
+	log.Printf("engine under test: %s (%s)", engineUnderTest(), weaverEngineEnv)
 
 	log.Printf("submitting %d fixtures to weaver at %s...", len(slugs), weaverURL)
 
@@ -947,7 +948,7 @@ func runTests(slugs []string) {
 	passCount, failCount := 0, 0
 	for _, j := range jobs {
 		passed := false
-		switch j.scenario.ExpectedOutcome {
+		switch j.scenario.expectedOutcome() {
 		case "success", "repair_then_success":
 			passed = j.status == "COMPLETE"
 		case "health_failure", "encryption_unsupported", "repair_failure", "extraction_failure":
@@ -962,7 +963,7 @@ func runTests(slugs []string) {
 		// A scenario that names the failure it is testing has to get that
 		// failure: "FAILED" on its own is also what a broken fixture looks like.
 		mismatch := ""
-		if expected := j.scenario.ExpectedErrorContains; passed && expected != "" {
+		if expected := j.scenario.expectedErrorContains(); passed && expected != "" {
 			if !strings.Contains(strings.ToLower(j.errMsg), strings.ToLower(expected)) {
 				passed = false
 				mismatch = fmt.Sprintf(
@@ -982,7 +983,7 @@ func runTests(slugs []string) {
 		} else {
 			passCount++
 		}
-		fmt.Printf("%-25s %-22s %-12s %-8s %s\n", j.slug, j.scenario.ExpectedOutcome, j.status, testJobDurationLabel(j), label)
+		fmt.Printf("%-25s %-22s %-12s %-8s %s\n", j.slug, j.scenario.expectedOutcome(), j.status, testJobDurationLabel(j), label)
 	}
 	fmt.Println(strings.Repeat("-", 78))
 	fmt.Printf("Total: %d passed, %d failed out of %d\n", passCount, failCount, len(jobs))
@@ -1086,7 +1087,24 @@ func fetchDirectStoreCounters(weaverURL string) (directStoreCounters, error) {
 //
 // A no-op when the phase did not enable direct-store: the conventional phases
 // legitimately report zeroes, and asserting there would fail them all.
+//
+// Under graph the same question is asked of the graph's lines instead (see
+// graphDirectStoreEngagementVerdict), with no gate: the graph always reads a
+// store archive in place.
 func assertDirectStoreEngagement(weaverURL string, jobs []testJob) error {
+	if engineUnderTest() == engineGraph {
+		raw, err := os.ReadFile(localWeaverLogPath())
+		if err != nil {
+			return fmt.Errorf("could not read the weaver log to check store engagement: %w", err)
+		}
+		var jobIDs []int
+		for _, job := range jobs {
+			if job.jobID > 0 {
+				jobIDs = append(jobIDs, job.jobID)
+			}
+		}
+		return graphDirectStoreEngagementVerdict(string(raw), jobIDs)
+	}
 	if !directStoreEnabledForPhase() {
 		return nil
 	}
@@ -1246,7 +1264,7 @@ func scenarioAllowsDamageDemotion(scenario *Scenario, reason string) bool {
 	if assertion := scenario.directStoreAssertion(); assertion != nil {
 		return assertion.ExpectedDemotionReason == reason
 	}
-	return damagedFixtureOutcomes[scenario.ExpectedOutcome]
+	return damagedFixtureOutcomes[scenario.expectedOutcome()]
 }
 
 // submittedScenariosByJobID maps job id -> the scenario submitted as that job,

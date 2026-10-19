@@ -281,14 +281,15 @@ type weaverReleasePhase struct {
 }
 
 type weaverReleasePhaseStatus struct {
-	Flow       string    `json:"flow"`
-	Datastore  string    `json:"datastore"`
-	Project    string    `json:"project"`
-	Status     string    `json:"status"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at,omitempty"`
-	DurationMS int64     `json:"duration_ms,omitempty"`
-	Error      string    `json:"error,omitempty"`
+	Flow       string       `json:"flow"`
+	Datastore  string       `json:"datastore"`
+	Project    string       `json:"project"`
+	Engine     weaverEngine `json:"engine"`
+	Status     string       `json:"status"`
+	StartedAt  time.Time    `json:"started_at"`
+	FinishedAt time.Time    `json:"finished_at,omitempty"`
+	DurationMS int64        `json:"duration_ms,omitempty"`
+	Error      string       `json:"error,omitempty"`
 }
 
 type weaverReleasePhaseConfiguration struct {
@@ -766,6 +767,7 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) we
 		Flow:      phase.Flow,
 		Datastore: phase.Datastore,
 		Project:   phase.Project,
+		Engine:    engineUnderTest(),
 		Status:    "running",
 		StartedAt: started.UTC(),
 	}
