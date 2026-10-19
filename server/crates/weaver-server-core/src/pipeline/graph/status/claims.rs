@@ -120,14 +120,14 @@ pub(crate) fn refused<'c>(
 // file as its own claim says. A short file is unrepaired when a recovery
 // object whose repair failed covers it, or covers a short volume it was
 // unpacked from: those are the bytes the repair could not rebuild. A
-// volume of an object refused after announcing a member it never closed is
-// delivered as it stands, never whole, however clean its bytes: the object
-// failed, not the post. So is a member given back for a reason that is
-// never whole (`Why::never_whole`): a volume whose set lost its first
-// bytes is the container it is, not the payload. A member given back for a
-// reason that withholds it (`Why::withholds`) delivered nothing: its bytes
-// are a container nothing opened, neither whole nor short, and stay as they
-// stand.
+// volume an object claimed is never a delivery of its own: what the object
+// closed is. Refused, every volume of its set is delivered as it stands,
+// never whole, however clean its bytes: the object failed, not the post.
+// An object that disclaims a member (`Why::disclaims`) leaves it the
+// posted file, whole when its bytes are.
+// A member given back for a reason that withholds it (`Why::withholds`)
+// delivered nothing: its bytes are a container nothing opened, neither
+// whole nor short, and stay as they stand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delivery {
     pub(crate) whole: Vec<String>,
@@ -155,24 +155,21 @@ pub(crate) struct Delivered {
 
 impl Delivery {
     // `payload` picks the root members that are the post's files,
-    // `furniture` the names whose state never decides a job, and `failed`
-    // the recovery objects whose repair could not rebuild what they found.
-    // `left_open` picks the members given back by an object refused after
-    // announcing a member it never closed, and `refused` says why an object
-    // gave a member back.
+    // `furniture` the names whose state never decides a job, and
+    // `unrepaired` the members a recovery set whose repair could not
+    // rebuild what it found covers, as their namespace says. `refused` says
+    // why a member is a leaf.
     pub(crate) fn read(
         tree: &Tree,
         payload: impl Fn(MemberId) -> bool,
         furniture: impl Fn(&str) -> bool,
-        failed: impl Fn(NodeId) -> bool,
-        left_open: impl Fn(NodeId, MemberId) -> bool,
+        unrepaired: impl Fn(NodeId, MemberId) -> bool,
         refused: impl Fn(NodeId, MemberId) -> Option<Why>,
     ) -> Self {
         let mut walk = Walk {
             tree,
             furniture: &furniture,
-            failed: &failed,
-            left_open: &left_open,
+            unrepaired: &unrepaired,
             refused: &refused,
             opened: BTreeSet::new(),
             delivery: Self::default(),
@@ -186,12 +183,17 @@ impl Delivery {
     }
 
     // How a job that has nothing left to wait for ends: complete when
-    // nothing it hands over is short or withheld, partial when some file is
-    // whole beside what is not, and failed when nothing is whole, for
-    // `failure` when a recovery object could not rebuild what it found, and
-    // otherwise for what was withheld.
+    // nothing it hands over is short or withheld and no recovery object
+    // failed to rebuild what it found, partial when some file is whole
+    // beside what is not, and failed when nothing is whole, for `failure`
+    // when a recovery object could not rebuild what it found, and otherwise
+    // for what was withheld. A failed rebuild is short whether or not a
+    // member carries what it could not rebuild: a file the set describes
+    // and nothing delivered is short too.
     pub(crate) fn status(&self, failure: Option<&str>) -> JobStatus {
-        if self.damaged.is_empty() && self.unrepaired.is_empty() && self.withheld.is_empty() {
+        let short =
+            !(self.damaged.is_empty() && self.unrepaired.is_empty() && self.withheld.is_empty());
+        if !short && failure.is_none() {
             return JobStatus::Complete;
         }
         if !self.whole.is_empty() {
@@ -255,15 +257,14 @@ impl Delivery {
 struct Walk<'t, F, R> {
     tree: &'t Tree,
     furniture: &'t F,
-    failed: &'t R,
-    left_open: &'t dyn Fn(NodeId, MemberId) -> bool,
+    unrepaired: &'t R,
     refused: &'t dyn Fn(NodeId, MemberId) -> Option<Why>,
     // Every volume of a set opens the same namespace; it is read once.
     opened: BTreeSet<NodeId>,
     delivery: Delivery,
 }
 
-impl<F: Fn(&str) -> bool, R: Fn(NodeId) -> bool> Walk<'_, F, R> {
+impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
     // `short` says a volume the member was unpacked from is short where a
     // failed repair covers it.
     fn member(&mut self, node: NodeId, member: &Member, short: bool) {
@@ -284,23 +285,27 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId) -> bool> Walk<'_, F, R> {
 
     // A file of the delivery. Short where a failed repair covers it, it is
     // unrepaired, since that is what left it so; given back for a reason
-    // that withholds it, it is withheld; and otherwise it is whole or
-    // delivered as it stands.
+    // that withholds it, it is withheld; a volume of an object that refused
+    // it is delivered as it stands, unless the object disclaimed it
+    // (`Why::disclaims`); and otherwise it is whole when its bytes are.
     fn leaf(&mut self, node: NodeId, member: &Member, short: bool) {
         let claim = Claim::of(member);
         let name = member.output_name.clone();
-        if claim != Claim::Complete && (short || self.unrepaired(node, member)) {
+        if claim != Claim::Complete && (short || (self.unrepaired)(node, member.id)) {
             self.delivery.unrepaired.push(name);
             return;
         }
-        let refused = (self.refused)(node, member.id);
+        // A member given back that no object has taken since is withheld
+        // by the tree, which holds its parse beside it.
+        let refused =
+            (self.refused)(node, member.id).or_else(|| self.tree.withholds(node, member.id));
         if let Some(why) = refused.filter(|why| why.withholds()) {
             self.delivery.withheld.push((name, why));
             return;
         }
         let whole = claim == Claim::Complete
-            && !(self.left_open)(node, member.id)
-            && !refused.is_some_and(Why::never_whole);
+            && (self.tree.refused_by(node, member.id).is_none()
+                || refused.is_some_and(Why::disclaims));
         let delivery = &mut self.delivery;
         match whole {
             true => delivery.whole.push(name.clone()),
@@ -343,18 +348,9 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId) -> bool> Walk<'_, F, R> {
         volumes
             .values()
             .filter_map(|volume| namespace.get(*volume))
-            .any(|volume| Claim::of(volume) != Claim::Complete && self.unrepaired(parent, volume))
-    }
-
-    // A recovery object whose repair failed covers the member.
-    fn unrepaired(&self, node: NodeId, member: &Member) -> bool {
-        self.tree.recovery_nodes(node).into_iter().any(|object| {
-            (self.failed)(object)
-                && self
-                    .tree
-                    .recovery(object)
-                    .is_some_and(|recovery| recovery.covers(member.id))
-        })
+            .any(|volume| {
+                Claim::of(volume) != Claim::Complete && (self.unrepaired)(parent, volume.id)
+            })
     }
 }
 

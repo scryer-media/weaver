@@ -126,6 +126,7 @@ fn rar_facts_of_another_version_are_refused() {
         kind: Kind::RarStore,
         version: 99,
         bytes: Vec::new(),
+        parts: Vec::new(),
     };
     assert!(matches!(
         crate::restore(&facts),

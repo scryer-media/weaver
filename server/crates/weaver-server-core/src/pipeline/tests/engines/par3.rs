@@ -5,7 +5,10 @@
 // files clean, damaged, lost and short of blocks, under obfuscated names
 // clean and damaged,
 // beside a stored RAR5 set and a stored 7z, beside a PAR2 set describing
-// the same file, and over a member it cannot repair beside a clean one.
+// the same file, and over a member it cannot repair beside a clean one;
+// under graph, over a file the post withholds, under FFT in one cohort and
+// in two uneven ones, carrying its input as Data packets, and beside a
+// second set of the other code.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -13,9 +16,11 @@ use std::io::Cursor;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
 use weaver_graph::recovery::RepairOutcome;
 
+use par3_rs::creation::{CreationCodec, CreationOptions};
+
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, par3_set, payload,
-    repair_and_terminal_events, run, run_both, try_run,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, par3_set, par3_set_with,
+    payload, repair_and_terminal_events, run, run_both, try_run,
 };
 use super::rar::{assert_classic_stalls, delivered, posts};
 use crate::history::HistoryFailureKind;
@@ -524,4 +529,176 @@ async fn a_par2_and_a_par3_set_repairing_different_members_are_announced_once_un
         repair_and_terminal_events(&graph),
         vec!["RepairComplete 2".to_string(), "JobCompleted".to_string()]
     );
+}
+
+// `lantern.bin` under a PAR2 set of one recovery block and a PAR3 set of
+// four, two articles damaged: the PAR2 set cannot rebuild them and the PAR3
+// set does. The member is whole, so the PAR2 shortfall fails nothing, and
+// the graph announces the repair once, with the slices the PAR3 set
+// rebuilt, before the job completes.
+#[tokio::test]
+async fn a_par3_set_repairing_what_a_par2_set_is_short_for_is_announced_once_under_graph() {
+    let lantern = payload(4 * ARTICLE, 74);
+    let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &lantern)], 1));
+    posts.extend(par3_set("lantern", &[("lantern.bin", &lantern)], 4));
+    let scenario = Scenario::new(posts).damaged(0, 1).damaged(0, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(&graph, &[("lantern.bin", &lantern)]);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![
+            Some(RepairOutcome::Impossible {
+                damaged: 2,
+                reachable: 1
+            }),
+            Some(RepairOutcome::Repaired { slices: 2 })
+        ]
+    );
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        vec!["RepairComplete 2".to_string(), "JobCompleted".to_string()]
+    );
+}
+
+// A PAR3 set over `files` built with `codec`, `recovery` blocks.
+fn par3_coded(
+    base: &str,
+    files: &[(&str, &[u8])],
+    codec: CreationCodec,
+    recovery: u64,
+) -> Vec<Post> {
+    let options = CreationOptions {
+        codec,
+        recovery_count: recovery,
+        ..CreationOptions::default()
+    };
+    par3_set_with(base, files, options)
+}
+
+fn assert_repaired_and_announced(graph: &Outcome, outcomes: &[RepairOutcome], slices: u64) {
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let expected: Vec<Option<RepairOutcome>> = outcomes.iter().copied().map(Some).collect();
+    assert_eq!(graph.graph().outcomes, expected);
+    assert_eq!(
+        repair_and_terminal_events(graph),
+        vec![
+            format!("RepairComplete {slices}"),
+            "JobCompleted".to_string()
+        ]
+    );
+}
+
+// `beacon.bin` is described by the set and never posted: the set announces
+// it absent, and the repair writes it whole beside `lantern.bin`.
+#[tokio::test]
+async fn a_file_a_par3_set_describes_and_the_post_withholds_is_rebuilt_under_graph() {
+    let lantern = payload(3 * ARTICLE, 80);
+    let beacon = payload(2 * ARTICLE, 81);
+    let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+    posts.extend(par3_set(
+        "lantern",
+        &[("lantern.bin", &lantern), ("beacon.bin", &beacon)],
+        3,
+    ));
+    let graph = run(&Scenario::new(posts), Engine::Graph).await;
+    assert_delivers(
+        &graph,
+        &[("lantern.bin", &lantern), ("beacon.bin", &beacon)],
+    );
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 2 }], 2);
+}
+
+// A set written under FFT Reed-Solomon, one cohort, two adjacent articles
+// damaged: the FFT recovery blocks are reachable and rebuild them.
+#[tokio::test]
+async fn two_damaged_articles_under_an_fft_par3_set_are_repaired_under_graph() {
+    let lantern = payload(6 * ARTICLE, 82);
+    let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+    let fft = CreationCodec::Fft {
+        capacity_log2: 2,
+        interleave: 0,
+    };
+    posts.extend(par3_coded("lantern", &[("lantern.bin", &lantern)], fft, 4));
+    let scenario = Scenario::new(posts).damaged(0, 1).damaged(0, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(&graph, &[("lantern.bin", &lantern)]);
+    assert_eq!(graph.graph().blocks_reachable, 4);
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 2 }], 2);
+}
+
+// FFT over two interleaved cohorts of uneven size, nine blocks the last a
+// short tail, with damage in both cohorts: each cohort rebuilds its own.
+#[tokio::test]
+async fn damage_in_both_uneven_cohorts_of_an_interleaved_fft_par3_set_is_repaired_under_graph() {
+    let lantern = payload(8 * ARTICLE + 123, 83);
+    let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+    let fft = CreationCodec::Fft {
+        capacity_log2: 1,
+        interleave: 1,
+    };
+    posts.extend(par3_coded("lantern", &[("lantern.bin", &lantern)], fft, 4));
+    let scenario = Scenario::new(posts)
+        .damaged(0, 1)
+        .damaged(0, 4)
+        .damaged(0, 8);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(&graph, &[("lantern.bin", &lantern)]);
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
+}
+
+// A set that carries its input as Data packets, posted without the payload
+// and without its recovery volumes: the set writes the payload whole from
+// the input it carries.
+#[tokio::test]
+async fn a_par3_set_carrying_its_input_rebuilds_the_unposted_payload_under_graph() {
+    let lantern = payload(3 * ARTICLE, 84);
+    let options = CreationOptions {
+        store_data: true,
+        recovery_count: 1,
+        ..CreationOptions::default()
+    };
+    let posts: Vec<Post> = par3_set_with("lantern", &[("lantern.bin", &lantern)], options)
+        .into_iter()
+        .filter(|post| !post.name.contains(".vol"))
+        .collect();
+    assert!(
+        posts.len() > 1,
+        "{:?}",
+        posts.iter().map(|post| &post.name).collect::<Vec<_>>()
+    );
+    let graph = run(&Scenario::new(posts), Engine::Graph).await;
+    assert_delivers(&graph, &[("lantern.bin", &lantern)]);
+    assert_eq!(graph.graph().blocks_reachable, 0);
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
+}
+
+// Two independent sets in one post, one Cauchy and one FFT, each over its
+// own damaged member. Every PAR3 file is a volume of the one object, so its
+// outcome adds both sets' slices, and the job announces them once.
+#[tokio::test]
+async fn a_cauchy_and_an_fft_par3_set_each_repair_their_own_member_under_graph() {
+    let lantern = payload(4 * ARTICLE, 85);
+    let beacon = payload(5 * ARTICLE + 9, 86);
+    let mut posts = vec![
+        Post::plain("lantern.bin", lantern.clone()),
+        Post::plain("beacon.bin", beacon.clone()),
+    ];
+    posts.extend(par3_set("lantern", &[("lantern.bin", &lantern)], 2));
+    let fft = CreationCodec::Fft {
+        capacity_log2: 2,
+        interleave: 0,
+    };
+    posts.extend(par3_coded("beacon", &[("beacon.bin", &beacon)], fft, 4));
+    let scenario = Scenario::new(posts)
+        .damaged(0, 1)
+        .damaged(1, 2)
+        .damaged(1, 3);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(
+        &graph,
+        &[("lantern.bin", &lantern), ("beacon.bin", &beacon)],
+    );
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
 }

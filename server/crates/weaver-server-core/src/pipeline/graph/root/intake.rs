@@ -69,9 +69,21 @@ pub(crate) struct Checksums {
 }
 
 impl Checksums {
+    // The checksums kept for a range are those of the bytes last delivered
+    // there: an article delivered again, cut at other boundaries, replaces
+    // every checksum its range overlaps.
     pub(crate) fn record(&mut self, volume: VolumeIndex, segments: &[Segment]) {
         let kept = self.volumes.entry(volume).or_default();
         for segment in segments {
+            let stale: Vec<u64> = kept
+                .range(..segment.range.end)
+                .rev()
+                .take_while(|(_, kept)| kept.range.end > segment.range.start)
+                .map(|(start, _)| *start)
+                .collect();
+            for start in stale {
+                kept.remove(&start);
+            }
             kept.insert(segment.range.start, *segment);
         }
     }

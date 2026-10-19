@@ -462,6 +462,58 @@ async fn a_server_removed_while_draining_cannot_bypass_its_pool_loan() {
 }
 
 #[tokio::test]
+async fn a_server_whose_connections_drop_while_draining_is_refused_its_loan() {
+    let rig = rig().await;
+    let nntp = NntpFixture::start(vec![], None, None).await;
+    let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+    rig.metrics.set_active_downloads(1);
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let mut revision = rig.service.subscribe();
+    while rig
+        .service
+        .run(started.id)
+        .unwrap()
+        .phase_label()
+        .as_deref()
+        != Some("draining 1")
+    {
+        revision.changed().await.unwrap();
+    }
+    rig.handle
+        .set_nntp_pool(Arc::new(weaver_nntp::pool::NntpPool::new(
+            weaver_nntp::pool::PoolConfig {
+                servers: vec![weaver_nntp::pool::ServerPoolConfig {
+                    stable_id: weaver_nntp::transfer::StableServerId(1),
+                    max_connections: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )));
+    rig.metrics.set_active_downloads(0);
+    let run = finished(&rig, started.id).await;
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert!(
+        matches!(
+            run.error,
+            Some(super::failure::SpeedTestFailure::LeaseRefused { server: 1, .. })
+        ),
+        "{:?}",
+        run.error
+    );
+    assert_eq!(*nntp.connections().borrow(), 0);
+    assert!(!rig.handle.is_globally_paused());
+}
+
+#[tokio::test]
 async fn a_disabled_server_without_live_pool_membership_is_refused() {
     let rig = rig().await;
     let nntp = NntpFixture::start(vec![], None, None).await;

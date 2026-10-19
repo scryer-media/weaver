@@ -66,14 +66,51 @@ pub fn nzb_to_spec(
 
     let password = first_password_candidate(nzb, nzb_path, None);
 
-    let mut files = Vec::with_capacity(nzb.files.len());
-    let mut total_bytes: u64 = 0;
-    let filenames = unique_download_filenames(
-        nzb.files
+    let (files, total_bytes, metadata) = nzb_file_specs(nzb, metadata);
+
+    JobSpec {
+        name,
+        password,
+        files,
+        total_bytes,
+        category,
+        metadata,
+    }
+}
+
+// The files of a job built from `nzb`, their total size, and `metadata` with
+// the record of every file written under a name other than its full one.
+// Every job built from an NZB, first or again, names its files here, so a
+// rebuilt job finds them under the names the first run gave them.
+pub(super) fn nzb_file_specs(
+    nzb: &Nzb,
+    metadata: Vec<(String, String)>,
+) -> (Vec<FileSpec>, u64, Vec<(String, String)>) {
+    let full_names = nzb
+        .files
+        .iter()
+        .map(|nzb_file| {
+            // Prefer the enhanced extraction (handles PRiVATE format, higher confidence).
+            // If the extracted name is obfuscated, keep it - PAR2 deobfuscation will
+            // rename it post-repair using 16KB hash matching.
+            nzb_file
+                .extract_filename()
+                .map(|(name, _confidence)| name)
+                .or_else(|| nzb_file.filename().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+        .collect::<Vec<_>>();
+    let filenames = unique_download_filenames(full_names.iter().map(String::as_str));
+    let metadata = super::append_full_file_names_metadata(
+        metadata,
+        full_names
             .iter()
-            .map(|nzb_file| nzb_file.filename().unwrap_or("unknown")),
+            .map(String::as_str)
+            .zip(filenames.iter().map(String::as_str)),
     );
 
+    let mut files = Vec::with_capacity(nzb.files.len());
+    let mut total_bytes: u64 = 0;
     for (nzb_file, filename) in nzb.files.iter().zip(filenames) {
         let role = FileRole::from_filename(&filename);
 
@@ -101,14 +138,7 @@ pub fn nzb_to_spec(
         });
     }
 
-    JobSpec {
-        name,
-        password,
-        files,
-        total_bytes,
-        category,
-        metadata,
-    }
+    (files, total_bytes, metadata)
 }
 
 pub fn normalize_archive_password_candidate(raw: Option<&str>) -> Option<String> {

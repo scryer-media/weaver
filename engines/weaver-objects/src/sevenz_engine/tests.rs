@@ -228,7 +228,7 @@ fn run(engine: &SevenZipEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
 fn named(names: &[&str]) -> SevenZipEngine {
     let mut engine = SevenZipEngine::new();
     for (volume, name) in names.iter().enumerate() {
-        engine.bound(VolumeIndex(volume as u32), name);
+        engine.bound(VolumeIndex(volume as u32), name, &[]);
     }
     engine
 }
@@ -427,7 +427,7 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     assert_eq!(bids, vec![(1, 1, Purpose::Data), (2, 2, Purpose::Data)]);
 
     seeks.clear();
-    engine.bound(VolumeIndex(3), "set.7z.004");
+    engine.bound(VolumeIndex(3), "set.7z.004", &[]);
     engine.reached(VolumeIndex(1), 0);
     engine.wants(&mut seeks);
     let bids: Vec<_> = seeks

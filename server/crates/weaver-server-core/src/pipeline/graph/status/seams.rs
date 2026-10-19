@@ -107,9 +107,7 @@ fn log_set_rulings(job_id: JobId, job: &GraphJob) {
     let mut rulings = Vec::new();
     for object in RootJob::recovery_summary(job).sets {
         rulings.clear();
-        if let Some(recovery) = job.tree().recovery(object.node) {
-            recovery.sets(&mut rulings);
-        }
+        job.writer().rulings(job.tree(), object.node, &mut rulings);
         for ruling in &rulings {
             let SetRuling {
                 outcome: Some(outcome),
@@ -176,21 +174,22 @@ impl Pipeline {
         true
     }
 
-    // PAR2 and PAR3 files, indexes and volumes alike, are spent once the job
-    // delivers and are not part of the release, so they are left out of it
-    // as a classic job's are. Root members are numbered as the posted files
-    // they are.
+    // PAR2 and PAR3 files, indexes and volumes alike, and the volumes of any
+    // recovery object are spent once the job delivers and are not part of
+    // the release, so they are left out of it as a classic job's are. Root
+    // members are numbered as the posted files they are.
     async fn remove_recovery_volumes(&self, job_id: JobId) {
         let (Some(graph), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id))
         else {
             return;
         };
         for (member, path) in graph.member_files() {
-            let is_recovery = state
-                .spec
-                .files
-                .get(member.0 as usize)
-                .is_some_and(|file| !file.role.counts_toward_health());
+            let is_recovery = graph.spends(member)
+                || state
+                    .spec
+                    .files
+                    .get(member.0 as usize)
+                    .is_some_and(|file| !file.role.counts_toward_health());
             if !is_recovery {
                 continue;
             }
@@ -359,27 +358,28 @@ impl Pipeline {
         let outcomes = summary.outcomes();
         let failure = failure(&summary, &outcomes, job);
         let ignore = self.par2_ignore_extensions();
-        // Root members are numbered as the posted files they are.
+        // Root members are numbered as the posted files they are; one past
+        // them is a file a recovery object announced, which is payload.
         let payload = |member: MemberId| {
             state
                 .spec
                 .files
                 .get(member.0 as usize)
-                .is_some_and(|file| file.role.counts_toward_health())
+                .is_none_or(|file| file.role.counts_toward_health())
         };
-        let failed = |object: NodeId| {
-            failure
-                .as_ref()
-                .is_some_and(|failure| failure.objects.contains(&object))
+        // A set whose repair failed covers the member.
+        let unrepaired = |node: NodeId, member: MemberId| {
+            failure.as_ref().is_some_and(|failure| {
+                job.writer()
+                    .covering(job.tree(), node, member)
+                    .any(|set| failure.objects.contains(&set))
+            })
         };
         let delivery = Delivery::read(
             job.tree(),
             payload,
             |name| par2_damage_ignorable(name, &ignore),
-            failed,
-            // Refused after announcing a member it never closed, which the
-            // tree keeps buried under the member.
-            |node, member| job.tree().left_open(node, member),
+            unrepaired,
             |node, member| job.writer().refused(node, member),
         );
         Some((delivery, failure))
@@ -445,7 +445,7 @@ impl Pipeline {
             let summary = RootJob::recovery_summary(&*graph);
             let outcomes = summary.outcomes();
             metrics::repaired(&summary, &outcomes);
-            if let Some(slices_repaired) = repaired_slices(&outcomes) {
+            if let Some(slices_repaired) = repaired_slices(&summary, &outcomes, &*graph) {
                 self.metrics
                     .job_lifecycle
                     .note_repair(StageOutcomeKind::Complete, u64::from(slices_repaired));

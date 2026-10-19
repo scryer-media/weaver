@@ -44,10 +44,12 @@ mod wire;
 
 pub use deliver::{Delivery, Emit, Provenance, RecoveryKind, Why};
 pub use engine::{Engine, Extraction, Sink, Volumes};
-pub use facts::{Durable, Facts, Restore, RestoreError};
+pub use facts::{
+    Durable, Facts, Part, Restore, RestoreError, Sealed, Shelf, decode_parts, encode_parts,
+};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
-pub use object::{Extent, Kind, Object, ObjectId, Placement};
+pub use object::{Carried, Extent, Kind, Object, ObjectId, Placement, Standing};
 pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
 };

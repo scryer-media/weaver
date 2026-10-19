@@ -69,16 +69,16 @@ pub(crate) fn bootstrap(tree: &Tree, waiting: impl Fn(VolumeIndex) -> bool, wind
 // asked for it, and the repair cannot ask before it decides. The sample asks
 // for the front's first article; this carries on from it, so the first
 // article of every member still leads, and most members decide on it alone.
-// It raises nothing: the order of what is queued stays as it is.
+// A first article that was lost is carried on from too: what follows it
+// tells where the loss ends, and the tree hears its front is gone. It raises
+// nothing: the order of what is queued stays as it is.
 pub(crate) fn fronts(tree: &Tree, map: &mut ArticleMap) {
-    let Some(root) = tree.namespace(NodeId::ROOT) else {
-        return;
-    };
     for member in tree.undecided(NodeId::ROOT) {
-        if root.first_bytes(member).is_empty() {
+        let volume = root_volume(member);
+        if map.head_waiting(volume) {
             continue;
         }
-        map.queue(root_volume(member), ByteRange::new(0, VERDICT_BYTES as u64));
+        map.queue(volume, ByteRange::new(0, VERDICT_BYTES as u64));
     }
 }
 

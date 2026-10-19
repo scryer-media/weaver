@@ -245,7 +245,7 @@ fn nameless_volumes_are_grouped_by_their_headers() {
 fn a_nameless_volume_without_its_predecessor_is_placed_where_it_states() {
     let volumes = write(&items(), &split(Version::Rar5));
     let mut object = store();
-    object.bound(VolumeIndex(0), "c0ffee");
+    object.bound(VolumeIndex(0), "c0ffee", &[]);
     // Volume 2 of the set states its number; volume 1, which nobody holds
     // yet, does not decide where it goes.
     let front = &volumes[2][..4096.min(volumes[2].len())];

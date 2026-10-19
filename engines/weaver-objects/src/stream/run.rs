@@ -12,14 +12,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why};
+use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
 
 use super::{Decoder, Front};
 
 const MEMBER: MemberId = MemberId(0);
 
 // How much decoded output is handed on at once.
-const CHUNK: usize = 64 << 10;
+pub(super) const CHUNK: usize = 64 << 10;
 
 pub(super) struct Run<D> {
     decoder: PhantomData<fn() -> D>,
@@ -67,43 +67,70 @@ impl<D: Decoder> Extraction for Run<D> {
             return;
         }
         let mut again = Front::new(volumes);
-        let damaged = D::damaged(&error, &mut again);
+        let damaged = D::damaged(&error, &mut again)
+            .map(|range| again.place(range))
+            .transpose();
         if again.failure().load(Ordering::Acquire) {
             return;
         }
-        sink(match damaged {
-            Some(range) => Emit::Damaged {
-                volume: VolumeIndex(0),
-                range,
-            },
-            None => Emit::Refuse(why(&error)),
-        });
+        match damaged {
+            Ok(Some(pieces)) if !pieces.is_empty() => {
+                for (volume, range) in pieces {
+                    if !sink(Emit::Damaged { volume, range }) {
+                        return;
+                    }
+                }
+            }
+            _ => {
+                sink(Emit::Refuse(why(&error)));
+            }
+        }
     }
 }
 
-// Decoded bytes to the sink as they come, until the stream ends or the owner
-// stops listening.
+// Decoded bytes to the sink a whole chunk at a time, however little each
+// read of the decoder gives, until the stream ends or fails or the owner
+// stops listening: every emit is a step of the owner's, so only the last is
+// short. What decoded before a failure is said before it.
 fn pump(mut reader: Box<dyn Read + Send>, sink: &mut Sink<'_>) -> io::Result<Ended> {
     let mut buffer = vec![0u8; CHUNK];
     let mut offset = 0u64;
     loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(0) => return Ok(Ended::Whole),
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        };
-        let heard = sink(Emit::Bytes {
-            member: MEMBER,
-            offset,
-            bytes: Bytes::copy_from_slice(&buffer[..read]),
-            provenance: Provenance::Fresh,
-        });
-        if !heard {
-            return Ok(Ended::Stopped);
+        let (filled, failed) = fill(&mut *reader, &mut buffer);
+        if filled > 0 {
+            let heard = sink(Emit::Bytes {
+                member: MEMBER,
+                offset,
+                bytes: Bytes::copy_from_slice(&buffer[..filled]),
+                provenance: Provenance::Fresh,
+            });
+            if !heard {
+                return Ok(Ended::Stopped);
+            }
+            offset += filled as u64;
         }
-        offset += read as u64;
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        if filled < buffer.len() {
+            return Ok(Ended::Whole);
+        }
     }
+}
+
+// As much of `buffer` as the stream holds, short only at its end or where
+// the decoder failed.
+fn fill(reader: &mut dyn Read, buffer: &mut [u8]) -> (usize, Option<io::Error>) {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return (filled, Some(error)),
+        }
+    }
+    (filled, None)
 }
 
 // A stream that asks for more than its reservation, or for something its

@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run, run_both,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::graph::Engine;
 
 // PAR2 names a file by the MD5 of at most this much of its front; damage
 // past it leaves an obfuscated member recognisable by its front.
@@ -276,5 +277,70 @@ async fn a_damaged_obfuscated_member_is_repaired_and_renamed_under_both_engines(
         view.outcomes,
         vec![Some(RepairOutcome::Repaired { slices: 1 })]
     );
+    assert!(claims_all(&view.claims, Claim::Complete));
+}
+
+// Two files posted under each other's names, the set describing them under
+// their own: each member's front says which file it is, so the set binds
+// it by content over the name it was posted as, finds both clean, and the
+// namespace puts both names back. The index comes first, so under the graph
+// each member is bound by its name until its front is in, and the slices
+// checked against the wrong file in that while ask for the recovery volume
+// ahead; classic asks for none of it.
+#[tokio::test]
+async fn swapped_names_are_put_back_by_the_set_under_both_engines() {
+    let files = [
+        ("lantern.bin", payload(3 * ARTICLE, 34)),
+        ("beacon.bin", payload(2 * ARTICLE + 7, 35)),
+    ];
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .collect();
+    let mut posts = vec![
+        Post::plain("beacon.bin", files[0].1.clone()),
+        Post::plain("lantern.bin", files[1].1.clone()),
+    ];
+    posts.extend(par2_set("lantern", &described, 2));
+    let scenario = Scenario::new(posts);
+    let (classic, graph) = run_both(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    delivered_as_described(&graph, &files);
+    let view = graph.graph();
+    assert_eq!(view.outcomes, vec![Some(RepairOutcome::Clean)]);
+    assert!(claims_all(&view.claims, Claim::Complete));
+    assert_eq!(graph.reads, 0, "nothing was read back");
+    assert!(graph.refetched().is_empty());
+    assert!(classic.completed(), "{:?}", classic.failure);
+    delivered_as_described(&classic, &files);
+}
+
+// The same swap with every article of the recovery volume gone: the set
+// has its index and no block, finds both members clean once each is bound
+// by its content, and the namespace still puts both names back.
+#[tokio::test]
+async fn swapped_names_are_put_back_by_a_set_whose_recovery_volume_is_gone() {
+    let files = [
+        ("lantern.bin", payload(3 * ARTICLE, 34)),
+        ("beacon.bin", payload(2 * ARTICLE + 7, 35)),
+    ];
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .collect();
+    let mut posts = vec![
+        Post::plain("beacon.bin", files[0].1.clone()),
+        Post::plain("lantern.bin", files[1].1.clone()),
+    ];
+    posts.extend(par2_set("lantern", &described, 2));
+    let articles = posts[3].bytes.len().div_ceil(ARTICLE) as u32;
+    let scenario = (0..articles).fold(Scenario::new(posts), |scenario, ordinal| {
+        scenario.lost(3, ordinal)
+    });
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    delivered_as_described(&graph, &files);
+    let view = graph.graph();
+    assert_eq!(view.outcomes, vec![Some(RepairOutcome::Clean)]);
     assert!(claims_all(&view.claims, Claim::Complete));
 }

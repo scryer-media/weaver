@@ -125,6 +125,7 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("torrent_files", ResetOnRestore, RequireEmpty),
     table!("torrent_trackers", ResetOnRestore, RequireEmpty),
     table!("torrent_counters", ResetOnRestore, RequireEmpty),
+    table!("graph_facts_parts", ResetOnRestore, RequireEmpty),
     table!("integration_events", ResetOnRestore, Replace),
     table!("metrics_history_chunks", ResetOnRestore, Replace),
     table!("async_operations", ResetOnRestore, Replace),

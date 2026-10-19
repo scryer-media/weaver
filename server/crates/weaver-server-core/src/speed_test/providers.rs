@@ -136,16 +136,23 @@ pub fn parse_librespeed_servers(body: &[u8]) -> Result<Vec<ProviderServer>, Stri
             if base.scheme() != "https" {
                 return None;
             }
-            let download = base.join(entry.dl_url.trim_start_matches('/')).ok()?;
+            // An absolute URL in the entry would replace the base outright, so
+            // every endpoint must stay on the base's own HTTPS origin.
+            let on_base = |path: &str| {
+                base.join(path.trim_start_matches('/'))
+                    .ok()
+                    .filter(|url| url.origin() == base.origin())
+            };
+            let download = on_base(&entry.dl_url)?;
             // The ping endpoint sits beside the download one, on the same
-            // base; a server that names none, or one that does not resolve,
-            // is listed but never pinged.
+            // base; a server that names none, or one that does not resolve
+            // there, is listed but never pinged.
             let ping = entry
                 .ping_url
                 .as_deref()
                 .map(str::trim)
                 .filter(|ping| !ping.is_empty())
-                .and_then(|ping| base.join(ping.trim_start_matches('/')).ok())
+                .and_then(on_base)
                 .map(|ping| ping.to_string());
             let id = match entry.id {
                 serde_json::Value::String(id) => id,
@@ -275,6 +282,49 @@ mod tests {
                 ("4".into(), None),
                 ("5".into(), None),
                 ("6".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn librespeed_endpoints_stay_on_the_server_origin() {
+        let body = br#"[
+            {"id":1,"name":"Cleartext","server":"https://one.example.test/","dlURL":"http://one.example.test/garbage.php"},
+            {"id":2,"name":"Elsewhere","server":"https://two.example.test/","dlURL":"https://other.example.test/garbage.php"},
+            {"id":3,"name":"Port","server":"https://three.example.test/","dlURL":"https://three.example.test:8443/garbage.php"},
+            {"id":4,"name":"Absolute","server":"https://four.example.test/speed/","dlURL":"https://four.example.test/garbage.php","pingURL":"https://four.example.test/empty.php"},
+            {"id":5,"name":"PingCleartext","server":"https://five.example.test/","dlURL":"garbage.php","pingURL":"http://five.example.test/empty.php"},
+            {"id":6,"name":"PingElsewhere","server":"https://six.example.test/","dlURL":"garbage.php","pingURL":"https://other.example.test/empty.php"},
+            {"id":7,"name":"SchemeRelative","server":"https://seven.example.test/","dlURL":"//other.example.test/garbage.php","pingURL":"//other.example.test/empty.php"}
+        ]"#;
+        let servers: Vec<(String, String, Option<String>)> = parse_librespeed_servers(body)
+            .unwrap()
+            .into_iter()
+            .map(|server| (server.id, server.download_url, server.ping_url))
+            .collect();
+        assert_eq!(
+            servers,
+            vec![
+                (
+                    "4".into(),
+                    "https://four.example.test/garbage.php".into(),
+                    Some("https://four.example.test/empty.php".into())
+                ),
+                (
+                    "5".into(),
+                    "https://five.example.test/garbage.php".into(),
+                    None
+                ),
+                (
+                    "6".into(),
+                    "https://six.example.test/garbage.php".into(),
+                    None
+                ),
+                (
+                    "7".into(),
+                    "https://seven.example.test/other.example.test/garbage.php".into(),
+                    Some("https://seven.example.test/other.example.test/empty.php".into())
+                ),
             ]
         );
     }

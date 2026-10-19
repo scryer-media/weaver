@@ -157,7 +157,14 @@ fn slice_validity(
     let Some(member) = state.members().get(&file).copied() else {
         return vec![false; count];
     };
-    let evidence = Evidence::of(grid, index, file, member, access.length(member));
+    let evidence = Evidence::of(
+        grid,
+        index,
+        state.whole(file),
+        file,
+        member,
+        access.length(member),
+    );
     if evidence.is_proven() {
         return vec![true; count];
     }

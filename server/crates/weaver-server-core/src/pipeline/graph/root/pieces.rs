@@ -246,6 +246,7 @@ impl Root for PieceRoot {
     type Class = Class;
     type Move = Move;
     type Facts = PieceFacts;
+    type Kept = ();
     const NAME: &'static str = "pieces";
     const FACTS_VERSION: u16 = PieceFacts::VERSION;
 

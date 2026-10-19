@@ -500,7 +500,7 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
     .unwrap();
 
     assert_eq!(result.moved_entries, 2);
-    assert_eq!(result.renamed_members, 2);
+    assert_eq!(result.renamed_members.len(), 2);
     assert!(dest.join("Silver Horizon 2024.mkv").is_file());
     assert!(dest.join("Silver Horizon 2024.eng.srt").is_file());
     assert!(!dest.join("Yb5drZSkNi20UCMkb.mkv").exists());
@@ -530,7 +530,7 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
     .await
     .unwrap();
 
-    assert_eq!(result.renamed_members, 0);
+    assert!(result.renamed_members.is_empty());
     assert!(dest.join("Yb5drZSkNi20UCMkb.mkv").is_file());
 }
 

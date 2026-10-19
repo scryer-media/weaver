@@ -9,7 +9,7 @@ use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{
     Builder, ByteRange, Delivery, Emit, Extent, Kind, MemberId, NodeId, Object, ObjectId,
-    Placement, Pull, Seek, VolumeIndex, Weight, Why,
+    Placement, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use weaver_model::files::FileRole;
 
@@ -67,6 +67,13 @@ impl Object for Probe {
         });
     }
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+    // Quiet with the member it announced still open, the probe refuses
+    // itself as a format object would: it never mapped what it named.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if standing.unplaced() {
+            out.push(Emit::Refuse(Why::Unmapped));
+        }
+    }
     fn wants(&mut self, out: &mut Vec<Seek>) {
         out.append(&mut self.wants);
     }
@@ -320,8 +327,8 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
     assert_eq!(job.phase(), RootPhase::Downloading);
 
     // Every volume in and the probe never closes the member it announced:
-    // the object is refused as unmapped in the settle that closes the last
-    // volume, and the job is done.
+    // the object refuses itself as unmapped once the job is quiet, in the
+    // settle that closes the last volume, and the job is done.
     job.intake(decoded(0, 1, 90, &[0; 90], Some(180)), 1)
         .unwrap();
     assert_eq!(job.phase(), RootPhase::Done);
@@ -729,12 +736,15 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
         // its admission took.
         let working_dir = insert_active_job(&mut pipeline, restored_id, lantern.clone()).await;
         stamp_graph(&pipeline.db, restored_id);
-        let (admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
+        let (mut admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
         pipeline
             .db
             .save_graph_checkpoint(
                 restored_id,
-                Arc::new(checkpoint::rows(&admitted.snapshot().unwrap())),
+                Arc::new(crate::jobs::graph_checkpoint::Delta::between(
+                    None,
+                    &checkpoint::rows(&admitted.snapshot().unwrap()),
+                )),
             )
             .unwrap();
         retire_pipeline_database(pipeline).await;
@@ -809,7 +819,7 @@ fn an_article_job_checkpointed_before_roots_had_kinds_restores() {
         caps: crate::pipeline::graph::limits::Caps::unbounded(),
         nesting: u32::MAX,
     };
-    let restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
+    let mut restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
     assert!(restored.refetched.is_empty());
     assert!(restored.settled.contains(&(VolumeIndex(0), 0)));
     let again = restored.job.snapshot().unwrap();

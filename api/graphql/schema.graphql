@@ -802,6 +802,24 @@ type FirstRunSetup {
 	pending: Boolean!
 }
 
+"""
+A file Weaver named other than its full name, because the full name was
+too long for a filesystem, used characters one refuses, or clashed with
+another file in the job.
+"""
+type FullFileName {
+	"""
+	The name Weaver gave the file last, inside `outputDir`. A file the job
+	deleted after extracting it keeps the name it had then.
+	"""
+	name: String!
+	"""
+	The file's full name: the name it was posted with, or the one PAR2 or
+	the release lookup gave it.
+	"""
+	fullName: String!
+}
+
 type GeneralSettings {
 	dataDir: String!
 	intermediateDir: String!
@@ -1008,6 +1026,11 @@ type HistoryItem {
 	attention: QueueAttention
 	deleteOperation: HistoryDeleteRowState
 	duplicateSummary: DuplicateSummaryInfo
+	"""
+	The files Weaver gave a name other than their full one, each with its
+	full name. Empty when every file carries its full name.
+	"""
+	fullFileNames: [FullFileName!]!
 }
 
 type HistoryPage {
@@ -1994,6 +2017,12 @@ type MutationRoot {
 	and the global one.
 	"""
 	setTorrentSeeding(id: Int!, seeding: SeedingPolicyInput): Boolean!
+}
+
+type NamedId {
+	kind: String!
+	id: Int!
+	name: String!
 }
 
 type NamedId {

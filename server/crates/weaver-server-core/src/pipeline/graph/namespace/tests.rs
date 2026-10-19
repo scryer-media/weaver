@@ -4,12 +4,13 @@
 use std::sync::Mutex;
 
 use weaver_graph::holds::HoldBudgets;
-use weaver_graph::recovery::{Recovery, SliceVerdict};
-use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, Seek};
+use weaver_graph::recovery::{Recovery, RepairOutcome, SliceVerdict};
+use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, RecoveryKind, Seek};
 
 use super::*;
 use crate::pipeline::graph::lines::Lines;
 
+mod recovery;
 mod streams;
 mod windows;
 

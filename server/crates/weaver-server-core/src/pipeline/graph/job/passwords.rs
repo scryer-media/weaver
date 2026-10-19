@@ -7,13 +7,13 @@
 // knows no secrets. An object asks again only after it tried the last offer,
 // so one is in flight per node, and the cursor moving on is what keeps any
 // candidate from being offered twice to the same node. A node that asks
-// with none left is not refused then: more of it may still arrive, and an
-// object that can tell refuses itself once all of it has. The job refuses
-// what is left asking only when nothing more can change.
+// with none left is left asking: more of it may still arrive, and the
+// object, which knows it is still asking, refuses itself once all of it
+// has or once the job is quiet.
 //
 // The values are secrets. Nothing here prints them; Debug says how many.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use weaver_graph::{Builder, Effect, NodeId};
@@ -25,8 +25,6 @@ use crate::pipeline::graph::root::Root;
 pub(super) struct Passwords {
     candidates: Vec<String>,
     offered: BTreeMap<NodeId, usize>,
-    // The nodes that asked once every candidate was spent on them.
-    unanswered: BTreeSet<NodeId>,
 }
 
 impl fmt::Debug for Passwords {
@@ -35,7 +33,6 @@ impl fmt::Debug for Passwords {
             .debug_struct("Passwords")
             .field("candidates", &self.candidates.len())
             .field("offered", &self.offered)
-            .field("unanswered", &self.unanswered)
             .finish()
     }
 }
@@ -65,11 +62,6 @@ impl Passwords {
         Some(candidate)
     }
 
-    // The node asked with no candidate left to give it.
-    pub(super) fn unanswered(&self, node: NodeId) -> bool {
-        self.unanswered.contains(&node)
-    }
-
     // The candidate after the one the node was offered last, if any is left.
     fn next(&mut self, node: NodeId) -> Option<&str> {
         let offered = self.offered.entry(node).or_default();
@@ -92,7 +84,6 @@ impl<R: Root> GraphJob<R> {
     pub(super) fn offer_password(&mut self, node: NodeId, effects: &mut Vec<Effect>) {
         let builder: &mut dyn Builder = &mut *self.builder;
         let Some(secret) = self.passwords.next(node) else {
-            self.passwords.unanswered.insert(node);
             return;
         };
         self.tree

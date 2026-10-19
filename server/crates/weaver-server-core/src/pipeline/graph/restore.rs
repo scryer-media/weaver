@@ -85,6 +85,8 @@ impl Pipeline {
         })
         .await
         .map_err(|error| GraphRestoreError::Join(error.to_string()))??;
+        // The next checkpoint writes only what it changes of these.
+        job.pending().written(rows);
         if !refetched.is_empty() {
             tracing::info!(
                 job_id = job_id.0,

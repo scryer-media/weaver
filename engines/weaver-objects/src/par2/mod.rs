@@ -50,9 +50,10 @@ pub struct Par2 {
     grid: Grid,
     // Each bound member's length, once all of it has arrived.
     lengths: BTreeMap<MemberId, u64>,
-    // Damaged slices the grid shows per set, recounted after the evidence
-    // changes.
-    seen_damaged: Option<BTreeMap<[u8; 16], u64>>,
+    // What the grid says of each bound member, per set: folded where its
+    // inputs change (a member's slices in `feed`, a set's index in `take`,
+    // its bindings and lengths in `bind`) and read everywhere else.
+    evidence: BTreeMap<([u8; 16], MemberId), Evidence>,
     // What the last repair came to, for the members bound then.
     outcome: Option<RepairOutcome>,
     meter: Meter,
@@ -70,20 +71,13 @@ impl Par2 {
             sets: BTreeMap::new(),
             grid: Grid::default(),
             lengths: BTreeMap::new(),
-            seen_damaged: None,
+            evidence: BTreeMap::new(),
             outcome: None,
             meter: Meter::default(),
             refused: false,
             output_limit: MAX_JOB_BYTES,
             memory_limit: REPAIR_MEMORY_LIMIT,
         }
-    }
-
-    fn covered_members(&self) -> BTreeSet<MemberId> {
-        self.sets
-            .values()
-            .flat_map(|state| state.members().values().copied())
-            .collect()
     }
 
     // Set keys in the order their first packets were found.
@@ -124,44 +118,67 @@ impl Par2 {
             .sum()
     }
 
-    fn block_sizes(&self) -> BTreeSet<u64> {
+    // Every grid the evidence is folded on: each known set's slices, and
+    // the whole member.
+    fn grids(&self) -> BTreeSet<u64> {
+        self.slice_sizes().chain([WHOLE]).collect()
+    }
+
+    fn slice_sizes(&self) -> impl Iterator<Item = u64> + '_ {
         self.sets
             .values()
             .filter_map(|state| state.index.as_ref())
             .map(|index| index.slice_size)
-            .chain([WHOLE])
-            .collect()
     }
 
-    fn damaged_seen(&mut self) -> BTreeMap<[u8; 16], u64> {
-        if let Some(seen) = &self.seen_damaged {
-            return seen.clone();
-        }
+    // Damaged slices the evidence shows, per set.
+    fn damaged_seen(&self) -> BTreeMap<[u8; 16], u64> {
         let mut seen = BTreeMap::new();
-        for key in self.ordered() {
-            let state = &self.sets[&key];
-            let count = state.usable().map_or(0, |index| {
-                state
-                    .members()
-                    .iter()
-                    .map(|(file, member)| {
-                        Evidence::of(
-                            &self.grid,
-                            index,
-                            *file,
-                            *member,
-                            self.lengths.get(member).copied(),
-                        )
-                        .vetoed()
-                        .filter(|verdict| *verdict == SliceVerdict::Damaged)
-                        .count() as u64
-                    })
-                    .sum()
-            });
-            seen.insert(key, count);
+        for ((key, _), evidence) in &self.evidence {
+            *seen.entry(*key).or_default() += evidence
+                .vetoed()
+                .filter(|verdict| *verdict == SliceVerdict::Damaged)
+                .count() as u64;
         }
-        self.seen_damaged = Some(seen.clone());
         seen
+    }
+
+    // Fold every bound member of the set afresh: its index, its bindings or
+    // its members' lengths changed, and each verdict reads all three.
+    pub(super) fn fold_set(&mut self, key: [u8; 16]) {
+        self.evidence.retain(|(set, _), _| *set != key);
+        let Some(state) = self.sets.get(&key) else {
+            return;
+        };
+        let Some(index) = state.usable() else {
+            return;
+        };
+        for (file, member) in state.members() {
+            self.evidence.entry((key, *member)).or_insert_with(|| {
+                Evidence::of(
+                    &self.grid,
+                    index,
+                    state.whole(*file),
+                    *file,
+                    *member,
+                    self.lengths.get(member).copied(),
+                )
+            });
+        }
+    }
+
+    // A set that waited on recovery blocks waits no longer once the blocks
+    // in hand cover the slices it found damaged, or once its volumes can
+    // bring no more: the wait's outcome is taken back, so the set rules in
+    // this step and repairs or fails.
+    fn end_wait(&mut self) {
+        let over = self.sets.iter().any(|(key, state)| {
+            let needed = state.needed();
+            needed > 0 && (state.recovery.len() as u64 >= needed || self.coming(key) == 0)
+        });
+        if over {
+            self.outcome = None;
+        }
     }
 
     fn take(&mut self, volume: VolumeIndex, found: Vec<Found>) {
@@ -177,7 +194,7 @@ impl Par2 {
             if !self.meter.charge(&item) || (new_set && self.sets.len() >= MAX_PAR2_RECOVERY_SETS) {
                 self.refused = true;
                 self.sets.clear();
-                self.seen_damaged = None;
+                self.evidence.clear();
                 return;
             }
             match item {
@@ -193,7 +210,7 @@ impl Par2 {
                         .or_insert_with(|| SetState::new((volume, at)))
                         .take_metadata(hash, packet, self.output_limit);
                     self.volume(volume).sets.insert(set);
-                    self.seen_damaged = None;
+                    self.fold_set(set);
                 }
                 Found::Recovery {
                     set,
@@ -237,10 +254,12 @@ impl Object for Par2 {
             .walker
             .deliver(delivery.offset, delivery.bytes, &mut found);
         self.take(delivery.volume, found);
+        self.end_wait();
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.volume(volume).closed = true;
+        self.end_wait();
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, _out: &mut Vec<Emit>) {
@@ -255,6 +274,7 @@ impl Object for Par2 {
                 .retain(|_, at| at.volume != volume || at.range.intersect(range).is_none());
         }
         self.take(volume, found);
+        self.end_wait();
     }
 
     fn wants(&mut self, out: &mut Vec<Seek>) {
@@ -287,7 +307,7 @@ impl Object for Par2 {
             .then(|| VolumeIndex(self.volumes.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
         self.volume(volume).name(name);
         let mut reopened = false;
         for state in self.sets.values_mut() {
@@ -311,7 +331,6 @@ impl Object for Par2 {
 
 impl Recovery for Par2 {
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
-        let before = self.covered_members();
         let (keys, indexes): (Vec<[u8; 16]>, Vec<&Par2FileSet>) = self
             .ordered()
             .into_iter()
@@ -326,10 +345,14 @@ impl Recovery for Par2 {
                 renamed.push(member);
             }
         }
+        let mut moved = BTreeSet::new();
         for (key, state) in &mut self.sets {
-            state.bind(bound.remove(key).unwrap_or_default());
+            if state.bind(bound.remove(key).unwrap_or_default()) {
+                moved.insert(*key);
+            }
         }
-        self.lengths = self
+        let voided = !moved.is_empty();
+        let lengths: BTreeMap<MemberId, u64> = self
             .sets
             .values()
             .flat_map(|state| state.members().values())
@@ -341,8 +364,21 @@ impl Recovery for Par2 {
                     .map(|length| (*member, length))
             })
             .collect();
-        self.seen_damaged = None;
-        if self.covered_members() != before {
+        for (key, state) in &self.sets {
+            let lengthened = state
+                .members()
+                .values()
+                .any(|member| lengths.get(member) != self.lengths.get(member));
+            if lengthened {
+                moved.insert(*key);
+            }
+        }
+        self.lengths = lengths;
+        for key in moved {
+            self.fold_set(key);
+        }
+        // The object's verdict is its sets' verdicts.
+        if voided {
             self.outcome = None;
         }
     }
@@ -374,22 +410,47 @@ impl Recovery for Par2 {
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
-        for block in self.block_sizes() {
+        for block in self.grids() {
             for segment in segments {
                 self.grid.offer(member, block, segment);
             }
         }
-        self.seen_damaged = None;
+        // Only the slices the segments touch, and the whole, fold anew.
+        for (key, state) in &self.sets {
+            let (Some(index), Some(file)) = (state.usable(), state.bound(member)) else {
+                continue;
+            };
+            let Some(evidence) = self.evidence.get_mut(&(*key, member)) else {
+                continue;
+            };
+            for segment in segments {
+                evidence.refold(
+                    &self.grid,
+                    index,
+                    state.whole(file),
+                    file,
+                    member,
+                    segment.range,
+                );
+            }
+        }
+    }
+
+    // A slice is proven by checksums cut at its boundaries; the whole
+    // member's CRC folds from any.
+    fn block_sizes(&self, out: &mut Vec<u64>) {
+        out.extend(self.slice_sizes());
     }
 
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>) {
         let found = self.ordered().into_iter().find_map(|key| {
             let state = self.sets.get(&key)?;
-            Some((state.usable()?, state.bound(member)?))
+            state.bound(member)?;
+            state.usable()?;
+            self.evidence.get(&(key, member))
         });
-        if let Some((index, file)) = found {
-            let length = self.lengths.get(&member).copied();
-            out.extend(Evidence::of(&self.grid, index, file, member, length).vetoed());
+        if let Some(evidence) = found {
+            out.extend(evidence.vetoed());
         }
     }
 

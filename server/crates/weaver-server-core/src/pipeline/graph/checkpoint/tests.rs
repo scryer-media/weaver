@@ -2,19 +2,20 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use weaver_graph::{
     ByteRange, CoverageRecord, CryptRecord, Facts, Kind, MemberId, MemberRecord, NodeId,
-    NodeRecord, NodeState, ObjectId, Provenance, Run, TreeRecord, VolumeIndex, Why,
+    NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
 };
 
 use super::{CheckpointError, FileState, Snapshot, rows, snapshot};
-use crate::jobs::graph_checkpoint::GraphCheckpoint;
+use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
 use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::{
-    ArticleFacts, ClassFacts, JobFacts, PostFacts, RootBlob, RootFactsError, RootRow, VolumeFacts,
-    decode, encode,
+    ArticleFacts, ClassFacts, Encoded, JobFacts, PostFacts, RootBlob, RootFactsError, RootRow,
+    VolumeFacts, decode, encode, encode_post,
 };
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::PieceRoot;
@@ -38,7 +39,16 @@ pub(crate) fn as_version_2(checkpoint: &mut GraphCheckpoint) {
         .iter_mut()
         .find(|row| row.node == 0)
         .expect("a root row");
-    let now = decode(RootRow::VERSION, &row.facts).unwrap();
+    let parts: Vec<Part> = checkpoint
+        .parts
+        .iter()
+        .filter(|part| part.node == 0)
+        .map(|part| Part {
+            key: part.part as u64,
+            bytes: Arc::clone(&part.bytes),
+        })
+        .collect();
+    let now = decode(RootRow::VERSION, &row.facts, &parts).unwrap();
     let post = now.root.read::<ArticleRoot>().unwrap();
     row.facts_version = 2;
     row.facts = rmp_serde::to_vec(&Version2 {
@@ -49,13 +59,22 @@ pub(crate) fn as_version_2(checkpoint: &mut GraphCheckpoint) {
         reported: now.job.reported,
     })
     .unwrap();
+    checkpoint.parts.retain(|part| part.node != 0);
 }
 
 fn article_blob(facts: PostFacts) -> RootBlob {
+    article_blob_kept(&mut Encoded::default(), facts)
+}
+
+// The post encoded by `kept`, so parts unchanged since it last encoded
+// keep their bytes.
+fn article_blob_kept(kept: &mut Encoded, facts: PostFacts) -> RootBlob {
+    let (bytes, parts) = encode_post(kept, &facts);
     RootBlob {
         root: "articles".to_owned(),
         version: PostFacts::VERSION,
-        bytes: rmp_serde::to_vec(&facts).unwrap(),
+        bytes,
+        parts,
     }
 }
 
@@ -91,6 +110,10 @@ fn node(id: u32, parent: Option<u32>, kind: Option<Kind>) -> NodeRecord {
             kind,
             version: 3,
             bytes: vec![1, 2, 3],
+            parts: vec![Part {
+                key: 1 << 32 | 2,
+                bytes: Arc::from([4, 5].as_slice()),
+            }],
         }),
         members: Vec::new(),
         coverage: Vec::new(),
@@ -249,6 +272,7 @@ fn the_phase_last_reported_comes_back_with_the_job() {
             job: taken.job,
             root: taken.root.clone(),
         }),
+        &taken.root.parts,
     )
     .unwrap();
     assert_eq!(row.job.reported, Some(RootPhase::Done));
@@ -263,11 +287,12 @@ fn an_article_checkpoint_from_before_roots_had_kinds_comes_back() {
     let mut checkpoint = rows(&taken);
     as_version_2(&mut checkpoint);
     assert_eq!(checkpoint.nodes[0].facts_version, 2);
+    assert!(checkpoint.parts.iter().all(|part| part.node != 0));
     assert_eq!(snapshot(&checkpoint), Ok(taken));
 }
 
-// Root facts written before the reported phase was kept: the rest reads as
-// it was written, and no phase was reported.
+// Root facts written whole, before they were kept as parts, are refused by
+// their version, not misread.
 #[test]
 fn root_facts_without_a_reported_phase_restore_none() {
     #[derive(serde::Serialize)]
@@ -286,7 +311,7 @@ fn root_facts_without_a_reported_phase_restore_none() {
         read_backs: taken.job.read_backs,
     })
     .unwrap();
-    let row = decode(2, &before).unwrap();
+    let row = decode(2, &before, &[]).unwrap();
     assert_eq!(
         row.job,
         JobFacts {
@@ -310,7 +335,105 @@ fn facts_are_read_only_into_the_root_that_wrote_them() {
         newer.read::<ArticleRoot>(),
         Err(RootFactsError::Version(newer.version))
     );
-    assert_eq!(decode(1, &[]), Err(RootFactsError::Version(1)));
+    assert_eq!(decode(1, &[], &[]), Err(RootFactsError::Version(1)));
+}
+
+// A post written whole, before its facts were kept as parts, is refused by
+// its version, not misread.
+#[test]
+fn root_facts_of_the_whole_blob_layout_are_refused() {
+    let taken = full();
+    let whole = RootBlob {
+        root: "articles".to_owned(),
+        version: 1,
+        bytes: rmp_serde::to_vec(&post(&taken.root)).unwrap(),
+        parts: Vec::new(),
+    };
+    assert_eq!(whole.read::<ArticleRoot>(), Err(RootFactsError::Version(1)));
+}
+
+// Many articles, of which the step changes one, encoded by `kept`.
+fn long_post(arrived: u32, kept: &mut Encoded) -> Snapshot {
+    let mut taken = full();
+    let mut facts = post(&taken.root);
+    let volume = &mut facts.volumes[0];
+    volume.articles = (0..100)
+        .map(|ordinal| {
+            let start = u64::from(ordinal) * 64;
+            let article = if ordinal < arrived {
+                ArticleFacts::Arrived(Some((start, start + 64)))
+            } else {
+                ArticleFacts::Waiting
+            };
+            (ordinal, article)
+        })
+        .collect();
+    volume.segments = (0..arrived)
+        .map(|ordinal| {
+            let start = u64::from(ordinal) * 64;
+            (start, start + 64, ordinal, false)
+        })
+        .collect();
+    taken.root = article_blob_kept(kept, facts);
+    taken
+}
+
+#[test]
+fn a_step_writes_only_the_rows_and_parts_it_changed() {
+    let mut kept = Encoded::default();
+    let before = rows(&long_post(40, &mut kept));
+    let after = rows(&long_post(41, &mut kept));
+    let delta = Delta::between(Some(&before), &after);
+    // The article's chunk and the segment's chunk; the root row only names
+    // its parts, so it stays as it was.
+    assert!(delta.nodes.is_empty(), "{delta:?}");
+    assert_eq!(delta.parts.len(), 2, "{delta:?}");
+    assert_eq!(delta.rows(), 2);
+    assert!(Delta::between(Some(&after), &after).is_empty());
+    // A fresh encoding of the same snapshot is the same rows.
+    let fresh = long_post(41, &mut Encoded::default());
+    assert_eq!(rows(&fresh), after);
+    assert_eq!(snapshot(&after), Ok(fresh));
+}
+
+#[test]
+fn a_change_queued_behind_another_writes_both_as_one() {
+    let first = rows(&full());
+    let mut second = first.clone();
+    second.members.pop();
+    second.coverage[0].verified = true;
+    let mut third = second.clone();
+    third.coverage[0].verified = false;
+    let mut queued = Delta::between(Some(&first), &second);
+    queued.absorb(Delta::between(Some(&second), &third));
+    assert_eq!(
+        queued.members.values().filter(|row| row.is_none()).count(),
+        1
+    );
+    assert_eq!(queued.coverage.len(), 1);
+    assert_eq!(
+        queued.coverage.values().next(),
+        Some(&Some(first.coverage[0].clone()))
+    );
+    // Nothing known of the database clears the job whatever follows.
+    let mut whole = Delta::between(None, &first);
+    whole.absorb(Delta::between(Some(&first), &second));
+    assert!(whole.whole);
+    queued.absorb(Delta::between(None, &third));
+    assert_eq!(queued, Delta::between(None, &third));
+    assert!(!Delta::between(Some(&GraphCheckpoint::default()), &first).is_empty());
+}
+
+#[test]
+fn parts_of_a_node_not_in_the_checkpoint_are_refused() {
+    let mut checkpoint = rows(&full());
+    let mut stray = checkpoint.parts[0].clone();
+    stray.node = 9;
+    checkpoint.parts.push(stray);
+    assert!(matches!(
+        snapshot(&checkpoint),
+        Err(CheckpointError::Row { node: 9, .. })
+    ));
 }
 
 #[test]

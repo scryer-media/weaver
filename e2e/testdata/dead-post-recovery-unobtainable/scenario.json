@@ -6,7 +6,7 @@
   "expected_outcome": "health_failure",
   "expectedErrorContains": "PAR2 metadata discovery exhausted",
   "expectedErrorContainsByEngine": {
-    "graph": "payload file(s) were never delivered and no verification, repair or discard accounts for them"
+    "graph": "below critical"
   },
   "fixtureAssets": [
     "par2-multivolume/archive.part1.rar",

@@ -13,6 +13,7 @@
 // The object is pure: no I/O, no threads, no files. Bytes it cannot place yet
 // are held by its owner, who hands them back once the map places them.
 
+mod carried;
 mod directory;
 mod geometry;
 mod map;
@@ -29,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement, Pull,
-    Seek, VolumeIndex, Weight, Why,
+    Seek, Standing, VolumeIndex, Weight, Why,
 };
 
 use crate::engine::{Format, SetName};
@@ -75,6 +76,9 @@ pub struct Zip {
     // Container ranges wanted ahead of the normal order.
     bids: Vec<(ByteRange, Weight)>,
     damage_said: HashSet<(u64, u64, u32)>,
+    // Whether the container's tail was looked at for a recovery set.
+    #[serde(default)]
+    recovery_said: bool,
     // Something changed since the object last looked.
     stale: bool,
     // The object gave its container up; it says nothing more.
@@ -82,7 +86,8 @@ pub struct Zip {
 }
 
 impl Durable for Zip {
-    const VERSION: u16 = 3;
+    // 4: the grid shelved by chunk of blocks, kept apart from the bytes.
+    const VERSION: u16 = 4;
 
     // A member said is an entry of the map, and every entry's member is one.
     fn impossible(&self) -> Option<&'static str> {
@@ -273,6 +278,7 @@ impl Zip {
         if self.gone || !std::mem::take(&mut self.stale) {
             return;
         }
+        self.find_recovery(out);
         if self.walking {
             self.walk(out);
         } else if self.map.is_none() {
@@ -401,6 +407,19 @@ impl Object for Zip {
         }
     }
 
+    // Nothing more will arrive. A member still damaged, or one named and
+    // never placed, leaves the archive unread.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if self.gone {
+            return;
+        }
+        if let Some(why) =
+            crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
+        {
+            self.give_up(Emit::Refuse(why), out);
+        }
+    }
+
     fn wants(&mut self, out: &mut Vec<Seek>) {
         if self.gone {
             return;
@@ -463,7 +482,7 @@ impl Object for Zip {
         self.kept.read(range).map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
         let first = self.names.values().next();
         if let Some(parsed) = ZipFormat::parse(name)
             && first.is_none_or(|first| first.same_set(&parsed))
@@ -472,6 +491,17 @@ impl Object for Zip {
         }
         self.bound.insert(volume.0);
         self.stale = true;
+    }
+
+    // The name a recovery set gave the volume is the set's numbering now.
+    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
+        self.names.remove(&volume.0);
+        let first = self.names.values().next();
+        if let Some(parsed) = ZipFormat::parse(name)
+            && first.is_none_or(|first| first.same_set(&parsed))
+        {
+            self.names.insert(volume.0, parsed);
+        }
     }
 
     fn claim(&mut self, name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {

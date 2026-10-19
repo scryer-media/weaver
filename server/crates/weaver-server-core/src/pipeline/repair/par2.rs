@@ -828,6 +828,7 @@ impl Pipeline {
         let mut touched_complete_rar_sets = HashSet::<String>::new();
         let mut stale_rar_sets = HashSet::<String>::new();
         let mut renamed_away = HashSet::<String>::new();
+        let mut file_renames = Vec::<crate::ingest::FileRename>::new();
         let mut rebound = 0usize;
 
         for (description_id, desc) in &par2_set.files {
@@ -852,6 +853,11 @@ impl Pipeline {
                 // An ordinary source already has the described path. Preserve
                 // it (and any PAR3 identity) instead of flattening a valid
                 // relative source path as a side effect of archive grouping.
+                file_renames.push(crate::ingest::FileRename {
+                    from: old_current.clone(),
+                    to: old_current,
+                    full_name: desc.filename.clone(),
+                });
                 continue;
             }
             let mut target_occupied = occupied_filenames.clone();
@@ -922,6 +928,15 @@ impl Pipeline {
             if filename_changed && canonical_is_current {
                 renamed_away.insert(old_current.clone());
             }
+            if canonical_is_current {
+                // The described name in full, before Weaver cleaned,
+                // shortened or numbered it into the one on disk.
+                file_renames.push(crate::ingest::FileRename {
+                    from: old_current.clone(),
+                    to: canonical_filename.clone(),
+                    full_name: desc.filename.clone(),
+                });
+            }
 
             let classification =
                 Self::canonical_archive_identity_from_filename(&canonical_filename)
@@ -978,6 +993,8 @@ impl Pipeline {
             }
             rebound += 1;
         }
+
+        self.record_file_renames(job_id, &file_renames);
 
         for (set_name, touched_filenames) in &touched_rar_files {
             self.invalidate_archive_set_for_identity_rebind(job_id, set_name, touched_filenames);
@@ -1154,6 +1171,7 @@ impl Pipeline {
 
         let mut moves = Vec::<(NzbFileId, ActiveFileIdentity, String)>::new();
         let mut targets = HashSet::<String>::new();
+        let mut full_names = HashMap::<String, String>::new();
         for (description_id, file_ids) in &by_description {
             let [file_id] = file_ids.as_slice() else {
                 continue;
@@ -1171,6 +1189,7 @@ impl Pipeline {
             if identity.current_filename == target || !targets.insert(target.clone()) {
                 continue;
             }
+            full_names.insert(target.clone(), desc.filename.clone());
             moves.push((*file_id, identity.clone(), target));
         }
         if moves.is_empty() {
@@ -1232,6 +1251,7 @@ impl Pipeline {
 
         // Phase two: land each lifted part on its described name and record it.
         let mut settled = 0usize;
+        let mut file_renames = Vec::<crate::ingest::FileRename>::new();
         for (_, identity, target, parked) in lifted {
             if let Some(parked) = parked.as_ref()
                 && let Err(error) = runtime_fs::rename_no_overwrite(
@@ -1269,9 +1289,15 @@ impl Pipeline {
             {
                 deleted.insert(target.clone());
             }
+            file_renames.push(crate::ingest::FileRename {
+                from: old_current.clone(),
+                to: target.clone(),
+                full_name: full_names.get(&target).cloned().unwrap_or(target),
+            });
             leftovers.push(old_current);
             settled += 1;
         }
+        self.record_file_renames(job_id, &file_renames);
         if settled > 0 {
             info!(
                 job_id = job_id.0,
@@ -1883,6 +1909,10 @@ impl Pipeline {
     // when a batch is leased. Served-set selection is a UI/repair view and
     // must not remove geometry needed by another file in the same job.
     pub(crate) fn par2_checkpoint_plan(&self, job_id: JobId) -> weaver_yenc::CheckpointPlan {
+        // A graph job's sets are its recovery objects', not this runtime's.
+        if let Some(graph) = self.graph_jobs.get(&job_id) {
+            return weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan;
+        }
         self.par2_runtime(job_id)
             .and_then(|runtime| runtime.checkpoint_plan.clone())
             .unwrap_or(weaver_yenc::CheckpointPlan::None)

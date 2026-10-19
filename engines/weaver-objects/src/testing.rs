@@ -242,13 +242,14 @@ impl<O: Object> Job<O> {
     // would: the object says where it goes, and `None` on the first makes
     // it the first.
     pub(crate) fn name(&mut self, name: &str, bytes: &[u8]) -> VolumeIndex {
-        let claimed = self.object.claim(name, &bytes[..bytes.len().min(64)]);
+        let front = &bytes[..bytes.len().min(64)];
+        let claimed = self.object.claim(name, front);
         let volume = match claimed {
             Some(volume) => volume,
             None if self.store.volumes.is_empty() => VolumeIndex(0),
             None => panic!("claimed"),
         };
-        self.object.bound(volume, name);
+        self.object.bound(volume, name, front);
         self.store.volumes.insert(volume, bytes.to_vec());
         volume
     }

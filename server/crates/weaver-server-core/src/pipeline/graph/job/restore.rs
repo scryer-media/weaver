@@ -19,7 +19,6 @@
 //
 // Step 1, refusing a graph job with no checkpoint, is the caller's.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -47,7 +46,7 @@ pub(crate) enum RestoreFailure {
     Step(#[from] GraphError),
 }
 
-pub(crate) struct Restored<R = ArticleRoot> {
+pub(crate) struct Restored<R: Root = ArticleRoot> {
     pub(crate) job: GraphJob<R>,
     // Units this run does not fetch: read back, or lost for good.
     pub(crate) settled: Vec<(VolumeIndex, u32)>,
@@ -126,11 +125,11 @@ impl<R: Root> GraphJob<R> {
             tree,
             root,
             builder: Box::new(weaver_objects::Objects),
+            kept: R::Kept::default(),
             writer,
             runs,
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.job.reported,
-            ruled_at: BTreeMap::new(),
             pending: Pending::default(),
         };
         for (node, index) in &snapshot.passwords {

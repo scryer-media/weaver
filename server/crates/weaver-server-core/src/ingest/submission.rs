@@ -23,12 +23,11 @@ use crate::ingest::{
 };
 use crate::jobs::{
     CallerScopedIdempotency, DuplicateAction, DuplicateAdmission, DuplicateAdmissionRequest,
-    DuplicateBackfillEntry, DuplicateDecision, DuplicateMode, FileSpec, FingerprintEvidence,
-    SegmentSpec, SemanticAdmission, SemanticCandidateSource, SemanticDuplicate,
-    SemanticDuplicateLifecycleEvent, SemanticPromotionClaim, SubmissionOrigin,
-    record_duplicate_admission_metric, record_semantic_duplicate_lifecycle_metric,
+    DuplicateBackfillEntry, DuplicateDecision, DuplicateMode, FingerprintEvidence,
+    SemanticAdmission, SemanticCandidateSource, SemanticDuplicate, SemanticDuplicateLifecycleEvent,
+    SemanticPromotionClaim, SubmissionOrigin, record_duplicate_admission_metric,
+    record_semantic_duplicate_lifecycle_metric,
 };
-use weaver_model::files::{FileRole, unique_download_filenames};
 
 static NEXT_API_JOB_ID: AtomicU64 = AtomicU64::new(10_000);
 const MAX_FETCH_REDIRECTS: usize = 10;
@@ -185,50 +184,7 @@ pub fn nzb_to_submission_spec(
         .next()
         .map(|candidate| candidate.value().to_string());
 
-    let mut files = Vec::with_capacity(nzb.files.len());
-    let mut total_bytes: u64 = 0;
-    let filename_candidates = nzb
-        .files
-        .iter()
-        .map(|nzb_file| {
-            // Prefer the enhanced extraction (handles PRiVATE format, higher confidence).
-            // If the extracted name is obfuscated, keep it - PAR2 deobfuscation will
-            // rename it post-repair using 16KB hash matching.
-            nzb_file
-                .extract_filename()
-                .map(|(name, _confidence)| name)
-                .or_else(|| nzb_file.filename().map(str::to_string))
-                .unwrap_or_else(|| "unknown".to_string())
-        })
-        .collect::<Vec<_>>();
-    let filenames = unique_download_filenames(filename_candidates.iter().map(String::as_str));
-
-    for (nzb_file, filename) in nzb.files.iter().zip(filenames) {
-        let role = FileRole::from_filename(&filename);
-
-        let segments: Vec<SegmentSpec> = nzb_file
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(ordinal, segment)| SegmentSpec {
-                ordinal: ordinal as u32,
-                article_number: segment.number,
-                bytes: segment.bytes,
-                message_id: segment.message_id.clone(),
-            })
-            .collect();
-
-        let file_bytes: u64 = nzb_file.total_bytes();
-        total_bytes += file_bytes;
-
-        files.push(FileSpec {
-            filename,
-            role,
-            groups: nzb_file.groups.clone(),
-            posted_at_epoch: (nzb_file.date > 0).then_some(nzb_file.date),
-            segments,
-        });
-    }
+    let (files, total_bytes, metadata) = super::import::nzb_file_specs(nzb, metadata);
 
     JobSpec {
         name,
@@ -1700,6 +1656,81 @@ mod tests {
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn submission_spec_records_the_full_name_of_a_shortened_file() {
+        let words = vec!["Harbor"; 60].join(" ");
+        let posted_name = format!("[Fixture] {words} - 07 (1080p) [ABCD1234].mkv");
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@test.com" date="1234567890" subject="&quot;{posted_name}&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="500000" number="1">long-seg1@test.com</segment></segments>
+  </file>
+  <file poster="test@test.com" date="1234567890" subject="&quot;short.nfo&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="500" number="1">short-seg1@test.com</segment></segments>
+  </file>
+</nzb>"#
+        );
+        let nzb = weaver_nzb::parse_nzb(xml.as_bytes()).unwrap();
+
+        let spec = nzb_to_submission_spec(&nzb, None, None, None, Vec::new());
+
+        let disk_name = &spec.files[0].filename;
+        assert!(disk_name.len() < posted_name.len());
+        assert_eq!(
+            crate::ingest::full_file_names(&spec.metadata),
+            vec![crate::ingest::FullFileName {
+                name: disk_name.clone(),
+                full_name: posted_name,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_job_names_its_files_as_the_submission_did_and_keeps_the_record() {
+        // A PRiVATE subject, whose name only the submission's parser read
+        // before every build shared it.
+        let words = vec!["Harbor"; 60].join(" ");
+        let posted_name = format!("{words} - 07.mkv");
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@test.com" date="1234567890" subject="[PRiVATE]-[WtFnZb]-[{posted_name}]-[1/1] - &quot;&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="500000" number="1">long-seg1@test.com</segment></segments>
+  </file>
+</nzb>"#
+        );
+        let nzb = weaver_nzb::parse_nzb(xml.as_bytes()).unwrap();
+        let submitted = nzb_to_submission_spec(&nzb, None, None, None, Vec::new());
+        let mut metadata = submitted.metadata.clone();
+        let disk_name = submitted.files[0].filename.clone();
+        assert!(disk_name.starts_with("Harbor Harbor"));
+        crate::ingest::record_file_renames(
+            &mut metadata,
+            &[crate::ingest::FileRename {
+                from: disk_name.clone(),
+                to: "short.mkv".to_string(),
+                full_name: "a full name from the recovery set.mkv".to_string(),
+            }],
+        );
+
+        let rebuilt = crate::ingest::nzb_to_spec(
+            &nzb,
+            std::path::Path::new("job.nzb"),
+            None,
+            metadata.clone(),
+        );
+
+        assert_eq!(rebuilt.files[0].filename, disk_name);
+        assert_eq!(
+            crate::ingest::full_file_names(&rebuilt.metadata),
+            crate::ingest::full_file_names(&metadata)
         );
     }
 }

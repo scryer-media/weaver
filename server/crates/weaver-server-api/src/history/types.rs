@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use async_graphql::{Enum, InputObject, SimpleObject};
+use async_graphql::{ComplexObject, Enum, InputObject, SimpleObject};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
@@ -19,6 +19,7 @@ use crate::jobs::types::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct HistoryItem {
     pub id: u64,
     #[serde(default)]
@@ -48,6 +49,42 @@ pub struct HistoryItem {
     pub delete_operation: Option<HistoryDeleteRowState>,
     #[serde(default)]
     pub duplicate_summary: Option<DuplicateSummaryInfo>,
+    // The job's stored record of full file names, read only when a query
+    // selects `fullFileNames`.
+    #[graphql(skip)]
+    #[serde(default)]
+    pub full_file_names_record: Option<String>,
+}
+
+#[ComplexObject]
+impl HistoryItem {
+    /// The files Weaver gave a name other than their full one, each with its
+    /// full name. Empty when every file carries its full name.
+    async fn full_file_names(&self) -> Vec<FullFileName> {
+        self.full_file_names_record
+            .as_deref()
+            .map(weaver_server_core::ingest::parse_full_file_names)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|file| FullFileName {
+                name: file.name,
+                full_name: file.full_name,
+            })
+            .collect()
+    }
+}
+
+/// A file Weaver named other than its full name, because the full name was
+/// too long for a filesystem, used characters one refuses, or clashed with
+/// another file in the job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct FullFileName {
+    /// The name Weaver gave the file last, inside `outputDir`. A file the job
+    /// deleted after extracting it keeps the name it had then.
+    pub name: String,
+    /// The file's full name: the name it was posted with, or the one PAR2 or
+    /// the release lookup gave it.
+    pub full_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -468,6 +505,7 @@ pub fn history_item_from_row(
     });
     history_item_from_display(
         row,
+        &metadata_pairs,
         delete_operation,
         client_request_id,
         attributes,
@@ -490,6 +528,7 @@ pub(crate) fn history_table_item_from_row(
     let (original_title, display_title) = history_display_titles(row, &metadata_pairs);
     history_item_from_display(
         row,
+        &metadata_pairs,
         delete_operation,
         client_request_id,
         attributes,
@@ -510,6 +549,7 @@ fn history_display_titles(row: &JobHistoryRow, metadata: &[(String, String)]) ->
 #[allow(clippy::too_many_arguments)]
 fn history_item_from_display(
     row: &JobHistoryRow,
+    metadata: &[(String, String)],
     delete_operation: Option<HistoryDeleteRowState>,
     client_request_id: Option<String>,
     attributes: Vec<Attribute>,
@@ -541,7 +581,7 @@ fn history_item_from_display(
         failed_bytes: row.failed_bytes,
         health: row.health,
         has_password: weaver_server_core::history::attributes::history_metadata_has_password(
-            &parse_history_metadata(row.metadata.as_deref()),
+            metadata,
         ),
         category: row.category.clone(),
         attributes,
@@ -552,6 +592,8 @@ fn history_item_from_display(
         attention: attention_for_history_row(row, state),
         delete_operation,
         duplicate_summary: None,
+        full_file_names_record: weaver_server_core::ingest::full_file_names_record(metadata)
+            .map(str::to_string),
     }
 }
 

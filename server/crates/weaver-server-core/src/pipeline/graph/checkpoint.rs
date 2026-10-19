@@ -8,9 +8,10 @@
 // ever describes bytes on disk; holds in memory are left out and fetched
 // again.
 //
-// One writer per job: a checkpoint waiting for the database is replaced by
-// the next one rather than queued behind it, so the database only ever
-// writes the newest, and a slow database costs writes, never order.
+// Each checkpoint is written as what it changed of the one before: a step
+// costs the database the rows it changed, not the job's. One writer per job:
+// a change waiting for the database takes in the next one rather than
+// queueing behind it, so a slow database costs writes, never order.
 //
 // Nothing secret is in any of it. The tree records carry no password and no
 // key, the objects' facts carry key tuples and salts but never a key, and a
@@ -18,17 +19,18 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
-use tracing::warn;
+use tracing::{debug, warn};
 use weaver_graph::{
     ByteRange, CoverageRecord, CryptRecord, Facts, Kind, MemberId, MemberRecord, NodeId,
-    NodeRecord, NodeState, ObjectId, Provenance, Run, TreeRecord, VolumeIndex, Why,
+    NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
 };
 
 use super::envelope::durable::KeptRecord;
 use super::root::facts::{self, JobFacts, RootBlob, RootFactsError, RootRow};
 use crate::jobs::graph_checkpoint::{
-    CoverageRow, CryptRow, EnvelopeRow, GraphCheckpoint, MemberRow, NodeRow,
+    CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, MemberRow, NodeRow, PartRow, Row,
 };
 use crate::jobs::ids::JobId;
 use crate::pipeline::Pipeline;
@@ -71,29 +73,91 @@ pub(crate) enum CheckpointError {
     Root(#[from] RootFactsError),
 }
 
-// A checkpoint queued for the database and not written yet. The write takes
-// whatever is here when it runs.
+// A job's checkpoints on their way to the database: the rows the database
+// holds once what is queued is written, and the change queued for it.
 #[derive(Clone, Default)]
-pub(crate) struct Pending(Arc<Mutex<Option<Arc<GraphCheckpoint>>>>);
+pub(crate) struct Pending(Arc<Mutex<Slot>>);
+
+#[derive(Default)]
+struct Slot {
+    // `None` until a checkpoint is written or read: what the database holds
+    // of the job is not known, so the next change is the whole job.
+    last: Option<GraphCheckpoint>,
+    queued: Option<Delta>,
+    // A write is queued that has not taken the change yet.
+    scheduled: bool,
+    tally: Tally,
+}
+
+// What a job's checkpoints asked the database to write, counted as each is
+// taken: how many were taken, how many rows they changed, and how many bytes
+// of facts they wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub(crate) checkpoints: usize,
+    pub(crate) rows: usize,
+    pub(crate) facts: usize,
+}
 
 impl Pending {
-    // Leave the newest checkpoint; true when no write is queued to take it.
-    fn put(&self, checkpoint: GraphCheckpoint) -> bool {
-        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let idle = slot.is_none();
-        *slot = Some(Arc::new(checkpoint));
-        idle
+    fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn take(&self) -> Option<Arc<GraphCheckpoint>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    // Queue what this checkpoint changes; true when a write must be queued
+    // to take it.
+    fn put(&self, snapshot: &Snapshot) -> bool {
+        let mut slot = self.slot();
+        let rows = rows(snapshot);
+        let delta = Delta::between(slot.last.as_ref(), &rows);
+        slot.last = Some(rows);
+        slot.tally.checkpoints += 1;
+        slot.tally.rows += delta.rows();
+        slot.tally.facts += delta.facts();
+        if delta.is_empty() {
+            return false;
+        }
+        match &mut slot.queued {
+            Some(queued) => queued.absorb(delta),
+            None => slot.queued = Some(delta),
+        }
+        !std::mem::replace(&mut slot.scheduled, true)
+    }
+
+    fn take(&self) -> Option<Delta> {
+        let mut slot = self.slot();
+        slot.scheduled = false;
+        slot.queued.take()
+    }
+
+    // The write was not queued: the next checkpoint queues one.
+    fn unschedule(&self) {
+        self.slot().scheduled = false;
+    }
+
+    // A write failed, so what the database holds is not known: the next
+    // checkpoint writes the whole job.
+    fn forget(&self) {
+        let mut slot = self.slot();
+        slot.last = None;
+        slot.queued = None;
+    }
+
+    // The database holds these rows, as a restore read them.
+    pub(crate) fn written(&self, rows: GraphCheckpoint) {
+        self.slot().last = Some(rows);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tally(&self) -> Tally {
+        self.slot().tally
     }
 }
 
 impl Pipeline {
     // Checkpoint the job's tree as it stands now.
     pub(crate) fn checkpoint_graph_job(&mut self, job_id: JobId) {
-        let Some(graph) = self.graph_jobs.get(&job_id) else {
+        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return;
         };
         let snapshot = match graph.snapshot() {
@@ -104,30 +168,55 @@ impl Pipeline {
             }
         };
         let pending = graph.pending().clone();
-        if !pending.put(rows(&snapshot)) {
+        if !pending.put(&snapshot) {
             return;
         }
         let writer = pending.clone();
         let queued = self
             .db
             .try_queue_job_write(job_id, "save_graph_checkpoint", move |db| {
-                match writer.take() {
-                    Some(checkpoint) => db.save_graph_checkpoint(job_id, checkpoint),
-                    None => Ok(()),
+                let Some(delta) = writer.take() else {
+                    return Ok(());
+                };
+                let (rows, facts) = (delta.rows(), delta.facts());
+                let started = Instant::now();
+                let written = db.save_graph_checkpoint(job_id, Arc::new(delta));
+                debug!(
+                    job_id = job_id.0,
+                    rows,
+                    facts,
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    "graph checkpoint written"
+                );
+                if written.is_err() {
+                    writer.forget();
                 }
+                written
             });
         if let Err(error) = queued {
-            // The next step queues the newest again.
-            pending.take();
+            pending.unschedule();
             warn!(job_id = job_id.0, error = %error, "could not queue the graph checkpoint");
         }
     }
 }
 
+fn part_rows(node: i64, parts: &[Part]) -> impl Iterator<Item = PartRow> + '_ {
+    parts.iter().map(move |part| PartRow {
+        node,
+        // The key's bits, as the column's integer.
+        part: part.key as i64,
+        bytes: Arc::clone(&part.bytes),
+    })
+}
+
+// Every row of the snapshot, each table in key order. The root's facts
+// come encoded: the job encodes them where they changed.
 pub(crate) fn rows(snapshot: &Snapshot) -> GraphCheckpoint {
     let mut out = GraphCheckpoint::default();
+    let root_id = i64::from(NodeId::ROOT.0);
+    out.parts.extend(part_rows(root_id, &snapshot.root.parts));
     out.nodes.push(NodeRow {
-        node: i64::from(NodeId::ROOT.0),
+        node: root_id,
         parent: None,
         parent_member: None,
         volumes: None,
@@ -169,6 +258,7 @@ pub(crate) fn rows(snapshot: &Snapshot) -> GraphCheckpoint {
                     .get(&node.node)
                     .map(|index| *index as i64),
             });
+            out.parts.extend(part_rows(id, &facts.parts));
         }
         for member in &node.members {
             let state = snapshot
@@ -227,6 +317,12 @@ pub(crate) fn rows(snapshot: &Snapshot) -> GraphCheckpoint {
         out.envelopes
             .extend(kept.runs.iter().map(|run| row(run.range, run.provenance)));
     }
+    out.nodes.sort_by_key(Row::key);
+    out.members.sort_by_key(Row::key);
+    out.coverage.sort_by_key(Row::key);
+    out.envelopes.sort_by_key(Row::key);
+    out.crypt.sort_by_key(Row::key);
+    out.parts.sort_by_key(Row::key);
     out
 }
 
@@ -237,7 +333,27 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
         .find(|row| row.node == i64::from(NodeId::ROOT.0))
         .filter(|row| row.kind == ROOT_KIND)
         .ok_or(CheckpointError::NoRoot)?;
-    let root = facts::decode(version(root)?, &root.facts)?;
+    let mut parts: BTreeMap<i64, Vec<Part>> = BTreeMap::new();
+    for row in &rows.parts {
+        parts.entry(row.node).or_default().push(Part {
+            key: row.part as u64,
+            bytes: Arc::clone(&row.bytes),
+        });
+    }
+    if let Some(node) = parts
+        .keys()
+        .find(|node| !rows.nodes.iter().any(|row| row.node == **node))
+    {
+        return Err(CheckpointError::Row {
+            node: *node,
+            reason: "facts parts of a node not in the checkpoint",
+        });
+    }
+    let root = facts::decode(
+        version(root)?,
+        &root.facts,
+        parts.get(&root.node).map_or(&[], Vec::as_slice),
+    )?;
     let mut nodes: BTreeMap<NodeId, NodeRecord> = BTreeMap::new();
     let mut passwords = BTreeMap::new();
     for row in &rows.nodes {
@@ -290,6 +406,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
                 kind,
                 version: version(row)?,
                 bytes: row.facts.clone(),
+                parts: parts.remove(&row.node).unwrap_or_default(),
             });
         }
         if let Some(index) = row.winning_password {
@@ -469,7 +586,7 @@ fn range(row: i64, start: i64, end: i64) -> Result<ByteRange, CheckpointError> {
     }
 }
 
-const KINDS: [Kind; 16] = [
+const KINDS: [Kind; 18] = [
     Kind::RarStore,
     Kind::SevenZipStore,
     Kind::Zip,
@@ -480,12 +597,14 @@ const KINDS: [Kind; 16] = [
     Kind::Zstd,
     Kind::Brotli,
     Kind::Deflate,
+    Kind::Split,
     Kind::RarEngine,
     Kind::SevenZipEngine,
     Kind::ZipEngine,
     Kind::Par2,
     Kind::Par3,
     Kind::Sfv,
+    Kind::RarRecovery,
 ];
 
 // The kind a row names, by the name the kind displays as.

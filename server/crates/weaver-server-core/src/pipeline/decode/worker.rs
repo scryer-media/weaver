@@ -1286,6 +1286,25 @@ impl Pipeline {
         }
     }
 
+    // Whether a body that failed to decode goes to another server: the job
+    // still downloads, the article has decode retries left, and a server
+    // that has not served it remains. With no such server, none configured
+    // among them, the damage stands as it came.
+    pub(crate) fn decode_retry_left(&mut self, segment_id: SegmentId, exclude: &[usize]) -> bool {
+        let job_id = segment_id.file_id.job_id;
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| is_terminal_status(&state.status) || state.extraction_depth > 0)
+            || self.segment_terminal_states.contains_key(&segment_id)
+        {
+            return false;
+        }
+        let retries = self.decode_retries.get(&segment_id).copied().unwrap_or(0);
+        retries < MAX_SEGMENT_RETRIES
+            && self.unavailable_server_count(job_id, exclude) < self.nntp.pool().server_count()
+    }
+
     // Handle a decode failure by re-queuing the segment for re-download.
     //
     // yEnc decode failures (CRC/size mismatch, malformed data) indicate the
@@ -1338,9 +1357,7 @@ impl Pipeline {
         // Re-queuing it would leave work no lane may serve sitting in the
         // queue forever while the job reports downloading at 0 B/s.
         let exclude = Self::decode_retry_exclude_servers(exclude_servers, source_server_idx);
-        let server_count = self.nntp.pool().server_count();
-        let no_server_left =
-            server_count > 0 && self.unavailable_server_count(job_id, &exclude) >= server_count;
+        let no_server_left = self.no_server_can_serve(job_id, &exclude);
 
         if retry_count > MAX_SEGMENT_RETRIES || no_server_left {
             if no_server_left {
@@ -1879,6 +1896,31 @@ impl Pipeline {
                 return;
             }
 
+            // A graph job's root takes an article's bytes once, so a body that
+            // failed its checksum goes to another server while one remains,
+            // and only the last server's copy stands as damage. Classic asks
+            // the same servers after keeping its copy on disk.
+            if retain_damage
+                && self.is_graph_job(job_id)
+                && self.decode_retry_left(
+                    segment_id,
+                    &Self::decode_retry_exclude_servers(
+                        &source.exclude_servers,
+                        source.source_server_idx,
+                    ),
+                )
+            {
+                if !crc_valid {
+                    self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                self.handle_decode_failure(
+                    segment_id,
+                    "damaged yEnc article; another server is asked before its bytes stand",
+                    &source.exclude_servers,
+                    source.source_server_idx,
+                );
+                return;
+            }
             // A graph job's root takes the article as placed, damaged or not;
             // a classic job has no root and this finds nothing. The graph is
             // a graph job's only writer, so the classic write path below is

@@ -75,3 +75,80 @@ fn parse_rar_volume(lower: &str) -> Option<u32> {
     }
     None
 }
+
+impl VolumeName {
+    // The set's name, lower-cased, without its numbering.
+    pub(crate) fn stem(&self) -> &str {
+        &self.stem
+    }
+}
+
+// The name volume `index` has in the set `reference` is a volume of, in the
+// reference's own numbering, width and case.
+pub(crate) fn sibling(reference: &str, index: u32) -> Option<String> {
+    let parsed = parse(reference)?;
+    let base = reference.get(..reference.len() - 4)?;
+    match parsed.scheme {
+        Scheme::Part => {
+            let digits = base.len() - base.rfind(|ch: char| !ch.is_ascii_digit())? - 1;
+            let width = digits;
+            Some(format!(
+                "{}{:0width$}{}",
+                &base[..base.len() - digits],
+                index + 1,
+                &reference[base.len()..]
+            ))
+        }
+        Scheme::Old if index == 0 => Some(format!("{base}.rar")),
+        // `parse` reads two digits after the letter, so `.r99` is the last
+        // old name it numbers.
+        Scheme::Old => (index <= 100).then(|| format!("{base}.r{:02}", index - 1)),
+    }
+}
+
+// The set a recovery volume's name covers: `name.part1.rev` and `name.rev`
+// both cover the volumes of `name`, lower-cased as `parse` gives it.
+pub(crate) fn recovery_stem(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".rev")?;
+    let stem = match stem.rfind(".part") {
+        Some(at) if stem[at + 5..].parse::<u32>().is_ok() => &stem[..at],
+        _ => stem,
+    };
+    (!stem.is_empty()).then(|| stem.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sibling_keeps_the_numbering_width_and_case() {
+        assert_eq!(
+            sibling("Archive.part1.rar", 1).as_deref(),
+            Some("Archive.part2.rar")
+        );
+        assert_eq!(sibling("a.part01.RAR", 9).as_deref(), Some("a.part10.RAR"));
+        assert_eq!(sibling("a.r00", 0).as_deref(), Some("a.rar"));
+        assert_eq!(sibling("a.rar", 1).as_deref(), Some("a.r00"));
+        assert_eq!(sibling("a.rar", 101), None);
+        for name in ["a.part3.rar", "a.r05", "a.rar"] {
+            let index = parse(name).unwrap().index();
+            assert_eq!(sibling(name, index).as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn a_recovery_volume_names_its_set() {
+        assert_eq!(
+            recovery_stem("Archive.part1.rev").as_deref(),
+            Some("archive")
+        );
+        assert_eq!(recovery_stem("archive.rev").as_deref(), Some("archive"));
+        assert_eq!(recovery_stem("archive.rar"), None);
+        assert_eq!(
+            parse("archive.part2.rar").unwrap().stem(),
+            parse("archive.r00").unwrap().stem()
+        );
+    }
+}

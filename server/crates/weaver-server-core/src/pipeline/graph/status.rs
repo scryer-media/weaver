@@ -86,17 +86,10 @@ impl RootJob for GraphJob {
                 node: object.node,
                 kind: object.kind,
                 namespace: object.namespace,
-                // The object is called what its first volume is, in the
-                // namespace it lives in.
-                name: tree
-                    .volumes(object.node)
-                    .and_then(|(parent, volumes)| {
-                        tree.namespace(parent)?.get(*volumes.values().next()?)
-                    })
-                    .map_or_else(
-                        || object.kind.to_string(),
-                        |member| member.output_name.clone(),
-                    ),
+                name: self
+                    .writer()
+                    .set_name(tree, object.node)
+                    .map_or_else(|| object.kind.to_string(), str::to_owned),
                 blocks_reachable: object.blocks_reachable,
                 damaged_slices: object.damaged_slices,
                 outcome: object.outcome,
@@ -178,20 +171,25 @@ pub(crate) fn drive(
 }
 
 // What the job's repair came to once every object has ruled: the slices
-// its objects rebuilt, when at least one rebuilt any and none fell short.
-// One still waiting has not ruled, and one that could not rebuild means the
-// repair did not hold, whatever the others did.
-pub(crate) fn repaired_slices(outcomes: &[RepairOutcome]) -> Option<u32> {
-    let mut repaired: Option<u64> = None;
-    for outcome in outcomes {
-        match outcome {
-            RepairOutcome::Waiting | RepairOutcome::Impossible { .. } => return None,
-            RepairOutcome::Repaired { slices } => {
-                repaired = Some(repaired.unwrap_or(0).saturating_add(*slices));
-            }
-            RepairOutcome::Clean => {}
-        }
+// its objects rebuilt, when at least one rebuilt any and the repair held.
+// One still waiting has not ruled. The repair held when nothing fails the
+// job as a recovery failure, the one judgement `failure` makes: a set that
+// could not rebuild what another set of its namespace made whole does not
+// undo that repair.
+pub(crate) fn repaired_slices(
+    summary: &RecoverySummary,
+    outcomes: &[RepairOutcome],
+    job: &dyn RootJob,
+) -> Option<u32> {
+    if outcomes.contains(&RepairOutcome::Waiting) || failure(summary, outcomes, job).is_some() {
+        return None;
     }
+    let repaired = outcomes
+        .iter()
+        .fold(None, |sum: Option<u64>, outcome| match outcome {
+            RepairOutcome::Repaired { slices } => Some(sum.unwrap_or(0).saturating_add(*slices)),
+            _ => sum,
+        });
     repaired.map(|slices| u32::try_from(slices).unwrap_or(u32::MAX))
 }
 

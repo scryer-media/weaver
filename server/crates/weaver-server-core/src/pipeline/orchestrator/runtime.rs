@@ -1089,6 +1089,7 @@ impl Pipeline {
             let mut turn_active = false;
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
+            turn_active |= self.hear_graph_runs();
             self.pump_decode_queue();
 
             // An ordinal can be retired from outside the result handlers — a

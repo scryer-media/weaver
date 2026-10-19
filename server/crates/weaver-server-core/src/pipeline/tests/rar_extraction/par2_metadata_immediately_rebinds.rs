@@ -3266,23 +3266,13 @@ async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_b
 
 // What a 7z extraction reports for a block whose packed bytes did not decode.
 fn sevenz_corrupted_block_error() -> crate::pipeline::ExtractionError {
-    sevenz_block_error(sevenz_turbo::BlockErrorKind::Corrupted, "data error")
+    sevenz_block_error(sevenz_turbo::Error::Corrupted("data error".into()))
 }
 
 // What sevenz-turbo raises for a block that failed, mapped as the extraction
 // maps it.
-fn sevenz_block_error(
-    kind: sevenz_turbo::BlockErrorKind,
-    message: &str,
-) -> crate::pipeline::ExtractionError {
-    crate::pipeline::completion::finalize::extract::sevenz_extraction_error(
-        &sevenz_turbo::Error::BlockDecode {
-            block_index: 0,
-            packed_offset: 32,
-            kind,
-            message: message.into(),
-        },
-    )
+fn sevenz_block_error(cause: sevenz_turbo::Error) -> crate::pipeline::ExtractionError {
+    crate::pipeline::completion::finalize::extract::sevenz_extraction_error(&cause.in_block(0, 32))
 }
 
 // What a worker reports when the process has run out of file descriptors.
@@ -3778,32 +3768,24 @@ async fn a_gzip_failure_the_recovery_data_finds_clean_is_final_after_one_fallbac
 #[test]
 fn only_7z_data_errors_are_recoverable_full_set_failures() {
     use crate::pipeline::ExtractionErrorClass;
-    use sevenz_turbo::BlockErrorKind;
+    use sevenz_turbo::Error;
     assert_eq!(
         sevenz_corrupted_block_error().class(),
         ExtractionErrorClass::Recoverable
     );
     assert_eq!(
-        sevenz_block_error(
-            BlockErrorKind::Io,
-            &format!(
-                "{:?}",
-                std::io::Error::from(std::io::ErrorKind::UnexpectedEof)
-            )
-        )
+        sevenz_block_error(Error::from(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof
+        )))
         .class(),
         ExtractionErrorClass::Recoverable
     );
     assert_eq!(
-        sevenz_block_error(
-            BlockErrorKind::UnsupportedMethod,
-            "UnsupportedCompressionMethod(\"ARM64\")"
-        )
-        .class(),
+        sevenz_block_error(Error::UnsupportedCompressionMethod("ARM64".into())).class(),
         ExtractionErrorClass::Terminal
     );
     assert_eq!(
-        sevenz_block_error(BlockErrorKind::Password, "PasswordRequired").class(),
+        sevenz_block_error(Error::PasswordRequired).class(),
         ExtractionErrorClass::PasswordRequired
     );
 }

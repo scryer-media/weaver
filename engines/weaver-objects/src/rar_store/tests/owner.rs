@@ -75,7 +75,7 @@ impl Owner {
         let volume = owner.object.claim(name, front).unwrap_or(VolumeIndex(0));
         assert_eq!(volume, VolumeIndex(first as u32), "founds on {name}");
         let name = name.clone();
-        owner.object.bound(volume, &name);
+        owner.object.bound(volume, &name, &[]);
         owner.bound[first] = true;
         owner.size(first);
         owner
@@ -120,7 +120,7 @@ impl Owner {
             "claims {name}"
         );
         let name = name.clone();
-        self.object.bound(VolumeIndex(volume as u32), &name);
+        self.object.bound(VolumeIndex(volume as u32), &name, &[]);
         self.bound[volume] = true;
         self.size(volume);
         self.settle();

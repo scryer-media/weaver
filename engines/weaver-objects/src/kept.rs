@@ -45,6 +45,11 @@ impl Kept {
         })
     }
 
+    // How many bytes are kept.
+    pub(crate) fn len(&self) -> u64 {
+        self.pieces.values().map(|piece| piece.range.len()).sum()
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -223,6 +228,14 @@ impl Kept {
             .filter(|run| run.range.end > offset)
             .map(|run| run.range.start.max(offset))
             .min()
+    }
+
+    // The bytes in hand that run unbroken to the end of a range, within it.
+    pub(crate) fn suffix(&self, range: ByteRange) -> &[u8] {
+        let mut gaps = Vec::new();
+        self.missing(range, &mut gaps);
+        let start = gaps.last().map_or(range.start, |gap| gap.end);
+        self.read(ByteRange::new(start, range.end)).unwrap_or(&[])
     }
 
     // The parts of a range not in hand yet.

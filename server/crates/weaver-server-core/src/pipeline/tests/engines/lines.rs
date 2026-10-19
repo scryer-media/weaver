@@ -90,13 +90,50 @@ async fn a_set_the_grid_vouches_for_logs_verification_grid() {
     assert_eq!(line, expected);
 }
 
-// Articles that straddle the slices leave the grid short of proof, so the
-// set read the member back to rule it clean.
+// Articles that straddle the slices, leased once the set's index is in:
+// the decoder cuts their checksums at the slice boundaries the job's PAR2
+// object folds, so the grid vouches for every slice without a read.
+#[tokio::test]
+async fn articles_straddling_the_slices_are_cut_at_them_and_the_grid_vouches() {
+    let data = payload(4 * ARTICLE, 42);
+    let files: [(&str, &[u8]); 1] = [("lantern.bin", &data)];
+    let scenario = Scenario::new(covered(&files, &["lantern.bin"])).framed(ARTICLE - 16);
+    let (line, reads) = ruled(scenario).await;
+    assert_eq!(reads, 0, "{line}");
+    let fields = fields(&line);
+    assert_eq!(value(&fields, "outcome"), "clean", "{line}");
+    assert_eq!(value(&fields, "verification"), "grid", "{line}");
+}
+
+// Articles longer than a slice, leased as a lane leases them, with the
+// payload's first article in reach of the first lease beside the index's:
+// the payload waits for the index the post declares, so every article is
+// cut at the slice boundaries and the grid vouches for every slice without
+// a read.
+#[tokio::test]
+async fn a_leased_payload_waits_for_its_index_and_the_grid_vouches() {
+    let data = payload(4 * ARTICLE, 42);
+    let files: [(&str, &[u8]); 1] = [("lantern.bin", &data)];
+    let scenario = Scenario::new(covered(&files, &["lantern.bin"]))
+        .framed(ARTICLE + ARTICLE / 2)
+        .leased();
+    let (line, reads) = ruled(scenario).await;
+    assert_eq!(reads, 0, "{line}");
+    let fields = fields(&line);
+    assert_eq!(value(&fields, "outcome"), "clean", "{line}");
+    assert_eq!(value(&fields, "verification"), "grid", "{line}");
+}
+
+// Articles decoded before the set's index arrived carry one checksum each,
+// which leaves the straddled slices short of proof, so the set read the
+// member back to rule it clean.
 #[tokio::test]
 async fn a_set_that_read_bytes_back_logs_verification_read() {
     let data = payload(4 * ARTICLE, 42);
     let files: [(&str, &[u8]); 1] = [("lantern.bin", &data)];
-    let scenario = Scenario::new(covered(&files, &["lantern.bin"])).framed(ARTICLE - 16);
+    let scenario = Scenario::new(covered(&files, &["lantern.bin"]))
+        .framed(ARTICLE - 16)
+        .backwards();
     let (line, reads) = ruled(scenario).await;
     assert!(reads > 0, "the repair read nothing back");
     let fields = fields(&line);

@@ -24,6 +24,7 @@ use crate::StateError;
 use crate::categories::CategoryConfig;
 use crate::categories::model::{completion_parent, resolve_category_config};
 use crate::jobs::JobId;
+use crate::jobs::graph_checkpoint::Delta;
 use crate::jobs::handle::{
     CancellationOrigin, HoldOrigin, HoldOwner, HoldSet, JobInfo, QueueAction, QueueMoveTarget,
     QueueOwner, SchedulerHandle, TorrentRate,
@@ -967,7 +968,9 @@ impl TorrentService {
                 return;
             }
         };
-        let rows = Arc::new(checkpoint::rows(&snapshot));
+        // A torrent job's checkpoint is written whole: its rows change little
+        // and seldom.
+        let rows = Arc::new(Delta::between(None, &checkpoint::rows(&snapshot)));
         let db = self.inner.db.clone();
         match tokio::task::spawn_blocking(move || db.save_graph_checkpoint(job_id, rows)).await {
             Ok(Ok(())) => {}

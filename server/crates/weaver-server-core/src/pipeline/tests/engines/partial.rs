@@ -1441,6 +1441,130 @@ async fn a_stored_rar_a_set_covers_but_cannot_rebuild_is_listed_unrepaired_and_t
     .await;
 }
 
+// Quiet: once nothing more will arrive and no repair will come, each
+// object that cannot finish rules for itself, from its own state and what
+// the tree records of its members. The server tells it and chooses no
+// reason.
+
+// A stored 7z whose article inside `beacon.bin` never arrives, with no
+// PAR2: the store's member is left damaged and nothing repaired it, so the
+// store refuses itself unrepairable. `ember.bin`, closed whole, stays
+// delivered.
+#[tokio::test]
+async fn a_stored_7z_with_a_damaged_member_and_no_par2_refuses_itself_unrepairable_under_graph() {
+    let archive = two_files(EncoderMethod::COPY);
+    let scenario = Scenario::new(beside(vec![Post::plain("lantern.7z", archive)])).lost(0, 3);
+    under_graph(
+        &scenario,
+        Graph {
+            status: Some(Status::Partial),
+            kind: Some("Unpack"),
+            files: with_quill(vec![
+                file("ember.bin", Some(ember())),
+                file("lantern.7z", None),
+            ]),
+            whole: &["ember.bin", "quill.bin"],
+            damaged: &["lantern.7z"],
+            unrepaired: &[],
+            withheld: &[],
+            refused: &["kind=sevenz_store member=lantern.7z why=unrepairable"],
+            delivered: &[
+                "name=ember.bin from=ember.bin depth=1 whole=true",
+                "name=lantern.7z from=lantern.7z depth=0 whole=false",
+                QUILL,
+            ],
+        },
+    )
+    .await;
+}
+
+// A stored zip whose last article, all directory and end record, never
+// arrives. Nothing can bring the directory forward, so once the job is
+// quiet the zip hears the loss and walks its local headers instead; both
+// members are found whole, and with nothing short the zip refuses nothing.
+#[tokio::test]
+async fn a_stored_zip_whose_central_directory_article_never_arrives_rules_for_itself_under_graph() {
+    let archive = super::zip::archive(super::zip::stored());
+    let last = articles(&archive) - 1;
+    let scenario = Scenario::new(vec![Post::plain("lantern.zip", archive)]).lost(0, last);
+    under_graph(
+        &scenario,
+        Graph {
+            status: Some(Status::Complete),
+            kind: None,
+            files: vec![
+                file("ember.bin", Some(payload(5 * ARTICLE + 13, 51))),
+                file("quill.bin", Some(payload(3 * ARTICLE - 5, 52))),
+            ],
+            whole: &["ember.bin", "quill.bin"],
+            damaged: &[],
+            unrepaired: &[],
+            withheld: &[],
+            refused: &[],
+            delivered: &[
+                "name=ember.bin from=ember.bin depth=1 whole=true",
+                "name=quill.bin from=quill.bin depth=1 whole=true",
+            ],
+        },
+    )
+    .await;
+}
+
+// A header-encrypted RAR that writes no password check: the store cannot
+// tell a right password from a wrong one and hands the set to its engine,
+// whose run asks for one. The job has none to give, and once it is quiet
+// the engine, still asking, refuses itself for its shut headers.
+#[tokio::test]
+async fn a_header_encrypted_rar_with_no_check_and_no_password_refuses_itself_encrypted_header_at_quiet_under_graph()
+ {
+    let volumes = header_encrypted_store_set("beacon.bin", &body(), 1, SECRET, HeaderCheck::Absent);
+    let scenario = Scenario::new(beside(posts(&volumes)));
+    under_graph(
+        &scenario,
+        Graph {
+            status: Some(Status::Partial),
+            kind: Some("Password"),
+            files: with_quill(raw(&volumes)),
+            whole: &["quill.bin"],
+            damaged: &[],
+            unrepaired: &[],
+            withheld: &[("silver.horizon.part01.rar", Why::EncryptedHeader)],
+            refused: &[
+                "kind=rar_engine member=silver.horizon.part01.rar why=encrypted_header",
+                "kind=rar_store member=silver.horizon.part01.rar why=encrypted_header",
+            ],
+            delivered: &[QUILL],
+        },
+    )
+    .await;
+}
+
+// The first volume of a two-volume RAR, the second never posted: the store
+// announces the member the first volume starts and never places the rest of
+// it. Nothing posted was lost, so once the job is quiet the store refuses
+// itself unmapped.
+#[tokio::test]
+async fn a_rar_that_announced_a_member_it_never_placed_refuses_itself_unmapped_under_graph() {
+    let mut volumes = store(2);
+    volumes.pop();
+    let scenario = Scenario::new(beside(posts(&volumes)));
+    under_graph(
+        &scenario,
+        Graph {
+            status: Some(Status::Partial),
+            kind: Some("Unpack"),
+            files: with_quill(raw(&volumes)),
+            whole: &["quill.bin"],
+            damaged: &[],
+            unrepaired: &[],
+            withheld: &[("silver.horizon.part01.rar", Why::Unmapped)],
+            refused: &["kind=rar_store member=silver.horizon.part01.rar why=unmapped"],
+            delivered: &[QUILL],
+        },
+    )
+    .await;
+}
+
 // Mixed jobs: the status follows from the delivery as a whole.
 
 fn three_one_withheld() -> Scenario {
@@ -1612,4 +1736,37 @@ async fn a_partial_job_restarted_after_every_article_ends_partial_with_the_same_
         "the files"
     );
     assert!(restarted.files == whole.files, "the bytes");
+}
+
+// A uuencoded file whose fourth article never arrives, with nothing to
+// rebuild it. The loss is heard before the articles after it arrive, so they
+// are placed where the order puts them, one hole early, and the file is
+// damaged from the hole to its end: not whole, so the job fails.
+#[tokio::test]
+async fn a_uuencoded_file_whose_middle_article_never_arrives_is_damaged_to_its_end() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", noise(7 * ARTICLE + 20, 61))])
+        .uuencoded()
+        .lost(0, 3);
+    under_graph(
+        &scenario,
+        Graph {
+            status: Some(Status::Failed(
+                "no file was delivered whole; 1 short: ember.bin",
+            )),
+            kind: Some("Unpack"),
+            files: vec![],
+            whole: &[],
+            damaged: &["ember.bin"],
+            unrepaired: &[],
+            withheld: &[],
+            refused: &[],
+            delivered: &[],
+        },
+    )
+    .await;
+    under_classic(
+        &scenario,
+        Classic::Fails("download incomplete after exhausting retries: 0/1 data files complete"),
+    )
+    .await;
 }

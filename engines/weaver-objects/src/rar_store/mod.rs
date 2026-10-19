@@ -12,7 +12,7 @@
 // The object is pure: no I/O, no threads, no files. Bytes it cannot place yet
 // are held by its owner, who hands them back once the headers place them.
 
-mod claim;
+pub(crate) mod claim;
 pub(crate) mod facts;
 mod image;
 mod layout;
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use unrar_rs::{EncryptedStore, StoredLayoutBuilder};
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Provenance,
-    Pull, Seek, VolumeIndex, Weight, Why,
+    Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
@@ -45,12 +45,18 @@ use walk::{Step, Walk};
 // streams here, so only the non-solid window applies.
 const WINDOW: u32 = 8;
 
-struct Volume {
+// One volume as the store holds it: everything it read of it, the headers
+// walked and the bytes kept for that, which is what travels with the member
+// when the store gives the volume back.
+pub(crate) struct Volume {
     name: Option<String>,
     length: Option<u64>,
     closed: bool,
     kept: Kept,
     walk: Walk,
+    // What the volume's front stated when it was bound, before any of its
+    // bytes reached the walk: what places a sibling beside it meanwhile.
+    front: Option<unrar_rs::RarVolumeFacts>,
 }
 
 impl Volume {
@@ -61,6 +67,7 @@ impl Volume {
             closed: false,
             kept: Kept::default(),
             walk: Walk::default(),
+            front: None,
         }
     }
 }
@@ -139,6 +146,8 @@ pub struct RarStore {
     // The process's derivations, shared by every walk, check and key.
     keys: Arc<Keys>,
     volumes: BTreeMap<VolumeIndex, Volume>,
+    // Volumes said to be given back, until the tree takes them.
+    giving: BTreeMap<VolumeIndex, Volume>,
     layout: Option<StoredLayoutBuilder>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
@@ -169,6 +178,7 @@ impl RarStore {
         Self {
             keys,
             volumes: BTreeMap::new(),
+            giving: BTreeMap::new(),
             layout: None,
             entries: Vec::new(),
             candidates: Vec::new(),
@@ -259,7 +269,50 @@ impl RarStore {
             if self.gone {
                 return;
             }
+            self.give_back_misplaced(volume, out);
         }
+    }
+
+    // A volume read to its close whose own headers say it is not where the
+    // store holds it was claimed on too little: its front said nothing that
+    // placed it, and a founding put it first. It goes back to its namespace
+    // with everything read of it, to be claimed where it belongs. Only at
+    // its close, so nothing of it is still on its way here, and the headers
+    // are read as far as they go: the parse that travels is the whole one.
+    // The store never mapped any of it, since the layout stops at a volume
+    // its headers do not place. The volume held first is the one the store
+    // was founded on, and every other was taken as a volume of the set it
+    // begins: when that one proves to be no set's first, the store was
+    // never that set, and each volume it took goes back with it, read to its
+    // close, for the store that holds their first volume to claim.
+    fn give_back_misplaced(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
+        let misplaced = self.volumes.get(&volume).is_some_and(|found| {
+            found.closed
+                && found
+                    .walk
+                    .facts
+                    .as_ref()
+                    .is_some_and(|facts| claim::misplaced(volume, facts))
+        });
+        if !misplaced {
+            return;
+        }
+        let going: Vec<VolumeIndex> = match volume == VolumeIndex(0) {
+            true => self
+                .volumes
+                .iter()
+                .filter(|(_, found)| found.closed)
+                .map(|(index, _)| *index)
+                .collect(),
+            false => vec![volume],
+        };
+        for index in going {
+            if let Some(found) = self.volumes.remove(&index) {
+                self.giving.insert(index, found);
+                out.push(Emit::GiveBack(index));
+            }
+        }
+        self.stale = true;
     }
 
     // Everything bound has closed: nothing more will arrive.
@@ -385,9 +438,12 @@ impl Object for RarStore {
         if self.gone {
             return;
         }
+        // A volume adopted closed was walked to its close already.
         let found = self.volume(volume);
-        found.closed = true;
-        found.walk.touch();
+        if !found.closed {
+            found.closed = true;
+            found.walk.touch();
+        }
         self.stale = true;
         self.settle(out);
         if self.gone {
@@ -424,10 +480,21 @@ impl Object for RarStore {
 
     // Nothing more will arrive. A set whose first volume never came has
     // lost its first bytes: no header says what any volume after it holds.
-    fn quiet(&mut self, out: &mut Vec<Emit>) {
+    // Otherwise a member still damaged, a password still asked for, or a
+    // member named and never placed leaves the set unread.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if self.gone {
+            return;
+        }
         let first = self.volumes.get(&VolumeIndex(0));
-        if !self.gone && first.is_none_or(|found| found.name.is_none()) {
-            self.give_up(Emit::Refuse(Why::FirstBytesLost), out);
+        let why = match first.is_none_or(|found| found.name.is_none()) {
+            true => Some(Why::FirstBytesLost),
+            false => crate::quiet::damaged(standing)
+                .or_else(|| self.shut())
+                .or_else(|| crate::quiet::unplaced(standing)),
+        };
+        if let Some(why) = why {
+            self.give_up(Emit::Refuse(why), out);
         }
     }
 
@@ -526,8 +593,11 @@ impl Object for RarStore {
             .map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str) {
-        self.volume(volume).name = Some(name.to_owned());
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8]) {
+        let facts = self.front_facts(front);
+        let bound = self.volume(volume);
+        bound.name = Some(name.to_owned());
+        bound.front = facts;
         self.stale = true;
     }
 
@@ -535,5 +605,38 @@ impl Object for RarStore {
     // goes where the set went.
     fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
         self.claim_volume(name, first_bytes)
+    }
+
+    // What was read of the volume goes with it, unless it is more than a
+    // volume's headers can need: then the member is refused, never read
+    // again.
+    fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        self.giving
+            .remove(&volume)
+            .filter(|given| given.kept.len() <= claim::CARRIED)
+            .map(|given| Box::new(given) as weaver_graph::Carried)
+    }
+
+    fn reclaim(&mut self, name: &str, carried: &weaver_graph::Carried) -> Option<VolumeIndex> {
+        self.reclaim_volume(name, carried.downcast_ref::<Volume>()?)
+    }
+
+    // The volume as its giver read it: its headers walked, its bytes kept,
+    // its length and close. Nothing of it is read or walked again, and no
+    // key is derived again: derivations live in the process's shared cache,
+    // and a volume's walk holds no key of its own.
+    fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
+        let Ok(mut given) = carried.downcast::<Volume>() else {
+            return self.bound(volume, name, &[]);
+        };
+        given.name = Some(name.to_owned());
+        self.volumes.insert(volume, *given);
+        self.stale = true;
+    }
+
+    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
+        if let Some(found) = self.volumes.get_mut(&volume) {
+            found.name = Some(name.to_owned());
+        }
     }
 }

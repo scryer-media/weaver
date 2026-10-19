@@ -15,7 +15,8 @@
 //
 // A member binds to a described file by its path or bare name, or, when no
 // described name answers to it, by its bytes: the repair reads it back and
-// identifies it, and the next bind gives it the described name.
+// identifies it, and the next bind gives it the described name. A described
+// file no member is is announced absent, and the repair writes it whole.
 
 pub(crate) mod facts;
 mod identity;
@@ -48,6 +49,30 @@ const MAX_SETS: usize = 256;
 // What one repair's decoder may hold: half the allowance a job has when the
 // host's memory is unknown.
 const REPAIR_MEMORY_LIMIT: u64 = 128 << 20;
+
+// A set's ruling and the members its files were bound to when it ruled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Settled {
+    members: Vec<Option<MemberId>>,
+    slice_size: u64,
+    blocks_reachable: u64,
+    damaged_slices: u64,
+    outcome: RepairOutcome,
+}
+
+impl Settled {
+    // A PAR3 ruling reads every bound member back.
+    fn ruling(&self, id: &str) -> SetRuling {
+        SetRuling {
+            id: id.to_owned(),
+            slice_size: self.slice_size,
+            blocks_reachable: self.blocks_reachable,
+            damaged_slices: self.damaged_slices,
+            outcome: Some(self.outcome),
+            read: true,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct Volume {
@@ -83,6 +108,10 @@ pub struct Par3 {
     outcome: Option<RepairOutcome>,
     // Each set as the last repair ruled it.
     ruled: Vec<SetRuling>,
+    // Each set a repair settled, by its id: what it ruled and the members
+    // its files were bound to then. The ruling stands while they are; only
+    // a set that waited or could not rebuild is tried again.
+    settled: BTreeMap<String, Settled>,
     memory_limit: u64,
 }
 
@@ -98,6 +127,7 @@ impl Par3 {
             needed: 0,
             outcome: None,
             ruled: Vec::new(),
+            settled: BTreeMap::new(),
             memory_limit: REPAIR_MEMORY_LIMIT,
         }
     }
@@ -257,8 +287,13 @@ impl Object for Par3 {
         volume.front[offset..end].copy_from_slice(&delivery.bytes[..end - offset]);
     }
 
+    // A repair reads its recovery packets back from the volumes, so a wait
+    // ends as one closes: its packets are in hand, or no more can come.
     fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.volume(volume).closed = true;
+        if self.outcome == Some(RepairOutcome::Waiting) {
+            self.outcome = None;
+        }
     }
 
     // A loss is a hole in what arrived, which no packet in it passes; the
@@ -294,7 +329,7 @@ impl Object for Par3 {
             .then(|| VolumeIndex(self.volumes.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, _name: &str) {
+    fn bound(&mut self, volume: VolumeIndex, _name: &str, _front: &[u8]) {
         self.volume(volume);
     }
 
@@ -371,6 +406,30 @@ impl Recovery for Par3 {
         self.bound = bound;
     }
 
+    // Every described file no member carries by name and none may yet turn
+    // out to be by content, by path and size, once each. A member of the
+    // file's size that no described name answers to may be it until a
+    // readback says what it is.
+    fn absent(&self, out: &mut Vec<(String, u64)>) {
+        for set in self.front_sets() {
+            for file in set.files() {
+                let path = file.path();
+                let maybe = self.unnamed.iter().any(|(member, unnamed)| {
+                    unnamed.length == file.size()
+                        && self.identified.get(member).is_none_or(|was| was == path)
+                });
+                let named = (path.to_owned(), file.size());
+                if self.free(path)
+                    && !self.bound.contains_key(path)
+                    && !maybe
+                    && !out.contains(&named)
+                {
+                    out.push(named);
+                }
+            }
+        }
+    }
+
     fn covers(&self, member: MemberId) -> bool {
         self.bound.values().any(|bound| *bound == member)
     }
@@ -425,6 +484,23 @@ impl Recovery for Par3 {
         let mut waiting = 0;
         self.ruled.clear();
         for set in sets {
+            // The digest of the set's root packet, which its recovery packets
+            // name it by.
+            let id: String = set
+                .root_hash()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let members: Vec<Option<MemberId>> = set
+                .files()
+                .iter()
+                .map(|file| self.bound.get(file.path()).copied())
+                .collect();
+            if let Some(settled) = self.settled.get(&id).filter(|was| was.members == members) {
+                self.ruled.push(settled.ruling(&id));
+                outcome = combine(outcome, settled.outcome);
+                continue;
+            }
             let result = if self.identifying(&set) {
                 rebuild::SetRepair {
                     outcome: RepairOutcome::Waiting,
@@ -436,21 +512,20 @@ impl Recovery for Par3 {
             if result.outcome == RepairOutcome::Waiting {
                 waiting += result.lost;
             }
-            // A PAR3 repair reads every bound member back to rule.
-            self.ruled.push(SetRuling {
-                // The digest of the set's root packet, which its recovery
-                // packets name it by.
-                id: set
-                    .root_hash()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
+            let settled = Settled {
+                members,
                 slice_size: set.block_size(),
                 blocks_reachable: rebuild::usable_recovery(&set).len() as u64,
                 damaged_slices: result.lost,
-                outcome: Some(result.outcome),
-                read: true,
-            });
+                outcome: result.outcome,
+            };
+            self.ruled.push(settled.ruling(&id));
+            if matches!(
+                result.outcome,
+                RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+            ) {
+                self.settled.insert(id, settled);
+            }
             outcome = combine(outcome, result.outcome);
         }
         self.needed = waiting;

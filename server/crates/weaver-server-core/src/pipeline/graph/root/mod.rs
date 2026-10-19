@@ -30,9 +30,11 @@ mod tests;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use weaver_graph::{ByteRange, NodeId, Pull, Purpose, Seek, Segment, Tree, VolumeIndex, Weight};
+use weaver_graph::{
+    ByteRange, NodeId, Part, Pull, Purpose, Seek, Segment, Tree, VolumeIndex, Weight,
+};
 
-use self::facts::PostFacts;
+use self::facts::{PostFacts, RootFactsError};
 use self::intake::{Checksums, Decoded};
 use self::source::{ArticleMap, Class, Move};
 use self::window::{Bid, Window};
@@ -61,10 +63,31 @@ pub(crate) trait Root: Segments {
     // What a checkpoint keeps of the root, under the root's name and the
     // version of its facts, so a restore reads them only into its own kind.
     type Facts: Serialize + DeserializeOwned;
+    // What the root keeps between encodings of its facts, so a part that
+    // did not change is not encoded again.
+    type Kept: Default + Send;
     const NAME: &'static str;
     const FACTS_VERSION: u16;
 
     fn facts(&self) -> Self::Facts;
+
+    // The facts' bytes and the parts they name, encoding again only what
+    // changed since `kept` last encoded. Facts kept whole name no parts.
+    fn encode(&self, _kept: &mut Self::Kept) -> Result<(Vec<u8>, Vec<Part>), RootFactsError> {
+        rmp_serde::to_vec(&self.facts())
+            .map(|bytes| (bytes, Vec::new()))
+            .map_err(|error| RootFactsError::Encode(error.to_string()))
+    }
+
+    // The facts back from their bytes and parts.
+    fn decode(bytes: &[u8], parts: &[Part]) -> Result<Self::Facts, RootFactsError> {
+        if !parts.is_empty() {
+            return Err(RootFactsError::Decode(
+                "parts of facts kept whole".to_owned(),
+            ));
+        }
+        rmp_serde::from_slice(bytes).map_err(|error| RootFactsError::Decode(error.to_string()))
+    }
 
     // Units the queues do not hold were fetched by an earlier run.
     fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool);
@@ -83,6 +106,14 @@ pub(crate) trait Root: Segments {
     fn lost(&mut self, volume: VolumeIndex, unit: u32);
     // Whether the volume still has units to come.
     fn volume_waiting(&self, volume: VolumeIndex) -> bool;
+    // Whether the volume has units the queue fetches unasked still to come.
+    // A unit fetched only when something asks for it holds nothing back.
+    fn volume_to_come(&self, volume: VolumeIndex) -> bool {
+        self.volume_waiting(volume)
+    }
+    // The units the queue holds parked when the job is installed: fetched
+    // only once something asks for them.
+    fn parked(&mut self, _held: impl FnMut(VolumeIndex, u32) -> bool) {}
     // What the root asks for itself before a round of seeks, from what the
     // tree knows now.
     fn bootstrap(&mut self, tree: &Tree);
@@ -185,11 +216,20 @@ impl Root for ArticleRoot {
     type Class = Class;
     type Move = Move;
     type Facts = PostFacts;
+    type Kept = facts::Encoded;
     const NAME: &'static str = "articles";
     const FACTS_VERSION: u16 = PostFacts::VERSION;
 
     fn facts(&self) -> PostFacts {
         self.post_facts()
+    }
+
+    fn encode(&self, kept: &mut facts::Encoded) -> Result<(Vec<u8>, Vec<Part>), RootFactsError> {
+        Ok(facts::encode_post(kept, &self.post_facts()))
+    }
+
+    fn decode(bytes: &[u8], parts: &[Part]) -> Result<PostFacts, RootFactsError> {
+        facts::decode_post(bytes, parts)
     }
 
     fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool) {
@@ -223,6 +263,14 @@ impl Root for ArticleRoot {
 
     fn volume_waiting(&self, volume: VolumeIndex) -> bool {
         self.map.volume_waiting(volume)
+    }
+
+    fn volume_to_come(&self, volume: VolumeIndex) -> bool {
+        self.map.volume_to_come(volume)
+    }
+
+    fn parked(&mut self, held: impl FnMut(VolumeIndex, u32) -> bool) {
+        self.map.parked(held);
     }
 
     fn bootstrap(&mut self, tree: &Tree) {

@@ -18,8 +18,8 @@ use weaver_model::files::FileRole;
 
 use super::super::{
     debug_job_state, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
-    pump_pipeline_runtime_queues, retire_pipeline_database, settle_direct_demotion_work,
-    settle_direct_verification_read,
+    pump_pipeline_runtime_queues, retention_client, retire_pipeline_database,
+    settle_direct_demotion_work, settle_direct_verification_read,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
@@ -90,6 +90,17 @@ pub(super) fn par2_volumes(
     blocks: u32,
     volumes: u32,
 ) -> Vec<Post> {
+    par2_volumes_sliced(base, files, ARTICLE as u64, blocks, volumes)
+}
+
+// The same, sliced at `slice` bytes rather than ARTICLE.
+pub(super) fn par2_volumes_sliced(
+    base: &str,
+    files: &[(&str, &[u8])],
+    slice: u64,
+    blocks: u32,
+    volumes: u32,
+) -> Vec<Post> {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
 
     let source = tempfile::tempdir().unwrap();
@@ -106,7 +117,7 @@ pub(super) fn par2_volumes(
         Some(source.path().to_path_buf()),
         inputs,
     );
-    options.block_sizing = BlockSizing::Bytes(ARTICLE as u64);
+    options.block_sizing = BlockSizing::Bytes(slice);
     options.recovery_amount = RecoveryAmount::Count(blocks);
     options.volume_count = Some(volumes);
     let creator = Par2Creator::new(options);
@@ -165,6 +176,49 @@ pub(super) fn par3_set(base: &str, files: &[(&str, &[u8])], blocks: u64) -> Vec<
         .collect()
 }
 
+// A PAR3 set over `files` built as `options` say (its codec, its recovery
+// count, whether it carries its input as Data packets), blocks of one
+// article, named as the creator names them under `base`, the index first.
+pub(super) fn par3_set_with(
+    base: &str,
+    files: &[(&str, &[u8])],
+    options: par3_rs::creation::CreationOptions,
+) -> Vec<Post> {
+    use par3_rs::creation::{CreationPlan, CreationSource};
+    use par3_rs::source::{MemorySourceAccess, SourceId};
+    let mut access = MemorySourceAccess::default();
+    let mut sources = Vec::new();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        let source = SourceId(index as u64 + 1);
+        access.insert(source, 1, bytes.to_vec().into());
+        sources.push(CreationSource {
+            name: (*name).into(),
+            source,
+        });
+    }
+    let options = par3_rs::creation::CreationOptions {
+        block_size: ARTICLE as u64,
+        ..options
+    };
+    let plan = CreationPlan::build(std::sync::Arc::new(access), &sources, options).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut written = plan.execute(&out.path().join(base), out.path()).unwrap();
+    written.sort_by_key(|path| {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        (name != format!("{base}.par3"), name)
+    });
+    written
+        .iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            Post {
+                bytes: std::fs::read(path).unwrap(),
+                ..Post::plain(name, Vec::new())
+            }
+        })
+        .collect()
+}
+
 // For each recovery block of a PAR2 volume, the ordinals of the articles
 // holding its bytes.
 pub(super) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
@@ -211,6 +265,10 @@ pub(super) struct Scenario {
     // answers: the article goes back on the queue the way the worker
     // retries it after a 430, and the next ask is served.
     pub(super) refused: Vec<(u32, u32)>,
+    // Articles the primary server serves damaged while a backup serves them
+    // whole. A scenario with any has both servers, and an ask that excludes
+    // the primary is the backup's.
+    pub(super) corrupt_primary: Vec<(u32, u32)>,
     pub(super) password: Option<String>,
     pub(super) global_passwords: Vec<String>,
     // The decoded size of every article but each post's last; PAR2 slices
@@ -218,6 +276,15 @@ pub(super) struct Scenario {
     pub(super) article: usize,
     // Every batch the download queue hands out is served last article first.
     pub(super) backwards: bool,
+    // Every batch the download queue hands out is served as workers fetching
+    // these posts at once: one article of each in turn, in this order.
+    pub(super) together: Vec<u32>,
+    // Every article is uuencoded: it says nothing of where its bytes go,
+    // so they are placed in order.
+    pub(super) uuencoded: bool,
+    // Every batch is leased as a download lane leases it, and its articles'
+    // checksums are cut at the slice sizes known when it was leased.
+    pub(super) leased: bool,
     // The extraction limits the pipeline holds, when not the environment's.
     pub(super) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
@@ -231,10 +298,14 @@ impl Scenario {
             damage: Vec::new(),
             lost: Vec::new(),
             refused: Vec::new(),
+            corrupt_primary: Vec::new(),
             password: None,
             global_passwords: Vec::new(),
             article: ARTICLE,
             backwards: false,
+            together: Vec::new(),
+            uuencoded: false,
+            leased: false,
             limits: None,
             unacceptable: None,
         }
@@ -281,6 +352,27 @@ impl Scenario {
         self
     }
 
+    // Whatever the download queue hands out at once arrives as workers
+    // fetching `posts` side by side: the first article of each, in this
+    // order, then the second of each, and so on.
+    pub(super) fn together(mut self, posts: &[u32]) -> Self {
+        self.together = posts.to_vec();
+        self
+    }
+
+    // Every article posted uuencoded rather than yEnc.
+    pub(super) fn uuencoded(mut self) -> Self {
+        self.uuencoded = true;
+        self
+    }
+
+    // Every batch leased by the download scheduler, served last article
+    // first, each cut at the slice sizes its lease was taken under.
+    pub(super) fn leased(mut self) -> Self {
+        self.leased = true;
+        self
+    }
+
     // Every post cut into articles of `size` bytes instead of ARTICLE.
     pub(super) fn framed(mut self, size: usize) -> Self {
         self.article = size;
@@ -312,6 +404,11 @@ impl Scenario {
 
     pub(super) fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
         self.refused.push((file, ordinal));
+        self
+    }
+
+    pub(super) fn corrupt_on_primary(mut self, file: u32, ordinal: u32) -> Self {
+        self.corrupt_primary.push((file, ordinal));
         self
     }
 
@@ -370,6 +467,9 @@ pub(super) struct GraphView {
     pub(super) offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
     pub(super) delivery: Delivery,
+    // What the job's checkpoints asked the database to write, at the last
+    // look.
+    pub(super) checkpoints: crate::pipeline::graph::checkpoint::Tally,
 }
 
 #[derive(Debug)]
@@ -522,6 +622,9 @@ pub(super) async fn admit(
     };
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers, 1).await;
+    if !scenario.corrupt_primary.is_empty() {
+        pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+    }
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     pipeline.admit_graph_job(JOB, engine);
@@ -541,7 +644,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
     let mut reads = 0;
     let mut stalled = None;
     loop {
-        while let Some(batch) = handed_out(&mut pipeline, scenario.backwards) {
+        while let Some((batch, plan)) = handed_out(&mut pipeline, scenario) {
             for work in batch {
                 let article = (
                     work.segment_id.file_id.file_index,
@@ -559,7 +662,15 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
                     pipeline.enqueue_download_work(retry);
                     continue;
                 }
-                serve(&mut pipeline, scenario, article).await;
+                serve_from(
+                    &mut pipeline,
+                    JOB,
+                    scenario,
+                    article,
+                    &work.exclude_servers,
+                    plan.as_ref(),
+                )
+                .await;
                 observe(&pipeline, &mut graph, &mut reads);
             }
         }
@@ -590,6 +701,22 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
             observe(&pipeline, &mut graph, &mut reads);
+            continue;
+        }
+        // A body a server spoiled is asked of the next server once the
+        // worker's backoff ends: the retry it scheduled is the job's next
+        // move.
+        if pipeline
+            .pending_retries_by_job
+            .get(&JOB)
+            .is_some_and(|pending| *pending > 0)
+        {
+            let retry = pipeline
+                .retry_rx
+                .recv()
+                .await
+                .expect("a scheduled retry is sent");
+            pipeline.receive_retry_work(retry);
             continue;
         }
         // Classic's extraction runs out on a task too, and says it is done
@@ -683,19 +810,105 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
     })
 }
 
+// A graph run whose completion gate runs only when the pipeline itself
+// scheduled it, as the orchestrator's loop runs it: no idle look is taken.
+// Every article is answered one at a time and ends as a decode ends, each
+// check a step scheduled is run, and a live run is heard. Returns where the
+// job stands once nothing is queued, scheduled or running: the recovery
+// outcomes as last seen, and whether its delivery move is out.
+pub(super) async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOutcome>>, bool) {
+    fn look(pipeline: &Pipeline, outcomes: &mut Vec<Option<RepairOutcome>>) {
+        if let Some(job) = pipeline.graph_jobs.get(&JOB) {
+            *outcomes = job
+                .recovery_summary()
+                .iter()
+                .map(|set| set.outcome)
+                .collect();
+        }
+    }
+    let (_temp_dir, mut pipeline, _) = admit(scenario, Engine::Graph).await;
+    let mut outcomes = Vec::new();
+    loop {
+        while let Some(work) = pipeline
+            .jobs
+            .get_mut(&JOB)
+            .and_then(|state| state.download_queue.pop())
+        {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            serve(&mut pipeline, scenario, article).await;
+            // The tail of every decode: the last one ends the download pass.
+            if pipeline.jobs.contains_key(&JOB) && pipeline.job_decode_stage_drained(JOB) {
+                pipeline.maybe_finish_download_pass(JOB);
+            }
+            look(&pipeline, &mut outcomes);
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+        }
+        if let Some(queued) = pipeline.pending_completion_checks.pop_front() {
+            look(&pipeline, &mut outcomes);
+            pipeline.check_job_completion(queued).await;
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+            continue;
+        }
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.runs().live())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            look(&pipeline, &mut outcomes);
+            continue;
+        }
+        break;
+    }
+    look(&pipeline, &mut outcomes);
+    let moved = pipeline.inflight_moves.contains(&JOB) || finished(&pipeline);
+    retire_pipeline_database(pipeline).await;
+    (outcomes, moved)
+}
+
 // The next articles the download queue hands out: one, or with `backwards`
-// every one it holds, last first. `None` once it is dry.
-fn handed_out(pipeline: &mut Pipeline, backwards: bool) -> Option<Vec<DownloadWork>> {
+// every one it holds, last first, or with `together` every one it holds, a
+// turn of each named post at a time, or with `leased` the batch a lane
+// leases, last first, with the slice sizes it was leased under. `None` once
+// it is dry.
+fn handed_out(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+) -> Option<(Vec<DownloadWork>, Option<weaver_yenc::CheckpointPlan>)> {
+    if scenario.leased {
+        let lease = pipeline.lease_for_server_for_test(0)?;
+        let mut works = lease.works;
+        works.reverse();
+        return Some((works, Some(lease.checkpoint_plan)));
+    }
     let queue = &mut pipeline.jobs.get_mut(&JOB)?.download_queue;
+    let all = scenario.backwards || !scenario.together.is_empty();
     let mut batch = Vec::new();
     while let Some(work) = queue.pop() {
         batch.push(work);
-        if !backwards {
+        if !all {
             break;
         }
     }
-    batch.reverse();
-    (!batch.is_empty()).then_some(batch)
+    if scenario.together.is_empty() {
+        batch.reverse();
+    } else {
+        // An article's turn is its number in its post, then its post's
+        // place in the order; a post not named comes after.
+        batch.sort_by_key(|work| {
+            let file = work.segment_id.file_id.file_index;
+            let at = scenario.together.iter().position(|named| *named == file);
+            (
+                work.segment_id.segment_number,
+                at.unwrap_or(scenario.together.len()),
+            )
+        });
+    }
+    (!batch.is_empty()).then_some((batch, None))
 }
 
 // One article as the scenario's server answers it.
@@ -708,8 +921,22 @@ pub(super) async fn serve_job(
     pipeline: &mut Pipeline,
     job: JobId,
     scenario: &Scenario,
-    (file, ordinal): (u32, u32),
+    article: (u32, u32),
 ) {
+    serve_from(pipeline, job, scenario, article, &[], None).await;
+}
+
+// [`serve_job`] for an ask that excludes `exclude`: the first server it
+// leaves answers.
+async fn serve_from(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    scenario: &Scenario,
+    (file, ordinal): (u32, u32),
+    exclude: &[usize],
+    leased: Option<&weaver_yenc::CheckpointPlan>,
+) {
+    let server = (0..).find(|server| !exclude.contains(server)).unwrap();
     let segment_id = SegmentId {
         file_id: NzbFileId {
             job_id: job,
@@ -721,7 +948,8 @@ pub(super) async fn serve_job(
         pipeline.book_failed_segment(segment_id);
         return;
     }
-    let intact = !scenario.damage.contains(&(file, ordinal));
+    let intact = !scenario.damage.contains(&(file, ordinal))
+        && !(server == 0 && scenario.corrupt_primary.contains(&(file, ordinal)));
     let post = &scenario.posts[file as usize];
     let offset = ordinal as usize * scenario.article;
     let posted = post
@@ -735,8 +963,59 @@ pub(super) async fn serve_job(
     if !intact {
         body.iter_mut().take(8).for_each(|byte| *byte ^= 0x5a);
     }
+    if scenario.uuencoded {
+        // The body carries no part number, range or checksum; the last
+        // article carries the `end` line.
+        let ended = ordinal as usize + 1 == post.articles(scenario.article).count();
+        let encoding = SegmentEncoding::Uu(crate::pipeline::UuSegmentFacts {
+            damaged: !intact,
+            ended,
+        });
+        pipeline
+            .handle_decode_success(
+                DecodeResult {
+                    segment_id,
+                    raw_size: body.len() as u64,
+                    encoding,
+                    yenc_layout: YencLayoutAssertions {
+                        file_size: 0,
+                        part: None,
+                        total: None,
+                        begin: None,
+                        end: None,
+                    },
+                    crc_valid: true,
+                    part_crc_verified: false,
+                    part_crc: 0,
+                    truncation_suspected: false,
+                    expected_file_crc: None,
+                    data: DecodedChunk::from(body),
+                    yenc_name: if ordinal == 0 {
+                        post.name.clone()
+                    } else {
+                        String::new()
+                    },
+                    checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                    segments: Vec::new(),
+                },
+                SegmentSource {
+                    source_server_idx: Some(server),
+                    exclude_servers: exclude.to_vec(),
+                },
+            )
+            .await;
+        return;
+    }
     let len = body.len() as u64;
-    let checkpoint_plan = pipeline.par2_checkpoint_plan(job);
+    // The decoder checksums the bytes it decoded, cut at the block
+    // boundaries of the plan the article was leased under: its lease's, or
+    // what the job knows now when it was handed out alone.
+    let checkpoint_plan = leased
+        .cloned()
+        .unwrap_or_else(|| pipeline.par2_checkpoint_plan(job));
+    let mut checksums = weaver_yenc::SegmentedCrc32::new(offset as u64, checkpoint_plan.clone());
+    checksums.update(&body);
+    let (_, segments) = checksums.finish_article();
     pipeline
         .handle_decode_success(
             DecodeResult {
@@ -758,15 +1037,11 @@ pub(super) async fn serve_job(
                 data: DecodedChunk::from(body),
                 yenc_name: post.name.clone(),
                 checkpoint_plan,
-                segments: vec![weaver_yenc::Segment {
-                    file_offset: offset as u64,
-                    len,
-                    crc32: crc,
-                }],
+                segments,
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                source_server_idx: Some(server),
+                exclude_servers: exclude.to_vec(),
             },
         )
         .await;
@@ -818,6 +1093,7 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
             .map(|kind| kind.to_string()),
     );
     view.offered = job.passwords_offered();
+    view.checkpoints = job.pending().tally();
     view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
     let namespace = job.namespace();
     view.claims = state

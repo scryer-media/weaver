@@ -453,7 +453,7 @@ fn a_torrent_job_writes_its_files_and_restores_its_pieces() {
 fn a_torrent_checkpoint_is_read_only_by_a_torrent_job() {
     let layout = layout();
     let dir = tempfile::tempdir().unwrap();
-    let job = torrent_job(&layout, dir.path());
+    let mut job = torrent_job(&layout, dir.path());
     let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot().unwrap())).unwrap();
     assert!(matches!(
         GraphJob::restore(&snapshot, &[], 1, storage(dir.path()), 1),

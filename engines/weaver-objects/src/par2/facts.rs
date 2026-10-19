@@ -23,7 +23,7 @@ use par2_rs::{FileId, Packet, RecoverySetId, SliceChecksum};
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{
-    ByteRange, Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError,
+    ByteRange, Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError, Sealed,
     VolumeIndex,
 };
 
@@ -64,7 +64,7 @@ pub(super) struct VolumeFacts {
 pub(super) struct SetFacts {
     key: [u8; 16],
     first_seen: (VolumeIndex, u64),
-    packets: Vec<PacketFacts>,
+    packets: Sealed<Packets>,
     hashes: BTreeSet<[u8; 16]>,
     recovery: BTreeMap<u32, Location>,
     pub(super) members: Vec<([u8; 16], MemberId)>,
@@ -94,6 +94,24 @@ enum PacketFacts {
         slices: Vec<(u32, [u8; 16])>,
     },
     Creator(String),
+}
+
+// A set's metadata packets, as the set keeps them. They encode as their
+// facts, so the set's index is rebuilt by par2-rs from the same packets.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Packets(pub(super) Vec<Packet>);
+
+impl Serialize for Packets {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().filter_map(PacketFacts::of))
+    }
+}
+
+impl<'de> Deserialize<'de> for Packets {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kept = Vec::<PacketFacts>::deserialize(deserializer)?;
+        Ok(Self(kept.into_iter().map(PacketFacts::packet).collect()))
+    }
 }
 
 fn ids(files: &[FileId]) -> Vec<[u8; 16]> {
@@ -176,7 +194,10 @@ impl PacketFacts {
 }
 
 impl Durable for Par2Facts {
-    const VERSION: u16 = 1;
+    // 2: each set's packets sealed, nested as the bytes they encoded to.
+    // 3: sealed parts kept apart from the facts' bytes, and the grid
+    // shelved by chunk of blocks.
+    const VERSION: u16 = 3;
 
     fn impossible(&self) -> Option<&'static str> {
         let keys: BTreeSet<_> = self.sets.iter().map(|set| set.key).collect();
@@ -221,7 +242,7 @@ pub(super) fn of(par2: &Par2) -> Facts {
             SetFacts {
                 key,
                 first_seen: state.first_seen,
-                packets: state.packets().iter().filter_map(PacketFacts::of).collect(),
+                packets: state.packets().clone(),
                 hashes: state.hashes().clone(),
                 recovery: state.recovery.clone(),
                 members: state
@@ -265,8 +286,8 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
         })
         .collect();
     for set in kept.sets {
-        let packets = set.packets.into_iter().map(PacketFacts::packet).collect();
-        let mut state = SetState::restored(set.first_seen, packets, set.hashes, kept.output_limit);
+        let mut state =
+            SetState::restored(set.first_seen, set.packets, set.hashes, kept.output_limit);
         state.recovery = set.recovery;
         state.bind(
             set.members
@@ -284,6 +305,9 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
     par2.refused = kept.refused;
     par2.output_limit = kept.output_limit;
     par2.memory_limit = kept.memory_limit;
+    for key in par2.ordered() {
+        par2.fold_set(key);
+    }
     Ok(par2)
 }
 

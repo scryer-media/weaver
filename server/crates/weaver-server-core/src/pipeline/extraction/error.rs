@@ -226,7 +226,7 @@ fn typed_io_error_class(error: &io::Error) -> Option<ExtractionErrorClass> {
                 unrar_rs::VolumeProviderError::Unavailable { .. } => {
                     ExtractionErrorClass::StaleTopology
                 }
-                unrar_rs::VolumeProviderError::Io(error) => io_error_class(error),
+                unrar_rs::VolumeProviderError::Io { error, .. } => io_error_class(error),
             });
         }
         if let Some(error) = inner.downcast_ref::<sevenz_turbo::Error>() {
@@ -253,29 +253,21 @@ fn typed_io_error_class(error: &io::Error) -> Option<ExtractionErrorClass> {
     None
 }
 
-// An I/O error unrar-rs returned. unrar-rs 0.11 hands some causes over as
-// text only; those are read back before the renderings every engine shares.
-fn rar_io_error_class(error: &io::Error) -> ExtractionErrorClass {
-    typed_io_error_class(error)
-        .or_else(|| adapters::unrar_0_11_erased_class(&error.to_string()))
-        .or_else(|| adapters::untyped_io_class(error))
-        .unwrap_or(ExtractionErrorClass::Terminal)
-}
-
 pub(crate) fn rar_error_class(error: &unrar_rs::RarError) -> ExtractionErrorClass {
     use unrar_rs::RarError;
     match error {
-        RarError::Io(error) => rar_io_error_class(error),
+        RarError::Io(error) => io_error_class(error),
         RarError::InvalidSignature
         | RarError::TruncatedHeader { .. }
         | RarError::HeaderCrcMismatch { .. }
+        | RarError::BlockHeaderChecksumMismatch { .. }
         | RarError::DataCrcMismatch { .. }
         | RarError::PackedDataCrcMismatch { .. } => ExtractionErrorClass::Recoverable,
-        RarError::CorruptArchive { detail }
-            if adapters::unrar_0_11_block_header_checksum_mismatch(detail) =>
-        {
-            ExtractionErrorClass::Recoverable
-        }
+        // A limit, a refused allocation or a fault in the decoder says nothing
+        // about the archive's bytes, so no repair of them is attempted.
+        RarError::ResourceLimit { .. }
+        | RarError::AllocationFailed { .. }
+        | RarError::Internal { .. } => ExtractionErrorClass::Terminal,
         error if crate::pipeline::Pipeline::rar_error_is_password_related(error) => {
             ExtractionErrorClass::PasswordRequired
         }
@@ -286,25 +278,34 @@ pub(crate) fn rar_error_class(error: &unrar_rs::RarError) -> ExtractionErrorClas
     }
 }
 
+// A 7z error's class, read from the error a block error locates rather than
+// from the block's kind: a block fails as `Corrupted` on a cancellation, a
+// limit or a fault in its coder too, and none of those is damage.
 pub(crate) fn sevenz_error_class(error: &sevenz_turbo::Error) -> ExtractionErrorClass {
-    use sevenz_turbo::{BlockErrorKind, Error};
+    use sevenz_turbo::Error;
+    if error.is_password_required() {
+        return ExtractionErrorClass::PasswordRequired;
+    }
+    if error.has_checksum_mismatch() {
+        return ExtractionErrorClass::Recoverable;
+    }
     match error {
-        Error::PasswordRequired => ExtractionErrorClass::PasswordRequired,
-        Error::BlockDecode {
-            kind: BlockErrorKind::Corrupted | BlockErrorKind::ChecksumMismatch,
-            ..
-        } => ExtractionErrorClass::Recoverable,
-        Error::BlockDecode { kind, message, .. } => {
-            adapters::sevenz_0_28_block_error_class(*kind, message, &error.to_string())
-        }
-        Error::ChecksumVerificationFailed | Error::NextHeaderCrcMismatch => {
-            ExtractionErrorClass::Recoverable
-        }
+        // A coder that finds its stream damaged fails the block's read with
+        // the kind that says so.
+        Error::BlockDecode { cause, .. } => match cause.as_ref() {
+            Error::Io(error, _) => {
+                typed_io_error_class(error).unwrap_or_else(|| match error.kind() {
+                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
+                        ExtractionErrorClass::Recoverable
+                    }
+                    _ => io_error_class(error),
+                })
+            }
+            cause => sevenz_error_class(cause),
+        },
+        Error::Corrupted(_) => ExtractionErrorClass::Recoverable,
         Error::Io(error, _) | Error::FileOpen(error, _) | Error::MaybeBadPassword(error) => {
             io_error_class(error)
-        }
-        Error::Other(text) if adapters::sevenz_0_28_other_names_checksum(text) => {
-            ExtractionErrorClass::Recoverable
         }
         _ => ExtractionErrorClass::Terminal,
     }
@@ -315,11 +316,6 @@ pub(crate) fn zip_error_class(error: &zip::result::ZipError) -> ExtractionErrorC
     match error {
         ZipError::Io(error) => io_error_class(error),
         ZipError::InvalidPassword => ExtractionErrorClass::PasswordRequired,
-        ZipError::InvalidArchive(detail)
-            if adapters::zip_8_6_unicode_extra_field_checksum(detail) =>
-        {
-            ExtractionErrorClass::Recoverable
-        }
         _ => ExtractionErrorClass::Terminal,
     }
 }

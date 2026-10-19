@@ -86,6 +86,21 @@ impl RunMail {
     pub(crate) async fn recv(&mut self) -> Option<Said> {
         self.receiver.recv().await
     }
+
+    // What the runs said that waits to be heard, at most what the mail holds
+    // at once: a run speaks its output a piece at a time, so the pipeline
+    // hears all of it each turn, and a run that keeps speaking cannot keep
+    // the turn.
+    pub(crate) fn waiting(&mut self) -> Vec<Said> {
+        let mut waiting = Vec::new();
+        while waiting.len() < MAIL_CAPACITY {
+            let Ok(said) = self.receiver.try_recv() else {
+                break;
+            };
+            waiting.push(said);
+        }
+        waiting
+    }
 }
 
 // A job the pipeline does not hold, hearing its runs through the pipeline's

@@ -107,6 +107,7 @@ security-framework = { workspace = true }
 security-framework-sys = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+cap-primitives = { workspace = true }
 keyring = { workspace = true }
 keyring-core = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }

@@ -167,6 +167,36 @@ fn a_damaged_slice_vetoes_every_arm() {
     assert!(!seen.contains(&SliceVerdict::Intact));
 }
 
+// Evidence folded piece by piece, as articles arrive after the member is
+// bound and last first, says what one fold of the whole grid says, clean
+// or with one slice wrong.
+#[test]
+fn evidence_fed_piece_by_piece_says_what_one_fold_of_the_whole_does() {
+    let data = payload(13, 5000);
+    let mut wrong = data.clone();
+    wrong[2300] ^= 0x01;
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1);
+    for (bytes, damaged) in [(&data, false), (&wrong, true)] {
+        let mut piecewise = job(&files);
+        let member = piecewise.member("payload.bin", bytes);
+        bind(&mut piecewise);
+        for piece in segments(0, bytes, ARTICLE, BLOCK, true).iter().rev() {
+            piecewise.object.feed(member, std::slice::from_ref(piece));
+        }
+        let mut whole = job(&files);
+        let other = whole.member("payload.bin", bytes);
+        feed(&mut whole, other, bytes, None);
+        bind(&mut whole);
+        let seen = verdicts(&piecewise, member);
+        assert_eq!(seen, verdicts(&whole, other));
+        assert_eq!(seen.contains(&SliceVerdict::Damaged), damaged);
+        assert_eq!(
+            seen.iter().all(|verdict| *verdict == SliceVerdict::Intact),
+            !damaged
+        );
+    }
+}
+
 #[test]
 fn a_damaged_member_is_repaired_through_member_access() {
     let data = payload(10, 5000);

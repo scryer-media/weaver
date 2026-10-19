@@ -5,6 +5,9 @@
   "category": "2000",
   "expected_outcome": "health_failure",
   "expectedErrorContains": "no retryable work remains for incomplete RAR sets",
+  "expectedErrorContainsByEngine": {
+    "graph": "no file was delivered whole; 1 short: 51273aad56a8b904e96928935278a627"
+  },
   "backupUnavailableUntilJobTerminal": true,
   "segment_size": 16777216,
   "fixtureAssets": [

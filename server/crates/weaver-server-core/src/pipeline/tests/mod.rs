@@ -53,6 +53,7 @@ mod direct_store;
 mod direct_unpack;
 mod download_dispatch;
 mod engines;
+mod full_file_names;
 mod hardware_profile;
 mod health_probe;
 mod idle;

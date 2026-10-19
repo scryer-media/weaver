@@ -25,7 +25,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
-    Provenance, Pull, Seek, VolumeIndex, Why,
+    Provenance, Pull, Seek, Standing, VolumeIndex, Why,
 };
 
 use crate::grid::crc32;
@@ -420,6 +420,19 @@ impl Object for Tar {
                 .is_some_and(|ahead| ahead.intersect(range).is_some())
         {
             self.give_up(Emit::Refuse(Why::Unrepairable), out);
+        }
+    }
+
+    // Nothing more will arrive. A member still damaged, or one named and
+    // never placed, leaves the archive unread.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if self.gone {
+            return;
+        }
+        if let Some(why) =
+            crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
+        {
+            self.give_up(Emit::Refuse(why), out);
         }
     }
 

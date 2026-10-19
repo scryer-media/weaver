@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Which member each described file is. Within one set a member is matched
-// by the described name, then by its first 16 KiB and its length. A name that
-// answers to two descriptions binds nothing, unless the member's length rules
-// out all but one, and two members that answer to one description both go
-// unbound. A member that answers in two sets is the first set's: the others
-// count it missing in their arithmetic and never write it. A member bound by
-// its content alone takes the described name.
+// Which member each described file is. Within one set a member is the file
+// its first 16 KiB and its length say it is; only while its front cannot
+// tell is it the file its name says, since a posted name can lie, swapped
+// with another file's, where the bytes cannot. A name that answers to two
+// descriptions binds nothing, unless the member's length rules out all but
+// one, and two members that answer to one description both go unbound. A
+// member that answers in two sets is the first set's: the others count it
+// missing in their arithmetic and never write it. A member bound by its
+// content under another name takes the described name.
 
 use std::collections::BTreeMap;
 
@@ -105,8 +107,15 @@ pub(super) fn bind_sets(
     (bound, names)
 }
 
-// A file and whether the member matched it by content alone.
+// A file and whether the member matched it by content alone, under a name
+// that does not answer to it even folded.
 fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<(FileId, bool)> {
+    if let Some(file) = by_content(index, candidate) {
+        let named = index
+            .file_description(&file)
+            .is_some_and(|description| description.filename.eq_ignore_ascii_case(candidate.name));
+        return Some((file, !named));
+    }
     let mut matches = described(index, |description| description.filename == candidate.name);
     if matches.is_empty() {
         // Posted subjects can change case without changing file identity.
@@ -136,8 +145,6 @@ fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<(FileI
     }
     match matches.as_slice() {
         [(file, _)] => Some((*file, false)),
-        // An obfuscated post lies in its subject, not in its bytes.
-        [] => by_content(index, candidate).map(|file| (file, true)),
         _ => None,
     }
 }

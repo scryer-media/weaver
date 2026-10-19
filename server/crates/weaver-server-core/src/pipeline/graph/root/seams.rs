@@ -108,6 +108,9 @@ impl Pipeline {
         };
         let moves = graph.sample();
         apply_moves(state, &moves);
+        let mut parked = std::collections::HashSet::new();
+        state.recovery_queue.extend_segment_ids(&mut parked);
+        graph.parked(|volume, ordinal| parked.contains(&segment(job_id, volume, ordinal)));
         self.graph_jobs.insert(job_id, graph);
         self.after_graph_step(job_id);
         self.checkpoint_graph_job(job_id);
@@ -204,6 +207,18 @@ impl Pipeline {
         if ended {
             self.schedule_job_completion_check(job_id);
         }
+    }
+
+    // Everything the runs said since the last turn. A turn hears the mail
+    // whole, not one piece of a run's output in a turn's spare moment: a run
+    // paced by the pipeline's turns runs as slowly as they are busy.
+    pub(in crate::pipeline) fn hear_graph_runs(&mut self) -> bool {
+        let waiting = self.graph_runs.waiting();
+        let heard = !waiting.is_empty();
+        for said in waiting {
+            self.graph_run_said(said);
+        }
+        heard
     }
 
     // How many runs a graph job may hold now: the extraction concurrency the

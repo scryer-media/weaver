@@ -556,6 +556,9 @@ fn assert_no_secret(rows: &crate::jobs::graph_checkpoint::GraphCheckpoint, secre
     for crypt in &rows.crypt {
         blobs.push(crypt.seed.clone());
     }
+    for part in &rows.parts {
+        blobs.push(part.bytes.to_vec());
+    }
     for blob in &blobs {
         for secret in secrets {
             assert!(

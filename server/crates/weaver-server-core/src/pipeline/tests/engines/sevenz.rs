@@ -10,12 +10,16 @@ use std::io::Cursor;
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
 
+use weaver_graph::recovery::RepairOutcome;
+
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
+use crate::pipeline::tests::direct_store::multi_member_store_set;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, payload, run, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, par2_volumes_sliced,
+    payload, run, run_both, run_unprompted, try_run,
 };
 
 const SECRET: &str = "quill-ember-secret";
@@ -126,6 +130,128 @@ async fn a_stored_7z_split_into_three_volumes_delivers_its_members_under_both_en
     assert_members(&graph);
     assert_members(&classic);
     assert_same(&classic, &graph);
+}
+
+// A split set renamed to numbers of its own, counted from ten: the first
+// volume's signature names the set, and the others are numbered from it.
+#[tokio::test]
+async fn a_split_7z_under_obfuscated_numbered_names_delivers_its_members() {
+    let volumes = split(&stored(None), 3)
+        .into_iter()
+        .zip(10..)
+        .map(|(post, number)| Post::plain(&format!("a1b2c3d4.{number}"), post.bytes))
+        .collect();
+    let graph = run(&Scenario::new(volumes), Engine::Graph).await;
+    assert_members(&graph);
+}
+
+// A split set's pieces under hash names that number nothing, the second
+// posted first, and the PAR2 set that names them last. Only the first
+// piece's signature says what it is; the others have no signature, so they
+// wait unowned until the PAR2 set names them, and the store founded on the
+// first claims each by the name it is given. Nothing is fetched twice.
+// Classic renames by the PAR2 set before it reads the set, and delivers the
+// same.
+fn hashed(volumes: &[Post]) -> Vec<Post> {
+    let mut posts: Vec<Post> = volumes
+        .iter()
+        .zip(0u32..)
+        .map(|(post, index)| {
+            Post::plain(&format!("{:032x}", 0x5eed_0000 + index), post.bytes.clone())
+        })
+        .collect();
+    posts.swap(0, 1);
+    posts
+}
+
+fn hashed_with_par2_last() -> Vec<Post> {
+    let volumes = split(&stored(None), 3);
+    let files: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let mut posts = hashed(&volumes);
+    posts.extend(par2_set("lantern", &files, 2));
+    posts
+}
+
+// The members, and the PAR2 set's ruling that every piece was whole under
+// the names it gave.
+fn assert_named_by_par2(graph: &Outcome) {
+    let view = graph.graph();
+    assert!(view.delivery.withheld.is_empty(), "{:?}", view.delivery);
+    assert_eq!(view.outcomes, vec![Some(RepairOutcome::Clean)]);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+#[tokio::test]
+async fn a_split_7z_under_hash_names_named_by_par2_last_delivers_its_members_under_both_engines() {
+    let (classic, graph) = run_both(&Scenario::new(hashed_with_par2_last())).await;
+    assert_members(&classic);
+    assert_members(&graph);
+    assert_same(&classic, &graph);
+    assert_named_by_par2(&graph);
+}
+
+// The same set one level down: its pieces and its PAR2 set are the members
+// of one stored RAR, and the names the PAR2 set gives are claimed in that
+// namespace as they are at the top. The PAR2 files are members of the
+// archive like any other, so they are delivered beside the 7z's members.
+// Divergence: classic extracts the RAR and never renames what came out of
+// it, so it cannot read the 7z and fails the job.
+#[tokio::test]
+async fn a_split_7z_under_hash_names_inside_a_stored_rar_named_by_par2_last_delivers_under_graph() {
+    let inner = hashed_with_par2_last();
+    let named: Vec<(&str, Vec<u8>)> = inner
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.clone()))
+        .collect();
+    let outer = multi_member_store_set(&named, 1).remove(0).1;
+    let scenario = Scenario::new(vec![Post::plain("lantern.rar", outer)]);
+    let classic = try_run(&scenario, Engine::Classic).await.unwrap();
+    assert!(
+        matches!(classic.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        classic.status
+    );
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let mut expected: Vec<String> = members().iter().map(|(name, _)| delivered(name)).collect();
+    expected.extend(
+        inner
+            .iter()
+            .filter(|post| post.name.ends_with(".par2"))
+            .map(|post| delivered(&post.name)),
+    );
+    expected.sort();
+    assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), expected);
+    for (name, bytes) in members() {
+        assert!(graph.files[&delivered(name)] == bytes, "{name} bytes");
+    }
+    assert_named_by_par2(&graph);
+}
+
+// A coded split set whose middle volume was never posted, PAR2 beside: the
+// engine takes the volumes on either side, the repair rebuilds the middle
+// one, and the run reads through it to the members.
+#[tokio::test]
+async fn a_coded_split_7z_missing_its_middle_volume_is_rebuilt_by_par2_and_decoded() {
+    let archive = container(Lzma2Options::from_level(1).into(), None);
+    let volumes = split(&archive, 3);
+    let files: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let slices = volumes[1].bytes.len().div_ceil(ARTICLE) as u32;
+    let mut posts = par2_set("lantern", &files, slices + 1);
+    posts.extend(
+        volumes
+            .iter()
+            .filter(|post| post.name != volumes[1].name)
+            .map(|post| Post::plain(&post.name, post.bytes.clone())),
+    );
+    let graph = run(&Scenario::new(posts), Engine::Graph).await;
+    assert_members(&graph);
 }
 
 // The header volume is file 0, so it is answered before any of the body:
@@ -605,4 +731,61 @@ async fn an_lzma2_7z_with_a_damaged_first_article_beside_par2_binds_its_store_af
         "graph: {:?}",
         graph.refetched()
     );
+}
+
+// A split 7z whose last volume, which holds the end header, is cut short:
+// the store never maps, and every volume it holds is refused with the set.
+// No volume of a container is a delivery of its own, so nothing is whole
+// and the job fails for unpacking.
+#[tokio::test]
+async fn a_split_7z_whose_last_volume_is_cut_short_delivers_no_volume_whole_under_graph() {
+    let mut volumes = split(&stored(None), 3);
+    let last = volumes.last_mut().unwrap();
+    last.bytes.truncate(last.bytes.len() - 8);
+    let graph = run(&Scenario::new(volumes), Engine::Graph).await;
+    let view = graph.graph();
+    assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+}
+
+// A coded split set beside PAR2 with one article of a middle volume
+// damaged: the recovery blocks it needs are in by the time the payload is,
+// so the set rules and repairs in the step its last byte arrives, the run
+// reads on through the repaired bytes, and the delivery is scheduled by the
+// job's own steps, never by a look the pipeline takes when it falls idle.
+async fn damaged_split_rules_unprompted(count: usize, slice: u64, blocks: u32, volumes: u32) {
+    let archive = container(Lzma2Options::from_level(1).into(), None);
+    let parts = split(&archive, count);
+    let files: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let mut posts = par2_volumes_sliced("lantern", &files, slice, blocks, volumes);
+    let recovery: Vec<Post> = posts.split_off(1);
+    let first = posts.len() as u32;
+    posts.extend(parts);
+    posts.extend(recovery);
+    let scenario = Scenario::new(posts).damaged(first + 1, 1);
+    let (outcomes, moved) = run_unprompted(&scenario).await;
+    assert!(
+        matches!(outcomes.as_slice(), [Some(RepairOutcome::Repaired { .. })]),
+        "{outcomes:?}"
+    );
+    assert!(moved, "the delivery waited for an idle look");
+}
+
+#[tokio::test]
+async fn a_damaged_split_lzma2_7z_under_par2_rules_and_delivers_without_an_idle_look() {
+    damaged_split_rules_unprompted(3, ARTICLE as u64, 2, 1).await;
+}
+
+#[tokio::test]
+async fn a_damaged_six_volume_lzma2_7z_under_five_par2_volumes_rules_and_delivers_without_an_idle_look()
+ {
+    damaged_split_rules_unprompted(6, ARTICLE as u64 / 4, 16, 5).await;
 }

@@ -14,7 +14,7 @@ use crate::pipeline::graph::root::Root;
 use crate::pipeline::graph::root::facts::{JobFacts, RootBlob, RootFactsError};
 
 impl<R: Root> GraphJob<R> {
-    pub(crate) fn snapshot(&self) -> Result<Snapshot, RootFactsError> {
+    pub(crate) fn snapshot(&mut self) -> Result<Snapshot, RootFactsError> {
         let tree = self.tree.records();
         let mut files = BTreeMap::new();
         for node in &tree.nodes {
@@ -30,7 +30,7 @@ impl<R: Root> GraphJob<R> {
                 read_backs: self.writer.read_backs(),
                 reported: self.reported,
             },
-            root: RootBlob::of(&self.root)?,
+            root: RootBlob::of(&self.root, &mut self.kept)?,
             tree,
             files,
             kept: self.writer.kept_records(),

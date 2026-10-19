@@ -7,8 +7,9 @@
 //
 // Bytes decide wherever a kind has a signature, so a member keeps its kind
 // under an obfuscated name. A name decides only once the bytes have ruled
-// out every signature: tar and bzip2 by their extensions too, and raw
-// deflate, brotli and SFV, which have no signature, by theirs alone.
+// out every signature: tar, bzip2 and zip by their extensions too, and raw
+// deflate, brotli and SFV, which have no signature, by theirs alone, as is
+// the first numbered piece of a plain file split into pieces.
 //
 // Bytes read before a verdict, per kind:
 //
@@ -18,7 +19,7 @@
 //             and whose start header must match its CRC
 //   PAR2 64   the first packet header, whose length must be a packet's
 //   bzip2 4   `BZh` and a block-size level
-//   RAR5 8, RAR4 7, PAR3 8, xz 6, zip 4, zstd 4, gzip 2   the signature
+//   RAR5 8, RAR4 7, RAR5 recovery 8, PAR3 8, xz 6, zip 4, zstd 4, gzip 2   the signature
 //
 // Each is cut short by bytes that already contradict the signature, and by
 // a known length too small to hold it.
@@ -166,6 +167,9 @@ const SIGNATURES: &[Signature] = &[
         ruled_out: |_| false,
     },
     signature(Kind::Par3, b"PAR3\x00PKT"),
+    // A RAR5 recovery volume. A RAR3 one opens with parity and is known by
+    // its name alone.
+    signature(Kind::RarRecovery, b"Rar!\x1aRev"),
 ];
 
 // A major version this build does not know places its fields elsewhere, and
@@ -228,6 +232,9 @@ const NAMED: &[(Kind, &[&str])] = &[
     (Kind::Deflate, &[".deflate"]),
     (Kind::Brotli, &[".br"]),
     (Kind::Sfv, &[".sfv"]),
+    (Kind::Zip, &[".zip"]),
+    (Kind::Split, &[".001"]),
+    (Kind::RarRecovery, &[".rev"]),
 ];
 
 fn named(name: &str) -> Option<Kind> {
@@ -378,6 +385,16 @@ mod tests {
     }
 
     #[test]
+    fn rar_recovery_volumes_by_signature_and_by_name() {
+        let mut rev5 = b"Rar!\x1aRev".to_vec();
+        rev5.extend(plain(64));
+        assert_eq!(sniff("a.part1.rev", &rev5, None), object(Kind::RarRecovery));
+        assert_eq!(sniff("9f3a7c1e", &rev5, None), object(Kind::RarRecovery));
+        assert_eq!(sniff("a.rev", &plain(600), None), object(Kind::RarRecovery));
+        assert_eq!(sniff("a.part1.rev", RAR5, None), object(Kind::RarStore));
+    }
+
+    #[test]
     fn par2_waits_for_its_whole_packet_header() {
         let header = par2(64);
         assert_eq!(sniff("a.par2", &header[..63], None), Sniff::Pending);
@@ -513,6 +530,13 @@ mod tests {
             sniff("a.sfv", &[0xFF, 0xFE, 0x41], Some(3)),
             object(Kind::Sfv)
         );
+    }
+
+    // Damage at its front hides a zip's signature, not its end records.
+    #[test]
+    fn a_zip_whose_front_opens_no_signature_is_a_zip_by_name() {
+        assert_eq!(sniff("a.zip", &[0; 300], Some(4096)), object(Kind::Zip));
+        assert_eq!(sniff("a.zip", &[0; 300], None), object(Kind::Zip));
     }
 
     #[test]

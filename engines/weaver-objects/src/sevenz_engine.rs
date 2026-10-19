@@ -19,6 +19,7 @@ pub struct SevenZip;
 impl Format for SevenZip {
     const KIND: Kind = Kind::SevenZipEngine;
     type Name = naming::VolumeName;
+    type Front = ();
 
     fn parse(name: &str) -> Option<naming::VolumeName> {
         naming::parse(name)

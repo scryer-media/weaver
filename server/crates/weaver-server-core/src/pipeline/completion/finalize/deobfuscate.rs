@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use weaver_nzb::delivery_rename::{DeliveredFile, PlannedRename};
 
+use crate::ingest::FileRename;
 use crate::jobs::ids::JobId;
 use crate::jobs::working_dir::OUTPUT_DIR_MARKER;
 use crate::post_processing::model::PostProcessingSettings;
@@ -76,7 +77,7 @@ pub(crate) struct SrrdbInputs {
 }
 
 // Renames the delivery's payload when it still wears an obfuscated name.
-// Returns how many files were renamed.
+// Returns the renames applied, each with the full name it gave.
 //
 // `policy` is the unwanted extension policy the delivery was scanned under.
 // A payload it refuses, or an executable, is never named after the job.
@@ -85,7 +86,7 @@ pub(super) async fn rename_obfuscated_members(
     root: &Path,
     plan: &DeliveryNamingPlan,
     policy: &PostProcessingSettings,
-) -> u32 {
+) -> Vec<FileRename> {
     let files = {
         let root = root.to_path_buf();
         match tokio::task::spawn_blocking(move || scan_delivery(&root)).await {
@@ -96,12 +97,12 @@ pub(super) async fn rename_obfuscated_members(
                     error = %error,
                     "delivery scan worker failed; leaving delivered names as they are"
                 );
-                return 0;
+                return Vec::new();
             }
         }
     };
     if files.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     let entries: Vec<DeliveredFile<'_>> = files
@@ -114,22 +115,22 @@ pub(super) async fn rename_obfuscated_members(
     let Some(candidate) = weaver_nzb::select_rename_candidate(&entries, |name| {
         policy.unacceptable_extension_match(name).is_some()
     }) else {
-        return 0;
+        return Vec::new();
     };
     let candidate_path = entries[candidate].relative_path;
 
     let target = resolve_target_name(job_id, candidate_path, plan).await;
-    let Some(target_stem) = target else {
-        return 0;
+    let Some((target_stem, full_stem)) = target else {
+        return Vec::new();
     };
 
-    let renames = weaver_nzb::plan_renames(&entries, candidate, &target_stem);
+    let renames = weaver_nzb::plan_renames(&entries, candidate, &target_stem, &full_stem);
     if renames.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     let root = root.to_path_buf();
-    match tokio::task::spawn_blocking(move || apply_renames(job_id, &root, &renames)).await {
+    match tokio::task::spawn_blocking(move || apply_renames(job_id, &root, renames)).await {
         Ok(renamed) => renamed,
         Err(error) => {
             warn!(
@@ -137,7 +138,7 @@ pub(super) async fn rename_obfuscated_members(
                 error = %error,
                 "delivery rename worker failed; some members may keep their obfuscated names"
             );
-            0
+            Vec::new()
         }
     }
 }
@@ -146,7 +147,8 @@ pub(super) async fn rename_obfuscated_members(
 // release name when the operator enabled the lookup and it answered
 // unambiguously, the job's own display name otherwise.
 //
-// `None` means the pass refuses itself. That happens when the name it would
+// Returns the stem to write and the full name it was cleaned or shortened
+// from. `None` means the pass refuses itself. That happens when the name it would
 // write is no more readable than the one already on disk — renaming one
 // unreadable name to another helps nobody and destroys the only handle an
 // operator has for correlating the file with its post.
@@ -154,14 +156,19 @@ async fn resolve_target_name(
     job_id: JobId,
     candidate_path: &str,
     plan: &DeliveryNamingPlan,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let from_srrdb = match plan.srrdb.as_ref() {
         Some(inputs) => srrdb_target(job_id, candidate_path, inputs).await,
         None => None,
     };
 
-    let target = from_srrdb
-        .unwrap_or_else(|| crate::jobs::working_dir::sanitize_dirname(&plan.job_display_name));
+    let (target, full_name) = match from_srrdb {
+        Some(release) => (release.clone(), release),
+        None => (
+            crate::jobs::working_dir::sanitize_dirname(&plan.job_display_name),
+            plan.job_display_name.trim().to_string(),
+        ),
+    };
 
     if weaver_nzb::looks_obfuscated_for_delivery(&target) {
         debug!(
@@ -171,7 +178,7 @@ async fn resolve_target_name(
         );
         return None;
     }
-    Some(target)
+    Some((target, full_name))
 }
 
 async fn srrdb_target(job_id: JobId, candidate_path: &str, inputs: &SrrdbInputs) -> Option<String> {
@@ -472,8 +479,8 @@ fn scan_delivery(root: &Path) -> Vec<(String, u64)> {
     files
 }
 
-fn apply_renames(job_id: JobId, root: &Path, renames: &[PlannedRename]) -> u32 {
-    let mut applied = 0u32;
+fn apply_renames(job_id: JobId, root: &Path, renames: Vec<PlannedRename>) -> Vec<FileRename> {
+    let mut applied = Vec::new();
     for rename in renames {
         let from = root.join(&rename.from);
         let to = root.join(&rename.to);
@@ -496,7 +503,11 @@ fn apply_renames(job_id: JobId, root: &Path, renames: &[PlannedRename]) -> u32 {
                     to = %rename.to,
                     "renamed an obfuscated delivered member"
                 );
-                applied += 1;
+                applied.push(FileRename {
+                    from: rename.from,
+                    to: rename.to,
+                    full_name: rename.full_to,
+                });
             }
             Err(error) => warn!(
                 job_id = job_id.0,
@@ -673,7 +684,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 3);
+        assert_eq!(renamed.len(), 3);
         assert_eq!(
             delivered_names(root.path()),
             vec![
@@ -681,6 +692,33 @@ mod tests {
                 "Silver Horizon 2024.dut.srt".to_string(),
                 "Silver Horizon 2024.mkv".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_named_after_a_cleaned_job_name_reports_the_full_name() {
+        let root = tempfile::tempdir().unwrap();
+        write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 64 * MIB);
+
+        let renamed = rename_obfuscated_members(
+            JobId(11),
+            root.path(),
+            &plan("Silver Horizon: Part 2"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
+
+        assert_eq!(
+            renamed,
+            vec![FileRename {
+                from: "Yb5drZSkNi20UCMkb.mkv".to_string(),
+                to: "Silver Horizon_ Part 2.mkv".to_string(),
+                full_name: "Silver Horizon: Part 2.mkv".to_string(),
+            }]
+        );
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Silver Horizon_ Part 2.mkv".to_string()]
         );
     }
 
@@ -697,7 +735,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Silver.Horizon.2024.1080p.mkv".to_string()]
@@ -717,7 +755,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Yb5drZSkNi20UCMkb.mkv".to_string()]
@@ -738,7 +776,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec![
@@ -764,7 +802,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 1);
+        assert_eq!(renamed.len(), 1);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Silver Horizon 2024.mkv".to_string()]
@@ -837,7 +875,7 @@ mod tests {
             "the request carries the checksum and nothing else"
         );
         assert_eq!(index.calls.load(Ordering::SeqCst), 1, "exactly one attempt");
-        assert_eq!(renamed, 2);
+        assert_eq!(renamed.len(), 2);
         assert_eq!(
             delivered_names(root.path()),
             vec![
@@ -861,7 +899,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
     }
 
     #[tokio::test]
@@ -877,7 +915,7 @@ mod tests {
             rename_obfuscated_members(JobId(9), root.path(), &plan("Silver Horizon"), &policy_off)
                 .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Yb5drZSkNi20UCMkb.exe".to_string()]
@@ -897,7 +935,7 @@ mod tests {
             rename_obfuscated_members(JobId(10), root.path(), &plan("Silver Horizon"), &policy)
                 .await;
 
-        assert_eq!(renamed, 0);
+        assert_eq!(renamed.len(), 0);
         assert_eq!(
             delivered_names(root.path()),
             vec!["Yb5drZSkNi20UCMkb.iso".to_string()]
@@ -919,7 +957,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(renamed, 1);
+        assert_eq!(renamed.len(), 1);
         assert!(root.path().join(OUTPUT_DIR_MARKER).is_file());
         assert!(root.path().join(".hidden-scratch").is_file());
     }

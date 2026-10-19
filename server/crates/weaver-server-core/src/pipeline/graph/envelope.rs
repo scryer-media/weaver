@@ -46,6 +46,9 @@ pub(crate) struct Shelved {
     // join. An index orders them; a gap is not a volume.
     pub(crate) volumes: BTreeSet<u32>,
     pub(crate) complete: bool,
+    // A member beside the volumes has yet to decide its owner, so a volume
+    // may still join past the last one bound.
+    pub(crate) deciding: bool,
     // Which run may read. Moving it on stops the one reading: a repair
     // behind what it read, or the node going away.
     pub(crate) generation: u64,
@@ -165,6 +168,16 @@ impl Envelopes {
         };
         let len = usize::try_from(range.len()).expect("an envelope range fits the address space");
         kept.coverage.covered(range) && kept.leaf.read(range.start, len, into).is_ok()
+    }
+
+    // An envelope the object at `node` gave back with its volume leaves the
+    // shelf, file and all: the file, at the volume's own offsets, is what
+    // the object kept of the volume. Nothing is read or copied.
+    pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Leaf> {
+        let shelf = self.shelves.get(&node)?;
+        shelf
+            .update(|state| state.kept.remove(&envelope))
+            .map(|kept| kept.leaf)
     }
 
     // The node is gone, and its envelopes with it. A run still reading them

@@ -69,6 +69,15 @@ pub trait MemberAccess {
     // so the member's coverage says what the object found.
     fn found_damaged(&mut self, _member: MemberId, _range: ByteRange) {}
     fn length(&self, member: MemberId) -> Option<u64>;
+    // An empty directory of the namespace's own, for a recovery object
+    // whose format repairs files on disk rather than ranges: it stages its
+    // volumes and the members it covers there for this one repair. The
+    // namespace removes it once the repair returns. A namespace that keeps
+    // no files answers none, and such an object cannot repair.
+    fn scratch(&mut self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     // Bytes of the recovery object's own volume, which the namespace kept
     // where the object's inverse map placed them. This is where the
     // recovery data a repair spends is read from. A namespace that keeps
@@ -101,9 +110,23 @@ pub trait Recovery {
     // Whether this object describes the member, by id, name or content.
     fn covers(&self, member: MemberId) -> bool;
 
+    // Whether this object's own volumes are part of the release. Recovery
+    // data is spent by the job and left out; a listing is kept beside what
+    // it lists.
+    fn released(&self) -> bool {
+        false
+    }
+
     // Evidence as bytes pass: the namespace calls this for every covered
     // member on every delivery and every repair.
     fn feed(&mut self, member: MemberId, segments: &[Segment]);
+
+    // The block sizes at whose boundaries `feed`'s checksums have to be cut
+    // for this object to vouch for a block without reading it back. A
+    // source that cuts its checksums there, as the article decoder can,
+    // gives the object its proof as the bytes pass. An object that folds
+    // checksums of any alignment, or takes none, names none.
+    fn block_sizes(&self, _out: &mut Vec<u64>) {}
 
     // The verdict per slice of a covered member, as far as the evidence goes.
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>);
@@ -117,7 +140,9 @@ pub trait Recovery {
 
     // What the last repair came to, or `None` before one ran, and again
     // after a bind changed which members this object covers: the verdict
-    // was on other members.
+    // was on other members. A wait ends the same way, in the step the
+    // object holds the recovery data it waited for or knows no more of it
+    // can come: the owner rules again only on `None`.
     fn outcome(&self) -> Option<RepairOutcome>;
 
     // Each set the object holds, in the order it repairs them. An object

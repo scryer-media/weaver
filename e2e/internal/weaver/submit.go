@@ -139,6 +139,10 @@ func cmdSubmit(slug string) {
 				log.Printf("(failure was expected for this scenario)")
 				return
 			}
+			if scenario.expectedOutcome() == outcomePartialDelivery {
+				log.Printf("(partial delivery was expected for this scenario)")
+				return
+			}
 			os.Exit(1)
 		}
 	}

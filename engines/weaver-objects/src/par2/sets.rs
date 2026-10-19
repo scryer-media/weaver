@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use par2_rs::{FileId, Packet, Par2FileSet};
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ByteRange, Coverage, MemberId, Seek, VolumeIndex, Weight};
+use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Weight};
 
+use super::facts::Packets;
 use super::repair::SetRepair;
 use super::walker::Walker;
 
@@ -31,11 +32,17 @@ pub(super) struct SetState {
     // Where the set's first packet was found: sets are taken in this order,
     // which is the order of the volumes that carry them.
     pub(super) first_seen: (VolumeIndex, u64),
-    packets: Vec<Packet>,
+    // Sealed: the metadata settles in the first volumes, and every
+    // checkpoint after that carries it as it was encoded then.
+    packets: Sealed<Packets>,
     hashes: BTreeSet<[u8; 16]>,
     // The set as far as its metadata has arrived; `None` until its main
     // packet has.
     pub(super) index: Option<Par2FileSet>,
+    // Each described file's whole CRC32, folded from its slice checksums
+    // when the index is built: the index is fixed until a new packet
+    // rebuilds it, so the fold is too.
+    whole: BTreeMap<FileId, u32>,
     // Recovery packets by exponent: the first copy found is the one kept.
     pub(super) recovery: BTreeMap<u32, Location>,
     // Which member each described file is bound to.
@@ -48,9 +55,10 @@ impl SetState {
     pub(super) fn new(first_seen: (VolumeIndex, u64)) -> Self {
         Self {
             first_seen,
-            packets: Vec::new(),
+            packets: Sealed::default(),
             hashes: BTreeSet::new(),
             index: None,
+            whole: BTreeMap::new(),
             recovery: BTreeMap::new(),
             members: BTreeMap::new(),
             last: None,
@@ -65,27 +73,30 @@ impl SetState {
         if !self.hashes.insert(hash) {
             return;
         }
-        self.packets.push(packet);
-        self.index = index_of(&self.packets, output_limit);
+        self.packets.change(|packets| packets.0.push(packet));
+        self.index = index_of(&self.packets.get().0, output_limit);
+        self.whole = whole_of(self.index.as_ref());
     }
 
     // A set as a checkpoint recorded it: the index is rebuilt from its
     // packets, as each new one rebuilt it.
     pub(super) fn restored(
         first_seen: (VolumeIndex, u64),
-        packets: Vec<Packet>,
+        packets: Sealed<Packets>,
         hashes: BTreeSet<[u8; 16]>,
         output_limit: u64,
     ) -> Self {
+        let index = index_of(&packets.get().0, output_limit);
         Self {
-            index: index_of(&packets, output_limit),
+            whole: whole_of(index.as_ref()),
+            index,
             packets,
             hashes,
             ..Self::new(first_seen)
         }
     }
 
-    pub(super) fn packets(&self) -> &[Packet] {
+    pub(super) fn packets(&self) -> &Sealed<Packets> {
         &self.packets
     }
 
@@ -108,16 +119,24 @@ impl SetState {
             .then_some(index)
     }
 
+    // The CRC32 the described file's slices fold to.
+    pub(super) fn whole(&self, file: FileId) -> Option<u32> {
+        self.whole.get(&file).copied()
+    }
+
     pub(super) fn members(&self) -> &BTreeMap<FileId, MemberId> {
         &self.members
     }
 
-    // A verdict was on the members bound then; other members void it.
-    pub(super) fn bind(&mut self, members: BTreeMap<FileId, MemberId>) {
-        if members != self.members {
+    // A verdict was on the members bound then; other members, or the same
+    // members bound to other files, void it. Returns whether it was voided.
+    pub(super) fn bind(&mut self, members: BTreeMap<FileId, MemberId>) -> bool {
+        let changed = members != self.members;
+        if changed {
             self.members = members;
             self.last = None;
         }
+        changed
     }
 
     // An impossible verdict counted the blocks of the volumes bound then; a
@@ -230,6 +249,17 @@ fn index_of(packets: &[Packet], output_limit: u64) -> Option<Par2FileSet> {
     Par2FileSet::from_packets(packets.to_vec())
         .ok()
         .filter(|set| validate_par2_geometry(set, output_limit).is_ok())
+}
+
+fn whole_of(index: Option<&Par2FileSet>) -> BTreeMap<FileId, u32> {
+    let Some(index) = index else {
+        return BTreeMap::new();
+    };
+    index
+        .files
+        .keys()
+        .filter_map(|file| Some((*file, index.expected_file_crc32(*file)?)))
+        .collect()
 }
 
 // Admit declared geometry before anything is built on it.

@@ -1091,8 +1091,21 @@ async fn execute(
                         reason,
                     });
                 }
+                // The legs open every connection the plan counted, so the
+                // pool must lend them all; a server whose count was lowered
+                // since the plan cannot, and the rest would run outside its
+                // budget.
                 let configured = pool.configured_connections(index).unwrap_or(0);
-                let lent = usize::from(connections).min(configured);
+                let lent = usize::from(connections);
+                if lent > configured {
+                    return Outcome::FailedWith(SpeedTestFailure::LeaseRefused {
+                        server: server.id,
+                        name: cell.consumer_name.clone(),
+                        reason: format!(
+                            "it has {configured} connections, fewer than the {connections} the run planned"
+                        ),
+                    });
+                }
                 let Some(loan) = pool.lend_connections(index, lent) else {
                     return Outcome::FailedWith(SpeedTestFailure::ServerLeftPool);
                 };

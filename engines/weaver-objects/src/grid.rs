@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weaver_graph::{ByteRange, MemberId, Segment, SliceVerdict};
+use weaver_graph::{ByteRange, MemberId, Segment, Shelf, SliceVerdict};
 
 // A run is folded eagerly inside its block, so ordered traffic needs one per
 // grid, and these bounds only bite on pathological interleavings.
@@ -145,11 +145,50 @@ impl Load {
     }
 }
 
+// Blocks per chunk of a member's grid: a segment changes the chunk of the
+// block it lands in, so a checkpoint writes that chunk again and not the
+// member's whole grid.
+const BLOCKS_PER_CHUNK: u64 = 16;
+
+type Block = BTreeMap<u64, Run>;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct FileGrid {
-    // Runs per block index, keyed by their start.
-    blocks: BTreeMap<u64, BTreeMap<u64, Run>>,
+    // Runs per block index, keyed by their start, the blocks shelved by
+    // chunk.
+    blocks: Shelf<BTreeMap<u64, Block>>,
     load: Load,
+}
+
+impl FileGrid {
+    fn chunk(index: u64) -> u32 {
+        // Past the last chunk only on a grid of more blocks than any file
+        // has; they share it, which costs bytes, never a verdict.
+        u32::try_from(index / BLOCKS_PER_CHUNK).unwrap_or(u32::MAX)
+    }
+
+    fn block(&self, index: u64) -> Option<&Block> {
+        self.blocks.get(Self::chunk(index))?.get(&index)
+    }
+
+    // Change one block, made empty first if the grid has none; an emptied
+    // block is dropped.
+    fn change<R>(&mut self, index: u64, change: impl FnOnce(&mut Block) -> R) -> R {
+        self.blocks
+            .change(Self::chunk(index), BTreeMap::is_empty, |blocks| {
+                let block = blocks.entry(index).or_default();
+                let out = change(block);
+                if block.is_empty() {
+                    blocks.remove(&index);
+                }
+                out
+            })
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.blocks.chunks().next().is_none()
+    }
 }
 
 // Every grid of every member one recovery object watches, under one budget.
@@ -171,34 +210,39 @@ impl Grid {
         // Whatever the segment overlaps is superseded by it.
         for index in first..=last {
             let bounds = block_bounds(index, block_size);
-            if let Some(block) = file.blocks.get_mut(&index) {
-                let before = Load::of(block, bounds);
-                block.retain(|_, run| run.range.intersect(segment.range).is_none());
-                let after = Load::of(block, bounds);
+            let overlaps = file.block(index).is_some_and(|block| {
+                block
+                    .values()
+                    .any(|run| run.range.intersect(segment.range).is_some())
+            });
+            if overlaps {
+                let (before, after) = file.change(index, |block| {
+                    let before = Load::of(block, bounds);
+                    block.retain(|_, run| run.range.intersect(segment.range).is_none());
+                    (before, Load::of(block, bounds))
+                });
                 file.load.sub(before);
                 file.load.add(after);
                 self.load.sub(before);
                 self.load.add(after);
-                if block.is_empty() {
-                    file.blocks.remove(&index);
-                }
             }
         }
         if first != last {
             return;
         }
         let bounds = block_bounds(first, block_size);
-        let block = file.blocks.entry(first).or_default();
-        let before = Load::of(block, bounds);
-        insert_merged(
-            block,
-            Run {
-                range: segment.range,
-                crc32: segment.crc32,
-                verified: segment.verified,
-            },
-        );
-        let after = Load::of(block, bounds);
+        let (before, after) = file.change(first, |block| {
+            let before = Load::of(block, bounds);
+            insert_merged(
+                block,
+                Run {
+                    range: segment.range,
+                    crc32: segment.crc32,
+                    verified: segment.verified,
+                },
+            );
+            (before, Load::of(block, bounds))
+        });
         let mut file_load = file.load;
         file_load.sub(before);
         file_load.add(after);
@@ -213,7 +257,7 @@ impl Grid {
             return;
         }
         // Over budget: the block is forgotten, so its slice is read back.
-        file.blocks.remove(&first);
+        file.change(first, Block::clear);
         file.load.sub(before);
         self.load.sub(before);
     }
@@ -228,7 +272,7 @@ impl Grid {
         index: u64,
         range: ByteRange,
     ) -> Option<Folded> {
-        let block = self.files.get(&(member, block_size))?.blocks.get(&index)?;
+        let block = self.files.get(&(member, block_size))?.block(index)?;
         fold_tiling(block.values(), range)
     }
 }

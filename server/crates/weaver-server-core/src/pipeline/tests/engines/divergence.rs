@@ -58,6 +58,38 @@ async fn a_rar_volume_is_extracted_under_both_engines() {
     assert_same(&classic, &graph);
 }
 
+// A primary that spoils every body it serves costs nothing while a backup
+// serves them whole: each article is asked of the backup before its damaged
+// bytes stand, and the file is delivered whole with no repair.
+#[tokio::test]
+async fn bodies_the_primary_spoils_come_whole_from_the_backup_under_both_engines() {
+    let inner = payload(4 * ARTICLE + 23, 34);
+    let mut scenario = Scenario::new(vec![Post::plain("ember.bin", inner.clone())]);
+    for ordinal in 0..5 {
+        scenario = scenario.corrupt_on_primary(0, ordinal);
+    }
+    let (classic, graph) = run_both(&scenario).await;
+    for outcome in [&classic, &graph] {
+        assert!(
+            outcome.completed(),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.failure
+        );
+        assert!(
+            outcome.files[&delivered("ember.bin")] == inner,
+            "{} delivers the backup's bytes",
+            outcome.engine
+        );
+        assert!(
+            outcome.requests.values().all(|asked| *asked == 2),
+            "{} asks each article of the primary, then the backup: {:?}",
+            outcome.engine,
+            outcome.requests
+        );
+    }
+}
+
 // Two posts of one name reach neither engine as one name: ingest gives the
 // second `.duplicateN` before the job is admitted, whichever engine runs it.
 #[tokio::test]

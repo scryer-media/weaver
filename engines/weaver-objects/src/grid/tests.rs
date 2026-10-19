@@ -158,6 +158,6 @@ fn a_file_over_its_run_budget_forgets_the_block() {
     assert!(
         grid.files
             .get(&(MEMBER, block))
-            .is_none_or(|file| file.blocks.is_empty())
+            .is_none_or(FileGrid::is_empty)
     );
 }

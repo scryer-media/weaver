@@ -102,7 +102,7 @@ impl Owner {
             next: 0,
         };
         let name = owner.volumes[0].0.clone();
-        owner.object.bound(VolumeIndex(0), &name);
+        owner.object.bound(VolumeIndex(0), &name, &[]);
         owner.bound[0] = true;
         owner.size(0);
         for volume in 1..count {
@@ -139,7 +139,7 @@ impl Owner {
         let first = &bytes[..bytes.len().min(32)];
         assert_eq!(self.object.claim(name, first), Some(self.index[volume]));
         let name = name.clone();
-        self.object.bound(self.index[volume], &name);
+        self.object.bound(self.index[volume], &name, &[]);
         self.bound[volume] = true;
         self.size(volume);
     }

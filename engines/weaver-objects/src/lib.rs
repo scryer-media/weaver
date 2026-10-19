@@ -13,12 +13,15 @@ mod kept;
 pub mod keys;
 pub mod par2;
 pub mod par3;
+mod quiet;
 pub mod rar_engine;
+pub mod rar_recovery;
 pub mod rar_store;
 mod runs;
 pub mod sevenz_engine;
 pub mod sevenz_store;
 pub mod sfv;
+mod split;
 pub mod stream;
 pub mod tar;
 mod verdict;
@@ -29,9 +32,16 @@ pub mod zip_engine;
 mod testing;
 
 use weaver_graph::{
-    Builder, Durable, Facts, Kind, NodeId, Object, ObjectId, Placement, Restore, RestoreError,
-    Tree, VolumeIndex,
+    Builder, Durable, Facts, Kind, NodeId, Object, ObjectId, Placement, RecoveryKind, Restore,
+    RestoreError, Tree, VolumeIndex,
 };
+
+// What a container may carry after its own end: a recovery set over it,
+// known by the magic its first packet opens with.
+pub(crate) const RECOVERY: [(&[u8; 8], RecoveryKind); 2] = [
+    (b"PAR2\0PKT", RecoveryKind::Par2),
+    (b"PAR3\0PKT", RecoveryKind::Par3),
+];
 
 // The object for a kind this crate has, or `None` for one it has not.
 pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
@@ -43,6 +53,7 @@ pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         Kind::SevenZipEngine => Some(Box::new(sevenz_engine::SevenZipEngine::new())),
         Kind::SevenZipStore => Some(Box::new(sevenz_store::SevenZipStore::new())),
         Kind::Sfv => Some(Box::new(sfv::Sfv::new(id))),
+        Kind::RarRecovery => Some(Box::new(rar_recovery::RarRecovery::new(id))),
         Kind::Tar => Some(Box::new(tar::Tar::new())),
         Kind::Xz => Some(Box::new(stream::XzStream::new())),
         Kind::Gzip => Some(Box::new(stream::GzipStream::new())),
@@ -50,6 +61,7 @@ pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         Kind::Zstd => Some(Box::new(stream::ZstdStream::new())),
         Kind::Brotli => Some(Box::new(stream::BrotliStream::new())),
         Kind::Deflate => Some(Box::new(stream::DeflateStream::new())),
+        Kind::Split => Some(Box::new(stream::SplitStream::new())),
         Kind::Zip => Some(Box::new(zip::Zip::new())),
         Kind::ZipEngine => Some(Box::new(zip_engine::ZipEngine::new())),
     }
@@ -68,6 +80,7 @@ pub fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         Kind::SevenZipEngine => back::<sevenz_engine::SevenZipEngine>(facts),
         Kind::SevenZipStore => back::<sevenz_store::SevenZipStore>(facts),
         Kind::Sfv => back::<sfv::Sfv>(facts),
+        Kind::RarRecovery => back::<rar_recovery::RarRecovery>(facts),
         Kind::Tar => back::<tar::Tar>(facts),
         Kind::Xz => back::<stream::XzStream>(facts),
         Kind::Gzip => back::<stream::GzipStream>(facts),
@@ -75,6 +88,7 @@ pub fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         Kind::Zstd => back::<stream::ZstdStream>(facts),
         Kind::Brotli => back::<stream::BrotliStream>(facts),
         Kind::Deflate => back::<stream::DeflateStream>(facts),
+        Kind::Split => back::<stream::SplitStream>(facts),
         Kind::Zip => back::<zip::Zip>(facts),
         Kind::ZipEngine => back::<zip_engine::ZipEngine>(facts),
     }

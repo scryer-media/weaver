@@ -4,6 +4,7 @@
 package weaver
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -297,6 +298,29 @@ func functionalNeedsFileIdentityRewriteObserver(jobs []testJob) bool {
 	return false
 }
 
+// fileCompleteQueries asks, per engine, whether a job has every byte of a
+// posted file. The classic engine writes an active_files row when a file
+// completes. The graph engine checkpoints each posted file as a root member
+// (node 0) and the byte runs it holds of it, so the file is complete once its
+// length is known and its runs cover all of it.
+var fileCompleteQueries = map[weaverEngine]string{
+	engineClassic: `SELECT COUNT(*) FROM active_files WHERE job_id = ? AND filename = ?`,
+	engineGraph: `SELECT COUNT(*) FROM graph_members m
+		WHERE m.job_id = ? AND m.node_id = 0 AND m.name = ? AND m.length IS NOT NULL
+		AND m.length <= (
+			SELECT COALESCE(SUM(c.range_end - c.range_start), 0) FROM graph_coverage c
+			WHERE c.job_id = m.job_id AND c.node_id = m.node_id AND c.member_id = m.member_id
+		)`,
+}
+
+// fileComplete reports whether the engine under test holds every byte of the
+// job's posted file.
+func fileComplete(db *sql.DB, datastore weaverDatastore, engine weaverEngine, jobID int, filename string) (bool, error) {
+	var count int
+	err := db.QueryRow(rebindWeaverSQL(datastore, fileCompleteQueries[engine]), jobID, filename).Scan(&count)
+	return count > 0, err
+}
+
 func waitForActiveFileComplete(dbPath string, jobID int, filename string, timeout time.Duration) error {
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
@@ -304,15 +328,11 @@ func waitForActiveFileComplete(dbPath string, jobID int, filename string, timeou
 	}
 	defer closeWeaverStateDB(db, datastore)
 
-	query := rebindWeaverSQL(
-		datastore,
-		`SELECT COUNT(*) FROM active_files WHERE job_id = ? AND filename = ?`,
-	)
+	engine := engineUnderTest()
 	deadline := time.Now().Add(timeout)
 	for {
-		var count int
-		err := db.QueryRow(query, jobID, filename).Scan(&count)
-		if err == nil && count > 0 {
+		complete, err := fileComplete(db, datastore, engine, jobID, filename)
+		if err == nil && complete {
 			return nil
 		}
 		if err != nil && !isTransientSQLiteBusy(err) {
@@ -951,7 +971,7 @@ func runTests(slugs []string) {
 		switch j.scenario.expectedOutcome() {
 		case "success", "repair_then_success":
 			passed = j.status == "COMPLETE"
-		case "health_failure", "encryption_unsupported", "repair_failure", "extraction_failure":
+		case "health_failure", "encryption_unsupported", "repair_failure", "extraction_failure", outcomePartialDelivery:
 			passed = j.status == "FAILED"
 		case "nested_depth_exceeded":
 			// Completes but output is still an archive (not the final media)
@@ -1233,10 +1253,11 @@ var byDesignDirectRefusals = map[string]bool{
 // detect their own damage and demote — correctly — so a damage demotion from
 // one of them is the product working rather than failing.
 var damagedFixtureOutcomes = map[string]bool{
-	"repair_then_success": true,
-	"repair_failure":      true,
-	"extraction_failure":  true,
-	"health_failure":      true,
+	"repair_then_success":  true,
+	"repair_failure":       true,
+	"extraction_failure":   true,
+	"health_failure":       true,
+	outcomePartialDelivery: true,
 }
 
 // isDamageDemotion reports whether a reason means "the bytes were wrong", which

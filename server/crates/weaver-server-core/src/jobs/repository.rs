@@ -53,7 +53,7 @@ impl OrphanActiveStateCounts {
 
 const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 22] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 23] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
@@ -76,6 +76,7 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 22] = [
     "graph_crypt",
     "graph_recovery",
     "graph_holds",
+    "graph_facts_parts",
 ];
 
 async fn run_inline_incremental_vacuum(datastore: &StoreDatastore) -> Result<(), StateError> {

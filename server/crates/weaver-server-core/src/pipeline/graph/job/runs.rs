@@ -9,7 +9,6 @@
 
 use std::collections::BTreeSet;
 
-use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
@@ -27,6 +26,13 @@ impl<R: Root> GraphJob<R> {
         }
         let admitted = match said.heard {
             Heard::Emit(emit) => {
+                // The object is told its run is asking, as it is told how
+                // far the run read: it rules on it when the job is quiet.
+                if emit == Emit::NeedsPassword
+                    && let Some(engine) = self.tree.engine_mut(node)
+                {
+                    engine.asked();
+                }
                 let mut out = Vec::new();
                 self.writer.said(
                     &mut self.tree,
@@ -90,7 +96,7 @@ impl<R: Root> GraphJob<R> {
             }
             // With every run started, a damaged namespace nothing will
             // repair is refused, and what that frees is stepped again.
-            if admitted.is_empty() && !self.refuse_unrepaired()? {
+            if admitted.is_empty() && !self.tell_quiet()? {
                 return Ok(());
             }
             for node in std::mem::take(&mut admitted) {
@@ -160,19 +166,20 @@ impl<R: Root> GraphJob<R> {
             return Ok(());
         };
         let bound: BTreeSet<u32> = volumes.keys().map(|volume| volume.0).collect();
-        let complete = namespace
+        // A volume can still join while a member's front has yet to decide
+        // its owner, and while anything more can come: a recovery object yet
+        // to rule may rebuild a volume never posted.
+        let ended = self.ended(parent);
+        let deciding = namespace
             .members()
-            .all(|member| !self.tree.is_undecided(parent, member.id));
+            .any(|member| self.tree.is_undecided(parent, member.id));
+        let complete = ended && !deciding;
         let ends: Vec<(u32, Option<u64>, bool)> = volumes
             .iter()
             .filter_map(|(volume, member)| {
                 let record = namespace.get(*member)?;
                 let closed = record.closed.then(|| record.length.unwrap_or(0));
-                Some((
-                    volume.0,
-                    closed,
-                    record.closed && self.settled(parent, *member),
-                ))
+                Some((volume.0, closed, record.closed && ended))
             })
             .collect();
         let shelf = self.writer.shelf(node);
@@ -180,6 +187,7 @@ impl<R: Root> GraphJob<R> {
             .update(|state| {
                 state.volumes = bound;
                 state.complete = complete;
+                state.deciding = deciding;
                 for (volume, closed, settled) in ends {
                     let kept = shelf.kept(state, volume)?;
                     kept.closed = closed;
@@ -190,18 +198,12 @@ impl<R: Root> GraphJob<R> {
             .map_err(|error| GraphError::Write(WriteError::Leaf(error)))
     }
 
-    // Nothing more will come for the member, not even a repair: the payload
-    // is in, and every recovery object beside it has ruled. One that has not
-    // may cover it yet, since it binds what it covers as its own volumes
-    // arrive, and those can come after the member closed.
-    fn settled(&self, parent: NodeId, _member: MemberId) -> bool {
-        !self.payload_waiting()
-            && self.tree.recovery_nodes(parent).into_iter().all(|node| {
-                self.tree.recovery(node).is_none_or(|recovery| {
-                    recovery
-                        .outcome()
-                        .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
-                })
-            })
+    // Nothing more will come for the namespace's members, not even a
+    // repair: the payload is in, and the namespace's sets have ruled. One
+    // that has not may cover a member yet, since it binds what it covers as
+    // its own volumes arrive, and those can come after the member closed,
+    // or rebuild a member that never came at all.
+    fn ended(&self, parent: NodeId) -> bool {
+        !self.payload_waiting() && self.writer.ruled(&self.tree, parent)
     }
 }

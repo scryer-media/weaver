@@ -24,6 +24,7 @@ impl Evidence {
     pub(super) fn of(
         grid: &Grid,
         index: &Par2FileSet,
+        expected_whole: Option<u32>,
         file: FileId,
         member: MemberId,
         length: Option<u64>,
@@ -36,27 +37,64 @@ impl Evidence {
             };
         };
         let described = description.length;
-        let exact = length == Some(described);
+        let count = index.slice_count_for_file(described) as usize;
+        let mut evidence = Self {
+            slices: vec![SliceVerdict::Unknown; count],
+            whole: SliceVerdict::Unknown,
+            exact: length == Some(described),
+        };
+        evidence.refold(
+            grid,
+            index,
+            expected_whole,
+            file,
+            member,
+            ByteRange::new(0, described),
+        );
+        evidence
+    }
+
+    // Fold again what the grid holds over `range` of the member: the slices
+    // it touches and the whole. The rest of the slices stand as they were,
+    // since nothing they fold from has changed.
+    pub(super) fn refold(
+        &mut self,
+        grid: &Grid,
+        index: &Par2FileSet,
+        expected_whole: Option<u32>,
+        file: FileId,
+        member: MemberId,
+        range: ByteRange,
+    ) {
+        let Some(description) = index.file_description(&file) else {
+            return;
+        };
+        let described = description.length;
         let block = index.slice_size;
         let checksums = index.file_checksums(&file).unwrap_or(&[]);
-        let count = index.slice_count_for_file(described) as usize;
-        let slices = (0..count)
-            .map(|slice| {
+        let exact = self.exact;
+        if !range.is_empty() && block > 0 {
+            let first = (range.start / block) as usize;
+            let last = ((range.end - 1) / block) as usize;
+            for slice in first..(last + 1).min(self.slices.len()) {
                 let start = slice as u64 * block;
                 let end = (start + block).min(described);
-                let Some(expected) = checksums.get(slice) else {
-                    return SliceVerdict::Unknown;
+                self.slices[slice] = match checksums.get(slice) {
+                    None => SliceVerdict::Unknown,
+                    // A short final slice is compared on its zero padding,
+                    // which says something only when the member ends where
+                    // described.
+                    Some(_) if end - start < block && !exact => SliceVerdict::Unknown,
+                    Some(expected) => grid::verdict(
+                        grid.fold(member, block, slice as u64, ByteRange::new(start, end)),
+                        end - start,
+                        block,
+                        expected.crc32,
+                    ),
                 };
-                // A short final slice is compared on its zero padding, which
-                // says something only when the member ends where described.
-                if end - start < block && !exact {
-                    return SliceVerdict::Unknown;
-                }
-                let folded = grid.fold(member, block, slice as u64, ByteRange::new(start, end));
-                grid::verdict(folded, end - start, block, expected.crc32)
-            })
-            .collect();
-        let whole = match index.expected_file_crc32(file) {
+            }
+        }
+        self.whole = match expected_whole {
             Some(_) if described == 0 && exact => SliceVerdict::Intact,
             Some(expected) if exact => grid::verdict(
                 grid.fold(member, WHOLE, 0, ByteRange::new(0, described)),
@@ -66,11 +104,6 @@ impl Evidence {
             ),
             _ => SliceVerdict::Unknown,
         };
-        Self {
-            slices,
-            whole,
-            exact,
-        }
     }
 
     pub(super) fn is_damaged(&self) -> bool {

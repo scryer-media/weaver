@@ -208,7 +208,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
 
 fn stream<D: Decoder>(name: &str) -> Stream<D> {
     let mut stream = Stream::<D>::new();
-    stream.bound(VolumeIndex(0), name);
+    stream.bound(VolumeIndex(0), name, &[]);
     stream
 }
 
@@ -517,4 +517,65 @@ fn every_byte_of_the_volume_is_its_envelope() {
     );
     assert!(stream.reads_in_order());
     assert!(stream.engine().is_some());
+}
+
+// The lengths of the byte emits a run says over `bytes`, handed out
+// `piece` bytes at a time.
+fn emitted<D: Decoder>(name: &str, bytes: Vec<u8>, piece: usize) -> Vec<usize> {
+    let gate = Gate::new(bytes);
+    let extraction = stream::<D>(name).start();
+    let runner = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            let mut lens = Vec::new();
+            let volumes: Arc<dyn Volumes> = gate.clone();
+            extraction.run(volumes, &mut |emit| {
+                if let Emit::Bytes { bytes, .. } = emit {
+                    lens.push(bytes.len());
+                }
+                true
+            });
+            gate.finish();
+            lens
+        })
+    };
+    let len = gate.bytes.len();
+    let mut released = 0;
+    while released < len {
+        released = (released + piece).min(len);
+        gate.release(released);
+        gate.await_reader();
+    }
+    gate.close();
+    runner.join().unwrap()
+}
+
+// Every emit is a step of the owner's, so a run hands its output on a
+// whole chunk at a time, however little each read of its decoder gives:
+// gzip's reads give half a chunk, brotli's a sixteenth.
+#[test]
+fn a_run_hands_its_output_on_in_whole_chunks() {
+    let plain = payload(7, 4 * super::run::CHUNK + 1_000);
+    let chunks = plain.len().div_ceil(super::run::CHUNK);
+    let cases: [(&str, Vec<u8>, fn(&str, Vec<u8>, usize) -> Vec<usize>); 6] = [
+        ("a.gz", gzip(&plain), emitted::<Gzip>),
+        ("a.deflate", deflate(&plain), emitted::<Deflate>),
+        ("a.bz2", bzip2(&plain), emitted::<Bzip2>),
+        ("a.zst", zstd(&plain), emitted::<Zstd>),
+        ("a.br", brotli(&plain), emitted::<Brotli>),
+        ("a.xz", xz(&plain), emitted::<Xz>),
+    ];
+    for (name, bytes, emitted) in cases {
+        for piece in [bytes.len(), 4096] {
+            let lens = emitted(name, bytes.clone(), piece);
+            assert_eq!(lens.len(), chunks, "{name} in {piece}-byte pieces");
+            assert_eq!(lens.iter().sum::<usize>(), plain.len(), "{name}");
+            assert!(
+                lens[..chunks - 1]
+                    .iter()
+                    .all(|len| *len == super::run::CHUNK),
+                "{name} in {piece}-byte pieces: {lens:?}"
+            );
+        }
+    }
 }

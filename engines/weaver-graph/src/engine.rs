@@ -23,9 +23,10 @@ use crate::volume::VolumeIndex;
 // and fails when they will never come, or when the run was cancelled.
 pub trait Volumes: Send + Sync {
     // The volume after `after` in the set's order, or its first for `None`;
-    // `None` past the last bound so far. An index orders the volumes and
-    // need not be dense, so a gap before the next one bound is waited on
-    // while a volume can still join there, and passed over once none can.
+    // `None` past the last bound once no member beside the volumes is still
+    // deciding its owner. An index orders the volumes and need not be
+    // dense, so a gap before the next one bound is waited on while a volume
+    // can still join there, and passed over once none can.
     fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>>;
 
     // The volume's length, once it is closed.
@@ -58,6 +59,11 @@ pub trait Engine {
     // object can bid for the volumes after it; the object's state is
     // otherwise its own.
     fn reached(&mut self, _volume: VolumeIndex, _offset: u64) {}
+
+    // The run said it cannot read further without a password. The owner
+    // tells the object, as it tells it how far the run read, so the object
+    // knows it is asking until `offer_password` answers.
+    fn asked(&mut self) {}
 
     // The bytes a run holds resident while it runs: a decoder's window, read
     // from the first bytes the object was delivered. The owner reserves it
