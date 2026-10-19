@@ -6039,7 +6039,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-graph"
-version = "0.15.0"
+version = "0.16.2"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -6099,7 +6099,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.15.0"
+version = "0.16.2"
 dependencies = [
  "aws-lc-rs",
  "brotli 8.0.4",
