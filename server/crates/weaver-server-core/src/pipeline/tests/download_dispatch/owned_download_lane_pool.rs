@@ -4239,7 +4239,10 @@ async fn par2_metadata_bootstrap_holds_a_graph_jobs_payload_until_its_index_is_r
         leased.extend(lease.works.into_iter().map(|work| work.segment_id));
     }
     assert_eq!(
-        leased.iter().map(|id| id.file_id.file_index).collect::<Vec<_>>(),
+        leased
+            .iter()
+            .map(|id| id.file_id.file_index)
+            .collect::<Vec<_>>(),
         vec![0],
         "{leased:?}"
     );
