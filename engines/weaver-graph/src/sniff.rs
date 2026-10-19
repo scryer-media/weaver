@@ -19,7 +19,7 @@
 //             and whose start header must match its CRC
 //   PAR2 64   the first packet header, whose length must be a packet's
 //   bzip2 4   `BZh` and a block-size level
-//   RAR5 8, RAR4 7, PAR3 8, xz 6, zip 4, zstd 4, gzip 2   the signature
+//   RAR5 8, RAR4 7, RAR5 recovery 8, PAR3 8, xz 6, zip 4, zstd 4, gzip 2   the signature
 //
 // Each is cut short by bytes that already contradict the signature, and by
 // a known length too small to hold it.
@@ -167,6 +167,9 @@ const SIGNATURES: &[Signature] = &[
         ruled_out: |_| false,
     },
     signature(Kind::Par3, b"PAR3\x00PKT"),
+    // A RAR5 recovery volume. A RAR3 one opens with parity and is known by
+    // its name alone.
+    signature(Kind::RarRecovery, b"Rar!\x1aRev"),
 ];
 
 // A major version this build does not know places its fields elsewhere, and
@@ -231,6 +234,7 @@ const NAMED: &[(Kind, &[&str])] = &[
     (Kind::Sfv, &[".sfv"]),
     (Kind::Zip, &[".zip"]),
     (Kind::Split, &[".001"]),
+    (Kind::RarRecovery, &[".rev"]),
 ];
 
 fn named(name: &str) -> Option<Kind> {
@@ -378,6 +382,16 @@ mod tests {
     fn par2_and_par3_signatures() {
         assert_eq!(sniff("a.par2", &par2(64), None), object(Kind::Par2));
         assert_eq!(sniff("a.vol00+01.par2", PAR3, None), object(Kind::Par3));
+    }
+
+    #[test]
+    fn rar_recovery_volumes_by_signature_and_by_name() {
+        let mut rev5 = b"Rar!\x1aRev".to_vec();
+        rev5.extend(plain(64));
+        assert_eq!(sniff("a.part1.rev", &rev5, None), object(Kind::RarRecovery));
+        assert_eq!(sniff("9f3a7c1e", &rev5, None), object(Kind::RarRecovery));
+        assert_eq!(sniff("a.rev", &plain(600), None), object(Kind::RarRecovery));
+        assert_eq!(sniff("a.part1.rev", RAR5, None), object(Kind::RarStore));
     }
 
     #[test]

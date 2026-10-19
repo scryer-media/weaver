@@ -15,6 +15,7 @@ pub mod par2;
 pub mod par3;
 mod quiet;
 pub mod rar_engine;
+pub mod rar_recovery;
 pub mod rar_store;
 mod runs;
 pub mod sevenz_engine;
@@ -52,6 +53,7 @@ pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         Kind::SevenZipEngine => Some(Box::new(sevenz_engine::SevenZipEngine::new())),
         Kind::SevenZipStore => Some(Box::new(sevenz_store::SevenZipStore::new())),
         Kind::Sfv => Some(Box::new(sfv::Sfv::new(id))),
+        Kind::RarRecovery => Some(Box::new(rar_recovery::RarRecovery::new(id))),
         Kind::Tar => Some(Box::new(tar::Tar::new())),
         Kind::Xz => Some(Box::new(stream::XzStream::new())),
         Kind::Gzip => Some(Box::new(stream::GzipStream::new())),
@@ -78,6 +80,7 @@ pub fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         Kind::SevenZipEngine => back::<sevenz_engine::SevenZipEngine>(facts),
         Kind::SevenZipStore => back::<sevenz_store::SevenZipStore>(facts),
         Kind::Sfv => back::<sfv::Sfv>(facts),
+        Kind::RarRecovery => back::<rar_recovery::RarRecovery>(facts),
         Kind::Tar => back::<tar::Tar>(facts),
         Kind::Xz => back::<stream::XzStream>(facts),
         Kind::Gzip => back::<stream::GzipStream>(facts),

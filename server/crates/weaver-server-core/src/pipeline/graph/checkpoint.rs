@@ -456,7 +456,7 @@ fn range(row: i64, start: i64, end: i64) -> Result<ByteRange, CheckpointError> {
     }
 }
 
-const KINDS: [Kind; 17] = [
+const KINDS: [Kind; 18] = [
     Kind::RarStore,
     Kind::SevenZipStore,
     Kind::Zip,
@@ -474,6 +474,7 @@ const KINDS: [Kind; 17] = [
     Kind::Par2,
     Kind::Par3,
     Kind::Sfv,
+    Kind::RarRecovery,
 ];
 
 // The kind a row names, by the name the kind displays as.

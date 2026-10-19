@@ -489,6 +489,7 @@ impl NamespaceWriter {
             reads: 0,
             repaired: Vec::new(),
             found: Vec::new(),
+            scratch: None,
         }
     }
 
@@ -1233,6 +1234,19 @@ pub(crate) struct Access<'a> {
     repaired: Vec<(MemberId, u64, Bytes)>,
     // Ranges the object proved bad and could not rebuild.
     found: Vec<(MemberId, ByteRange)>,
+    // The directory lent for this one repair, removed when it returns.
+    scratch: Option<PathBuf>,
+}
+
+// A repair's scratch directory goes with the repair. One left behind by a
+// crash is cleared before the next is lent, and lives under the directory
+// finalize never delivers.
+fn remove_scratch(dir: &Path) {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(dir = %dir.display(), %error, "recovery scratch left behind"),
+    }
 }
 
 impl Access<'_> {
@@ -1383,6 +1397,20 @@ impl MemberAccess for Access<'_> {
 
     fn length(&self, member: MemberId) -> Option<u64> {
         self.tree.namespace(self.node)?.get(member)?.length
+    }
+
+    // Under the directory finalize never delivers, one per recovery object
+    // and namespace, so two repairs never share one.
+    fn scratch(&mut self) -> Option<PathBuf> {
+        let recovery = self.recovery?;
+        let dir = self.writer.working_dir.join(format!(
+            ".weaver-chunks/graph-recovery-{}-{}",
+            self.node.0, recovery.0
+        ));
+        remove_scratch(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        self.scratch = Some(dir.clone());
+        Some(dir)
     }
 
     // The recovery object's volume is a member of this namespace, or a

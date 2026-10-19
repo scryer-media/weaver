@@ -174,21 +174,22 @@ impl Pipeline {
         true
     }
 
-    // PAR2 and PAR3 files, indexes and volumes alike, are spent once the job
-    // delivers and are not part of the release, so they are left out of it
-    // as a classic job's are. Root members are numbered as the posted files
-    // they are.
+    // PAR2 and PAR3 files, indexes and volumes alike, and the volumes of any
+    // recovery object are spent once the job delivers and are not part of
+    // the release, so they are left out of it as a classic job's are. Root
+    // members are numbered as the posted files they are.
     async fn remove_recovery_volumes(&self, job_id: JobId) {
         let (Some(graph), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id))
         else {
             return;
         };
         for (member, path) in graph.member_files() {
-            let is_recovery = state
-                .spec
-                .files
-                .get(member.0 as usize)
-                .is_some_and(|file| !file.role.counts_toward_health());
+            let is_recovery = graph.recovers(member)
+                || state
+                    .spec
+                    .files
+                    .get(member.0 as usize)
+                    .is_some_and(|file| !file.role.counts_toward_health());
             if !is_recovery {
                 continue;
             }

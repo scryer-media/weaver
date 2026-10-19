@@ -383,6 +383,9 @@ impl NamespaceWriter {
                 .recovery_mut()
                 .map(|recovery| recovery.repair(&mut access));
             let (reads, repaired, found) = (access.reads, access.repaired, access.found);
+            if let Some(dir) = access.scratch {
+                super::remove_scratch(&dir);
+            }
             tree.put_object(set, object);
             self.read_backs += reads;
             ruled.extend(outcome.map(|outcome| (set, outcome)));

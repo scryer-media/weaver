@@ -69,6 +69,15 @@ pub trait MemberAccess {
     // so the member's coverage says what the object found.
     fn found_damaged(&mut self, _member: MemberId, _range: ByteRange) {}
     fn length(&self, member: MemberId) -> Option<u64>;
+    // An empty directory of the namespace's own, for a recovery object
+    // whose format repairs files on disk rather than ranges: it stages its
+    // volumes and the members it covers there for this one repair. The
+    // namespace removes it once the repair returns. A namespace that keeps
+    // no files answers none, and such an object cannot repair.
+    fn scratch(&mut self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     // Bytes of the recovery object's own volume, which the namespace kept
     // where the object's inverse map placed them. This is where the
     // recovery data a repair spends is read from. A namespace that keeps

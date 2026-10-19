@@ -246,6 +246,15 @@ impl GraphJob {
             .collect()
     }
 
+    // Seam for status: whether the root member is the volume of a recovery
+    // object, which rebuilds the set it covers and is never part of the
+    // release.
+    pub(crate) fn recovers(&self, member: MemberId) -> bool {
+        self.tree
+            .child_of(NodeId::ROOT, member)
+            .is_some_and(|(child, _)| self.tree.recovers(child))
+    }
+
     // Articles the queues do not hold were fetched by an earlier run.
     pub(crate) fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool) {
         self.root.map.arrived_before(queued);
