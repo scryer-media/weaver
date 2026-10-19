@@ -158,29 +158,14 @@ pub enum TrackerStatus {
     Disabled,
 }
 
-impl TrackerStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotContacted => "not_contacted",
-            Self::Updating => "updating",
-            Self::Working => "working",
-            Self::NotWorking => "not_working",
-            Self::Disabled => "disabled",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "not_contacted" => Some(Self::NotContacted),
-            "updating" => Some(Self::Updating),
-            "working" => Some(Self::Working),
-            "not_working" => Some(Self::NotWorking),
-            "disabled" => Some(Self::Disabled),
-            _ => None,
-        }
-    }
+/// A tracker the torrent names, and its place in the announce list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerEntry {
+    pub tier: u32,
+    pub url: String,
 }
 
+/// A tracker and how announcing to it is going.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TorrentTracker {
     pub tier: u32,

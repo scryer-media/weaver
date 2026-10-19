@@ -6,7 +6,7 @@ use crate::persistence::Database;
 use crate::settings::{SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
     Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TorrentTracker, TrackerStatus,
+    TorrentSource, TrackerEntry,
 };
 
 fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
@@ -45,27 +45,15 @@ fn files() -> Vec<TorrentFile> {
     ]
 }
 
-fn trackers() -> Vec<TorrentTracker> {
+fn trackers() -> Vec<TrackerEntry> {
     vec![
-        TorrentTracker {
+        TrackerEntry {
             tier: 0,
             url: "udp://tracker.invalid:80/announce".to_string(),
-            status: TrackerStatus::Working,
-            last_announce_ms: Some(5),
-            next_announce_ms: Some(1_805),
-            message: None,
-            seeders: Some(12),
-            leechers: Some(3),
         },
-        TorrentTracker {
+        TrackerEntry {
             tier: 1,
             url: "https://backup.invalid/announce".to_string(),
-            status: TrackerStatus::NotContacted,
-            last_announce_ms: None,
-            next_announce_ms: None,
-            message: Some("not yet".to_string()),
-            seeders: None,
-            leechers: None,
         },
     ]
 }

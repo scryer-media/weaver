@@ -13,7 +13,7 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::{LimitKind, LimitsConfig};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent, Session,
-    torrent_from_bytes,
+    TrackerAnnounce, torrent_from_bytes,
 };
 use tokio::sync::{Notify, mpsc, watch};
 use weaver_graph::VolumeIndex;
@@ -54,7 +54,7 @@ use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::torrents::{
     Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TorrentState, TorrentTracker, TrackerStatus,
+    TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
 };
 
 #[cfg(test)]
@@ -351,21 +351,15 @@ struct Parsed {
     layout: Arc<PieceLayout>,
     private: bool,
     files: Vec<TorrentFile>,
-    trackers: Vec<TorrentTracker>,
+    trackers: Vec<TrackerEntry>,
     total: u64,
 }
 
-fn tracker(tier: u32, url: &[u8]) -> Option<TorrentTracker> {
+fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
     let url = std::str::from_utf8(url).ok()?.trim();
-    (!url.is_empty()).then(|| TorrentTracker {
+    (!url.is_empty()).then(|| TrackerEntry {
         tier,
         url: url.to_owned(),
-        status: TrackerStatus::NotContacted,
-        last_announce_ms: None,
-        next_announce_ms: None,
-        message: None,
-        seeders: None,
-        leechers: None,
     })
 }
 
@@ -393,7 +387,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
             selected: !file.padding,
         })
         .collect();
-    let mut trackers: Vec<TorrentTracker> = metainfo
+    let mut trackers: Vec<TrackerEntry> = metainfo
         .announce_list
         .iter()
         .enumerate()
@@ -522,6 +516,14 @@ impl Live {
 
     fn holding(&self) -> bool {
         self.intake.as_ref().is_some_and(|intake| intake.holding())
+    }
+
+    // How announcing to each tracker of the session's latest run went.
+    fn announces(&self) -> Vec<TrackerAnnounce> {
+        self.attached
+            .as_ref()
+            .map(|attached| attached.handle.tracker_announces())
+            .unwrap_or_default()
     }
 
     // What the session says of the torrent now, over what was kept of it:
@@ -1179,7 +1181,7 @@ impl TorrentService {
                     false,
                     None,
                 );
-                let trackers: Vec<TorrentTracker> = magnet
+                let trackers: Vec<TrackerEntry> = magnet
                     .trackers
                     .iter()
                     .filter_map(|url| tracker(0, url.as_bytes()))
@@ -1286,7 +1288,7 @@ impl TorrentService {
         &self,
         record: &TorrentRecord,
         files: &[TorrentFile],
-        trackers: &[TorrentTracker],
+        trackers: &[TrackerEntry],
     ) -> Result<(), AddError> {
         match self.inner.db.insert_torrent(record, files, trackers) {
             Ok(TorrentInsert::Inserted) => Ok(()),
@@ -2227,16 +2229,19 @@ impl TorrentService {
     pub async fn torrent(&self, job_id: JobId) -> Option<TorrentView> {
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
-        let mut view = {
+        let (mut view, announces) = {
             let live = self.inner.live.lock().await;
-            self.view(&settings, live.get(&job_id)?, now)
+            let torrent = live.get(&job_id)?;
+            (self.view(&settings, torrent, now), torrent.announces())
         };
         view.files = self.inner.db.list_torrent_files(job_id).unwrap_or_default();
-        view.trackers = self
-            .inner
-            .db
-            .list_torrent_trackers(job_id)
-            .unwrap_or_default();
+        view.trackers = status::trackers(
+            self.inner
+                .db
+                .list_torrent_trackers(job_id)
+                .unwrap_or_default(),
+            &announces,
+        );
         Some(view)
     }
 

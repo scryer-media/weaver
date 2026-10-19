@@ -7,7 +7,7 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::torrents::{
     Infohash, TorrentCounters, TorrentFile, TorrentIntent, TorrentRecord, TorrentSource,
-    TorrentTracker, TrackerStatus,
+    TrackerEntry,
 };
 
 pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
@@ -193,31 +193,21 @@ impl Database {
         })
     }
 
-    pub fn list_torrent_trackers(&self, job_id: JobId) -> Result<Vec<TorrentTracker>, StateError> {
+    pub fn list_torrent_trackers(&self, job_id: JobId) -> Result<Vec<TrackerEntry>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT tier, url, status, last_announce_ms, next_announce_ms, message,
-                        seeders, leechers
-                   FROM torrent_trackers WHERE job_id = {} ORDER BY tier, url",
+                "SELECT tier, url FROM torrent_trackers WHERE job_id = {} ORDER BY tier, url",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
             .await?;
             rows.iter()
                 .map(|row| {
                     let tier = row.i64("tier")?;
-                    let status = row.text("status")?;
-                    Ok(TorrentTracker {
+                    Ok(TrackerEntry {
                         tier: u32::try_from(tier).map_err(|_| corrupt("tracker tier", tier))?,
                         url: row.text("url")?,
-                        status: TrackerStatus::parse(&status)
-                            .ok_or_else(|| corrupt("tracker status", &status))?,
-                        last_announce_ms: row.opt_i64("last_announce_ms")?,
-                        next_announce_ms: row.opt_i64("next_announce_ms")?,
-                        message: row.opt_text("message")?,
-                        seeders: opt_u32(row, "seeders")?,
-                        leechers: opt_u32(row, "leechers")?,
                     })
                 })
                 .collect()

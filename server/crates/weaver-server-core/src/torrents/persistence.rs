@@ -8,8 +8,14 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::SeedingPolicy;
 use crate::torrents::queries::{TORRENT_COLUMNS, torrent_by_infohash_tx};
 use crate::torrents::{
-    TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord, TorrentTracker,
+    TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
 };
+
+// A tracker row holds where the tracker sits in the announce list; how
+// announcing to it goes is read from the session. The status column is NOT
+// NULL in the schema, and nothing reads it.
+const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url, status)
+     VALUES ({}, {}, {}, 'not_contacted')";
 
 fn stored(value: u64) -> Result<i64, StateError> {
     i64::try_from(value)
@@ -47,7 +53,7 @@ impl Database {
         &self,
         torrent: &TorrentRecord,
         files: &[TorrentFile],
-        trackers: &[TorrentTracker],
+        trackers: &[TrackerEntry],
     ) -> Result<TorrentInsert, StateError> {
         let infohash = torrent.infohash().ok_or_else(|| {
             StateError::Database("a torrent needs a v1 or a v2 infohash".to_string())
@@ -74,12 +80,6 @@ impl Database {
                     SqlArg::I64(stored(job_id.0)?),
                     SqlArg::I64(i64::from(tracker.tier)),
                     SqlArg::Text(tracker.url.clone()),
-                    SqlArg::Text(tracker.status.as_str().to_string()),
-                    SqlArg::OptI64(tracker.last_announce_ms),
-                    SqlArg::OptI64(tracker.next_announce_ms),
-                    SqlArg::OptText(tracker.message.clone()),
-                    SqlArg::OptI64(tracker.seeders.map(i64::from)),
-                    SqlArg::OptI64(tracker.leechers.map(i64::from)),
                 ])
             })
             .collect::<Result<Vec<_>, StateError>>()?;
@@ -111,10 +111,7 @@ impl Database {
                     }
                     for args in &tracker_args {
                         tx.execute(
-                            "INSERT INTO torrent_trackers
-                                (job_id, tier, url, status, last_announce_ms, next_announce_ms,
-                                 message, seeders, leechers)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+                            TRACKER_INSERT,
                             args,
                         )
                         .await?;
@@ -254,7 +251,7 @@ impl Database {
         private: bool,
         storage_dir: &str,
         files: &[TorrentFile],
-        trackers: &[TorrentTracker],
+        trackers: &[TrackerEntry],
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
         let head = vec![
@@ -283,7 +280,6 @@ impl Database {
                     SqlArg::I64(id),
                     SqlArg::I64(i64::from(tracker.tier)),
                     SqlArg::Text(tracker.url.clone()),
-                    SqlArg::Text(tracker.status.as_str().to_string()),
                 ]
             })
             .collect::<Vec<_>>();
@@ -321,8 +317,7 @@ impl Database {
                     }
                     for args in &tracker_args {
                         tx.execute(
-                            "INSERT INTO torrent_trackers (job_id, tier, url, status)
-                             VALUES ({}, {}, {}, {})",
+                            TRACKER_INSERT,
                             args,
                         )
                         .await?;

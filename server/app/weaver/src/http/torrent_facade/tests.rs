@@ -383,6 +383,60 @@ fn view(state: TorrentState) -> TorrentView {
     }
 }
 
+// Each tracker status reads as the client's number for it, with the
+// tracker's own counts and message.
+#[test]
+fn a_trackers_status_reads_as_the_clients_number() {
+    let tracker = |status: TrackerStatus| TorrentTracker {
+        tier: 1,
+        url: "http://tracker.invalid/announce".into(),
+        status,
+        last_announce_ms: None,
+        next_announce_ms: None,
+        message: None,
+        seeders: None,
+        leechers: None,
+    };
+    let numbers: Vec<Value> = [
+        TrackerStatus::Disabled,
+        TrackerStatus::NotContacted,
+        TrackerStatus::Working,
+        TrackerStatus::Updating,
+        TrackerStatus::NotWorking,
+    ]
+    .into_iter()
+    .map(|status| tracker_json(&tracker(status))["status"].clone())
+    .collect();
+    assert_eq!(numbers, [0, 1, 2, 3, 4]);
+
+    let working = tracker_json(&TorrentTracker {
+        seeders: Some(3),
+        leechers: Some(5),
+        ..tracker(TrackerStatus::Working)
+    });
+    assert_eq!(
+        working,
+        serde_json::json!({
+            "url": "http://tracker.invalid/announce",
+            "status": 2,
+            "tier": 1,
+            "num_peers": 8,
+            "num_seeds": 3,
+            "num_leeches": 5,
+            "num_downloaded": -1,
+            "msg": "",
+        })
+    );
+    let failed = tracker_json(&TorrentTracker {
+        message: Some("refused".into()),
+        ..tracker(TrackerStatus::NotWorking)
+    });
+    assert_eq!(
+        (&failed["status"], &failed["num_seeds"], &failed["msg"]),
+        (&Value::from(4), &Value::from(-1), &Value::from("refused"))
+    );
+}
+
 #[test]
 fn every_weaver_state_maps_to_one_client_state() {
     let done = Some(1_700_000_100_000);

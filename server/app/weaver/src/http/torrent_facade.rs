@@ -35,7 +35,7 @@ use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, AddSource, SeedingSource, TorrentService, TorrentSettings,
     TorrentView,
 };
-use weaver_server_core::torrents::{TorrentState, TrackerStatus, status};
+use weaver_server_core::torrents::{TorrentState, TorrentTracker, TrackerStatus, status};
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle};
 
@@ -867,24 +867,22 @@ async fn trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
         return not_found();
     };
-    let count = |value: Option<u32>| value.map_or(-1, i64::from);
-    let list: Vec<Value> = view
-        .trackers
-        .iter()
-        .map(|tracker| {
-            json!({
-                "url": tracker.url,
-                "status": tracker_status(tracker.status),
-                "tier": tracker.tier,
-                "num_peers": count(tracker.leechers.zip(tracker.seeders).map(|(l, s)| l + s)),
-                "num_seeds": count(tracker.seeders),
-                "num_leeches": count(tracker.leechers),
-                "num_downloaded": -1,
-                "msg": tracker.message.clone().unwrap_or_default(),
-            })
-        })
-        .collect();
+    let list: Vec<Value> = view.trackers.iter().map(tracker_json).collect();
     axum::Json(list).into_response()
+}
+
+fn tracker_json(tracker: &TorrentTracker) -> Value {
+    let count = |value: Option<u32>| value.map_or(-1, i64::from);
+    json!({
+        "url": tracker.url,
+        "status": tracker_status(tracker.status),
+        "tier": tracker.tier,
+        "num_peers": count(tracker.leechers.zip(tracker.seeders).map(|(l, s)| l + s)),
+        "num_seeds": count(tracker.seeders),
+        "num_leeches": count(tracker.leechers),
+        "num_downloaded": -1,
+        "msg": tracker.message.clone().unwrap_or_default(),
+    })
 }
 
 async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {

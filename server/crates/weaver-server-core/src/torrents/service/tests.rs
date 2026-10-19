@@ -11,6 +11,7 @@ use super::*;
 use crate::jobs::{Hold, HoldScope};
 use crate::post_processing::model::PostProcessingSettings;
 use crate::settings::{SeedingAction, SeedingGoalMode};
+use crate::torrents::TrackerStatus;
 use crate::torrents::sessions::Routes;
 use crate::torrents::sessions::tests::{FakeRoutes, env};
 use crate::torrents::status::ROUTE_DOWN_FETCHING;
@@ -1441,4 +1442,108 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     assert_eq!(uploaded(&seeding), sent);
     again.stop().await;
     seeding.stop().await;
+}
+
+// The next announce the tracker on `listener` hears, unanswered.
+async fn heard_announce(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    use tokio::io::AsyncReadExt;
+
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+        let read = stream.read(&mut buf).await.unwrap();
+        assert!(read > 0, "the announce ended before its request was read");
+        request.extend_from_slice(&buf[..read]);
+    }
+    stream
+}
+
+// The torrent's trackers once its session's announce table says `done`.
+async fn trackers_once(
+    service: &TorrentService,
+    job_id: JobId,
+    done: impl Fn(&[TrackerAnnounce]) -> bool,
+) -> Vec<TorrentTracker> {
+    let table = handle_of(service, job_id).await.tracker_status().unwrap();
+    table
+        .subscribe()
+        .wait_for(|announces| done(announces))
+        .await
+        .unwrap();
+    service.torrent(job_id).await.unwrap().trackers
+}
+
+// A tracker reads as the torrent's session last heard it: updating while an
+// announce waits, working with its counts once it answers, and not working
+// once it stops answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trackers_status_follows_its_announces() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(announcing(
+            &plain("set", 1),
+            &url,
+        ))))
+        .await
+        .unwrap();
+
+    let mut started = heard_announce(&listener).await;
+    let trackers = rig.service.torrent(job_id).await.unwrap().trackers;
+    assert_eq!(
+        trackers
+            .iter()
+            .map(|tracker| (tracker.tier, tracker.url.as_str(), tracker.status))
+            .collect::<Vec<_>>(),
+        [(0, url.as_str(), TrackerStatus::Updating)]
+    );
+
+    // The tracker stops once it has answered.
+    drop(listener);
+    let body = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    started
+        .write_all(&[head.as_bytes(), body].concat())
+        .await
+        .unwrap();
+    let trackers = trackers_once(&rig.service, job_id, |announces| {
+        announces[0].last.is_some()
+    })
+    .await;
+    let working = &trackers[0];
+    assert_eq!(working.status, TrackerStatus::Working);
+    assert_eq!((working.seeders, working.leechers), (Some(3), Some(5)));
+    assert_eq!(working.message, None);
+    let at = working.last_announce_ms.unwrap();
+    assert_eq!(working.next_announce_ms, Some(at + 1_800_000));
+
+    // Paused, the answer stands with nothing in flight.
+    rig.service.pause(job_id).await.unwrap();
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().trackers,
+        trackers
+    );
+
+    // The next run's first announce finds no tracker.
+    rig.service.resume(job_id).await.unwrap();
+    let trackers = trackers_once(&rig.service, job_id, |announces| {
+        announces[0].last.is_some() && !announces[0].in_flight
+    })
+    .await;
+    let failed = &trackers[0];
+    assert_eq!(failed.status, TrackerStatus::NotWorking);
+    assert!(failed.message.is_some());
+    assert_eq!((failed.seeders, failed.leechers), (None, None));
+    assert!(failed.last_announce_ms.is_some());
+    rig.service.stop().await;
 }

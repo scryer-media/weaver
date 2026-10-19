@@ -16,7 +16,7 @@ pub(crate) mod storage;
 
 pub use model::{
     Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TorrentState, TorrentTracker, TrackerStatus,
+    TorrentSource, TorrentState, TorrentTracker, TrackerEntry, TrackerStatus,
 };
 
 #[cfg(test)]
