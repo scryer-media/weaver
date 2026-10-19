@@ -737,6 +737,16 @@
       "oracle": "browser"
     },
     {
+      "name": "pauseTorrents",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "resumeTorrents",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
       "name": "pauseTorrent",
       "owner": "torrents",
       "oracle": "api-metrics"

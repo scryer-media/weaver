@@ -193,6 +193,32 @@ test("a torrent job pauses, resumes, forces and unforces from its header", async
   await expect(header.getByRole("button", { name: "Force", exact: true })).toBeVisible();
 });
 
+test("Pause torrents on the Downloads page holds every torrent and leaves the queue's pause alone", async ({ cleanPage: page }) => {
+  await page.goto("/");
+  const header = page.getByRole("banner");
+  const rows = [queueRow(page, magnetFixture.name), queueRow(page, fileFixture.name)];
+  for (const row of rows) await expect(row.getByText("Seeding", { exact: true })).toBeVisible();
+  await expect(header.getByRole("button", { name: "Pause all", exact: true })).toBeVisible();
+
+  await header.getByRole("button", { name: "Pause torrents", exact: true }).click();
+  await expect(header.getByRole("button", { name: "Resume torrents", exact: true })).toBeVisible();
+  for (const row of rows) {
+    await expect(row.getByText("Paused", { exact: true })).toBeVisible();
+    await expect(row.getByRole("button", { name: "Resume", exact: true })).toBeVisible();
+  }
+  // The torrents' hold is its own: the queue's pause still reads unpaused.
+  await expect(header.getByRole("button", { name: "Pause all", exact: true })).toBeVisible();
+  await expect(header.getByRole("button", { name: "Resume all", exact: true })).toHaveCount(0);
+
+  await header.getByRole("button", { name: "Resume torrents", exact: true }).click();
+  await expect(header.getByRole("button", { name: "Pause torrents", exact: true })).toBeVisible();
+  for (const row of rows) {
+    await expect(row.getByText("Seeding", { exact: true })).toBeVisible();
+    await expect(row.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
+  }
+  await expect(header.getByRole("button", { name: "Pause all", exact: true })).toBeVisible();
+});
+
 test("removing a private torrent short of its goal asks about its files and then the goal", async ({ cleanPage: page }) => {
   // The daemon refuses the first remove with the goal it is short of; the dialog turns that into its second confirm.
   expectGraphqlErrors(page, /seeding goal is not met/);
