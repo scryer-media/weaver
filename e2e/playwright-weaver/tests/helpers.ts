@@ -123,7 +123,7 @@ export const test = base.extend<WeaverFixtures>({
           ||
           request.method() !== "POST"
           || !response.url().includes("/graphql")
-          || !response.headers()["content-type"]?.includes("application/json")
+          || !/application\/(graphql-response\+)?json/.test(response.headers()["content-type"] ?? "")
         ) {
           return;
         }

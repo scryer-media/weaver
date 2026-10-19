@@ -197,6 +197,8 @@ func torrentFixtureSpecs() []torrentFixtureSpec {
 			Files: []torrentFileSpec{synthetic("cobalt.bin", 2*mib)}},
 		{Slug: "capped", Name: "Iron.Capped.Bundle", PieceLength: 256 * kib,
 			Files: []torrentFileSpec{synthetic("iron.bin", 12*mib)}},
+		{Slug: "split", Name: "Nickel.Split.Bundle", PieceLength: 256 * kib,
+			Files: []torrentFileSpec{synthetic("nickel.bin", 12*mib)}},
 		{Slug: "facade-file", Name: "Pewter.Facade.File", PieceLength: 64 * kib,
 			Files: []torrentFileSpec{synthetic("pewter.bin", 1*mib)}},
 		{Slug: "facade-magnet", Name: "Tin.Facade.Magnet", PieceLength: 64 * kib,

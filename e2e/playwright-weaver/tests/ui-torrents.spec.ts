@@ -43,9 +43,13 @@ function tableRow(page: Page, table: string, cellText: string): Locator {
     .filter({ has: page.getByText(cellText, { exact: true }) });
 }
 
-/** The queue row of a download, by the name the row carries as its title. */
+/**
+ * The queue row of a download, by the name the row carries as its title: the
+ * queue shows a release name with its dots read as spaces.
+ */
 function queueRow(page: Page, name: string): Locator {
-  return page.getByRole("main").getByTitle(name, { exact: true });
+  const shown = name.replaceAll(".", " ").replace(/\s+/g, " ").trim();
+  return page.getByRole("main").getByTitle(shown, { exact: true });
 }
 
 async function setNumber(scope: Locator, label: string, value: string) {

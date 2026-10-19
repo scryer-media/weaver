@@ -999,6 +999,11 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "torrent-bandwidth-split-lower-bound",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "torrent-client-compatibility-facade",
       "owner": "torrents",
       "oracle": "api-metrics"

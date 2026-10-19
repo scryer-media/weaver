@@ -173,6 +173,15 @@ func torrentScenarios() []torrentScenario {
 			Run: scenarioDownloadCap,
 		},
 		{
+			Name: "bandwidth-split",
+			Asserts: []string{
+				"an 80% usenet split with no download limit is in force, needs a limit, and holds neither side to a rate",
+				"under a 2 MiB/s limit every reading holds usenet to at least its 80% and torrents to at least their 20%, neither past the limit",
+				"with usenet idle, the last 75% of a 12 MiB torrent takes at least 75% of its size over 1.25x the whole limit",
+			},
+			Run: scenarioBandwidthSplit,
+		},
+		{
 			Name: "client-facade",
 			Asserts: []string{
 				"auth/login with an API key returns Ok. and a SID cookie; app/webapiVersion answers 2.11.0",
@@ -869,7 +878,6 @@ func (lane *torrentLane) setDownloadCap(bps any) error {
 
 func scenarioDownloadCap(lane *torrentLane, evidence map[string]any) error {
 	const capBps = 2 * mib
-	fixture := lane.fixture("capped")
 	if err := lane.setDownloadCap(capBps); err != nil {
 		return err
 	}
@@ -878,14 +886,23 @@ func scenarioDownloadCap(lane *torrentLane, evidence map[string]any) error {
 			evidence["restore_cap_error"] = err.Error()
 		}
 	}()
+	return lane.cappedDownload(lane.fixture("capped"), capBps, evidence, nil)
+}
+
+// cappedDownload downloads fixture under a global download limit of capBps
+// and checks the transfer took at least as long as the limit allows. Torrents
+// never move faster than the whole limit, whatever share of it the split gives
+// them, so the bound holds under any split. sample, when set, runs at every
+// progress reading.
+func (lane *torrentLane) cappedDownload(fixture *torrentFixture, capBps int64, evidence map[string]any, sample func() error) error {
 	// Progress is read two ways: Weaver's own fetched-bytes counter, and
 	// what the seeder, the only peer holding this infohash, has sent; a
-	// reading is the larger of the two. The last reading short of the
-	// whole and the first reading of the whole bracket the transfer of
-	// the bytes between them, so the time between those readings is at
-	// least as long as that transfer took. One second of the cap is
-	// allowed as a burst. Starting the bracket at the submit, before any
-	// byte can move, keeps it sound when no partial reading is seen.
+	// reading is the larger of the two. The last reading at or below a
+	// quarter of the whole and the first reading of the whole bracket the
+	// transfer of at least the last three quarters, so the time between
+	// those readings is at least as long as that transfer took. One second
+	// of the cap is allowed as a burst. Starting the bracket at the submit,
+	// before any byte can move, keeps it sound when no early reading is seen.
 	type reading struct {
 		at    time.Time
 		bytes int64
@@ -901,7 +918,7 @@ func scenarioDownloadCap(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	defer lane.cleanupTorrent(view.ID, evidence)
-	done, err := lane.waitTorrent(view.ID, "capped torrent seeds", func(view *torrentView) bool {
+	done, err := lane.waitTorrent(view.ID, fixture.Slug+" torrent seeds under the cap", func(view *torrentView) bool {
 		if full == nil && probeErr == nil {
 			stats, err := lane.peerStats(lane.seederURL, fixture.Infohash)
 			if err != nil {
@@ -924,8 +941,14 @@ func scenarioDownloadCap(lane *torrentLane, evidence map[string]any) error {
 			bytes := max(sent, fetched)
 			if bytes >= fixture.TotalBytes {
 				full = &reading{at: now, bytes: bytes}
-			} else {
+			} else if bytes <= fixture.TotalBytes/4 {
 				last = reading{at: now, bytes: bytes}
+			}
+			if sample != nil {
+				if err := sample(); err != nil {
+					probeErr = err
+					return true
+				}
 			}
 		}
 		return seeding(view)
@@ -942,7 +965,7 @@ func scenarioDownloadCap(lane *torrentLane, evidence map[string]any) error {
 	}
 	window := full.at.Sub(last.at)
 	measured := fixture.TotalBytes - last.bytes
-	floor := time.Duration(float64(max(measured-capBps, 0)) / (1.25 * capBps) * float64(time.Second))
+	floor := time.Duration(float64(max(measured-capBps, 0)) / (1.25 * float64(capBps)) * float64(time.Second))
 	evidence["cap_bps"], evidence["bytes_measured"] = capBps, measured
 	evidence["window_ms"], evidence["floor_ms"] = window.Milliseconds(), floor.Milliseconds()
 	if window < floor {
@@ -950,6 +973,131 @@ func scenarioDownloadCap(lane *torrentLane, evidence map[string]any) error {
 	}
 	_, err = verifyTorrentOutput(fixture, deref(done.StorageDir))
 	return err
+}
+
+type bandwidthSplitView struct {
+	InForce *struct {
+		UsenetPct int `json:"usenetPct"`
+	} `json:"inForce"`
+	NeedsDownloadLimit bool   `json:"needsDownloadLimit"`
+	UsenetBps          *int64 `json:"usenetBps"`
+	TorrentBps         *int64 `json:"torrentBps"`
+}
+
+func (view *bandwidthSplitView) summary() string {
+	pct, usenet, torrent := "none", "none", "none"
+	if view.InForce != nil {
+		pct = fmt.Sprint(view.InForce.UsenetPct)
+	}
+	if view.UsenetBps != nil {
+		usenet = fmt.Sprint(*view.UsenetBps)
+	}
+	if view.TorrentBps != nil {
+		torrent = fmt.Sprint(*view.TorrentBps)
+	}
+	return fmt.Sprintf("usenetPct=%s needsDownloadLimit=%t usenetBps=%s torrentBps=%s", pct, view.NeedsDownloadLimit, usenet, torrent)
+}
+
+func (lane *torrentLane) bandwidthSplit() (*bandwidthSplitView, error) {
+	var out struct {
+		Networking struct {
+			BandwidthSplit bandwidthSplitView `json:"bandwidthSplit"`
+		} `json:"networking"`
+	}
+	err := lane.gql(`{ networking { bandwidthSplit { inForce { usenetPct } needsDownloadLimit usenetBps torrentBps } } }`, nil, &out)
+	return &out.Networking.BandwidthSplit, err
+}
+
+// waitBandwidthSplit waits for the split state, which the bandwidth tick
+// publishes, to satisfy want.
+func (lane *torrentLane) waitBandwidthSplit(describe string, want func(*bandwidthSplitView) bool) (*bandwidthSplitView, error) {
+	var seen *bandwidthSplitView
+	err := waitUntil(describe, func() (bool, string, error) {
+		view, err := lane.bandwidthSplit()
+		if err != nil {
+			return false, "", err
+		}
+		seen = view
+		return want(view), view.summary(), nil
+	})
+	return seen, err
+}
+
+func scenarioBandwidthSplit(lane *torrentLane, evidence map[string]any) error {
+	const capBps = 2 * mib
+	const usenetPct = 80
+	torrentShare := int64(capBps - capBps*usenetPct/100)
+	setBandwidth := func(input map[string]any) error {
+		return lane.gql(`mutation($input: BandwidthInput!) { setBandwidth(input: $input) { downloadBps split { usenetPct } } }`,
+			map[string]any{"input": input}, nil)
+	}
+	if err := setBandwidth(map[string]any{"downloadBps": nil, "split": map[string]any{"usenetPct": usenetPct}}); err != nil {
+		return err
+	}
+	defer func() {
+		if err := setBandwidth(map[string]any{"downloadBps": nil, "split": nil}); err != nil {
+			evidence["restore_error"] = err.Error()
+		}
+	}()
+	unlimited, err := lane.waitBandwidthSplit("the split is in force with no download limit", func(view *bandwidthSplitView) bool {
+		return view.InForce != nil && view.InForce.UsenetPct == usenetPct && view.NeedsDownloadLimit
+	})
+	if err != nil {
+		return err
+	}
+	evidence["split_without_limit"] = unlimited.summary()
+	if unlimited.UsenetBps != nil || unlimited.TorrentBps != nil {
+		return fmt.Errorf("with no download limit the split holds a side to a rate: %s", unlimited.summary())
+	}
+	if err := setBandwidth(map[string]any{"downloadBps": capBps}); err != nil {
+		return err
+	}
+	// Each reading of the split under the limit holds each side to at least
+	// its share and neither past the whole limit. A side that lends keeps its
+	// own share as its limit, so the two may add up to more than the limit.
+	check := func(view *bandwidthSplitView) error {
+		if view.InForce == nil || view.InForce.UsenetPct != usenetPct || view.NeedsDownloadLimit ||
+			view.UsenetBps == nil || view.TorrentBps == nil {
+			return fmt.Errorf("under a %d B/s limit with an %d%% usenet split: %s", capBps, usenetPct, view.summary())
+		}
+		usenetShare := int64(capBps) - torrentShare
+		if *view.UsenetBps < usenetShare || *view.TorrentBps < torrentShare ||
+			*view.UsenetBps > capBps || *view.TorrentBps > capBps {
+			return fmt.Errorf("under a %d B/s limit the split must hold usenet to %d..%d B/s and torrents to %d..%d B/s: %s",
+				capBps, usenetShare, capBps, torrentShare, capBps, view.summary())
+		}
+		return nil
+	}
+	limited, err := lane.waitBandwidthSplit("the split holds the download limit", func(view *bandwidthSplitView) bool {
+		return !view.NeedsDownloadLimit && view.UsenetBps != nil
+	})
+	if err != nil {
+		return err
+	}
+	evidence["split_with_limit"] = limited.summary()
+	if err := check(limited); err != nil {
+		return err
+	}
+	var readings []string
+	maxTorrent := *limited.TorrentBps
+	defer func() {
+		evidence["split_readings"] = readings
+		evidence["torrent_share_bps"], evidence["max_torrent_bps"] = torrentShare, maxTorrent
+	}()
+	return lane.cappedDownload(lane.fixture("split"), capBps, evidence, func() error {
+		view, err := lane.bandwidthSplit()
+		if err != nil {
+			return err
+		}
+		if len(readings) < 400 {
+			readings = append(readings, view.summary())
+		}
+		if err := check(view); err != nil {
+			return err
+		}
+		maxTorrent = max(maxTorrent, *view.TorrentBps)
+		return nil
+	})
 }
 
 // ---- the client facade ----
