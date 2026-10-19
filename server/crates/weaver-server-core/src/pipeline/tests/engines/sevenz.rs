@@ -732,3 +732,23 @@ async fn an_lzma2_7z_with_a_damaged_first_article_beside_par2_binds_its_store_af
         graph.refetched()
     );
 }
+
+// A split 7z whose last volume, which holds the end header, is cut short:
+// the store never maps, and every volume it holds is refused with the set.
+// No volume of a container is a delivery of its own, so nothing is whole
+// and the job fails for unpacking.
+#[tokio::test]
+async fn a_split_7z_whose_last_volume_is_cut_short_delivers_no_volume_whole_under_graph() {
+    let mut volumes = split(&stored(None), 3);
+    let last = volumes.last_mut().unwrap();
+    last.bytes.truncate(last.bytes.len() - 8);
+    let graph = run(&Scenario::new(volumes), Engine::Graph).await;
+    let view = graph.graph();
+    assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+}

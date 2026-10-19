@@ -456,7 +456,7 @@ fn range(row: i64, start: i64, end: i64) -> Result<ByteRange, CheckpointError> {
     }
 }
 
-const KINDS: [Kind; 16] = [
+const KINDS: [Kind; 17] = [
     Kind::RarStore,
     Kind::SevenZipStore,
     Kind::Zip,
@@ -467,6 +467,7 @@ const KINDS: [Kind; 16] = [
     Kind::Zstd,
     Kind::Brotli,
     Kind::Deflate,
+    Kind::Split,
     Kind::RarEngine,
     Kind::SevenZipEngine,
     Kind::ZipEngine,

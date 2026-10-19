@@ -24,6 +24,7 @@ impl Evidence {
     pub(super) fn of(
         grid: &Grid,
         index: &Par2FileSet,
+        expected_whole: Option<u32>,
         file: FileId,
         member: MemberId,
         length: Option<u64>,
@@ -56,7 +57,7 @@ impl Evidence {
                 grid::verdict(folded, end - start, block, expected.crc32)
             })
             .collect();
-        let whole = match index.expected_file_crc32(file) {
+        let whole = match expected_whole {
             Some(_) if described == 0 && exact => SliceVerdict::Intact,
             Some(expected) if exact => grid::verdict(
                 grid.fold(member, WHOLE, 0, ByteRange::new(0, described)),

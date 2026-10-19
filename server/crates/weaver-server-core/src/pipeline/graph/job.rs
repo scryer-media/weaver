@@ -13,16 +13,14 @@ pub(crate) mod restore;
 mod runs;
 mod snapshot;
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::warn;
 use weaver_graph::holds::HoldsAccountant;
-use weaver_graph::recovery::{RepairOutcome, SliceVerdict};
 use weaver_graph::{
-    Builder, Effect, Kind, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
+    Builder, Effect, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
 };
 
 use self::passwords::Passwords;
@@ -30,7 +28,7 @@ use super::Engine;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
 use super::limits::Caps;
-use super::namespace::{NamespaceWriter, WriteError};
+use super::namespace::{NamespaceWriter, SetState, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, RootPhase};
 use super::root::sample;
@@ -62,24 +60,6 @@ pub(crate) struct Storage {
     pub(crate) nesting: u32,
 }
 
-// What one recovery object says of the members it covers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RecoverySummary {
-    // The tree node the object is. One PAR2 object holds every PAR2 set of
-    // its namespace, so this is per object, not per set id.
-    pub(crate) node: NodeId,
-    // The namespace it lives in, where the members it covers are.
-    pub(crate) namespace: NodeId,
-    pub(crate) kind: Kind,
-    // Recovery blocks in hand or still on their way.
-    pub(crate) blocks_reachable: u64,
-    // Slices the evidence in hand says are damaged, over every member the
-    // object covers.
-    pub(crate) damaged_slices: u64,
-    // What its last repair came to; `None` before it ran one.
-    pub(crate) outcome: Option<RepairOutcome>,
-}
-
 pub(crate) struct GraphJob {
     tree: Tree,
     root: ArticleRoot,
@@ -89,9 +69,6 @@ pub(crate) struct GraphJob {
     passwords: Passwords,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
-    // Per recovery object, how many of its volumes were closed when it last
-    // ruled: one waiting on recovery bytes rules again once more are.
-    ruled_at: BTreeMap<NodeId, usize>,
     // The checkpoint waiting for the database, if one is.
     pending: Pending,
 }
@@ -180,7 +157,6 @@ impl GraphJob {
             runs,
             passwords: Passwords::default(),
             reported: None,
-            ruled_at: BTreeMap::new(),
             pending: Pending::default(),
         }
     }
@@ -216,13 +192,8 @@ impl GraphJob {
     // Seam for completion, status and health: where the job stands, read
     // off the tree. Stable.
     pub(crate) fn phase(&self) -> RootPhase {
-        let tree = &self.tree;
-        let activity = phase::activity(
-            self.recovery_objects()
-                .into_iter()
-                .map(|(_, node)| tree.recovery(node).and_then(|recovery| recovery.outcome())),
-        );
-        let extracting = phase::extracting(tree) || self.runs.live();
+        let activity = phase::activity(self.writer.outcomes(&self.tree));
+        let extracting = phase::extracting(&self.tree) || self.runs.live();
         RootPhase::derive(self.payload_waiting(), activity, extracting)
     }
 
@@ -236,36 +207,32 @@ impl GraphJob {
             .expect("the root namespace lives as long as the tree")
     }
 
-    // Seam for completion, status and health: each recovery object of every
-    // namespace in the tree, parents first, with the blocks it can reach and
-    // the slices it knows are damaged. Stable.
-    pub(crate) fn recovery_summary(&self) -> Vec<RecoverySummary> {
-        let tree = &self.tree;
-        let mut verdicts = Vec::new();
-        self.recovery_objects()
-            .into_iter()
-            .filter_map(|(namespace, node)| {
-                let (kind, recovery) = (tree.kind(node)?, tree.recovery(node)?);
-                verdicts.clear();
-                for member in tree.namespace(namespace)?.members() {
-                    if recovery.covers(member.id) {
-                        recovery.verdicts(member.id, &mut verdicts);
-                    }
-                }
-                let damaged_slices = verdicts
-                    .iter()
-                    .filter(|verdict| **verdict == SliceVerdict::Damaged)
-                    .count() as u64;
-                Some(RecoverySummary {
-                    node,
-                    namespace,
-                    kind,
-                    blocks_reachable: recovery.blocks_reachable(),
-                    damaged_slices,
-                    outcome: recovery.outcome(),
-                })
-            })
-            .collect()
+    // Seam for completion, status and health: each recovery set of every
+    // namespace in the tree, parents first, as its namespace reads it.
+    // Stable.
+    pub(crate) fn recovery_summary(&self) -> Vec<SetState> {
+        self.writer.states(&self.tree)
+    }
+
+    // Seam for the article decoder: the block sizes the root namespace's
+    // sets fold their evidence at. An article leased now has its checksums
+    // cut at their boundaries, so a slice its bytes tile is proven as it
+    // passes rather than read back. Stable.
+    pub(crate) fn block_sizes(&self) -> Vec<u64> {
+        self.writer.block_sizes(&self.tree, NodeId::ROOT)
+    }
+
+    // Seam for the download scheduler: of the root members the post
+    // declares as indexes, the ones the root namespace holds its payload
+    // for. `None` once it holds for none.
+    pub(crate) fn indexes_to_come(
+        &self,
+        declared: impl IntoIterator<Item = MemberId>,
+    ) -> Option<Vec<MemberId>> {
+        let held = self
+            .writer
+            .holding_for(declared, |member| self.to_come(VolumeIndex(member.0)));
+        (!held.is_empty()).then_some(held)
     }
 
     // Seam for completion, status and health: every root member written to
@@ -365,32 +332,37 @@ impl GraphJob {
     }
 
     fn closed(&self, member: MemberId) -> bool {
-        self.closed_in(NodeId::ROOT, member)
-    }
-
-    fn closed_in(&self, node: NodeId, member: MemberId) -> bool {
-        self.tree
-            .namespace(node)
-            .and_then(|namespace| namespace.get(member))
+        self.namespace()
+            .get(member)
             .is_some_and(|record| record.closed)
     }
 
-    fn is_recovery_volume(&self, member: MemberId) -> Option<NodeId> {
-        self.tree
-            .child_of(NodeId::ROOT, member)
-            .map(|(child, _)| child)
-            .filter(|child| self.tree.recovers(*child))
-    }
-
     // A root member that is not a recovery volume still has articles to
-    // come. Recovery volumes are left out: their articles stay parked until
-    // a repair asks for them. Root members are numbered as the volumes they
-    // are.
+    // come: articles the queue fetches without being asked. A parked
+    // article comes only when something asks for it, so a volume nothing
+    // will ask for, such as one whose opening article was lost before
+    // anything could name it, holds nothing back. Recovery volumes are left
+    // out: what a repair asks of them is the repair's. Root members are
+    // numbered as the volumes they are.
     fn payload_waiting(&self) -> bool {
         self.namespace().members().any(|member| {
-            self.is_recovery_volume(member.id).is_none()
-                && self.root.map.volume_waiting(VolumeIndex(member.id.0))
+            !self
+                .writer
+                .carries_recovery(&self.tree, NodeId::ROOT, member.id)
+                && self.to_come(VolumeIndex(member.id.0))
         })
+    }
+
+    // Whether the volume has articles the queue fetches unasked still to
+    // come.
+    pub(crate) fn to_come(&self, volume: VolumeIndex) -> bool {
+        self.root.map.volume_to_come(volume)
+    }
+
+    // The articles the queue holds parked when the job is installed: they
+    // are fetched only once something asks for them.
+    pub(crate) fn parked(&mut self, held: impl FnMut(VolumeIndex, u32) -> bool) {
+        self.root.map.parked(held);
     }
 
     // One round of seeks: every object's standing wants lifted to the root,

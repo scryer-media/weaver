@@ -31,6 +31,8 @@
 //     .framed(size)               articles of `size` bytes, not ARTICLE
 //     .backwards()                every batch the download queue hands
 //                                 out arrives last article first
+//     .uuencoded()                every article is posted uuencoded: no
+//                                 position of its own, placed in order
 //     .password(secret)           the password the job is submitted with
 //     .global_password(secret)    a password among the candidates every
 //                                 job is offered, the job has none of its own
@@ -86,5 +88,7 @@ mod seek;
 mod sets;
 mod sevenz;
 mod sfv;
+mod split;
 mod streams;
 mod zip;
+mod zip_par3;

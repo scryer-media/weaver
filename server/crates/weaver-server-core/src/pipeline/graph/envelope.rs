@@ -46,6 +46,9 @@ pub(crate) struct Shelved {
     // join. An index orders them; a gap is not a volume.
     pub(crate) volumes: BTreeSet<u32>,
     pub(crate) complete: bool,
+    // A member beside the volumes has yet to decide its owner, so a volume
+    // may still join past the last one bound.
+    pub(crate) deciding: bool,
     // Which run may read. Moving it on stops the one reading: a repair
     // behind what it read, or the node going away.
     pub(crate) generation: u64,

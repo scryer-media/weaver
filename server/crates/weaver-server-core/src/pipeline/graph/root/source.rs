@@ -30,6 +30,8 @@ pub(crate) enum Class {
     // A volume an in-order reader will reach next, by draw order.
     Window(u32),
     Ordinary,
+    // Held in the job's recovery queue: fetched only once something asks.
+    Parked,
 }
 
 impl Class {
@@ -172,9 +174,19 @@ impl Volume {
             .any(|article| article.state == State::Waiting)
     }
 
+    // Whether an article the queue fetches unasked can still arrive.
+    fn to_come(&self) -> bool {
+        self.articles
+            .iter()
+            .any(|article| article.state == State::Waiting && article.class != Class::Parked)
+    }
+
     // Runs of lost articles whose range can now be told: both edges are
     // known, or nothing else in the volume can arrive to tell them better,
-    // in which case the run takes its widest bound.
+    // in which case the run takes its widest bound. In a volume placed only
+    // in order, every article after a lost one sits where the order put it,
+    // short of the bytes the loss took, so the run's damage reaches the
+    // volume's end, which is told once nothing else can arrive.
     fn take_damage(&mut self, out: &mut Vec<ByteRange>) {
         let settled = !self.waiting();
         let mut index = 0;
@@ -192,11 +204,17 @@ impl Volume {
             let fresh = self.articles[start..index]
                 .iter()
                 .any(|article| article.state == State::Lost { damaged: false });
-            let told = self.known.contains_key(&start) && self.known.contains_key(&index);
+            let end = match self.ordered_only {
+                true => self.articles.len(),
+                false => index,
+            };
+            let told = !self.ordered_only
+                && self.known.contains_key(&start)
+                && self.known.contains_key(&end);
             if !fresh || !(told || settled) {
                 continue;
             }
-            let range = ByteRange::new(self.bounds(start).0, self.bounds(index).1);
+            let range = ByteRange::new(self.bounds(start).0, self.bounds(end).1);
             if !range.is_empty() {
                 out.push(range);
             }
@@ -283,18 +301,43 @@ impl ArticleMap {
     // Whether some volume's opening article can still arrive: until it
     // does, nothing is known of what the volume is.
     pub(crate) fn any_head_waiting(&self) -> bool {
-        self.volumes.iter().any(|found| {
-            found
-                .articles
-                .first()
-                .is_some_and(|article| article.state == State::Waiting)
-        })
+        (0..self.volumes.len()).any(|index| self.head_waiting(VolumeIndex(index as u32)))
+    }
+
+    // Whether the volume's opening article can still arrive.
+    pub(crate) fn head_waiting(&self, volume: VolumeIndex) -> bool {
+        self.volumes
+            .get(volume.0 as usize)
+            .and_then(|found| found.articles.first())
+            .is_some_and(|article| article.state == State::Waiting)
     }
 
     pub(crate) fn volume_waiting(&self, volume: VolumeIndex) -> bool {
         self.volumes
             .get(volume.0 as usize)
             .is_some_and(Volume::waiting)
+    }
+
+    pub(crate) fn volume_to_come(&self, volume: VolumeIndex) -> bool {
+        self.volumes
+            .get(volume.0 as usize)
+            .is_some_and(Volume::to_come)
+    }
+
+    // The articles still waiting that the queue holds parked. One already
+    // raised keeps its class.
+    pub(crate) fn parked(&mut self, mut held: impl FnMut(VolumeIndex, u32) -> bool) {
+        for (index, found) in self.volumes.iter_mut().enumerate() {
+            let volume = VolumeIndex(index as u32);
+            for article in &mut found.articles {
+                if article.state == State::Waiting
+                    && article.class == Class::Ordinary
+                    && held(volume, article.ordinal)
+                {
+                    article.class = Class::Parked;
+                }
+            }
+        }
     }
 
     // The ranges of lost articles that can now be marked damaged.
@@ -368,20 +411,21 @@ impl ArticleMap {
     // are wanted, but ahead of nothing, so queued work keeps its order and
     // only parked work joins it. An article already raised keeps its class.
     pub(crate) fn queue(&mut self, volume: VolumeIndex, range: ByteRange) {
-        let Some(found) = self.volumes.get(volume.0 as usize) else {
+        let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return;
         };
-        let moves: Vec<Move> = found
-            .covering(range)
-            .map(|index| &found.articles[index])
-            .filter(|article| article.state == State::Waiting && article.class == Class::Ordinary)
-            .map(|article| Move {
-                volume,
-                ordinal: article.ordinal,
-                class: Class::Ordinary,
-            })
-            .collect();
-        self.moves.extend(moves);
+        let covering: Vec<usize> = found.covering(range).collect();
+        for index in covering {
+            let article = &mut found.articles[index];
+            if article.state == State::Waiting && article.class >= Class::Ordinary {
+                article.class = Class::Ordinary;
+                self.moves.push(Move {
+                    volume,
+                    ordinal: article.ordinal,
+                    class: Class::Ordinary,
+                });
+            }
+        }
     }
 
     // The first article of every volume leads the payload.

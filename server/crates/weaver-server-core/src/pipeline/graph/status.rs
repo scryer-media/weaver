@@ -86,17 +86,10 @@ impl RootJob for GraphJob {
                 node: object.node,
                 kind: object.kind,
                 namespace: object.namespace,
-                // The object is called what its first volume is, in the
-                // namespace it lives in.
-                name: tree
-                    .volumes(object.node)
-                    .and_then(|(parent, volumes)| {
-                        tree.namespace(parent)?.get(*volumes.values().next()?)
-                    })
-                    .map_or_else(
-                        || object.kind.to_string(),
-                        |member| member.output_name.clone(),
-                    ),
+                name: self
+                    .writer()
+                    .set_name(tree, object.node)
+                    .map_or_else(|| object.kind.to_string(), str::to_owned),
                 blocks_reachable: object.blocks_reachable,
                 damaged_slices: object.damaged_slices,
                 outcome: object.outcome,

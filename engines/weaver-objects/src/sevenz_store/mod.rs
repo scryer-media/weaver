@@ -29,10 +29,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
-    Pull, RecoveryKind, Seek, Standing, VolumeIndex, Weight, Why,
+    Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
+use crate::RECOVERY;
 use crate::crypt::{Cbc, Chain, Padding};
 use crate::engine::Format;
 use crate::grid::{Grid, crc32};
@@ -47,12 +48,6 @@ use map::Map;
 // member. Bytes a volume carries past what the geometry gives it go to the
 // envelope after it, one per volume, which holds nothing.
 const ENVELOPE: u32 = 0;
-
-// What may follow the container in its last volume.
-const RECOVERY: [(&[u8; 8], RecoveryKind); 2] = [
-    (b"PAR2\0PKT", RecoveryKind::Par2),
-    (b"PAR3\0PKT", RecoveryKind::Par3),
-];
 
 // A folder's cipher, by what the object knows of its key. A sealed one was
 // open before a restart: it keeps its chain and waits, as a locked one does,

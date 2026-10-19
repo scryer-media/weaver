@@ -339,6 +339,97 @@ async fn the_nameless_encrypted_five_volume_set_beside_par2_delivers_under_both_
     assert!(classic.files == graph.files, "the same member");
 }
 
+// The second and third volumes posted under each other's names beside a
+// PAR2 set that names them: the engine reads each by its own headers, the
+// set binds each by content and the namespace puts the names back.
+fn swapped_with_par2() -> Vec<Post> {
+    let set = video_set();
+    let files: Vec<(&str, &[u8])> = set
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let recovery = super::harness::par2_set("clip", &files, 2);
+    let mut swapped = set.clone();
+    swapped.swap(1, 2);
+    let mut out: Vec<Post> = set
+        .iter()
+        .zip(swapped)
+        .map(|((name, _), (_, bytes))| Post::plain(name, bytes))
+        .collect();
+    out.extend(recovery);
+    out
+}
+
+#[tokio::test]
+async fn the_set_with_two_volumes_posted_swapped_beside_par2_delivers_under_graph() {
+    let graph = run(
+        &video(swapped_with_par2()).password(VIDEO_SECRET),
+        Engine::Graph,
+    )
+    .await;
+    assert_video(&graph);
+}
+
+// The same swap with every article of the recovery volume gone: the set
+// has its index and no block, and the volumes are whole, so the member is
+// delivered all the same.
+#[tokio::test]
+async fn the_set_with_two_volumes_posted_swapped_and_its_recovery_volume_gone_delivers_under_graph()
+{
+    let posts = swapped_with_par2();
+    let recovery = posts.len() as u32 - 1;
+    let articles = posts[recovery as usize].bytes.len().div_ceil(VIDEO_FRAME) as u32;
+    let scenario = (0..articles).fold(video(posts).password(VIDEO_SECRET), |scenario, ordinal| {
+        scenario.lost(recovery, ordinal)
+    });
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_video(&graph);
+}
+
+// The fixture's shape scaled to the video set's frame: slices of 41856 of
+// every 65536 bytes an article holds, fifteen recovery blocks over four
+// volumes, the index ahead of the volumes, the second and third volumes
+// posted under each other's names, and every article of the four recovery
+// volumes gone. The volumes are whole, so the set finds both swapped ones
+// clean once each is bound by its content, and the member is delivered.
+#[tokio::test]
+async fn the_swapped_set_beside_an_index_whose_four_recovery_volumes_are_gone_delivers_under_graph()
+{
+    let set = video_set();
+    let files: Vec<(&str, &[u8])> = set
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let slice = (VIDEO_FRAME * 41856 / 65536) as u64;
+    let recovery = super::harness::par2_volumes_sliced("clip", &files, slice, 15, 4);
+    assert_eq!(recovery.len(), 5, "an index and four volumes");
+    let mut swapped = set.clone();
+    swapped.swap(1, 2);
+    let mut recovery = recovery.into_iter();
+    let mut posts: Vec<Post> = recovery.next().into_iter().collect();
+    posts.extend(
+        set.iter()
+            .zip(swapped)
+            .map(|((name, _), (_, bytes))| Post::plain(name, bytes)),
+    );
+    posts.extend(recovery);
+    let lost: Vec<(u32, u32)> = posts
+        .iter()
+        .enumerate()
+        .skip(1 + set.len())
+        .flat_map(|(file, post)| {
+            (0..post.bytes.len().div_ceil(VIDEO_FRAME))
+                .map(move |ordinal| (file as u32, ordinal as u32))
+        })
+        .collect();
+    let scenario = lost.into_iter().fold(
+        video(posts).password(VIDEO_SECRET),
+        |scenario, (file, ordinal)| scenario.lost(file, ordinal),
+    );
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_video(&graph);
+}
+
 // One article of the middle volume damaged, PAR2 beside: the graph repairs
 // it in the stream and delivers the member, as posted, with no refetch.
 // The set rewrites the one slice that was bad and vouches for the rest of
@@ -367,15 +458,11 @@ async fn the_encrypted_set_damaged_mid_volume_beside_par2_is_repaired_in_the_str
 }
 
 // One article of the middle volume damaged with no PAR2. The store's CRC
-// refutes the one member and it refuses the set: the five volumes are
-// delivered as posted (the damaged article's bytes as served), the member
-// is not, and the job is not Failed: it ends Partial. The failing member
-// is the set's only one, so the partial-extraction invariant holds: no
-// member closed before it, and it is the only one missing. The volumes in
-// its place come from the same refusal of an unrepaired damaged leaf as
-// the compressed row below. Divergence: classic fails the job (Unpack)
-// and asks again for the article before the damaged one and the first
-// articles of the two volumes after it.
+// refutes the one member and it refuses the set: none of the five
+// volumes is whole, since they are the set's, not deliveries of their
+// own. The member is not delivered and the job fails. Classic fails it too (Unpack), and
+// asks again for the article before the damaged one and the first articles
+// of the two volumes after it.
 #[tokio::test]
 async fn the_encrypted_set_damaged_mid_volume_without_par2_delivers_the_volumes_under_graph() {
     let scenario = video(posts(video_set()))
@@ -392,19 +479,21 @@ async fn the_encrypted_set_damaged_mid_volume_without_par2_delivers_the_volumes_
     assert_eq!(classic.refetched(), [(2, 9), (3, 0), (4, 0)]);
     let graph = run(&scenario, Engine::Graph).await;
     assert!(
-        !matches!(graph.status, Some(JobStatus::Failed { .. })),
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
         "{:?}",
         graph.status
     );
+    assert!(
+        graph.graph().delivery.whole.is_empty(),
+        "{:?}",
+        graph.graph().delivery
+    );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
     assert!(!graph.files.contains_key(&delivered(VIDEO)));
-    for (name, bytes) in video_set() {
+    for (name, _) in video_set() {
         let claim = match name.as_str() {
             "clip.part3.rar" => Claim::Damaged,
-            _ => {
-                assert!(graph.files[&delivered(&name)] == bytes, "{name} as posted");
-                Claim::Complete
-            }
+            _ => Claim::Complete,
         };
         assert_eq!(graph.graph().claims.get(&name), Some(&claim), "{name}");
     }
@@ -621,4 +710,27 @@ async fn a_compressed_rar5_member_corrupted_without_par2_and_posted_backwards_ha
     let scenario = corrupted_solid_scenario().framed(768_000).backwards();
     let graph = run(&scenario, Engine::Graph).await;
     assert_hands_back_the_volume(&graph);
+}
+
+// A compressed volume beside an index and two recovery volumes whose first
+// articles never arrive: nothing names those volumes, so the rest of their
+// articles stay parked, never fetched. The volume is whole and the set finds
+// it clean while the engine's run is still reading it, and the job waits
+// for the run before it delivers every member.
+#[tokio::test]
+async fn a_compressed_volume_whose_recovery_volumes_lost_their_heads_waits_for_its_run_under_graph()
+{
+    let bytes = rar5_fixture_bytes(MIXED);
+    let recovery = super::harness::par2_volumes("mixed", &[("mixed.rar", &bytes)], 4, 2);
+    assert_eq!(recovery.len(), 3, "an index and two volumes");
+    let mut posts = vec![Post::plain("mixed.rar", bytes)];
+    posts.extend(recovery);
+    let scenario = mixed_framed_posts(posts).lost(2, 0).lost(3, 0);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_mixed_members(&graph);
+    assert_engine_ran(&graph);
+}
+
+fn mixed_framed_posts(posts: Vec<Post>) -> Scenario {
+    Scenario::new(posts).framed(64)
 }

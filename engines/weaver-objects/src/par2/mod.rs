@@ -117,13 +117,17 @@ impl Par2 {
             .sum()
     }
 
-    fn block_sizes(&self) -> BTreeSet<u64> {
+    // Every grid the evidence is folded on: each known set's slices, and
+    // the whole member.
+    fn grids(&self) -> BTreeSet<u64> {
+        self.slice_sizes().chain([WHOLE]).collect()
+    }
+
+    fn slice_sizes(&self) -> impl Iterator<Item = u64> + '_ {
         self.sets
             .values()
             .filter_map(|state| state.index.as_ref())
             .map(|index| index.slice_size)
-            .chain([WHOLE])
-            .collect()
     }
 
     fn damaged_seen(&mut self) -> BTreeMap<[u8; 16], u64> {
@@ -141,6 +145,7 @@ impl Par2 {
                         Evidence::of(
                             &self.grid,
                             index,
+                            state.whole(*file),
                             *file,
                             *member,
                             self.lengths.get(member).copied(),
@@ -368,7 +373,7 @@ impl Recovery for Par2 {
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
-        for block in self.block_sizes() {
+        for block in self.grids() {
             for segment in segments {
                 self.grid.offer(member, block, segment);
             }
@@ -376,14 +381,21 @@ impl Recovery for Par2 {
         self.seen_damaged = None;
     }
 
+    // A slice is proven by checksums cut at its boundaries; the whole
+    // member's CRC folds from any.
+    fn block_sizes(&self, out: &mut Vec<u64>) {
+        out.extend(self.slice_sizes());
+    }
+
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>) {
         let found = self.ordered().into_iter().find_map(|key| {
             let state = self.sets.get(&key)?;
-            Some((state.usable()?, state.bound(member)?))
+            let file = state.bound(member)?;
+            Some((state.usable()?, state.whole(file), file))
         });
-        if let Some((index, file)) = found {
+        if let Some((index, whole, file)) = found {
             let length = self.lengths.get(&member).copied();
-            out.extend(Evidence::of(&self.grid, index, file, member, length).vetoed());
+            out.extend(Evidence::of(&self.grid, index, whole, file, member, length).vetoed());
         }
     }
 

@@ -108,6 +108,9 @@ impl Pipeline {
         };
         let moves = graph.sample();
         apply_moves(state, &moves);
+        let mut parked = std::collections::HashSet::new();
+        state.recovery_queue.extend_segment_ids(&mut parked);
+        graph.parked(|volume, ordinal| parked.contains(&segment(job_id, volume, ordinal)));
         self.graph_jobs.insert(job_id, graph);
         self.after_graph_step(job_id);
         self.checkpoint_graph_job(job_id);

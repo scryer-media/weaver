@@ -23,9 +23,10 @@ use crate::volume::VolumeIndex;
 // and fails when they will never come, or when the run was cancelled.
 pub trait Volumes: Send + Sync {
     // The volume after `after` in the set's order, or its first for `None`;
-    // `None` past the last bound so far. An index orders the volumes and
-    // need not be dense, so a gap before the next one bound is waited on
-    // while a volume can still join there, and passed over once none can.
+    // `None` past the last bound once no member beside the volumes is still
+    // deciding its owner. An index orders the volumes and need not be
+    // dense, so a gap before the next one bound is waited on while a volume
+    // can still join there, and passed over once none can.
     fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>>;
 
     // The volume's length, once it is closed.

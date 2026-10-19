@@ -280,11 +280,10 @@ func TestGraphDirectStoreVerdict(t *testing.T) {
 	ruled := func(outcome string) string {
 		return graphLine("recovery set ruled", `job_id=40 node=1 kind=par2 set=archive.par2 recovery_set_id=00ff slice_size=65536 blocks_reachable=4 damaged_slices=9 outcome=`+outcome+` slices_repaired=0 verification=`)
 	}
-	routed := []string{storeBound("archive.part1.rar"), storeBound("archive.part2.rar")}
-	// A member no object held is refused with an empty kind.
-	heldByNone := func(why string) string {
-		return graphLine("object refused", `job_id=40 node=0 kind= member=notes.bin why=`+why)
+	reboundBy := func(member, as, by string) string {
+		return graphLine("recovery bound", `job_id=40 node=1 kind=par2 set=archive.par2 member=`+member+` as=`+as+` by=`+by)
 	}
+	routed := []string{storeBound("archive.part1.rar"), storeBound("archive.part2.rar")}
 
 	for _, test := range []struct {
 		name      string
@@ -322,26 +321,33 @@ func TestGraphDirectStoreVerdict(t *testing.T) {
 			wantErr:   "ruled impossible",
 		},
 		{
-			name:      "a malformed member refused",
+			name:      "a chain posted out of order routes and rebinds by content",
 			assertion: ScenarioDirectStoreAssertion{ExpectedDemotionReason: "member_malformed_chain", RequireRoutedByteMaterialization: true, ForbidVolumeRefetch: true},
-			lines:     append([]string{refused("unbounded_entry")}, routed...),
+			lines:     append([]string{reboundBy("archive.part3.rar", "archive.part4.rar", "content")}, routed...),
 		},
 		{
-			name:      "a malformed refusal no object held is judged by why alone",
+			name:      "a chain reason alone still needs every volume routed",
 			assertion: ScenarioDirectStoreAssertion{ExpectedDemotionReason: "member_malformed_chain"},
-			lines:     []string{heldByNone("unsupported")},
+			lines:     []string{reboundBy("archive.part3.rar", "archive.part4.rar", "content"), storeBound("archive.part1.rar")},
+			wantErr:   "no store object was bound over volume(s): opaque.part2.rar",
 		},
 		{
-			name:      "a breached hold no object held is not malformed",
+			name:      "binding by name is no rebind",
 			assertion: ScenarioDirectStoreAssertion{ExpectedDemotionReason: "member_malformed_chain"},
-			lines:     []string{heldByNone("holds_breached")},
-			wantErr:   "refused a member as malformed",
+			lines:     append([]string{reboundBy("archive.part3.rar", "archive.part3.rar", "name")}, routed...),
+			wantErr:   "bound a posted volume to another name by content",
 		},
 		{
-			name:      "a compressed refusal is not malformed",
+			name:      "content binding a volume to its own posted name is no rebind",
 			assertion: ScenarioDirectStoreAssertion{ExpectedDemotionReason: "member_malformed_chain"},
-			lines:     []string{refused("compressed")},
-			wantErr:   "refused a member as malformed",
+			lines:     append([]string{reboundBy("archive.part3.rar", "archive.part3.rar", "content")}, routed...),
+			wantErr:   "bound a posted volume to another name by content",
+		},
+		{
+			name:      "a refusal is no rebind",
+			assertion: ScenarioDirectStoreAssertion{ExpectedDemotionReason: "member_malformed_chain"},
+			lines:     append([]string{refused("unsupported")}, routed...),
+			wantErr:   "bound a posted volume to another name by content",
 		},
 		{
 			name:      "a demotion the graph has no equivalent for",
@@ -357,11 +363,6 @@ func TestGraphDirectStoreVerdict(t *testing.T) {
 			assertion := test.assertion
 			wantVerdict(t, graphDirectStoreVerdict(graphLog(test.lines...), 40, &assertion, testVolumes), test.wantErr)
 		})
-	}
-
-	for _, why := range []string{"unsupported", "not_a_file", "unbounded_entry", "first_bytes_lost"} {
-		err := graphDirectStoreVerdict(refused(why), 40, &ScenarioDirectStoreAssertion{ExpectedDemotionReason: "member_malformed_chain"}, volumes)
-		wantVerdict(t, err, "")
 	}
 }
 
@@ -422,7 +423,12 @@ func TestGraphPar2CleanSettlementVerdict(t *testing.T) {
 			name:      "a read-back set the grid vouched for",
 			assertion: assertion(),
 			lines:     []string{ruled("aa11", "65536", "clean", "grid"), ruled("bb22", "98304", "clean", "grid")},
-			wantErr:   `verification "grid"`,
+		},
+		{
+			name:      "a grid-only set the recovery object read",
+			assertion: assertion(),
+			lines:     []string{ruled("aa11", "65536", "clean", "read"), ruled("bb22", "98304", "clean", "read")},
+			wantErr:   `verification "read"`,
 		},
 		{
 			name:      "a set that needed repair",
@@ -668,7 +674,6 @@ func TestScenarioExpectationsAreEngineKeyed(t *testing.T) {
 }
 
 func TestEngineKeyedScenarioFiles(t *testing.T) {
-	const graphHealthFailure = "payload file(s) were never delivered and no verification, repair or discard accounts for them"
 	for _, test := range []struct {
 		slug         string
 		classic      string
@@ -676,8 +681,8 @@ func TestEngineKeyedScenarioFiles(t *testing.T) {
 		graph        string
 		graphError   string
 	}{
-		{slug: "dead-post-first-articles-missing", classic: "health_failure", classicError: "first articles are missing", graph: "health_failure", graphError: graphHealthFailure},
-		{slug: "dead-post-recovery-unobtainable", classic: "health_failure", classicError: "PAR2 metadata discovery exhausted", graph: "health_failure", graphError: graphHealthFailure},
+		{slug: "dead-post-first-articles-missing", classic: "health_failure", classicError: "first articles are missing", graph: "health_failure", graphError: "first articles are missing"},
+		{slug: "dead-post-recovery-unobtainable", classic: "health_failure", classicError: "PAR2 metadata discovery exhausted", graph: "health_failure", graphError: "below critical"},
 		{slug: "rar5-colliding-member-paths", classic: "extraction_failure", graph: "success"},
 	} {
 		scenario, err := loadScenario(filepath.Join(testdataDir(), test.slug))

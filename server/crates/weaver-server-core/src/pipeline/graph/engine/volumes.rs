@@ -133,13 +133,16 @@ impl Volumes for RunVolumes {
             if state.generation != self.generation {
                 return Err(Unreadable::Stopped.into());
             }
-            let Some(&next) = state.volumes.range(from..).next() else {
-                return Ok(None);
-            };
             // No index lies between `after` and `from`, so only a gap past
-            // `from` can still fill, and only while a volume can still join.
-            if next == from || state.complete {
-                return Ok(Some(VolumeIndex(next)));
+            // `from` can still fill, and only while a volume can still join
+            // there. Past the last volume bound, one joins only from a member
+            // beside them still deciding its owner.
+            match state.volumes.range(from..).next() {
+                Some(&next) if next == from || state.complete => {
+                    return Ok(Some(VolumeIndex(next)));
+                }
+                None if !state.deciding => return Ok(None),
+                _ => {}
             }
             state = self.shelf.wait(state);
         }

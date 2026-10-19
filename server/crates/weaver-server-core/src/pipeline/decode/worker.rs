@@ -1288,8 +1288,8 @@ impl Pipeline {
 
     // Whether a body that failed to decode goes to another server: the job
     // still downloads, the article has decode retries left, and a server
-    // that has not served it remains. [`Self::handle_decode_failure`]
-    // re-queues it exactly when this holds.
+    // that has not served it remains. With no such server, none configured
+    // among them, the damage stands as it came.
     pub(crate) fn decode_retry_left(&mut self, segment_id: SegmentId, exclude: &[usize]) -> bool {
         let job_id = segment_id.file_id.job_id;
         if self
@@ -1301,7 +1301,8 @@ impl Pipeline {
             return false;
         }
         let retries = self.decode_retries.get(&segment_id).copied().unwrap_or(0);
-        retries < MAX_SEGMENT_RETRIES && !self.no_server_can_serve(job_id, exclude)
+        retries < MAX_SEGMENT_RETRIES
+            && self.unavailable_server_count(job_id, exclude) < self.nntp.pool().server_count()
     }
 
     // Handle a decode failure by re-queuing the segment for re-download.

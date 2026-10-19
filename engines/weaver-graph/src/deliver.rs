@@ -126,14 +126,13 @@ impl Why {
         }
     }
 
-    // Whether a member given back for this reason is delivered as it
-    // stands but never whole, however clean its bytes: they are the
-    // container it is, and what it held was lost with the first bytes that
-    // said so. A member given back for any other reason is whole when its
-    // bytes are.
-    pub fn never_whole(self) -> bool {
+    // Whether an object that refused a member for this reason disclaims it:
+    // not its to open, so the member is the posted file and is whole when
+    // its bytes are. For any other reason the object's set failed with the
+    // member, which is delivered as it stands, never whole.
+    pub fn disclaims(self) -> bool {
         match self {
-            Why::FirstBytesLost => true,
+            Why::Unsupported => true,
             Why::Compressed
             | Why::TailUnreachable
             | Why::EncryptedHeader
@@ -141,8 +140,8 @@ impl Why {
             | Why::UnboundedEntry
             | Why::NotAFile
             | Why::Unrepairable
+            | Why::FirstBytesLost
             | Why::HoldsBreached
-            | Why::Unsupported
             | Why::Unmapped
             | Why::TooDeep => false,
         }
@@ -222,6 +221,11 @@ mod tests {
         }
         for why in delivered {
             assert!(!why.withholds(), "{why:?}");
+        }
+        // Only a shape the object does not implement leaves the member the
+        // posted file; every other refusal is its set failing.
+        for why in withheld.into_iter().chain(delivered) {
+            assert_eq!(why.disclaims(), why == Why::Unsupported, "{why:?}");
         }
     }
 }

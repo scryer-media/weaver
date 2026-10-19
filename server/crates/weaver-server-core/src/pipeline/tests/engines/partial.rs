@@ -1737,3 +1737,36 @@ async fn a_partial_job_restarted_after_every_article_ends_partial_with_the_same_
     );
     assert!(restarted.files == whole.files, "the bytes");
 }
+
+// A uuencoded file whose fourth article never arrives, with nothing to
+// rebuild it. The loss is heard before the articles after it arrive, so they
+// are placed where the order puts them, one hole early, and the file is
+// damaged from the hole to its end: not whole, so the job fails.
+#[tokio::test]
+async fn a_uuencoded_file_whose_middle_article_never_arrives_is_damaged_to_its_end() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", noise(7 * ARTICLE + 20, 61))])
+        .uuencoded()
+        .lost(0, 3);
+    under_graph(
+        &scenario,
+        Graph {
+            status: Some(Status::Failed(
+                "no file was delivered whole; 1 short: ember.bin",
+            )),
+            kind: Some("Unpack"),
+            files: vec![],
+            whole: &[],
+            damaged: &["ember.bin"],
+            unrepaired: &[],
+            withheld: &[],
+            refused: &[],
+            delivered: &[],
+        },
+    )
+    .await;
+    under_classic(
+        &scenario,
+        Classic::Fails("download incomplete after exhausting retries: 0/1 data files complete"),
+    )
+    .await;
+}

@@ -9,7 +9,6 @@
 
 use std::io::Write;
 
-use weaver_graph::Why;
 use weaver_graph::recovery::RepairOutcome;
 
 use weaver_model::files::FileRole;
@@ -187,6 +186,39 @@ async fn a_four_volume_rar5_set_served_last_article_first_delivers_its_member_un
     let scenario = Scenario::new(posts(single_member_store_set(MEMBER, &body, 4))).backwards();
     let graph = run(&scenario, Engine::Graph).await;
     assert_member(&graph, &body);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// Fetched side by side, as a crowd of workers fetches a post: the last
+// volume's head comes first, then the first's, then the middle's, while
+// every volume is still arriving. A RAR4 front states no position, and a
+// member that spans every volume links any volume to any other, so only
+// the names number them: one named set is one store whatever the order.
+#[tokio::test]
+async fn a_named_rar4_set_fetched_side_by_side_last_volume_first_is_one_store_under_graph() {
+    let body = body();
+    let scenario = Scenario::new(posts(single_member_rar4_store_set_numbered(
+        MEMBER, &body, 3,
+    )))
+    .together(&[2, 0, 1]);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_member(&graph, &body);
+    let view = graph.graph();
+    assert!(view.delivery.withheld.is_empty(), "{:?}", view.delivery);
+    assert!(view.claims.values().all(|claim| *claim == Claim::Complete));
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// The same beside its PAR2 set, four volumes fetched last, first, then the
+// middle two, every head before any volume closes.
+#[tokio::test]
+async fn a_four_volume_rar4_set_beside_par2_fetched_side_by_side_is_one_store_under_graph() {
+    let body = body();
+    let volumes = single_member_rar4_store_set_numbered(MEMBER, &body, 4);
+    let scenario = Scenario::new(with_par2(volumes)).together(&[3, 0, 2, 1]);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_member(&graph, &body);
+    assert!(graph.graph().delivery.withheld.is_empty());
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
@@ -554,23 +586,22 @@ async fn a_late_par2_rename_over_a_bound_set_changes_only_its_names_under_both_e
 }
 
 // The set's first volume never comes: the one that did founds a store as
-// the second volume its headers say it is, and the store never places the
-// member it continues. Its bytes are a container nothing opened: withheld,
-// never a file delivered whole, and the job fails.
+// the second volume its headers say it is, and once nothing more will
+// come the store has lost its first bytes. The volume is delivered as it
+// stands, damaged, never whole, and the job fails.
 #[tokio::test]
-async fn a_continuation_volume_whose_first_never_comes_is_withheld_under_graph() {
+async fn a_continuation_volume_whose_first_never_comes_is_delivered_damaged_under_graph() {
     let volumes = single_member_store_set(MEMBER, &body(), 2);
     let scenario = Scenario::new(vec![Post::plain("a1b2c3.102", volumes[1].1.clone())]);
     let graph = run(&scenario, Engine::Graph).await;
     let view = graph.graph();
     assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
+    assert!(view.delivery.withheld.is_empty(), "{:?}", view.delivery);
     assert_eq!(
+        view.delivery.damaged,
+        vec!["a1b2c3.102"],
+        "{:?}",
         view.delivery
-            .withheld
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["a1b2c3.102"]
     );
     assert!(
         matches!(graph.status, Some(JobStatus::Failed { .. })),
@@ -764,10 +795,10 @@ async fn an_xz_stream_inside_a_stored_rar_volume_streams_under_both_engines() {
 
 // Each volume carries a recovery record and there is no PAR2. Neither
 // engine decodes the record, so nothing can repair the damaged article.
-// Divergence: classic fails the job at unpack and delivers nothing. The
-// graph rules that nothing will repair the set: the store gives its
-// volumes up unrepaired, they are delivered as they came, the damaged one
-// claimed damaged, and the job completes.
+// Both engines fail the job. Classic fails it at unpack and delivers
+// nothing. The graph rules that nothing will repair the set: the store
+// refuses every volume it holds, none of them whole, the damaged one
+// claimed damaged, and the job fails.
 #[tokio::test]
 async fn a_rar5_set_with_recovery_records_and_a_damaged_article_ends_unrepaired_under_both_engines()
 {
@@ -785,21 +816,17 @@ async fn a_rar5_set_with_recovery_records_and_a_damaged_article_ends_unrepaired_
     );
     assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
     assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
-    // The damaged volume is delivered as it stands: the job ends Partial.
-    assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
+    // Every volume is delivered as it stands, none whole: the job fails.
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
         "{:?}",
-        graph.failure
+        graph.status
     );
-    assert_eq!(
-        graph.files.keys().cloned().collect::<Vec<_>>(),
-        set.iter()
-            .map(|(name, _)| delivered(name))
-            .collect::<Vec<_>>()
+    assert!(
+        graph.graph().delivery.whole.is_empty(),
+        "{:?}",
+        graph.graph().delivery
     );
-    assert!(graph.files[&delivered(&set[0].0)] != set[0].1);
-    assert_eq!(graph.files[&delivered(&set[1].0)], set[1].1);
     let view = graph.graph();
     assert_eq!(view.claims[&set[0].0], Claim::Damaged);
     assert_eq!(view.claims[&set[1].0], Claim::Complete);
@@ -807,4 +834,26 @@ async fn a_rar5_set_with_recovery_records_and_a_damaged_article_ends_unrepaired_
     assert!(view.outcomes.is_empty(), "{:?}", view.outcomes);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
     assert!(classic.refetched().is_empty(), "{:?}", classic.refetched());
+}
+
+// More of the second volume lost than its PAR2 set can rebuild: the store
+// cannot deliver its member, and every volume it holds is refused with it,
+// the ones that came whole too. No volume of the set is a delivery of its
+// own, so nothing is whole and the job fails for the repair.
+#[tokio::test]
+async fn a_rar_set_whose_middle_volume_is_past_repair_delivers_no_volume_whole_under_graph() {
+    let body = payload(16 * ARTICLE + 13, 53);
+    let scenario = Scenario::new(with_par2(single_member_store_set(MEMBER, &body, 4)))
+        .lost(1, 1)
+        .lost(1, 2)
+        .lost(1, 3);
+    let graph = run(&scenario, Engine::Graph).await;
+    let view = graph.graph();
+    assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
 }

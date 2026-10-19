@@ -4,6 +4,9 @@
   "description": "A PAR2-protected payload beside a 32 KiB text sidecar, five of whose eight blocks are destroyed against three recovery blocks. Every payload block verifies, so the only short file in the set is one whose extension marks it as furniture: the release is delivered whole, no repair is attempted for a file the parity cannot rebuild, and the damage is reported rather than fatal.",
   "category": "2000",
   "expected_outcome": "success",
+  "expectedOutcomeByEngine": {
+    "graph": "partial_delivery"
+  },
   "forbiddenJobEvents": [
     "RepairStarted",
     "RepairFailed"

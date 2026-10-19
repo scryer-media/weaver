@@ -140,6 +140,7 @@ impl Standing for Stood<'_> {
                 tree.child_of(node, member.id).is_none()
                     && member.coverage.damaged_ranges().next().is_some()
                     && !tree.retired.contains_key(&(node, member.id))
+                    && !tree.given_back(node, member.id)
                     && !tree.vouched(node, member.id)
             })
     }

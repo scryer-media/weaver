@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::object::{Kind, Object};
 use crate::tree::NodeId;
 
+mod sealed;
+
+pub use sealed::Sealed;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub kind: Kind,

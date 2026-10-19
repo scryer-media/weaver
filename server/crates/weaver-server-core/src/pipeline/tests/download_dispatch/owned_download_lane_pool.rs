@@ -4170,7 +4170,7 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
 }
 
 #[tokio::test]
-async fn par2_metadata_bootstrap_holds_no_payload_of_a_graph_job() {
+async fn par2_metadata_bootstrap_holds_a_graph_jobs_payload_until_its_index_is_read() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -4232,13 +4232,19 @@ async fn par2_metadata_bootstrap_holds_no_payload_of_a_graph_job() {
     let queued = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
     assert_eq!(queued, 8);
 
-    // No grid is ever published for this job: every article must still
-    // lease, the index leading, with no refusal in between.
+    // The namespace holds the payload an index to come will place: only
+    // the index leases until it has been read, and nothing is refused.
     let mut leased = Vec::new();
     while let Some(lease) = pipeline.lease_for_server_for_test(0) {
         leased.extend(lease.works.into_iter().map(|work| work.segment_id));
     }
-    assert_eq!(leased.first().map(|id| id.file_id.file_index), Some(0));
-    assert_eq!(leased.len(), queued, "{leased:?}");
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        leased.iter().map(|id| id.file_id.file_index).collect::<Vec<_>>(),
+        vec![0],
+        "{leased:?}"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        queued - 1
+    );
 }

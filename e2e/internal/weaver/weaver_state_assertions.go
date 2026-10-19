@@ -683,12 +683,12 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 	if jobID <= 0 || !facadeTerminalStatus(status) {
 		return status, ""
 	}
-	if err := assertTerminalFixtureStateEventuallySweeping(dbPath, jobID, status, sweepOrphans); err != nil {
+	scenario, err := loadScenario(filepath.Join(testdataDir(), slug))
+	if err := assertTerminalFixtureStateEventuallySweeping(dbPath, jobID, scenario.expectedHistoryStatus(status), sweepOrphans); err != nil {
 		log.Printf("  %s: state mismatch after %s: %v", slug, status, err)
 		return "DB_STATE_ERROR", err.Error()
 	}
-	if normalizeFacadeState(status) == "COMPLETE" {
-		scenario, err := loadScenario(filepath.Join(testdataDir(), slug))
+	if scenario.deliveredOn(status) {
 		if err == nil && len(scenario.RequiredJobEvents) > 0 {
 			if err := assertRequiredJobEvents(dbPath, jobID, scenario.RequiredJobEvents); err != nil {
 				log.Printf("  %s: required job event mismatch after %s: %v", slug, status, err)

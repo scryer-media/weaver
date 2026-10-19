@@ -105,6 +105,13 @@ pub trait Recovery {
     // member on every delivery and every repair.
     fn feed(&mut self, member: MemberId, segments: &[Segment]);
 
+    // The block sizes at whose boundaries `feed`'s checksums have to be cut
+    // for this object to vouch for a block without reading it back. A
+    // source that cuts its checksums there, as the article decoder can,
+    // gives the object its proof as the bytes pass. An object that folds
+    // checksums of any alignment, or takes none, names none.
+    fn block_sizes(&self, _out: &mut Vec<u64>) {}
+
     // The verdict per slice of a covered member, as far as the evidence goes.
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>);
 

@@ -213,8 +213,8 @@ fn a_store_that_refuses_hands_back_its_volumes_as_leaves_with_their_bytes() {
 }
 
 // The store closed each of its members whole before it gave up: buried, it
-// keeps them, and the delivery lists them whole beside the volumes handed
-// back as posted.
+// keeps them, and the delivery lists them whole. The volumes it handed back
+// are delivered as posted, never whole: the store refused them.
 #[test]
 fn what_a_refused_store_closed_whole_is_delivered_whole() {
     let mut refusing = refusing(Mode::Refuse, 2, &[]);
@@ -223,24 +223,22 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
         refusing.job.tree(),
         |_| true,
         |_| false,
-        |_| false,
         |_, _| false,
         |_, _| None,
     );
     assert_eq!(
         delivery,
         Delivery {
-            whole: vec![
+            whole: vec!["inner-0.bin".to_string(), "inner-1.bin".to_string()],
+            damaged: vec![
                 "lantern.part1.rar".to_string(),
-                "inner-0.bin".to_string(),
-                "inner-1.bin".to_string(),
                 "lantern.part2.rar".to_string(),
             ],
             files: vec![
-                super::delivered("lantern.part1.rar", 0, true),
+                super::delivered("lantern.part1.rar", 0, false),
                 super::delivered("inner-0.bin", 1, true),
                 super::delivered("inner-1.bin", 1, true),
-                super::delivered("lantern.part2.rar", 0, true),
+                super::delivered("lantern.part2.rar", 0, false),
             ],
             ..Delivery::default()
         }

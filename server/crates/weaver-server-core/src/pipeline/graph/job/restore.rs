@@ -19,7 +19,6 @@
 //
 // Step 1, refusing a graph job with no checkpoint, is the caller's.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -116,7 +115,6 @@ impl GraphJob {
             runs,
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,
-            ruled_at: BTreeMap::new(),
             pending: Pending::default(),
         };
         for (node, index) in &snapshot.passwords {

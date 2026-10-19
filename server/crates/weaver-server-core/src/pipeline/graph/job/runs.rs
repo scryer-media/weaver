@@ -9,7 +9,6 @@
 
 use std::collections::BTreeSet;
 
-use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
@@ -170,10 +169,10 @@ impl GraphJob {
         // its owner, and while anything more can come: a recovery object yet
         // to rule may rebuild a volume never posted.
         let ended = self.ended(parent);
-        let complete = ended
-            && namespace
-                .members()
-                .all(|member| !self.tree.is_undecided(parent, member.id));
+        let deciding = namespace
+            .members()
+            .any(|member| self.tree.is_undecided(parent, member.id));
+        let complete = ended && !deciding;
         let ends: Vec<(u32, Option<u64>, bool)> = volumes
             .iter()
             .filter_map(|(volume, member)| {
@@ -187,6 +186,7 @@ impl GraphJob {
             .update(|state| {
                 state.volumes = bound;
                 state.complete = complete;
+                state.deciding = deciding;
                 for (volume, closed, settled) in ends {
                     let kept = shelf.kept(state, volume)?;
                     kept.closed = closed;
@@ -198,18 +198,11 @@ impl GraphJob {
     }
 
     // Nothing more will come for the namespace's members, not even a
-    // repair: the payload is in, and every recovery object beside them has
-    // ruled. One that has not may cover a member yet, since it binds what it
-    // covers as its own volumes arrive, and those can come after the member
-    // closed, or rebuild a member that never came at all.
+    // repair: the payload is in, and the namespace's sets have ruled. One
+    // that has not may cover a member yet, since it binds what it covers as
+    // its own volumes arrive, and those can come after the member closed,
+    // or rebuild a member that never came at all.
     fn ended(&self, parent: NodeId) -> bool {
-        !self.payload_waiting()
-            && self.tree.recovery_nodes(parent).into_iter().all(|node| {
-                self.tree.recovery(node).is_none_or(|recovery| {
-                    recovery
-                        .outcome()
-                        .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
-                })
-            })
+        !self.payload_waiting() && self.writer.ruled(&self.tree, parent)
     }
 }

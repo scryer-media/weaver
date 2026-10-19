@@ -230,6 +230,14 @@ impl Kept {
             .min()
     }
 
+    // The bytes in hand that run unbroken to the end of a range, within it.
+    pub(crate) fn suffix(&self, range: ByteRange) -> &[u8] {
+        let mut gaps = Vec::new();
+        self.missing(range, &mut gaps);
+        let start = gaps.last().map_or(range.start, |gap| gap.end);
+        self.read(ByteRange::new(start, range.end)).unwrap_or(&[])
+    }
+
     // The parts of a range not in hand yet.
     pub(crate) fn missing(&self, range: ByteRange, out: &mut Vec<ByteRange>) {
         let mut cursor = range.start;

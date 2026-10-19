@@ -4,11 +4,11 @@
 // Which sibling members are this set's volumes, and where in the set each
 // one is: the position the set gives it, never the order it arrived in.
 // Every volume of a RAR set starts with the signature, so a member without
-// one is never claimed. A volume is placed by its own first headers: at the
-// number they state, or, stating none, after the held volume whose last
-// member it continues. A posted name is a label a recovery set may change
-// later, so a name in the set's own numbering places only a volume whose
-// headers place nothing, as in a set numbered by its names alone. The
+// one is never claimed. A volume is placed by what states its position: the
+// number its own headers give, else its name in the set's numbering, as in
+// a set numbered by its names alone. A posted name is a label a recovery set
+// may change later, so a stated number outranks it. A volume that neither
+// numbers goes after the held volume whose last member it continues. The
 // store's first volume is placed the same way, with nothing held yet, and a
 // front that places it nowhere founds the store with it first. That claim is
 // provisional: a volume whose own headers, read to its close, say it is not
@@ -159,11 +159,6 @@ impl RarStore {
         format: ArchiveFormat,
         facts: Option<&RarVolumeFacts>,
     ) -> Option<VolumeIndex> {
-        // A store giving volumes back takes none until it has given them
-        // all: what it gives back it holds no claim to.
-        if !self.giving.is_empty() {
-            return None;
-        }
         if self.volumes.values().any(|ours| {
             ours.walk.in_set() == Some(false)
                 || ours
@@ -186,16 +181,19 @@ impl RarStore {
                     .filter_map(|volume| volume.name.as_deref().and_then(naming::parse))
                     .any(|bound| bound.same_set(wanted))
         });
-        // The headers place a volume; a name in the set's numbering places
-        // only one whose headers state nothing that does.
-        let index = match (
-            facts.and_then(|facts| self.claim_by_headers(facts)),
-            named,
-            wanted,
-        ) {
-            (Some(index), _, _) => index,
-            (None, true, Some(wanted)) => VolumeIndex(wanted.index()),
-            (None, _, _) => return None,
+        // A position is what states it: the number the headers give, else
+        // the name in the set's numbering. Only a volume that neither
+        // numbers is placed by the members that link it to those held,
+        // which never fix a position on their own: one member may span
+        // every volume, and then it links each to all the others.
+        let stated = facts.is_some_and(|facts| Nameless { facts }.position().is_some());
+        let named = wanted
+            .filter(|_| named)
+            .map(|wanted| VolumeIndex(wanted.index()));
+        let index = match (facts.and_then(|facts| self.claim_by_headers(facts)), named) {
+            (Some(index), _) if stated => index,
+            (_, Some(named)) => named,
+            (linked, None) => linked?,
         };
         let taken = self
             .volumes

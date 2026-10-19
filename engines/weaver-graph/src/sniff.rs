@@ -7,8 +7,9 @@
 //
 // Bytes decide wherever a kind has a signature, so a member keeps its kind
 // under an obfuscated name. A name decides only once the bytes have ruled
-// out every signature: tar and bzip2 by their extensions too, and raw
-// deflate, brotli and SFV, which have no signature, by theirs alone.
+// out every signature: tar, bzip2 and zip by their extensions too, and raw
+// deflate, brotli and SFV, which have no signature, by theirs alone, as is
+// the first numbered piece of a plain file split into pieces.
 //
 // Bytes read before a verdict, per kind:
 //
@@ -228,6 +229,8 @@ const NAMED: &[(Kind, &[&str])] = &[
     (Kind::Deflate, &[".deflate"]),
     (Kind::Brotli, &[".br"]),
     (Kind::Sfv, &[".sfv"]),
+    (Kind::Zip, &[".zip"]),
+    (Kind::Split, &[".001"]),
 ];
 
 fn named(name: &str) -> Option<Kind> {
@@ -513,6 +516,13 @@ mod tests {
             sniff("a.sfv", &[0xFF, 0xFE, 0x41], Some(3)),
             object(Kind::Sfv)
         );
+    }
+
+    // Damage at its front hides a zip's signature, not its end records.
+    #[test]
+    fn a_zip_whose_front_opens_no_signature_is_a_zip_by_name() {
+        assert_eq!(sniff("a.zip", &[0; 300], Some(4096)), object(Kind::Zip));
+        assert_eq!(sniff("a.zip", &[0; 300], None), object(Kind::Zip));
     }
 
     #[test]

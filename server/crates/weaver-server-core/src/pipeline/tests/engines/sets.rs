@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run, run_both,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::graph::Engine;
 
 // PAR2 names a file by the MD5 of at most this much of its front; damage
 // past it leaves an obfuscated member recognisable by its front.
@@ -312,4 +313,34 @@ async fn swapped_names_are_put_back_by_the_set_under_both_engines() {
     assert!(graph.refetched().is_empty());
     assert!(classic.completed(), "{:?}", classic.failure);
     delivered_as_described(&classic, &files);
+}
+
+// The same swap with every article of the recovery volume gone: the set
+// has its index and no block, finds both members clean once each is bound
+// by its content, and the namespace still puts both names back.
+#[tokio::test]
+async fn swapped_names_are_put_back_by_a_set_whose_recovery_volume_is_gone() {
+    let files = [
+        ("lantern.bin", payload(3 * ARTICLE, 34)),
+        ("beacon.bin", payload(2 * ARTICLE + 7, 35)),
+    ];
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .collect();
+    let mut posts = vec![
+        Post::plain("beacon.bin", files[0].1.clone()),
+        Post::plain("lantern.bin", files[1].1.clone()),
+    ];
+    posts.extend(par2_set("lantern", &described, 2));
+    let articles = posts[3].bytes.len().div_ceil(ARTICLE) as u32;
+    let scenario = (0..articles).fold(Scenario::new(posts), |scenario, ordinal| {
+        scenario.lost(3, ordinal)
+    });
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    delivered_as_described(&graph, &files);
+    let view = graph.graph();
+    assert_eq!(view.outcomes, vec![Some(RepairOutcome::Clean)]);
+    assert!(claims_all(&view.claims, Claim::Complete));
 }

@@ -223,6 +223,37 @@ func (s *Scenario) expectedOutcomeFor(engine weaverEngine) string {
 	return s.ExpectedOutcome
 }
 
+// outcomePartialDelivery is the expected outcome of a job that delivers some
+// outputs whole and others damaged: history records it PARTIAL, the facade
+// reports it FAILED, and the outputs the scenario lists are still checked as
+// delivered.
+const outcomePartialDelivery = "partial_delivery"
+
+// expectedHistoryStatus is the job_history status the scenario expects of a job
+// the facade reports terminal with `status`. A partial delivery is FAILED to the
+// facade and PARTIAL in history; every other outcome records what the facade
+// reports. A nil scenario expects the facade status.
+func (s *Scenario) expectedHistoryStatus(status string) string {
+	if s != nil && s.expectedOutcome() == outcomePartialDelivery && normalizeFacadeState(status) == "FAILED" {
+		return "PARTIAL"
+	}
+	return status
+}
+
+// deliveredOn reports whether a job the facade reports terminal with `status`
+// delivered outputs the scenario's post-terminal checks (events, digests,
+// runtime assertions) apply to: a completed job, or a partial delivery the
+// scenario expects.
+func (s *Scenario) deliveredOn(status string) bool {
+	switch normalizeFacadeState(status) {
+	case "COMPLETE":
+		return true
+	case "FAILED":
+		return s != nil && s.expectedOutcome() == outcomePartialDelivery
+	}
+	return false
+}
+
 // expectedErrorContains is the terminal error substring the scenario expects of
 // the engine under test.
 func (s *Scenario) expectedErrorContains() string {

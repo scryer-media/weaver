@@ -159,7 +159,7 @@ fn class_facts(class: Class) -> Option<ClassFacts> {
         Class::Recovery => ClassFacts::Recovery,
         Class::FirstArticle => ClassFacts::FirstArticle,
         Class::Window(rank) => ClassFacts::Window(rank),
-        Class::Ordinary => return None,
+        Class::Ordinary | Class::Parked => return None,
     })
 }
 

@@ -280,7 +280,11 @@ impl RarStore {
     // its close, so nothing of it is still on its way here, and the headers
     // are read as far as they go: the parse that travels is the whole one.
     // The store never mapped any of it, since the layout stops at a volume
-    // its headers do not place.
+    // its headers do not place. The volume held first is the one the store
+    // was founded on, and every other was taken as a volume of the set it
+    // begins: when that one proves to be no set's first, the store was
+    // never that set, and each volume it took goes back with it, read to its
+    // close, for the store that holds their first volume to claim.
     fn give_back_misplaced(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
         let misplaced = self.volumes.get(&volume).is_some_and(|found| {
             found.closed
@@ -290,28 +294,23 @@ impl RarStore {
                     .as_ref()
                     .is_some_and(|facts| claim::misplaced(volume, facts))
         });
-        if let Some(found) = misplaced.then(|| self.volumes.remove(&volume)).flatten() {
-            self.giving.insert(volume, found);
-            self.stale = true;
-            out.push(Emit::GiveBack(volume));
-        }
-    }
-
-    // A store that holds no first volume once nothing more will come to it
-    // holds volumes it can never open: the first volume their headers carry
-    // on from is with another store, or nowhere. Every one goes back to
-    // its namespace with what was read of it, to be claimed by the store
-    // that holds that first volume, or the one founded on it when it
-    // comes. Nothing of them was mapped, since a layout starts at the first
-    // volume.
-    fn give_back_headless(&mut self, out: &mut Vec<Emit>) {
-        if self.volumes.is_empty() || self.volumes.contains_key(&VolumeIndex(0)) || !self.finished()
-        {
+        if !misplaced {
             return;
         }
-        for (volume, found) in std::mem::take(&mut self.volumes) {
-            self.giving.insert(volume, found);
-            out.push(Emit::GiveBack(volume));
+        let going: Vec<VolumeIndex> = match volume == VolumeIndex(0) {
+            true => self
+                .volumes
+                .iter()
+                .filter(|(_, found)| found.closed)
+                .map(|(index, _)| *index)
+                .collect(),
+            false => vec![volume],
+        };
+        for index in going {
+            if let Some(found) = self.volumes.remove(&index) {
+                self.giving.insert(index, found);
+                out.push(Emit::GiveBack(index));
+            }
         }
         self.stale = true;
     }
@@ -450,7 +449,6 @@ impl Object for RarStore {
         if self.gone {
             return;
         }
-        self.give_back_headless(out);
         self.say_gaps(out);
         self.exhausted(out);
     }

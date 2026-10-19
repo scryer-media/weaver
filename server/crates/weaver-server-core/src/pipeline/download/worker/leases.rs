@@ -222,10 +222,10 @@ impl Pipeline {
         job_id: JobId,
     ) -> Option<Vec<u32>> {
         // The hold ends when the classic parse of the index publishes its
-        // grid. A graph job's root reads the index itself and publishes no
-        // grid here, so holding its payload would hold it for ever.
+        // grid. A graph job's root namespace holds its own payload for the
+        // indexes the post declares, as long as it says.
         if !self.job_engine(job_id).classic_switches_apply() {
-            return None;
+            return self.graph_indexes_to_come(job_id);
         }
         if self.par2_bypassed.contains(&job_id)
             || self
@@ -262,12 +262,39 @@ impl Pipeline {
         }
     }
 
+    // The PAR2 indexes the post declares that a graph job's root namespace
+    // holds its payload for. Root members are numbered as the posted files
+    // they are.
+    fn graph_indexes_to_come(&self, job_id: JobId) -> Option<Vec<u32>> {
+        let (graph, state) = (self.graph_jobs.get(&job_id)?, self.jobs.get(&job_id)?);
+        let declared = state
+            .spec
+            .files
+            .iter()
+            .zip(0u32..)
+            .filter(|(file, _)| {
+                matches!(
+                    file.role,
+                    weaver_model::files::FileRole::Par2 { is_index: true, .. }
+                )
+            })
+            .map(|(_, index)| weaver_graph::MemberId(index));
+        graph
+            .indexes_to_come(declared)
+            .map(|held| held.into_iter().map(|member| member.0).collect())
+    }
+
     // While bootstrap is active, lease only tracked explicit-index work.
     pub(in crate::pipeline::download) fn par2_metadata_bootstrap_claims_work(
         &mut self,
         job_id: JobId,
         work: &DownloadWork,
     ) {
+        // The discovery states are the classic parse's; a graph job's root
+        // tells its own hold from its articles.
+        if !self.job_engine(job_id).classic_switches_apply() {
+            return;
+        }
         let file_index = work.segment_id.file_id.file_index;
         if !matches!(
             self.par2_discovery_state_for_candidate(job_id, file_index),

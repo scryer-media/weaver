@@ -18,7 +18,7 @@ use super::harness::{
 
 const SECRET: &str = "beacon-lantern-secret";
 
-fn members() -> Vec<(&'static str, Vec<u8>)> {
+pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("ember.bin", payload(5 * ARTICLE + 13, 51)),
         ("quill.bin", payload(3 * ARTICLE - 5, 52)),
@@ -133,7 +133,7 @@ fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
 }
 
-fn assert_members(outcome: &Outcome) {
+pub(super) fn assert_members(outcome: &Outcome) {
     assert!(
         outcome.completed(),
         "{}: {:?}",

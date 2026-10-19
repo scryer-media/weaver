@@ -13,6 +13,7 @@
 // The object is pure: no I/O, no threads, no files. Bytes it cannot place yet
 // are held by its owner, who hands them back once the map places them.
 
+mod carried;
 mod directory;
 mod geometry;
 mod map;
@@ -75,6 +76,9 @@ pub struct Zip {
     // Container ranges wanted ahead of the normal order.
     bids: Vec<(ByteRange, Weight)>,
     damage_said: HashSet<(u64, u64, u32)>,
+    // Whether the container's tail was looked at for a recovery set.
+    #[serde(default)]
+    recovery_said: bool,
     // Something changed since the object last looked.
     stale: bool,
     // The object gave its container up; it says nothing more.
@@ -273,6 +277,7 @@ impl Zip {
         if self.gone || !std::mem::take(&mut self.stale) {
             return;
         }
+        self.find_recovery(out);
         if self.walking {
             self.walk(out);
         } else if self.map.is_none() {

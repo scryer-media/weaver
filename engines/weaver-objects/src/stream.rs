@@ -16,6 +16,7 @@ mod bzip2;
 mod deflate;
 mod front;
 mod gzip;
+mod pieces;
 mod run;
 mod xz;
 mod zstd;
@@ -31,13 +32,14 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, MemberId, Object,
-    Placement, Pull, Seek, Standing, VolumeIndex,
+    Placement, Pull, Seek, Standing, VolumeIndex, Why,
 };
 
 pub use self::brotli::Brotli;
 pub use self::bzip2::Bzip2;
 pub use self::deflate::Deflate;
 pub use self::gzip::Gzip;
+pub use self::pieces::Pieces;
 pub use self::xz::Xz;
 pub use self::zstd::Zstd;
 pub use front::Front;
@@ -61,6 +63,18 @@ pub trait Decoder: Send + Sync + 'static {
     fn damaged(_error: &io::Error, _input: &mut Front) -> Option<ByteRange> {
         None
     }
+
+    // The name the one member is announced under, from the first volume's.
+    fn member(volume: &str) -> String {
+        member_name(volume)
+    }
+
+    // Why the stream gives its volumes back once nothing more will reach
+    // its run: a member left damaged cannot be read whole from them, nor
+    // one never closed.
+    fn quiet(standing: &dyn Standing) -> Option<Why> {
+        crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
+    }
 }
 
 pub type XzStream = Stream<Xz>;
@@ -69,6 +83,7 @@ pub type Bzip2Stream = Stream<Bzip2>;
 pub type ZstdStream = Stream<Zstd>;
 pub type BrotliStream = Stream<Brotli>;
 pub type DeflateStream = Stream<Deflate>;
+pub type SplitStream = Stream<Pieces>;
 
 // The front of the volume a window is read from: enough for every format's
 // header up to the field that sizes its window.
@@ -150,11 +165,10 @@ impl<D: Decoder> Object for Stream<D> {
 
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
-    // Nothing more will reach the run. A member it left damaged or never
-    // closed cannot be read whole, and the volume goes back as it stands.
+    // Nothing more will reach the run; the decoder says whether its volumes
+    // go back as they stand.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        let why = crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing));
-        out.extend(why.map(Emit::Refuse));
+        out.extend(D::quiet(standing).map(Emit::Refuse));
     }
 
     // One volume, read in order: there is nothing to bid for.
@@ -218,7 +232,7 @@ impl<D: Decoder> Object for Stream<D> {
 impl<D: Decoder> Engine for Stream<D> {
     fn start(&self) -> Box<dyn Extraction> {
         Box::new(run::Run::<D>::new(
-            member_name(&self.name),
+            D::member(&self.name),
             D::window(&self.first),
         ))
     }

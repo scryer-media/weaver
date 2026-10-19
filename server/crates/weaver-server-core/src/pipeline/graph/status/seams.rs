@@ -107,9 +107,7 @@ fn log_set_rulings(job_id: JobId, job: &GraphJob) {
     let mut rulings = Vec::new();
     for object in RootJob::recovery_summary(job).sets {
         rulings.clear();
-        if let Some(recovery) = job.tree().recovery(object.node) {
-            recovery.sets(&mut rulings);
-        }
+        job.writer().rulings(job.tree(), object.node, &mut rulings);
         for ruling in &rulings {
             let SetRuling {
                 outcome: Some(outcome),
@@ -368,19 +366,19 @@ impl Pipeline {
                 .get(member.0 as usize)
                 .is_none_or(|file| file.role.counts_toward_health())
         };
-        let failed = |object: NodeId| {
-            failure
-                .as_ref()
-                .is_some_and(|failure| failure.objects.contains(&object))
+        // A set whose repair failed covers the member.
+        let unrepaired = |node: NodeId, member: MemberId| {
+            failure.as_ref().is_some_and(|failure| {
+                job.writer()
+                    .covering(job.tree(), node, member)
+                    .any(|set| failure.objects.contains(&set))
+            })
         };
         let delivery = Delivery::read(
             job.tree(),
             payload,
             |name| par2_damage_ignorable(name, &ignore),
-            failed,
-            // Refused after announcing a member it never closed, which the
-            // tree keeps buried under the member.
-            |node, member| job.tree().left_open(node, member),
+            unrepaired,
             |node, member| job.writer().refused(node, member),
         );
         Some((delivery, failure))
