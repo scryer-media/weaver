@@ -1092,6 +1092,16 @@ impl TorrentService {
 
     // Add a torrent. A metainfo becomes a job at once; a magnet needs its
     // route's session to fetch the metainfo, and becomes one when it has.
+    /// Whether the route a torrent in `scope` would take carries DHT, so a
+    /// magnet with no trackers can find its peers there.
+    pub fn carries_dht(&self, scope: TorrentScope) -> bool {
+        self.inner
+            .sessions
+            .routes()
+            .plan(scope)
+            .is_ok_and(|plan| plan.kind.shape().dht)
+    }
+
     pub async fn add(&self, request: AddRequest) -> Result<JobId, AddError> {
         if !self.inner.sessions.on() {
             return Err(AddError::Off);
@@ -1157,7 +1167,7 @@ impl TorrentService {
                     .plan(scope)
                     .map_err(AddError::NoNetwork)?;
                 if magnet.trackers.is_empty() && !plan.kind.shape().dht {
-                    return Err(AddError::Invalid(
+                    return Err(AddError::NoNetwork(
                         "a magnet with no trackers needs DHT, which this route does not carry"
                             .into(),
                     ));

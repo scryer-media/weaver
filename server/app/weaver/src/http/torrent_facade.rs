@@ -25,7 +25,7 @@ use weaver_server_core::auth::{
 use weaver_server_core::categories::{
     CategoryConfig, completion_parent, validate_category_path_component,
 };
-use weaver_server_core::proxies::Bandwidth;
+use weaver_server_core::proxies::{Bandwidth, TorrentScope};
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
@@ -448,7 +448,18 @@ async fn handle(
         }))
         .into_response(),
         ("app", "preferences") => {
-            axum::Json(preferences(&*ctx.inner.config.read().await)).into_response()
+            let config = ctx.inner.config.read().await;
+            let dht = ctx.inner.torrents.as_ref().is_some_and(|torrents| {
+                std::iter::once(TorrentScope::Default)
+                    .chain(
+                        config
+                            .categories
+                            .iter()
+                            .map(|c| TorrentScope::Category(c.id)),
+                    )
+                    .any(|scope| torrents.carries_dht(scope))
+            });
+            axum::Json(preferences(&config, dht)).into_response()
         }
         ("app", "setPreferences") => set_preferences(&ctx, &params).await,
         ("app", "defaultSavePath") => {
@@ -1118,13 +1129,16 @@ fn with_limits(mut fields: Value, limits: [(&str, Option<u64>); 2]) -> Value {
     fields
 }
 
-pub(super) fn preferences(config: &Config) -> Value {
+// `dht` is whether any torrent route carries it: a client reads it before
+// handing over a magnet with no trackers, and the route refuses one it
+// cannot serve.
+pub(super) fn preferences(config: &Config, dht: bool) -> Value {
     let torrent = &config.torrent;
     let seeding = config.seeding.as_ref();
     let minutes = |value: Option<u32>| value.map_or(-1, i64::from);
     let bandwidth = config.bandwidth;
-    // DHT is a route's, not the client's: no one value is true here.
     let fields = json!({
+        "dht": dht,
         "save_path": config.complete_dir(),
         "temp_path_enabled": false,
         "temp_path": "",

@@ -856,6 +856,14 @@ async fn a_duplicate_fails_and_a_refusal_conflicts() {
         )
         .await;
     assert_eq!(magnet.status, StatusCode::CONFLICT);
+    // The same hash in base32 reaches the same refusal, not a parse error.
+    let base32 = rig
+        .post(
+            "/api/v2/torrents/add",
+            "urls=magnet%3A%3Fxt%3Durn%3Abtih%3AAERUKZ4JVPG66AJDIVTYTK6N54ASGRLH",
+        )
+        .await;
+    assert_eq!((base32.status, &base32.body), (magnet.status, &magnet.body));
     assert_eq!(rig.torrents().await.len(), 1);
 }
 
@@ -1312,8 +1320,9 @@ async fn the_stub_endpoints_answer_and_a_url_must_be_a_magnet() {
         )
     );
     assert!(rig.torrents().await.is_empty());
+    // The offline rig's route is a system leg, which carries DHT.
     let preferences = rig.get("/api/v2/app/preferences").await.json();
-    assert!(preferences.get("dht").is_none());
+    assert_eq!(preferences["dht"], true);
 }
 
 #[tokio::test]

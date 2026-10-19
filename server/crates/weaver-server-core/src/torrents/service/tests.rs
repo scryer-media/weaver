@@ -509,12 +509,19 @@ async fn a_magnet_is_refused_without_a_network_to_fetch_it_on() {
         rig.service.add(request(AddSource::Magnet(magnet))).await,
         Err(AddError::NoNetwork(_))
     ));
+    // A base32 hash names the same torrent as its hex form.
+    let base32 = "AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH";
+    let magnet = format!("magnet:?xt=urn:btih:{base32}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce");
+    assert!(matches!(
+        rig.service.add(request(AddSource::Magnet(magnet))).await,
+        Err(AddError::NoNetwork(_))
+    ));
     // A route with no DHT cannot find peers for a magnet with no trackers.
     rig.routes.set_down(None);
     let bare = format!("magnet:?xt=urn:btih:{hash}");
     assert!(matches!(
         rig.service.add(request(AddSource::Magnet(bare))).await,
-        Err(AddError::Invalid(_))
+        Err(AddError::NoNetwork(_))
     ));
     assert!(rig.db.list_torrents().unwrap().is_empty());
 }
