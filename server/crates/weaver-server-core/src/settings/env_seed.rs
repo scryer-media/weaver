@@ -929,6 +929,7 @@ mod tests {
         db.set_network_bandwidth(&crate::proxies::Bandwidth {
             download_bps: Some(2000),
             upload_bps: None,
+            split: None,
         })
         .unwrap();
         let mut config = db.load_config().unwrap();

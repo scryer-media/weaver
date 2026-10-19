@@ -77,6 +77,7 @@ fn sample_config() -> Config {
         bandwidth: crate::proxies::Bandwidth {
             download_bps: Some(42),
             upload_bps: None,
+            split: None,
         },
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),

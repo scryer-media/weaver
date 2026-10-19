@@ -8,6 +8,7 @@ pub mod model;
 pub mod net;
 pub mod persistence;
 pub mod queries;
+pub mod rate;
 pub mod service;
 pub mod sessions;
 pub mod status;

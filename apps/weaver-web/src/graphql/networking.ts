@@ -19,8 +19,9 @@ export const EGRESS_QUOTAS_QUERY = gql`
   }
 `;
 /** The limits over every egress together. */
-export const BANDWIDTH_QUERY = gql`query Bandwidth { networking { bandwidth { downloadBps uploadBps } } }`;
-export const SET_BANDWIDTH = gql`mutation SetBandwidth($input:BandwidthInput!) { setBandwidth(input:$input) { downloadBps uploadBps } }`;
+export const BANDWIDTH_QUERY = gql`query Bandwidth { networking { bandwidth { downloadBps uploadBps split { usenetPct } } } }`;
+export const SET_BANDWIDTH = gql`mutation SetBandwidth($input:BandwidthInput!) { setBandwidth(input:$input) { downloadBps uploadBps split { usenetPct } } }`;
+export const BANDWIDTH_SPLIT_QUERY = gql`query BandwidthSplit { networking { bandwidthSplit { inForce { usenetPct } needsDownloadLimit usenetBps torrentBps } } }`;
 export const NETWORKING_QUERY = gql`
   query Networking {
     egressInterfaces { ${EGRESS_FIELDS} }

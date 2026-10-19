@@ -1245,3 +1245,57 @@ async fn the_checkpoint_is_written_once_a_tick() {
     rig.service.tick().await;
     assert_eq!(written.borrow().checkpoints, base + 1);
 }
+
+// The global pause the queue publishes reaches the torrents: a pause stops
+// downloading and leaves what is complete seeding, pausing everything stops
+// seeding too, and a resume lets both run again. Neither touches a torrent's
+// own intent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_global_pause_reaches_the_torrents() {
+    let rig = rig(set_clock());
+    let queue = queue();
+    rig.service.publish_to(queue.clone());
+    rig.service.open().await.unwrap();
+    let downloading = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("downloading", 1))))
+        .await
+        .unwrap();
+    let seeding = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("seeding", 2))))
+        .await
+        .unwrap();
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&seeding)
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+
+    let mut published = queue.state().subscribe_job_changes();
+    let paused = |job_id| {
+        let service = rig.service.clone();
+        async move { service.torrent(job_id).await.unwrap().state == TorrentState::Paused }
+    };
+    for (hold, stopped) in [
+        (QueueHold::Downloads, (true, false)),
+        (QueueHold::Everything, (true, true)),
+        (QueueHold::None, (false, false)),
+    ] {
+        published.borrow_and_update();
+        queue.state().set_queue_hold(hold);
+        while (paused(downloading).await, paused(seeding).await) != stopped {
+            published.changed().await.unwrap();
+        }
+    }
+    for job_id in [downloading, seeding] {
+        assert_eq!(
+            rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+            TorrentIntent::Resumed
+        );
+    }
+}

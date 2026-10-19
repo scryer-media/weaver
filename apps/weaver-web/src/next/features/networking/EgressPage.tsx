@@ -5,6 +5,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
   BANDWIDTH_QUERY,
+  BANDWIDTH_SPLIT_QUERY,
   CREATE_EGRESS,
   DELETE_EGRESS,
   RESET_EGRESS_USAGE,
@@ -13,7 +14,7 @@ import {
   UPDATE_EGRESS,
 } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import type { Bandwidth, Egress } from "@/lib/networking";
+import type { Bandwidth, BandwidthSplitState, Egress } from "@/lib/networking";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { RecordEditor } from "../../components/RecordEditor";
 import { SecondaryButton, TextField } from "../../components/controls";
@@ -37,7 +38,7 @@ import {
   QuotaCell,
   quotaSearchText,
 } from "./egress-quota";
-import { LimitControl } from "./limits";
+import { LimitControl, SplitControl } from "./limits";
 import { bindingLabel, formatLimit, Hint, stateLabel, StatusMark } from "./presentation";
 import { TestViaDialog } from "./TestViaDialog";
 
@@ -54,6 +55,9 @@ const NEW_EGRESS: Egress = {
   reason: null,
 };
 
+/** How often the rates the split holds each side to are read again. */
+const SPLIT_REFRESH_MS = 2000;
+
 /** The system egress is the operating system's own routing; it can be limited, never renamed or rebound. */
 const isSystem = (egress: Egress) => egress.id === 0;
 
@@ -68,8 +72,16 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
   const [{ data, fetching }, reexecute] = useQuery<{ networking: { bandwidth: Bandwidth } }>({
     query: BANDWIDTH_QUERY,
   });
+  const [{ data: splitData }, refreshSplit] = useQuery<{ networking: { bandwidthSplit: BandwidthSplitState } }>({
+    query: BANDWIDTH_SPLIT_QUERY,
+  });
   const [updateState, setBandwidth] = useMutation(SET_BANDWIDTH);
   const [status, setStatus] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => refreshSplit({ requestPolicy: "network-only" }), SPLIT_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [refreshSplit]);
   const [error, setError] = useState<string | null>(null);
 
   // A write to an egress takes the status line over from the limits' last save.
@@ -82,7 +94,13 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
 
   const source = useMemo<Bandwidth | null>(() => {
     const bandwidth = data?.networking?.bandwidth;
-    return bandwidth ? { downloadBps: bandwidth.downloadBps ?? null, uploadBps: bandwidth.uploadBps ?? null } : null;
+    return bandwidth
+      ? {
+          downloadBps: bandwidth.downloadBps ?? null,
+          uploadBps: bandwidth.uploadBps ?? null,
+          split: bandwidth.split ? { usenetPct: bandwidth.split.usenetPct } : null,
+        }
+      : null;
   }, [data?.networking?.bandwidth]);
 
   const draft = useDraft(source, () => {
@@ -106,7 +124,8 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
         return;
       }
       setError(null);
-      void setBandwidth({ input: { downloadBps: values.downloadBps, uploadBps: values.uploadBps } }).then((result) => {
+      const input = { downloadBps: values.downloadBps, uploadBps: values.uploadBps, split: values.split };
+      void setBandwidth({ input }).then((result) => {
         if (result.error || !result.data?.setBandwidth) {
           setError(result.error?.message ?? t("next.bandwidth.saveFailed"));
           return;
@@ -114,6 +133,7 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
         draft.markSaved();
         setStatus(t("next.settings.saved"));
         void reexecute({ requestPolicy: "network-only" });
+        refreshSplit({ requestPolicy: "network-only" });
       });
     },
   });
@@ -135,6 +155,29 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
     },
   });
 
+  // The rates each side is held to, while a split is in force over a download limit.
+  const live = splitData?.networking?.bandwidthSplit;
+  const rates =
+    live?.inForce && !live.needsDownloadLimit
+      ? `${t("next.bandwidth.splitUsenet")} ↓ ${formatLimit(t, live.usenetBps)} · ${t("next.bandwidth.splitTorrentsRate")} ↓ ${formatLimit(t, live.torrentBps)}`
+      : undefined;
+  const split: FieldSpec = {
+    id: "split",
+    label: t("next.bandwidth.split"),
+    help: rates,
+    keywords: "split share usenet torrents bandwidth",
+    control: {
+      kind: "custom",
+      control: values ? (
+        <SplitControl
+          value={values.split}
+          needsDownloadLimit={values.downloadBps === null}
+          onChange={(next) => draft.set({ ...values, split: next })}
+        />
+      ) : null,
+    },
+  };
+
   const block: SettingsSectionModel | null = values
     ? {
         kind: "section",
@@ -142,6 +185,7 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
         title: t("next.bandwidth.limits"),
         fields: [
           limit("downloadBps", t("next.bandwidth.downloadLimit")),
+          split,
           limit("uploadBps", t("next.bandwidth.uploadLimit")),
         ],
       }

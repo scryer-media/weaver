@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useState } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
+import type { BandwidthSplit } from "@/lib/networking";
 import { NumberField, Toggle } from "../../components/controls";
 import { MIB } from "./presentation";
 
@@ -44,6 +46,57 @@ export function LimitControl({
         />
       ) : null}
       <Toggle checked={value !== null} label={label} onChange={(on) => onChange(on ? last : null)} />
+    </div>
+  );
+}
+
+/**
+ * How the global download limit is shared: usenet's percentage, torrents the
+ * rest, or no split. Without a download limit there is nothing to share, so
+ * the control is held as it stands and says why; the split it holds is kept.
+ */
+export function SplitControl({
+  value,
+  onChange,
+  needsDownloadLimit,
+}: {
+  value: BandwidthSplit | null;
+  onChange: (next: BandwidthSplit | null) => void;
+  needsDownloadLimit: boolean;
+}) {
+  const t = useTranslate();
+  const [last, setLast] = useState(value?.usenetPct ?? 50);
+  const label = t("next.bandwidth.split");
+  return (
+    <div className="flex flex-wrap items-center justify-end gap-[10px]">
+      {needsDownloadLimit ? (
+        <span className="font-wv-mono text-[11px] text-wv-muted">{t("next.bandwidth.needsDownloadLimit")}</span>
+      ) : null}
+      {value !== null ? (
+        <>
+          <NumberField
+            label={t("next.bandwidth.splitUsenet")}
+            value={value.usenetPct}
+            min={1}
+            max={99}
+            suffix="%"
+            disabled={needsDownloadLimit}
+            onChange={(next) => {
+              setLast(next);
+              onChange({ usenetPct: next });
+            }}
+          />
+          <span className="font-wv-mono text-[11.5px] text-wv-secondary">
+            {t("next.bandwidth.splitTorrents", { pct: 100 - value.usenetPct })}
+          </span>
+        </>
+      ) : null}
+      <Toggle
+        checked={value !== null}
+        label={label}
+        disabled={needsDownloadLimit}
+        onChange={(on) => onChange(on ? { usenetPct: last } : null)}
+      />
     </div>
   );
 }

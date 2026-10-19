@@ -1966,6 +1966,7 @@ export const SCHEDULES_QUERY = gql`
       pruneCancelled { deleteFiles }
       speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -1991,6 +1992,7 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -2016,6 +2018,7 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -2041,6 +2044,7 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -2066,6 +2070,7 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;

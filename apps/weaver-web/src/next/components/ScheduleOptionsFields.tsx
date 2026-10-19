@@ -146,6 +146,22 @@ export function scheduleActionFields({ t, action, value, onChange, targets }: Sc
       },
     ];
   }
+  if (action === "bandwidth_split") {
+    const rows: FieldSpec[] = [{
+      id: "splitLift",
+      label: t("next.schedules.splitLift"),
+      control: { kind: "toggle", value: value.splitLift, onChange: (next) => set({ splitLift: next }) },
+    }];
+    if (!value.splitLift) {
+      rows.push({
+        id: "splitPct",
+        label: t("next.bandwidth.splitUsenet"),
+        help: t("next.bandwidth.splitTorrents", { pct: 100 - value.splitPct }),
+        control: { kind: "number", value: value.splitPct, min: 1, max: 99, suffix: "%", onChange: (next) => set({ splitPct: next }) },
+      });
+    }
+    return rows;
+  }
   if (action === "prune_history") {
     return (["pruneFailed", "pruneCompleted", "pruneCancelled"] as const).flatMap((key) => {
       const choice = value[key];

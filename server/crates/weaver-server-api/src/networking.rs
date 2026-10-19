@@ -364,25 +364,83 @@ fn egress_gql(
 pub struct BandwidthGql {
     pub download_bps: Option<u64>,
     pub upload_bps: Option<u64>,
+    /// How the download limit is shared between usenet and torrents; null
+    /// is no split.
+    pub split: Option<BandwidthSplitGql>,
 }
 impl From<core::Bandwidth> for BandwidthGql {
     fn from(value: core::Bandwidth) -> Self {
         Self {
             download_bps: value.download_bps,
             upload_bps: value.upload_bps,
+            split: value.split.map(Into::into),
         }
     }
+}
+/// Usenet's percentage of the global download limit; torrents get the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "BandwidthSplit")]
+pub struct BandwidthSplitGql {
+    pub usenet_pct: u8,
+}
+impl From<weaver_server_core::bandwidth::BandwidthSplit> for BandwidthSplitGql {
+    fn from(value: weaver_server_core::bandwidth::BandwidthSplit) -> Self {
+        Self {
+            usenet_pct: value.usenet_pct,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, InputObject)]
+pub struct BandwidthSplitInput {
+    pub usenet_pct: u8,
 }
 #[derive(Clone, Copy, Debug, InputObject)]
 pub struct BandwidthInput {
     pub download_bps: Option<u64>,
     pub upload_bps: Option<u64>,
+    /// Left out keeps the split; null clears it.
+    pub split: async_graphql::MaybeUndefined<BandwidthSplitInput>,
 }
-impl From<BandwidthInput> for core::Bandwidth {
-    fn from(value: BandwidthInput) -> Self {
+impl BandwidthInput {
+    fn into_bandwidth(self, stored: core::Bandwidth) -> core::Bandwidth {
+        core::Bandwidth {
+            download_bps: self.download_bps,
+            upload_bps: self.upload_bps,
+            split: match self.split {
+                async_graphql::MaybeUndefined::Undefined => stored.split,
+                async_graphql::MaybeUndefined::Null => None,
+                async_graphql::MaybeUndefined::Value(split) => {
+                    Some(weaver_server_core::bandwidth::BandwidthSplit {
+                        usenet_pct: split.usenet_pct,
+                    })
+                }
+            },
+        }
+    }
+}
+/// The usenet/torrent split as it stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "BandwidthSplitState")]
+pub struct BandwidthSplitStateGql {
+    /// The operator's split.
+    pub stored: Option<BandwidthSplitGql>,
+    /// The split in force: a scheduled one over the operator's.
+    pub in_force: Option<BandwidthSplitGql>,
+    /// No global download limit is in force, so the split does nothing.
+    pub needs_download_limit: bool,
+    /// The download limit usenet is held to this tick; null is no limit.
+    pub usenet_bps: Option<u64>,
+    /// The download limit torrents are held to this tick; null is no limit.
+    pub torrent_bps: Option<u64>,
+}
+impl From<weaver_server_core::bandwidth::SplitState> for BandwidthSplitStateGql {
+    fn from(value: weaver_server_core::bandwidth::SplitState) -> Self {
         Self {
-            download_bps: value.download_bps,
-            upload_bps: value.upload_bps,
+            stored: value.stored.map(Into::into),
+            in_force: value.in_force.map(Into::into),
+            needs_download_limit: value.cap.is_none(),
+            usenet_bps: value.rates.usenet,
+            torrent_bps: value.rates.torrent,
         }
     }
 }
@@ -392,6 +450,10 @@ impl Networking {
     async fn bandwidth(&self, ctx: &Context<'_>) -> Result<BandwidthGql> {
         let config = ctx.data::<weaver_server_core::settings::SharedConfig>()?;
         Ok(config.read().await.bandwidth.into())
+    }
+    async fn bandwidth_split(&self, ctx: &Context<'_>) -> Result<BandwidthSplitStateGql> {
+        let handle = ctx.data::<weaver_server_core::SchedulerHandle>()?;
+        Ok(handle.state().bandwidth_split().into())
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
@@ -1317,7 +1379,7 @@ impl NetworkingMutation {
         let handle = ctx.data::<weaver_server_core::SchedulerHandle>()?;
         let config = ctx.data::<weaver_server_core::settings::SharedConfig>()?;
         let db = ctx.data::<Database>()?;
-        let bandwidth = core::Bandwidth::from(input);
+        let bandwidth = input.into_bandwidth(config.read().await.bandwidth);
         handle
             .save_bandwidth(db, config, bandwidth)
             .await

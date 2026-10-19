@@ -485,7 +485,10 @@ impl Pipeline {
                 self.global_paused = true;
                 self.scheduled_pause = false;
                 self.download_restart_durable_lead_retry_after.clear();
-                self.shared_state.set_paused(true);
+                // The operator's pause stops downloading; what is complete
+                // keeps seeding.
+                self.shared_state
+                    .set_queue_hold(crate::jobs::QueueHold::Downloads);
                 self.shared_state.set_download_block(
                     self.bandwidth_ledger
                         .to_download_block_state(self.global_pause()),
@@ -502,7 +505,8 @@ impl Pipeline {
             SchedulerCommand::ResumeAll { reply } => {
                 self.global_paused = false;
                 self.scheduled_pause = false;
-                self.shared_state.set_paused(false);
+                self.shared_state
+                    .set_queue_hold(crate::jobs::QueueHold::None);
                 self.publish_download_block();
                 if let Err(e) = self
                     .db_blocking(move |db| db.set_setting("global_paused", "false"))
@@ -599,11 +603,18 @@ impl Pipeline {
                 replaces_schedule,
                 reply,
             } => {
+                let split_changed = self.configured_bandwidth.split != bandwidth.split;
                 self.configured_bandwidth = bandwidth;
                 if replaces_schedule && self.scheduled_bandwidth.take().is_some() {
                     // The schedule's rate gives way until its next rule fires.
                     self.publish_download_block();
                     info!(?bandwidth, "bandwidth set over the scheduled limit");
+                }
+                // A split the operator sets gives way to no scheduled one until
+                // the next split rule fires; editing the limits alone leaves a
+                // scheduled split in force.
+                if replaces_schedule && split_changed && self.scheduled_split.take().is_some() {
+                    info!(?bandwidth, "bandwidth split set over the scheduled split");
                 }
                 self.apply_global_rate();
                 let _ = reply.send(());
@@ -632,7 +643,12 @@ impl Pipeline {
                     ScheduleAction::Pause | ScheduleAction::PauseAll => {
                         self.global_paused = true;
                         self.scheduled_pause = true;
-                        self.shared_state.set_paused(true);
+                        // Pause stops downloading and leaves what is complete
+                        // seeding; pause all stops seeding too.
+                        self.shared_state.set_queue_hold(match action {
+                            ScheduleAction::PauseAll => crate::jobs::QueueHold::Everything,
+                            _ => crate::jobs::QueueHold::Downloads,
+                        });
                         // The Scheduled kind now falls out of global_pause(), so
                         // any later block-state refresh keeps reporting it
                         // instead of reclassifying the pause as manual.
@@ -642,7 +658,8 @@ impl Pipeline {
                     ScheduleAction::Resume => {
                         self.global_paused = false;
                         self.scheduled_pause = false;
-                        self.shared_state.set_paused(false);
+                        self.shared_state
+                            .set_queue_hold(crate::jobs::QueueHold::None);
                         self.publish_download_block();
                         info!("schedule: resumed downloads");
                     }
@@ -658,6 +675,7 @@ impl Pipeline {
                                 let scheduled = crate::proxies::Bandwidth {
                                     download_bps: limit.bytes_per_sec,
                                     upload_bps: limit.upload_bytes_per_sec,
+                                    split: None,
                                 };
                                 self.scheduled_bandwidth = Some(scheduled);
                                 self.apply_global_rate();
@@ -669,6 +687,19 @@ impl Pipeline {
                                 "an egress or provider speed limit reached download pipeline"
                             ),
                         }
+                    }
+                    ScheduleAction::BandwidthSplit { usenet_pct } => {
+                        self.scheduled_split =
+                            match usenet_pct.map(crate::bandwidth::BandwidthSplit::new) {
+                                None => None,
+                                Some(Ok(split)) => Some(split),
+                                Some(Err(error)) => {
+                                    warn!(?usenet_pct, %error, "schedule: bandwidth split refused");
+                                    self.scheduled_split
+                                }
+                            };
+                        self.apply_global_rate();
+                        info!(?usenet_pct, "schedule: set bandwidth split");
                     }
                     ScheduleAction::SetQuotaMetering { enabled, target } => {
                         // Metering off suspends an egress's download quota:

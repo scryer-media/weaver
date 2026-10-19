@@ -3002,6 +3002,8 @@ pub struct Pipeline {
     pub(super) configured_bandwidth: crate::proxies::Bandwidth,
     // The global limits a schedule rule has in force, if one does.
     pub(super) scheduled_bandwidth: Option<crate::proxies::Bandwidth>,
+    // The split a schedule rule has in force over the operator's, if one does.
+    pub(super) scheduled_split: Option<crate::bandwidth::BandwidthSplit>,
     // Effective bandwidth rate limiter.
     pub(super) rate_limiter: TokenBucket,
     // Max pending segments per write reorder buffer (memory-adaptive).

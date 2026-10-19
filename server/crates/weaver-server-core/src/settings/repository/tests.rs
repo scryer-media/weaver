@@ -152,6 +152,7 @@ fn config_roundtrip() {
         bandwidth: crate::proxies::Bandwidth {
             download_bps: Some(1_000_000),
             upload_bps: None,
+            split: Some(crate::bandwidth::BandwidthSplit { usenet_pct: 70 }),
         },
         propagation_delay_secs: None,
         cleanup_after_extract: Some(false),
@@ -191,7 +192,7 @@ fn config_roundtrip() {
         Some("/tmp/intermediate".to_string())
     );
     assert_eq!(loaded.complete_dir, Some("/tmp/complete".to_string()));
-    assert_eq!(loaded.bandwidth.download_bps, Some(1_000_000));
+    assert_eq!(loaded.bandwidth, config.bandwidth);
     assert_eq!(loaded.servers[0].max_download_speed, 4_000_000);
     assert_eq!(
         loaded.servers[0].download_quota,

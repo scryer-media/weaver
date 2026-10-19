@@ -227,7 +227,11 @@ impl Pipeline {
         let server_counters = Self::activate_server_counters(&metrics, &nntp);
         let owned_download_lane_pool =
             download::owned_lane::OwnedDownloadLanePool::new(total_connections.max(1));
-        shared_state.set_paused(initial_global_paused);
+        shared_state.set_queue_hold(if initial_global_paused {
+            crate::jobs::QueueHold::Downloads
+        } else {
+            crate::jobs::QueueHold::None
+        });
         let pp_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
         );
@@ -414,6 +418,7 @@ impl Pipeline {
             rate_limit_reservations: HashMap::new(),
             configured_bandwidth: crate::proxies::Bandwidth::default(),
             scheduled_bandwidth: None,
+            scheduled_split: None,
             rate_limiter: TokenBucket::new(None),
             write_buf_max_pending,
             decode_backlog_budget_bytes,
@@ -1450,7 +1455,7 @@ impl Pipeline {
         processed
     }
 
-    fn refresh_periodic_snapshot(&mut self) {
+    pub(in crate::pipeline) fn refresh_periodic_snapshot(&mut self) {
         self.checkpoint_server_attribution_if_due();
         let live = self.pipeline_is_live();
         // Phase rows are sampled while anything moves, and once more after,
@@ -1466,6 +1471,9 @@ impl Pipeline {
             self.publish_download_footprint_metrics();
         }
         self.metrics_rates_moving = self.shared_state.refresh_metrics_snapshot();
+        // The bandwidth tick: the usenet/torrent shares follow what each
+        // side moved at since the last one.
+        self.apply_global_rate();
         self.flush_pending_snapshot();
     }
 

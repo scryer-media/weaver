@@ -2508,6 +2508,7 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     let kept_upload = weaver_server_core::proxies::Bandwidth {
         download_bps: None,
         upload_bps: Some(4096),
+        split: None,
     };
     db.set_network_bandwidth(&kept_upload).unwrap();
     config.write().await.bandwidth = kept_upload;
@@ -2530,6 +2531,7 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     let limited = weaver_server_core::proxies::Bandwidth {
         download_bps: Some(2500 * 1024),
         upload_bps: Some(4096),
+        split: None,
     };
     assert_eq!(config.read().await.bandwidth, limited);
     assert_eq!(db.network_bandwidth().unwrap(), limited);

@@ -253,3 +253,43 @@ fn unreadable_schedules_are_an_error_and_left_as_they_are() {
         Some("invalid")
     );
 }
+
+#[test]
+fn split_rules_round_trip_and_a_split_out_of_range_is_refused() {
+    let db = Database::open_in_memory().unwrap();
+    let entries = vec![
+        rule(
+            "evening",
+            "18:00",
+            vec![],
+            ScheduleAction::BandwidthSplit {
+                usenet_pct: Some(80),
+            },
+        ),
+        rule(
+            "night",
+            "23:00",
+            vec![],
+            ScheduleAction::BandwidthSplit { usenet_pct: None },
+        ),
+    ];
+    db.save_schedules(&entries).unwrap();
+    assert_eq!(db.list_schedules().unwrap(), entries);
+    assert_eq!(
+        entries[0].action.tracks(),
+        vec![crate::bandwidth::ScheduleTrack::Split]
+    );
+
+    for usenet_pct in [0, 100] {
+        let refused = rule(
+            "r",
+            "07:00",
+            vec![],
+            ScheduleAction::BandwidthSplit {
+                usenet_pct: Some(usenet_pct),
+            },
+        );
+        assert!(db.save_schedules(&[refused]).is_err());
+    }
+    assert_eq!(db.list_schedules().unwrap(), entries);
+}

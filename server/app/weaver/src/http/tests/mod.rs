@@ -460,11 +460,11 @@ fn scheduler_handle_with_mock_commands_with_db(
                     let _ = reply.send(result);
                 }
                 SchedulerCommand::PauseAll { reply } => {
-                    state.set_paused(true);
+                    state.set_queue_hold(weaver_server_core::jobs::QueueHold::Downloads);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::ResumeAll { reply } => {
-                    state.set_paused(false);
+                    state.set_queue_hold(weaver_server_core::jobs::QueueHold::None);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetBandwidth { reply, .. } => {

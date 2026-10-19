@@ -189,6 +189,11 @@ impl Holders {
                     None => Ok(()),
                 }
             }
+            ScheduleAction::BandwidthSplit {
+                usenet_pct: Some(usenet_pct),
+            } => crate::bandwidth::BandwidthSplit::new(*usenet_pct)
+                .map(|_| ())
+                .map_err(StateError::Database),
             _ => Ok(()),
         }
     }

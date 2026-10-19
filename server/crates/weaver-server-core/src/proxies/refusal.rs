@@ -23,6 +23,7 @@ pub enum NetworkRefusal {
     EgressSpeedLimitTooLarge,
     EgressQuota(EgressQuotaFault),
     BandwidthLimitTooLarge,
+    BandwidthSplitRange,
     EgressGone,
     EgressNotFound,
     EgressSystemUndeletable,
@@ -155,6 +156,7 @@ impl NetworkRefusal {
             }
             Self::EgressQuota(EgressQuotaFault::SoftAboveHard) => "EGRESS_QUOTA_SOFT_ABOVE_HARD",
             Self::BandwidthLimitTooLarge => "BANDWIDTH_LIMIT_TOO_LARGE",
+            Self::BandwidthSplitRange => "BANDWIDTH_SPLIT_RANGE",
             Self::EgressGone | Self::EgressNotFound => "EGRESS_NOT_FOUND",
             Self::EgressSystemUndeletable => "EGRESS_SYSTEM_UNDELETABLE",
             Self::EgressInUse => "EGRESS_IN_USE",
@@ -287,6 +289,7 @@ impl std::fmt::Display for NetworkRefusal {
             Self::EgressSpeedLimitTooLarge => "egress speed limit is too large",
             Self::EgressQuota(fault) => fault.message(),
             Self::BandwidthLimitTooLarge => "bandwidth limit is too large",
+            Self::BandwidthSplitRange => "a bandwidth split gives usenet 1% to 99%",
             Self::EgressGone => "egress no longer exists",
             Self::EgressNotFound => "egress not found",
             Self::EgressSystemUndeletable => "the System egress cannot be deleted",

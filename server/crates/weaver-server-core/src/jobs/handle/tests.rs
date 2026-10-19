@@ -403,7 +403,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(result);
                 }
                 SchedulerCommand::PauseAll { reply } => {
-                    shared_state.set_paused(true);
+                    shared_state.set_queue_hold(crate::jobs::QueueHold::Downloads);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetSpeedTestPause { paused, reply } => {
@@ -411,7 +411,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::ResumeAll { reply } => {
-                    shared_state.set_paused(false);
+                    shared_state.set_queue_hold(crate::jobs::QueueHold::None);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetPropagationDelay { reply, .. }

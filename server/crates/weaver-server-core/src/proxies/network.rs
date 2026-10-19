@@ -144,6 +144,10 @@ pub const DEFAULT_UPLOAD_TRICKLE_BPS: u64 = 2_048;
 pub struct Bandwidth {
     pub download_bps: Option<u64>,
     pub upload_bps: Option<u64>,
+    // How the download limit is shared between usenet and torrents. It is
+    // kept without a download limit, and does nothing until one is set.
+    #[serde(default)]
+    pub split: Option<crate::bandwidth::BandwidthSplit>,
 }
 
 impl Bandwidth {
@@ -154,6 +158,11 @@ impl Bandwidth {
             .any(|rate| rate > MAX_STORED_BANDWIDTH)
         {
             return Err(NetworkRefusal::BandwidthLimitTooLarge);
+        }
+        if let Some(split) = self.split {
+            split
+                .validate()
+                .map_err(|_| NetworkRefusal::BandwidthSplitRange)?;
         }
         Ok(())
     }

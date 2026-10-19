@@ -48,6 +48,11 @@ pub enum ScheduleAction {
     HardwareProfile {
         profile: crate::runtime::HardwareProfile,
     },
+    // Share the global download limit between usenet and torrents until the
+    // next split rule fires. `None` lifts back to the operator's split.
+    BandwidthSplit {
+        usenet_pct: Option<u8>,
+    },
     SetServerActive {
         server_id: u32,
         active: bool,
@@ -131,6 +136,12 @@ pub enum ScheduleTrack {
     WatchFolder,
     Rss,
     Speed(SpeedTarget),
+    // A split rule is not a speed limit: it shares out whatever download
+    // limit is in force and never lowers it, so the speed limits' rule that
+    // a schedule may lower a limit but never raise it does not apply here.
+    // Split rules hold this track alone: one never ends a pause or a speed
+    // limit, and neither of those ends it.
+    Split,
     Profile,
     Quota(QuotaTarget),
     Server(u32),
@@ -163,6 +174,7 @@ impl ScheduleAction {
                 tracks
             }
             Self::HardwareProfile { .. } => vec![ScheduleTrack::Profile],
+            Self::BandwidthSplit { .. } => vec![ScheduleTrack::Split],
             Self::SetQuotaMetering { target, .. } => vec![ScheduleTrack::Quota(*target)],
             Self::SetServerActive { server_id, .. } => vec![ScheduleTrack::Server(*server_id)],
             Self::PruneHistory { .. } => Vec::new(),

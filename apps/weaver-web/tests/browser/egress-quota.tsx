@@ -67,7 +67,19 @@ const action: NetworkingAction = async (document, variables) => {
   return null;
 };
 // The global limits the daemon holds, one per direction, and every write the page sends through the client.
-let bandwidth: { downloadBps: number | null; uploadBps: number | null } = { downloadBps: 25 * MIB, uploadBps: null };
+let bandwidth: { downloadBps: number | null; uploadBps: number | null; split: { usenetPct: number } | null } = {
+  downloadBps: 25 * MIB, uploadBps: null, split: null,
+};
+// What the daemon holds each side to: the split's shares of the download limit, or the whole limit each with no split.
+const splitState = () => {
+  const cap = bandwidth.downloadBps;
+  const share = (pct: number) => (cap === null ? null : bandwidth.split ? Math.round((cap * pct) / 100) : cap);
+  const usenet = bandwidth.split?.usenetPct ?? 100;
+  return {
+    inForce: bandwidth.split, needsDownloadLimit: cap === null,
+    usenetBps: share(usenet), torrentBps: share(bandwidth.split ? 100 - usenet : 100),
+  };
+};
 const sent: { name: string; variables: Record<string, unknown> }[] = [];
 const actionsRef: { current: { save: () => void; revert: () => void } | null } = { current: null };
 Object.assign(window, { egressQuotaFixture: { saved, sent, actions: actionsRef } });
@@ -80,6 +92,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
   if (name === "SetBandwidth") bandwidth = (operation.variables as { input: typeof bandwidth }).input;
   const answer = name === "EgressQuotas" ? { egressInterfaces: egresses }
     : name === "Bandwidth" ? { networking: { bandwidth } }
+    : name === "BandwidthSplit" ? { networking: { bandwidthSplit: splitState() } }
     : name === "SetBandwidth" ? { setBandwidth: bandwidth }
     : {};
   return fromValue({ operation, data: answer });

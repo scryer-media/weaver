@@ -739,11 +739,11 @@ fn spawn_test_scheduler(
                     let _ = reply.send(());
                 }
                 SchedulerCommand::PauseAll { reply } => {
-                    scheduler_state.set_paused(true);
+                    scheduler_state.set_queue_hold(weaver_server_core::jobs::QueueHold::Downloads);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::ResumeAll { reply } => {
-                    scheduler_state.set_paused(false);
+                    scheduler_state.set_queue_hold(weaver_server_core::jobs::QueueHold::None);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetPropagationDelay { reply, .. }

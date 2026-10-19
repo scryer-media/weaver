@@ -135,11 +135,11 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
                     let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::PauseAll { reply } => {
-                    task_state.set_paused(true);
+                    task_state.set_queue_hold(crate::jobs::QueueHold::Downloads);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::ResumeAll { reply } => {
-                    task_state.set_paused(false);
+                    task_state.set_queue_hold(crate::jobs::QueueHold::None);
                     let _ = reply.send(());
                 }
                 _ => {}
@@ -203,6 +203,7 @@ fn sample_config() -> Config {
         bandwidth: crate::proxies::Bandwidth {
             download_bps: Some(1234),
             upload_bps: None,
+            split: None,
         },
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),

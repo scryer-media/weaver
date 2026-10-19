@@ -326,6 +326,7 @@ pub enum ScheduleTrackGql {
     WatchFolder,
     Rss,
     Speed,
+    Split,
     Profile,
     Quota,
     Server,
@@ -446,6 +447,10 @@ pub struct Schedule {
     /// The profile a `hardware_profile` rule puts in force; null for every
     /// other action.
     pub hardware_profile: Option<HardwareProfileGql>,
+    /// Usenet's percentage of the download limit a `bandwidth_split` rule
+    /// puts in force; null lifts back to the operator's split, and is null
+    /// for every other action.
+    pub split_usenet_pct: Option<u8>,
 }
 
 impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
@@ -459,6 +464,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             Some(ScheduleTrack::WatchFolder) => ScheduleTrackGql::WatchFolder,
             Some(ScheduleTrack::Rss) => ScheduleTrackGql::Rss,
             Some(ScheduleTrack::Speed(_)) => ScheduleTrackGql::Speed,
+            Some(ScheduleTrack::Split) => ScheduleTrackGql::Split,
             Some(ScheduleTrack::Profile) => ScheduleTrackGql::Profile,
             Some(ScheduleTrack::Quota(_)) => ScheduleTrackGql::Quota,
             Some(ScheduleTrack::Server(_)) => ScheduleTrackGql::Server,
@@ -493,6 +499,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             _ => (None, None, None),
         };
         let mut hardware_profile = None;
+        let mut split_usenet_pct = None;
         let mut speed_limits = Vec::new();
         let mut speed_limit_bytes = None;
         let action_type = match &e.action {
@@ -520,6 +527,10 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
                 hardware_profile = Some((*profile).into());
                 "hardware_profile"
             }
+            ScheduleAction::BandwidthSplit { usenet_pct } => {
+                split_usenet_pct = *usenet_pct;
+                "bandwidth_split"
+            }
         };
         Self {
             id: e.id,
@@ -541,6 +552,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             speed_limit_bytes,
             speed_limits,
             hardware_profile,
+            split_usenet_pct,
         }
     }
 }
@@ -572,6 +584,10 @@ pub struct ScheduleInput {
     pub speed_limits: Option<Vec<ScheduleSpeedLimit>>,
     /// Required when the action is `hardware_profile`, ignored otherwise.
     pub hardware_profile: Option<HardwareProfileGql>,
+    /// Usenet's percentage of the download limit for a `bandwidth_split`
+    /// rule, 1 to 99; omit to lift back to the operator's split. Ignored
+    /// for every other action.
+    pub split_usenet_pct: Option<u8>,
 }
 
 impl ScheduleInput {
@@ -634,6 +650,7 @@ impl ScheduleInput {
                 | "pause_rss"
                 | "resume_rss"
                 | "speed_limit"
+                | "bandwidth_split"
                 | "hardware_profile"
                 | "set_server_active"
                 | "set_quota_metering"
@@ -670,6 +687,11 @@ impl ScheduleInput {
         }
         if self.action_type == "speed_limit" && self.speed_limit_changes()?.is_empty() {
             return Err("a speed_limit schedule needs at least one limit".into());
+        }
+        if self.action_type == "bandwidth_split"
+            && let Some(usenet_pct) = self.split_usenet_pct
+        {
+            weaver_server_core::bandwidth::BandwidthSplit::new(usenet_pct)?;
         }
         if self.action_type == "set_server_active"
             && (self.server_id.is_none() || self.server_active.is_none())
@@ -739,6 +761,9 @@ impl ScheduleInput {
                 }
                 ScheduleAction::SpeedLimit { limits }
             }
+            "bandwidth_split" => ScheduleAction::BandwidthSplit {
+                usenet_pct: self.split_usenet_pct,
+            },
             "hardware_profile" => match self.hardware_profile {
                 Some(profile) => ScheduleAction::HardwareProfile {
                     profile: profile.into(),
@@ -834,6 +859,7 @@ mod schedule_input_tests {
             speed_limit_bytes: None,
             speed_limits: None,
             hardware_profile: None,
+            split_usenet_pct: None,
         }
     }
 
@@ -1038,6 +1064,37 @@ mod schedule_input_tests {
             delete_files: false,
         });
         rule.validate(&probe()).unwrap();
+    }
+
+    #[test]
+    fn a_split_rule_sets_a_percentage_or_lifts_and_refuses_one_out_of_range() {
+        let mut rule = input("bandwidth_split");
+        rule.split_usenet_pct = Some(80);
+        rule.validate(&probe()).unwrap();
+        let entry = rule.into_entry().unwrap();
+        assert_eq!(
+            entry.action,
+            ScheduleAction::BandwidthSplit {
+                usenet_pct: Some(80)
+            }
+        );
+        let shown = Schedule::from(entry);
+        assert_eq!(shown.action_type, "bandwidth_split");
+        assert_eq!(shown.track, ScheduleTrackGql::Split);
+        assert_eq!(shown.split_usenet_pct, Some(80));
+
+        let lift = input("bandwidth_split");
+        lift.validate(&probe()).unwrap();
+        assert_eq!(
+            lift.into_entry().unwrap().action,
+            ScheduleAction::BandwidthSplit { usenet_pct: None }
+        );
+
+        for usenet_pct in [0, 100] {
+            let mut rule = input("bandwidth_split");
+            rule.split_usenet_pct = Some(usenet_pct);
+            assert!(rule.validate(&probe()).is_err());
+        }
     }
 }
 

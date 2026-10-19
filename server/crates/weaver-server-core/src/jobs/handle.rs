@@ -112,7 +112,13 @@ pub struct SharedPipelineState {
     // The owner of the jobs published beside the pipeline's.
     owner: Arc<RwLock<Option<Arc<dyn QueueOwner>>>>,
     job_revision: tokio::sync::watch::Sender<u64>,
-    paused: Arc<AtomicBool>,
+    // The global pause in force, which the pipeline publishes and every
+    // owner of queue items follows.
+    queue_hold: tokio::sync::watch::Sender<QueueHold>,
+    // The torrent side of the global download limit, once torrents run.
+    torrent_rate: Arc<RwLock<Option<Arc<dyn TorrentRate>>>>,
+    // How the global download limit is shared out, as last put in force.
+    bandwidth_split: Arc<RwLock<crate::bandwidth::SplitState>>,
     speed_test_paused: Arc<AtomicBool>,
     schedule_replay_paused: Arc<AtomicBool>,
     // Why the schedule evaluator is holding download admission, while it is.
@@ -210,7 +216,9 @@ impl SharedPipelineState {
             })),
             owner: Arc::new(RwLock::new(None)),
             job_revision,
-            paused: Arc::new(AtomicBool::new(false)),
+            queue_hold: tokio::sync::watch::channel(QueueHold::None).0,
+            torrent_rate: Arc::new(RwLock::new(None)),
+            bandwidth_split: Arc::new(RwLock::new(crate::bandwidth::SplitState::default())),
             speed_test_paused: Arc::new(AtomicBool::new(false)),
             schedule_replay_paused: Arc::new(AtomicBool::new(false)),
             schedule_hold_reason: Arc::new(RwLock::new(None)),
@@ -298,7 +306,16 @@ impl SharedPipelineState {
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed) || self.speed_test_paused()
+        *self.queue_hold.borrow() != QueueHold::None || self.speed_test_paused()
+    }
+
+    pub fn queue_hold(&self) -> QueueHold {
+        *self.queue_hold.borrow()
+    }
+
+    // Wakes on each change of the global pause.
+    pub fn subscribe_queue_hold(&self) -> tokio::sync::watch::Receiver<QueueHold> {
+        self.queue_hold.subscribe()
     }
 
     pub(crate) fn speed_test_paused(&self) -> bool {
@@ -429,8 +446,26 @@ impl SharedPipelineState {
         self.metrics_refreshes.load(Ordering::Relaxed)
     }
 
-    pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
+    pub fn set_queue_hold(&self, hold: QueueHold) {
+        self.queue_hold
+            .send_if_modified(|current| std::mem::replace(current, hold) != hold);
+    }
+
+    // Seat the torrent side of the global download limit.
+    pub fn seat_torrent_rate(&self, rate: Arc<dyn TorrentRate>) {
+        *self.torrent_rate.write().unwrap() = Some(rate);
+    }
+
+    pub fn torrent_rate(&self) -> Option<Arc<dyn TorrentRate>> {
+        self.torrent_rate.read().unwrap().clone()
+    }
+
+    pub fn set_bandwidth_split(&self, state: crate::bandwidth::SplitState) {
+        *self.bandwidth_split.write().unwrap() = state;
+    }
+
+    pub fn bandwidth_split(&self) -> crate::bandwidth::SplitState {
+        *self.bandwidth_split.read().unwrap()
     }
 
     pub fn set_download_block(&self, mut state: DownloadBlockState) {
@@ -680,6 +715,37 @@ pub enum QueueAction {
 #[async_trait::async_trait]
 pub trait QueueOwner: Send + Sync {
     async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError>;
+}
+
+// What the global pause stops. Every owner of queue items follows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QueueHold {
+    #[default]
+    None,
+    // Downloading stops; what is complete keeps seeding.
+    Downloads,
+    // Everything stops, seeding too.
+    Everything,
+}
+
+impl QueueHold {
+    // Whether this hold stops an item, given whether it has finished
+    // downloading.
+    pub const fn stops(self, complete: bool) -> bool {
+        match self {
+            Self::None => false,
+            Self::Downloads => !complete,
+            Self::Everything => true,
+        }
+    }
+}
+
+// The torrent side of the global download limit.
+pub trait TorrentRate: Send + Sync {
+    // What torrents downloaded at over the last second, in bytes per second.
+    fn download_bps(&self) -> u64;
+    // Put the torrents' download rate in force. `None` is no limit.
+    fn set_download_rate(&self, rate: Option<u64>);
 }
 
 // Splice `job_id` to its new position in the manual queue order. Pure so the

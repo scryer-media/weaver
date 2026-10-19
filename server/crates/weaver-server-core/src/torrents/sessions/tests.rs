@@ -404,3 +404,43 @@ async fn a_route_that_goes_down_holds_closed_until_it_is_back() {
     assert_eq!(routes.opened.load(Ordering::SeqCst), 2);
     sessions.stop_all().await;
 }
+
+// The torrents' rate is laid over every open session, live, and a session
+// that opens later takes its share at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_torrent_rate_is_shared_across_the_open_sessions() {
+    use std::num::NonZeroU32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.route(TorrentScope::Default, 1);
+    routes.route(TorrentScope::Category(6), 2);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let rate = |session: &Session| session.ratelimits.get_download_bps().map(NonZeroU32::get);
+
+    let one = sessions
+        .session(&routes.plan(TorrentScope::Default).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rate(&one), None);
+    sessions.rates().set(Some(1_000_000));
+    assert_eq!(rate(&one), Some(1_000_000));
+
+    let two = sessions
+        .session(&routes.plan(TorrentScope::Category(6)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!((rate(&one), rate(&two)), (Some(500_000), Some(500_000)));
+    assert_eq!(sessions.rates().download_bps(), 0);
+
+    // Nothing is a rate of one byte a second, the least the limiter takes.
+    sessions.rates().set(Some(0));
+    assert_eq!((rate(&one), rate(&two)), (Some(1), Some(1)));
+    sessions.rates().set(None);
+    assert_eq!((rate(&one), rate(&two)), (None, None));
+    sessions.stop_all().await;
+}

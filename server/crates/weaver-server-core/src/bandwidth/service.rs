@@ -350,12 +350,49 @@ impl Pipeline {
         })
     }
 
-    // Put the global download rate in force on the dispatch limiter.
+    // The usenet/torrent split in force: a scheduled one over the
+    // operator's.
+    pub(crate) fn split_in_force(&self) -> Option<crate::bandwidth::BandwidthSplit> {
+        self.scheduled_split.or(self.configured_bandwidth.split)
+    }
+
+    // Put the global download rate in force, shared between usenet and
+    // torrents by the split in force from what each moved at over the last
+    // tick. Run on every change to the limit or the split and on the
+    // bandwidth tick, so the shares follow throughput.
     pub(crate) fn apply_global_rate(&mut self) {
-        let rate = self.global_rate(crate::bandwidth::Direction::Download);
-        if self.rate_limiter.rate() != rate {
-            self.rate_limiter.set_rate(rate);
+        let cap = self.global_rate(crate::bandwidth::Direction::Download);
+        let split = self.split_in_force();
+        let torrents = self.shared_state.torrent_rate();
+        let rates = match &torrents {
+            Some(torrents) => crate::bandwidth::split_rates(
+                cap,
+                split,
+                crate::bandwidth::SplitUse {
+                    usenet: self.shared_state.metrics_snapshot().current_download_speed,
+                    torrent: torrents.download_bps(),
+                },
+            ),
+            // With no torrent side there is nothing to share: usenet is held
+            // to the limit itself.
+            None => crate::bandwidth::SplitRates {
+                usenet: cap,
+                torrent: None,
+            },
+        };
+        if self.rate_limiter.rate() != rates.usenet {
+            self.rate_limiter.set_rate(rates.usenet);
         }
+        if let Some(torrents) = torrents {
+            torrents.set_download_rate(rates.torrent);
+        }
+        self.shared_state
+            .set_bandwidth_split(crate::bandwidth::SplitState {
+                stored: self.configured_bandwidth.split,
+                in_force: split,
+                cap,
+                rates,
+            });
     }
 
     // The current global-pause origin, so every download-block refresh reports

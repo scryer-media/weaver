@@ -20,6 +20,7 @@ export const SCHEDULE_ACTIONS = [
   { value: "pause_rss", label: "next.schedules.pauseRss" },
   { value: "resume_rss", label: "next.schedules.resumeRss" },
   { value: "speed_limit", label: "next.schedules.setLimit" },
+  { value: "bandwidth_split", label: "next.schedules.setSplit" },
   { value: "hardware_profile", label: "next.schedules.setProfile" },
   { value: "set_server_active", label: "next.schedules.serverActive" },
   { value: "prune_history", label: "next.schedules.pruneHistory" },
@@ -85,10 +86,16 @@ export interface ScheduleOptions {
   pruneCompleted: { deleteFiles: boolean } | null;
   pruneCancelled: { deleteFiles: boolean } | null;
   speedLimits: ScheduleSpeedLimit[];
+  /** Usenet's percentage a split rule puts in force; null lifts back to the stored split. */
+  splitUsenetPct: number | null;
 }
 
-export interface ScheduleOptionsForm extends Omit<ScheduleOptions, "times" | "speedLimits"> {
+export interface ScheduleOptionsForm extends Omit<ScheduleOptions, "times" | "speedLimits" | "splitUsenetPct"> {
   timesText: string;
+  /** A split rule that lifts the scheduled split rather than setting one. */
+  splitLift: boolean;
+  /** The percentage a split rule sets, kept while Lift is on. */
+  splitPct: number;
   /** What the rule sets on each target, keyed by {@link speedKey}. A target with no entry is left as it is. */
   speeds: Record<string, SpeedEntry>;
 }
@@ -209,6 +216,10 @@ export function scheduleActionDetails(
       return schedule.speedLimits.length > 0
         ? speedLimitsLabel(t, schedule.speedLimits, targets)
         : t("next.schedules.speedNothing");
+    case "bandwidth_split":
+      return schedule.splitUsenetPct === null
+        ? t("next.schedules.splitLifted")
+        : t("next.schedules.splitTo", { usenet: schedule.splitUsenetPct, torrent: 100 - schedule.splitUsenetPct });
     case "prune_history": {
       const choices = (["pruneFailed", "pruneCompleted", "pruneCancelled"] as const)
         .filter((key) => schedule[key] !== null)
@@ -225,15 +236,18 @@ export const NEW_SCHEDULE_OPTIONS: ScheduleOptionsForm = {
   serverId: null, serverActive: true, quotaMeteringEnabled: true, quotaEgressId: null,
   pruneFailed: null, pruneCompleted: null, pruneCancelled: null,
   speeds: {},
+  splitLift: false, splitPct: 50,
 };
 
 /** Only pruning runs once each time rather than holding until the next rule. */
 export const isOneShot = (action: string) => action === "prune_history";
 
-export function optionsFromSchedule(schedule: ScheduleOptions): ScheduleOptionsForm {
-  const { times, speedLimits, ...rest } = schedule;
+export function optionsFromSchedule(schedule: ScheduleOptions & { actionType: string }): ScheduleOptionsForm {
+  const { times, speedLimits, splitUsenetPct, actionType, ...rest } = schedule;
   return {
     ...rest,
+    splitLift: actionType === "bandwidth_split" && splitUsenetPct === null,
+    splitPct: splitUsenetPct ?? 50,
     timesText: (times ?? []).join(", "),
     serverActive: schedule.serverActive ?? true,
     quotaMeteringEnabled: schedule.quotaMeteringEnabled ?? true,
@@ -261,6 +275,7 @@ export function optionsInput(form: ScheduleOptionsForm, action: string, stored: 
     pruneCompleted: action === "prune_history" ? form.pruneCompleted : null,
     pruneCancelled: action === "prune_history" ? form.pruneCancelled : null,
     speedLimits: action === "speed_limit" ? speedLimitsInput(form.speeds, stored) : null,
+    splitUsenetPct: action === "bandwidth_split" && !form.splitLift ? form.splitPct : null,
   };
 }
 

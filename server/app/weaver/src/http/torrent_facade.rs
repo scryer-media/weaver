@@ -134,6 +134,11 @@ impl TorrentFacadeContext {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    // The download limit torrents are held to this tick.
+    fn torrent_download_limit(&self) -> Option<u64> {
+        self.inner.handle.state().bandwidth_split().rates.torrent
+    }
+
     // Every torrent with its files, which its paths follow.
     async fn views(&self) -> Vec<TorrentView> {
         let Some(torrents) = &self.inner.torrents else {
@@ -486,8 +491,8 @@ async fn handle(
         ("sync", "maindata") => maindata(&ctx).await,
         ("transfer", "info") => {
             let views = ctx.views().await;
-            let bandwidth = ctx.inner.config.read().await.bandwidth;
-            axum::Json(transfer(&views, bandwidth)).into_response()
+            let upload = ctx.inner.config.read().await.bandwidth.upload_bps;
+            axum::Json(transfer(&views, ctx.torrent_download_limit(), upload)).into_response()
         }
         _ => text(StatusCode::NOT_FOUND, "Not Found"),
     }
@@ -1158,6 +1163,7 @@ async fn set_preferences(ctx: &TorrentFacadeContext, params: &Params) -> Respons
         let bandwidth = Bandwidth {
             download_bps: download.unwrap_or(current.download_bps),
             upload_bps: upload.unwrap_or(current.upload_bps),
+            ..current
         };
         if bandwidth.validate().is_err() {
             return text(StatusCode::BAD_REQUEST, "limit too large");
@@ -1263,7 +1269,9 @@ async fn create_category(ctx: &TorrentFacadeContext, params: &Params) -> Respons
     ok()
 }
 
-fn transfer(views: &[TorrentView], bandwidth: Bandwidth) -> Value {
+// The download limit is what torrents are held to this tick: their share of
+// the global limit, not the limit itself.
+fn transfer(views: &[TorrentView], download: Option<u64>, upload: Option<u64>) -> Value {
     let fields = json!({
         "dl_info_speed": views.iter().map(|view| view.download_bps).sum::<u64>(),
         "dl_info_data": views.iter().map(|view| view.downloaded_bytes).sum::<u64>(),
@@ -1274,10 +1282,7 @@ fn transfer(views: &[TorrentView], bandwidth: Bandwidth) -> Value {
     });
     with_limits(
         fields,
-        [
-            ("dl_rate_limit", bandwidth.download_bps),
-            ("up_rate_limit", bandwidth.upload_bps),
-        ],
+        [("dl_rate_limit", download), ("up_rate_limit", upload)],
     )
 }
 
@@ -1297,7 +1302,11 @@ async fn maindata(ctx: &TorrentFacadeContext) -> Response {
             (hash, entry)
         })
         .collect();
-    let mut server_state = transfer(&views, config.bandwidth);
+    let mut server_state = transfer(
+        &views,
+        ctx.torrent_download_limit(),
+        config.bandwidth.upload_bps,
+    );
     if let Some(state) = server_state.as_object_mut() {
         state.insert("queueing".into(), Value::Bool(false));
         state.insert("use_alt_speed_limits".into(), Value::Bool(false));

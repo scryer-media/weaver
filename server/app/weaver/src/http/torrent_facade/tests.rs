@@ -1171,7 +1171,18 @@ async fn a_cap_of_nothing_is_never_read_as_no_limit() {
     rig.config.write().await.bandwidth = Bandwidth {
         download_bps: Some(0),
         upload_bps: None,
+        split: None,
     };
+    rig.context.inner.handle.state().set_bandwidth_split(
+        weaver_server_core::bandwidth::SplitState {
+            cap: Some(0),
+            rates: weaver_server_core::bandwidth::SplitRates {
+                usenet: Some(0),
+                torrent: Some(0),
+            },
+            ..Default::default()
+        },
+    );
     let preferences = rig.get("/api/v2/app/preferences").await.json();
     assert!(preferences.get("dl_limit").is_none());
     assert_eq!(preferences["up_limit"], 0);

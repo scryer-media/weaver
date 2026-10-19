@@ -817,3 +817,20 @@ scope = "all"
 kind = "rust"
 hook_id = "move_bandwidth_to_networking_v69"
 scope = "upgrade_only"
+
+[[migration]]
+version = 70
+description = "the global download limit can be split between usenet and torrents"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0070_bandwidth_split/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0070_bandwidth_split/schema.sql"
+engine = "postgres"
+scope = "all"

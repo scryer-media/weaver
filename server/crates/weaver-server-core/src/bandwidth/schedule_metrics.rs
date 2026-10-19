@@ -29,6 +29,7 @@ pub enum ActionKind {
     PauseRss,
     ResumeRss,
     SpeedLimit,
+    BandwidthSplit,
     HardwareProfile,
     SetServerActive,
     SetQuotaMetering,
@@ -36,7 +37,7 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Pause,
         Self::Resume,
         Self::PauseAll,
@@ -47,6 +48,7 @@ impl ActionKind {
         Self::PauseRss,
         Self::ResumeRss,
         Self::SpeedLimit,
+        Self::BandwidthSplit,
         Self::HardwareProfile,
         Self::SetServerActive,
         Self::SetQuotaMetering,
@@ -65,6 +67,7 @@ impl ActionKind {
             ScheduleAction::PauseRss => Self::PauseRss,
             ScheduleAction::ResumeRss => Self::ResumeRss,
             ScheduleAction::SpeedLimit { .. } => Self::SpeedLimit,
+            ScheduleAction::BandwidthSplit { .. } => Self::BandwidthSplit,
             ScheduleAction::HardwareProfile { .. } => Self::HardwareProfile,
             ScheduleAction::SetServerActive { .. } => Self::SetServerActive,
             ScheduleAction::SetQuotaMetering { .. } => Self::SetQuotaMetering,
@@ -84,6 +87,7 @@ impl ActionKind {
             Self::PauseRss => "pause_rss",
             Self::ResumeRss => "resume_rss",
             Self::SpeedLimit => "speed_limit",
+            Self::BandwidthSplit => "bandwidth_split",
             Self::HardwareProfile => "hardware_profile",
             Self::SetServerActive => "set_server_active",
             Self::SetQuotaMetering => "set_quota_metering",
@@ -108,6 +112,7 @@ impl ActionKind {
             }
             Self::PauseRss | Self::ResumeRss => &[TrackKind::Rss],
             Self::SpeedLimit => &[TrackKind::Speed],
+            Self::BandwidthSplit => &[TrackKind::Split],
             Self::HardwareProfile => &[TrackKind::Profile],
             Self::SetServerActive => &[TrackKind::Server],
             Self::SetQuotaMetering => &[TrackKind::Quota],
@@ -123,6 +128,7 @@ pub enum TrackKind {
     WatchFolder,
     Rss,
     Speed,
+    Split,
     Profile,
     Quota,
     Server,
@@ -130,12 +136,13 @@ pub enum TrackKind {
 }
 
 impl TrackKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Downloads,
         Self::PostProcessing,
         Self::WatchFolder,
         Self::Rss,
         Self::Speed,
+        Self::Split,
         Self::Profile,
         Self::Quota,
         Self::Server,
@@ -149,6 +156,7 @@ impl TrackKind {
             ScheduleTrack::WatchFolder => Self::WatchFolder,
             ScheduleTrack::Rss => Self::Rss,
             ScheduleTrack::Speed(_) => Self::Speed,
+            ScheduleTrack::Split => Self::Split,
             ScheduleTrack::Profile => Self::Profile,
             ScheduleTrack::Quota(_) => Self::Quota,
             ScheduleTrack::Server(_) => Self::Server,
@@ -162,6 +170,7 @@ impl TrackKind {
             Self::WatchFolder => "watch_folder",
             Self::Rss => "rss",
             Self::Speed => "speed",
+            Self::Split => "split",
             Self::Profile => "profile",
             Self::Quota => "quota",
             Self::Server => "server",

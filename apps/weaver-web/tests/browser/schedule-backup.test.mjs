@@ -217,7 +217,7 @@ test("the action picker offers the holds, then the settings a rule switches, and
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
       "Pause downloads", "Resume downloads", "Pause all intake", "Pause post-processing", "Resume post-processing",
       "Pause watch folder scanning", "Resume watch folder scanning", "Pause RSS", "Resume RSS", "Set a speed limit",
-      "Switch the hardware profile", "Set server availability", "Prune history", "Set quota metering",
+      "Bandwidth split", "Switch the hardware profile", "Set server availability", "Prune history", "Set quota metering",
     ]);
     await page.keyboard.press("Escape");
     assert.equal(await form.getByRole("button", { name: "Script job", exact: true }).count(), 0);
@@ -283,6 +283,43 @@ test("a speed rule sets the global limits, each egress and each provider on its 
     await edit.getByRole("button", { name: "Save", exact: true }).click();
     await edit.waitFor({ state: "hidden" });
     assert.deepEqual((await storedSchedules(page))[0].speedLimits.map((limit) => limit.kind), ["GLOBAL", "EGRESS"]);
+  } finally { await page.close(); }
+});
+
+test("a split rule puts a percentage in force, or lifts back to the stored split", async () => {
+  const page = await open("?schedules");
+  try {
+    await addSchedule(page).click();
+    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    await form.getByLabel("Label", { exact: true }).fill("fixture evening split");
+    await choose(page, form, "Action", "Bandwidth split");
+    const usenet = form.getByRole("spinbutton", { name: "Usenet", exact: true });
+    assert.equal(await toggle(form, "Lift").getAttribute("aria-checked"), "false");
+    assert.equal(await usenet.inputValue(), "50");
+    await usenet.fill("80");
+    await usenet.press("Tab");
+    await form.getByText("Torrents 20%", { exact: true }).waitFor();
+    await shot(page, "bandwidth-split-editor");
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await form.waitFor({ state: "hidden" });
+    const [rule] = await storedSchedules(page);
+    assert.deepEqual([rule.actionType, rule.splitUsenetPct], ["bandwidth_split", 80]);
+    // A split rule holds its own group, apart from the speed limits.
+    const row = groupRow(page, "Bandwidth split", "fixture evening split");
+    await row.getByText("Bandwidth split: usenet 80%, torrents 20%", { exact: true }).waitFor();
+
+    // Lift sends no percentage; reopened, the rule still reads as a lift.
+    await row.click();
+    const edit = page.getByRole("dialog", { name: "fixture evening split", exact: true });
+    assert.equal(await edit.getByRole("spinbutton", { name: "Usenet", exact: true }).inputValue(), "80");
+    await toggle(edit, "Lift").click();
+    assert.equal(await edit.getByRole("spinbutton", { name: "Usenet", exact: true }).count(), 0);
+    await edit.getByRole("button", { name: "Save", exact: true }).click();
+    await edit.waitFor({ state: "hidden" });
+    assert.equal((await storedSchedules(page))[0].splitUsenetPct, null);
+    await row.getByText("Bandwidth split: lift", { exact: true }).waitFor();
+    await row.click();
+    assert.equal(await toggle(page.getByRole("dialog", { name: "fixture evening split", exact: true }), "Lift").getAttribute("aria-checked"), "true");
   } finally { await page.close(); }
 });
 

@@ -7,6 +7,7 @@ use super::{
     Bandwidth, EgressBinding, EgressInterface, EgressQuota, LegPath, NetworkRefusal, ProxyPool,
     ProxyProfile, Route, RoutingPolicy, Rung,
 };
+use crate::bandwidth::BandwidthSplit;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::servers::ServerDownloadQuotaPeriod;
 use crate::servers::record::{parse_quota_weekday, quota_weekday_str};
@@ -279,7 +280,7 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let Some(row) = SqlRuntime::fetch_optional(
                 store.read_exec(),
-                "SELECT download_bps, upload_bps FROM network_bandwidth WHERE id = 1",
+                "SELECT download_bps, upload_bps, usenet_split_pct FROM network_bandwidth WHERE id = 1",
                 &[],
             )
             .await?
@@ -289,6 +290,9 @@ impl Database {
             Ok(Bandwidth {
                 download_bps: opt_u64(&row, "download_bps")?,
                 upload_bps: opt_u64(&row, "upload_bps")?,
+                split: opt_u64(&row, "usenet_split_pct")?.map(|pct| BandwidthSplit {
+                    usenet_pct: u8::try_from(pct).unwrap_or(u8::MAX),
+                }),
             })
         })
     }
@@ -300,12 +304,15 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 store.read_exec(),
-                "INSERT INTO network_bandwidth (id, download_bps, upload_bps) VALUES (1, {}, {})
+                "INSERT INTO network_bandwidth (id, download_bps, upload_bps, usenet_split_pct)
+                 VALUES (1, {}, {}, {})
                  ON CONFLICT(id) DO UPDATE SET download_bps = excluded.download_bps,
-                     upload_bps = excluded.upload_bps",
+                     upload_bps = excluded.upload_bps,
+                     usenet_split_pct = excluded.usenet_split_pct",
                 &[
                     opt_arg(bandwidth.download_bps),
                     opt_arg(bandwidth.upload_bps),
+                    opt_arg(bandwidth.split.map(|split| u64::from(split.usenet_pct))),
                 ],
             )
             .await?;

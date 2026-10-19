@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use librqbit::{TorrentStats, TorrentStatsState};
 
 use crate::jobs::JobId;
+use crate::jobs::QueueHold;
 use crate::settings::{SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{TorrentCounters, TorrentIntent, TorrentState};
 
@@ -107,6 +108,8 @@ pub struct Observed {
     pub intent: TorrentIntent,
     /// Held back by the download queue.
     pub queued: bool,
+    /// Stopped by the global pause.
+    pub paused_globally: bool,
     /// Why unpacking refused the torrent's output, while that stands.
     pub failed: Option<String>,
     pub held: Option<Held>,
@@ -126,6 +129,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
             return (TorrentState::Stopped, why);
         }
         TorrentIntent::Resumed => {}
+    }
+    if seen.paused_globally {
+        return (TorrentState::Paused, None);
     }
     if let Some(held) = &seen.held {
         return (held.state(), Some(held.detail(seen.complete)));
@@ -234,12 +240,16 @@ pub struct Queued {
     pub paused: bool,
 }
 
-/// The torrents the queue lets run: every forced or complete one, and the
-/// first `max_active` of the rest that are not paused.
-pub fn active(torrents: &[Queued], max_active: u32) -> BTreeSet<JobId> {
+/// The torrents the queue lets run: of those the global pause does not
+/// stop, every forced or complete one, and the first `max_active` of the
+/// rest that are not paused.
+pub fn active(torrents: &[Queued], max_active: u32, hold: QueueHold) -> BTreeSet<JobId> {
     let mut slots = max_active as usize;
     let mut active = BTreeSet::new();
     for torrent in torrents {
+        if hold.stops(torrent.complete) {
+            continue;
+        }
         if torrent.forced || torrent.complete {
             active.insert(torrent.job_id);
         } else if !torrent.paused && slots > 0 {
@@ -262,6 +272,7 @@ mod tests {
             complete: false,
             intent: TorrentIntent::Resumed,
             queued: false,
+            paused_globally: false,
             failed: None,
             held: None,
             disk_full: false,
@@ -309,6 +320,17 @@ mod tests {
                 ..seen(Engine::Paused { finished: false })
             }),
             (TorrentState::Queued, None)
+        );
+        // The global pause outranks what else holds a torrent, and a complete
+        // torrent it stops is paused, not seeding.
+        assert_eq!(
+            project(&Observed {
+                paused_globally: true,
+                complete: true,
+                held: Some(Held::RouteDown(String::new())),
+                ..seen(Engine::Paused { finished: true })
+            }),
+            (TorrentState::Paused, None)
         );
         assert_eq!(
             project(&Observed {
@@ -482,11 +504,17 @@ mod tests {
             torrent(5, false, false, false),
             torrent(6, false, false, false),
         ];
-        let active = active(&torrents, 2);
-        assert_eq!(
-            active.into_iter().map(|id| id.0).collect::<Vec<_>>(),
-            [1, 3, 4, 5]
-        );
+        let ids = |hold| {
+            active(&torrents, 2, hold)
+                .into_iter()
+                .map(|id| id.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(QueueHold::None), [1, 3, 4, 5]);
+        // A pause stops every download, forced ones too, and leaves the
+        // complete ones seeding; pausing everything stops those too.
+        assert_eq!(ids(QueueHold::Downloads), [1]);
+        assert!(ids(QueueHold::Everything).is_empty());
         assert_eq!(eta_seconds(1000, 300), Some(4));
         assert_eq!(eta_seconds(1000, 0), None);
     }

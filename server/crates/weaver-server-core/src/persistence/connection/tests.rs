@@ -2655,6 +2655,7 @@ async fn postgres_runtime_smoke_when_configured() {
         bandwidth: crate::proxies::Bandwidth {
             download_bps: Some(12_345),
             upload_bps: None,
+            split: Some(crate::bandwidth::BandwidthSplit { usenet_pct: 70 }),
         },
         cleanup_after_extract: Some(false),
         propagation_delay_secs: Some(0),

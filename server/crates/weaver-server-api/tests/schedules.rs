@@ -730,3 +730,34 @@ async fn a_hardware_profile_the_machine_cannot_honour_is_refused_in_a_schedule()
         "BALANCED"
     );
 }
+
+#[tokio::test]
+async fn a_split_rule_holds_the_split_track_and_lifts_without_a_percentage() {
+    let h = common::TestHarness::new().await;
+    for (input, pct) in [
+        (r#"splitUsenetPct: 80"#, serde_json::json!(80)),
+        ("", serde_json::Value::Null),
+    ] {
+        let response = h
+            .execute(&format!(
+                r#"mutation {{ createSchedule(input: {{ enabled: false, label: "split-{pct}", time: "08:00", actionType: "bandwidth_split", {input} }}) {{ label actionType track splitUsenetPct }} }}"#
+            ))
+            .await;
+        common::assert_no_errors(&response);
+        let data = common::response_data(&response);
+        let rule = data["createSchedule"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["label"] == format!("split-{pct}"))
+            .cloned()
+            .unwrap();
+        assert_eq!(rule["actionType"], "bandwidth_split");
+        assert_eq!(rule["track"], "SPLIT");
+        assert_eq!(rule["splitUsenetPct"], pct);
+    }
+    common::assert_has_errors(
+        &h.execute(r#"mutation { createSchedule(input: { enabled: false, time: "08:00", actionType: "bandwidth_split", splitUsenetPct: 100 }) { id } }"#)
+            .await,
+    );
+}

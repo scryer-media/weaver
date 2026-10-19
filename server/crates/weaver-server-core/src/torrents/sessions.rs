@@ -29,6 +29,7 @@ use crate::proxies::{
 use crate::settings::TorrentEncryption;
 use crate::torrents::identity::ClientIdentity;
 use crate::torrents::net::{LegKind, LegSockets, tracker_client};
+use crate::torrents::rate::SessionRates;
 
 /// The most sessions that run at once.
 pub const MAX_SESSIONS: usize = 8;
@@ -325,6 +326,8 @@ pub struct Sessions {
     encryption: Mutex<TorrentEncryption>,
     // Held while the stored port slots are read and written.
     port_slots: Arc<Mutex<()>>,
+    // The torrents' download rate, laid over every open session.
+    rates: SessionRates,
 }
 
 impl Sessions {
@@ -337,7 +340,13 @@ impl Sessions {
             on: AtomicBool::new(true),
             encryption: Mutex::new(TorrentEncryption::default()),
             port_slots: Arc::default(),
+            rates: SessionRates::default(),
         }
+    }
+
+    /// The torrents' download rate across the open sessions.
+    pub fn rates(&self) -> &SessionRates {
+        &self.rates
     }
 
     /// The encryption sessions opened from now on ask of their peers.
@@ -439,6 +448,7 @@ impl Sessions {
         let peers = self.env.max_peers_total as usize / (open + 1);
         match self.build(plan, port_slot, peers).await {
             Ok((session, leg, port)) => {
+                self.rates.add(&session);
                 slots.insert(
                     plan.key.clone(),
                     Slot::Open {

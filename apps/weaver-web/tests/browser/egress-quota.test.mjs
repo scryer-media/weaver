@@ -84,10 +84,50 @@ test("the global limits sit above the egress table, one per direction, and save 
   await page.evaluate(() => window.egressQuotaFixture.actions.current.save());
   await status.filter({ hasText: /^clean Saved$/ }).waitFor();
   assert.deepEqual((await sent(page)).filter((entry) => entry.name === "SetBandwidth").map((entry) => entry.variables), [
-    { input: { downloadBps: 8 * MIB, uploadBps: 3 * MIB } },
+    { input: { downloadBps: 8 * MIB, uploadBps: 3 * MIB, split: null } },
   ]);
   assert.equal(await download.inputValue(), "8");
   if (shot("egress")) await page.screenshot({ path: shot("egress"), fullPage: true });
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+test("the split shares the download limit between usenet and torrents, and needs one", async () => {
+  const { page, errors } = await open("egress");
+  const status = page.locator("#status");
+  const limits = page.getByRole("region", { name: "Limits", exact: true });
+  const split = limits.getByRole("switch", { name: "Bandwidth split", exact: true });
+  const usenet = limits.getByRole("spinbutton", { name: "Usenet", exact: true });
+  await split.waitFor();
+  // No split: the shares show only once one is switched on.
+  assert.equal(await split.getAttribute("aria-checked"), "false");
+  assert.equal(await usenet.count(), 0);
+  await split.click();
+  assert.equal(await usenet.inputValue(), "50");
+  await limits.getByText("Torrents 50%", { exact: true }).waitFor();
+  await usenet.fill("80");
+  await usenet.press("Tab");
+  await limits.getByText("Torrents 20%", { exact: true }).waitFor();
+  await status.filter({ hasText: /^dirty/ }).waitFor();
+  await page.evaluate(() => window.egressQuotaFixture.actions.current.save());
+  await status.filter({ hasText: /^clean Saved$/ }).waitFor();
+  // The rates each side is held to sit beside the split once it is in force.
+  await limits.getByText("Usenet ↓ 20.0 MiB/s · Torrents ↓ 5.0 MiB/s", { exact: true }).waitFor();
+  if (shot("split")) await limits.screenshot({ path: shot("split") });
+
+  // Without a download limit the split is kept, held as it stands, and says what it needs.
+  await limits.getByRole("switch", { name: "Download limit", exact: true }).click();
+  await limits.getByText("Needs a global download limit", { exact: true }).waitFor();
+  assert.equal(await split.isDisabled(), true);
+  assert.equal(await usenet.isDisabled(), true);
+  await page.evaluate(() => window.egressQuotaFixture.actions.current.save());
+  await status.filter({ hasText: /^clean Saved$/ }).waitFor();
+  await limits.getByText("Usenet ↓", { exact: false }).waitFor({ state: "detached" });
+  assert.deepEqual((await sent(page)).filter((entry) => entry.name === "SetBandwidth").map((entry) => entry.variables), [
+    { input: { downloadBps: 25 * MIB, uploadBps: null, split: { usenetPct: 80 } } },
+    { input: { downloadBps: null, uploadBps: null, split: { usenetPct: 80 } } },
+  ]);
+  if (shot("split-needs-limit")) await limits.screenshot({ path: shot("split-needs-limit") });
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });

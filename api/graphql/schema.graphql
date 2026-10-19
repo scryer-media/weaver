@@ -277,11 +277,20 @@ Bytes per second in each direction; null is no limit.
 type Bandwidth {
 	downloadBps: Int
 	uploadBps: Int
+	"""
+	How the download limit is shared between usenet and torrents; null
+	is no split.
+	"""
+	split: BandwidthSplit
 }
 
 input BandwidthInput {
 	downloadBps: Int
 	uploadBps: Int
+	"""
+	Left out keeps the split; null clears it.
+	"""
+	split: BandwidthSplitInput
 }
 
 type BandwidthProvider {
@@ -303,6 +312,43 @@ type BandwidthResult {
 	server: String
 	url: String!
 	connections: Int!
+}
+
+"""
+Usenet's percentage of the global download limit; torrents get the rest.
+"""
+type BandwidthSplit {
+	usenetPct: Int!
+}
+
+input BandwidthSplitInput {
+	usenetPct: Int!
+}
+
+"""
+The usenet/torrent split as it stands.
+"""
+type BandwidthSplitState {
+	"""
+	The operator's split.
+	"""
+	stored: BandwidthSplit
+	"""
+	The split in force: a scheduled one over the operator's.
+	"""
+	inForce: BandwidthSplit
+	"""
+	No global download limit is in force, so the split does nothing.
+	"""
+	needsDownloadLimit: Boolean!
+	"""
+	The download limit usenet is held to this tick; null is no limit.
+	"""
+	usenetBps: Int
+	"""
+	The download limit torrents are held to this tick; null is no limit.
+	"""
+	torrentBps: Int
 }
 
 input BandwidthTestInput {
@@ -2116,6 +2162,7 @@ type NetworkRoute {
 
 type Networking {
 	bandwidth: Bandwidth!
+	bandwidthSplit: BandwidthSplitState!
 }
 
 enum OperatingSystemGql {
@@ -3219,6 +3266,12 @@ type Schedule {
 	other action.
 	"""
 	hardwareProfile: HardwareProfileGql
+	"""
+	Usenet's percentage of the download limit a `bandwidth_split` rule
+	puts in force; null lifts back to the operator's split, and is null
+	for every other action.
+	"""
+	splitUsenetPct: Int
 }
 
 input ScheduleInput {
@@ -3254,6 +3307,12 @@ input ScheduleInput {
 	Required when the action is `hardware_profile`, ignored otherwise.
 	"""
 	hardwareProfile: HardwareProfileGql
+	"""
+	Usenet's percentage of the download limit for a `bandwidth_split`
+	rule, 1 to 99; omit to lift back to the operator's split. Ignored
+	for every other action.
+	"""
+	splitUsenetPct: Int
 }
 
 type SchedulePruneFiles {
@@ -3313,6 +3372,7 @@ enum ScheduleTrack {
 	WATCH_FOLDER
 	RSS
 	SPEED
+	SPLIT
 	PROFILE
 	QUOTA
 	SERVER

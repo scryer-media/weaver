@@ -26,7 +26,8 @@ use crate::categories::CategoryConfig;
 use crate::categories::model::{completion_parent, resolve_category_config};
 use crate::jobs::JobId;
 use crate::jobs::handle::{
-    CancellationOrigin, JobInfo, QueueAction, QueueMoveTarget, QueueOwner, SchedulerHandle,
+    CancellationOrigin, JobInfo, QueueAction, QueueHold, QueueMoveTarget, QueueOwner,
+    SchedulerHandle, TorrentRate,
 };
 use crate::jobs::model::{
     FieldUpdate, JobStatus, JobUpdate, PRIORITY_ATTRIBUTE_KEY, Protocol,
@@ -459,6 +460,8 @@ struct Live {
     // takes the next change.
     run_error: Option<String>,
     queued: bool,
+    // Stopped by the global pause.
+    paused_globally: bool,
     applied: Option<Vec<usize>>,
     speeds: (u64, u64),
     peers: (u32, u32),
@@ -485,6 +488,7 @@ impl Live {
             engine: Engine::Absent,
             run_error: None,
             queued: false,
+            paused_globally: false,
             applied: None,
             speeds: (0, 0),
             peers: (0, 0),
@@ -534,6 +538,7 @@ impl Live {
             complete: self.complete(),
             intent: self.record.intent,
             queued: self.queued,
+            paused_globally: self.paused_globally,
             failed: self.refusal(),
             held: self.held.clone(),
             disk_full: self.holding(),
@@ -708,15 +713,32 @@ impl TorrentService {
 
     /// Put the torrents in the queue that `queue` publishes, and send its
     /// actions on a torrent here.
+    ///
+    /// The torrents also take their share of the global download limit from
+    /// it, and follow its global pause.
     pub fn publish_to(&self, queue: SchedulerHandle) {
-        queue
-            .state()
-            .seat_owner(Arc::new(Seat(Arc::downgrade(&self.inner))));
+        let seat = Arc::new(Seat(Arc::downgrade(&self.inner)));
+        queue.state().seat_owner(seat.clone());
+        queue.state().seat_torrent_rate(seat);
+        let mut hold = queue.state().subscribe_queue_hold();
         *self
             .inner
             .queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(queue);
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            while hold.changed().await.is_ok() {
+                service.apply_queue().await;
+                service.publish().await;
+            }
+        }));
+    }
+
+    // What the global pause stops.
+    fn queue_hold(&self) -> QueueHold {
+        self.queue()
+            .map_or(QueueHold::None, |queue| queue.state().queue_hold())
     }
 
     fn queue(&self) -> Option<SchedulerHandle> {
@@ -1375,7 +1397,7 @@ impl TorrentService {
                 layout,
                 intake,
                 torrent.record.storage_dir.clone().unwrap_or_default(),
-                !torrent.resumed() || torrent.queued,
+                !torrent.resumed() || torrent.queued || self.queue_hold().stops(torrent.complete()),
                 limit,
                 job.with(|job| initial_have(job)),
             )
@@ -1797,6 +1819,7 @@ impl TorrentService {
     // Which torrents the queue lets download, applied to their sessions.
     async fn apply_queue(&self) {
         let max_active = self.settings().torrent.max_active_downloads;
+        let hold = self.queue_hold();
         let mut live = self.inner.live.lock().await;
         let mut order: Vec<&Live> = live.values().collect();
         order.sort_by_key(|torrent| (torrent.record.added_at_ms, torrent.record.job_id));
@@ -1809,10 +1832,11 @@ impl TorrentService {
                 paused: !torrent.resumed(),
             })
             .collect();
-        let active = status::active(&queue, max_active);
+        let active = status::active(&queue, max_active, hold);
         for torrent in live.values_mut() {
             let active = active.contains(&torrent.record.job_id);
-            torrent.queued = !active && torrent.resumed();
+            torrent.paused_globally = torrent.resumed() && hold.stops(torrent.complete());
+            torrent.queued = !active && torrent.resumed() && !torrent.paused_globally;
             let run = active && torrent.resumed();
             let Some(attached) = &torrent.attached else {
                 continue;
@@ -2232,6 +2256,20 @@ impl TorrentService {
 
 // The torrents' seat in the queue.
 struct Seat(Weak<Inner>);
+
+impl TorrentRate for Seat {
+    fn download_bps(&self) -> u64 {
+        self.0
+            .upgrade()
+            .map_or(0, |inner| inner.sessions.rates().download_bps())
+    }
+
+    fn set_download_rate(&self, rate: Option<u64>) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.sessions.rates().set(rate);
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl QueueOwner for Seat {

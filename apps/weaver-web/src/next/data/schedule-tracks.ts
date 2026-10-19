@@ -8,6 +8,7 @@ export const SCHEDULE_TRACKS = [
   { value: "WATCH_FOLDER", label: "next.schedules.trackWatchFolder" },
   { value: "RSS", label: "next.schedules.trackRss" },
   { value: "SPEED", label: "next.schedules.trackSpeed" },
+  { value: "SPLIT", label: "next.schedules.trackSplit" },
   { value: "PROFILE", label: "next.schedules.trackProfile" },
   { value: "QUOTA", label: "next.schedules.trackQuota" },
   { value: "SERVER", label: "next.schedules.trackServers" },

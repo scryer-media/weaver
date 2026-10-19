@@ -245,6 +245,11 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "bandwidth limit is too large",
         ),
         (
+            R::BandwidthSplitRange,
+            "BANDWIDTH_SPLIT_RANGE",
+            "a bandwidth split gives usenet 1% to 99%",
+        ),
+        (
             R::WireGuardPathConflict {
                 proxy: 2,
                 egress: 0,
@@ -523,9 +528,10 @@ fn slot(refusal: &R) -> usize {
         R::TorrentRouteLegs => 82,
         R::TorrentRoutePool => 83,
         R::BandwidthLimitTooLarge => 84,
+        R::BandwidthSplitRange => 85,
     }
 }
-const SLOTS: usize = 85;
+const SLOTS: usize = 86;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {

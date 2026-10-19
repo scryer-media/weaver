@@ -20,7 +20,16 @@ export type QuotaDirectionUsage = { usedBytes: number; remainingBytes: number | 
 /** An egress's spend this period in each direction; `state` is the tighter of the two. */
 export type EgressQuotaUsage = { down: QuotaDirectionUsage; up: QuotaDirectionUsage; state: QuotaState; periodStartEpochMs: number | null; periodEndEpochMs: number | null; timezoneName: string };
 /** Bytes per second in each direction over every egress together; null is no limit. */
-export type Bandwidth = { downloadBps: number | null; uploadBps: number | null };
+/** Usenet's percentage of the global download limit; torrents get the rest. */
+export type BandwidthSplit = { usenetPct: number };
+export type Bandwidth = { downloadBps: number | null; uploadBps: number | null; split: BandwidthSplit | null };
+/** The split in force and the download limit each side holds to; null is no limit. */
+export type BandwidthSplitState = {
+  inForce: BandwidthSplit | null;
+  needsDownloadLimit: boolean;
+  usenetBps: number | null;
+  torrentBps: number | null;
+};
 export type ProxyPool = { id: number; name: string; kind: ProxyKind; memberIds: number[]; enabled: boolean };
 export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: number; target: number; open: number; opening: number; state: string; reason: string | null; pinnedAddress: string | null; sourceAddress?:string|null;bytesPerSecond?:number;selectedRung?:number|null;selectedProxyId?:number|null;failingHops?:FailingHop[] };
 /**

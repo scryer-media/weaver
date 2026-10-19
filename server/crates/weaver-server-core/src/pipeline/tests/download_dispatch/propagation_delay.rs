@@ -898,6 +898,7 @@ async fn download_block_refresh_preserves_scheduled_speed_limit() {
     pipeline.scheduled_bandwidth = Some(crate::proxies::Bandwidth {
         download_bps: Some(131_072),
         upload_bps: None,
+        split: None,
     });
     pipeline.apply_global_rate();
     pipeline.publish_download_block();
@@ -933,6 +934,7 @@ fn download_bandwidth(bytes_per_sec: u64) -> crate::proxies::Bandwidth {
     crate::proxies::Bandwidth {
         download_bps: Some(bytes_per_sec),
         upload_bps: None,
+        split: None,
     }
 }
 
