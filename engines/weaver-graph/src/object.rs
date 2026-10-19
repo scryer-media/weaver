@@ -144,6 +144,12 @@ pub trait Object: Send + Sync {
     // This range of my volume will never arrive and no recovery covers it.
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>);
 
+    // The job is quiet: nothing more will arrive and no repair will come,
+    // and every lost range of my volumes was told through `volume_lost`
+    // just before. A volume of my set no member ever became will never
+    // come either; an object that cannot read without it says so now.
+    fn quiet(&mut self, _out: &mut Vec<Emit>) {}
+
     // What I want ahead of the normal order, right now. The namespace lifts
     // each one to the parent and answers through `pulled`.
     fn wants(&mut self, out: &mut Vec<Seek>);

@@ -122,9 +122,12 @@ pub(crate) fn refused<'c>(
 // unpacked from: those are the bytes the repair could not rebuild. A
 // volume of an object refused after announcing a member it never closed is
 // delivered as it stands, never whole, however clean its bytes: the object
-// failed, not the post. A member given back for a reason that withholds it
-// (`Why::withholds`) delivered nothing: its bytes are a container nothing
-// opened, neither whole nor short, and stay as they stand.
+// failed, not the post. So is a member given back for a reason that is
+// never whole (`Why::never_whole`): a volume whose set lost its first
+// bytes is the container it is, not the payload. A member given back for a
+// reason that withholds it (`Why::withholds`) delivered nothing: its bytes
+// are a container nothing opened, neither whole nor short, and stay as they
+// stand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delivery {
     pub(crate) whole: Vec<String>,
@@ -290,11 +293,14 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId) -> bool> Walk<'_, F, R> {
             self.delivery.unrepaired.push(name);
             return;
         }
-        if let Some(why) = (self.refused)(node, member.id).filter(|why| why.withholds()) {
+        let refused = (self.refused)(node, member.id);
+        if let Some(why) = refused.filter(|why| why.withholds()) {
             self.delivery.withheld.push((name, why));
             return;
         }
-        let whole = claim == Claim::Complete && !(self.left_open)(node, member.id);
+        let whole = claim == Claim::Complete
+            && !(self.left_open)(node, member.id)
+            && !refused.is_some_and(Why::never_whole);
         let delivery = &mut self.delivery;
         match whole {
             true => delivery.whole.push(name.clone()),

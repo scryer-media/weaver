@@ -217,6 +217,12 @@ impl Walk {
         hole(kept, self.facts.as_ref().map_or(0, data_end), closed)
     }
 
+    // Whether a hole at `at` is the main header, the first header after
+    // the signature, or the signature itself.
+    pub(super) fn at_main_header(&self, at: u64) -> bool {
+        at <= self.facts.as_ref().map_or(SIGNATURE, signature_len)
+    }
+
     // Whether the volume is one of a set. Only the main header sets the
     // volume flag, so a set flag is its word at once; a clear one is its
     // word only once the walk has ended, since a walk short of the main

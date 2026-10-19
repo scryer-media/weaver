@@ -125,6 +125,28 @@ impl Why {
             | Why::TooDeep => false,
         }
     }
+
+    // Whether a member given back for this reason is delivered as it
+    // stands but never whole, however clean its bytes: they are the
+    // container it is, and what it held was lost with the first bytes that
+    // said so. A member given back for any other reason is whole when its
+    // bytes are.
+    pub fn never_whole(self) -> bool {
+        match self {
+            Why::FirstBytesLost => true,
+            Why::Compressed
+            | Why::TailUnreachable
+            | Why::EncryptedHeader
+            | Why::Encrypted
+            | Why::UnboundedEntry
+            | Why::NotAFile
+            | Why::Unrepairable
+            | Why::HoldsBreached
+            | Why::Unsupported
+            | Why::Unmapped
+            | Why::TooDeep => false,
+        }
+    }
 }
 
 // What a child says back when bytes arrive.

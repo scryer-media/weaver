@@ -9,8 +9,6 @@ use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, payload, run, run_both, try_run,
 };
 use super::rar::{assert_classic_stalls, delivered, posts, with_par2};
-use weaver_graph::Why;
-
 use crate::history::failure_kind::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
@@ -553,10 +551,10 @@ async fn a_solid_rar4_archive_delivers_what_the_rar5_one_does_under_graph() {
 // arrives intact, so nothing marks the volume, and the engine's run alone
 // finds the damage, when the member's CRC fails. It retracts the member it
 // left open and says its volume is damaged; with no PAR2 nothing repairs
-// it. A member is whole only when its engine closed it, so the run's end
-// closes nothing: the engine is refused for the member it left open
-// (`Why::Unmapped`), and the volume is handed back as it stands in its
-// place, withheld, with no file at any length for the member.
+// it. Once the job is quiet the engine hears its volume's damage, which
+// nothing repaired, and is refused for it (`Why::Unrepairable`): the volume
+// is handed back damaged, as it stands in its place, with no file at any
+// length for the member.
 const SOLID_CORRUPTED_AT: usize = 10 << 20;
 
 fn corrupted_solid() -> (String, Vec<u8>) {
@@ -579,12 +577,12 @@ fn assert_hands_back_the_volume(graph: &Outcome) {
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
     let delivery = &graph.graph().delivery;
     assert!(delivery.whole.is_empty(), "{delivery:?}");
-    assert!(delivery.damaged.is_empty(), "{delivery:?}");
     assert_eq!(
-        delivery.withheld,
-        [(name.clone(), Why::Unmapped)],
-        "the volume withheld as it stands"
+        delivery.damaged,
+        [name.clone()],
+        "the volume delivered as it stands"
     );
+    assert!(delivery.withheld.is_empty(), "{delivery:?}");
     assert_eq!(graph.graph().claims.get(&name), Some(&Claim::Damaged));
     for (path, delivered_bytes) in &graph.files {
         assert_eq!(*path, delivered(&name), "only the volume is a file");

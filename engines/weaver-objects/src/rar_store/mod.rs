@@ -404,16 +404,31 @@ impl Object for RarStore {
         let Some(found) = self.volumes.get(&volume) else {
             return;
         };
-        let next = ByteRange::at(found.walk.hole(&found.kept, found.closed), 1);
-        if found.walk.ended || range.intersect(next).is_none() {
+        let hole = found.walk.hole(&found.kept, found.closed);
+        if found.walk.ended || !range.contains(hole) {
             return;
         }
-        // The next header will never come, and nothing past it can be read.
-        let why = match volume == VolumeIndex(0) && found.walk.facts.is_none() {
-            true => Why::FirstBytesLost,
-            false => Why::Unrepairable,
+        // The next header will never come, and nothing past it can be read:
+        // the set's own first bytes, when it is the first volume's main
+        // header. A loss that runs to the volume's end leaves nothing past
+        // it to read.
+        let why = if volume == VolumeIndex(0) && found.walk.at_main_header(hole) {
+            Why::FirstBytesLost
+        } else if found.length.is_some_and(|length| range.end >= length) {
+            return;
+        } else {
+            Why::Unrepairable
         };
         self.give_up(Emit::Refuse(why), out);
+    }
+
+    // Nothing more will arrive. A set whose first volume never came has
+    // lost its first bytes: no header says what any volume after it holds.
+    fn quiet(&mut self, out: &mut Vec<Emit>) {
+        let first = self.volumes.get(&VolumeIndex(0));
+        if !self.gone && first.is_none_or(|found| found.name.is_none()) {
+            self.give_up(Emit::Refuse(Why::FirstBytesLost), out);
+        }
     }
 
     fn wants(&mut self, out: &mut Vec<Seek>) {

@@ -9,6 +9,7 @@
 
 use std::io::Write;
 
+use weaver_graph::Why;
 use weaver_graph::recovery::RepairOutcome;
 
 use weaver_model::files::FileRole;
@@ -471,9 +472,12 @@ async fn a_nameless_four_volume_rar5_set_posted_backwards_delivers_under_both_en
 // A nameless RAR4 volume's front states no position: its number is in its
 // end record, and the first-volume flag of its main header is not among the
 // facts unrar-rs reads. The set's last volume founds the store at the first
-// position, and the set is never placed. Classic stalls. Under graph every
-// volume closes with the store unmapped, so it is refused, the volumes are
-// delivered as posted and the job is Partial for unpacking.
+// position, and its end record says it is not the set's first: that store
+// lost its set's first bytes, and the three volumes it holds are delivered
+// as they stand, never whole. The true first volume, last to arrive, founds
+// a store of its own that never places its member, and is withheld. Classic
+// stalls. Under graph nothing is whole, so the job fails and nothing moves
+// to the complete directory.
 #[tokio::test]
 async fn a_nameless_four_volume_rar4_set_posted_backwards_stalls_under_classic_and_is_refused_under_graph()
  {
@@ -484,21 +488,25 @@ async fn a_nameless_four_volume_rar4_set_posted_backwards_stalls_under_classic_a
     let graph = try_run(&scenario, Engine::Graph)
         .await
         .expect("the graph settles");
+    let (first, tail) = scenario.posts.split_last().expect("four volumes");
     assert_eq!(
         graph.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        graph.failure
+        Some(JobStatus::Failed {
+            error: format!("{} never placed every member it named", first.name),
+        }),
     );
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert_eq!(graph.files.len(), 4, "{:?}", graph.files.keys());
-    for post in &scenario.posts {
-        assert!(
-            graph.files.get(&format!("lantern beacon/{}", post.name)) == Some(&post.bytes),
-            "{} as posted",
-            post.name
-        );
-    }
+    let delivery = &graph.graph().delivery;
+    assert!(delivery.whole.is_empty(), "{delivery:?}");
+    assert_eq!(
+        delivery.damaged,
+        tail.iter()
+            .map(|post| post.name.clone())
+            .collect::<Vec<_>>(),
+        "the tail volumes as they stand"
+    );
+    assert_eq!(delivery.withheld, [(first.name.clone(), Why::Unmapped)]);
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     assert!(
         graph.refetched().is_empty(),
         "graph: {:?}",

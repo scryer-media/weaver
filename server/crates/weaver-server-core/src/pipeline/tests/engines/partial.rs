@@ -915,15 +915,11 @@ async fn a_rar_whose_first_volume_never_arrives_delivers_the_tail_volumes_first_
     under_graph(
         &scenario,
         Graph {
-            status: None,
-            kind: None,
+            status: Some(Status::Partial),
+            kind: Some("Unpack"),
             files: with_quill(raw(&volumes)),
-            whole: &[
-                "quill.bin",
-                "silver.horizon.part02.rar",
-                "silver.horizon.part03.rar",
-            ],
-            damaged: &[],
+            whole: &["quill.bin"],
+            damaged: &["silver.horizon.part02.rar", "silver.horizon.part03.rar"],
             unrepaired: &[],
             withheld: &[],
             refused: &[
@@ -931,8 +927,8 @@ async fn a_rar_whose_first_volume_never_arrives_delivers_the_tail_volumes_first_
                 "kind=rar_store member=silver.horizon.part03.rar why=first_bytes_lost",
             ],
             delivered: &[
-                "name=silver.horizon.part02.rar from=silver.horizon.part02.rar depth=0 whole=true",
-                "name=silver.horizon.part03.rar from=silver.horizon.part03.rar depth=0 whole=true",
+                "name=silver.horizon.part02.rar from=silver.horizon.part02.rar depth=0 whole=false",
+                "name=silver.horizon.part03.rar from=silver.horizon.part03.rar depth=0 whole=false",
                 QUILL,
             ],
         },
@@ -954,15 +950,11 @@ async fn a_rar_inside_a_stored_rar_whose_first_volume_never_arrives_delivers_the
     under_graph(
         &scenario,
         Graph {
-            status: None,
-            kind: None,
+            status: Some(Status::Partial),
+            kind: Some("Unpack"),
             files: with_quill(raw(&volumes)),
-            whole: &[
-                "quill.bin",
-                "silver.horizon.part02.rar",
-                "silver.horizon.part03.rar",
-            ],
-            damaged: &[],
+            whole: &["quill.bin"],
+            damaged: &["silver.horizon.part02.rar", "silver.horizon.part03.rar"],
             unrepaired: &[],
             withheld: &[],
             refused: &[
@@ -970,8 +962,8 @@ async fn a_rar_inside_a_stored_rar_whose_first_volume_never_arrives_delivers_the
                 "kind=rar_store member=silver.horizon.part03.rar why=first_bytes_lost",
             ],
             delivered: &[
-                "name=silver.horizon.part02.rar from=silver.horizon.part02.rar depth=1 whole=true",
-                "name=silver.horizon.part03.rar from=silver.horizon.part03.rar depth=1 whole=true",
+                "name=silver.horizon.part02.rar from=silver.horizon.part02.rar depth=1 whole=false",
+                "name=silver.horizon.part03.rar from=silver.horizon.part03.rar depth=1 whole=false",
                 QUILL,
             ],
         },
@@ -994,20 +986,20 @@ async fn a_rar_whose_first_volumes_main_header_article_never_arrives_delivers_it
     under_graph(
         &scenario,
         Graph {
-            status: None,
-            kind: None,
+            status: Some(Status::Partial),
+            kind: Some("Unpack"),
             files: vec![
                 file("quill.bin", Some(quill())),
                 file("silver.horizon.part01.rar", None),
                 file("silver.horizon.part02.rar", Some(volumes[1].1.clone())),
                 file("silver.horizon.part03.rar", Some(volumes[2].1.clone())),
             ],
-            whole: &[
-                "quill.bin",
+            whole: &["quill.bin"],
+            damaged: &[
+                "silver.horizon.part01.rar",
                 "silver.horizon.part02.rar",
                 "silver.horizon.part03.rar",
             ],
-            damaged: &["silver.horizon.part01.rar"],
             unrepaired: &[],
             withheld: &[],
             refused: &[
@@ -1017,8 +1009,8 @@ async fn a_rar_whose_first_volumes_main_header_article_never_arrives_delivers_it
             ],
             delivered: &[
                 "name=silver.horizon.part01.rar from=silver.horizon.part01.rar depth=0 whole=false",
-                "name=silver.horizon.part02.rar from=silver.horizon.part02.rar depth=0 whole=true",
-                "name=silver.horizon.part03.rar from=silver.horizon.part03.rar depth=0 whole=true",
+                "name=silver.horizon.part02.rar from=silver.horizon.part02.rar depth=0 whole=false",
+                "name=silver.horizon.part03.rar from=silver.horizon.part03.rar depth=0 whole=false",
                 QUILL,
             ],
         },
@@ -1433,9 +1425,9 @@ async fn a_stored_rar_a_set_covers_but_cannot_rebuild_is_listed_unrepaired_and_t
             files: vec![],
             whole: &[],
             damaged: &[],
-            unrepaired: &["lantern.rar"],
+            unrepaired: &["silver.horizon.part01.rar"],
             withheld: &[],
-            refused: &["kind=rar_store member=lantern.rar why=unmapped"],
+            refused: &["kind=rar_store member=silver.horizon.part01.rar why=unrepairable"],
             delivered: &[],
         },
     )
