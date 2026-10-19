@@ -18,7 +18,8 @@ use crate::RuntimeTuner;
 use crate::operations::disk::{Capacity, CapacityDebits};
 use crate::pipeline::completion::finalize::MAX_GRAPH_NESTING_DEPTH;
 use crate::pipeline::direct_store::DirectStoreSettings;
-use crate::pipeline::extraction::{ExtractionFailure, ExtractionLimits, ExtractionRejectionReason};
+pub(crate) use crate::pipeline::extraction::ExtractionLimits;
+use crate::pipeline::extraction::{ExtractionFailure, ExtractionRejectionReason};
 use crate::pipeline::graph::job::RootFile;
 use crate::pipeline::graph::leaf::Leaf;
 use crate::post_processing::model::{PostProcessingSettings, unwanted_extension_reason};
@@ -58,7 +59,9 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //                      the ratio over the bytes posted for the objects
 //   member bytes       one member's extent
 //   entries            members announced below the root
-//   deadline           the job's wall clock since its budget was built
+//   deadline           the job's wall clock since an object first produced
+//                      output: extraction's own time, however long the
+//                      posts or pieces took to arrive
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take
 //   content policy     the operator's unacceptable extensions, on every
@@ -68,7 +71,8 @@ pub(crate) struct Caps {
     policy: Result<Arc<PostProcessingSettings>, String>,
     // The bytes posted for each root member, by member id.
     declared: Vec<u64>,
-    started: Instant,
+    // When an object first produced output.
+    started: Option<Instant>,
     debits: CapacityDebits,
     // How far each member an object produced is written.
     extents: BTreeMap<(NodeId, MemberId), u64>,
@@ -86,7 +90,7 @@ impl Caps {
             limits,
             policy,
             declared,
-            started: Instant::now(),
+            started: None,
             debits: CapacityDebits::default(),
             extents: BTreeMap::new(),
             written: 0,
@@ -96,16 +100,7 @@ impl Caps {
 
     // No limit and no policy: a writer standing alone, outside a job.
     pub(crate) fn unbounded() -> Self {
-        let limits = ExtractionLimits {
-            max_job_bytes: u64::MAX,
-            max_member_bytes: u64::MAX,
-            max_entries: u64::MAX,
-            max_ratio: u64::MAX,
-            ratio_floor_bytes: u64::MAX,
-            max_seconds: u64::MAX,
-            min_free_bytes: 0,
-            max_memory_bytes: u64::MAX,
-        };
+        let limits = ExtractionLimits::unbounded();
         let policy = PostProcessingSettings {
             unacceptable_extensions: Vec::new(),
             ..PostProcessingSettings::default()
@@ -123,7 +118,10 @@ impl Caps {
         if let Some(refusal) = &self.refusal {
             return Err(refusal.clone());
         }
-        if self.started.elapsed() > Duration::from_secs(self.limits.max_seconds) {
+        if self
+            .started
+            .is_some_and(|started| started.elapsed() > Duration::from_secs(self.limits.max_seconds))
+        {
             let detail = format!(
                 "extraction exceeded the {} second deadline",
                 self.limits.max_seconds
@@ -131,6 +129,11 @@ impl Caps {
             return Err(self.breach(ExtractionRejectionReason::Deadline, detail));
         }
         Ok(())
+    }
+
+    // An object produced output: extraction's clock runs from the first time.
+    fn start(&mut self) {
+        self.started.get_or_insert_with(Instant::now);
     }
 
     // A namespace places `name`. A directory carries no extension.
@@ -162,6 +165,7 @@ impl Caps {
         if !produced(tree, node) {
             return Ok(());
         }
+        self.start();
         let entries: u64 = tree
             .live()
             .into_iter()
@@ -192,6 +196,7 @@ impl Caps {
         if !produced(tree, node) {
             return Ok(());
         }
+        self.start();
         let extent = self.extents.get(&(node, member)).copied().unwrap_or(0);
         let Some(grown) = end.checked_sub(extent).filter(|grown| *grown > 0) else {
             return Ok(());
@@ -216,8 +221,7 @@ impl Caps {
             }
         }
         if let Some(reading) = self.debits.apply(capacity).reading() {
-            let remaining = reading.available_bytes.saturating_sub(grown);
-            if remaining < self.limits.min_free_bytes && !reading.stale {
+            if let Some(remaining) = self.limits.short_of_reserve(&reading, grown) {
                 let detail = format!(
                     "writing {grown} bytes would leave {remaining} bytes free, reserve is {}",
                     self.limits.min_free_bytes
@@ -251,6 +255,7 @@ impl Caps {
             .unwrap_or(0);
         self.forget(node, member);
         if extent > 0 {
+            self.start();
             self.extents.insert((node, member), extent);
             self.written = self.written.saturating_add(extent);
         }
@@ -307,5 +312,69 @@ impl crate::pipeline::Pipeline {
             })
             .collect();
         Caps::new(Arc::clone(&self.extraction_limits), policy, declared)
+    }
+
+    // What a job outside the pipeline builds its graph with: the pipeline's
+    // holds accountant, slots, extraction limits and the complete root's
+    // free-space reader.
+    pub(crate) fn graph_budget(&self) -> GraphBudget {
+        GraphBudget {
+            accountant: Arc::clone(&self.graph_holds),
+            slots: self.graph_slot_limit(),
+            limits: Arc::clone(&self.extraction_limits),
+            free_disk: self
+                .storage_capacity()
+                .reader(crate::operations::disk::StorageRoot::Complete),
+            mail: self.graph_runs.sender(),
+            outside: Arc::clone(&self.graph_outside),
+        }
+    }
+}
+
+// The pipeline's budget, for a job it does not run.
+#[derive(Clone)]
+pub(crate) struct GraphBudget {
+    pub(crate) accountant: Arc<weaver_graph::holds::HoldsAccountant>,
+    pub(crate) slots: usize,
+    pub(crate) limits: Arc<ExtractionLimits>,
+    pub(crate) free_disk: crate::operations::disk::CapacityReader,
+    // Where the job's runs speak, and where it joins to hear them.
+    pub(crate) mail: tokio::sync::mpsc::Sender<super::engine::Said>,
+    pub(crate) outside: Arc<super::engine::Outside>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The deadline counts from extraction's start, not from the job's: a
+    // job whose input took past the deadline to arrive is not refused, and
+    // the clock, once running, keeps its first start.
+    #[test]
+    fn the_deadline_runs_from_the_first_output_not_the_job() {
+        let mut limits = ExtractionLimits::unbounded();
+        limits.max_seconds = 0;
+        let mut caps = Caps::new(
+            Arc::new(limits),
+            Ok(Arc::new(PostProcessingSettings::default())),
+            Vec::new(),
+        );
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a second before now");
+
+        // The input arriving, however long it takes, starts nothing.
+        caps.admit_entry(&Tree::new(), NodeId::ROOT).unwrap();
+        assert_eq!(caps.started, None);
+        caps.check().unwrap();
+
+        caps.start();
+        let first = caps.started.expect("started");
+        caps.start();
+        assert_eq!(caps.started, Some(first));
+
+        caps.started = Some(long_ago);
+        let refused = caps.check().unwrap_err();
+        assert_eq!(refused.reason(), ExtractionRejectionReason::Deadline);
     }
 }

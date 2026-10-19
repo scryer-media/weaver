@@ -68,6 +68,8 @@ export function statusDetail(
     return job.error;
   }
   if (job.downloadWaitReason) {
+    // A reason is either a code the screen names, or the daemon's own sentence, shown as it came.
+    if (!/^[a-z0-9_]+$/i.test(job.downloadWaitReason)) return job.downloadWaitReason;
     const key = `next.status.wait.${job.downloadWaitReason.toLowerCase()}`;
     const label = t(key);
     return label === key ? job.downloadWaitReason.toLowerCase().replace(/_/g, " ") : label;

@@ -37,8 +37,66 @@ function AllowanceInput({
   );
 }
 
+/** An allowance as typed, and the unit it is typed in. */
+export function AllowanceControl({
+  label,
+  limit,
+  unit,
+  onChange,
+}: {
+  label: string;
+  limit: string;
+  unit: AllowanceUnit;
+  onChange: (next: { limit: string; unit: AllowanceUnit }) => void;
+}) {
+  return (
+    <div className="flex items-center gap-[10px]">
+      <AllowanceInput label={label} value={limit} onChange={(next) => onChange({ limit: next, unit })} />
+      <div className="flex border border-wv-control bg-wv-input">
+        {(["GB", "TB"] as const).map((option, index) => (
+          <button
+            key={option}
+            type="button"
+            aria-pressed={unit === option}
+            onClick={() => onChange({ limit, unit: option })}
+            className={`flex h-8 cursor-pointer items-center px-[13px] font-wv-mono text-[12px] ${
+              index > 0 ? "border-l border-wv-control " : ""
+            }${
+              unit === option
+                ? "bg-wv-segment-active font-medium text-wv-strong"
+                : "text-wv-muted hover:text-wv-strong"
+            }`}
+          >
+            {option}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export type AllowanceUnit = "GB" | "TB";
+
 const GIB = 1024 ** 3;
 const TIB = 1024 ** 4;
+
+/** A size in bytes as an allowance is typed: a number, and the unit it reads best in. */
+export function allowanceText(bytes: number): { limit: string; unit: AllowanceUnit } {
+  const unit = bytes >= TIB ? "TB" : "GB";
+  return { limit: trimNumber(bytes / (unit === "TB" ? TIB : GIB)), unit };
+}
+
+/**
+ * An allowance as typed, in bytes. Text that is not a number, or a number too
+ * large to send exactly, is null: no allowance at all.
+ */
+export function allowanceBytes(limit: string, unit: AllowanceUnit): number | null {
+  if (!limit.trim()) {
+    return null;
+  }
+  const bytes = Math.round(Number(limit) * (unit === "TB" ? TIB : GIB));
+  return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+}
 
 export const EMPTY_QUOTA: DownloadQuota = {
   enabled: false,
@@ -53,7 +111,7 @@ export const EMPTY_QUOTA: DownloadQuota = {
 export interface QuotaDraft {
   quota: DownloadQuota;
   limit: string;
-  unit: "GB" | "TB";
+  unit: AllowanceUnit;
   resetTime: string;
 }
 
@@ -148,16 +206,7 @@ export function quotaFields(
   }
   return [
     toggle,
-    {
-      id: "quotaPeriod",
-      label: t("next.providers.quotaWindow"),
-      control: {
-        kind: "select",
-        value: draft.quota.period,
-        options: QUOTA_PERIODS.map((option) => ({ ...option, label: t(option.label) })),
-        onChange: (next) => patchQuota({ period: next as QuotaPeriod }),
-      },
-    },
+    periodField(t, draft.quota.period, (period) => patchQuota({ period })),
     {
       id: "quotaLimit",
       label: t("next.bandwidth.allowance"),
@@ -168,36 +217,59 @@ export function quotaFields(
       control: {
         kind: "custom",
         control: (
-          <div className="flex items-center gap-[10px]">
-            <AllowanceInput
-              label={t("next.bandwidth.allowance")}
-              value={draft.limit}
-              onChange={(limit) => onChange({ ...draft, limit })}
-            />
-            <div className="flex border border-wv-control bg-wv-input">
-              {(["GB", "TB"] as const).map((unit, index) => (
-                <button
-                  key={unit}
-                  type="button"
-                  aria-pressed={draft.unit === unit}
-                  onClick={() => onChange({ ...draft, unit })}
-                  className={`flex h-8 cursor-pointer items-center px-[13px] font-wv-mono text-[12px] ${
-                    index > 0 ? "border-l border-wv-control " : ""
-                  }${
-                    draft.unit === unit
-                      ? "bg-wv-segment-active font-medium text-wv-strong"
-                      : "text-wv-muted hover:text-wv-strong"
-                  }`}
-                >
-                  {unit}
-                </button>
-              ))}
-            </div>
-          </div>
+          <AllowanceControl
+            label={t("next.bandwidth.allowance")}
+            limit={draft.limit}
+            unit={draft.unit}
+            onChange={(next) => onChange({ ...draft, ...next })}
+          />
         ),
       },
     },
-    ...(draft.quota.period === "ONE_TIME"
+    ...windowFields(
+      t,
+      {
+        period: draft.quota.period,
+        resetTime: draft.resetTime,
+        weeklyResetWeekday: draft.quota.weeklyResetWeekday,
+        monthlyResetDay: draft.quota.monthlyResetDay,
+      },
+      ({ resetTime, ...quota }) =>
+        onChange({ ...draft, resetTime: resetTime ?? draft.resetTime, quota: { ...draft.quota, ...quota } }),
+    ),
+  ];
+}
+
+/** When an allowance's window resets, as its editor holds it. */
+export interface QuotaWindow {
+  period: QuotaPeriod;
+  resetTime: string;
+  weeklyResetWeekday: Weekday;
+  monthlyResetDay: number;
+}
+
+/** The window's period picker, as a field. */
+export function periodField(t: Translate, period: QuotaPeriod, onChange: (period: QuotaPeriod) => void): FieldSpec {
+  return {
+    id: "quotaPeriod",
+    label: t("next.providers.quotaWindow"),
+    control: {
+      kind: "select",
+      value: period,
+      options: QUOTA_PERIODS.map((option) => ({ ...option, label: t(option.label) })),
+      onChange: (next) => onChange(next as QuotaPeriod),
+    },
+  };
+}
+
+/** The fields that say when a window of `window.period` resets. A one-time block never does. */
+export function windowFields(
+  t: Translate,
+  window: QuotaWindow,
+  patch: (next: Partial<QuotaWindow>) => void,
+): FieldSpec[] {
+  return [
+    ...(window.period === "ONE_TIME"
       ? []
       : [
           {
@@ -205,36 +277,36 @@ export function quotaFields(
             label: t("next.bandwidth.resetAt"),
             control: {
               kind: "time" as const,
-              value: draft.resetTime,
-              onChange: (resetTime: string) => onChange({ ...draft, resetTime }),
+              value: window.resetTime,
+              onChange: (resetTime: string) => patch({ resetTime }),
             },
           },
         ]),
-    ...(draft.quota.period === "WEEKLY"
+    ...(window.period === "WEEKLY"
       ? [
           {
             id: "quotaWeekday",
             label: t("next.bandwidth.resetDay"),
             control: {
               kind: "select" as const,
-              value: draft.quota.weeklyResetWeekday,
+              value: window.weeklyResetWeekday,
               options: WEEKDAYS.map((option) => ({ ...option, label: t(option.label) })),
-              onChange: (next: string) => patchQuota({ weeklyResetWeekday: next as Weekday }),
+              onChange: (next: string) => patch({ weeklyResetWeekday: next as Weekday }),
             },
           },
         ]
       : []),
-    ...(draft.quota.period === "MONTHLY"
+    ...(window.period === "MONTHLY"
       ? [
           {
             id: "quotaMonthDay",
             label: t("next.bandwidth.resetDayOfMonth"),
             control: {
               kind: "number" as const,
-              value: draft.quota.monthlyResetDay,
+              value: window.monthlyResetDay,
               min: 1,
               max: 31,
-              onChange: (monthlyResetDay: number) => patchQuota({ monthlyResetDay }),
+              onChange: (monthlyResetDay: number) => patch({ monthlyResetDay }),
             },
           },
         ]

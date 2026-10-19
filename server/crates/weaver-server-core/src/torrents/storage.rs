@@ -17,13 +17,17 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, bail};
+use bitvec::boxed::BitBox;
+use bitvec::order::Msb0;
 use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
 use librqbit::{ManagedTorrentShared, TorrentMetadata, ValidatedTorrentMetaV1Info};
 use librqbit_core::lengths::ValidPieceIndex;
 use weaver_graph::{ByteRange, VolumeIndex};
 
 use crate::pipeline::graph::job::GraphJob;
-use crate::pipeline::graph::root::pieces::{LayoutError, PieceFile, PieceLayout, PieceRoot, Verified};
+use crate::pipeline::graph::root::pieces::{
+    LayoutError, PieceFile, PieceLayout, PieceRoot, Verified,
+};
 
 #[cfg(test)]
 mod tests;
@@ -66,6 +70,15 @@ impl Pieces for TorrentJob {
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
         self.with(|job| job.posted(volume, range, into))
     }
+}
+
+// The pieces the job has, as the session takes them to skip checking the
+// files: one bit per piece, most significant first, the spare bits of the
+// last byte clear, as BEP 3 sends them.
+pub(crate) fn initial_have(job: &GraphJob<PieceRoot>) -> BitBox<u8, Msb0> {
+    let mut have = job.have();
+    have.set_uninitialized(false);
+    have.into_boxed_bitslice()
 }
 
 // The layout of a torrent's files over its pieces, from its metainfo.
@@ -134,11 +147,7 @@ impl PieceStorage {
 }
 
 impl TorrentStorage for PieceStorage {
-    fn init(
-        &mut self,
-        _: &ManagedTorrentShared,
-        metadata: &TorrentMetadata,
-    ) -> anyhow::Result<()> {
+    fn init(&mut self, _: &ManagedTorrentShared, metadata: &TorrentMetadata) -> anyhow::Result<()> {
         let theirs = layout_of(&metadata.info)?;
         if theirs != *self.inner.layout {
             bail!("the torrent is not the one the job was made for");

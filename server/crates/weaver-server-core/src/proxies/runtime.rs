@@ -494,6 +494,12 @@ impl ProxyRuntime {
                     .map(|f| Consumer::Rss(f.id)),
             )
             .chain(std::iter::once(Consumer::Outbound))
+            .chain(std::iter::once(Consumer::Torrent(TorrentScope::Default)))
+            .chain(
+                db.list_categories()?
+                    .into_iter()
+                    .map(|c| Consumer::Torrent(TorrentScope::Category(c.id))),
+            )
             .collect())
     }
     // Whether the runtime knows this consumer, so a route for it can be

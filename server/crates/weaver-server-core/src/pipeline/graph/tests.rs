@@ -757,3 +757,59 @@ fn classic_switches_apply_only_to_classic() {
 }
 
 mod refusals;
+
+// A job outside the pipeline's own hears its runs through the pipeline's
+// mail, on the pipeline's loop.
+#[tokio::test]
+async fn an_outside_job_hears_its_runs_through_the_pipelines_mail() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::pipeline::graph::engine::{Hears, Said};
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(u64, u64)>>);
+
+    impl Hears for Recorder {
+        fn said(&self, said: Said, _slots: usize) {
+            self.0.lock().unwrap().push((said.scope, said.generation));
+        }
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let recorder = Arc::new(Recorder::default());
+    let budget = pipeline.graph_budget();
+    budget
+        .outside
+        .join(4242, Arc::clone(&recorder) as Arc<dyn Hears>);
+    budget
+        .mail
+        .send(Said {
+            scope: 4242,
+            node: weaver_graph::NodeId::ROOT,
+            generation: 7,
+            heard: Heard::Ended,
+        })
+        .await
+        .unwrap();
+    let said = pipeline.graph_runs.recv().await.unwrap();
+    pipeline.graph_run_said(said);
+    assert_eq!(*recorder.0.lock().unwrap(), [(4242, 7)]);
+
+    // A job that left hears nothing more.
+    budget.outside.leave(4242);
+    budget
+        .mail
+        .send(Said {
+            scope: 4242,
+            node: weaver_graph::NodeId::ROOT,
+            generation: 8,
+            heard: Heard::Ended,
+        })
+        .await
+        .unwrap();
+    let said = pipeline.graph_runs.recv().await.unwrap();
+    pipeline.graph_run_said(said);
+    assert_eq!(recorder.0.lock().unwrap().len(), 1);
+    retire_pipeline_database(pipeline).await;
+}

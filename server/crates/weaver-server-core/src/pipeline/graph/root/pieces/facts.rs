@@ -84,7 +84,9 @@ impl PieceRoot {
         // one that went down was.
         for (piece, class) in &facts.raised {
             let Some(found) = root.classes.get_mut(*piece as usize) else {
-                return Err(RootFactsError::Mismatch("a raised piece not in the torrent"));
+                return Err(RootFactsError::Mismatch(
+                    "a raised piece not in the torrent",
+                ));
             };
             *found = *class;
             root.moves.push(super::Move {

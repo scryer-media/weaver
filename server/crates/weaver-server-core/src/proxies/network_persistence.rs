@@ -8,14 +8,30 @@ use super::{
     ProxyProfile, Route, RoutingPolicy, Rung,
 };
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
-use crate::servers::record::{parse_quota_weekday, quota_weekday_str};
 use crate::servers::ServerDownloadQuotaPeriod;
+use crate::servers::record::{parse_quota_weekday, quota_weekday_str};
 use crate::{Database, StateError};
 
 // A storage fault: a row that cannot be read back, or an id that cannot be
 // allocated. Input the operator can correct is a `NetworkRefusal` instead.
 fn error(value: impl std::fmt::Display) -> StateError {
     StateError::Database(value.to_string())
+}
+
+// The columns `egress_row` reads, named rather than `*`: a pooled connection
+// can prepare against the schema it saw before a migration, and SQLite then
+// re-prepares a `*` with more columns than the statement was described with.
+macro_rules! select_egresses {
+    ($($tail:literal)?) => {
+        concat!(
+            "SELECT id, name, binding_kind, binding_value, enabled, download_bps, upload_bps, \
+             quota_download_bytes, quota_download_enabled, quota_upload_soft_bytes, \
+             quota_upload_trickle_bps, \
+             quota_upload_hard_bytes, quota_period, quota_reset_time_minutes_local, \
+             quota_weekly_reset_weekday, quota_monthly_reset_day FROM egress_interfaces"
+            $(, " ", $tail)?
+        )
+    };
 }
 
 fn egress_row(row: SqlRow) -> Result<EgressInterface, StateError> {
@@ -60,8 +76,10 @@ fn opt_arg(value: Option<u64>) -> SqlArg {
 fn quota_row(row: &SqlRow) -> Result<EgressQuota, StateError> {
     let period = row.text("quota_period")?;
     let weekday = row.text("quota_weekly_reset_weekday")?;
+    // A download limit turned off stays stored, and is no limit.
+    let download_on = row.bool("quota_download_enabled")?;
     Ok(EgressQuota {
-        download_bytes: opt_u64(row, "quota_download_bytes")?,
+        download_bytes: opt_u64(row, "quota_download_bytes")?.filter(|_| download_on),
         upload_soft_bytes: opt_u64(row, "quota_upload_soft_bytes")?,
         upload_trickle_bps: u64::try_from(row.i64("quota_upload_trickle_bps")?).map_err(error)?,
         upload_hard_bytes: opt_u64(row, "quota_upload_hard_bytes")?,
@@ -177,7 +195,7 @@ pub(super) async fn validate_policy(
         return Ok(policy.clone());
     }
     let egresses = tx
-        .fetch_all("SELECT * FROM egress_interfaces", &[])
+        .fetch_all(select_egresses!(), &[])
         .await?
         .into_iter()
         .map(egress_row)
@@ -207,7 +225,7 @@ pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), St
         .map(|r| r.map(|pool| (pool.id, pool)))
         .collect::<Result<HashMap<_, _>, _>>()?;
     let egresses = tx
-        .fetch_all("SELECT * FROM egress_interfaces", &[])
+        .fetch_all(select_egresses!(), &[])
         .await?
         .into_iter()
         .map(egress_row)
@@ -285,7 +303,10 @@ impl Database {
                 "INSERT INTO network_bandwidth (id, download_bps, upload_bps) VALUES (1, {}, {})
                  ON CONFLICT(id) DO UPDATE SET download_bps = excluded.download_bps,
                      upload_bps = excluded.upload_bps",
-                &[opt_arg(bandwidth.download_bps), opt_arg(bandwidth.upload_bps)],
+                &[
+                    opt_arg(bandwidth.download_bps),
+                    opt_arg(bandwidth.upload_bps),
+                ],
             )
             .await?;
             Ok(())
@@ -295,15 +316,11 @@ impl Database {
     pub fn list_egress_interfaces(&self) -> Result<Vec<EgressInterface>, StateError> {
         let store = self.datastore();
         self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_all(
-                store.read_exec(),
-                "SELECT * FROM egress_interfaces ORDER BY id",
-                &[],
-            )
-            .await?
-            .into_iter()
-            .map(egress_row)
-            .collect()
+            SqlRuntime::fetch_all(store.read_exec(), select_egresses!("ORDER BY id"), &[])
+                .await?
+                .into_iter()
+                .map(egress_row)
+                .collect()
         })
     }
 
@@ -346,10 +363,10 @@ impl Database {
                     };
                     let now = chrono::Utc::now().timestamp();
                     let quota = &egress.quota;
-                    tx.execute("INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, download_bps, upload_bps, quota_download_bytes, quota_upload_soft_bytes, quota_upload_trickle_bps, quota_upload_hard_bytes, quota_period, quota_reset_time_minutes_local, quota_weekly_reset_weekday, quota_monthly_reset_day, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, binding_kind = excluded.binding_kind, binding_value = excluded.binding_value, enabled = excluded.enabled, download_bps = excluded.download_bps, upload_bps = excluded.upload_bps, quota_download_bytes = excluded.quota_download_bytes, quota_upload_soft_bytes = excluded.quota_upload_soft_bytes, quota_upload_trickle_bps = excluded.quota_upload_trickle_bps, quota_upload_hard_bytes = excluded.quota_upload_hard_bytes, quota_period = excluded.quota_period, quota_reset_time_minutes_local = excluded.quota_reset_time_minutes_local, quota_weekly_reset_weekday = excluded.quota_weekly_reset_weekday, quota_monthly_reset_day = excluded.quota_monthly_reset_day, updated_at = excluded.updated_at", &[
+                    tx.execute("INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, download_bps, upload_bps, quota_download_bytes, quota_download_enabled, quota_upload_soft_bytes, quota_upload_trickle_bps, quota_upload_hard_bytes, quota_period, quota_reset_time_minutes_local, quota_weekly_reset_weekday, quota_monthly_reset_day, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, binding_kind = excluded.binding_kind, binding_value = excluded.binding_value, enabled = excluded.enabled, download_bps = excluded.download_bps, upload_bps = excluded.upload_bps, quota_download_bytes = COALESCE(excluded.quota_download_bytes, egress_interfaces.quota_download_bytes), quota_download_enabled = excluded.quota_download_enabled, quota_upload_soft_bytes = excluded.quota_upload_soft_bytes, quota_upload_trickle_bps = excluded.quota_upload_trickle_bps, quota_upload_hard_bytes = excluded.quota_upload_hard_bytes, quota_period = excluded.quota_period, quota_reset_time_minutes_local = excluded.quota_reset_time_minutes_local, quota_weekly_reset_weekday = excluded.quota_weekly_reset_weekday, quota_monthly_reset_day = excluded.quota_monthly_reset_day, updated_at = excluded.updated_at", &[
                         SqlArg::I64(i64::from(egress.id)), SqlArg::Text(egress.name.clone()), SqlArg::Text(kind.into()), SqlArg::OptText(value),
                         SqlArg::Bool(egress.enabled), opt_arg(egress.download_bps), opt_arg(egress.upload_bps),
-                        opt_arg(quota.download_bytes), opt_arg(quota.upload_soft_bytes), SqlArg::I64(quota.upload_trickle_bps as i64), opt_arg(quota.upload_hard_bytes),
+                        opt_arg(quota.download_bytes), SqlArg::Bool(quota.download_bytes.is_some()), opt_arg(quota.upload_soft_bytes), SqlArg::I64(quota.upload_trickle_bps as i64), opt_arg(quota.upload_hard_bytes),
                         SqlArg::Text(quota.period.as_str().into()),
                         SqlArg::I64(i64::from(quota.reset_time_minutes_local)), SqlArg::Text(quota_weekday_str(quota.weekly_reset_weekday).into()),
                         SqlArg::I64(i64::from(quota.monthly_reset_day)),

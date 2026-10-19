@@ -3,21 +3,24 @@
 
 import { gql } from "urql";
 
-/** An egress as every page reads it: its quota settings, and how much of the allowance is spent. */
-const EGRESS_FIELDS = `id name bindingKind interfaceName sourceAddress addresses enabled maxDownloadSpeed health reason
-  downloadQuota { enabled period limitBytes resetTimeMinutesLocal weeklyResetWeekday monthlyResetDay }
-  downloadQuotaUsage { usedBytes reservedBytes remainingBytes blocked windowStartsAtEpochMs windowEndsAtEpochMs timezoneName }`;
+const QUOTA_FIELDS = `quota { downloadBytes uploadSoftBytes uploadTrickleBps uploadHardBytes period resetTimeMinutesLocal weeklyResetWeekday monthlyResetDay }
+  quotaUsage { down { usedBytes remainingBytes state } up { usedBytes remainingBytes state } state periodStartEpochMs periodEndEpochMs timezoneName }`;
+/** An egress as every page reads it: its limits, its quota settings, and how much of each cap is spent. */
+const EGRESS_FIELDS = `id name bindingKind interfaceName sourceAddress addresses enabled downloadBps uploadBps health reason
+  ${QUOTA_FIELDS}`;
 
-/** Every egress's allowance and how much of it the current window has spent. */
+/** Every egress's caps and how much of them the current period has spent. */
 export const EGRESS_QUOTAS_QUERY = gql`
   query EgressQuotas {
     egressInterfaces {
       id name
-      downloadQuota { enabled period limitBytes resetTimeMinutesLocal weeklyResetWeekday monthlyResetDay }
-      downloadQuotaUsage { usedBytes reservedBytes remainingBytes blocked windowStartsAtEpochMs windowEndsAtEpochMs timezoneName }
+      ${QUOTA_FIELDS}
     }
   }
 `;
+/** The limits over every egress together. */
+export const BANDWIDTH_QUERY = gql`query Bandwidth { networking { bandwidth { downloadBps uploadBps } } }`;
+export const SET_BANDWIDTH = gql`mutation SetBandwidth($input:BandwidthInput!) { setBandwidth(input:$input) { downloadBps uploadBps } }`;
 export const NETWORKING_QUERY = gql`
   query Networking {
     egressInterfaces { ${EGRESS_FIELDS} }
@@ -36,6 +39,7 @@ export const NETWORK_FLOW_SUBSCRIPTION = gql`subscription NetworkFlowUpdates { n
 export const CREATE_EGRESS = gql`mutation CreateEgress($input:EgressInterfaceInput!) { createEgressInterface(input:$input) { id } }`;
 export const UPDATE_EGRESS = gql`mutation UpdateEgress($id:Int!,$input:EgressInterfaceInput!) { updateEgressInterface(id:$id,input:$input) { id } }`;
 export const DELETE_EGRESS = gql`mutation DeleteEgress($id:Int!) { deleteEgressInterface(id:$id) }`;
+export const SET_EGRESS_QUOTA = gql`mutation SetEgressQuota($id:Int!,$input:EgressQuotaInput!) { setEgressQuota(id:$id,input:$input) { id } }`;
 export const RESET_EGRESS_USAGE = gql`mutation ResetEgressUsage($id:Int!) { resetEgressDownloadQuotaUsage(id:$id) { id } }`;
 export const CREATE_POOL = gql`mutation CreatePool($input:ProxyPoolInput!) { createProxyPool(input:$input) { id } }`;
 export const UPDATE_POOL = gql`mutation UpdatePool($id:Int!,$input:ProxyPoolInput!) { updateProxyPool(id:$id,input:$input) { id } }`;

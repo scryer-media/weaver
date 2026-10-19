@@ -1735,3 +1735,43 @@ async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
     );
     assert_eq!(handing_on.budget(), Duration::from_secs(31));
 }
+
+// A stage that carries datagrams, as a WireGuard session does.
+struct Carrying;
+struct NoPeers;
+#[async_trait::async_trait]
+impl crate::endpoint::DatagramTransport for NoPeers {
+    async fn resolve(&self, _: &str) -> Result<Vec<IpAddr>, TunnelError> {
+        Ok(Vec::new())
+    }
+    async fn bind(
+        &self,
+        _: SocketAddr,
+    ) -> Result<Arc<dyn crate::endpoint::DatagramSocket>, TunnelError> {
+        Err(TunnelError::Engine("no peers".into()))
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for Carrying {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        Err(DialError::Skipped("carries datagrams only".into()))
+    }
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn crate::endpoint::DatagramTransport>> {
+        Some(Arc::new(NoPeers))
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "carrying".into()
+    }
+}
+
+#[test]
+fn a_revocable_leg_carries_its_stage_datagrams_until_revoked() {
+    let leg = Arc::new(Revocable::new(Arc::new(Carrying)));
+    assert!(Arc::clone(&leg).datagrams().is_some());
+    assert!(Arc::new(Revocable::new(bottom())).datagrams().is_none());
+    leg.revoke();
+    assert!(leg.datagrams().is_none());
+}

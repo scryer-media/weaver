@@ -20,6 +20,7 @@ import {
 } from "@/lib/hooks/use-stable-queue-eta";
 import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
+import { showsSeeding, torrentErrorText, type TorrentSummaryData } from "@/lib/torrents";
 import { BulkBar, BulkButton, BulkCluster, BulkMenu } from "../components/BulkBar";
 import { EmptyState, MetricCell, SectionHeader } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -51,6 +52,8 @@ import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
+import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
+import { useTorrentSummaries } from "../data/use-torrents";
 import { SpeedLimitControl } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
@@ -147,6 +150,8 @@ export function DownloadsPage() {
   const [confirmCancel, setConfirmCancel] = useState(false);
   // The one row whose cancel button is waiting on confirmation.
   const [confirmRowCancel, setConfirmRowCancel] = useState<number | null>(null);
+  // The one torrent whose remove is waiting on confirmation.
+  const [removeTorrentId, setRemoveTorrentId] = useState<number | null>(null);
   const [report, setReport] = useState<string | null>(null);
 
   const client = useClient();
@@ -164,6 +169,15 @@ export function DownloadsPage() {
     () => queue.jobs.filter((job) => !removedIds.has(job.id)),
     [queue.jobs, removedIds],
   );
+
+  const torrents = useTorrentSummaries(jobs.some((job) => job.protocol === "TORRENT"));
+  const seedingColumn = [...torrents.values()].some((torrent) => showsSeeding(torrent.state));
+  // The row handlers read a job's protocol by id, so they keep their identity while the rows move.
+  const jobsRef = useRef(jobs);
+  useLayoutEffect(() => {
+    jobsRef.current = jobs;
+  });
+  const isTorrent = useCallback((id: number) => jobsRef.current.find((job) => job.id === id)?.protocol === "TORRENT", []);
 
   const etaSpeed = useStableEtaSpeed(jobs, speed);
   const estimates = useStableQueueEta(jobs, speed);
@@ -419,9 +433,16 @@ export function DownloadsPage() {
 
   const pauseRow = useCallback(
     (id: number, paused: boolean) => {
-      void (paused ? pauseJob({ id }) : resumeJob({ id }));
+      void (paused ? pauseJob({ id }) : resumeJob({ id })).then((result) => {
+        if (result.error) setReport(torrentErrorText(result.error));
+        refreshQueue();
+      });
     },
-    [pauseJob, resumeJob],
+    [pauseJob, refreshQueue, resumeJob],
+  );
+  const askCancelRow = useCallback(
+    (id: number) => (isTorrent(id) ? setRemoveTorrentId(id) : setConfirmRowCancel(id)),
+    [isTorrent],
   );
 
   // Like the bulk cancel: the row leaves the moment the cancel is sent and
@@ -672,7 +693,9 @@ export function DownloadsPage() {
                   onPick={togglePicked}
                   statusLabel={statusLabel}
                   onPause={pauseRow}
-                  onCancel={setConfirmRowCancel}
+                  onCancel={askCancelRow}
+                  torrents={torrents}
+                  seedingColumn={seedingColumn}
                   heldOf={heldValue}
                   holdOf={holdValue}
                 />
@@ -693,6 +716,7 @@ export function DownloadsPage() {
           job={selected}
           eta={heldValue(selected) ?? etaById.get(selected.id) ?? EM_DASH}
           rate={ratePhase(selected.phaseProgress)?.rateBps ?? 0}
+          torrent={torrents.get(selected.id) ?? null}
           onRemoved={handleRemoved}
         />
       )}
@@ -720,6 +744,24 @@ export function DownloadsPage() {
         dismissLabel={t("next.downloads.keepDownloading")}
         onConfirm={() => void cancelRow()}
         onDismiss={() => setConfirmRowCancel(null)}
+      />
+
+      <TorrentRemoveDialog
+        id={removeTorrentId}
+        name={(() => {
+          const job = jobs.find((candidate) => candidate.id === removeTorrentId);
+          return job ? formatJobReleaseName(job) : undefined;
+        })()}
+        onRemoved={(id) => {
+          setRemoveTorrentId(null);
+          handleRemoved(id);
+          refreshQueue();
+        }}
+        onFailed={(message) => {
+          setRemoveTorrentId(null);
+          setReport(message);
+        }}
+        onDismiss={() => setRemoveTorrentId(null)}
       />
 
       <AddNzbDialog
@@ -759,6 +801,8 @@ interface QueueGroupProps {
   onCancel: (id: number) => void;
   heldOf: (job: JobData) => string | null;
   holdOf: (job: JobData) => string | null;
+  torrents: ReadonlyMap<number, TorrentSummaryData>;
+  seedingColumn: boolean;
 }
 
 /**
@@ -781,6 +825,8 @@ const QueueGroup = memo(function QueueGroup({
   onCancel,
   heldOf,
   holdOf,
+  torrents,
+  seedingColumn,
 }: QueueGroupProps) {
   const t = useTranslate();
   const sorted = sortJobs(rows, sort, etaById);
@@ -811,6 +857,8 @@ const QueueGroup = memo(function QueueGroup({
           onCancel={onCancel}
           held={heldOf(job)}
           hold={holdOf(job)}
+          seeding={seedingOf(torrents.get(job.id))}
+          seedingColumn={seedingColumn}
           statusTitle={
             job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
               ? t("next.status.propagationUntil", {
@@ -823,6 +871,11 @@ const QueueGroup = memo(function QueueGroup({
     </section>
   );
 }, sameGroupProps);
+
+/** A torrent's figures for the seeding column, while it seeds or has stopped. */
+function seedingOf(torrent: TorrentSummaryData | undefined): TorrentSummaryData | null {
+  return torrent && showsSeeding(torrent.state) ? torrent : null;
+}
 
 /** Whether a drag is carrying files from the desktop, not text or a link from the page. */
 function carriesFiles(event: DragEvent): boolean {

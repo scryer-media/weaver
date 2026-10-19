@@ -114,6 +114,40 @@ fn migration_seeds_exactly_one_system_egress_and_backup_accepts_it() {
     );
 }
 
+// Turning a download limit off keeps it stored, and turning it on again
+// with no value of its own brings it back.
+#[test]
+fn a_download_limit_turned_off_is_kept() {
+    let db = Database::open_in_memory().unwrap();
+    let mut wan = egress();
+    wan.quota.download_bytes = Some(5_000);
+    let mut wan = db.create_egress_interface(&wan).unwrap();
+    wan.quota.download_bytes = None;
+    db.update_egress_interface(&wan).unwrap();
+    assert_eq!(
+        db.list_egress_interfaces().unwrap()[1].quota.download_bytes,
+        None
+    );
+    let kept: i64 = db
+        .run_sql_blocking_read({
+            let store = db.datastore();
+            async move {
+                Ok::<_, StateError>(
+                    SqlRuntime::fetch_all(
+                        store.read_exec(),
+                        "SELECT quota_download_bytes FROM egress_interfaces WHERE id = {}",
+                        &[SqlArg::I64(i64::from(wan.id))],
+                    )
+                    .await?
+                    .remove(0)
+                    .i64("quota_download_bytes")?,
+                )
+            }
+        })
+        .unwrap();
+    assert_eq!(kept, 5_000);
+}
+
 #[test]
 fn egress_and_pool_configuration_round_trips_through_backup() {
     let source = Database::open_in_memory().unwrap();

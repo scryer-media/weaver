@@ -169,7 +169,7 @@ impl SystemQuery {
         let max_download_speed = with_timed_config_read(
             config,
             "system.query.system_status.max_download_speed",
-            |cfg| cfg.max_download_speed.unwrap_or(0),
+            |cfg| cfg.bandwidth.download_bps,
         )
         .await;
         let global_state = global_queue_state(

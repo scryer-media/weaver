@@ -2,9 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A graph job's checkpoint: the tree's records, the job's and the root's
-// facts, which
-// members have files, the kept envelopes and which candidate each node was
-// offered last, as the rows the database keeps. It is taken after every
+// facts, which members have files, the kept envelopes and which candidate
+// each node was offered last, as the rows the database keeps. It is taken after every
 // step that reached the tree, when the step's bytes are written, so it only
 // ever describes bytes on disk; holds in memory are left out and fetched
 // again.
@@ -97,8 +96,15 @@ impl Pipeline {
         let Some(graph) = self.graph_jobs.get(&job_id) else {
             return;
         };
+        let snapshot = match graph.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a graph job");
+                return;
+            }
+        };
         let pending = graph.pending().clone();
-        if !pending.put(rows(&graph.snapshot())) {
+        if !pending.put(rows(&snapshot)) {
             return;
         }
         let writer = pending.clone();

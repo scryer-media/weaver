@@ -122,6 +122,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         disk_space,
         http_metrics,
         restart,
+        torrents,
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
@@ -164,6 +165,17 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         session_token: session_token.clone(),
         security: Arc::clone(&request_security),
     };
+    let torrent_facade = super::torrent_facade::TorrentFacadeContext::new(
+        db.clone(),
+        handle.clone(),
+        config.clone(),
+        auth_cache.clone(),
+        api_key_cache.clone(),
+        session_token.clone(),
+        security.clone(),
+        watch_folder.clone(),
+        torrents,
+    );
     let nzbget_context = super::nzbget::NzbgetFacadeContext::new(
         db.clone(),
         handle.clone(),
@@ -188,6 +200,9 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .route("/healthz", get(super::health::healthz_handler))
         .route("/readyz", get(super::health::readyz_handler))
         .merge(nzbget_rpc_routes)
+        .merge(super::torrent_facade::build_torrent_facade_routes(
+            torrent_facade,
+        ))
         .route("/graphql", post(super::graphql::graphql_handler))
         .route(
             "/graphql/ws",

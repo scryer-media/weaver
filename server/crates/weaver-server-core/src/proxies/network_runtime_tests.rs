@@ -1194,3 +1194,55 @@ fn a_held_share_on_an_out_of_quota_leg_leaves_no_leg_in_quota() {
 
 #[path = "network_test_via_tests.rs"]
 mod via;
+
+// Torrent scopes whose routes resolve to one leg share its session, so they
+// share its stage: it outlives the removal of one scope and goes with the
+// last. Servers on one leg each keep their own.
+#[tokio::test]
+async fn torrent_scopes_on_one_leg_keep_its_stage_until_the_last_goes() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let timeout = Duration::from_secs(1);
+    let tv = TorrentScope::Category(1);
+    let film = TorrentScope::Category(2);
+    let mut config = runtime.configuration.read().unwrap().clone();
+    for consumer in [
+        Consumer::Torrent(tv),
+        Consumer::Torrent(film),
+        Consumer::Server(1),
+        Consumer::Server(2),
+    ] {
+        config.consumers.insert(consumer.key());
+    }
+    runtime.apply_configuration(config.clone()).unwrap();
+    let tv_leg = runtime.torrent_leg(tv, timeout).unwrap();
+    let film_leg = runtime.torrent_leg(film, timeout).unwrap();
+    assert!(Arc::ptr_eq(&tv_leg.stage, &film_leg.stage));
+    let server_stage = |id| {
+        runtime
+            .route(Consumer::Server(id), 1, timeout)
+            .unwrap()
+            .legs
+            .read()
+            .unwrap()[0]
+            .stage
+            .clone()
+    };
+    assert!(!Arc::ptr_eq(&server_stage(1), &server_stage(2)));
+
+    config.consumers.remove(&Consumer::Torrent(tv).key());
+    runtime.apply_configuration(config.clone()).unwrap();
+    assert!(!film_leg.stage.is_revoked());
+    assert!(Arc::ptr_eq(
+        &film_leg.stage,
+        &runtime.torrent_leg(film, timeout).unwrap().stage
+    ));
+
+    config.consumers.remove(&Consumer::Torrent(film).key());
+    runtime.apply_configuration(config).unwrap();
+    assert!(film_leg.stage.is_revoked());
+    runtime.shutdown().await;
+}

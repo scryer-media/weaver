@@ -734,7 +734,7 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
             .db
             .save_graph_checkpoint(
                 restored_id,
-                Arc::new(checkpoint::rows(&admitted.snapshot())),
+                Arc::new(checkpoint::rows(&admitted.snapshot().unwrap())),
             )
             .unwrap();
         retire_pipeline_database(pipeline).await;
@@ -789,7 +789,7 @@ fn an_article_job_checkpointed_before_roots_had_kinds_restores() {
     let files = [file("lantern.bin", &[100]), file("later.bin", &[100])];
     let (mut job, dir, _) = job_with(&files, Vec::new());
     job.intake(decoded(0, 0, 0, &[7; 90], Some(90)), 1).unwrap();
-    let taken = job.snapshot();
+    let taken = job.snapshot().unwrap();
     let mut rows = checkpoint::rows(&taken);
     checkpoint::tests::as_version_2(&mut rows);
     let snapshot = checkpoint::snapshot(&rows).unwrap();
@@ -812,7 +812,7 @@ fn an_article_job_checkpointed_before_roots_had_kinds_restores() {
     let restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
     assert!(restored.refetched.is_empty());
     assert!(restored.settled.contains(&(VolumeIndex(0), 0)));
-    let again = restored.job.snapshot();
+    let again = restored.job.snapshot().unwrap();
     assert_eq!(again.root, taken.root);
     assert_eq!(again.job.read_backs, taken.job.read_backs);
 }

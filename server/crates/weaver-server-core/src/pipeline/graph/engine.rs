@@ -88,6 +88,46 @@ impl RunMail {
     }
 }
 
+// A job the pipeline does not hold, hearing its runs through the pipeline's
+// mail: the step a run's word drives, with the slots the job may use now.
+pub(crate) trait Hears: Send + Sync {
+    fn said(&self, said: Said, slots: usize);
+}
+
+// The jobs outside the pipeline whose runs speak on its mail, by scope.
+#[derive(Default)]
+pub(crate) struct Outside(std::sync::Mutex<std::collections::HashMap<u64, Arc<dyn Hears>>>);
+
+impl Outside {
+    fn jobs(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, Arc<dyn Hears>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn join(&self, scope: u64, hears: Arc<dyn Hears>) {
+        self.jobs().insert(scope, hears);
+    }
+
+    pub(crate) fn leave(&self, scope: u64) {
+        self.jobs().remove(&scope);
+    }
+
+    // Hand `said` to the job it is addressed to, if that job is here.
+    pub(crate) fn deliver(&self, said: Said, slots: usize) {
+        let hears = self.jobs().get(&said.scope).cloned();
+        if let Some(hears) = hears {
+            hears.said(said, slots);
+        }
+    }
+}
+
+impl std::fmt::Debug for Outside {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Outside").field(&self.jobs().len()).finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Life {
     Queued,

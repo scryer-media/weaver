@@ -340,11 +340,9 @@ fn render_gate(out: &mut Encoder, pipeline_paused: bool, download_block: &Downlo
             u8::from(kind == download_block.kind),
         );
     }
-    out.sample(
-        &f::SCHEDULED_SPEED_LIMIT,
-        &[],
-        download_block.scheduled_speed_limit,
-    );
+    if let Some(limit) = download_block.scheduled_speed_limit {
+        out.sample(&f::SCHEDULED_SPEED_LIMIT, &[], limit);
+    }
 
     out.sample(
         &f::DOWNLOAD_BLOCK_WINDOW_END_SECONDS,

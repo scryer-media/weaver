@@ -41,6 +41,7 @@ import {
 } from "../data/hardware-profiles";
 import { WV } from "../data/palette";
 import { PathField } from "./DirectoryBrowserDialog";
+import type { SeedingPolicy } from "../pages/settings/seeding";
 
 interface FirstRunSetupState {
   firstRunSetup: { pending: boolean };
@@ -70,6 +71,9 @@ interface Category {
   id: number;
   name: string;
   destDir: string | null;
+  aliases?: string;
+  seeding?: SeedingPolicy | null;
+  torrentRoute?: boolean;
 }
 
 interface FolderSettings {

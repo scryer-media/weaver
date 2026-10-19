@@ -300,7 +300,7 @@ impl<R: Root> GraphJob<R> {
             .collect()
     }
 
-    // Articles the queues do not hold were fetched by an earlier run.
+    // What the queues do not hold arrived in an earlier run.
     pub(crate) fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool) {
         self.root.arrived_before(queued);
     }
@@ -311,7 +311,7 @@ impl<R: Root> GraphJob<R> {
         self.root.any_head_waiting()
     }
 
-    // The class the root fetches an article under now.
+    // The class the root fetches `ordinal` of `volume` under now.
     pub(crate) fn article_class(&self, volume: VolumeIndex, ordinal: u32) -> Option<R::Class> {
         self.root.class(volume, ordinal)
     }

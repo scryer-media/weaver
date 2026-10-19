@@ -19,6 +19,7 @@ import {
   REPROCESS_JOB_MUTATION,
   RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
+  SET_TORRENT_FORCED_MUTATION,
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
@@ -63,6 +64,8 @@ import { useSharedStructure } from "../data/share";
 import { countLabel } from "../i18n/labels";
 import { NextShell, RailBlock } from "../shell/NextShell";
 import { SupportReportActions } from "../features/SupportReportActions";
+import { TorrentDetail, useTorrent } from "../features/torrents/TorrentDetail";
+import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 
 /**
  * One job, end to end.
@@ -229,6 +232,8 @@ function JobDetailContent() {
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
+  const [, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
+  const [removingTorrent, setRemovingTorrent] = useState(false);
 
   const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "cancel" | "forget" | null>(null);
   const [report, setReport] = useState<string | null>(null);
@@ -241,6 +246,8 @@ function JobDetailContent() {
   const raw = snapshot?.queueItem ?? snapshot?.historyItem ?? null;
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
   const progress = useJobProgress(job ?? NO_JOB);
+  const isTorrent = job?.protocol === "TORRENT";
+  const { torrent, refresh: refreshTorrent } = useTorrent(jobId, isTorrent, inQueue);
   // The output folder fills in as the job moves through post-processing and
   // settles when it finishes, so the listing is re-read on each status change
   // rather than kept from the page's first render.
@@ -431,16 +438,18 @@ function JobDetailContent() {
             <StateChip label={statusLabel(progress.status)} tone={failed ? "bad" : "ok"} />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <SecondaryButton
-              icon="downloadFile"
-              size="compact"
-              disabled={busy}
-              onClick={() => {
-                void downloadNzb();
-              }}
-            >
-              {t("next.job.downloadNzb")}
-            </SecondaryButton>
+            {isTorrent ? null : (
+              <SecondaryButton
+                icon="downloadFile"
+                size="compact"
+                disabled={busy}
+                onClick={() => {
+                  void downloadNzb();
+                }}
+              >
+                {t("next.job.downloadNzb")}
+              </SecondaryButton>
+            )}
             <SupportReportActions jobId={job.id} size="compact" onReport={setReport} />
             {/* Only while scripts run: a job waiting for a script slot reports itself as queued. */}
             {job.status === "POST_PROCESSING" ? (
@@ -455,7 +464,38 @@ function JobDetailContent() {
                 {t("next.inspector.stopScripts")}
               </SecondaryButton>
             ) : null}
-            {inQueue && !terminal ? (
+            {isTorrent && inQueue ? (
+              <>
+                <SecondaryButton
+                  icon={token === "paused" ? "resume" : "pause"}
+                  size="compact"
+                  disabled={busy}
+                  onClick={() => {
+                    void run(
+                      token === "paused" ? t("next.job.report.resumed") : t("next.job.report.paused"),
+                      () => (token === "paused" ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })),
+                    ).then(refreshTorrent);
+                  }}
+                >
+                  {token === "paused" ? t("action.resume") : t("action.pause")}
+                </SecondaryButton>
+                <SecondaryButton
+                  size="compact"
+                  disabled={busy || torrent === null}
+                  onClick={() => {
+                    const forced = !(torrent?.forced ?? false);
+                    void run(t(forced ? "next.torrent.forced" : "next.torrent.unforced"), () =>
+                      setTorrentForced({ id: job.id, forced }),
+                    ).then(refreshTorrent);
+                  }}
+                >
+                  {torrent?.forced ? t("next.torrent.unforce") : t("next.torrent.force")}
+                </SecondaryButton>
+                <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setRemovingTorrent(true)}>
+                  {t("next.common.remove")}
+                </DangerButton>
+              </>
+            ) : inQueue && !terminal ? (
               <>
                 <SecondaryButton
                   icon={token === "paused" ? "resume" : "pause"}
@@ -488,6 +528,7 @@ function JobDetailContent() {
               </>
             ) : (
               <>
+                {isTorrent ? null : (
                 <SecondaryButton
                   icon="redownload"
                   size="compact"
@@ -498,6 +539,7 @@ function JobDetailContent() {
                 >
                   {t("next.completed.redownload")}
                 </SecondaryButton>
+                )}
                 <SecondaryButton
                   icon="postProcessing"
                   size="compact"
@@ -510,6 +552,7 @@ function JobDetailContent() {
                 >
                   {t("next.completed.rerunScripts")}
                 </SecondaryButton>
+                {isTorrent ? null : (
                 <SecondaryButton
                   icon="reprocess"
                   size="compact"
@@ -520,6 +563,7 @@ function JobDetailContent() {
                 >
                   {t("next.job.reprocess")}
                 </SecondaryButton>
+                )}
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
                   {t("next.job.deleteSaveFiles")}
                 </DangerButton>
@@ -655,6 +699,14 @@ function JobDetailContent() {
             }
           />
         </MetricStrip>
+
+        {torrent ? (
+          <TorrentDetail
+            torrent={torrent}
+            onChanged={refreshTorrent}
+            onReport={setReport}
+          />
+        ) : null}
 
         <DetailBlock id="pipeline" title={t("next.job.pipeline")} note={timeline?.note} bodyClassName="gap-0">
           {timeline ? (
@@ -994,6 +1046,19 @@ function JobDetailContent() {
             return result;
           });
         }}
+      />
+      <TorrentRemoveDialog
+        id={removingTorrent ? job.id : null}
+        name={job.displayTitle || job.name}
+        onRemoved={() => {
+          setRemovingTorrent(false);
+          navigate("/");
+        }}
+        onFailed={(message) => {
+          setRemovingTorrent(false);
+          setReport(message);
+        }}
+        onDismiss={() => setRemovingTorrent(false)}
       />
     </NextShell>
   );

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use crate::persistence::Refusal;
 use super::EgressQuotaFault;
+use crate::persistence::Refusal;
 
 // Why a networking edit was refused. Each variant is one sentence; `code`
 // names the condition and is part of the API, so a client words the refusal

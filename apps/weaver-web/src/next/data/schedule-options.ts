@@ -50,12 +50,27 @@ export function scheduleDaysLabel(t: Translate, days: readonly string[]): string
 /** What one change of a speed rule applies to. */
 export type SpeedTargetKind = "GLOBAL" | "EGRESS" | "SERVER";
 
-/** One target of a speed rule and the rate it sets; 0 removes the limit there. */
+/**
+ * One target of a speed rule and the rates it sets. Null lifts the limit
+ * there; 0 lets nothing through. Only the global target has an upload rate,
+ * and a rule that sets the global target sets both of its directions.
+ */
 export interface ScheduleSpeedLimit {
   kind: SpeedTargetKind;
   /** The egress or provider; null for the global limit. */
   id: number | null;
-  bytesPerSec: number;
+  download: number | null;
+  upload: number | null;
+}
+
+/**
+ * What the form holds for a target the rule sets: per direction, the rate
+ * typed in MB/s, or null for no limit. A target the rule leaves as it is has
+ * no entry.
+ */
+export interface SpeedEntry {
+  download: string | null;
+  upload: string | null;
 }
 
 export interface ScheduleOptions {
@@ -74,11 +89,8 @@ export interface ScheduleOptions {
 
 export interface ScheduleOptionsForm extends Omit<ScheduleOptions, "times" | "speedLimits"> {
   timesText: string;
-  /**
-   * The rate typed for each target, in MB/s, keyed by {@link speedKey}. Blank
-   * leaves that target as it is.
-   */
-  speeds: Record<string, string>;
+  /** What the rule sets on each target, keyed by {@link speedKey}. A target with no entry is left as it is. */
+  speeds: Record<string, SpeedEntry>;
 }
 
 export interface ScheduleTargets {
@@ -93,45 +105,63 @@ export function speedKey(kind: SpeedTargetKind, id: number | null): string {
   return kind === "GLOBAL" ? "GLOBAL" : `${kind}:${id}`;
 }
 
-/** A stored rate as its field shows it: MB/s, to two places. */
-function rateText(bytesPerSec: number): string {
-  return String(Math.round((bytesPerSec / MIB) * 100) / 100);
+/** A stored rate as its field shows it: MB/s, to two places; null stays no limit. */
+function rateText(bytesPerSec: number | null): string | null {
+  return bytesPerSec === null ? null : String(Math.round((bytesPerSec / MIB) * 100) / 100);
 }
 
-/** Why a typed rate cannot be saved, as a translation key; null when it can. */
-export function speedProblem(text: string): string | null {
+/** Why a typed rate cannot be saved, as a translation key; null when it can. No limit always can. */
+function rateProblem(text: string | null): string | null {
+  if (text === null) return null;
   const trimmed = text.trim();
-  if (trimmed === "") return null;
   const value = Number(trimmed);
-  return Number.isFinite(value) && value >= 0 ? null : "next.schedules.speedInvalid";
+  return trimmed !== "" && Number.isFinite(value) && value >= 0 ? null : "next.schedules.speedInvalid";
+}
+
+/** Why a target's entry cannot be saved, as a translation key; null when it can. */
+export function speedProblem(entry: SpeedEntry, kind: SpeedTargetKind): string | null {
+  return rateProblem(entry.download) ?? (kind === "GLOBAL" ? rateProblem(entry.upload) : null);
+}
+
+/** The target a form key names. */
+export function speedTarget(key: string): { kind: SpeedTargetKind; id: number | null } {
+  const [kind, id] = key.split(":") as [SpeedTargetKind, string | undefined];
+  return { kind, id: id === undefined ? null : Number(id) };
+}
+
+/** A typed rate in bytes, or the stored one when the field only rounded it for display. */
+function rateBytes(text: string | null, saved: number | null | undefined): number | null {
+  if (text === null) return null;
+  return saved !== undefined && saved !== null && rateText(saved) === String(Number(text.trim()))
+    ? saved
+    : Math.round(Number(text.trim()) * MIB);
 }
 
 /**
  * The changes a speed form makes, global first, then each egress, then each
- * provider. A target left blank is left out. A rate the field only rounded for
- * display goes back exactly as it was stored.
+ * provider. A target with no entry is left out. A rate the field only rounded
+ * for display goes back exactly as it was stored.
  */
 export function speedLimitsInput(
-  speeds: Record<string, string>,
+  speeds: Record<string, SpeedEntry>,
   stored: readonly ScheduleSpeedLimit[] = [],
 ): ScheduleSpeedLimit[] {
   const order = (kind: SpeedTargetKind) => (kind === "GLOBAL" ? 0 : kind === "EGRESS" ? 1 : 2);
   return Object.entries(speeds)
-    .filter(([, text]) => text.trim() !== "" && speedProblem(text) === null)
-    .map(([key, text]): ScheduleSpeedLimit => {
-      const [kind, id] = key.split(":") as [SpeedTargetKind, string | undefined];
-      const target = { kind, id: id === undefined ? null : Number(id) };
+    .map(([key, entry]) => ({ target: speedTarget(key), entry }))
+    .filter(({ target, entry }) => speedProblem(entry, target.kind) === null)
+    .map(({ target, entry }): ScheduleSpeedLimit => {
       const saved = stored.find((limit) => limit.kind === target.kind && limit.id === target.id);
-      const bytesPerSec =
-        saved && rateText(saved.bytesPerSec) === String(Number(text.trim()))
-          ? saved.bytesPerSec
-          : Math.round(Number(text.trim()) * MIB);
-      return { ...target, bytesPerSec };
+      return {
+        ...target,
+        download: rateBytes(entry.download, saved?.download),
+        upload: target.kind === "GLOBAL" ? rateBytes(entry.upload, saved?.upload) : null,
+      };
     })
     .sort((left, right) => order(left.kind) - order(right.kind) || (left.id ?? 0) - (right.id ?? 0));
 }
 
-/** A speed rule in the table's words: "Global 5 MB/s, wan 2 MB/s", with "unlimited" for a removed limit. */
+/** A speed rule in the table's words: "Global ↓ 5 MB/s ↑ unlimited, wan 2 MB/s", with "unlimited" for a lifted limit. */
 export function speedLimitsLabel(
   t: Translate,
   limits: readonly ScheduleSpeedLimit[],
@@ -147,8 +177,10 @@ export function speedLimitsLabel(
               `${t("next.schedules.egress")} #${limit.id}`
             : targets?.servers.find((server) => server.id === limit.id)?.host ??
               `${t("next.schedules.server")} #${limit.id}`;
-      const rate = limit.bytesPerSec > 0 ? formatRate(limit.bytesPerSec) : t("next.schedules.unlimited");
-      return `${name} ${rate}`;
+      const rate = (bytes: number | null) => (bytes !== null ? formatRate(bytes) : t("next.schedules.unlimited"));
+      return limit.kind === "GLOBAL"
+        ? `${name} ↓ ${rate(limit.download)} ↑ ${rate(limit.upload)}`
+        : `${name} ${rate(limit.download)}`;
     })
     .join(", ");
 }
@@ -206,7 +238,10 @@ export function optionsFromSchedule(schedule: ScheduleOptions): ScheduleOptionsF
     serverActive: schedule.serverActive ?? true,
     quotaMeteringEnabled: schedule.quotaMeteringEnabled ?? true,
     speeds: Object.fromEntries(
-      (speedLimits ?? []).map((limit) => [speedKey(limit.kind, limit.id), rateText(limit.bytesPerSec)]),
+      (speedLimits ?? []).map((limit) => [
+        speedKey(limit.kind, limit.id),
+        { download: rateText(limit.download), upload: limit.kind === "GLOBAL" ? rateText(limit.upload) : null },
+      ]),
     ),
   };
 }

@@ -39,7 +39,10 @@ pub(crate) struct ServerQuotaWindow {
     pub end: DateTime<Utc>,
 }
 
-pub(crate) fn quota_window(now: DateTime<Local>, calendar: QuotaCalendar) -> Option<ServerQuotaWindow> {
+pub(crate) fn quota_window(
+    now: DateTime<Local>,
+    calendar: QuotaCalendar,
+) -> Option<ServerQuotaWindow> {
     let window = crate::bandwidth::service::compute_window(now, calendar)?;
     Some(ServerQuotaWindow {
         start: window.starts_at().with_timezone(&Utc),
@@ -286,15 +289,13 @@ impl ServerTransferPolicyRegistry {
     fn load_upload(&self, scope: TransferScope, id: u32) -> Result<UploadCount, StateError> {
         Ok(match scope {
             TransferScope::Server => UploadCount::default(),
-            TransferScope::Egress => self
-                .db
-                .egress_upload_usage(id)?
-                .map_or_else(UploadCount::default, |(lifetime_bytes, baseline_bytes)| {
-                    UploadCount {
-                        lifetime_bytes,
-                        baseline_bytes,
-                    }
-                }),
+            TransferScope::Egress => self.db.egress_upload_usage(id)?.map_or_else(
+                UploadCount::default,
+                |(lifetime_bytes, baseline_bytes)| UploadCount {
+                    lifetime_bytes,
+                    baseline_bytes,
+                },
+            ),
         })
     }
 
@@ -493,7 +494,10 @@ impl ServerTransferPolicyRegistry {
                     .max(usage.lifetime_bytes);
                 upload = upload.restart();
             }
-            if matches!(holder.quota.calendar.period, ServerDownloadQuotaPeriod::OneTime) {
+            if matches!(
+                holder.quota.calendar.period,
+                ServerDownloadQuotaPeriod::OneTime
+            ) {
                 window = None;
             }
 
@@ -835,7 +839,12 @@ impl ServerTransferPolicyRegistry {
         Ok(())
     }
 
-    fn record_flushed(&self, scope: TransferScope, usage: &ServerDownloadUsage, upload: UploadCount) {
+    fn record_flushed(
+        &self,
+        scope: TransferScope,
+        usage: &ServerDownloadUsage,
+        upload: UploadCount,
+    ) {
         self.flushed_usage
             .lock()
             .expect("server policy registry poisoned")
@@ -971,29 +980,19 @@ fn pacer_config(policy: &ServerPolicyState) -> ServerTransferConfig {
             generation: policy.generation,
             retry_at: policy.window.and_then(monotonic_deadline),
         });
-    rate_config(policy.rate, quota, policy.generation)
+    rate_config(policy.rate, quota)
 }
 
 // A download rate and quota as the pacer takes them: its rate of 0 is no
-// limit, so a rate of `Some(0)` becomes a quota of no bytes.
+// limit, so a rate of `Some(0)` closes the holder instead.
 pub(crate) fn rate_config(
     rate: Option<u64>,
     quota: Option<QuotaRuntimeConfig>,
-    generation: u64,
 ) -> ServerTransferConfig {
-    match rate {
-        Some(0) => ServerTransferConfig {
-            rate_bytes_per_sec: 0,
-            quota: Some(QuotaRuntimeConfig {
-                limit_bytes: 0,
-                generation,
-                retry_at: None,
-            }),
-        },
-        rate => ServerTransferConfig {
-            rate_bytes_per_sec: rate.unwrap_or(0),
-            quota,
-        },
+    ServerTransferConfig {
+        rate_bytes_per_sec: rate.unwrap_or(0),
+        quota,
+        closed: rate == Some(0),
     }
 }
 
@@ -1107,7 +1106,11 @@ mod tests {
     #[test]
     fn one_time_quota_has_no_automatic_window() {
         assert!(
-            quota_window(Local::now(), (&quota(ServerDownloadQuotaPeriod::OneTime)).into()).is_none()
+            quota_window(
+                Local::now(),
+                (&quota(ServerDownloadQuotaPeriod::OneTime)).into()
+            )
+            .is_none()
         );
     }
 
@@ -1118,7 +1121,8 @@ mod tests {
         assert!(daily.start < now.with_timezone(&Utc));
         assert!(daily.end > now.with_timezone(&Utc));
 
-        let monthly = quota_window(now, (&quota(ServerDownloadQuotaPeriod::Monthly)).into()).unwrap();
+        let monthly =
+            quota_window(now, (&quota(ServerDownloadQuotaPeriod::Monthly)).into()).unwrap();
         assert!(monthly.start < monthly.end);
     }
 
@@ -1280,6 +1284,118 @@ mod tests {
         assert!(control.try_reserve(1).is_err());
     }
 
+    fn upload_capped_egress(db: &Database) -> crate::proxies::EgressInterface {
+        db.create_egress_interface(&crate::proxies::EgressInterface {
+            id: 0,
+            name: "Upload capped".into(),
+            binding: crate::proxies::EgressBinding::SourceAddress {
+                address: "127.0.0.1".parse().unwrap(),
+            },
+            enabled: true,
+            download_bps: Some(1_000),
+            upload_bps: Some(4_000),
+            quota: crate::proxies::EgressQuota {
+                upload_soft_bytes: Some(100),
+                upload_trickle_bps: 512,
+                upload_hard_bytes: Some(200),
+                ..Default::default()
+            },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn upload_moves_an_egress_through_trickle_to_stopped_and_a_reset_restores_it() {
+        let db = Database::open_in_memory().unwrap();
+        let egress = upload_capped_egress(&db);
+        let registry = ServerTransferPolicyRegistry::new(db, &[]).unwrap();
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        let mut changes = registry.subscribe_changes();
+        changes.borrow_and_update();
+
+        assert_eq!(registry.record_egress_upload(egress.id + 1, 1), None);
+        assert_eq!(
+            registry.record_egress_upload(egress.id, 99),
+            Some(QuotaState::Normal)
+        );
+        assert!(!changes.has_changed().unwrap());
+        assert_eq!(
+            registry.record_egress_upload(egress.id, 1),
+            Some(QuotaState::Trickle)
+        );
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        assert_eq!(
+            registry.record_egress_upload(egress.id, 99),
+            Some(QuotaState::Trickle)
+        );
+        assert!(!changes.has_changed().unwrap());
+        assert_eq!(
+            registry.record_egress_upload(egress.id, 1),
+            Some(QuotaState::Stopped)
+        );
+        assert!(changes.has_changed().unwrap());
+        let usage = registry.egress_usage(egress.id).unwrap();
+        assert_eq!(usage.upload.used_bytes, 200);
+        assert_eq!(usage.upload.remaining_bytes, Some(0));
+        assert_eq!(
+            registry.egress_quota_states(egress.id).unwrap(),
+            EgressQuotaStates {
+                download: QuotaState::Normal,
+                upload: QuotaState::Stopped,
+            }
+        );
+
+        registry.reset_egress_usage(egress.id).unwrap();
+        assert_eq!(
+            registry.egress_quota_states(egress.id).unwrap().upload,
+            QuotaState::Normal
+        );
+        assert_eq!(
+            registry.egress_usage(egress.id).unwrap().upload.used_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn an_egress_rate_is_the_tightest_limit_and_its_quota_state_a_floor() {
+        let db = Database::open_in_memory().unwrap();
+        let egress = upload_capped_egress(&db);
+        let registry = ServerTransferPolicyRegistry::new(db, &[]).unwrap();
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        let rate = |direction, global, schedule| {
+            registry.egress_rate(egress.id, direction, global, schedule)
+        };
+        // The egress cap, then a tighter global or scheduled limit.
+        assert_eq!(rate(Direction::Download, None, None), Some(1_000));
+        assert_eq!(rate(Direction::Download, Some(500), None), Some(500));
+        assert_eq!(rate(Direction::Download, Some(500), Some(300)), Some(300));
+        assert_eq!(rate(Direction::Download, None, Some(0)), Some(0));
+        assert_eq!(rate(Direction::Upload, None, None), Some(4_000));
+        // An egress the registry does not hold adds no limit of its own.
+        assert_eq!(
+            registry.egress_rate(egress.id + 1, Direction::Upload, Some(9), None),
+            Some(9)
+        );
+        assert_eq!(
+            registry.egress_rate(egress.id + 1, Direction::Upload, None, None),
+            None
+        );
+
+        // Past the soft cap uploads trickle; a looser schedule cannot lift it.
+        registry.record_egress_upload(egress.id, 100);
+        assert_eq!(rate(Direction::Upload, None, Some(1_000_000)), Some(512));
+        assert_eq!(rate(Direction::Upload, None, Some(100)), Some(100));
+        assert_eq!(rate(Direction::Download, None, None), Some(1_000));
+        // Past the hard cap they stop.
+        registry.record_egress_upload(egress.id, 100);
+        assert_eq!(rate(Direction::Upload, Some(1_000_000), None), Some(0));
+    }
+
     #[test]
     fn reset_notifies_waiters_even_when_persistence_fails() {
         let registry = ServerTransferPolicyRegistry::new(
@@ -1329,6 +1445,7 @@ mod tests {
         assert!(registry.quota_rejection_is_current(&rejection));
 
         control.update_config(ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(QuotaRuntimeConfig {
                 limit_bytes: 1_200,

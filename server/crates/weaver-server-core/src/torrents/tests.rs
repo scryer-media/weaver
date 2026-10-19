@@ -5,8 +5,8 @@ use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::settings::{SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
-    Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentRecord, TorrentSource,
-    TorrentState, TorrentTracker, TrackerStatus,
+    Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
+    TorrentSource, TorrentTracker, TrackerStatus,
 };
 
 fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
@@ -20,7 +20,7 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         private: false,
         category_id: None,
         added_at_ms: 1_000 + job_id as i64,
-        state: TorrentState::FetchingMetadata,
+        intent: TorrentIntent::Resumed,
         forced: false,
         completed_at_ms: None,
         storage_dir: None,
@@ -116,17 +116,17 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
 }
 
 #[test]
-fn state_and_counters_update_in_place() {
+fn intent_and_counters_update_in_place() {
     let db = Database::open_in_memory().unwrap();
     db.insert_torrent(&torrent(3, Some([3; 20]), None), &[], &[])
         .unwrap();
 
     assert!(
-        db.update_torrent_state(JobId(3), TorrentState::Seeding, Some(9_000))
+        db.update_torrent_intent(JobId(3), TorrentIntent::Stopped, Some(9_000))
             .unwrap()
     );
     let stored = db.get_torrent(JobId(3)).unwrap().unwrap();
-    assert_eq!(stored.state, TorrentState::Seeding);
+    assert_eq!(stored.intent, TorrentIntent::Stopped);
     assert_eq!(stored.completed_at_ms, Some(9_000));
 
     let counters = TorrentCounters {
@@ -141,7 +141,7 @@ fn state_and_counters_update_in_place() {
     assert_eq!(db.get_torrent_counters(JobId(3)).unwrap(), Some(counters));
 
     assert!(
-        !db.update_torrent_state(JobId(4), TorrentState::Paused, None)
+        !db.update_torrent_intent(JobId(4), TorrentIntent::Paused, None)
             .unwrap()
     );
     assert!(!db.update_torrent_counters(JobId(4), &counters).unwrap());

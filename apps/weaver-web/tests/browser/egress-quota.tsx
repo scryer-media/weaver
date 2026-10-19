@@ -7,7 +7,7 @@ import { Client, Provider } from "urql";
 import { fromValue, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
-import type { Egress } from "@/lib/networking";
+import type { Egress, EgressQuota, QuotaState } from "@/lib/networking";
 import { NextDataContext, type NextData } from "@/next/data/next-data";
 import type { NetworkingAction, NetworkingData } from "@/next/features/networking/data";
 import { EgressPage } from "@/next/features/networking/EgressPage";
@@ -21,28 +21,38 @@ import "@/next/theme.css";
 const MIB = 1024 ** 2;
 const GIB = 1024 ** 3;
 const TIB = 1024 ** 4;
-// The window every metered egress is in: October, resetting at midnight UTC on the first.
-const windowStart = Date.UTC(2026, 9, 1);
-const windowEnd = Date.UTC(2026, 10, 1);
-const monthly = (limitBytes: number) => ({
-  enabled: true, period: "MONTHLY" as const, limitBytes, resetTimeMinutesLocal: 0, weeklyResetWeekday: "MON" as const, monthlyResetDay: 1,
+// The period every capped egress is in: October, resetting at midnight UTC on the first.
+const periodStart = Date.UTC(2026, 9, 1);
+const periodEnd = Date.UTC(2026, 10, 1);
+const windowStart = periodStart;
+const windowEnd = periodEnd;
+const caps = (rest: Partial<EgressQuota>): EgressQuota => ({
+  downloadBytes: null, uploadSoftBytes: null, uploadTrickleBps: 2048 * 1024, uploadHardBytes: null,
+  period: "MONTHLY", resetTimeMinutesLocal: 0, weeklyResetWeekday: "MON", monthlyResetDay: 1, ...rest,
 });
-const usage = (usedBytes: number, limitBytes: number | null, blocked = false) => ({
-  usedBytes, reservedBytes: 0, remainingBytes: limitBytes === null ? null : Math.max(0, limitBytes - usedBytes), blocked,
-  windowStartsAtEpochMs: limitBytes === null ? null : windowStart, windowEndsAtEpochMs: limitBytes === null ? null : windowEnd, timezoneName: "UTC",
+const spent = (usedBytes: number, capBytes: number | null, state: QuotaState = "NORMAL") => ({
+  usedBytes, remainingBytes: capBytes === null ? null : Math.max(0, capBytes - usedBytes), state,
 });
-const off = { ...monthly(0), enabled: false };
 const egress = (id: number, name: string, rest: Partial<Egress>): Egress => ({
   id, name, bindingKind: "SOURCE_ADDRESS", interfaceName: null, sourceAddress: `192.0.2.${10 + id}`, addresses: [], enabled: true,
-  maxDownloadSpeed: 0, health: "UP", reason: null, downloadQuota: off, downloadQuotaUsage: usage(0, null), ...rest,
+  downloadBps: null, uploadBps: null, health: "UP", reason: null, quota: caps({}),
+  quotaUsage: { down: spent(0, null), up: spent(0, null), state: "NORMAL", periodStartEpochMs: null, periodEndEpochMs: null, timezoneName: "UTC" },
+  ...rest,
 });
 // System last, as a daemon may list it; the table puts it first.
 const egresses: Egress[] = [
-  egress(1, "WAN Fiber", { downloadQuota: monthly(TIB), downloadQuotaUsage: usage(400 * GIB, TIB) }),
-  egress(2, "LTE standby", {
-    downloadQuota: monthly(20 * GIB), downloadQuotaUsage: usage(20 * GIB, 20 * GIB, true), health: "DOWN", reason: "Quota reached",
+  egress(1, "WAN Fiber", {
+    uploadBps: 5 * MIB,
+    quota: caps({ downloadBytes: TIB }),
+    quotaUsage: { down: spent(400 * GIB, TIB), up: spent(30 * GIB, null), state: "NORMAL", periodStartEpochMs: periodStart, periodEndEpochMs: periodEnd, timezoneName: "UTC" },
   }),
-  egress(0, "System", { bindingKind: "SYSTEM", sourceAddress: null, downloadQuotaUsage: usage(3 * GIB, null) }),
+  egress(2, "LTE standby", {
+    downloadBps: 2 * MIB,
+    quota: caps({ downloadBytes: 20 * GIB, uploadHardBytes: 2 * GIB }),
+    quotaUsage: { down: spent(20 * GIB, 20 * GIB, "STOPPED"), up: spent(GIB, 2 * GIB), state: "STOPPED", periodStartEpochMs: periodStart, periodEndEpochMs: periodEnd, timezoneName: "UTC" },
+    health: "DOWN", reason: "Quota reached",
+  }),
+  egress(0, "System", { bindingKind: "SYSTEM", sourceAddress: null }),
 ];
 const data: NetworkingData = {
   egressInterfaces: egresses, proxyProfiles: [], proxyPools: [], discoverNetworkInterfaces: [],
@@ -56,21 +66,21 @@ const action: NetworkingAction = async (document, variables) => {
   saved.push({ name: definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "", variables });
   return null;
 };
-// The global download ceiling the daemon holds, and every settings write the page sends.
-let maxDownloadSpeed = 25 * MIB;
+// The global limits the daemon holds, one per direction, and every write the page sends through the client.
+let bandwidth: { downloadBps: number | null; uploadBps: number | null } = { downloadBps: 25 * MIB, uploadBps: null };
 const sent: { name: string; variables: Record<string, unknown> }[] = [];
 const actionsRef: { current: { save: () => void; revert: () => void } | null } = { current: null };
 Object.assign(window, { egressQuotaFixture: { saved, sent, actions: actionsRef } });
 
-// The page's reads and the ceiling's save, answered at once from the fixture.
+// The page's reads and the limits' save, answered at once from the fixture.
 const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [() => (operations) => pipe(operations, mergeMap((operation) => {
   const definition = operation.query.definitions.find((entry) => entry.kind === "OperationDefinition");
   const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
   if (operation.kind === "mutation") sent.push({ name, variables: operation.variables as Record<string, unknown> });
-  if (name === "UpdateSettings") maxDownloadSpeed = (operation.variables as { input: { maxDownloadSpeed: number } }).input.maxDownloadSpeed;
+  if (name === "SetBandwidth") bandwidth = (operation.variables as { input: typeof bandwidth }).input;
   const answer = name === "EgressQuotas" ? { egressInterfaces: egresses }
-    : name === "Settings" ? { settings: { maxDownloadSpeed }, globalState: null }
-    : name === "UpdateSettings" ? { updateSettings: { maxDownloadSpeed } }
+    : name === "Bandwidth" ? { networking: { bandwidth } }
+    : name === "SetBandwidth" ? { setBandwidth: bandwidth }
     : {};
   return fromValue({ operation, data: answer });
 }))] });

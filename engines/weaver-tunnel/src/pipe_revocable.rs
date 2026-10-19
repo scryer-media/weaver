@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use super::{ConnectionOutcome, DialError, Dialed, DialedStream, Dialer, Resolution, Target};
+use crate::endpoint::DatagramTransport;
 
 // One leg's sockets and streams. Revocation also cancels in-flight opens.
 pub struct Revocable {
@@ -110,6 +111,13 @@ impl Dialer for Revocable {
             .check()
             .map_err(|e| DialError::Skipped(e.to_string()))?;
         self.inner.resolve(host).await
+    }
+    // The leg's datagrams, while it is not revoked.
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        if self.is_revoked() {
+            return None;
+        }
+        Arc::clone(&self.inner).datagrams()
     }
     fn budget(&self) -> Duration {
         self.inner.budget()

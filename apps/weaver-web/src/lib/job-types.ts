@@ -62,9 +62,14 @@ export interface JobPhaseProgressData {
   updatedAtEpochMs: number;
 }
 
+/** How a job's content is fetched. */
+export type JobProtocol = "NZB" | "TORRENT";
+
 export interface JobData {
   id: number;
   name: string;
+  /** Absent from an older daemon, which only fetches NZBs. */
+  protocol?: JobProtocol;
   displayTitle: string;
   originalTitle: string;
   parsedRelease: ParsedReleaseData;

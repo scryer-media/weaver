@@ -26,6 +26,9 @@ pub use fetch::FetchAttempt;
 #[path = "network_draft.rs"]
 mod draft;
 pub use draft::DraftNetworkRoute;
+#[path = "network_torrent.rs"]
+mod torrent;
+pub use torrent::TorrentLeg;
 #[path = "network_test_via.rs"]
 mod test_via;
 pub use test_via::{
@@ -155,6 +158,7 @@ pub struct DormantLeg {
     pub health: LegHealthState,
 }
 
+#[derive(Clone)]
 pub struct LiveLeg {
     pub definition: RouteLeg,
     pub warning: Option<String>,
@@ -164,6 +168,12 @@ pub struct LiveLeg {
     signature: String,
 }
 impl LiveLeg {
+    // Ride `other`'s stage, which dials the same leg.
+    fn share(&mut self, other: &LiveLeg) {
+        self.stage = other.stage.clone();
+        self.address_plan = other.address_plan.clone();
+        self.ladder = other.ladder.clone();
+    }
     pub fn rung_states(&self) -> Vec<&'static str> {
         self.ladder
             .as_ref()
@@ -874,12 +884,20 @@ impl NetworkRuntime {
             .cloned()
             .unwrap_or_default()
             .route();
-        let legs = definition
+        let mut legs = definition
             .legs
             .iter()
             .enumerate()
             .map(|(position, leg)| self.leg(&config, consumer, position, leg, timeout))
             .collect::<Result<Vec<_>, _>>()?;
+        if consumer.shares_legs() {
+            let live: Vec<_> = routes.values().cloned().collect();
+            for leg in &mut legs {
+                if let Some(shared) = shared_leg(&live, &leg.signature) {
+                    leg.share(&shared);
+                }
+            }
+        }
         let weighted = Weighted::new(
             definition,
             legs.iter()
@@ -983,6 +1001,8 @@ impl NetworkRuntime {
         let mut removed = Vec::new();
         let mut routes = self.live_routes();
         routes.sort_by_key(|route| route.consumer.key());
+        // Legs a sharing consumer took up this reload, by signature.
+        let mut shared: HashMap<String, LiveLeg> = HashMap::new();
         for route in routes {
             if !next.consumers.contains(&route.consumer.key()) {
                 removed.push(route);
@@ -1009,9 +1029,17 @@ impl NetworkRuntime {
                         .get(position)
                         .filter(|prior| prior.signature == new.signature)
                     {
-                        new.stage = prior.stage.clone();
-                        new.address_plan = prior.address_plan.clone();
-                        new.ladder = prior.ladder.clone();
+                        new.share(prior);
+                    }
+                }
+            }
+            if route.consumer.shares_legs() {
+                for new in &mut fresh {
+                    match shared.get(&new.signature) {
+                        Some(leg) => new.share(leg),
+                        None => {
+                            shared.insert(new.signature.clone(), new.clone());
+                        }
                     }
                 }
             }
@@ -1044,6 +1072,9 @@ impl NetworkRuntime {
         }
         let snapshot = self.interfaces();
         let quota_blocked = self.quota_blocked_egresses();
+        // A stage goes once no route holds it.
+        let mut retired: Vec<Arc<Revocable>> = Vec::new();
+        let mut held: Vec<Arc<Revocable>> = Vec::new();
         for (route, fresh, allocation) in updates {
             let mut old = route.legs.write().expect("route legs");
             route.weighted.apply_update(allocation);
@@ -1059,24 +1090,28 @@ impl NetworkRuntime {
                     ),
                 );
             }
-            for (position, prior) in old.iter().enumerate() {
-                if fresh
-                    .get(position)
-                    .is_none_or(|new| !Arc::ptr_eq(&new.stage, &prior.stage))
-                {
-                    prior.stage.revoke();
-                }
-            }
+            retired.extend(old.iter().map(|leg| leg.stage.clone()));
+            held.extend(fresh.iter().map(|leg| leg.stage.clone()));
             *old = fresh;
         }
         for route in removed {
-            for leg in route.legs.read().expect("route legs").iter() {
-                leg.stage.revoke();
-            }
+            retired.extend(
+                route
+                    .legs
+                    .read()
+                    .expect("route legs")
+                    .iter()
+                    .map(|leg| leg.stage.clone()),
+            );
             self.routes
                 .lock()
                 .expect("network routes")
                 .remove(&route.consumer.key());
+        }
+        for stage in retired {
+            if !held.iter().any(|kept| Arc::ptr_eq(kept, &stage)) {
+                stage.revoke();
+            }
         }
         // The policy registry already applied rates and quotas on reload.
         if self.quota_policy.is_none() {
@@ -1189,6 +1224,22 @@ impl Drop for NetworkRuntime {
 }
 
 // Download rates alone, for a runtime without download policies.
+// The leg with `signature` that a sharing consumer's live route dials.
+fn shared_leg(routes: &[Arc<LiveNetworkRoute>], signature: &str) -> Option<LiveLeg> {
+    routes
+        .iter()
+        .filter(|route| route.consumer.shares_legs())
+        .find_map(|route| {
+            route
+                .legs
+                .read()
+                .expect("route legs")
+                .iter()
+                .find(|leg| leg.signature == signature)
+                .cloned()
+        })
+}
+
 fn configure_egress_rates(
     controls: &weaver_nntp::transfer::ServerTransferRegistry,
     configuration: &Configuration,
@@ -1196,7 +1247,7 @@ fn configure_egress_rates(
     for egress in configuration.egresses.values() {
         controls.configure(
             weaver_nntp::transfer::StableServerId(egress.id),
-            crate::servers::transfer_policy::rate_config(egress.download_bps, None, 1),
+            crate::servers::transfer_policy::rate_config(egress.download_bps, None),
         );
     }
 }

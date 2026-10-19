@@ -78,6 +78,7 @@ pub(crate) mod deobfuscate;
 pub(in crate::pipeline) mod extract;
 mod nested;
 mod output;
+pub(crate) use output::claim_complete_destination_path;
 pub(crate) mod placement;
 pub(crate) mod rar;
 mod sfv;

@@ -1894,3 +1894,34 @@ async fn pause_clears_stale_completion_rechecks() {
         Some(JobStatus::Paused)
     );
 }
+
+// A job another owner retired joins the finished jobs once, newest first,
+// and the published queue lists it.
+#[tokio::test]
+async fn a_retired_job_joins_the_finished_jobs() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30031);
+    let mut info = finished_job_info(job_id);
+    info.protocol = crate::jobs::model::Protocol::Torrent;
+    pipeline
+        .handle_command(SchedulerCommand::RetireJob {
+            info: Box::new(info.clone()),
+        })
+        .await;
+    pipeline
+        .handle_command(SchedulerCommand::RetireJob {
+            info: Box::new(info),
+        })
+        .await;
+    let finished: Vec<JobId> = pipeline
+        .finished_jobs
+        .iter()
+        .filter(|job| job.job_id == job_id)
+        .map(|job| job.job_id)
+        .collect();
+    assert_eq!(finished, [job_id]);
+    assert_eq!(pipeline.finished_jobs[0].job_id, job_id);
+    let listed = pipeline.shared_state.get_job(job_id).unwrap();
+    assert_eq!(listed.protocol, crate::jobs::model::Protocol::Torrent);
+}

@@ -18,24 +18,83 @@ async fn set_speed_limit() {
 }
 
 #[tokio::test]
-async fn set_speed_limit_becomes_the_configured_limit() {
+async fn set_speed_limit_becomes_the_global_download_limit() {
     let h = TestHarness::new().await;
+    let bandwidth = r#"{ networking { bandwidth { downloadBps uploadBps } } }"#;
+    assert_no_errors(
+        &h.execute(r#"mutation { setBandwidth(input: { uploadBps: 4096 }) { uploadBps } }"#)
+            .await,
+    );
     let resp = h
         .execute(r#"mutation { setSpeedLimit(bytesPerSec: 2097161) }"#)
         .await;
     assert_no_errors(&resp);
-    let resp = h.execute(r#"{ settings { maxDownloadSpeed } }"#).await;
+    let resp = h.execute(bandwidth).await;
     assert_no_errors(&resp);
     assert_eq!(
-        response_data(&resp)["settings"]["maxDownloadSpeed"],
-        2097161
+        response_data(&resp)["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": 2097161, "uploadBps": 4096 })
     );
+    assert_eq!(
+        h.db.network_bandwidth().unwrap().download_bps,
+        Some(2097161)
+    );
+    // The old call's 0 is no limit.
     let resp = h
-        .execute(r#"mutation { setSpeedLimit(bytesPerSec: 0) }"#)
+        .execute(r#"mutation { setQueueSpeedLimit(bytesPerSec: 0) { globalState { speedLimitBytesPerSec } } }"#)
         .await;
     assert_no_errors(&resp);
-    let resp = h.execute(r#"{ settings { maxDownloadSpeed } }"#).await;
-    assert_eq!(response_data(&resp)["settings"]["maxDownloadSpeed"], 0);
+    assert_eq!(
+        response_data(&resp)["setQueueSpeedLimit"]["globalState"]["speedLimitBytesPerSec"],
+        serde_json::Value::Null
+    );
+    let resp = h.execute(bandwidth).await;
+    assert_eq!(
+        response_data(&resp)["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": null, "uploadBps": 4096 })
+    );
+}
+
+#[tokio::test]
+async fn set_bandwidth_round_trips_and_keeps_a_true_zero() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(r#"mutation { setBandwidth(input: { downloadBps: 0, uploadBps: 1024 }) { downloadBps uploadBps } }"#)
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["setBandwidth"],
+        serde_json::json!({ "downloadBps": 0, "uploadBps": 1024 })
+    );
+    let resp = h
+        .execute(r#"{ networking { bandwidth { downloadBps uploadBps } } globalQueueState { speedLimitBytesPerSec } }"#)
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": 0, "uploadBps": 1024 })
+    );
+    assert_eq!(data["globalQueueState"]["speedLimitBytesPerSec"], 0);
+    assert_eq!(
+        h.db.network_bandwidth().unwrap(),
+        weaver_server_core::proxies::Bandwidth {
+            download_bps: Some(0),
+            upload_bps: Some(1024),
+        }
+    );
+    let resp = h
+        .execute(r#"mutation { setBandwidth(input: {}) { downloadBps uploadBps } }"#)
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        h.db.network_bandwidth().unwrap(),
+        weaver_server_core::proxies::Bandwidth::default()
+    );
+    assert_has_errors(
+        &h.execute(r#"mutation { setBandwidth(input: { downloadBps: 9223372036854775808 }) { downloadBps } }"#)
+            .await,
+    );
 }
 
 #[tokio::test]

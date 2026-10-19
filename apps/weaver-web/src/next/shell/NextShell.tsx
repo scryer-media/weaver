@@ -466,7 +466,7 @@ const ThroughputBlock = memo(function ThroughputBlock() {
   const { openDialog, dialog } = useSpeedLimitDialog();
   const now = splitSpeed(speed);
   const peak = splitSpeed(peakSpeed);
-  const limit = splitSpeed(inForce);
+  const limit = splitSpeed(inForce ?? 0);
   const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");
   return (
     <RailBlock>
@@ -482,7 +482,7 @@ const ThroughputBlock = memo(function ThroughputBlock() {
                 : t("next.shell.noTraffic")
             }
           />
-          {inForce > 0 ? (
+          {inForce !== null ? (
             <div className="-mt-[4px] font-wv-mono text-[11px] text-wv-warn">
               {t(bySchedule ? "next.shell.scheduledLimit" : "next.shell.limit", {
                 value: limit.value,
@@ -498,7 +498,7 @@ const ThroughputBlock = memo(function ThroughputBlock() {
           aria-label={title}
           className={cn(
             "flex size-9 flex-none cursor-pointer items-center justify-center border bg-wv-button hover:bg-wv-button-hover",
-            inForce > 0
+            inForce !== null
               ? "border-wv-warn/60 text-wv-warn hover:border-wv-warn"
               : "border-wv-control text-wv-fg hover:border-wv-control-hover",
           )}

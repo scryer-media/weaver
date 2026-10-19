@@ -330,6 +330,10 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
+            SchedulerCommand::RetireJob { info } => {
+                self.finish_job(*info);
+                self.publish_snapshot();
+            }
             SchedulerCommand::UpdateHistory {
                 job_id,
                 update,

@@ -1301,6 +1301,7 @@ fn quota_selection_client(
                     transfers.configure(
                         stable_id,
                         crate::transfer::ServerTransferConfig {
+                            closed: false,
                             rate_bytes_per_sec: 0,
                             quota: Some(crate::transfer::QuotaRuntimeConfig {
                                 limit_bytes: 0,
@@ -1339,6 +1340,7 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
     let limited = transfers.configure(
         limited_id,
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 100,
@@ -1524,6 +1526,7 @@ async fn quota_stopped_pipeline_reports_every_unissued_item_without_poisoning_la
     let control = transfers.configure(
         stable_id,
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 500,
@@ -1608,6 +1611,7 @@ fn earliest_quota_selection_preserves_first_blocked_registry_revision() {
     let first = transfers.configure(
         StableServerId(3_000),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 0,
@@ -1620,6 +1624,7 @@ fn earliest_quota_selection_preserves_first_blocked_registry_revision() {
     let second = transfers.configure(
         StableServerId(3_001),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 0,
@@ -2070,6 +2075,7 @@ async fn decoded_quota_rejection_fails_over_to_another_fill_server() {
     let capped_control = transfers.configure(
         crate::transfer::StableServerId(101),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 0,
@@ -2137,6 +2143,7 @@ async fn decoded_quota_rejection_does_not_unlock_backfill() {
     let capped_control = transfers.configure(
         crate::transfer::StableServerId(102),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 0,
@@ -2201,6 +2208,7 @@ async fn deliberate_rate_wait_does_not_trip_decoded_soft_timeout_or_health() {
     let control = transfers.configure(
         crate::transfer::StableServerId(103),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 1_000,
             quota: None,
         },
@@ -2411,6 +2419,7 @@ async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
     let control = transfers.configure(
         crate::transfer::StableServerId(105),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 1,
             quota: None,
         },
@@ -3263,6 +3272,7 @@ fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
     let limited = transfers.configure(
         limited_id,
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 100,

@@ -727,7 +727,11 @@ fn history_query_plan(
                 | QueueItemState::Repairing
                 | QueueItemState::Extracting
                 | QueueItemState::Finalizing
-                | QueueItemState::PostProcessing => {}
+                | QueueItemState::PostProcessing
+                | QueueItemState::FetchingMetadata
+                | QueueItemState::CheckingFiles
+                | QueueItemState::Seeding
+                | QueueItemState::Stalled => {}
             }
         }
         if statuses.is_empty() {
@@ -963,6 +967,10 @@ fn history_state_key(state: QueueItemState) -> &'static str {
         QueueItemState::Extracting => "extracting",
         QueueItemState::Finalizing => "finalizing",
         QueueItemState::PostProcessing => "post_processing",
+        QueueItemState::FetchingMetadata => "fetching_metadata",
+        QueueItemState::CheckingFiles => "checking_files",
+        QueueItemState::Seeding => "seeding",
+        QueueItemState::Stalled => "stalled",
     }
 }
 

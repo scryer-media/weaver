@@ -7,6 +7,7 @@ const FACADE_QUEUE_ITEM_FIELDS = `
   fragment FacadeQueueItemFields on QueueItem {
     id
     name
+    protocol
     displayTitle
     originalTitle
     parsedRelease {
@@ -45,6 +46,7 @@ const QUEUE_TABLE_ITEM_FIELDS = `
   fragment QueueTableItemFields on QueueItem {
     id
     name
+    protocol
     displayTitle
     originalTitle
     status: state
@@ -80,6 +82,7 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
   fragment FacadeHistoryItemFields on HistoryItem {
     id
     name
+    protocol
     displayTitle
     originalTitle
     parsedRelease {
@@ -116,6 +119,7 @@ export const HISTORY_TABLE_ITEM_FIELDS = `
   fragment HistoryTableItemFields on HistoryItem {
     id
     name
+    protocol
     displayTitle
     originalTitle
     status: state
@@ -247,13 +251,29 @@ const SERVER_DETAILS_FIELDS = `
   }
 `;
 
+export const SEEDING_POLICY_FIELDS = `
+  fragment SeedingPolicyFields on SeedingPolicySettings {
+    ratioGoal
+    seedTimeGoalMinutes
+    inactiveGoalMinutes
+    mode
+    action
+    maxUploadBps
+  }
+`;
+
 const CATEGORY_FIELDS = `
   fragment CategoryFields on Category {
     id
     name
     destDir
     aliases
+    seeding {
+      ...SeedingPolicyFields
+    }
+    torrentRoute
   }
+  ${SEEDING_POLICY_FIELDS}
 `;
 
 export const VERSION_QUERY = gql`
@@ -446,7 +466,6 @@ const GENERAL_SETTINGS_FIELDS = `
     intermediateDir
     completeDir
     cleanupAfterExtract
-    maxDownloadSpeed
     maxRetries
     propagationDelaySecs
     enableSrrdbLookup
@@ -1037,12 +1056,6 @@ export const RESUME_ALL_MUTATION = gql`
   }
 `;
 
-export const SET_SPEED_LIMIT_MUTATION = gql`
-  mutation SetSpeedLimit($bytesPerSec: Int!) {
-    setSpeedLimit(bytesPerSec: $bytesPerSec)
-  }
-`;
-
 export const UPDATE_JOBS_MUTATION = gql`
   mutation UpdateJobs($ids: [Int!]!, $category: String, $priority: String) {
     updateJobs(ids: $ids, category: $category, priority: $priority)
@@ -1371,6 +1384,134 @@ export const UPDATE_SETTINGS_MUTATION = gql`
     }
   }
   ${GENERAL_SETTINGS_FIELDS}
+`;
+
+const TORRENT_SETTINGS_FIELDS = `
+  fragment TorrentSettingsFields on GeneralSettings {
+    seeding {
+      ...SeedingPolicyFields
+    }
+    torrent {
+      enabled
+      basePort
+      announcePort
+      upnp
+      encryption
+      maxActiveDownloads
+      maxPeersTotal
+    }
+  }
+  ${SEEDING_POLICY_FIELDS}
+`;
+
+export const TORRENT_SETTINGS_QUERY = gql`
+  query TorrentSettings {
+    settings {
+      ...TorrentSettingsFields
+    }
+  }
+  ${TORRENT_SETTINGS_FIELDS}
+`;
+
+export const UPDATE_TORRENT_SETTINGS_MUTATION = gql`
+  mutation UpdateTorrentSettings($input: GeneralSettingsInput!) {
+    updateSettings(input: $input) {
+      ...TorrentSettingsFields
+    }
+  }
+  ${TORRENT_SETTINGS_FIELDS}
+`;
+
+// --- Torrents ---
+
+/** What the queue reads of each torrent beside its job. */
+export const TORRENT_SUMMARIES_QUERY = gql`
+  query TorrentSummaries {
+    torrents {
+      id
+      state
+      forced
+      ratio
+      uploadBps
+    }
+  }
+`;
+
+export const TORRENT_QUERY = gql`
+  query Torrent($id: Int!) {
+    torrent(id: $id) {
+      id
+      name
+      infohash
+      state
+      detail
+      category
+      private
+      forced
+      progress
+      totalBytes
+      haveBytes
+      uploadedBytes
+      downloadedBytes
+      ratio
+      downloadBps
+      uploadBps
+      peers
+      seeds
+      leechers
+      seedingLeft
+      seedingOverride {
+        ...SeedingPolicyFields
+      }
+      seedingPolicy {
+        ...SeedingPolicyFields
+      }
+      seedingSource
+      route
+      files {
+        index
+        path
+        length
+        selected
+        progress
+      }
+      trackers {
+        tier
+        url
+        status
+        message
+        seeders
+        leechers
+      }
+    }
+  }
+  ${SEEDING_POLICY_FIELDS}
+`;
+
+export const SUBMIT_TORRENT_MUTATION = gql`
+  mutation SubmitTorrent($input: SubmitTorrentInput!) {
+    submitTorrent(input: $input) {
+      id
+    }
+  }
+`;
+
+export const REMOVE_TORRENT_MUTATION = gql`
+  mutation RemoveTorrent($id: Int!, $deleteFiles: Boolean!, $confirmUnmetGoal: Boolean!) {
+    removeTorrent(id: $id, deleteFiles: $deleteFiles, confirmUnmetGoal: $confirmUnmetGoal)
+  }
+`;
+
+export const SET_TORRENT_FORCED_MUTATION = gql`
+  mutation SetTorrentForced($id: Int!, $forced: Boolean!) {
+    setTorrentForced(id: $id, forced: $forced)
+  }
+`;
+
+export const SET_TORRENT_SEEDING_MUTATION = gql`
+  mutation SetTorrentSeeding($id: Int!, $seeding: SeedingPolicyInput) {
+    setTorrentSeeding(id: $id, seeding: $seeding)
+  }
 `;
 
 // --- Hardware profile ---
@@ -1823,7 +1964,7 @@ export const SCHEDULES_QUERY = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
     }
   }
@@ -1848,7 +1989,7 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
     }
   }
@@ -1873,7 +2014,7 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
     }
   }
@@ -1898,7 +2039,7 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
     }
   }
@@ -1923,7 +2064,7 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
     }
   }

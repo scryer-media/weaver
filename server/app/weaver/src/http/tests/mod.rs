@@ -193,7 +193,7 @@ fn test_config() -> SharedConfig {
         servers: vec![],
         categories: vec![],
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         cleanup_after_extract: None,
         propagation_delay_secs: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
@@ -467,7 +467,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                     state.set_paused(false);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                SchedulerCommand::SetBandwidth { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::ReprocessJob { reply, .. } => {
@@ -1421,7 +1421,7 @@ fn manual_pause_block() -> DownloadBlockState {
         window_starts_at_epoch_ms: None,
         window_ends_at_epoch_ms: None,
         timezone_name: "MDT".into(),
-        scheduled_speed_limit: 4_096,
+        scheduled_speed_limit: Some(4_096),
         schedule_hold_reason: None,
     }
 }
@@ -1759,6 +1759,7 @@ mod nzbget_version_uses_jsonrpc;
 mod renders_prometheus_metrics_for;
 mod restart_handler_tests;
 mod setup_handler_tests;
+mod torrent_graphql;
 
 #[tokio::test]
 async fn stored_backup_create_challenges_only_expired_administrators() {

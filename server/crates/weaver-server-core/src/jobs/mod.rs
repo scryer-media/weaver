@@ -15,6 +15,7 @@ pub mod phase_progress;
 pub mod queries;
 pub mod record;
 pub(crate) mod repair_outputs;
+pub mod report;
 pub mod repository;
 pub mod server_attribution;
 mod server_attribution_persistence;

@@ -2476,6 +2476,7 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
     let control = transfers.configure(
         weaver_nntp::transfer::StableServerId(7),
         weaver_nntp::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
                 limit_bytes: 128,
@@ -2581,6 +2582,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
     let control = policy.transfer_registry().configure(
         stable_id,
         weaver_nntp::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
                 limit_bytes: 10_000,
@@ -2746,6 +2748,7 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
     let control = policy.transfer_registry().configure(
         weaver_nntp::transfer::StableServerId(8),
         weaver_nntp::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
                 limit_bytes: 128,
@@ -2822,6 +2825,7 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
     let control = transfers.configure(
         weaver_nntp::transfer::StableServerId(9),
         weaver_nntp::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
                 limit_bytes: 128,
@@ -2968,6 +2972,7 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
     let control = transfers.configure(
         weaver_nntp::transfer::StableServerId(12),
         weaver_nntp::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
                 limit_bytes: 128,
@@ -3083,6 +3088,7 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
     let first_stable_id = weaver_nntp::transfer::StableServerId(14);
     let second_stable_id = weaver_nntp::transfer::StableServerId(15);
     let manual_quota = |generation| weaver_nntp::transfer::ServerTransferConfig {
+        closed: false,
         rate_bytes_per_sec: 0,
         quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
             limit_bytes: 128,
@@ -4134,6 +4140,7 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
     assert!(std::future::Future::poll(capacity_wait.as_mut(), &mut context).is_pending());
     let snapshot = egress.snapshot();
     egress.update_config(weaver_nntp::transfer::ServerTransferConfig {
+        closed: false,
         rate_bytes_per_sec: 0,
         quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
             limit_bytes: 128,
@@ -4147,6 +4154,7 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
         crate::jobs::handle::DownloadBlockKind::EgressQuota
     );
     egress.update_config(weaver_nntp::transfer::ServerTransferConfig {
+        closed: false,
         rate_bytes_per_sec: 0,
         quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
             limit_bytes: 256,

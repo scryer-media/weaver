@@ -40,6 +40,10 @@ const en: LocaleDictionary = {
   // Status labels
   "status.queued": "Queued",
   "status.downloading": "Downloading",
+  "status.fetchingMetadata": "Fetching metadata",
+  "status.checkingFiles": "Checking files",
+  "status.seeding": "Seeding",
+  "status.stalled": "Stalled",
   "status.propagating": "Propagating",
   "status.propagationUntil": "Waiting for propagation. Download starts at {{time}}.",
   "status.fetchingRepairData": "Fetching repair data",

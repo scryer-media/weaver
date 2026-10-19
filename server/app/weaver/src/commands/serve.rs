@@ -296,6 +296,27 @@ pub(crate) async fn run(
     // read their cached readings and never stat a filesystem themselves.
     let storage_capacity = pipeline.storage_capacity();
     let post_processing_executor = pipeline.post_processing_executor();
+    // The torrent client starts with the server, on when the settings turn it
+    // on, and runs on the pipeline's budget; one that cannot start leaves the
+    // rest of the server running.
+    let torrents = {
+        let config = shared_config.read().await.clone();
+        match weaver_server_core::torrents::service::TorrentService::for_server(
+            &config,
+            db.clone(),
+            &proxies,
+            &pipeline,
+            handle.clone(),
+        )
+        .await
+        {
+            Ok(torrents) => Some(torrents),
+            Err(error) => {
+                error!(%error, "the torrent client did not start");
+                None
+            }
+        }
+    };
     let scheduled_resume =
         weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
 
@@ -423,6 +444,7 @@ pub(crate) async fn run(
             nntp_pool: Some(nntp_pool.clone()),
             spawn_history_delete_worker: true,
             post_processing_executor: Some(post_processing_executor),
+            torrents: torrents.clone(),
         },
         backup.clone(),
     );
@@ -488,6 +510,7 @@ pub(crate) async fn run(
         security,
         disk_space: storage_capacity,
         restart: restart_controller.clone(),
+        torrents: torrents.clone(),
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
 
@@ -579,6 +602,7 @@ pub(crate) async fn run(
             auto_backup_scheduler.abort();
             let _ = auto_backup_scheduler.await;
             tokio::join!(backup.shutdown(), schedule_task.shutdown());
+            stop_torrents(torrents.as_ref()).await;
             proxies.stop_all().await;
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
@@ -602,6 +626,7 @@ pub(crate) async fn run(
             auto_backup_scheduler.abort();
             let _ = auto_backup_scheduler.await;
             tokio::join!(backup.shutdown(), schedule_task.shutdown());
+            stop_torrents(torrents.as_ref()).await;
             proxies.stop_all().await;
             handle.shutdown().await.ok();
             if let Err(join_error) = pipeline_task.await {
@@ -643,6 +668,7 @@ pub(crate) async fn run(
     auto_backup_scheduler.abort();
     let _ = auto_backup_scheduler.await;
     tokio::join!(backup.shutdown(), schedule_task.shutdown());
+    stop_torrents(torrents.as_ref()).await;
     proxies.stop_all().await;
     handle.shutdown().await.ok();
     if let Err(join_error) = pipeline_task.await {
@@ -669,6 +695,14 @@ pub(crate) async fn run(
     heartbeat::log_peak_rss();
 
     Ok(stop)
+}
+
+// The torrent client's tick and jobs stop and its sessions close, before
+// the routes they ride go away.
+async fn stop_torrents(torrents: Option<&weaver_server_core::torrents::service::TorrentService>) {
+    if let Some(torrents) = torrents {
+        torrents.stop().await;
+    }
 }
 
 // The GraphQL endpoint as a script on this host reaches it, given the address

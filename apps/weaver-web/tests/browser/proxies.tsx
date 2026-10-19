@@ -97,7 +97,7 @@ function graphql(name: string, variables: Record<string, unknown>) {
  * so whatever it carries or is fails at it.
  */
 const egress = (id: number, name: string, enabled: boolean) => ({
-  id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled, maxDownloadSpeed: 0, health: "UP", reason: null,
+  id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled, downloadBps: null, uploadBps: null, health: "UP", reason: null,
 });
 const egresses = [egress(4, "Backup", false), egress(0, "System", true), egress(5, "Fiber", true)];
 const SILENT = 2;

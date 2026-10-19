@@ -308,7 +308,7 @@ async fn queue_event_records_from_pipeline_event(
             global_state: Some(global_queue_state(
                 handle.is_globally_paused(),
                 &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(0),
+                cfg.bandwidth.download_bps,
             )),
         });
     }
@@ -528,7 +528,7 @@ mod tests {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),

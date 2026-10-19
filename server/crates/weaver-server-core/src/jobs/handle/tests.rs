@@ -571,6 +571,8 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::UpdateHistory { job_id, reply, .. } => {
                     let _ = reply.send(Err(SchedulerError::JobNotFound(job_id)));
                 }
+                // This stub keeps no finished jobs.
+                SchedulerCommand::RetireJob { .. } => {}
                 SchedulerCommand::ReorderJob { job_id, reply, .. } => {
                     let result = if jobs.contains_key(&job_id) {
                         Ok(())
@@ -1112,4 +1114,132 @@ fn job_download_rates_report_only_transferring_download_phases() {
         job_download_rates(&jobs),
         vec![(JobId(1), 61_000_000), (JobId(5), 1_000)]
     );
+}
+
+// An owner that records what the queue asked of it.
+#[derive(Default)]
+struct RecordingOwner {
+    asked: std::sync::Mutex<Vec<(JobId, String)>>,
+}
+
+#[async_trait::async_trait]
+impl QueueOwner for RecordingOwner {
+    async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((job_id, format!("{action:?}")));
+        Ok(())
+    }
+}
+
+fn owned_job(job_id: JobId, created_at_epoch_ms: f64) -> JobInfo {
+    JobInfo {
+        protocol: crate::jobs::Protocol::Torrent,
+        job_id,
+        job_hash: None,
+        name: format!("job {}", job_id.0),
+        error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
+        status: JobStatus::Queued,
+        download_state: crate::jobs::model::DownloadState::Queued,
+        finalizing_download: false,
+        fetching_repair_data: false,
+        post_state: crate::jobs::model::PostState::Idle,
+        run_state: crate::jobs::model::RunState::Active,
+        progress: 0.0,
+        total_bytes: 0,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
+        failed_bytes: 0,
+        health: 1000,
+        terminal_discards: Vec::new(),
+        total_files: 0,
+        completed_files: 0,
+        remaining_par_files: 0,
+        password: None,
+        category: None,
+        metadata: Vec::new(),
+        output_dir: None,
+        server_attribution: Vec::new(),
+        created_at_epoch_ms,
+    }
+}
+
+// Each job id has one owner: an action on a job another owner published goes
+// to that owner, and an action on any other job goes to the pipeline.
+#[tokio::test]
+async fn a_queue_action_goes_to_the_jobs_owner() {
+    let (handle, task) = test_scheduler();
+    handle
+        .add_job(
+            JobId(1),
+            make_spec("Pipeline Job"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
+        .await
+        .unwrap();
+    let owner = Arc::new(RecordingOwner::default());
+    handle.state().seat_owner(owner.clone());
+    handle
+        .state()
+        .publish_torrent_jobs(vec![owned_job(JobId(2), 0.0)]);
+
+    handle.pause_job(JobId(2)).await.unwrap();
+    handle.resume_job(JobId(2)).await.unwrap();
+    handle.cancel_job_keeping_files(JobId(2)).await.unwrap();
+    handle
+        .update_job(
+            JobId(2),
+            JobUpdate {
+                category: FieldUpdate::Set("tv".into()),
+                ..JobUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+    handle
+        .reorder_jobs(vec![
+            (JobId(1), QueueMoveTarget::Top),
+            (JobId(2), QueueMoveTarget::Bottom),
+        ])
+        .await
+        .unwrap();
+    handle.pause_job(JobId(1)).await.unwrap();
+    assert_eq!(handle.get_job(JobId(1)).unwrap().status, JobStatus::Paused);
+
+    let asked = owner.asked.lock().unwrap().clone();
+    let ids: Vec<JobId> = asked.iter().map(|(job_id, _)| *job_id).collect();
+    assert_eq!(ids, vec![JobId(2); 5]);
+    let actions: Vec<&str> = asked.iter().map(|(_, action)| action.as_str()).collect();
+    assert_eq!(actions[0], "Pause");
+    assert_eq!(actions[1], "Resume");
+    assert_eq!(actions[2], "Cancel(UserKeepingFiles)");
+    assert!(actions[3].starts_with("Update("), "{}", actions[3]);
+    assert_eq!(actions[4], "Move(Bottom)");
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+// The queue lists every owner's jobs by when they were added, each owner's
+// own order kept, then the finished jobs.
+#[test]
+fn the_queue_interleaves_owners_by_when_their_jobs_were_added() {
+    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    let live = vec![
+        owned_job(JobId(1), 100.0),
+        owned_job(JobId(2), 300.0),
+        // Moved up by hand: the pipeline's order stands among its jobs.
+        owned_job(JobId(3), 50.0),
+    ];
+    let finished = vec![owned_job(JobId(9), 10.0)];
+    state.publish_live_jobs(live, Arc::from(finished));
+    state.publish_torrent_jobs(vec![owned_job(JobId(4), 200.0), owned_job(JobId(5), 400.0)]);
+    let order: Vec<u64> = state.list_jobs().iter().map(|job| job.job_id.0).collect();
+    assert_eq!(order, vec![1, 4, 2, 3, 5, 9]);
 }

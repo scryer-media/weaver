@@ -109,6 +109,8 @@ pub struct SharedPipelineState {
     #[cfg(test)]
     pub(crate) turn_observation: tokio::sync::watch::Sender<Option<PipelineTurnObservation>>,
     jobs: Arc<RwLock<PublishedJobs>>,
+    // The owner of the jobs published beside the pipeline's.
+    owner: Arc<RwLock<Option<Arc<dyn QueueOwner>>>>,
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
     speed_test_paused: Arc<AtomicBool>,
@@ -163,18 +165,31 @@ pub struct SharedPipelineState {
     metrics_refreshes: Arc<AtomicU64>,
 }
 
-// The published job list: live jobs rebuilt on each publish, followed by the
-// finished jobs, which are shared with the orchestrator and only rebuilt when
-// history itself changes.
+// The published job list: the live jobs, rebuilt on each publish, and the
+// jobs another owner publishes on its own, followed by the finished jobs,
+// which are shared with the orchestrator and only rebuilt when history itself
+// changes.
 #[derive(Default)]
 struct PublishedJobs {
     live: Vec<JobInfo>,
+    torrents: Vec<JobInfo>,
     history: Arc<[JobInfo]>,
 }
 
 impl PublishedJobs {
+    // The queue in one order: by when each job was added, each owner's own
+    // order kept among its jobs, then the finished jobs.
     fn iter(&self) -> impl Iterator<Item = &JobInfo> {
-        self.live.iter().chain(self.history.iter())
+        let mut live = self.live.iter().peekable();
+        let mut owned = self.torrents.iter().peekable();
+        std::iter::from_fn(move || match (live.peek(), owned.peek()) {
+            (Some(job), Some(other)) if other.created_at_epoch_ms < job.created_at_epoch_ms => {
+                owned.next()
+            }
+            (Some(_), _) => live.next(),
+            (None, _) => owned.next(),
+        })
+        .chain(self.history.iter())
     }
 }
 
@@ -190,8 +205,10 @@ impl SharedPipelineState {
         Self {
             jobs: Arc::new(RwLock::new(PublishedJobs {
                 live: initial_jobs,
+                torrents: Vec::new(),
                 history: Arc::from(Vec::new()),
             })),
+            owner: Arc::new(RwLock::new(None)),
             job_revision,
             paused: Arc::new(AtomicBool::new(false)),
             speed_test_paused: Arc::new(AtomicBool::new(false)),
@@ -266,6 +283,7 @@ impl SharedPipelineState {
     pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
         let jobs = self.jobs.read().unwrap();
         let mut rates = job_download_rates(&jobs.live);
+        rates.extend(job_download_rates(&jobs.torrents));
         rates.extend(job_download_rates(&jobs.history));
         rates
     }
@@ -354,9 +372,37 @@ impl SharedPipelineState {
     // list is shared, not copied: the orchestrator rebuilds it only when
     // history changes.
     pub fn publish_live_jobs(&self, live: Vec<JobInfo>, history: Arc<[JobInfo]>) {
-        *self.jobs.write().unwrap() = PublishedJobs { live, history };
+        {
+            let mut jobs = self.jobs.write().unwrap();
+            jobs.live = live;
+            jobs.history = history;
+        }
         self.job_revision
             .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    // Publish the torrents, kept beside whatever the pipeline publishes.
+    pub fn publish_torrent_jobs(&self, torrents: Vec<JobInfo>) {
+        self.jobs.write().unwrap().torrents = torrents;
+        self.job_revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    // Seat the owner of the jobs published beside the pipeline's.
+    pub fn seat_owner(&self, owner: Arc<dyn QueueOwner>) {
+        *self.owner.write().unwrap() = Some(owner);
+    }
+
+    // The owner that answers for `job_id`; `None` is the pipeline.
+    fn owner_of(&self, job_id: JobId) -> Option<Arc<dyn QueueOwner>> {
+        let owned = self
+            .jobs
+            .read()
+            .unwrap()
+            .torrents
+            .iter()
+            .any(|job| job.job_id == job_id);
+        owned.then(|| self.owner.read().unwrap().clone()).flatten()
     }
 
     pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -619,6 +665,23 @@ pub enum QueueMoveTarget {
     Offset(i64),
 }
 
+// What the queue asks of one job, whoever owns it.
+#[derive(Debug, Clone)]
+pub enum QueueAction {
+    Pause,
+    Resume,
+    Cancel(CancellationOrigin),
+    Update(JobUpdate),
+    Move(QueueMoveTarget),
+}
+
+// The owner of the jobs published beside the pipeline's. Each job id has one
+// owner: the one that published it, or else the pipeline.
+#[async_trait::async_trait]
+pub trait QueueOwner: Send + Sync {
+    async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError>;
+}
+
 // Splice `job_id` to its new position in the manual queue order. Pure so the
 // clamp/splice arithmetic is unit-testable apart from pipeline state.
 pub fn splice_job_order(
@@ -855,6 +918,10 @@ pub enum SchedulerCommand {
         job_id: JobId,
         update: JobUpdate,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    // A job another owner finished, for the finished jobs.
+    RetireJob {
+        info: Box<JobInfo>,
     },
     // Rename, recategorise or re-parameterise a finished job's history row.
     UpdateHistory {
@@ -1148,24 +1215,52 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    // Pause a job.
-    pub async fn pause_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+    // Every queue action on one job comes through here, and the job's owner
+    // answers it.
+    async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError> {
+        if let Some(owner) = self.state.owner_of(job_id) {
+            return owner.act(job_id, action).await;
+        }
         let (tx, rx) = oneshot::channel();
+        let command = match action {
+            QueueAction::Pause => SchedulerCommand::PauseJob { job_id, reply: tx },
+            QueueAction::Resume => SchedulerCommand::ResumeJob { job_id, reply: tx },
+            QueueAction::Cancel(origin) => {
+                if origin.is_user() {
+                    self.state.cancel_active_job_work(job_id);
+                }
+                SchedulerCommand::CancelJob {
+                    job_id,
+                    origin,
+                    reply: tx,
+                }
+            }
+            QueueAction::Update(update) => SchedulerCommand::UpdateJob {
+                job_id,
+                update,
+                reply: tx,
+            },
+            QueueAction::Move(target) => SchedulerCommand::ReorderJob {
+                job_id,
+                target,
+                reply: tx,
+            },
+        };
         self.cmd_tx
-            .send(SchedulerCommand::PauseJob { job_id, reply: tx })
+            .send(command)
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
+    // Pause a job.
+    pub async fn pause_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.act(job_id, QueueAction::Pause).await
+    }
+
     // Resume a paused job.
     pub async fn resume_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ResumeJob { job_id, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.act(job_id, QueueAction::Resume).await
     }
 
     // Cancel a job.
@@ -1195,33 +1290,12 @@ impl SchedulerHandle {
         job_id: JobId,
         origin: CancellationOrigin,
     ) -> Result<(), SchedulerError> {
-        if origin.is_user() {
-            self.state.cancel_active_job_work(job_id);
-        }
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::CancelJob {
-                job_id,
-                origin,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.act(job_id, QueueAction::Cancel(origin)).await
     }
 
     // Update a job's category and/or metadata.
     pub async fn update_job(&self, job_id: JobId, update: JobUpdate) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::UpdateJob {
-                job_id,
-                update,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.act(job_id, QueueAction::Update(update)).await
     }
 
     // Update a finished job's history row. The password field is ignored.
@@ -1250,16 +1324,7 @@ impl SchedulerHandle {
         job_id: JobId,
         target: QueueMoveTarget,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ReorderJob {
-                job_id,
-                target,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.act(job_id, QueueAction::Move(target)).await
     }
 
     // Move multiple jobs within the manual queue order in a single round
@@ -1271,12 +1336,36 @@ impl SchedulerHandle {
         &self,
         moves: Vec<(JobId, QueueMoveTarget)>,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
+        // The pipeline's moves go as one batch; another owner's go to it.
+        let (owned, moves): (Vec<_>, Vec<_>) = moves
+            .into_iter()
+            .partition(|(job_id, _)| self.state.owner_of(*job_id).is_some());
+        if !moves.is_empty() || owned.is_empty() {
+            let (tx, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(SchedulerCommand::ReorderJobs { moves, reply: tx })
+                .await
+                .map_err(|_| SchedulerError::ChannelClosed)?;
+            rx.await.map_err(|_| SchedulerError::ChannelClosed)??;
+        }
+        for (job_id, target) in owned {
+            self.act(job_id, QueueAction::Move(target)).await?;
+        }
+        Ok(())
+    }
+
+    // A job another owner finished joins the finished jobs.
+    pub async fn retire_job(&self, info: JobInfo) -> Result<(), SchedulerError> {
         self.cmd_tx
-            .send(SchedulerCommand::ReorderJobs { moves, reply: tx })
+            .send(SchedulerCommand::RetireJob {
+                info: Box::new(info),
+            })
             .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+            .map_err(|_| SchedulerError::ChannelClosed)
+    }
+
+    pub fn state(&self) -> &SharedPipelineState {
+        &self.state
     }
 
     // Reprocess a completed or failed job (re-run post-download stages without re-downloading).
@@ -1596,6 +1685,37 @@ impl SchedulerHandle {
         bandwidth: crate::proxies::Bandwidth,
     ) -> Result<(), SchedulerError> {
         self.send_bandwidth(bandwidth, true).await
+    }
+
+    // Save the global bandwidth limits as the operator's edit: the store,
+    // then the shared configuration, then the limiter.
+    pub async fn save_bandwidth(
+        &self,
+        db: &crate::Database,
+        config: &crate::settings::SharedConfig,
+        bandwidth: crate::proxies::Bandwidth,
+    ) -> Result<(), SchedulerError> {
+        let store = db.clone();
+        tokio::task::spawn_blocking(move || store.set_network_bandwidth(&bandwidth))
+            .await
+            .map_err(|error| SchedulerError::Io(std::io::Error::other(error)))??;
+        config.write().await.bandwidth = bandwidth;
+        self.set_bandwidth(bandwidth).await
+    }
+
+    // Save the global download limit, keeping the upload limit as it is.
+    pub async fn save_download_limit(
+        &self,
+        db: &crate::Database,
+        config: &crate::settings::SharedConfig,
+        download_bps: Option<u64>,
+    ) -> Result<crate::proxies::Bandwidth, SchedulerError> {
+        let bandwidth = crate::proxies::Bandwidth {
+            download_bps,
+            ..config.read().await.bandwidth
+        };
+        self.save_bandwidth(db, config, bandwidth).await?;
+        Ok(bandwidth)
     }
 
     // Load the saved global bandwidth limits, as a configuration reload

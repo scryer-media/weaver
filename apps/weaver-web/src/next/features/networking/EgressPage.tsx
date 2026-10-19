@@ -3,10 +3,17 @@
 
 import { memo, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
-import { CREATE_EGRESS, DELETE_EGRESS, RESET_EGRESS_USAGE, UPDATE_EGRESS } from "@/graphql/networking";
-import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
+import {
+  BANDWIDTH_QUERY,
+  CREATE_EGRESS,
+  DELETE_EGRESS,
+  RESET_EGRESS_USAGE,
+  SET_BANDWIDTH,
+  SET_EGRESS_QUOTA,
+  UPDATE_EGRESS,
+} from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import type { Egress } from "@/lib/networking";
+import type { Bandwidth, Egress } from "@/lib/networking";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { RecordEditor } from "../../components/RecordEditor";
 import { SecondaryButton, TextField } from "../../components/controls";
@@ -19,10 +26,19 @@ import {
   type SettingsBlock,
   type SettingsSectionModel,
 } from "../../pages/settings/framework";
-import { quotaDraft, quotaFields, quotaInput, quotaProblem } from "../../pages/settings/quota";
 import { egressInput, liveAddresses, type NetworkingAction, type NetworkingData } from "./data";
-import { QuotaCell, quotaSearchText } from "./egress-quota";
-import { bindingLabel, formatLimit, Hint, MIB, stateLabel, StatusMark } from "./presentation";
+import {
+  egressQuotaChanged,
+  egressQuotaDraft,
+  egressQuotaFields,
+  egressQuotaInput,
+  egressQuotaProblem,
+  metered,
+  QuotaCell,
+  quotaSearchText,
+} from "./egress-quota";
+import { LimitControl } from "./limits";
+import { bindingLabel, formatLimit, Hint, stateLabel, StatusMark } from "./presentation";
 import { TestViaDialog } from "./TestViaDialog";
 
 const NEW_EGRESS: Egress = {
@@ -32,7 +48,8 @@ const NEW_EGRESS: Egress = {
   interfaceName: "",
   sourceAddress: "",
   enabled: true,
-  maxDownloadSpeed: 0,
+  downloadBps: null,
+  uploadBps: null,
   health: "UNKNOWN",
   reason: null,
 };
@@ -41,21 +58,21 @@ const NEW_EGRESS: Egress = {
 const isSystem = (egress: Egress) => egress.id === 0;
 
 /**
- * The global download ceiling, over every egress together. It is a daemon
- * setting rather than an egress's, so it saves through the settings and owns
- * the top bar's Save and Revert. The status line it publishes also carries
- * what the egress table last wrote, unless the ceiling has an edit pending.
+ * The global limits, over every egress together, one per direction. They save
+ * through `setBandwidth`, which replaces both at once, and own the top bar's
+ * Save and Revert. The status line they publish also carries what the egress
+ * table last wrote, unless the limits have an edit pending.
  */
-function useDownloadCeiling(busy: boolean, message: string | null, failed: boolean) {
+function useGlobalBandwidth(busy: boolean, message: string | null, failed: boolean) {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<{ settings: { maxDownloadSpeed: number } }>({
-    query: SETTINGS_QUERY,
+  const [{ data, fetching }, reexecute] = useQuery<{ networking: { bandwidth: Bandwidth } }>({
+    query: BANDWIDTH_QUERY,
   });
-  const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
+  const [updateState, setBandwidth] = useMutation(SET_BANDWIDTH);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // A write to an egress takes the status line over from the ceiling's last save.
+  // A write to an egress takes the status line over from the limits' last save.
   useEffect(() => {
     if (busy) {
       setStatus(null);
@@ -63,10 +80,10 @@ function useDownloadCeiling(busy: boolean, message: string | null, failed: boole
     }
   }, [busy]);
 
-  const source = useMemo<{ maxDownloadSpeed: number } | null>(() => {
-    const settings = data?.settings;
-    return settings ? { maxDownloadSpeed: settings.maxDownloadSpeed ?? 0 } : null;
-  }, [data?.settings]);
+  const source = useMemo<Bandwidth | null>(() => {
+    const bandwidth = data?.networking?.bandwidth;
+    return bandwidth ? { downloadBps: bandwidth.downloadBps ?? null, uploadBps: bandwidth.uploadBps ?? null } : null;
+  }, [data?.networking?.bandwidth]);
 
   const draft = useDraft(source, () => {
     setStatus(null);
@@ -89,8 +106,8 @@ function useDownloadCeiling(busy: boolean, message: string | null, failed: boole
         return;
       }
       setError(null);
-      void updateSettings({ input: { maxDownloadSpeed: values.maxDownloadSpeed } }).then((result) => {
-        if (result.error || !result.data?.updateSettings) {
+      void setBandwidth({ input: { downloadBps: values.downloadBps, uploadBps: values.uploadBps } }).then((result) => {
+        if (result.error || !result.data?.setBandwidth) {
           setError(result.error?.message ?? t("next.bandwidth.saveFailed"));
           return;
         }
@@ -101,32 +118,55 @@ function useDownloadCeiling(busy: boolean, message: string | null, failed: boole
     },
   });
 
+  const limit = (id: "downloadBps" | "uploadBps", label: string): FieldSpec => ({
+    id,
+    label,
+    keywords: "speed limit throttle rate bandwidth",
+    control: {
+      kind: "custom",
+      control: values ? (
+        <LimitControl
+          label={label}
+          value={values[id]}
+          suffix="MB/s"
+          onChange={(next) => draft.set({ ...values, [id]: next })}
+        />
+      ) : null,
+    },
+  });
+
   const block: SettingsSectionModel | null = values
     ? {
         kind: "section",
         id: "limits",
         title: t("next.bandwidth.limits"),
         fields: [
-          {
-            id: "maxDownloadSpeed",
-            label: t("next.bandwidth.ceiling"),
-            help: t("next.bandwidth.ceilingHelp"),
-            keywords: "speed limit throttle rate",
-            // The same field as the speed-limit dialog, so the ceiling reads and
-            // edits identically wherever it is set.
-            control: {
-              kind: "number",
-              value: Math.round((values.maxDownloadSpeed / MIB) * 10) / 10,
-              min: 0,
-              onChange: (next) => draft.set({ maxDownloadSpeed: Math.round(Math.max(0, next) * MIB) }),
-              suffix: "MB/s",
-            },
-          },
+          limit("downloadBps", t("next.bandwidth.downloadLimit")),
+          limit("uploadBps", t("next.bandwidth.uploadLimit")),
         ],
       }
     : null;
 
   return { block, loading: fetching && !data };
+}
+
+/** The egress table's limit cell: one line per direction. */
+function LimitCell({ egress }: { egress: Egress }) {
+  const t = useTranslate();
+  return (
+    <div className="flex min-w-0 flex-col gap-[3px]">
+      {(
+        [
+          ["↓", egress.downloadBps, "next.quota.download"],
+          ["↑", egress.uploadBps, "next.quota.upload"],
+        ] as const
+      ).map(([arrow, value, label]) => (
+        <Cell key={arrow} mono className={value === null ? "text-wv-muted" : undefined} title={t(label)}>
+          {`${arrow} ${formatLimit(t, value)}`}
+        </Cell>
+      ))}
+    </div>
+  );
 }
 
 export const EgressPage = memo(function EgressPage({
@@ -147,7 +187,7 @@ export const EgressPage = memo(function EgressPage({
 }) {
   const t = useTranslate();
   const [editing, setEditing] = useState<Egress | null>(null);
-  const ceiling = useDownloadCeiling(busy, message, failed);
+  const ceiling = useGlobalBandwidth(busy, message, failed);
   const kinds = data.platformNetworking.egressBindingKinds;
   const listed = [...egresses.filter(isSystem), ...egresses.filter((egress) => !isSystem(egress))];
 
@@ -162,7 +202,7 @@ export const EgressPage = memo(function EgressPage({
       kind: "table",
       id: "egress",
       title: t("next.networking.egress.title"),
-      columns: "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.8fr) 104px minmax(0, 1.4fr) 80px",
+      columns: "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.8fr) 120px minmax(0, 1.6fr) 80px",
       headers: [
         t("next.networking.egress.name"),
         t("next.networking.egress.bindingColumn"),
@@ -189,8 +229,7 @@ export const EgressPage = memo(function EgressPage({
             binding,
             addresses,
             egress.health,
-            t("next.networking.egress.quotaSection"),
-            t("next.bandwidth.allowance"),
+            t("next.networking.egress.quota"),
             quotaSearchText(t, egress),
           ].join(" "),
           cells: [
@@ -213,9 +252,7 @@ export const EgressPage = memo(function EgressPage({
                 <span className="font-wv-mono text-[11px] text-wv-muted">{t("next.networking.disabled")}</span>
               )}
             </span>,
-            <Cell key="limit" mono className={egress.maxDownloadSpeed ? undefined : "text-wv-muted"}>
-              {formatLimit(t, egress.maxDownloadSpeed)}
-            </Cell>,
+            <LimitCell key="limit" egress={egress} />,
             <QuotaCell key="quota" t={t} egress={egress} />,
             <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
               <SecondaryButton size="compact" icon="edit" onClick={() => open(egress)}>
@@ -266,7 +303,7 @@ export function EgressEditor({
 }) {
   const t = useTranslate();
   const [editing, setEditing] = useState(egress);
-  const [quota, setQuota] = useState(() => quotaDraft(egress.downloadQuota));
+  const [quota, setQuota] = useState(() => egressQuotaDraft(egress.quota));
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Egress | null>(null);
   const [testing, setTesting] = useState<Egress | null>(null);
@@ -280,17 +317,29 @@ export function EgressEditor({
         ? t("next.networking.egress.interfaceRequired")
         : editing.bindingKind === "SOURCE_ADDRESS" && !editing.sourceAddress?.trim()
           ? t("next.networking.egress.sourceRequired")
-          : quotaProblem(t, quota);
+          : egressQuotaProblem(t, quota);
     if (missing) {
       setError(missing);
       return;
     }
-    const failure = await action(editing.id < 0 ? CREATE_EGRESS : UPDATE_EGRESS, {
-      id: editing.id,
-      input: { ...egressInput(editing), downloadQuota: quotaInput(quota) },
-    });
-    if (failure) {
-      setError(failure);
+    let id = editing.id;
+    const failure = await action(
+      editing.id < 0 ? CREATE_EGRESS : UPDATE_EGRESS,
+      { id: editing.id, input: egressInput(editing) },
+      (saved) => {
+        const created = (saved as { createEgressInterface?: { id: number } } | undefined)?.createEgressInterface;
+        if (created) {
+          id = created.id;
+        }
+      },
+    );
+    // The quota saves on its own, once the egress it caps exists.
+    const quotaFailure =
+      failure ?? (egressQuotaChanged(quota, egress.quota) && id >= 0
+        ? await action(SET_EGRESS_QUOTA, { id, input: egressQuotaInput(quota) })
+        : null);
+    if (quotaFailure) {
+      setError(quotaFailure);
     } else {
       onClose();
     }
@@ -398,17 +447,33 @@ export function EgressEditor({
         ]
       : []),
     {
-      id: "limit",
+      id: "downloadLimit",
       label: t("next.networking.egress.downloadLimit"),
-      help: t("next.networking.egress.limitHelp"),
+      keywords: "speed limit throttle rate",
       control: {
-        kind: "number",
-        value: editing.maxDownloadSpeed / MIB,
-        min: 0,
-        step: 0.1,
-        precision: 1,
-        suffix: "MiB/s",
-        onChange: (limit) => patch({ maxDownloadSpeed: Math.round(limit * MIB) }),
+        kind: "custom",
+        control: (
+          <LimitControl
+            label={t("next.networking.egress.downloadLimit")}
+            value={editing.downloadBps}
+            onChange={(downloadBps) => patch({ downloadBps })}
+          />
+        ),
+      },
+    },
+    {
+      id: "uploadLimit",
+      label: t("next.networking.egress.uploadLimit"),
+      keywords: "speed limit throttle rate",
+      control: {
+        kind: "custom",
+        control: (
+          <LimitControl
+            label={t("next.networking.egress.uploadLimit")}
+            value={editing.uploadBps}
+            onChange={(uploadBps) => patch({ uploadBps })}
+          />
+        ),
       },
     },
     {
@@ -435,7 +500,7 @@ export function EgressEditor({
         extraActions={
           editing.id >= 0 ? (
             <>
-              {editing.downloadQuota?.enabled ? (
+              {metered(egress) ? (
                 <SecondaryButton
                   icon="reset"
                   disabled={busy}
@@ -459,11 +524,10 @@ export function EgressEditor({
           { id: "egress", title: t("next.networking.egress.section"), fields },
           {
             id: "quota",
-            title: t("next.networking.egress.quotaSection"),
-            fields: quotaFields(t, quota, setQuota, {
-              label: t("next.networking.egress.quotaEnabled"),
-              help: t("next.networking.egress.quotaHelp"),
-              usedBytes: egress.downloadQuotaUsage?.usedBytes,
+            title: t("next.networking.egress.quota"),
+            fields: egressQuotaFields(t, quota, setQuota, {
+              down: egress.quotaUsage?.down.usedBytes,
+              up: egress.quotaUsage?.up.usedBytes,
             }),
           },
         ]}

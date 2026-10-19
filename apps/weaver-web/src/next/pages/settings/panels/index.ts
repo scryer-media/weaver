@@ -15,6 +15,7 @@ import { SchedulesPanel } from "./SchedulesPanel";
 import { ScriptRunsPanel } from "./ScriptRunsPanel";
 import { SecretsPanel } from "./SecretsPanel";
 import { SecurityPanel } from "./SecurityPanel";
+import { TorrentsPanel } from "./TorrentsPanel";
 import { WatchFolderPanel } from "./WatchFolderPanel";
 
 /**
@@ -83,6 +84,13 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     note: "next.settings.panel.categoriesNote",
     icon: "categories",
     Component: CategoriesPanel,
+  },
+  {
+    slug: "torrents",
+    label: "next.settings.panel.torrents",
+    note: "next.settings.panel.torrentsNote",
+    icon: "downloads",
+    Component: TorrentsPanel,
   },
   {
     slug: "networking/overview",

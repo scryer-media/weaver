@@ -48,7 +48,7 @@ fn fixture(execution_enabled: bool) -> Fixture {
         servers: vec![],
         categories: vec![],
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         cleanup_after_extract: None,
         propagation_delay_secs: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),

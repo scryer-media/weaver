@@ -147,10 +147,12 @@ async fn write_checkpoint(
         )
         .await?;
     }
+    // A job is live while its queue row or its torrent row is.
     let live = tx
         .fetch_optional(
-            "SELECT 1 AS live FROM active_jobs WHERE job_id = {}",
-            &[SqlArg::I64(id)],
+            "SELECT 1 AS live FROM active_jobs WHERE job_id = {}
+             UNION ALL SELECT 1 AS live FROM torrents WHERE job_id = {}",
+            &[SqlArg::I64(id), SqlArg::I64(id)],
         )
         .await?
         .is_some();

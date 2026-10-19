@@ -71,6 +71,8 @@ pub struct SchemaContext {
     // reruns share concurrency and cancellation state.
     pub post_processing_executor:
         Option<weaver_server_core::post_processing::executor::PostProcessingExecutor>,
+    // The torrent client, when the server started with torrents on.
+    pub torrents: Option<weaver_server_core::torrents::service::TorrentService>,
 }
 
 // Render the GraphQL SDL for the public API without constructing any runtime
@@ -176,6 +178,9 @@ pub fn build_schema_with_backup(
     .data(history_delete_manager)
     .data(staged_upload_manager)
     .data(speed_test);
-    let schema = schema.data(post_processing_executor);
+    let mut schema = schema.data(post_processing_executor);
+    if let Some(torrents) = context.torrents {
+        schema = schema.data(torrents);
+    }
     schema.finish()
 }

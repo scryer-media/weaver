@@ -740,7 +740,7 @@ fn complete_destination_candidate(
     }
 }
 
-async fn claim_complete_destination_path(
+pub(crate) async fn claim_complete_destination_path(
     parent: &Path,
     dir_name: &str,
     job_id: JobId,

@@ -200,7 +200,10 @@ fn sample_config() -> Config {
             },
         ],
         retry: None,
-        bandwidth: crate::proxies::Bandwidth { download_bps: Some(1234), upload_bps: None },
+        bandwidth: crate::proxies::Bandwidth {
+            download_bps: Some(1234),
+            upload_bps: None,
+        },
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

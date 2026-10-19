@@ -998,7 +998,10 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
         .await;
     received.await.unwrap();
     // A reload records the saved limit but leaves the scheduled one in force.
-    assert_eq!(pipeline.configured_bandwidth, download_bandwidth(768 * 1024));
+    assert_eq!(
+        pipeline.configured_bandwidth,
+        download_bandwidth(768 * 1024)
+    );
     assert_eq!(pipeline.rate_limiter.rate(), Some(128 * 1024));
 
     let (reply, received) = oneshot::channel();
@@ -2920,7 +2923,10 @@ async fn an_operator_speed_limit_replaces_the_scheduled_one_until_the_next_rule_
         .await;
     received.await.unwrap();
     assert_eq!(pipeline.scheduled_bandwidth, None);
-    assert_eq!(pipeline.configured_bandwidth, download_bandwidth(640 * 1024));
+    assert_eq!(
+        pipeline.configured_bandwidth,
+        download_bandwidth(640 * 1024)
+    );
     assert_eq!(pipeline.rate_limiter.rate(), Some(640 * 1024));
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
@@ -2936,5 +2942,8 @@ async fn an_operator_speed_limit_replaces_the_scheduled_one_until_the_next_rule_
         Some(download_bandwidth(256 * 1024))
     );
     assert_eq!(pipeline.rate_limiter.rate(), Some(256 * 1024));
-    assert_eq!(pipeline.configured_bandwidth, download_bandwidth(640 * 1024));
+    assert_eq!(
+        pipeline.configured_bandwidth,
+        download_bandwidth(640 * 1024)
+    );
 }

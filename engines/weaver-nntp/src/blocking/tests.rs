@@ -412,6 +412,7 @@ fn test_transfer_control(
     crate::transfer::ServerTransferRegistry::new().configure(
         StableServerId(stable_id),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes,
@@ -1378,6 +1379,7 @@ fn blocking_rustls_rate_wait_is_excluded_from_active_budget() {
     let control = crate::transfer::ServerTransferRegistry::new().configure(
         StableServerId(104),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 1_000,
             quota: None,
         },
@@ -1412,6 +1414,7 @@ fn expired_active_budget_does_not_enter_blocking_rate_wait() {
     let control = crate::transfer::ServerTransferRegistry::new().configure(
         StableServerId(105),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 1_000,
             quota: None,
         },

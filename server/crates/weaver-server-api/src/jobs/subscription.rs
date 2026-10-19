@@ -102,7 +102,7 @@ impl JobsSubscription {
                 let memo = memo.clone();
                 async move {
                     let state = SnapshotState::capture(&handle);
-                    let max_download_speed = config.read().await.max_download_speed.unwrap_or(0);
+                    let max_download_speed = config.read().await.bandwidth.download_bps;
                     {
                         let mut memo = memo.lock().expect("queue snapshot memo poisoned");
                         let unchanged = memo.last.as_ref().is_some_and(|(last, speed)| {
@@ -312,7 +312,7 @@ impl SnapshotState {
 
 #[derive(Default)]
 struct QueueSnapshotMemo {
-    last: Option<(SnapshotState, u64)>,
+    last: Option<(SnapshotState, Option<u64>)>,
     summaries: Option<(u64, Arc<HashMap<u64, DuplicateSummaryInfo>>)>,
 }
 

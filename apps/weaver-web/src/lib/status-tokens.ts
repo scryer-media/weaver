@@ -23,6 +23,9 @@ const STATUS_TO_TOKEN: Record<string, StatusToken> = {
   QUEUED_REPAIR: "queued",
   QUEUED_EXTRACT: "queued",
   DOWNLOADING: "downloading",
+  FETCHING_METADATA: "downloading",
+  STALLED: "downloading",
+  CHECKING_FILES: "verifying",
   FETCHING_REPAIR_DATA: "repairing",
   FINALIZING_DOWNLOAD: "downloading",
   PAUSED: "paused",
@@ -36,6 +39,7 @@ const STATUS_TO_TOKEN: Record<string, StatusToken> = {
   FINALIZING: "copying",
   COMPLETE: "completed",
   COMPLETED: "completed",
+  SEEDING: "completed",
   FAILED: "failed",
   CANCELLED: "failed",
   INTERRUPTED: "failed",
@@ -48,6 +52,9 @@ const STATUS_TO_I18N_KEY: Record<string, string> = {
   QUEUED_REPAIR: "status.queued",
   QUEUED_EXTRACT: "status.queued",
   DOWNLOADING: "status.downloading",
+  FETCHING_METADATA: "status.fetchingMetadata",
+  STALLED: "status.stalled",
+  CHECKING_FILES: "status.checkingFiles",
   FETCHING_REPAIR_DATA: "status.fetchingRepairData",
   FINALIZING_DOWNLOAD: "timeline.finalizingDownload",
   PAUSED: "status.paused",
@@ -61,13 +68,19 @@ const STATUS_TO_I18N_KEY: Record<string, string> = {
   FINALIZING: "status.finalizing",
   COMPLETE: "status.complete",
   COMPLETED: "status.complete",
+  SEEDING: "status.seeding",
   FAILED: "status.failed",
   CANCELLED: "status.cancelled",
   INTERRUPTED: "status.failed",
 };
 
+// A stalled torrent is downloading with nothing arriving, so it is not active;
+// a seeding one is complete and still uploading, so it is.
 const ACTIVE_STATUSES = new Set([
   "DOWNLOADING",
+  "FETCHING_METADATA",
+  "CHECKING_FILES",
+  "SEEDING",
   "FETCHING_REPAIR_DATA",
   "FINALIZING_DOWNLOAD",
   "CHECKING",
@@ -83,6 +96,8 @@ const ACTIVE_STATUSES = new Set([
 const INDETERMINATE_STATUSES = new Set([
   "AWAITING_QUEUE_SCRIPTS",
   "CHECKING",
+  "CHECKING_FILES",
+  "FETCHING_METADATA",
   "FETCHING_REPAIR_DATA",
   "VERIFYING",
   "REPAIRING",
@@ -120,7 +135,7 @@ export function progressDisplayKind(
   progressFraction: number,
 ): ProgressKind {
   const value = normalizeStatus(status);
-  if (value === "COMPLETE" || value === "COMPLETED") return "complete";
+  if (value === "COMPLETE" || value === "COMPLETED" || value === "SEEDING") return "complete";
   if (value === "QUEUED" || value === "PROPAGATING") return "empty";
   if (INDETERMINATE_STATUSES.has(value) && progressFraction <= 0) return "indeterminate";
   return "determinate";

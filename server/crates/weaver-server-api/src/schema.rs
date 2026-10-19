@@ -66,6 +66,7 @@ pub struct QueryRoot(
     servers_query::ServersQuery,
     settings_query::SettingsQuery,
     system_query::SystemQuery,
+    crate::torrents::TorrentsQuery,
 );
 
 #[derive(Default, MergedObject)]
@@ -91,6 +92,7 @@ struct ApplicationMutations(
     post_processing_mutation::PostProcessingMutation,
     settings_mutation::SettingsMutation,
     system_mutation::SystemMutation,
+    crate::torrents::TorrentsMutation,
 );
 
 #[derive(Default, MergedSubscription)]

@@ -31,6 +31,10 @@ const ja: LocaleDictionary = {
   // Status labels
   "status.queued": "待機中",
   "status.downloading": "ダウンロード中",
+  "status.fetchingMetadata": "メタデータを取得中",
+  "status.checkingFiles": "ファイルを確認中",
+  "status.seeding": "シード中",
+  "status.stalled": "停滞中",
   "status.verifying": "検証中",
   "status.repairing": "修復中",
   "status.extracting": "展開中",

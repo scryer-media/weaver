@@ -55,6 +55,10 @@ fn queue_display_state(state: QueueItemState) -> &'static str {
         QueueItemState::Completed => "COMPLETE",
         QueueItemState::Failed => "FAILED",
         QueueItemState::Paused => "PAUSED",
+        QueueItemState::FetchingMetadata => "FETCHING_METADATA",
+        QueueItemState::CheckingFiles => "CHECKING_FILES",
+        QueueItemState::Seeding => "SEEDING",
+        QueueItemState::Stalled => "STALLED",
     }
 }
 
@@ -207,7 +211,9 @@ fn queue_page_summary(
             QueueItemState::Queued => summary.queued_items += 1,
             QueueItemState::Paused => summary.paused_items += 1,
             QueueItemState::Failed => summary.failed_items += 1,
-            QueueItemState::Verifying | QueueItemState::Checking => {
+            QueueItemState::Verifying
+            | QueueItemState::Checking
+            | QueueItemState::CheckingFiles => {
                 summary.active_items += 1;
                 summary.verifying_items += 1;
             }
@@ -223,8 +229,10 @@ fn queue_page_summary(
             | QueueItemState::FetchingRepairData
             | QueueItemState::FinalizingDownload
             | QueueItemState::Finalizing
-            | QueueItemState::PostProcessing => summary.active_items += 1,
-            QueueItemState::Completed => {}
+            | QueueItemState::PostProcessing
+            | QueueItemState::FetchingMetadata
+            | QueueItemState::Stalled => summary.active_items += 1,
+            QueueItemState::Completed | QueueItemState::Seeding => {}
         }
     }
 
@@ -415,7 +423,7 @@ impl JobsQuery {
         let max_download_speed = with_timed_config_read(
             config,
             "jobs.query.queue_snapshot.max_download_speed",
-            |cfg| cfg.max_download_speed.unwrap_or(0),
+            |cfg| cfg.bandwidth.download_bps,
         )
         .await;
 
@@ -440,7 +448,7 @@ impl JobsQuery {
         let max_download_speed = with_timed_config_read(
             config,
             "jobs.query.global_queue_state.max_download_speed",
-            |cfg| cfg.max_download_speed.unwrap_or(0),
+            |cfg| cfg.bandwidth.download_bps,
         )
         .await;
         Ok(global_queue_state(

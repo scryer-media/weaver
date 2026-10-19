@@ -195,6 +195,7 @@ impl Pipeline {
         let job_id = JobId(said.scope);
         let limit = self.graph_slot_limit();
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+            self.graph_outside.deliver(said, limit);
             return;
         };
         let ended = matches!(said.heard, Heard::Ended);
@@ -207,7 +208,7 @@ impl Pipeline {
 
     // How many runs a graph job may hold now: the extraction concurrency the
     // tuner allows at this moment, the limit the repair slots follow too.
-    pub(in crate::pipeline::graph) fn graph_slot_limit(&self) -> usize {
+    pub(crate) fn graph_slot_limit(&self) -> usize {
         limits::budgets(&self.direct_store.settings(), &self.tuner).1
     }
 

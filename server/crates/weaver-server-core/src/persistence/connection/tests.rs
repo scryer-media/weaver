@@ -2652,7 +2652,10 @@ async fn postgres_runtime_smoke_when_configured() {
             base_delay_secs: Some(4.0),
             multiplier: Some(1.5),
         }),
-        bandwidth: crate::proxies::Bandwidth { download_bps: Some(12_345), upload_bps: None },
+        bandwidth: crate::proxies::Bandwidth {
+            download_bps: Some(12_345),
+            upload_bps: None,
+        },
         cleanup_after_extract: Some(false),
         propagation_delay_secs: Some(0),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

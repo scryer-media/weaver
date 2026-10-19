@@ -236,7 +236,7 @@ impl TestHarness {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
@@ -345,6 +345,7 @@ impl TestHarness {
             nntp_pool: None,
             spawn_history_delete_worker,
             post_processing_executor: None,
+            torrents: None,
         });
 
         Self {
@@ -746,7 +747,7 @@ fn spawn_test_scheduler(
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetPropagationDelay { reply, .. }
-                | SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                | SchedulerCommand::SetBandwidth { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::RebuildNntp {
@@ -1008,6 +1009,8 @@ fn spawn_test_scheduler(
                 // reports a pipeline that did not respond, which is what a
                 // mock scheduler is.
                 SchedulerCommand::PipelineDiagnostics { .. } => {}
+                // This harness keeps no finished jobs.
+                SchedulerCommand::RetireJob { .. } => {}
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.

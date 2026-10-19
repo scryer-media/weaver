@@ -51,13 +51,13 @@ pub(crate) struct RootBlob {
 }
 
 impl RootBlob {
-    pub(crate) fn of<R: Root>(root: &R) -> Self {
-        Self {
+    pub(crate) fn of<R: Root>(root: &R) -> Result<Self, RootFactsError> {
+        Ok(Self {
             root: R::NAME.to_owned(),
             version: R::FACTS_VERSION,
-            // Plain structs of integers and strings always encode.
-            bytes: rmp_serde::to_vec(&root.facts()).unwrap_or_default(),
-        }
+            bytes: rmp_serde::to_vec(&root.facts())
+                .map_err(|error| RootFactsError::Encode(error.to_string()))?,
+        })
     }
 
     // The facts, for a root of the kind that wrote them.
@@ -114,6 +114,8 @@ pub(crate) enum RootFactsError {
     Version(u16),
     #[error("the root's facts do not decode: {0}")]
     Decode(String),
+    #[error("the root's facts do not encode: {0}")]
+    Encode(String),
     #[error("the root's facts do not match the post: {0}")]
     Mismatch(&'static str),
 }

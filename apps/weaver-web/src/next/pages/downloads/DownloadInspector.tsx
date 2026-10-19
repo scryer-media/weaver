@@ -10,19 +10,22 @@ import {
   JOB_OUTPUT_FILES_QUERY,
   PAUSE_JOB_MUTATION,
   RESUME_JOB_MUTATION,
+  SET_TORRENT_FORCED_MUTATION,
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
+import { torrentErrorText, type TorrentSummaryData } from "@/lib/torrents";
 import { Eyebrow } from "@/next/components/chrome";
-import { DangerButton, SecondaryButton, Select } from "@/next/components/controls";
+import { DangerButton, SecondaryButton, Select, Toggle } from "@/next/components/controls";
 import { Icon } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 import { SupportReportActions } from "@/next/features/SupportReportActions";
+import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
 
 interface OutputFile {
   name: string;
@@ -76,13 +79,17 @@ export function DownloadInspector({
   job,
   eta,
   rate,
+  torrent = null,
   onRemoved,
 }: {
   job: JobData;
   eta: string;
   rate: number;
+  /** The torrent behind a torrent job, once it has been read. */
+  torrent?: TorrentSummaryData | null;
   onRemoved: (id: number) => void;
 }) {
+  const isTorrent = job.protocol === "TORRENT";
   const t = useTranslate();
   const statusLabel = useStatusLabel();
   const [{ data }] = useQuery<OutputFilesResponse>({
@@ -94,6 +101,8 @@ export function DownloadInspector({
   const [cancelState, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
   const [stopState, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
+  const [forceState, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
+  const [removingTorrent, setRemovingTorrent] = useState(false);
   const { categories, queue } = useNextData("categories", "queue");
   // What was just picked, shown until the queue carries it back; the daemon's
   // answer can take a refresh to arrive, and a select that snaps back to the
@@ -123,11 +132,20 @@ export function DownloadInspector({
           }
           return next;
         });
-        setFailure(result.error.message);
+        setFailure(torrentErrorText(result.error));
         return;
       }
       queue.refresh();
     });
+  };
+
+  /** An action's answer: the daemon's refusal, or a fresh queue. */
+  const settle = (result: { error?: Parameters<typeof torrentErrorText>[0] }) => {
+    if (result.error) {
+      setFailure(torrentErrorText(result.error));
+      return;
+    }
+    queue.refresh();
   };
 
   const priorityOptions: { value: Priority; label: string }[] = [
@@ -202,15 +220,29 @@ export function DownloadInspector({
               className="h-[30px] w-full min-w-0 text-[12.5px]"
             />
           </EditField>
-          <EditField label={t("table.priority")}>
-            <Select
-              label={t("table.priority")}
-              value={priority}
-              options={priorityOptions}
-              onChange={(next) => edit({ priority: next })}
-              className="h-[30px] w-full min-w-0 text-[12.5px]"
-            />
-          </EditField>
+          {isTorrent ? (
+            <EditField label={t("next.torrent.force")}>
+              <Toggle
+                label={t("next.torrent.force")}
+                checked={torrent?.forced ?? false}
+                disabled={torrent === null || forceState.fetching}
+                onChange={(forced) => {
+                  setFailure(null);
+                  void setTorrentForced({ id: job.id, forced }).then(settle);
+                }}
+              />
+            </EditField>
+          ) : (
+            <EditField label={t("table.priority")}>
+              <Select
+                label={t("table.priority")}
+                value={priority}
+                options={priorityOptions}
+                onChange={(next) => edit({ priority: next })}
+                className="h-[30px] w-full min-w-0 text-[12.5px]"
+              />
+            </EditField>
+          )}
           {failure === null ? null : (
             <div className="text-[12px] text-wv-error-text">{failure}</div>
           )}
@@ -258,7 +290,8 @@ export function DownloadInspector({
             icon={isPaused ? "resume" : "pause"}
             className="flex-1 justify-center"
             onClick={() => {
-              void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id }));
+              setFailure(null);
+              void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })).then(settle);
             }}
           >
             {isPaused ? t("action.resume") : t("action.pause")}
@@ -267,7 +300,8 @@ export function DownloadInspector({
             icon="topOfQueue"
             className="flex-1 justify-center"
             onClick={() => {
-              void updateJobs({ ids: [job.id], priority: "HIGH" });
+              setFailure(null);
+              void updateJobs({ ids: [job.id], priority: "HIGH" }).then(settle);
             }}
           >
             {t("next.inspector.topOfQueue")}
@@ -297,6 +331,10 @@ export function DownloadInspector({
           disabled={cancelState.fetching}
           onClick={() => {
             setFailure(null);
+            if (isTorrent) {
+              setRemovingTorrent(true);
+              return;
+            }
             // The row leaves the queue only once the daemon has accepted the removal.
             void cancelJob({ id: job.id }).then((result) => {
               if (result.error || result.data?.cancelJob !== true) {
@@ -310,6 +348,20 @@ export function DownloadInspector({
           {t("next.inspector.removeDownload")}
         </DangerButton>
       </div>
+      <TorrentRemoveDialog
+        id={removingTorrent ? job.id : null}
+        name={job.displayTitle || job.name}
+        onRemoved={(id) => {
+          setRemovingTorrent(false);
+          onRemoved(id);
+          queue.refresh();
+        }}
+        onFailed={(message) => {
+          setRemovingTorrent(false);
+          setFailure(message);
+        }}
+        onDismiss={() => setRemovingTorrent(false)}
+      />
     </aside>
   );
 }

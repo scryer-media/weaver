@@ -109,6 +109,9 @@ impl CategoriesMutation {
 
         info!(id, name = %name, "category added");
         reconcile_watch_folder(ctx).await?;
+        // A category is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reconcile(ctx).await?;
         Ok(added)
     }
     /// Update a category by ID.
@@ -191,6 +194,9 @@ impl CategoriesMutation {
 
         info!(id, "category updated");
         reconcile_watch_folder(ctx).await?;
+        // A category is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reconcile(ctx).await?;
         Ok(updated_category)
     }
     /// Remove a category by ID.
@@ -241,6 +247,9 @@ impl CategoriesMutation {
 
         info!(id, "category removed");
         reconcile_watch_folder(ctx).await?;
+        // A category is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reconcile(ctx).await?;
         Ok(remaining)
     }
 }
@@ -274,7 +283,7 @@ mod tests {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),

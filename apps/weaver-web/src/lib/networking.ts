@@ -6,13 +6,21 @@ import type { ProxyKind } from "./proxies";
 export type Rung = { kind: "PROXY" | "POOL" | "CHAIN"; proxyId: number | null; poolId: number | null; chainIds: number[] };
 export type Leg = { egressId: number; weight: number; path: { kind: "DIRECT" | "LADDER"; rungs: Rung[]; directFallback: boolean } };
 export type NetworkRoute = { legs: Leg[]; failover: "REDISTRIBUTE" | "HOLD" };
-export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; maxDownloadSpeed: number; downloadQuota?: DownloadQuota; downloadQuotaUsage?: DownloadQuotaUsage | null; health: string; reason: string | null };
+export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; downloadBps: number | null; uploadBps: number | null; quota?: EgressQuota; quotaUsage?: EgressQuotaUsage | null; health: string; reason: string | null };
 export type QuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
 export type Weekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
-/** A download allowance as it is configured, on a server or an egress. */
+/** A server's download allowance as it is configured. */
 export type DownloadQuota = { enabled: boolean; period: QuotaPeriod; limitBytes: number; resetTimeMinutesLocal: number; weeklyResetWeekday: Weekday; monthlyResetDay: number };
-/** How much of an egress's allowance is spent; null `remainingBytes` means it has none. */
-export type DownloadQuotaUsage = { usedBytes: number; reservedBytes: number; remainingBytes: number | null; blocked: boolean; windowStartsAtEpochMs: number | null; windowEndsAtEpochMs: number | null; timezoneName: string };
+/** An egress's caps per period, in bytes; null is no cap, and 0 a budget of nothing. */
+export type EgressQuota = { downloadBytes: number | null; uploadSoftBytes: number | null; uploadTrickleBps: number; uploadHardBytes: number | null; period: QuotaPeriod; resetTimeMinutesLocal: number; weeklyResetWeekday: Weekday; monthlyResetDay: number };
+/** Where a direction stands against its caps: open, slowed to the trickle, or stopped. */
+export type QuotaState = "NORMAL" | "TRICKLE" | "STOPPED";
+/** One direction's spend this period; null `remainingBytes` means it has no cap. */
+export type QuotaDirectionUsage = { usedBytes: number; remainingBytes: number | null; state: QuotaState };
+/** An egress's spend this period in each direction; `state` is the tighter of the two. */
+export type EgressQuotaUsage = { down: QuotaDirectionUsage; up: QuotaDirectionUsage; state: QuotaState; periodStartEpochMs: number | null; periodEndEpochMs: number | null; timezoneName: string };
+/** Bytes per second in each direction over every egress together; null is no limit. */
+export type Bandwidth = { downloadBps: number | null; uploadBps: number | null };
 export type ProxyPool = { id: number; name: string; kind: ProxyKind; memberIds: number[]; enabled: boolean };
 export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: number; target: number; open: number; opening: number; state: string; reason: string | null; pinnedAddress: string | null; sourceAddress?:string|null;bytesPerSecond?:number;selectedRung?:number|null;selectedProxyId?:number|null;failingHops?:FailingHop[] };
 /**
@@ -24,10 +32,17 @@ export type PoolMemberFlow = { state?:string; id: number; open: number; opening:
 export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:ConsumerKind;cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: PoolFlow[] };
 /** A pool on one egress as it runs: `liveBytesPerSecond` on a member is what it carries now, `bytesPerSecond` what the pool judges it by. */
 export type PoolFlow = { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] };
-/** What owns a route: a server, a feed, or Default outbound, which carries every other fetch. */
-export type ConsumerKind = "SERVER" | "RSS" | "OUTBOUND";
+/**
+ * What owns a route: a server, a feed, Default outbound, which carries every
+ * other fetch, or torrent traffic: the default route, or one category's own.
+ */
+export type ConsumerKind = "SERVER" | "RSS" | "OUTBOUND" | "TORRENT_DEFAULT" | "TORRENT_CATEGORY";
+/** Whether a consumer carries torrent traffic, whose route has one leg and no pool. */
+export const isTorrentConsumer = (kind: ConsumerKind) => kind === "TORRENT_DEFAULT" || kind === "TORRENT_CATEGORY";
 /** Default outbound's key: there is one, and it is never made or removed. */
 export const OUTBOUND_CONSUMER = "outbound";
+/** The default torrent route's key: there is one, like Default outbound. */
+export const TORRENT_DEFAULT_CONSUMER = "torrent:default";
 export const directLeg = (): Leg => ({ egressId: 0, weight: 100, path: { kind: "DIRECT", rungs: [], directFallback: false } });
 /** A path nothing can take: a ladder with no rung on it and no going direct. It is how a kill switch is stored. */
 export const closedPath = (path: Leg["path"]) => path.kind === "LADDER" && !path.rungs.length && !path.directFallback;
@@ -37,15 +52,19 @@ export function routeInput(route: NetworkRoute) {
   })) };
 }
 /** Why a route cannot be saved, as a code the interface words for itself. */
-export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated";
+export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated" | "torrentLegs" | "torrentPool";
 /** The proxies a rung uses, a pool's members included. */
 export function rungProxyIds(rung: Rung, pools: ProxyPool[]): number[] {
   if (rung.kind === "PROXY") return rung.proxyId === null ? [] : [rung.proxyId];
   if (rung.kind === "POOL") return pools.find(pool => pool.id === rung.poolId)?.memberIds ?? [];
   return rung.chainIds;
 }
-export function routeProblem(route: NetworkRoute, known: { egresses?: Egress[]; pools?: ProxyPool[] } = {}): RouteProblem | null {
+export function routeProblem(route: NetworkRoute, known: { egresses?: Egress[]; pools?: ProxyPool[]; kind?: ConsumerKind } = {}): RouteProblem | null {
   if (!route.legs.length || route.legs.length > 8) return "legCount";
+  // A torrent route takes exactly one leg, and no pool on it.
+  const torrent = known.kind !== undefined && isTorrentConsumer(known.kind);
+  if (torrent && route.legs.length !== 1) return "torrentLegs";
+  if (torrent && route.legs.some(leg => leg.path.kind === "LADDER" && leg.path.rungs.some(rung => rung.kind === "POOL"))) return "torrentPool";
   if (route.legs.some(l => !Number.isInteger(l.weight) || l.weight < 1 || l.weight > 100) || route.legs.reduce((sum,l) => sum+l.weight,0) !== 100) return "weights";
   for (const leg of route.legs) {
     if (leg.path.kind === "DIRECT") continue;

@@ -15,7 +15,6 @@ use super::{GraphError, GraphJob, Storage};
 use crate::pipeline::graph::checkpoint::Snapshot;
 use crate::pipeline::graph::engine::Runs;
 use crate::pipeline::graph::namespace::NamespaceWriter;
-use crate::pipeline::graph::root::Root;
 use crate::pipeline::graph::root::pieces::{PieceLayout, PieceRoot, Verified};
 
 impl GraphJob<PieceRoot> {
@@ -94,29 +93,19 @@ impl GraphJob<PieceRoot> {
         Ok(())
     }
 
-    // The torrent was abandoned: what never arrived is lost, and the tree
-    // hears it as damage.
-    pub(crate) fn abandon(&mut self, limit: usize) -> Result<(), GraphError> {
-        self.root.abandon();
-        self.mark_damage()?;
-        for volume in 0..self.root.volume_count() {
-            self.after_member(VolumeIndex(volume as u32))?;
-        }
-        self.step_runs(Vec::new(), limit)
-    }
-
     // The pieces in hand, for the fetch to start from.
     pub(crate) fn have(&self) -> BitVec<u8, Msb0> {
         self.root.have()
     }
 
+    // Each file's bytes in hand, by torrent index.
+    pub(crate) fn file_have(&self) -> Vec<u64> {
+        self.root.file_have()
+    }
+
     // The files the fetch should fetch now, by torrent index.
     pub(crate) fn selection(&self) -> Vec<usize> {
         self.root.selection()
-    }
-
-    pub(crate) fn layout(&self) -> &Arc<PieceLayout> {
-        self.root.layout()
     }
 
     // A volume's posted bytes as they are in hand now, for a peer.

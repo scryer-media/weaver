@@ -603,3 +603,25 @@ fn queue_filter_supports_exact_attribute_matches() {
     };
     assert!(!matches_queue_filter(&item, Some(&misses)));
 }
+
+// A torrent's phases reach the queue as themselves, the same states the
+// history outcome names, while a pause still reads as paused.
+#[test]
+fn torrent_phases_project_one_to_one() {
+    for (status, expected) in [
+        (
+            JobStatus::FetchingMetadata,
+            QueueItemState::FetchingMetadata,
+        ),
+        (JobStatus::CheckingFiles, QueueItemState::CheckingFiles),
+        (JobStatus::Seeding, QueueItemState::Seeding),
+        (JobStatus::Stalled, QueueItemState::Stalled),
+    ] {
+        let job = base_job(status.clone());
+        assert_eq!(queue_item_from_job(&job).state, expected);
+        assert_eq!(QueueItemState::from(&status), expected);
+        let mut paused = base_job(status);
+        paused.run_state = weaver_server_core::RunState::Paused;
+        assert_eq!(queue_item_from_job(&paused).state, QueueItemState::Paused);
+    }
+}

@@ -149,7 +149,10 @@ fn config_roundtrip() {
             aliases: "movie*, film*".to_string(),
         }],
         retry: None,
-        bandwidth: crate::proxies::Bandwidth { download_bps: Some(1_000_000), upload_bps: None },
+        bandwidth: crate::proxies::Bandwidth {
+            download_bps: Some(1_000_000),
+            upload_bps: None,
+        },
         propagation_delay_secs: None,
         cleanup_after_extract: Some(false),
         watch_folder: crate::watch_folder::WatchFolderConfig {

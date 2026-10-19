@@ -473,6 +473,13 @@ impl Pipeline {
         self.update_queue_metrics();
     }
 
+    // A finished job goes to the front of the finished jobs, once.
+    pub(crate) fn finish_job(&mut self, info: JobInfo) {
+        self.finished_jobs.retain(|job| job.job_id != info.job_id);
+        self.finished_jobs.insert(0, info);
+        self.enforce_finished_jobs_runtime_cap();
+    }
+
     pub(crate) fn enforce_finished_jobs_runtime_cap(&mut self) {
         self.finished_jobs
             .truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
@@ -588,52 +595,48 @@ impl Pipeline {
             server_attribution: state.server_attribution.to_storage_json(),
         };
 
-        self.finished_jobs.retain(|j| j.job_id != job_id);
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
             state.assembly.optional_recovery_bytes();
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
-        self.finished_jobs.insert(
-            0,
-            JobInfo {
-                protocol: crate::jobs::Protocol::Nzb,
-                job_id,
-                job_hash: Some(state.job_hash),
-                name: state.spec.name.clone(),
-                error: if let JobStatus::Failed { error } = &state.status {
-                    Some(error.clone())
-                } else {
-                    None
-                },
-                download_wait_reason: None,
-                download_retry_at_epoch_ms: None,
-                status: state.status.clone(),
-                download_state,
-                finalizing_download: false,
-                fetching_repair_data: false,
-                post_state,
-                run_state,
-                progress: Self::effective_progress(state),
-                total_bytes: total,
-                downloaded_bytes: Self::effective_downloaded_bytes(state),
-                optional_recovery_bytes,
-                optional_recovery_downloaded_bytes,
-                phase_progress: Vec::new(),
-                failed_bytes,
-                health,
-                terminal_discards,
-                total_files: state.assembly.total_file_count() as u32,
-                completed_files: state.assembly.complete_file_count() as u32,
-                remaining_par_files: 0,
-                password: state.spec.password.clone(),
-                category: state.spec.category.clone(),
-                metadata: state.spec.metadata.clone(),
-                output_dir: Some(state.working_dir.display().to_string()),
-                server_attribution: state.server_attribution.contributions().to_vec(),
-                created_at_epoch_ms: state.created_at_epoch_ms,
+        let finished = JobInfo {
+            protocol: crate::jobs::Protocol::Nzb,
+            job_id,
+            job_hash: Some(state.job_hash),
+            name: state.spec.name.clone(),
+            error: if let JobStatus::Failed { error } = &state.status {
+                Some(error.clone())
+            } else {
+                None
             },
-        );
-        self.enforce_finished_jobs_runtime_cap();
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
+            status: state.status.clone(),
+            download_state,
+            finalizing_download: false,
+            fetching_repair_data: false,
+            post_state,
+            run_state,
+            progress: Self::effective_progress(state),
+            total_bytes: total,
+            downloaded_bytes: Self::effective_downloaded_bytes(state),
+            optional_recovery_bytes,
+            optional_recovery_downloaded_bytes,
+            phase_progress: Vec::new(),
+            failed_bytes,
+            health,
+            terminal_discards,
+            total_files: state.assembly.total_file_count() as u32,
+            completed_files: state.assembly.complete_file_count() as u32,
+            remaining_par_files: 0,
+            password: state.spec.password.clone(),
+            category: state.spec.category.clone(),
+            metadata: state.spec.metadata.clone(),
+            output_dir: Some(state.working_dir.display().to_string()),
+            server_attribution: state.server_attribution.contributions().to_vec(),
+            created_at_epoch_ms: state.created_at_epoch_ms,
+        };
+        self.finish_job(finished);
 
         let whole = completed && shortfall.is_none();
         let typed_terminal_cause = if whole {

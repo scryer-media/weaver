@@ -17,6 +17,7 @@ export const NEXT_HISTORY_PAGE_QUERY = gql`
       items {
         id
         name
+        protocol
         displayTitle
         originalTitle
         status: state

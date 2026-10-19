@@ -3,7 +3,10 @@
 
 mod common;
 
-use common::{BlockingDbOperation, TestHarness, assert_no_errors, local_request, response_data};
+use common::{
+    BlockingDbOperation, TestHarness, assert_has_errors, assert_no_errors, local_request,
+    response_data,
+};
 use weaver_server_core::auth::CallerScope;
 
 #[tokio::test]
@@ -112,7 +115,7 @@ async fn get_settings_defaults() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            r#"{ settings { dataDir intermediateDir completeDir cleanupAfterExtract maxDownloadSpeed maxRetries propagationDelaySecs enableSrrdbLookup } }"#,
+            r#"{ settings { dataDir intermediateDir completeDir cleanupAfterExtract maxRetries propagationDelaySecs enableSrrdbLookup } }"#,
         )
         .await;
     assert_no_errors(&resp);
@@ -125,8 +128,6 @@ async fn get_settings_defaults() {
     assert!(!s["completeDir"].as_str().unwrap().is_empty());
     // cleanupAfterExtract defaults to true.
     assert!(s["cleanupAfterExtract"].as_bool().unwrap());
-    // maxDownloadSpeed defaults to 0 (unlimited).
-    assert_eq!(s["maxDownloadSpeed"].as_u64().unwrap(), 0);
     // maxRetries defaults to 3.
     assert_eq!(s["maxRetries"].as_u64().unwrap(), 3);
     assert_eq!(s["propagationDelaySecs"].as_u64().unwrap(), 0);
@@ -235,22 +236,20 @@ async fn update_max_retries() {
 }
 
 #[tokio::test]
-async fn update_max_download_speed() {
+async fn the_old_speed_setting_is_gone_from_general_settings() {
     let h = TestHarness::new().await;
+    assert_has_errors(&h.execute(r#"{ settings { maxDownloadSpeed } }"#).await);
+    assert_has_errors(
+        &h.execute(r#"mutation { updateSettings(input: { maxDownloadSpeed: 1 }) { maxRetries } }"#)
+            .await,
+    );
     let resp = h
-        .execute(
-            r#"mutation {
-                updateSettings(input: { maxDownloadSpeed: 5242880 }) {
-                    maxDownloadSpeed
-                }
-            }"#,
-        )
+        .execute(r#"{ networking { bandwidth { downloadBps uploadBps } } }"#)
         .await;
     assert_no_errors(&resp);
-    let data = response_data(&resp);
     assert_eq!(
-        data["updateSettings"]["maxDownloadSpeed"].as_u64().unwrap(),
-        5242880
+        response_data(&resp)["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": null, "uploadBps": null })
     );
 }
 
@@ -432,9 +431,7 @@ async fn partial_settings_update() {
 
     // Get defaults first.
     let resp = h
-        .execute(
-            r#"{ settings { intermediateDir cleanupAfterExtract maxRetries maxDownloadSpeed } }"#,
-        )
+        .execute(r#"{ settings { intermediateDir cleanupAfterExtract maxRetries } }"#)
         .await;
     assert_no_errors(&resp);
     let before = response_data(&resp);
@@ -444,14 +441,13 @@ async fn partial_settings_update() {
         .to_string();
     let before_cleanup = before["settings"]["cleanupAfterExtract"].as_bool().unwrap();
     let before_retries = before["settings"]["maxRetries"].as_u64().unwrap();
-    let before_speed = before["settings"]["maxDownloadSpeed"].as_u64().unwrap();
 
     // Update only completeDir.
     let resp = h
         .execute(
             r#"mutation {
                 updateSettings(input: { completeDir: "/tmp/partial" }) {
-                    completeDir intermediateDir cleanupAfterExtract maxRetries maxDownloadSpeed
+                    completeDir intermediateDir cleanupAfterExtract maxRetries
                 }
             }"#,
         )
@@ -466,7 +462,6 @@ async fn partial_settings_update() {
     assert_eq!(s["intermediateDir"].as_str().unwrap(), before_intermediate);
     assert_eq!(s["cleanupAfterExtract"].as_bool().unwrap(), before_cleanup);
     assert_eq!(s["maxRetries"].as_u64().unwrap(), before_retries);
-    assert_eq!(s["maxDownloadSpeed"].as_u64().unwrap(), before_speed);
 }
 
 #[tokio::test]

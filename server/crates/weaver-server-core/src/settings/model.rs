@@ -431,7 +431,8 @@ pub fn resolve_seeding_policy(
 #[serde(default)]
 pub struct TorrentConfig {
     pub enabled: bool,
-    // First port the listener tries; it walks up from here when taken.
+    // The first route's listen port; each further route listens on the
+    // next port its slot names.
     pub base_port: u16,
     // The port announced to trackers, when it differs from the one listened
     // on (a forwarded port).
@@ -440,8 +441,8 @@ pub struct TorrentConfig {
     pub encryption: TorrentEncryption,
     pub max_active_downloads: u32,
     pub max_peers_total: u32,
-    // Where the session keeps its resume state. Absent means under the data
-    // directory.
+    // Where each route's session keeps its DHT state. Absent means under
+    // the data directory.
     pub session_dir: Option<PathBuf>,
 }
 

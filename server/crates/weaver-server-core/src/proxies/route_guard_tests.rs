@@ -73,6 +73,7 @@ const LIFTED: &[(&str, usize)] = &[
     ),
     ("server/crates/weaver-server-core/src/proxies/runtime.rs", 2),
     ("server/crates/weaver-server-core/src/speed_test/http.rs", 1),
+    ("server/crates/weaver-server-core/src/torrents/net.rs", 1),
     ("xtask/src/main.rs", 1),
 ];
 
@@ -84,6 +85,13 @@ const CLIENT_CRATES: &[(&str, &[&str])] = &[
         &[
             "application-updater",
             "artifact-trust",
+            // The torrent session takes its tracker client from
+            // `torrents::net`, built on the route; its own fallback client is
+            // never built. UPnP keeps its own client and runs only on System
+            // egress.
+            "librqbit",
+            "librqbit-tracker-comms",
+            "librqbit-upnp",
             "weaver",
             "weaver-server-api",
             "weaver-server-core",
@@ -97,6 +105,9 @@ const CLIENT_CRATES: &[(&str, &[&str])] = &[
     ),
     ("h3", &["h3-quinn", "proxy-tunnels", "weaver-tunnel"]),
     ("tokio-tungstenite", &["axum", "weaver"]),
+    // Dials only for a session given a SOCKS URL. Torrent sessions never set
+    // one: every peer socket goes through the route's `SocketFactory`.
+    ("tokio-socks", &["librqbit"]),
 ];
 
 // Crates that connect or resolve names their own way, none of which may enter
@@ -110,7 +121,6 @@ const FORBIDDEN_CRATES: &[&str] = &[
     "isahc",
     "minreq",
     "surf",
-    "tokio-socks",
     "trust-dns-resolver",
     "ureq",
 ];

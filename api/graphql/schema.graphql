@@ -155,6 +155,11 @@ type ApplicationUpgradeRunPayload {
 	error: String
 	startedAtEpochMs: Int!
 	completedAtEpochMs: Int
+	"""
+	Where the Windows installer wrote its verbose log for this run, once it
+	has written one.
+	"""
+	installerLogPath: String
 }
 
 """
@@ -266,23 +271,83 @@ enum BackupTrigger {
 	AUTO
 }
 
+"""
+Bytes per second in each direction; null is no limit.
+"""
+type Bandwidth {
+	downloadBps: Int
+	uploadBps: Int
+}
+
+input BandwidthInput {
+	downloadBps: Int
+	uploadBps: Int
+}
+
+type BandwidthProvider {
+	id: String!
+	name: String!
+	host: String
+	needsServer: Boolean!
+}
+
+type BandwidthProviderServer {
+	id: String!
+	name: String!
+	location: String
+	host: String!
+}
+
+type BandwidthResult {
+	providerId: String
+	server: String
+	url: String!
+	connections: Int!
+}
+
+input BandwidthTestInput {
+	providerId: String
+	server: String
+	customUrl: String
+}
+
+type BandwidthTestRequest {
+	providerId: String
+	server: String
+	customUrl: String
+}
+
 type Category {
 	id: Int!
 	name: String!
 	destDir: String
 	aliases: String!
+	seeding: SeedingPolicySettings
+	torrentRoute: Boolean!
 }
 
 input CategoryInput {
 	name: String!
 	destDir: String
 	aliases: String! = ""
+	seeding: SeedingPolicyInput
+	torrentRoute: Boolean
 }
 
 type ConfiguredStorage {
 	labels: [String!]!
 	path: String!
 	capacity: DiskCapacity
+	error: String
+}
+
+type ConnectionResult {
+	leg: Int!
+	connectMs: Int!
+	path: DialPath!
+	sourceAddress: String
+	bytes: Float!
+	bytesPerSecond: Float!
 	error: String
 }
 
@@ -327,6 +392,14 @@ limit. The numbers the profile requirements are judged against.
 type DetectedHardware {
 	memoryBytes: Int!
 	cores: Int!
+}
+
+type DialPath {
+	egressId: Int!
+	rung: Int
+	poolId: Int
+	memberId: Int
+	proxyIds: [Int!]!
 }
 
 type DirectoryBrowseEntry {
@@ -396,7 +469,7 @@ type DownloadBlock {
 	windowStartsAtEpochMs: Float
 	windowEndsAtEpochMs: Float
 	timezoneName: String!
-	scheduledSpeedLimit: Int!
+	scheduledSpeedLimit: Int
 	"""
 	Why a schedule rule is holding new downloads, while one is.
 	"""
@@ -422,23 +495,6 @@ enum DownloadPressureStateGql {
 	CLEAR
 	SOFT
 	HARD
-}
-
-"""
-The live usage of a download allowance in its current window.
-"""
-type DownloadQuotaUsage {
-	lifetimeBytes: Int!
-	usedBytes: Int!
-	reservedBytes: Int!
-	"""
-	What is left in this window, or null when there is no allowance.
-	"""
-	remainingBytes: Int
-	blocked: Boolean!
-	windowStartsAtEpochMs: Float
-	windowEndsAtEpochMs: Float
-	timezoneName: String!
 }
 
 enum DuplicateActionGql {
@@ -537,16 +593,13 @@ type EgressInterface {
 	sourceAddress: String
 	addresses: [String!]!
 	enabled: Boolean!
-	maxDownloadSpeed: Int!
+	downloadBps: Int
+	uploadBps: Int
+	quota: EgressQuota!
 	"""
-	The download allowance and its live usage.
+	Null while this Weaver is not tracking usage.
 	"""
-	downloadQuota: ServerDownloadQuota!
-	"""
-	The live usage of the download allowance, or null while this Weaver
-	is not tracking it.
-	"""
-	downloadQuotaUsage: DownloadQuotaUsage
+	quotaUsage: EgressQuotaUsageGql
 	health: String!
 	reason: String
 }
@@ -557,12 +610,51 @@ input EgressInterfaceInput {
 	interfaceName: String
 	sourceAddress: String
 	enabled: Boolean! = true
-	maxDownloadSpeed: Int! = 0
 	"""
-	The download allowance on this egress. Omitted on an update, the
-	saved quota stays as it is; omitted on a create, there is none.
+	Bytes per second; null is no limit.
 	"""
-	downloadQuota: ServerDownloadQuotaInput
+	downloadBps: Int
+	"""
+	Bytes per second; null is no limit.
+	"""
+	uploadBps: Int
+}
+
+"""
+Caps per period; null is no cap, 0 a budget of nothing.
+"""
+type EgressQuota {
+	downloadBytes: Int
+	uploadSoftBytes: Int
+	uploadTrickleBps: Int!
+	uploadHardBytes: Int
+	period: ServerDownloadQuotaPeriodGql!
+	resetTimeMinutesLocal: Int!
+	weeklyResetWeekday: ServerDownloadQuotaWeekdayGql!
+	monthlyResetDay: Int!
+}
+
+input EgressQuotaInput {
+	downloadBytes: Int
+	uploadSoftBytes: Int
+	uploadTrickleBps: Int! = 2048
+	uploadHardBytes: Int
+	period: ServerDownloadQuotaPeriodGql! = ONE_TIME
+	resetTimeMinutesLocal: Int! = 0
+	weeklyResetWeekday: ServerDownloadQuotaWeekdayGql! = MON
+	monthlyResetDay: Int! = 1
+}
+
+type EgressQuotaUsageGql {
+	down: QuotaDirectionUsage!
+	up: QuotaDirectionUsage!
+	"""
+	The tighter of the two directions.
+	"""
+	state: QuotaStateGql!
+	periodStartEpochMs: Float
+	periodEndEpochMs: Float
+	timezoneName: String!
 }
 
 type EgressTestResult {
@@ -669,29 +761,31 @@ type GeneralSettings {
 	intermediateDir: String!
 	completeDir: String!
 	cleanupAfterExtract: Boolean!
-	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
 	enableSrrdbLookup: Boolean!
 	watchFolder: WatchFolderSettings!
 	duplicatePolicy: DuplicatePolicySettings!
+	seeding: SeedingPolicySettings
+	torrent: TorrentSettings!
 }
 
 input GeneralSettingsInput {
 	intermediateDir: String
 	completeDir: String
 	cleanupAfterExtract: Boolean
-	maxDownloadSpeed: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
 	enableSrrdbLookup: Boolean
 	watchFolder: WatchFolderSettingsInput
 	duplicatePolicy: DuplicatePolicySettingsInput
+	seeding: SeedingPolicyInput
+	torrent: TorrentSettingsInput
 }
 
 type GlobalQueueState {
 	isPaused: Boolean!
-	speedLimitBytesPerSec: Int!
+	speedLimitBytesPerSec: Int
 	downloadBlock: DownloadBlock!
 }
 
@@ -838,6 +932,7 @@ enum HistoryDeleteRowStateKind {
 
 type HistoryItem {
 	id: Int!
+	protocol: Protocol!
 	jobHash: String
 	name: String!
 	displayTitle: String!
@@ -923,6 +1018,17 @@ enum HistoryStatusFilter {
 	ALL
 	SUCCESS
 	FAILURE
+}
+
+type HostResolution {
+	host: String!
+	resolvedBy: ResolvedBy!
+	proxyId: Int
+	dnsServers: [String!]!
+	addresses: [String!]!
+	cached: Boolean!
+	connectedAddress: String
+	error: LookupError
 }
 
 """
@@ -1093,6 +1199,10 @@ enum JobStatusGql {
 	COMPLETE
 	FAILED
 	PAUSED
+	FETCHING_METADATA
+	CHECKING_FILES
+	SEEDING
+	STALLED
 }
 
 type JobTimeline {
@@ -1179,6 +1289,25 @@ enum LegPathKind {
 	LADDER
 }
 
+type LegResult {
+	position: Int!
+	bytes: Float!
+	averageBps: Float!
+	peakBps: Float!
+	connections: Int!
+	sourceAddresses: [String!]!
+}
+
+type LegRung {
+	leg: Int!
+	rung: Int!
+}
+
+input LegRungInput {
+	leg: Int!
+	rung: Int!
+}
+
 type LiveScriptRun {
 	"""
 	The same value the script was handed as `WEAVER_RUN_ID`.
@@ -1227,6 +1356,20 @@ type LogFilter {
 type LoginStatusResult {
 	enabled: Boolean!
 	username: String
+}
+
+type LookupError {
+	code: LookupErrorCode!
+	detail: String!
+}
+
+enum LookupErrorCode {
+	NO_SUCH_NAME
+	NO_ADDRESS
+	TIMED_OUT
+	SERVER_FAILURE
+	NO_REPLY
+	OTHER
 }
 
 type MetadataEntry {
@@ -1371,17 +1514,22 @@ type MutationRoot {
 	resetEgressDownloadQuotaUsage(id: Int!): EgressInterface!
 	createEgressInterface(input: EgressInterfaceInput!): EgressInterface!
 	updateEgressInterface(id: Int!, input: EgressInterfaceInput!): EgressInterface!
+	setEgressQuota(id: Int!, input: EgressQuotaInput!): EgressInterface!
+	setBandwidth(input: BandwidthInput!): Bandwidth!
 	deleteEgressInterface(id: Int!): Boolean!
 	createProxyPool(input: ProxyPoolInput!): ProxyPool!
 	updateProxyPool(id: Int!, input: ProxyPoolInput!): ProxyPool!
 	deleteProxyPool(id: Int!): Boolean!
 	saveNetworkRoute(kind: NetworkConsumerKind!, id: Int!, input: RouteInput!): NetworkRoute!
-	testEgressInterface(id: Int!, proxyId: Int, host: String!, port: Int!): EgressTestResult!
-	testProxyPool(id: Int!, egressId: Int!, host: String, port: Int): [EgressTestResult!]!
+	testVia(route: RouteInput!, subject: TestSubjectInput, target: TestTargetInput): [PathTestResult!]!
+	testEgressInterface(id: Int!, proxyId: Int, host: String!, port: Int!): EgressTestResult! @deprecated(reason: "Use testVia with a direct route on the egress.")
+	testProxyPool(id: Int!, egressId: Int!, host: String, port: Int): [EgressTestResult!]! @deprecated(reason: "Use testVia with a direct route on the egress.")
 	saveProxyProfile(id: Int, input: ProxyProfileInput!): ProxyProfile!
 	deleteProxyProfile(id: Int!): Boolean!
 	resetProxyHostKey(id: Int!): ProxyProfile!
-	testProxyProfile(id: Int!): ProxyTestResult!
+	testProxyProfile(id: Int!): ProxyTestResult! @deprecated(reason: "Use testVia with the route the proxy is tested through.")
+	startSpeedTest(input: SpeedTestInput!): SpeedTestRun!
+	cancelSpeedTest(id: Int!): Boolean!
 	"""
 	Create a new API key. Returns the raw key (shown only once).
 	"""
@@ -1596,7 +1744,7 @@ type MutationRoot {
 	"""
 	Set the global download speed limit in bytes/sec. 0 means unlimited.
 	"""
-	setSpeedLimit(bytesPerSec: Int!): Boolean!
+	setSpeedLimit(bytesPerSec: Int!): Boolean! @deprecated(reason: "Use setBandwidth.")
 	"""
 	Pause one queue item and return its updated facade state.
 	"""
@@ -1632,8 +1780,13 @@ type MutationRoot {
 	"""
 	Set the queue speed limit in bytes/sec. 0 means unlimited.
 	"""
-	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
+	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult! @deprecated(reason: "Use setBandwidth.")
 	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
+	"""
+	Replace the unwanted extension list and nothing else. An empty list
+	turns the check off. Returns the list as saved, normalized.
+	"""
+	setUnacceptableExtensions(extensions: [String!]!): [String!]!
 	"""
 	Select the sole live source of scripts. Changing it turns every
 	script job off, because a name in the new directory is not the script
@@ -1770,6 +1923,23 @@ type MutationRoot {
 	"""
 	setLogFilter(directives: String!): LogFilter!
 	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
+	submitTorrent(input: SubmitTorrentInput!): Torrent!
+	removeTorrent(id: Int!, deleteFiles: Boolean! = false, confirmUnmetGoal: Boolean! = false): Boolean!
+	pauseTorrent(id: Int!): Boolean!
+	resumeTorrent(id: Int!): Boolean!
+	setTorrentForced(id: Int!, forced: Boolean!): Boolean!
+	setTorrentCategory(id: Int!, category: String): Boolean!
+	"""
+	The torrent's own seeding policy; null returns it to its category's
+	and the global one.
+	"""
+	setTorrentSeeding(id: Int!, seeding: SeedingPolicyInput): Boolean!
+}
+
+type NamedId {
+	kind: String!
+	id: Int!
+	name: String!
 }
 
 """
@@ -1869,6 +2039,9 @@ type NetworkConsumerFlow {
 enum NetworkConsumerKind {
 	SERVER
 	RSS
+	OUTBOUND
+	TORRENT_DEFAULT
+	TORRENT_CATEGORY
 }
 
 """
@@ -1932,12 +2105,17 @@ type NetworkPoolMemberFlow {
 	bytesPerSecond: Float
 	samples: Int!
 	failures: Int!
+	liveBytesPerSecond: Int!
 }
 
 type NetworkRoute {
 	consumer: String!
 	legs: [RouteLeg!]!
 	failover: RouteFailover!
+}
+
+type Networking {
+	bandwidth: Bandwidth!
 }
 
 enum OperatingSystemGql {
@@ -1985,6 +2163,36 @@ type ParsedRelease {
 	animeVersion: Int
 	episode: ParsedEpisode
 	parseConfidence: Float!
+}
+
+type PathOverride {
+	downLegs: [Int!]!
+	downRungs: [LegRung!]!
+	downProxies: [Int!]!
+	downEgresses: [Int!]!
+}
+
+input PathOverrideInput {
+	downLegs: [Int!]! = []
+	downRungs: [LegRungInput!]! = []
+	downProxies: [Int!]! = []
+	downEgresses: [Int!]! = []
+}
+
+type PathTestResult {
+	leg: Int!
+	egressId: Int!
+	carrierIds: [Int!]!
+	proxyId: Int
+	poolId: Int
+	success: Boolean!
+	code: String!
+	message: String!
+	params: JSON!
+	failingProxyId: Int
+	sourceAddress: String
+	connectMillis: Float!
+	resolution: HostResolution
 }
 
 type PipelineEventGql {
@@ -2066,6 +2274,11 @@ input PostProcessingSettingsInput {
 	globalScriptsRun: GlobalScriptsRun
 }
 
+enum Protocol {
+	NZB
+	TORRENT
+}
+
 """
 How many of a server's connections are in use at one instant.
 """
@@ -2136,6 +2349,7 @@ type ProxyProfile {
 	enabled: Boolean!
 	host: String!
 	port: Int!
+	resolver: ProxyResolver!
 	dnsServers: [String!]!
 	tunnelAddresses: [String!]!
 	peerPublicKey: String
@@ -2157,6 +2371,7 @@ input ProxyProfileInput {
 	enabled: Boolean!
 	host: String!
 	port: Int!
+	resolver: ProxyResolver
 	dnsServers: [String!]! = []
 	tunnelAddresses: [String!]! = []
 	peerPublicKey: String
@@ -2170,6 +2385,11 @@ input ProxyProfileInput {
 	presharedKey: String
 }
 
+enum ProxyResolver {
+	WEAVER
+	PROXY
+}
+
 type ProxyTestResult {
 	success: Boolean!
 	code: String!
@@ -2181,6 +2401,7 @@ type QueryRoot {
 	backups: [BackupInfo!]!
 	backupSettings: BackupSettings!
 	autoBackupSettings: AutoBackupSettings!
+	networking: Networking!
 	egressInterfaces: [EgressInterface!]!
 	discoverNetworkInterfaces: [DiscoveredNetworkInterface!]!
 	platformNetworking: PlatformNetworking!
@@ -2188,6 +2409,10 @@ type QueryRoot {
 	networkRoutes: [NetworkRoute!]!
 	networkFlow: NetworkFlow!
 	proxyProfiles: [ProxyProfile!]!
+	bandwidthProviders: [BandwidthProvider!]!
+	bandwidthProviderServers(providerId: String!, kind: NetworkConsumerKind!, id: Int!): [BandwidthProviderServer!]!
+	speedTestRuns: [SpeedTestRun!]!
+	speedTestRun(id: Int!): SpeedTestRun
 	"""
 	Admin-facing auth status moved to query semantics.
 	"""
@@ -2482,6 +2707,8 @@ type QueryRoot {
 	Filesystem capacity for the configured storage directories (data / intermediate / complete).
 	"""
 	diskUsage: [DiskUsage!]!
+	torrent(id: Int!): Torrent
+	torrents(category: String): [Torrent!]!
 }
 
 type QueueAttention {
@@ -2536,6 +2763,7 @@ input QueueFilterInput {
 
 type QueueItem {
 	id: Int!
+	protocol: Protocol!
 	jobHash: String
 	name: String!
 	displayTitle: String!
@@ -2602,6 +2830,10 @@ enum QueueItemState {
 	COMPLETED
 	FAILED
 	PAUSED
+	FETCHING_METADATA
+	CHECKING_FILES
+	SEEDING
+	STALLED
 }
 
 """
@@ -2718,6 +2950,29 @@ enum QueueWaitReason {
 	REPAIR_CAPACITY
 	EXTRACTION_CAPACITY
 	POST_PROCESSING_CAPACITY
+}
+
+type QuotaDirectionUsage {
+	usedBytes: Int!
+	"""
+	Null when the direction has no cap.
+	"""
+	remainingBytes: Int
+	state: QuotaStateGql!
+}
+
+enum QuotaStateGql {
+	NORMAL
+	TRICKLE
+	STOPPED
+}
+
+enum ResolvedBy {
+	LITERAL
+	HOST
+	SERVERS
+	PROXY
+	PROXY_SERVERS
 }
 
 type Route {
@@ -2912,6 +3167,19 @@ enum RungKind {
 	CHAIN
 }
 
+enum SabTestSize {
+	MB_100
+	GB_1
+	GB_10
+}
+
+type Sample {
+	atMs: Int!
+	leg: Int!
+	bytes: Float!
+	decodedBytes: Float!
+}
+
 type Schedule {
 	id: String!
 	enabled: Boolean!
@@ -2974,12 +3242,12 @@ input ScheduleInput {
 	actionType: String!
 	"""
 	A global rate for a `speed_limit` rule, read only when `speedLimits`
-	is omitted.
+	is omitted. 0 is no limit.
 	"""
 	speedLimitBytes: Int @deprecated(reason: "Use speedLimits.")
 	"""
 	Every target a `speed_limit` rule sets. A target left out is left as
-	it is; 0 removes the limit at that level.
+	it is.
 	"""
 	speedLimits: [ScheduleSpeedLimitInput!]
 	"""
@@ -2997,8 +3265,8 @@ input SchedulePruneFilesInput {
 }
 
 """
-One target of a `speed_limit` rule and the rate it sets. 0 removes the
-limit at that level.
+One target of a `speed_limit` rule and the rates it sets, in bytes per
+second. Null is no limit; 0 lets nothing through.
 """
 type ScheduleSpeedLimit {
 	kind: ScheduleTargetKind!
@@ -3006,12 +3274,16 @@ type ScheduleSpeedLimit {
 	The egress or provider id; null for the global limit.
 	"""
 	id: Int
-	bytesPerSec: Int!
+	download: Int
+	"""
+	Global limit only.
+	"""
+	upload: Int
 }
 
 """
-One target of a `speed_limit` rule and the rate it sets. 0 removes the
-limit at that level.
+One target of a `speed_limit` rule and the rates it sets, in bytes per
+second. Null is no limit; 0 lets nothing through.
 """
 input ScheduleSpeedLimitInput {
 	kind: ScheduleTargetKind!
@@ -3019,7 +3291,11 @@ input ScheduleSpeedLimitInput {
 	The egress or provider id; null for the global limit.
 	"""
 	id: Int
-	bytesPerSec: Int!
+	download: Int
+	"""
+	Global limit only.
+	"""
+	upload: Int
 }
 
 """
@@ -3586,6 +3862,44 @@ type SecurityUpgradeNotice {
 	loginEnabled: Boolean!
 }
 
+enum SeedingAction {
+	STOP
+	REMOVE
+	REMOVE_WITH_DATA
+}
+
+enum SeedingGoalMode {
+	ANY
+	ALL
+}
+
+input SeedingPolicyInput {
+	ratioGoal: Float
+	seedTimeGoalMinutes: Int
+	inactiveGoalMinutes: Int
+	mode: SeedingGoalMode! = ANY
+	action: SeedingAction! = STOP
+	maxUploadBps: Int
+}
+
+type SeedingPolicySettings {
+	ratioGoal: Float
+	seedTimeGoalMinutes: Int
+	inactiveGoalMinutes: Int
+	mode: SeedingGoalMode!
+	action: SeedingAction!
+	maxUploadBps: Int
+}
+
+"""
+Where a torrent's seeding policy comes from.
+"""
+enum SeedingSource {
+	CATEGORY
+	GLOBAL
+	TORRENT
+}
+
 type SemanticCandidateSnapshotInfo {
 	groupId: Int!
 	normalizedKey: String!
@@ -3902,6 +4216,81 @@ type ServiceLogsPayload {
 	count: Int!
 }
 
+type SpeedTestFailure {
+	code: SpeedTestFailureCode!
+	message: String!
+	params: JSON!
+}
+
+enum SpeedTestFailureCode {
+	RATE_LIMITED
+	HTTP_STATUS
+	TLS_VERIFICATION
+	UNRESOLVED
+	ADDRESS_NOT_ALLOWED
+	EGRESS_QUOTA_USED
+	NO_LEG_UP
+	LEASE_REFUSED
+	SERVER_LEFT_POOL
+	STOPPED
+	STOPPED_UNEXPECTEDLY
+	NO_BYTES
+	OTHER
+}
+
+input SpeedTestInput {
+	kind: NetworkConsumerKind!
+	id: Int!
+	route: RouteInput
+	overrides: PathOverrideInput
+	bandwidth: BandwidthTestInput
+	usenet: UsenetTestInput
+}
+
+enum SpeedTestKind {
+	BANDWIDTH
+	USENET
+}
+
+type SpeedTestRequest {
+	bandwidth: BandwidthTestRequest
+	usenet: UsenetTestRequest
+}
+
+type SpeedTestResult {
+	bytes: Float!
+	elapsedMs: Int!
+	averageBps: Float!
+	peakBps: Float!
+	legs: [LegResult!]!
+	connections: [ConnectionResult!]!
+	usenet: UsenetResult
+	bandwidth: BandwidthResult
+	samples: [Sample!]!
+}
+
+type SpeedTestRun {
+	id: Int!
+	consumer: String!
+	consumerName: String!
+	kind: SpeedTestKind!
+	request: SpeedTestRequest!
+	status: SpeedTestStatus!
+	phase: String
+	startedAt: Float!
+	finishedAt: Float
+	failure: SpeedTestFailure
+	tested: TestedRoute!
+	result: SpeedTestResult
+}
+
+enum SpeedTestStatus {
+	RUNNING
+	COMPLETED
+	CANCELLED
+	FAILED
+}
+
 input StageNzbUploadInput {
 	nzbUpload: Upload!
 	filename: String
@@ -3968,6 +4357,7 @@ input SubmitNzbInput {
 	nzbUpload: Upload
 	filename: String
 	password: String
+	passwordCandidates: [String!]
 	category: String
 	attributes: [AttributeInput!]
 	clientRequestId: String
@@ -3995,6 +4385,18 @@ type SubmitStagedNzbsResult {
 	acceptedCount: Int!
 	clientRequestId: String
 	results: [StagedNzbSubmissionResult!]!
+}
+
+"""
+A torrent to add: its metainfo file, base64, or a magnet link.
+"""
+input SubmitTorrentInput {
+	metainfoBase64: String
+	magnet: String
+	category: String
+	paused: Boolean! = false
+	forced: Boolean! = false
+	seeding: SeedingPolicyInput
 }
 
 type SubscriptionRoot {
@@ -4158,6 +4560,33 @@ type TestConnectionResult {
 	tlsHonorsClientCipherOrder: Boolean
 }
 
+input TestSubjectInput @oneOf {
+	proxy: Int
+	pool: Int
+}
+
+input TestTargetInput {
+	host: String!
+	port: Int!
+}
+
+type TestedLeg {
+	position: Int!
+	egressId: Int!
+	weight: Int!
+	down: Boolean!
+	downReason: String
+	path: LegPath!
+	target: Int!
+}
+
+type TestedRoute {
+	legs: [TestedLeg!]!
+	failover: RouteFailover!
+	overrides: PathOverride!
+	names: [NamedId!]!
+}
+
 enum TimelineSpanState {
 	RUNNING
 	COMPLETE
@@ -4174,6 +4603,119 @@ enum TimelineStage {
 	EXTRACTING
 	INTERRUPTED
 	FINAL_MOVE
+}
+
+type Torrent {
+	id: Int!
+	name: String!
+	infohash: String!
+	state: TorrentState!
+	"""
+	Why the torrent is in its state, when there is a reason to give.
+	"""
+	detail: String
+	category: String
+	private: Boolean!
+	forced: Boolean!
+	progress: Float!
+	totalBytes: Int!
+	haveBytes: Int!
+	uploadedBytes: Int!
+	downloadedBytes: Int!
+	ratio: Float!
+	downloadBps: Int!
+	uploadBps: Int!
+	etaSeconds: Int
+	peers: Int!
+	seeds: Int!
+	leechers: Int!
+	addedAtMs: Int!
+	completedAtMs: Int
+	storageDir: String
+	"""
+	The seeding goal still to meet; absent once it is met.
+	"""
+	seedingLeft: String
+	"""
+	The torrent's own seeding policy; absent when it inherits one.
+	"""
+	seedingOverride: SeedingPolicySettings
+	"""
+	The seeding policy in effect.
+	"""
+	seedingPolicy: SeedingPolicySettings!
+	seedingSource: SeedingSource!
+	route: String
+	files: [TorrentFile!]!
+	trackers: [TorrentTracker!]!
+}
+
+enum TorrentEncryption {
+	PREFER
+	REQUIRE
+}
+
+type TorrentFile {
+	index: Int!
+	path: String!
+	length: Int!
+	selected: Boolean!
+	"""
+	The share of the file in hand, from 0 to 1.
+	"""
+	progress: Float!
+}
+
+type TorrentSettings {
+	enabled: Boolean!
+	basePort: Int!
+	announcePort: Int
+	upnp: Boolean!
+	encryption: TorrentEncryption!
+	maxActiveDownloads: Int!
+	maxPeersTotal: Int!
+	sessionDir: String
+}
+
+input TorrentSettingsInput {
+	enabled: Boolean
+	basePort: Int
+	announcePort: Int
+	upnp: Boolean
+	encryption: TorrentEncryption
+	maxActiveDownloads: Int
+	maxPeersTotal: Int
+	sessionDir: String
+}
+
+enum TorrentState {
+	QUEUED
+	FETCHING_METADATA
+	CHECKING_FILES
+	DOWNLOADING
+	STALLED
+	SEEDING
+	PAUSED
+	STOPPED
+}
+
+type TorrentTracker {
+	tier: Int!
+	url: String!
+	status: TrackerStatus!
+	message: String
+	seeders: Int
+	leechers: Int
+	lastAnnounceMs: Int
+	nextAnnounceMs: Int
+}
+
+enum TrackerStatus {
+	NOT_CONTACTED
+	UPDATING
+	WORKING
+	NOT_WORKING
+	DISABLED
 }
 
 """
@@ -4195,6 +4737,36 @@ type UpdateStatus {
 A multipart file upload
 """
 scalar Upload
+
+type UsenetResult {
+	articlesRequested: Int!
+	delivered: Int!
+	missing: Int!
+	failed: Int!
+	declaredBytes: Float!
+	decodedBytes: Float!
+	pipelining: Boolean!
+	tls: Boolean!
+	tlsCipherSuite: String
+}
+
+input UsenetTestInput {
+	sabSize: SabTestSize
+	nzbUrl: String
+	nzbUpload: Upload
+	nzbRunId: Int
+	connections: Int
+	maxDurationSeconds: Int! = 120
+}
+
+type UsenetTestRequest {
+	sabSize: SabTestSize
+	nzbUrl: String
+	nzbFilename: String
+	nzbRunId: Int
+	connections: Int
+	maxDurationSeconds: Int!
+}
 
 type WatchFolderMarkerRename {
 	from: String!

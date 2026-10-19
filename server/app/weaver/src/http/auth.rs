@@ -53,7 +53,7 @@ struct LoginFailureWindow {
 }
 
 impl LoginRateLimiter {
-    fn too_many_failures(&self, username: &str, client_id: &str) -> bool {
+    pub(super) fn too_many_failures(&self, username: &str, client_id: &str) -> bool {
         let now = Instant::now();
         let keys = Self::limiter_keys(username, client_id);
         let mut attempts = self.inner.lock().unwrap();
@@ -66,7 +66,7 @@ impl LoginRateLimiter {
             && keys.iter().any(|key| !attempts.contains_key(key)))
     }
 
-    fn record_failure(&self, username: &str, client_id: &str) {
+    pub(super) fn record_failure(&self, username: &str, client_id: &str) {
         let now = Instant::now();
         let keys = Self::limiter_keys(username, client_id);
         let mut attempts = self.inner.lock().unwrap();
@@ -86,7 +86,7 @@ impl LoginRateLimiter {
         }
     }
 
-    fn record_success(&self, username: &str, client_id: &str) {
+    pub(super) fn record_success(&self, username: &str, client_id: &str) {
         let keys = Self::limiter_keys(username, client_id);
         let mut attempts = self.inner.lock().unwrap();
         for key in keys {
@@ -114,7 +114,7 @@ impl LoginRateLimiter {
 // meters each browser separately instead of pooling every attempt under the
 // proxy's own address. Headers are believed only from a configured proxy; a
 // direct peer is metered on its socket address exactly as before.
-fn login_client_id(
+pub(super) fn login_client_id(
     security: &RuntimeSecurityConfig,
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,

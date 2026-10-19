@@ -902,8 +902,7 @@ async fn import_sqlite(
         .await?;
         fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
             .await?;
-        name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
-            .await?;
+        name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
         move_older_bandwidth_limits(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
     }
     .await;
@@ -1085,7 +1084,11 @@ async fn move_older_bandwidth_limits(
 
 // A row of an older bundle, in the columns this schema keeps it in. Column
 // lists are mapped by the same rule, as rows of nulls.
-fn upgrade_older_row(table: &str, source_schema_version: i64, row: &mut JsonMap<String, JsonValue>) {
+fn upgrade_older_row(
+    table: &str,
+    source_schema_version: i64,
+    row: &mut JsonMap<String, JsonValue>,
+) {
     if table == "egress_interfaces"
         && source_schema_version < networking_bandwidth_v69::SCHEMA_VERSION
     {
@@ -1093,7 +1096,11 @@ fn upgrade_older_row(table: &str, source_schema_version: i64, row: &mut JsonMap<
     }
 }
 
-fn upgrade_older_columns(table: &str, source_schema_version: i64, columns: &[String]) -> Vec<String> {
+fn upgrade_older_columns(
+    table: &str,
+    source_schema_version: i64,
+    columns: &[String],
+) -> Vec<String> {
     let mut row = columns
         .iter()
         .map(|column| (column.clone(), JsonValue::Null))
@@ -2326,8 +2333,8 @@ mod logical_reader_tests {
             true,
             networking_bandwidth_v69::SCHEMA_VERSION,
         )
-            .await
-            .unwrap_err();
+        .await
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2342,8 +2349,8 @@ mod logical_reader_tests {
             true,
             networking_bandwidth_v69::SCHEMA_VERSION,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let restored: (Option<String>, String) =
             sqlx::query_as("SELECT optional, defaulted FROM accepted WHERE id = 1")
                 .fetch_one(&mut conn)

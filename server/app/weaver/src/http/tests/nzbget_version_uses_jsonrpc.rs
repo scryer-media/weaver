@@ -1332,7 +1332,7 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     let config = test_config();
     {
         let mut config_write = config.write().await;
-        config_write.max_download_speed = Some((i32::MAX as u64) * 4);
+        config_write.bandwidth.download_bps = Some((i32::MAX as u64) * 4);
     }
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
@@ -2505,6 +2505,12 @@ async fn nzbget_global_pause_resume_and_scheduleresume_auto_resume() {
 async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     let db = Database::open_in_memory().unwrap();
     let config = test_config();
+    let kept_upload = weaver_server_core::proxies::Bandwidth {
+        download_bps: None,
+        upload_bps: Some(4096),
+    };
+    db.set_network_bandwidth(&kept_upload).unwrap();
+    config.write().await.bandwidth = kept_upload;
     let handle = scheduler_handle_with_mock_commands(vec![]);
     let app = nzbget_test_router(
         db.clone(),
@@ -2521,15 +2527,22 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
-    assert_eq!(
-        config.read().await.max_download_speed,
-        Some(2500 * 1024),
-        "rate should update the shared config in KB/s -> bytes/s"
-    );
-    assert_eq!(
-        db.get_setting("max_download_speed").unwrap().as_deref(),
-        Some("2560000")
-    );
+    let limited = weaver_server_core::proxies::Bandwidth {
+        download_bps: Some(2500 * 1024),
+        upload_bps: Some(4096),
+    };
+    assert_eq!(config.read().await.bandwidth, limited);
+    assert_eq!(db.network_bandwidth().unwrap(), limited);
+
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "rate", "params": [0], "id": "unlimited"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert_eq!(config.read().await.bandwidth, kept_upload);
+    assert_eq!(db.network_bandwidth().unwrap(), kept_upload);
 
     let (_, payload) = post_nzbget(
         app.clone(),

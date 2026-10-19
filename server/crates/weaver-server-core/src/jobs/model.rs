@@ -224,6 +224,9 @@ impl<T> FieldUpdate<T> {
     }
 }
 
+// The metadata key a job's priority is kept under.
+pub const PRIORITY_ATTRIBUTE_KEY: &str = "priority";
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct JobUpdate {
     pub category: FieldUpdate<String>,

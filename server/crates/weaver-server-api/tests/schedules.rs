@@ -46,14 +46,14 @@ async fn deleting_a_provider_takes_its_limit_out_of_a_speed_rule() {
     };
     let response = h.schema.execute(request(format!(r#"mutation {{
         createSchedule(input: {{ enabled: false, time: "08:00", actionType: "speed_limit",
-            speedLimits: [{{ kind: GLOBAL, bytesPerSec: 5000000 }}, {{ kind: SERVER, id: {id}, bytesPerSec: 0 }}] }}) {{
-            speedLimits {{ kind id bytesPerSec }}
+            speedLimits: [{{ kind: GLOBAL, download: 5000000 }}, {{ kind: SERVER, id: {id}, download: 1000 }}] }}) {{
+            speedLimits {{ kind id download upload }}
         }}
     }}"#))).await;
     common::assert_no_errors(&response);
     assert_eq!(
         common::response_data(&response)["createSchedule"][0]["speedLimits"][1],
-        serde_json::json!({ "kind": "SERVER", "id": id, "bytesPerSec": 0 })
+        serde_json::json!({ "kind": "SERVER", "id": id, "download": 1000, "upload": null })
     );
     let removed = h
         .schema
@@ -68,7 +68,8 @@ async fn deleting_a_provider_takes_its_limit_out_of_a_speed_rule() {
         ScheduleAction::SpeedLimit {
             limits: vec![SpeedLimitChange {
                 target: SpeedTarget::Global,
-                bytes_per_sec: 5_000_000,
+                bytes_per_sec: Some(5_000_000),
+                upload_bytes_per_sec: None,
             }],
         }
     );
@@ -154,7 +155,7 @@ async fn one_shot_and_hourly_inputs_validate_and_update_every_field() {
     for input in [
         r#"{ time: "08:00", actionType: "pause", everyHourAtMinute: 10 }"#,
         r#"{ time: "08:00", actionType: "prune_history", pruneFailed: { deleteFiles: false }, everyHourAtMinute: 60 }"#,
-        r#"{ time: "08:00", times: ["01:00", "02:00"], actionType: "speed_limit", speedLimits: [{ kind: GLOBAL, bytesPerSec: 1 }] }"#,
+        r#"{ time: "08:00", times: ["01:00", "02:00"], actionType: "speed_limit", speedLimits: [{ kind: GLOBAL, download: 1 }] }"#,
         r#"{ time: "08:00", actionType: "speed_limit" }"#,
         r#"{ time: "08:00", actionType: "fetch_rss" }"#,
         r#"{ time: "08:00", actionType: "scan_watch_folder" }"#,

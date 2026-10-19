@@ -1556,7 +1556,8 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             | weaver_server_core::DownloadBlockKind::ServerQuota
     );
     let config = ctx.config.read().await;
-    let download_limit = config.max_download_speed.unwrap_or(0);
+    // NZBGet reports no limit as 0.
+    let download_limit = config.bandwidth.download_bps.unwrap_or(0);
     let arr_download_limit = download_limit.min(i32::MAX as u64);
     let scan_paused = config.watch_folder.scanning_paused;
     let news_servers = config
@@ -3904,21 +3905,14 @@ async fn rate(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value,
         .unwrap_or(0)
         .saturating_mul(1024);
 
-    // Mirror the settings mutation: persist, update shared config, then apply
-    // to the live limiter, so `status` and the weaver UI agree with the value.
-    let db = ctx.db.clone();
-    tokio::task::spawn_blocking(move || {
-        db.set_setting("max_download_speed", &bytes_per_sec.to_string())
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("rate failed: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("rate failed: {error}")))?;
-    {
-        let mut config = ctx.config.write().await;
-        config.max_download_speed = Some(bytes_per_sec);
-    }
+    // NZBGet's 0 is no limit. The limit is the global download row, so
+    // `status` and the weaver UI agree with it.
     ctx.handle
-        .set_speed_limit(bytes_per_sec)
+        .save_download_limit(
+            &ctx.db,
+            &ctx.config,
+            (bytes_per_sec != 0).then_some(bytes_per_sec),
+        )
         .await
         .map_err(|error| scheduler_rpc_error("rate", error))?;
     Ok(json!(true))
@@ -4177,14 +4171,18 @@ fn nzbget_queue_status(state: QueueItemState) -> &'static str {
         QueueItemState::Queued => "QUEUED",
         QueueItemState::Downloading
         | QueueItemState::FetchingRepairData
-        | QueueItemState::FinalizingDownload => "DOWNLOADING",
-        QueueItemState::Checking | QueueItemState::Verifying => "VERIFYING_SOURCES",
+        | QueueItemState::FinalizingDownload
+        | QueueItemState::FetchingMetadata
+        | QueueItemState::Stalled => "DOWNLOADING",
+        QueueItemState::Checking | QueueItemState::Verifying | QueueItemState::CheckingFiles => {
+            "VERIFYING_SOURCES"
+        }
         QueueItemState::Repairing => "REPAIRING",
         QueueItemState::Extracting => "UNPACKING",
         QueueItemState::Finalizing => "MOVING",
         QueueItemState::PostProcessing => "EXECUTING_SCRIPT",
         QueueItemState::Paused => "PAUSED",
-        QueueItemState::Completed => "SUCCESS",
+        QueueItemState::Completed | QueueItemState::Seeding => "SUCCESS",
         QueueItemState::Failed => "FAILURE",
     }
 }

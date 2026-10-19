@@ -127,6 +127,10 @@ export function routeProblemText(t: Translate, problem: RouteProblem): string {
       return t("next.networking.problem.egressDisabled");
     case "proxyRepeated":
       return t("next.networking.problem.proxyRepeated");
+    case "torrentLegs":
+      return t("next.refusal.TORRENT_ROUTE_LEGS");
+    case "torrentPool":
+      return t("next.refusal.TORRENT_ROUTE_POOL");
   }
 }
 
@@ -136,8 +140,9 @@ export function formatRate(bytesPerSecond = 0): string {
   return `${(bytesPerSecond / MIB).toFixed(2)} MiB/s`;
 }
 
-export function formatLimit(t: Translate, bytesPerSecond: number): string {
-  return bytesPerSecond > 0
+/** A limit as a rate, or Unlimited for none; 0 is a limit like any other. */
+export function formatLimit(t: Translate, bytesPerSecond: number | null): string {
+  return bytesPerSecond !== null
     ? `${(bytesPerSecond / MIB).toFixed(1)} MiB/s`
     : t("next.networking.unlimited");
 }

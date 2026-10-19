@@ -670,11 +670,9 @@ impl JobsMutation {
         Ok(true)
     }
     /// Set the global download speed limit in bytes/sec. 0 means unlimited.
-    #[graphql(guard = "ControlGuard")]
+    #[graphql(guard = "ControlGuard", deprecation = "Use setBandwidth.")]
     async fn set_speed_limit(&self, ctx: &Context<'_>, bytes_per_sec: u64) -> Result<bool> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        handle.set_speed_limit(bytes_per_sec).await?;
-        persist_operator_speed_limit(ctx, bytes_per_sec).await?;
+        save_legacy_download_limit(ctx, bytes_per_sec).await?;
         Ok(true)
     }
     /// Pause one queue item and return its updated facade state.
@@ -837,7 +835,7 @@ impl JobsMutation {
             global_state: Some(global_queue_state(
                 handle.is_globally_paused(),
                 &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(0),
+                cfg.bandwidth.download_bps,
             )),
         })
     }
@@ -856,22 +854,19 @@ impl JobsMutation {
             global_state: Some(global_queue_state(
                 handle.is_globally_paused(),
                 &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(0),
+                cfg.bandwidth.download_bps,
             )),
         })
     }
     /// Set the queue speed limit in bytes/sec. 0 means unlimited.
-    #[graphql(guard = "ControlGuard")]
+    #[graphql(guard = "ControlGuard", deprecation = "Use setBandwidth.")]
     async fn set_queue_speed_limit(
         &self,
         ctx: &Context<'_>,
         bytes_per_sec: u64,
     ) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let config = ctx.data::<SharedConfig>()?;
-        map_scheduler_result(handle.set_speed_limit(bytes_per_sec).await)?;
-        persist_operator_speed_limit(ctx, bytes_per_sec).await?;
-        let cfg = config.read().await;
+        let bandwidth = save_legacy_download_limit(ctx, bytes_per_sec).await?;
         Ok(QueueCommandResult {
             success: true,
             message: None,
@@ -879,7 +874,7 @@ impl JobsMutation {
             global_state: Some(global_queue_state(
                 handle.is_globally_paused(),
                 &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(bytes_per_sec),
+                bandwidth.download_bps,
             )),
         })
     }
@@ -1317,22 +1312,15 @@ async fn history_items_from_db(db: Database, live_jobs: HashSet<u64>) -> Result<
 // The operator's speed limit is the saved global limit from now on: the queue
 // state reads it from the configuration, and a reload restores it, so the edit
 // lands in the settings as the settings screen's own edit would.
-async fn persist_operator_speed_limit(ctx: &Context<'_>, bytes_per_sec: u64) -> Result<()> {
+// Save a download limit sent the old way, where 0 is no limit, onto the
+// global bandwidth row.
+async fn save_legacy_download_limit(
+    ctx: &Context<'_>,
+    bytes_per_sec: u64,
+) -> Result<weaver_server_core::proxies::Bandwidth> {
+    let handle = ctx.data::<SchedulerHandle>()?;
     let config = ctx.data::<SharedConfig>()?;
-    let db = ctx.data::<Database>()?.clone();
-    let persist = async move {
-        crate::observability::spawn_blocking_db(
-            "jobs.mutation.set_speed_limit.persist",
-            move || db.set_setting("max_download_speed", &bytes_per_sec.to_string()),
-        )
-        .await
-    };
-    crate::observability::persist_then_update_config(
-        config,
-        "jobs.mutation.set_speed_limit.apply",
-        persist,
-        move |cfg| cfg.max_download_speed = Some(bytes_per_sec),
-    )
-    .await?;
-    Ok(())
+    let db = ctx.data::<Database>()?;
+    let download_bps = (bytes_per_sec != 0).then_some(bytes_per_sec);
+    map_scheduler_result(handle.save_download_limit(db, config, download_bps).await)
 }

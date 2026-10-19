@@ -11,6 +11,7 @@ async fn unavailable_provider_recovery_does_not_leave_602_retries_parked_forever
     let control = registry.configure(
         weaver_nntp::transfer::StableServerId(0),
         weaver_nntp::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
                 limit_bytes: 1,

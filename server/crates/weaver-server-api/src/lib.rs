@@ -18,6 +18,7 @@ pub mod servers;
 pub mod settings;
 pub mod speed_test;
 pub mod system;
+pub mod torrents;
 
 pub use auth::types::*;
 pub use backup::{

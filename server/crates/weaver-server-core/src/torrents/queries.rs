@@ -6,7 +6,7 @@ use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::torrents::{
-    Infohash, TorrentCounters, TorrentFile, TorrentRecord, TorrentSource, TorrentState,
+    Infohash, TorrentCounters, TorrentFile, TorrentIntent, TorrentRecord, TorrentSource,
     TorrentTracker, TrackerStatus,
 };
 
@@ -39,7 +39,7 @@ fn opt_u32(row: &SqlRow, column: &str) -> Result<Option<u32>, StateError> {
 
 pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError> {
     let source = row.text("source")?;
-    let state = row.text("state")?;
+    let intent = row.text("state")?;
     let policy_override = row
         .opt_text("policy_override")?
         .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("policy", error)))
@@ -54,7 +54,7 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         private: row.bool("private")?,
         category_id: opt_u32(row, "category_id")?,
         added_at_ms: row.i64("added_at_ms")?,
-        state: TorrentState::parse(&state).ok_or_else(|| corrupt("state", &state))?,
+        intent: TorrentIntent::parse(&intent).ok_or_else(|| corrupt("intent", &intent))?,
         forced: row.bool("forced")?,
         completed_at_ms: row.opt_i64("completed_at_ms")?,
         storage_dir: row.opt_text("storage_dir")?,
@@ -116,6 +116,20 @@ impl Database {
             .as_ref()
             .map(torrent_from_row)
             .transpose()
+        })
+    }
+
+    // Every torrent, in the order they were added.
+    pub fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                &format!("SELECT {TORRENT_COLUMNS} FROM torrents ORDER BY added_at_ms, job_id"),
+                &[],
+            )
+            .await?;
+            rows.iter().map(torrent_from_row).collect()
         })
     }
 

@@ -94,7 +94,7 @@ interface ProviderHoldoff {
 
 interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
-  globalState: { isPaused: boolean; speedLimitBytesPerSec: number; downloadBlock: DownloadBlockState };
+  globalState: { isPaused: boolean; speedLimitBytesPerSec: number | null; downloadBlock: DownloadBlockState };
   providerHoldoffs?: ProviderHoldoff[];
   providerConnections?: ProviderConnections[];
   /** Per-job download rates on the same tick as the speed; only the push carries them. */
@@ -116,8 +116,8 @@ export interface NextData {
   /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
   peakSpeed: number;
   isPaused: boolean;
-  /** The configured download ceiling in bytes per second; 0 is unlimited. */
-  speedLimit: number;
+  /** The configured download limit in bytes per second; null is no limit, and 0 lets nothing through. */
+  speedLimit: number | null;
   downloadBlock: DownloadBlockState;
   queue: LiveQueue;
   /**
@@ -155,7 +155,7 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   windowStartsAtEpochMs: null,
   windowEndsAtEpochMs: null,
   timezoneName: "",
-  scheduledSpeedLimit: 0,
+  scheduledSpeedLimit: null,
 };
 
 const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
@@ -363,7 +363,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const globalState = snapshot?.globalState;
   const downloadBlock = useSettled(globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK, shallowEqual);
   const isPaused = globalState?.isPaused ?? false;
-  const speedLimit = globalState?.speedLimitBytesPerSec ?? 0;
+  const speedLimit = globalState?.speedLimitBytesPerSec ?? null;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const refreshCategories = useCallback(
     () => reexecuteCategories({ requestPolicy: "network-only" }),

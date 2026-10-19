@@ -4,7 +4,16 @@
 import { gql, useQuery } from "urql";
 import type { Translate } from "@/lib/context/translate-context";
 import type { FieldSpec } from "@/next/pages/settings/framework";
-import { isOneShot, speedKey, speedProblem, type ScheduleOptionsForm, type ScheduleTargets, type SpeedTargetKind } from "../data/schedule-options";
+import { Segmented, TextField } from "./controls";
+import {
+  isOneShot,
+  speedKey,
+  speedProblem,
+  type ScheduleOptionsForm,
+  type ScheduleTargets,
+  type SpeedEntry,
+  type SpeedTargetKind,
+} from "../data/schedule-options";
 
 /**
  * The rows an action adds to the schedule editor.
@@ -165,31 +174,110 @@ export function scheduleActionFields({ t, action, value, onChange, targets }: Sc
   return [];
 }
 
+type RateChoice = "keep" | "unlimited" | "limit";
+
+/**
+ * One direction of a target: as it is (the download only, and only while the
+ * rule does not set the target), no limit, or a rate in MB/s.
+ */
+function RateControl({
+  t,
+  label,
+  text,
+  keep,
+  onChange,
+}: {
+  t: Translate;
+  label: string;
+  /** The rate typed, null for no limit; undefined while the target is left as it is. */
+  text: string | null | undefined;
+  /** Whether "as is" is offered. */
+  keep: boolean;
+  onChange: (next: string | null | undefined) => void;
+}) {
+  const choice: RateChoice = text === undefined ? "keep" : text === null ? "unlimited" : "limit";
+  return (
+    <div className="flex flex-wrap items-center gap-[10px]">
+      <Segmented<RateChoice>
+        label={label}
+        value={choice}
+        options={[
+          ...(keep ? [{ value: "keep" as const, label: t("next.schedules.speedLeaveAsIs") }] : []),
+          { value: "unlimited", label: t("next.schedules.unlimited") },
+          { value: "limit", label: t("next.schedules.speedSet") },
+        ]}
+        onChange={(next) => onChange(next === "keep" ? undefined : next === "unlimited" ? null : (text ?? ""))}
+      />
+      {choice === "limit" ? (
+        <TextField label={label} value={text ?? ""} placeholder="0" onChange={onChange} className="w-[110px]" />
+      ) : null}
+    </div>
+  );
+}
+
 /**
  * The targets a speed rule can set, one group per heading: the global limit,
- * then each egress, then each provider. Each takes its own rate; blank leaves
- * that target as it is and 0 removes its limit.
+ * then each egress, then each provider. Each is left as it is, lifted, or
+ * given a rate; the global one also takes the upload rate it sets with it.
  */
 export function scheduleSpeedSections({ t, value, onChange, targets }: Omit<ScheduleOptionFields, "action"> & {
   targets: ScheduleTargets | undefined;
 }): { id: string; title: string; note?: string; fields: FieldSpec[] }[] {
+  const setEntry = (key: string, entry: SpeedEntry | undefined) => {
+    const { [key]: _dropped, ...rest } = value.speeds;
+    onChange({ ...value, speeds: entry ? { ...rest, [key]: entry } : rest });
+  };
   const field = (kind: SpeedTargetKind, id: number | null, label: string): FieldSpec => {
     const key = speedKey(kind, id);
-    const text = value.speeds[key] ?? "";
-    const problem = speedProblem(text);
+    const entry = value.speeds[key];
+    const problem = entry && entry.download !== null ? speedProblem({ download: entry.download, upload: null }, kind) : null;
     return {
       id: `speed-${key}`,
       label,
       help: problem ? t(problem) : undefined,
       keywords: "MB/s",
       control: {
-        kind: "text",
-        value: text,
-        placeholder: t("next.schedules.speedLeaveAsIs"),
-        onChange: (next) => onChange({ ...value, speeds: { ...value.speeds, [key]: next } }),
+        kind: "custom",
+        control: (
+          <RateControl
+            t={t}
+            label={label}
+            keep
+            text={entry?.download}
+            onChange={(download) =>
+              setEntry(key, download === undefined ? undefined : { download, upload: entry?.upload ?? null })
+            }
+          />
+        ),
       },
     };
   };
+  const globalEntry = value.speeds[speedKey("GLOBAL", null)];
+  const uploadProblem = globalEntry && globalEntry.upload !== null
+    ? speedProblem({ download: null, upload: globalEntry.upload }, "GLOBAL")
+    : null;
+  const globalUpload: FieldSpec[] = globalEntry
+    ? [
+        {
+          id: "speed-GLOBAL-upload",
+          label: t("next.schedules.speedGlobalUpload"),
+          help: uploadProblem ? t(uploadProblem) : undefined,
+          keywords: "MB/s upload",
+          control: {
+            kind: "custom",
+            control: (
+              <RateControl
+                t={t}
+                label={t("next.schedules.speedGlobalUpload")}
+                keep={false}
+                text={globalEntry.upload}
+                onChange={(upload) => setEntry(speedKey("GLOBAL", null), { ...globalEntry, upload: upload ?? null })}
+              />
+            ),
+          },
+        },
+      ]
+    : [];
   // A rule can outlive an egress or provider it names until the next load drops it.
   const listed = <T extends { id: number }>(kind: SpeedTargetKind, records: readonly T[], name: (record: T) => string, unknown: string) => [
     ...records.map((record) => field(kind, record.id, name(record))),
@@ -206,7 +294,7 @@ export function scheduleSpeedSections({ t, value, onChange, targets }: Omit<Sche
       id: "speedGlobal",
       title: t("next.schedules.speedGlobal"),
       note: t("next.schedules.speedUnit"),
-      fields: [field("GLOBAL", null, t("next.schedules.speedGlobalField"))],
+      fields: [field("GLOBAL", null, t("next.schedules.speedGlobalField")), ...globalUpload],
     },
     ...(egresses.length > 0 ? [{ id: "speedEgresses", title: t("next.schedules.speedEgresses"), fields: egresses }] : []),
     ...(servers.length > 0 ? [{ id: "speedServers", title: t("next.schedules.speedServers"), fields: servers }] : []),

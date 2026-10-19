@@ -150,7 +150,6 @@ impl SettingsMutation {
         let normalized_intermediate_dir = normalize_settings_path_update(&input.intermediate_dir);
         let normalized_complete_dir = normalize_settings_path_update(&input.complete_dir);
         let cleanup_after_extract = input.cleanup_after_extract;
-        let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
         let enable_srrdb_lookup = input.enable_srrdb_lookup;
@@ -189,7 +188,6 @@ impl SettingsMutation {
             normalized_intermediate_dir.clone(),
             normalized_complete_dir.clone(),
             cleanup_after_extract,
-            max_download_speed,
             max_retries,
             watch_folder_update.clone(),
             duplicate_policy_update.clone(),
@@ -218,12 +216,9 @@ impl SettingsMutation {
                             db.set_setting("cleanup_after_extract", &v.to_string())?;
                         }
                         if let Some(v) = persist_input.3 {
-                            db.set_setting("max_download_speed", &v.to_string())?;
-                        }
-                        if let Some(v) = persist_input.4 {
                             db.set_setting("retry.max_retries", &v.to_string())?;
                         }
-                        if let Some(ref watch) = persist_input.5 {
+                        if let Some(ref watch) = persist_input.4 {
                             if let Some(mode) = watch.mode {
                                 db.set_setting("watch_folder.mode", mode.as_str())?;
                             }
@@ -253,7 +248,7 @@ impl SettingsMutation {
                                 db.set_setting("watch_folder.scanning_paused", &value.to_string())?;
                             }
                         }
-                        if let Some(ref duplicate_policy) = persist_input.6 {
+                        if let Some(ref duplicate_policy) = persist_input.5 {
                             if let Some(value) = duplicate_policy.strict_active_or_success {
                                 db.set_setting(
                                     "duplicate_policy.strict_active_or_success",
@@ -292,19 +287,19 @@ impl SettingsMutation {
                                 )?;
                             }
                         }
-                        if let Some(seconds) = persist_input.8 {
+                        if let Some(seconds) = persist_input.7 {
                             db.set_setting("propagation_delay_secs", &seconds.to_string())?;
                         }
-                        if let Some(enabled) = persist_input.7 {
+                        if let Some(enabled) = persist_input.6 {
                             db.set_setting(
                                 "delivery_naming.enable_srrdb_lookup",
                                 &enabled.to_string(),
                             )?;
                         }
-                        if let Some(policy) = persist_input.9 {
+                        if let Some(policy) = persist_input.8 {
                             db.save_seeding_policy(policy.as_ref())?;
                         }
-                        if let Some(ref torrent) = persist_input.10 {
+                        if let Some(ref torrent) = persist_input.9 {
                             db.save_torrent_config(torrent)?;
                         }
                         Ok(())
@@ -335,9 +330,6 @@ impl SettingsMutation {
                 }
                 if let Some(cleanup) = cleanup_after_extract {
                     cfg.cleanup_after_extract = Some(cleanup);
-                }
-                if let Some(speed) = max_download_speed {
-                    cfg.max_download_speed = Some(speed);
                 }
                 if let Some(seconds) = propagation_delay_secs {
                     cfg.propagation_delay_secs = Some(seconds);
@@ -386,10 +378,6 @@ impl SettingsMutation {
         if let Some(seconds) = propagation_delay_secs {
             handle.set_propagation_delay(seconds).await?;
         }
-        // Apply speed limit immediately.
-        if let Some(speed) = max_download_speed {
-            let _ = handle.set_speed_limit(speed).await;
-        }
 
         // Apply directory changes immediately so new jobs use them without restart.
         if let Some((data_dir, intermediate_dir, complete_dir)) = runtime_paths {
@@ -404,6 +392,7 @@ impl SettingsMutation {
                 .await
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         }
+        crate::torrents::reconcile(ctx).await?;
 
         Ok(settings)
     }
@@ -695,7 +684,7 @@ mod tests {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
@@ -724,7 +713,7 @@ mod tests {
                         Ok(())
                     },
                     |cfg| {
-                        cfg.max_download_speed = Some(42);
+                        cfg.propagation_delay_secs = Some(42);
                     },
                 )
                 .await
@@ -734,9 +723,10 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        let read_result =
-            with_timed_config_read(&config, "tests.settings.read", |cfg| cfg.max_download_speed)
-                .await;
+        let read_result = with_timed_config_read(&config, "tests.settings.read", |cfg| {
+            cfg.propagation_delay_secs
+        })
+        .await;
         assert_eq!(read_result, None);
 
         release_tx

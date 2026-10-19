@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::NetworkRefusal as R;
 use super::EgressQuotaFault as Quota;
+use super::NetworkRefusal as R;
 use crate::{Refusal, StateError};
 
 // Every refusal with the code and the sentence a client is promised. A code

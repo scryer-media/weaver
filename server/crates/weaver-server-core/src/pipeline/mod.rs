@@ -6,6 +6,7 @@ pub mod archive;
 pub(crate) use archive::rar_state;
 mod capacity;
 mod completion;
+pub(crate) use completion::finalize::claim_complete_destination_path;
 pub(crate) use completion::finalize::placement;
 mod decode;
 pub mod diagnostics;
@@ -2560,6 +2561,8 @@ pub struct Pipeline {
     pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
     // Where the engines graph jobs run say what they found.
     pub(super) graph_runs: graph::engine::RunMail,
+    // The jobs outside the pipeline whose runs speak on that mail too.
+    pub(super) graph_outside: Arc<graph::engine::Outside>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,

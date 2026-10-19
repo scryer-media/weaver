@@ -18,7 +18,7 @@ import { stateLabel, StatusMark } from "./presentation";
 /**
  * "20 NNTP connections · 2 legs": what a consumer is, and how its route splits
  * it. A route of one leg splits nothing, so says nothing about legs, and
- * Default outbound's name already says what it is.
+ * Default outbound's and the torrent routes' names already say what they are.
  */
 export function consumerSummary(t: Translate, consumer: Consumer): string {
   const count = consumer.route?.legs.length ?? 1;
@@ -29,6 +29,8 @@ export function consumerSummary(t: Translate, consumer: Consumer): string {
     case "RSS":
       return [t("next.networking.routes.rssFeed"), ...legs].join(" · ");
     case "OUTBOUND":
+    case "TORRENT_DEFAULT":
+    case "TORRENT_CATEGORY":
       return legs.join(" · ");
   }
 }
@@ -174,7 +176,7 @@ export function RouteDialog({
     }
   };
 
-  const problem = routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools });
+  const problem = routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools, kind: consumer.kind });
 
   return (
     <Dialog

@@ -31,6 +31,10 @@ const fr: LocaleDictionary = {
   // Status labels
   "status.queued": "En attente",
   "status.downloading": "Téléchargement",
+  "status.fetchingMetadata": "Récupération des métadonnées",
+  "status.checkingFiles": "Vérification des fichiers",
+  "status.seeding": "Partage",
+  "status.stalled": "Bloqué",
   "status.fetchingRepairData": "Récupération des données de réparation",
   "status.verifying": "Vérification",
   "status.repairing": "Réparation",

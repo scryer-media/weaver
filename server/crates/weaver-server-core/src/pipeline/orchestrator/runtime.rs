@@ -253,6 +253,7 @@ impl Pipeline {
             graph_status: Default::default(),
             graph_holds,
             graph_runs: Default::default(),
+            graph_outside: Default::default(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             archive_password_winners: HashMap::new(),

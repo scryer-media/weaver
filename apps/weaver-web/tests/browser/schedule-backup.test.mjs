@@ -224,7 +224,7 @@ test("the action picker offers the holds, then the settings a rule switches, and
   } finally { await page.close(); }
 });
 
-test("a speed rule sets the global limit, each egress and each provider on its own, and blank leaves one as it is", async () => {
+test("a speed rule sets the global limits, each egress and each provider on its own, and as is leaves one alone", async () => {
   const page = await open("?schedules");
   try {
     await addSchedule(page).click();
@@ -234,39 +234,52 @@ test("a speed rule sets the global limit, each egress and each provider on its o
     // One time of day: there is no list of further times for a speed rule.
     assert.equal(await form.getByLabel("Several times", { exact: true }).count(), 0);
     for (const heading of ["Global", "Egresses", "Providers"]) await form.getByText(heading, { exact: true }).first().waitFor();
-    await form.getByText("MB/s", { exact: true }).first().waitFor();
+    const choice = (scope, target, option) =>
+      scope.getByRole("radiogroup", { name: target, exact: true }).getByRole("radio", { name: option, exact: true });
+    const rate = (scope, target) => scope.getByRole("textbox", { name: target, exact: true });
     // A rule that sets nothing is refused.
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await form.getByText("Set at least one limit.", { exact: true }).waitFor();
-    await form.getByLabel("fixture-egress", { exact: true }).fill("fast");
+    await choice(form, "fixture-egress", "Limit").click();
+    await rate(form, "fixture-egress").fill("fast");
     await form.getByText("A speed limit is a number of MB/s, 0 or more.", { exact: true }).waitFor();
-    await form.getByLabel("Global limit", { exact: true }).fill("5");
+    // The global target sets both directions: its upload rate shows once it is set.
+    assert.equal(await form.getByRole("radiogroup", { name: "Global upload limit", exact: true }).count(), 0);
+    await choice(form, "Global limit", "Limit").click();
+    await rate(form, "Global limit").fill("5");
     // Typing a rate takes back what a refused save said.
     assert.equal(await form.getByText("Set at least one limit.", { exact: true }).count(), 0);
-    await form.getByLabel("fixture-egress", { exact: true }).fill("0");
-    await form.getByLabel("fixture-provider", { exact: true }).fill("2.5");
+    assert.equal(await choice(form, "Global upload limit", "unlimited").getAttribute("aria-checked"), "true");
+    assert.equal(await choice(form, "Global upload limit", "as is").count(), 0);
+    await choice(form, "Global upload limit", "Limit").click();
+    await rate(form, "Global upload limit").fill("1");
+    await rate(form, "fixture-egress").fill("0");
+    await choice(form, "fixture-provider", "unlimited").click();
     await shot(page, "speed-limit-editor");
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await form.waitFor({ state: "hidden" });
 
+    const MIB = 1024 * 1024;
     const [rule] = await storedSchedules(page);
     assert.deepEqual(rule.speedLimits, [
-      { kind: "GLOBAL", id: null, bytesPerSec: 5 * 1024 * 1024 },
-      { kind: "EGRESS", id: 7, bytesPerSec: 0 },
-      { kind: "SERVER", id: 1, bytesPerSec: Math.round(2.5 * 1024 * 1024) },
+      { kind: "GLOBAL", id: null, download: 5 * MIB, upload: MIB },
+      { kind: "EGRESS", id: 7, download: 0, upload: null },
+      { kind: "SERVER", id: 1, download: null, upload: null },
     ]);
     assert.deepEqual(rule.times, []);
     const row = groupRow(page, "Speed limit", "fixture evening");
     const line = await row.getByText(/^Global /).textContent();
-    assert.match(line, /^Global 5(\.0+)? MB\/s, fixture-egress unlimited, fixture-provider 2\.5 MB\/s$/);
+    assert.match(line, /^Global ↓ 5(\.0+)? MB\/s ↑ 1(\.0+)? MB\/s, fixture-egress 0(\.0+)? \S+\/s, fixture-provider unlimited$/);
 
-    // Reopened, the stored rates are shown, and the target left blank stays out of the rule.
+    // Reopened, the stored rates are shown, and the target left as it is stays out of the rule.
     await row.click();
     const edit = page.getByRole("dialog", { name: "fixture evening", exact: true });
-    assert.equal(await edit.getByLabel("Global limit", { exact: true }).inputValue(), "5");
-    assert.equal(await edit.getByLabel("fixture-egress", { exact: true }).inputValue(), "0");
-    assert.equal(await edit.getByLabel("fixture-vpn", { exact: true }).inputValue(), "");
-    await edit.getByLabel("fixture-provider", { exact: true }).fill("");
+    assert.equal(await rate(edit, "Global limit").inputValue(), "5");
+    assert.equal(await rate(edit, "Global upload limit").inputValue(), "1");
+    assert.equal(await rate(edit, "fixture-egress").inputValue(), "0");
+    assert.equal(await choice(edit, "fixture-vpn", "as is").getAttribute("aria-checked"), "true");
+    assert.equal(await choice(edit, "fixture-provider", "unlimited").getAttribute("aria-checked"), "true");
+    await choice(edit, "fixture-provider", "as is").click();
     await edit.getByRole("button", { name: "Save", exact: true }).click();
     await edit.waitFor({ state: "hidden" });
     assert.deepEqual((await storedSchedules(page))[0].speedLimits.map((limit) => limit.kind), ["GLOBAL", "EGRESS"]);

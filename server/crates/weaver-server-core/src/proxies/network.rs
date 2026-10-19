@@ -180,9 +180,7 @@ impl EgressQuotaFault {
         match self {
             Self::LimitTooLarge => "egress quota limit exceeds database range",
             Self::ResetTimeRange => "egress quota reset time must be between 0 and 1439",
-            Self::MonthlyResetDayRange => {
-                "egress quota monthly reset day must be between 1 and 31"
-            }
+            Self::MonthlyResetDayRange => "egress quota monthly reset day must be between 1 and 31",
             Self::SoftAboveHard => "egress upload soft cap must not exceed its hard cap",
         }
     }

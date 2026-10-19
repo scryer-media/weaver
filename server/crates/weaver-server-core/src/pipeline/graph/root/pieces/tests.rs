@@ -7,8 +7,8 @@ use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{ByteRange, MemberId, NodeId, Pull, Purpose, Seek, VolumeIndex, Weight};
 
-use super::{Class, Move, PieceFile, PieceLayout, PieceRoot, Unit, Verified};
 use super::layout::Span;
+use super::{Class, Move, PieceFile, PieceLayout, PieceRoot, Unit, Verified};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{RunMail, Runs};
@@ -46,8 +46,12 @@ fn layout() -> Arc<PieceLayout> {
     )
 }
 
+fn total(layout: &PieceLayout) -> u64 {
+    layout.files().map(|file| file.length).sum()
+}
+
 fn torrent_bytes(layout: &PieceLayout) -> Vec<u8> {
-    (0..layout.total()).map(|at| (at % 251) as u8).collect()
+    (0..total(layout)).map(|at| (at % 251) as u8).collect()
 }
 
 // Each volume's share of the piece, as the storage hands it over.
@@ -106,9 +110,20 @@ fn a_volume_range_maps_onto_the_pieces_across_file_boundaries() {
     assert_eq!(layout.pieces(VolumeIndex(1), ByteRange::new(23, 25)), 0..2);
     assert_eq!(layout.pieces(VolumeIndex(1), ByteRange::new(24, 25)), 1..2);
     // Cut at the volume's end, and nothing past it.
-    assert_eq!(layout.pieces(VolumeIndex(0), ByteRange::new(900, u64::MAX)), 0..1);
-    assert!(layout.pieces(VolumeIndex(0), ByteRange::new(1000, 2000)).is_empty());
-    assert!(layout.pieces(VolumeIndex(3), ByteRange::new(0, 1)).is_empty());
+    assert_eq!(
+        layout.pieces(VolumeIndex(0), ByteRange::new(900, u64::MAX)),
+        0..1
+    );
+    assert!(
+        layout
+            .pieces(VolumeIndex(0), ByteRange::new(1000, 2000))
+            .is_empty()
+    );
+    assert!(
+        layout
+            .pieces(VolumeIndex(3), ByteRange::new(0, 1))
+            .is_empty()
+    );
 
     assert_eq!(
         layout.spans(0),
@@ -144,7 +159,10 @@ fn a_volume_range_maps_onto_the_pieces_across_file_boundaries() {
             },
         ]
     );
-    assert_eq!(layout.span(VolumeIndex(2), 4), Some(ByteRange::new(596, 700)));
+    assert_eq!(
+        layout.span(VolumeIndex(2), 4),
+        Some(ByteRange::new(596, 700))
+    );
     assert_eq!(layout.span(VolumeIndex(0), 1), None);
     assert_eq!(layout.piece_range(4), ByteRange::new(4096, 4200));
 }
@@ -191,7 +209,12 @@ fn receive_delivers_each_file_share_in_its_own_coordinates() {
     let mut piece = shares(&layout, 0).into_iter();
     let arrival = root.receive(piece.next().unwrap());
     assert_eq!(
-        (arrival.node, arrival.member, arrival.offset, arrival.bytes.len()),
+        (
+            arrival.node,
+            arrival.member,
+            arrival.offset,
+            arrival.bytes.len()
+        ),
         (NodeId::ROOT, MemberId(0), 0, 1000)
     );
     // Half of piece 0 in hand is not the piece.
@@ -283,7 +306,7 @@ fn a_class_raised_by_a_seek_becomes_the_selection() {
 }
 
 #[test]
-fn a_piece_is_lost_only_when_the_torrent_is_abandoned() {
+fn a_waiting_piece_is_moved_never_lost() {
     let layout = layout();
     let mut root = PieceRoot::new(Arc::clone(&layout));
     for share in shares(&layout, 1) {
@@ -300,30 +323,7 @@ fn a_piece_is_lost_only_when_the_torrent_is_abandoned() {
         root.answer(&[critical(0, ByteRange::new(5000, 6000))], |_| true),
         vec![Pull::Moved(0)]
     );
-
-    root.abandon();
-    assert_eq!(
-        root.answer(&[critical(1, ByteRange::new(0, 100))], |_| true),
-        vec![Pull::Lost]
-    );
-    // The piece in hand stays in hand; the rest is damage at its exact
-    // ranges, runs of shares merged.
-    assert_eq!(
-        root.answer(&[critical(1, ByteRange::new(24, 1048))], |_| true),
-        vec![Pull::Moved(0)]
-    );
-    assert_eq!(
-        root.damage(),
-        vec![
-            (VolumeIndex(0), ByteRange::new(0, 1000)),
-            (VolumeIndex(1), ByteRange::new(0, 24)),
-            (VolumeIndex(1), ByteRange::new(1048, 2500)),
-            (VolumeIndex(2), ByteRange::new(0, 700)),
-        ]
-    );
     assert!(root.damage().is_empty());
-    assert!(!root.volume_waiting(VolumeIndex(1)));
-    assert_eq!(root.settled().len(), 2 + 4 + 1);
 }
 
 #[test]
@@ -340,10 +340,7 @@ fn the_have_bitfield_comes_back_from_the_facts() {
     let facts = root.facts();
     let mut restored = PieceRoot::restore(Arc::clone(&layout), &facts).unwrap();
     assert_eq!(restored.have(), root.have());
-    assert_eq!(
-        restored.have().iter_ones().collect::<Vec<_>>(),
-        vec![0, 3]
-    );
+    assert_eq!(restored.have().iter_ones().collect::<Vec<_>>(), vec![0, 3]);
     assert_eq!(
         restored.take_moves(),
         vec![Move {
@@ -353,10 +350,7 @@ fn the_have_bitfield_comes_back_from_the_facts() {
     );
     // A share that does not read back takes its piece out of hand.
     restored.unarrive(VolumeIndex(2), 3);
-    assert_eq!(
-        restored.have().iter_ones().collect::<Vec<_>>(),
-        vec![0]
-    );
+    assert_eq!(restored.have().iter_ones().collect::<Vec<_>>(), vec![0]);
 
     let other = Arc::new(PieceLayout::new(PIECE * 2, vec![file("a.bin", 4200)]).unwrap());
     assert_eq!(
@@ -419,21 +413,27 @@ fn a_torrent_job_writes_its_files_and_restores_its_pieces() {
     // Piece 3 again: b's share and c's are both in hand already.
     job.verified(shares(&layout, 3), 1).unwrap();
     let bytes = torrent_bytes(&layout);
-    assert_eq!(std::fs::read(dir.path().join("a.bin")).unwrap(), bytes[..1000]);
+    assert_eq!(
+        std::fs::read(dir.path().join("a.bin")).unwrap(),
+        bytes[..1000]
+    );
     assert_eq!(
         std::fs::read(dir.path().join("b.bin")).unwrap(),
         bytes[1000..3500]
     );
     assert_eq!(job.have().iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
     assert_eq!(job.selection(), vec![2]);
+    // c's share of piece 3 is in hand; its share of piece 4 is not.
+    assert_eq!(job.file_have(), vec![1000, 2500, 4096 - 3500]);
 
-    let rows = checkpoint::rows(&job.snapshot());
+    let rows = checkpoint::rows(&job.snapshot().unwrap());
     let snapshot = checkpoint::snapshot(&rows).unwrap();
     let restored =
         GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
             .unwrap();
     assert!(restored.refetched.is_empty());
     assert_eq!(restored.job.have(), job.have());
+    assert_eq!(restored.job.file_have(), job.file_have());
     assert_eq!(restored.settled.len(), 1 + 4 + 1);
 
     // The last piece completes c.
@@ -454,7 +454,7 @@ fn a_torrent_checkpoint_is_read_only_by_a_torrent_job() {
     let layout = layout();
     let dir = tempfile::tempdir().unwrap();
     let job = torrent_job(&layout, dir.path());
-    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot().unwrap())).unwrap();
     assert!(matches!(
         GraphJob::restore(&snapshot, &[], 1, storage(dir.path()), 1),
         Err(crate::pipeline::graph::job::restore::RestoreFailure::Root(

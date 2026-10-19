@@ -76,7 +76,7 @@ function namedAsTested(run: SpeedTestRun, data: NetworkingData) {
   const egresses: Egress[] = data.egressInterfaces.map((egress) => ({ ...egress, name: egressNames.get(egress.id) ?? egress.name }));
   for (const [id, name] of egressNames) {
     if (!egresses.some((egress) => egress.id === id)) {
-      egresses.push({ id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled: true, maxDownloadSpeed: 0, health: "UNKNOWN", reason: null });
+      egresses.push({ id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled: true, downloadBps: null, uploadBps: null, health: "UNKNOWN", reason: null });
     }
   }
   const profiles: ProxyProfile[] = data.proxyProfiles.map((profile) => ({ ...profile, name: proxyNames.get(profile.id) ?? profile.name }));

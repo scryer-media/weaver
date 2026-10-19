@@ -1543,6 +1543,7 @@ async fn expired_active_budget_does_not_enter_async_rate_wait() {
     let control = registry.configure(
         crate::transfer::StableServerId(46),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 100,
             quota: None,
         },
@@ -1602,6 +1603,7 @@ async fn quota_rejection_happens_before_body_command() {
     let control = registry.configure(
         crate::transfer::StableServerId(43),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 0,

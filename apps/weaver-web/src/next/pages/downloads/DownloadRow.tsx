@@ -4,9 +4,10 @@
 import { memo, useContext, useMemo } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
+import type { TorrentSummaryData } from "@/lib/torrents";
 import { statusToken } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
-import { Square } from "@/next/components/chrome";
+import { ProtocolTag, Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
 import { Icon, type IconName } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
@@ -36,6 +37,8 @@ export const DownloadRow = memo(function DownloadRow({
   statusTitle,
   onPause,
   onCancel,
+  seeding = null,
+  seedingColumn = false,
 }: {
   job: JobData;
   selected: boolean;
@@ -54,6 +57,10 @@ export const DownloadRow = memo(function DownloadRow({
   onPause: (id: number, paused: boolean) => void;
   /** Ask to cancel the download; the page confirms first. */
   onCancel: (id: number) => void;
+  /** A seeding or stopped torrent's ratio and upload rate. */
+  seeding?: TorrentSummaryData | null;
+  /** Whether the queue draws the seeding column, so a row without figures keeps it empty. */
+  seedingColumn?: boolean;
 }) {
   const t = useTranslate();
   const progress = useJobProgress(job);
@@ -81,8 +88,9 @@ export const DownloadRow = memo(function DownloadRow({
       lead={lead}
       left={
         <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px]">
-          <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
-            {name}
+          <span className="flex min-w-0 items-center gap-[7px]">
+            <ProtocolTag protocol={job.protocol} />
+            <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">{name}</span>
           </span>
           <PhaseBars
             job={job}
@@ -117,6 +125,15 @@ export const DownloadRow = memo(function DownloadRow({
               ) : null}
             </span>
           </div>
+          {seedingColumn ? (
+            <ValueCell width={112}>
+              {seeding === null ? null : (
+                <span title={t("next.torrent.seedingCell")}>
+                  {`${seeding.ratio.toFixed(2)} · ↑ ${formatRate(seeding.uploadBps)}`}
+                </span>
+              )}
+            </ValueCell>
+          ) : null}
           <ValueCell>{formatSize(job.totalBytes)}</ValueCell>
           <ValueCell>
             <RowWait id={job.id} held={held} fallback={progressText} />

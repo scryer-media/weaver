@@ -25,8 +25,8 @@ const t: Translate = (key, values) =>
   Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key);
 
 const egresses: Egress[] = [
-  { id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null },
-  { id: 1, name: "WAN Fiber", bindingKind: "SOURCE_ADDRESS", interfaceName: null, sourceAddress: "192.0.2.10", enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null },
+  { id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled: true, downloadBps: null, uploadBps: null, health: "UP", reason: null },
+  { id: 1, name: "WAN Fiber", bindingKind: "SOURCE_ADDRESS", interfaceName: null, sourceAddress: "192.0.2.10", enabled: true, downloadBps: null, uploadBps: null, health: "UP", reason: null },
 ];
 const profile = (id: number, name: string, kind: ProxyKind): ProxyProfile => ({
   id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port: 51820, resolver: "WEAVER", dnsServers: [],

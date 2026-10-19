@@ -31,9 +31,7 @@ const SYSTEM_EGRESS_ID: i64 = 0;
 
 // Run the step on a connection that is already inside the transaction it
 // belongs to.
-pub(crate) async fn move_bandwidth_to_networking(
-    conn: &mut SqlConn<'_>,
-) -> Result<(), StateError> {
+pub(crate) async fn move_bandwidth_to_networking(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
     let download = setting(conn, SPEED_KEY)
         .await?
         .and_then(|value| legacy_limit(&value));
@@ -54,10 +52,7 @@ pub(crate) async fn move_bandwidth_to_networking(
     {
         conn.execute(
             "UPDATE settings SET value = {} WHERE key = {}",
-            &[
-                SqlArg::Text(schedules),
-                SqlArg::Text(SCHEDULES_KEY.into()),
-            ],
+            &[SqlArg::Text(schedules), SqlArg::Text(SCHEDULES_KEY.into())],
         )
         .await?;
     }
@@ -126,16 +121,21 @@ fn schedules_without_zero_limits(raw: &str) -> Option<String> {
 pub(crate) fn upgrade_egress_row(row: &mut Map<String, Value>) {
     if let Some(speed) = row.remove("max_download_speed") {
         let limit = speed.as_u64().filter(|&speed| speed > 0);
-        row.insert("download_bps".into(), limit.map_or(Value::Null, Value::from));
+        row.insert(
+            "download_bps".into(),
+            limit.map_or(Value::Null, Value::from),
+        );
     }
     let enabled = row.remove("download_quota_enabled");
     let limit = row.remove("download_quota_limit_bytes");
     if enabled.is_some() || limit.is_some() {
         let enabled = enabled.is_some_and(|enabled| {
-            enabled.as_bool().unwrap_or_else(|| enabled.as_i64().is_some_and(|value| value != 0))
+            enabled
+                .as_bool()
+                .unwrap_or_else(|| enabled.as_i64().is_some_and(|value| value != 0))
         });
-        let bytes = limit.filter(|_| enabled).filter(|limit| !limit.is_null());
-        row.insert("quota_download_bytes".into(), bytes.unwrap_or(Value::Null));
+        row.insert("quota_download_bytes".into(), limit.unwrap_or(Value::Null));
+        row.insert("quota_download_enabled".into(), Value::Bool(enabled));
     }
     for (older, current) in [
         ("download_quota_period", "quota_period"),
@@ -147,7 +147,10 @@ pub(crate) fn upgrade_egress_row(row: &mut Map<String, Value>) {
             "download_quota_weekly_reset_weekday",
             "quota_weekly_reset_weekday",
         ),
-        ("download_quota_monthly_reset_day", "quota_monthly_reset_day"),
+        (
+            "download_quota_monthly_reset_day",
+            "quota_monthly_reset_day",
+        ),
     ] {
         if let Some(value) = row.remove(older) {
             row.insert(current.into(), value);
@@ -166,6 +169,7 @@ pub(crate) async fn move_older_cap(conn: &mut SqlConn<'_>) -> Result<(), StateEr
     conn.execute(
         "UPDATE egress_interfaces
             SET quota_download_bytes = {},
+                quota_download_enabled = TRUE,
                 quota_period = {},
                 quota_reset_time_minutes_local = {},
                 quota_weekly_reset_weekday = {},
@@ -294,21 +298,54 @@ mod tests {
 
         upgrade_to_69(&pool).await;
 
-        let rows: Vec<(i64, Option<i64>, Option<i64>, Option<i64>, i64, String, i64, String, i64)> =
-            sqlx::query_as(
-                "SELECT id, download_bps, upload_bps, quota_download_bytes,
+        let rows: Vec<(
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            bool,
+            i64,
+            String,
+            i64,
+            String,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT id, download_bps, upload_bps, quota_download_bytes, quota_download_enabled,
                         quota_upload_trickle_bps, quota_period, quota_reset_time_minutes_local,
                         quota_weekly_reset_weekday, quota_monthly_reset_day
                    FROM egress_interfaces ORDER BY id",
-            )
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             rows,
             vec![
-                (0, None, None, Some(5_000), 2_048, "monthly".into(), 120, "wed".into(), 3),
-                (1, Some(4_096), None, None, 2_048, "one_time".into(), 0, "mon".into(), 1),
+                (
+                    0,
+                    None,
+                    None,
+                    Some(5_000),
+                    true,
+                    2_048,
+                    "monthly".into(),
+                    120,
+                    "wed".into(),
+                    3
+                ),
+                (
+                    1,
+                    Some(4_096),
+                    None,
+                    // A limit turned off is kept, and stays off.
+                    Some(9_000),
+                    false,
+                    2_048,
+                    "one_time".into(),
+                    0,
+                    "mon".into(),
+                    1
+                ),
             ]
         );
         let uncapped: i64 = sqlx::query_scalar(
@@ -368,6 +405,7 @@ mod tests {
             Value::Object(row),
             serde_json::json!({
                 "id": 1, "download_bps": null, "quota_download_bytes": 700,
+                "quota_download_enabled": true,
                 "quota_period": "daily", "quota_reset_time_minutes_local": 5,
                 "quota_weekly_reset_weekday": "fri", "quota_monthly_reset_day": 2,
             })
@@ -379,6 +417,7 @@ mod tests {
         .unwrap();
         upgrade_egress_row(&mut off);
         assert_eq!(off.get("download_bps"), Some(&Value::from(2048)));
-        assert_eq!(off.get("quota_download_bytes"), Some(&Value::Null));
+        assert_eq!(off.get("quota_download_bytes"), Some(&Value::from(700)));
+        assert_eq!(off.get("quota_download_enabled"), Some(&Value::Bool(false)));
     }
 }

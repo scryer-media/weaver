@@ -330,6 +330,22 @@ export function BetaTag({ className }: { className?: string }) {
 }
 
 
+/** A torrent's chip before its name; an NZB job carries none. */
+export const ProtocolTag = memo(function ProtocolTag({ protocol }: { protocol: "NZB" | "TORRENT" | undefined }) {
+  const t = useTranslate();
+  if (protocol !== "TORRENT") return null;
+  const label = t("next.protocol.torrent");
+  return (
+    <span
+      title={label}
+      aria-label={label}
+      className="inline-flex h-[16px] flex-none items-center border border-wv-accent/60 px-[4px] font-wv-mono text-[9.5px] leading-none font-medium tracking-[0.08em] whitespace-nowrap text-wv-accent uppercase"
+    >
+      BT
+    </span>
+  );
+});
+
 /** An outlined mono chip: a parsed release's flags, and nothing else so far. */
 export function Tag({ children }: { children: ReactNode }) {
   return (

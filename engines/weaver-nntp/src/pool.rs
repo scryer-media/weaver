@@ -2827,6 +2827,7 @@ mod tests {
         let control = registry.configure(
             stable_id,
             crate::transfer::ServerTransferConfig {
+                closed: false,
                 quota: Some(crate::transfer::QuotaRuntimeConfig {
                     limit_bytes: 0,
                     generation: 1,

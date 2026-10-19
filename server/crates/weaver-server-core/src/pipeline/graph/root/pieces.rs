@@ -33,9 +33,7 @@ use bitvec::prelude::{BitVec, Msb0};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use weaver_graph::{
-    ByteRange, MemberId, NodeId, Provenance, Pull, Segment, Tree, VolumeIndex,
-};
+use weaver_graph::{ByteRange, MemberId, NodeId, Provenance, Pull, Segment, Tree, VolumeIndex};
 
 pub(crate) use self::facts::PieceFacts;
 pub(crate) use self::layout::{LayoutError, PieceFile, PieceLayout};
@@ -113,10 +111,6 @@ impl PieceRoot {
         }
     }
 
-    pub(crate) fn layout(&self) -> &Arc<PieceLayout> {
-        &self.layout
-    }
-
     fn unit(&self, volume: VolumeIndex, piece: u32) -> Option<&Unit> {
         let first = self.layout.volume_pieces(volume).start;
         self.units
@@ -133,14 +127,17 @@ impl PieceRoot {
 
     // Every unit with its volume and piece.
     fn each(&self) -> impl Iterator<Item = (VolumeIndex, u32, Unit)> + '_ {
-        self.units.iter().enumerate().flat_map(move |(index, units)| {
-            let volume = VolumeIndex(index as u32);
-            let first = self.layout.volume_pieces(volume).start;
-            units
-                .iter()
-                .enumerate()
-                .map(move |(at, unit)| (volume, first + at as u32, *unit))
-        })
+        self.units
+            .iter()
+            .enumerate()
+            .flat_map(move |(index, units)| {
+                let volume = VolumeIndex(index as u32);
+                let first = self.layout.volume_pieces(volume).start;
+                units
+                    .iter()
+                    .enumerate()
+                    .map(move |(at, unit)| (volume, first + at as u32, *unit))
+            })
     }
 
     // Whether the volume's share of the piece is still to come.
@@ -164,15 +161,6 @@ impl PieceRoot {
         }
     }
 
-    // The torrent was abandoned: nothing will fetch what is still waiting.
-    pub(crate) fn abandon(&mut self) {
-        for unit in self.units.iter_mut().flatten() {
-            if *unit == Unit::Waiting {
-                *unit = Unit::Lost { damaged: false };
-            }
-        }
-    }
-
     // The pieces in hand, one bit per piece, most significant first: a
     // piece is in hand when every file's share of it is.
     pub(crate) fn have(&self) -> BitVec<u8, Msb0> {
@@ -180,6 +168,17 @@ impl PieceRoot {
         for (_, piece, unit) in self.each() {
             if !matches!(unit, Unit::Arrived(_)) {
                 have.set(piece as usize, false);
+            }
+        }
+        have
+    }
+
+    // Each file's bytes in hand, by its index in the torrent.
+    pub(crate) fn file_have(&self) -> Vec<u64> {
+        let mut have = vec![0; self.layout.files().count()];
+        for (volume, piece, unit) in self.each() {
+            if let (Unit::Arrived(_), Some(span)) = (unit, self.layout.span(volume, piece)) {
+                have[self.layout.volume_file(volume)] += span.len();
             }
         }
         have

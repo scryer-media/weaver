@@ -24,7 +24,7 @@ import {
 } from "../../../data/hardware-profiles";
 import { SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
 import { scheduleActionFields, scheduleActionHelp, scheduleSpeedSections, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, speedTarget, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -132,12 +132,12 @@ export function SchedulesPanel() {
   const save = async () => {
     if (form.actionType === "speed_limit") {
       // What is wrong with a rate, or a rule that sets nothing, is said before saving.
-      const typed = Object.values(form.options.speeds);
-      if (typed.some((text) => speedProblem(text) !== null)) {
+      const typed = Object.entries(form.options.speeds);
+      if (typed.some(([key, entry]) => speedProblem(entry, speedTarget(key).kind) !== null)) {
         setError(t("next.schedules.speedInvalid"));
         return;
       }
-      if (typed.every((text) => text.trim() === "")) {
+      if (typed.length === 0) {
         setError(t("next.schedules.speedNeeded"));
         return;
       }

@@ -149,6 +149,8 @@ export function settlePhases(
  */
 const WORKING_STATUSES = new Set([
   "DOWNLOADING",
+  "FETCHING_METADATA",
+  "CHECKING_FILES",
   "FETCHING_REPAIR_DATA",
   "FINALIZING_DOWNLOAD",
   "CHECKING",

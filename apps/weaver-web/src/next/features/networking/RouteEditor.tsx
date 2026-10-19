@@ -10,6 +10,7 @@ import {
   routeProblem,
   routeTargets,
   rungProxyIds,
+  isTorrentConsumer,
   type ConsumerKind,
   type Egress,
   type Leg,
@@ -91,6 +92,7 @@ export function RouteEditor({
   const t = useTranslate();
   // Only a server's connections are shared out across legs by weight.
   const split = kind === "SERVER";
+  const torrent = isTorrentConsumer(kind);
   // A lone leg is the whole route, so it is not boxed and numbered as one of several.
   const framed = value.legs.length > 1;
   const Frame = framed ? "fieldset" : "div";
@@ -102,7 +104,7 @@ export function RouteEditor({
   const targets = routeTargets(value, cap, down);
   const assigned = targets.reduce((sum, target) => sum + target, 0);
   const weight = (index: number, next: number) => onChange({ ...value, legs: adjustWeight(value.legs, index, next) });
-  const problem = routeProblem(value, { egresses, pools });
+  const problem = routeProblem(value, { egresses, pools, kind });
   const reorder = (legs: Leg[]) => {
     setDown(new Set());
     onChange({ ...value, legs });
@@ -305,7 +307,10 @@ export function RouteEditor({
                           onChange={(kind) => setRungs(seedRung(path.rungs, rungIndex, kind))}
                           options={[
                             { value: "PROXY", label: t("next.networking.route.proxy") },
-                            { value: "POOL", label: t("next.networking.route.pool") },
+                            // A torrent route cannot take a pool.
+                            ...(torrent && rung.kind !== "POOL"
+                              ? []
+                              : [{ value: "POOL" as const, label: t("next.networking.route.pool") }]),
                             { value: "CHAIN", label: t("next.networking.route.chain") },
                           ]}
                         />

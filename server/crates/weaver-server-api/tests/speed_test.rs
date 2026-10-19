@@ -553,6 +553,7 @@ fn egress_quota(h: &TestHarness, limit: u64) {
         .configure(
             StableServerId(0),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 0,
                 quota: Some(QuotaRuntimeConfig {
                     limit_bytes: limit,

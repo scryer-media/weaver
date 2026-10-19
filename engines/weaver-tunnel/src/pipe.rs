@@ -52,6 +52,8 @@ pub enum Purpose {
     Feed { feed: u32 },
     // Any other fetch Weaver makes over HTTP.
     Outbound,
+    // A torrent session's peers, trackers and metainfo downloads.
+    Torrent,
     Probe,
     // A DNS query a hop asks to resolve a name dialled through it.
     Dns,

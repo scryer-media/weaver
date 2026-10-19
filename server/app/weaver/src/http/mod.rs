@@ -14,6 +14,7 @@ mod request_metrics;
 mod routes;
 mod setup_code;
 mod system;
+mod torrent_facade;
 mod upgrade_splash;
 
 use std::sync::Arc;
@@ -71,6 +72,8 @@ pub struct ServerRuntime {
     // Handle the restart endpoint pulls to ask the serve loop to tear down
     // and start again.
     pub restart: weaver_server_core::runtime::restart::RestartController,
+    // The torrent client, when this server runs one.
+    pub torrents: Option<weaver_server_core::torrents::service::TorrentService>,
     // The pipeline's background free-space samplers for the data,
     // intermediate and complete roots. The exporter and the NZBGet status
     // read their cached readings; nothing here stats a filesystem.

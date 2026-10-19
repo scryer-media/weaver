@@ -74,6 +74,10 @@ pub enum QueueItemState {
     Completed,
     Failed,
     Paused,
+    FetchingMetadata,
+    CheckingFiles,
+    Seeding,
+    Stalled,
 }
 
 impl From<&weaver_server_core::JobStatus> for QueueItemState {
@@ -96,10 +100,10 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
             weaver_server_core::JobStatus::Partial
             | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
-            weaver_server_core::JobStatus::FetchingMetadata
-            | weaver_server_core::JobStatus::Stalled => Self::Downloading,
-            weaver_server_core::JobStatus::CheckingFiles => Self::Verifying,
-            weaver_server_core::JobStatus::Seeding => Self::Completed,
+            weaver_server_core::JobStatus::FetchingMetadata => Self::FetchingMetadata,
+            weaver_server_core::JobStatus::CheckingFiles => Self::CheckingFiles,
+            weaver_server_core::JobStatus::Seeding => Self::Seeding,
+            weaver_server_core::JobStatus::Stalled => Self::Stalled,
         }
     }
 }
@@ -326,7 +330,7 @@ pub struct QueueSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct GlobalQueueState {
     pub is_paused: bool,
-    pub speed_limit_bytes_per_sec: u64,
+    pub speed_limit_bytes_per_sec: Option<u64>,
     pub download_block: DownloadBlock,
 }
 
@@ -1151,7 +1155,7 @@ pub fn encode_offset_cursor(offset: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("off:{offset}"))
 }
 
-pub const PRIORITY_ATTRIBUTE_KEY: &str = "priority";
+pub use weaver_server_core::jobs::model::PRIORITY_ATTRIBUTE_KEY;
 
 pub fn normalize_priority_value(value: &str) -> std::result::Result<String, String> {
     let trimmed = value.trim();
@@ -1457,11 +1461,14 @@ pub fn queue_summary(items: &[QueueItem], metrics: &MetricsSnapshot) -> QueueSum
             | QueueItemState::PostProcessing => {
                 summary.active_items += 1;
             }
-            QueueItemState::Checking => {
+            QueueItemState::Checking | QueueItemState::CheckingFiles => {
                 summary.active_items += 1;
                 summary.verifying_items += 1;
             }
-            QueueItemState::Completed => {}
+            QueueItemState::FetchingMetadata | QueueItemState::Stalled => {
+                summary.active_items += 1;
+            }
+            QueueItemState::Completed | QueueItemState::Seeding => {}
         }
     }
 
@@ -1485,7 +1492,7 @@ pub fn queue_event_from_record(id: i64, record: PersistedQueueEvent) -> QueueEve
 pub fn global_queue_state(
     is_paused: bool,
     download_block: &DownloadBlockState,
-    speed_limit_bytes_per_sec: u64,
+    speed_limit_bytes_per_sec: Option<u64>,
 ) -> GlobalQueueState {
     GlobalQueueState {
         is_paused,
@@ -1600,6 +1607,15 @@ fn terminal_queue_item_state(info: &weaver_server_core::JobInfo) -> Option<Queue
     ) || matches!(info.post_state, weaver_server_core::PostState::Failed)
     {
         return Some(QueueItemState::Failed);
+    }
+
+    // A torrent's phases are named by its status alone: the lanes fold them.
+    if let state @ (QueueItemState::FetchingMetadata
+    | QueueItemState::CheckingFiles
+    | QueueItemState::Seeding
+    | QueueItemState::Stalled) = QueueItemState::from(&info.status)
+    {
+        return Some(state);
     }
 
     if matches!(

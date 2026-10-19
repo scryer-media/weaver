@@ -31,6 +31,10 @@ const zh: LocaleDictionary = {
   // Status labels
   "status.queued": "排队中",
   "status.downloading": "下载中",
+  "status.fetchingMetadata": "正在获取元数据",
+  "status.checkingFiles": "正在检查文件",
+  "status.seeding": "做种中",
+  "status.stalled": "停滞",
   "status.fetchingRepairData": "正在获取修复数据",
   "status.verifying": "校验中",
   "status.repairing": "修复中",

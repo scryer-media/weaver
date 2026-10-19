@@ -364,6 +364,12 @@ impl Consumer {
         }
     }
 
+    // Torrent scopes whose routes resolve to one leg share one session, so
+    // they share the leg's stage: it lives while any of them routes over it.
+    pub fn shares_legs(self) -> bool {
+        matches!(self, Self::Torrent(_))
+    }
+
     // A torrent session dials through one path at a time, trying its rungs in
     // order: it cannot spread over weighted legs or a pool.
     pub fn validate_route(self, route: &super::Route) -> Result<(), super::NetworkRefusal> {

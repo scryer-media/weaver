@@ -11,6 +11,7 @@ import {
   closedPath,
   directLeg,
   OUTBOUND_CONSUMER,
+  TORRENT_DEFAULT_CONSUMER,
   type ConsumerKind,
   type Egress,
   type NetworkFlow,
@@ -55,18 +56,32 @@ export type NetworkingPage = (typeof NETWORKING_PAGES)[number];
 export const speedPage = (consumer: string) => `/settings/networking/speed?consumer=${encodeURIComponent(consumer)}`;
 
 /** Run a mutation; resolves to the failure message, or null once it has landed. */
-export type NetworkingAction = (document: DocumentNode, variables: Record<string, unknown>) => Promise<string | null>;
+/** `onData` hears what a mutation that landed returned, before the pages are read again. */
+export type NetworkingAction = (
+  document: DocumentNode,
+  variables: Record<string, unknown>,
+  onData?: (data: unknown) => void,
+) => Promise<string | null>;
 
 export const EMPTY_FLOW: NetworkFlow = { legs: [], pools: [] };
 const NO_EGRESSES: Egress[] = [];
 const NO_PROFILES: ProxyProfile[] = [];
 const NO_POOLS: ProxyPool[] = [];
 
+/** A category's own torrent route is keyed by this and the category's id. */
+const TORRENT_CATEGORY_PREFIX = "torrent:category:";
+
 export const defaultRoute = (): NetworkRoute => ({ legs: [directLeg()], failover: "REDISTRIBUTE" });
 
-/** A consumer's name. Default outbound is named here, in the reader's language, not by the daemon. */
+/** A consumer's name. Default outbound and the torrent routes are named here, in the reader's language, not by the daemon. */
 export const consumerName = (t: Translate, key: string, name: string) =>
-  key === OUTBOUND_CONSUMER ? t("next.networking.defaultOutbound") : name;
+  key === OUTBOUND_CONSUMER
+    ? t("next.networking.defaultOutbound")
+    : key === TORRENT_DEFAULT_CONSUMER
+      ? t("next.networking.defaultTorrent")
+      : key.startsWith(TORRENT_CATEGORY_PREFIX)
+        ? t("next.networking.torrentCategory", { name })
+        : name;
 
 /**
  * Everything that owns a route. The flow names them once the daemon has
@@ -150,12 +165,14 @@ async function runNetworkingAction(
   variables: Record<string, unknown>,
   refresh: () => void,
   report: (failure: string | null) => void,
+  onData?: (data: unknown) => void,
 ): Promise<string | null> {
   try {
     const result = await client.mutation(document, variables).toPromise();
     const failure = result.error ? refusalMessage(t, result.error) : null;
     report(failure);
     if (failure === null) {
+      onData?.(result.data);
       refresh();
       await client.query(NETWORK_FLOW_QUERY, {}, { requestPolicy: "network-only" }).toPromise();
     }
@@ -195,7 +212,7 @@ export function useNetworkingWorkspace(page: string) {
 
   // Kept the same across renders, as is everything derived below, so a page
   // drawn again for some other reason hands its rows the same props.
-  const action = useCallback<NetworkingAction>(async (document, variables) => {
+  const action = useCallback<NetworkingAction>(async (document, variables, onData) => {
     setBusy(true);
     setMessage(null);
     const failure = await runNetworkingAction(
@@ -208,6 +225,7 @@ export function useNetworkingWorkspace(page: string) {
         setFailed(outcome !== null);
         setMessage(outcome ?? t("next.networking.saved"));
       },
+      onData,
     );
     setBusy(false);
     return failure;
@@ -274,6 +292,7 @@ export function egressInput(egress: Egress) {
     interfaceName: egress.bindingKind === "INTERFACE" ? egress.interfaceName : null,
     sourceAddress: egress.bindingKind === "SOURCE_ADDRESS" ? egress.sourceAddress : null,
     enabled: egress.enabled,
-    maxDownloadSpeed: egress.maxDownloadSpeed,
+    downloadBps: egress.downloadBps,
+    uploadBps: egress.uploadBps,
   };
 }

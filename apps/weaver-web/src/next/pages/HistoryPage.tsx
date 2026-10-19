@@ -11,11 +11,11 @@ import {
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { formatJobReleaseName, normalizeGraphqlTimestamp } from "@/lib/job-types";
+import { formatJobReleaseName, normalizeGraphqlTimestamp, type JobProtocol } from "@/lib/job-types";
 import { saveBlobAsDownload } from "@/lib/download";
 import { cn } from "@/lib/utils";
 import { statusToken } from "@/lib/status-tokens";
-import { EmptyState, MetricCell, MetricStrip, SectionHeader, Square } from "../components/chrome";
+import { EmptyState, MetricCell, MetricStrip, ProtocolTag, SectionHeader, Square } from "../components/chrome";
 import { BulkBar, BulkButton, BulkCluster } from "../components/BulkBar";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ArchivePasswordDialog } from "../components/ArchivePassword";
@@ -108,6 +108,7 @@ const TAB_STATUS: Record<TabId, "ALL" | "SUCCESS" | "FAILURE"> = {
 interface HistoryRow {
   id: number;
   name: string;
+  protocol?: JobProtocol;
   displayTitle: string;
   originalTitle: string;
   status: string;
@@ -694,11 +695,14 @@ export function HistoryPage() {
                       disabled={locked}
                       onChange={() => togglePicked(row.id)}
                     />
-                    <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
-                      {formatJobReleaseName(row)}
-                      {row.hasPassword ? (
-                        <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
-                      ) : null}
+                    <div className="flex min-w-0 items-center gap-[7px]">
+                      <ProtocolTag protocol={row.protocol} />
+                      <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
+                        {formatJobReleaseName(row)}
+                        {row.hasPassword ? (
+                          <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
+                        ) : null}
+                      </div>
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square

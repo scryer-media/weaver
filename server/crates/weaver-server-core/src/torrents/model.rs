@@ -81,6 +81,38 @@ impl TorrentState {
     }
 }
 
+// What the operator asked of a torrent, which is all of its state that is
+// kept: the state consumers read is projected from it, the session and what
+// holds the torrent back, each time it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentIntent {
+    Resumed,
+    Paused,
+    // Stopped by its seeding goal, or by a refusal found while unpacking,
+    // until the operator resumes it.
+    Stopped,
+}
+
+impl TorrentIntent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resumed => "resumed",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "resumed" => Some(Self::Resumed),
+            "paused" => Some(Self::Paused),
+            "stopped" => Some(Self::Stopped),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TorrentRecord {
     pub job_id: JobId,
@@ -92,7 +124,7 @@ pub struct TorrentRecord {
     pub private: bool,
     pub category_id: Option<u32>,
     pub added_at_ms: i64,
-    pub state: TorrentState,
+    pub intent: TorrentIntent,
     pub forced: bool,
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,

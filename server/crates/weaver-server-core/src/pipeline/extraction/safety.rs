@@ -15,7 +15,9 @@ use tracing::{info, warn};
 
 use super::error::ExtractionError;
 
-use crate::operations::disk::{Capacity, CapacityDebits, CapacityReader, probe_nearest_disk_space};
+use crate::operations::disk::{
+    Capacity, CapacityDebits, CapacityReader, CapacityReading, probe_nearest_disk_space,
+};
 use crate::operations::metrics::PipelineMetrics;
 
 mod positional;
@@ -44,6 +46,20 @@ pub(crate) struct ExtractionLimits {
 }
 
 impl ExtractionLimits {
+    // No limit at all: a writer standing alone, outside a job.
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            max_job_bytes: u64::MAX,
+            max_member_bytes: u64::MAX,
+            max_entries: u64::MAX,
+            max_ratio: u64::MAX,
+            ratio_floor_bytes: u64::MAX,
+            max_seconds: u64::MAX,
+            min_free_bytes: 0,
+            max_memory_bytes: u64::MAX,
+        }
+    }
+
     pub(crate) fn from_env(complete_dir: &Path) -> Result<Self, String> {
         Self::resolve(complete_dir, None)
     }
@@ -131,6 +147,14 @@ impl ExtractionLimits {
         } else {
             (self.max_job_bytes, ExtractionRejectionReason::JobBytes)
         }
+    }
+
+    // The free space writing `bytes` would leave on the volume `reading` is
+    // of, while that falls under the reserve. Only a fresh reading refuses:
+    // the next successful probe confirms or clears it.
+    pub(crate) fn short_of_reserve(&self, reading: &CapacityReading, bytes: u64) -> Option<u64> {
+        let remaining = reading.available_bytes.saturating_sub(bytes);
+        (remaining < self.min_free_bytes && !reading.stale).then_some(remaining)
     }
 }
 
@@ -1508,8 +1532,7 @@ impl JobExtractionBudget {
             // problem the filesystem never reported.
             return Ok(());
         };
-        let remaining = reading.available_bytes.saturating_sub(bytes);
-        if remaining < self.limits.min_free_bytes && !reading.stale {
+        if let Some(remaining) = self.limits.short_of_reserve(&reading, bytes) {
             return Err(self.reject(
                 ExtractionRejectionReason::DiskReserve,
                 format!(

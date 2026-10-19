@@ -152,7 +152,6 @@ pub struct GeneralSettings {
     pub intermediate_dir: String,
     pub complete_dir: String,
     pub cleanup_after_extract: bool,
-    pub max_download_speed: u64,
     pub max_retries: u32,
     pub propagation_delay_secs: u32,
     pub enable_srrdb_lookup: bool,
@@ -168,7 +167,6 @@ pub struct GeneralSettingsInput {
     pub intermediate_dir: MaybeUndefined<String>,
     pub complete_dir: MaybeUndefined<String>,
     pub cleanup_after_extract: Option<bool>,
-    pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
     pub propagation_delay_secs: Option<u32>,
     pub enable_srrdb_lookup: Option<bool>,
@@ -364,15 +362,17 @@ pub enum ScheduleTargetKind {
     Server,
 }
 
-/// One target of a `speed_limit` rule and the rate it sets. 0 removes the
-/// limit at that level.
+/// One target of a `speed_limit` rule and the rates it sets, in bytes per
+/// second. Null is no limit; 0 lets nothing through.
 #[derive(Debug, Clone, Copy, SimpleObject, InputObject)]
 #[graphql(input_name = "ScheduleSpeedLimitInput")]
 pub struct ScheduleSpeedLimit {
     pub kind: ScheduleTargetKind,
     /// The egress or provider id; null for the global limit.
     pub id: Option<u32>,
-    pub bytes_per_sec: u64,
+    pub download: Option<u64>,
+    /// Global limit only.
+    pub upload: Option<u64>,
 }
 
 impl From<weaver_server_core::bandwidth::SpeedLimitChange> for ScheduleSpeedLimit {
@@ -386,7 +386,8 @@ impl From<weaver_server_core::bandwidth::SpeedLimitChange> for ScheduleSpeedLimi
         Self {
             kind,
             id,
-            bytes_per_sec: change.bytes_per_sec,
+            download: change.bytes_per_sec,
+            upload: change.upload_bytes_per_sec,
         }
     }
 }
@@ -402,10 +403,15 @@ impl TryFrom<ScheduleSpeedLimit> for weaver_server_core::bandwidth::SpeedLimitCh
             (ScheduleTargetKind::Server, Some(id)) => SpeedTarget::Server(id),
             (_, None) => return Err("an egress or provider speed limit needs its id".into()),
         };
-        Ok(Self {
+        let change = Self {
             target,
-            bytes_per_sec: limit.bytes_per_sec,
-        })
+            bytes_per_sec: limit.download,
+            upload_bytes_per_sec: limit.upload,
+        };
+        match change.fault() {
+            Some(fault) => Err(fault.into()),
+            None => Ok(change),
+        }
     }
 }
 
@@ -506,7 +512,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
                 speed_limit_bytes = limits
                     .iter()
                     .find(|change| change.target == SpeedTarget::Global)
-                    .map(|change| change.bytes_per_sec);
+                    .and_then(|change| change.bytes_per_sec);
                 speed_limits = limits.iter().copied().map(Into::into).collect();
                 "speed_limit"
             }
@@ -558,11 +564,11 @@ pub struct ScheduleInput {
     pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
     /// A global rate for a `speed_limit` rule, read only when `speedLimits`
-    /// is omitted.
+    /// is omitted. 0 is no limit.
     #[graphql(deprecation = "Use speedLimits.")]
     pub speed_limit_bytes: Option<u64>,
     /// Every target a `speed_limit` rule sets. A target left out is left as
-    /// it is; 0 removes the limit at that level.
+    /// it is.
     pub speed_limits: Option<Vec<ScheduleSpeedLimit>>,
     /// Required when the action is `hardware_profile`, ignored otherwise.
     pub hardware_profile: Option<HardwareProfileGql>,
@@ -585,16 +591,19 @@ impl ScheduleInput {
                 .speed_limit_bytes
                 .map(|bytes_per_sec| SpeedLimitChange {
                     target: SpeedTarget::Global,
-                    bytes_per_sec,
+                    bytes_per_sec: (bytes_per_sec != 0).then_some(bytes_per_sec),
+                    upload_bytes_per_sec: None,
                 })
                 .into_iter()
                 .collect(),
         };
         // Egress and provider limits are stored as signed 64-bit values.
-        if changes
-            .iter()
-            .any(|change| i64::try_from(change.bytes_per_sec).is_err())
-        {
+        if changes.iter().any(|change| {
+            [change.bytes_per_sec, change.upload_bytes_per_sec]
+                .into_iter()
+                .flatten()
+                .any(|rate| i64::try_from(rate).is_err())
+        }) {
             return Err("speed limit is too large".into());
         }
         let mut seen = std::collections::HashSet::new();
@@ -832,7 +841,8 @@ mod schedule_input_tests {
         ScheduleSpeedLimit {
             kind,
             id,
-            bytes_per_sec,
+            download: Some(bytes_per_sec),
+            upload: None,
         }
     }
 
@@ -840,7 +850,7 @@ mod schedule_input_tests {
     fn a_speed_rule_sets_each_target_it_names_in_global_egress_provider_order() {
         let mut rule = input("speed_limit");
         rule.speed_limits = Some(vec![
-            limit(ScheduleTargetKind::Server, Some(4), 0),
+            limit(ScheduleTargetKind::Server, Some(4), 1_000_000),
             limit(ScheduleTargetKind::Egress, Some(2), 2_000_000),
             limit(ScheduleTargetKind::Global, None, 5_000_000),
         ]);
@@ -852,15 +862,18 @@ mod schedule_input_tests {
                 limits: vec![
                     SpeedLimitChange {
                         target: SpeedTarget::Global,
-                        bytes_per_sec: 5_000_000,
+                        bytes_per_sec: Some(5_000_000),
+                        upload_bytes_per_sec: None,
                     },
                     SpeedLimitChange {
                         target: SpeedTarget::Egress(2),
-                        bytes_per_sec: 2_000_000,
+                        bytes_per_sec: Some(2_000_000),
+                        upload_bytes_per_sec: None,
                     },
                     SpeedLimitChange {
                         target: SpeedTarget::Server(4),
-                        bytes_per_sec: 0,
+                        bytes_per_sec: Some(1_000_000),
+                        upload_bytes_per_sec: None,
                     },
                 ],
             }
@@ -881,10 +894,62 @@ mod schedule_input_tests {
             ScheduleAction::SpeedLimit {
                 limits: vec![SpeedLimitChange {
                     target: SpeedTarget::Global,
-                    bytes_per_sec: 1024,
+                    bytes_per_sec: Some(1024),
+                    upload_bytes_per_sec: None,
                 }],
             }
         );
+        // The old field's 0 was no limit.
+        let mut rule = input("speed_limit");
+        rule.speed_limit_bytes = Some(0);
+        assert_eq!(
+            rule.into_entry().unwrap().action,
+            ScheduleAction::SpeedLimit {
+                limits: vec![SpeedLimitChange {
+                    target: SpeedTarget::Global,
+                    bytes_per_sec: None,
+                    upload_bytes_per_sec: None,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn only_the_global_target_takes_an_upload_limit_and_a_provider_no_zero() {
+        let mut rule = input("speed_limit");
+        rule.speed_limits = Some(vec![ScheduleSpeedLimit {
+            kind: ScheduleTargetKind::Global,
+            id: None,
+            download: None,
+            upload: Some(0),
+        }]);
+        let entry = rule.into_entry().unwrap();
+        assert_eq!(
+            entry.action,
+            ScheduleAction::SpeedLimit {
+                limits: vec![SpeedLimitChange {
+                    target: SpeedTarget::Global,
+                    bytes_per_sec: None,
+                    upload_bytes_per_sec: Some(0),
+                }],
+            }
+        );
+        let shown = Schedule::from(entry);
+        assert_eq!(shown.speed_limits[0].upload, Some(0));
+        for (kind, download, upload) in [
+            (ScheduleTargetKind::Egress, None, Some(1)),
+            (ScheduleTargetKind::Server, None, Some(1)),
+            (ScheduleTargetKind::Server, Some(0), None),
+        ] {
+            let mut rule = input("speed_limit");
+            rule.speed_limits = Some(vec![ScheduleSpeedLimit {
+                kind,
+                id: Some(1),
+                download,
+                upload,
+            }]);
+            assert!(rule.validate(&probe()).is_err());
+        }
     }
 
     #[test]
@@ -1200,7 +1265,6 @@ impl From<&weaver_server_core::settings::Config> for GeneralSettings {
             intermediate_dir: cfg.intermediate_dir(),
             complete_dir: cfg.complete_dir(),
             cleanup_after_extract: cfg.cleanup_after_extract(),
-            max_download_speed: cfg.max_download_speed.unwrap_or(0),
             propagation_delay_secs: cfg.propagation_delay_secs(),
             max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
             enable_srrdb_lookup: cfg.enable_srrdb_lookup(),

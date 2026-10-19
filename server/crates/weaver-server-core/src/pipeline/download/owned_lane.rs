@@ -2500,6 +2500,7 @@ mod tests {
         let control = transfers.configure(
             weaver_nntp::transfer::StableServerId(77),
             weaver_nntp::transfer::ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 0,
                 quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
                     limit_bytes: 1,
@@ -2558,6 +2559,7 @@ mod tests {
         let control = transfers.configure(
             weaver_nntp::transfer::StableServerId(78),
             weaver_nntp::transfer::ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 0,
                 quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
                     limit_bytes: 1,

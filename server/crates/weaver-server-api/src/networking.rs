@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::{
-    auth::AdminGuard,
+    auth::{AdminGuard, ControlGuard, ReadGuard},
     observability::{refusal_error, spawn_blocking_db},
     proxies::ProxyKind,
 };
@@ -238,23 +238,13 @@ pub struct EgressInterfaceInput {
     pub source_address: Option<String>,
     #[graphql(default = true)]
     pub enabled: bool,
-    #[graphql(default)]
-    pub max_download_speed: u64,
-    /// The download allowance on this egress. Omitted on an update, the
-    /// saved quota stays as it is; omitted on a create, there is none.
-    pub download_quota: Option<crate::servers::types::ServerDownloadQuotaInput>,
+    /// Bytes per second; null is no limit.
+    pub download_bps: Option<u64>,
+    /// Bytes per second; null is no limit.
+    pub upload_bps: Option<u64>,
 }
 impl EgressInterfaceInput {
-    fn egress(
-        self,
-        id: u32,
-        saved_quota: weaver_server_core::servers::ServerDownloadQuotaConfig,
-    ) -> Result<core::EgressInterface> {
-        // The egress checks its own quota below, so a refusal names an egress.
-        let download_quota = match self.download_quota {
-            Some(quota) => quota.config(),
-            None => saved_quota,
-        };
+    fn egress(self, id: u32, quota: core::EgressQuota) -> Result<core::EgressInterface> {
         let binding = match self.binding_kind {
             EgressBindingKind::System => core::EgressBinding::System,
             EgressBindingKind::Interface => {
@@ -282,8 +272,9 @@ impl EgressInterfaceInput {
             name: self.name,
             binding,
             enabled: self.enabled,
-            max_download_speed: self.max_download_speed,
-            download_quota,
+            download_bps: self.download_bps,
+            upload_bps: self.upload_bps,
+            quota,
         };
         egress.validate().map_err(refusal_error)?;
         Ok(egress)
@@ -299,12 +290,11 @@ pub struct EgressInterfaceGql {
     pub source_address: Option<String>,
     pub addresses: Vec<String>,
     pub enabled: bool,
-    pub max_download_speed: u64,
-    /// The download allowance and its live usage.
-    pub download_quota: crate::servers::types::ServerDownloadQuota,
-    /// The live usage of the download allowance, or null while this Weaver
-    /// is not tracking it.
-    pub download_quota_usage: Option<crate::servers::types::DownloadQuotaUsage>,
+    pub download_bps: Option<u64>,
+    pub upload_bps: Option<u64>,
+    pub quota: EgressQuotaGql,
+    /// Null while this Weaver is not tracking usage.
+    pub quota_usage: Option<EgressQuotaUsageGql>,
     pub health: String,
     pub reason: Option<String>,
 }
@@ -322,9 +312,7 @@ fn egress_gql(
         core::EgressHealth::Up => ("UP", None),
         core::EgressHealth::Unknown => ("UNKNOWN", interfaces.error.clone()),
     };
-    let download_quota =
-        crate::servers::types::ServerDownloadQuota::from_config(&e.download_quota, usage.as_ref());
-    let download_quota_usage = usage.as_ref().map(Into::into);
+    let quota_usage = network.egress_usage(e.id).map(Into::into);
     let addresses = interfaces
         .interfaces
         .iter()
@@ -362,11 +350,161 @@ fn egress_gql(
         source_address,
         addresses,
         enabled: e.enabled,
-        max_download_speed: e.max_download_speed,
-        download_quota,
-        download_quota_usage,
+        download_bps: e.download_bps,
+        upload_bps: e.upload_bps,
+        quota: e.quota.into(),
+        quota_usage,
         health: health.into(),
         reason,
+    }
+}
+/// Bytes per second in each direction; null is no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "Bandwidth")]
+pub struct BandwidthGql {
+    pub download_bps: Option<u64>,
+    pub upload_bps: Option<u64>,
+}
+impl From<core::Bandwidth> for BandwidthGql {
+    fn from(value: core::Bandwidth) -> Self {
+        Self {
+            download_bps: value.download_bps,
+            upload_bps: value.upload_bps,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, InputObject)]
+pub struct BandwidthInput {
+    pub download_bps: Option<u64>,
+    pub upload_bps: Option<u64>,
+}
+impl From<BandwidthInput> for core::Bandwidth {
+    fn from(value: BandwidthInput) -> Self {
+        Self {
+            download_bps: value.download_bps,
+            upload_bps: value.upload_bps,
+        }
+    }
+}
+pub struct Networking;
+#[Object]
+impl Networking {
+    async fn bandwidth(&self, ctx: &Context<'_>) -> Result<BandwidthGql> {
+        let config = ctx.data::<weaver_server_core::settings::SharedConfig>()?;
+        Ok(config.read().await.bandwidth.into())
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum QuotaStateGql {
+    Normal,
+    Trickle,
+    Stopped,
+}
+impl From<weaver_server_core::bandwidth::QuotaState> for QuotaStateGql {
+    fn from(value: weaver_server_core::bandwidth::QuotaState) -> Self {
+        use weaver_server_core::bandwidth::QuotaState;
+        match value {
+            QuotaState::Normal => Self::Normal,
+            QuotaState::Trickle => Self::Trickle,
+            QuotaState::Stopped => Self::Stopped,
+        }
+    }
+}
+/// Caps per period; null is no cap, 0 a budget of nothing.
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
+#[graphql(name = "EgressQuota")]
+pub struct EgressQuotaGql {
+    pub download_bytes: Option<u64>,
+    pub upload_soft_bytes: Option<u64>,
+    pub upload_trickle_bps: u64,
+    pub upload_hard_bytes: Option<u64>,
+    pub period: crate::servers::types::ServerDownloadQuotaPeriodGql,
+    pub reset_time_minutes_local: u16,
+    pub weekly_reset_weekday: crate::servers::types::ServerDownloadQuotaWeekdayGql,
+    pub monthly_reset_day: u8,
+}
+impl From<core::EgressQuota> for EgressQuotaGql {
+    fn from(value: core::EgressQuota) -> Self {
+        Self {
+            download_bytes: value.download_bytes,
+            upload_soft_bytes: value.upload_soft_bytes,
+            upload_trickle_bps: value.upload_trickle_bps,
+            upload_hard_bytes: value.upload_hard_bytes,
+            period: value.period.into(),
+            reset_time_minutes_local: value.reset_time_minutes_local,
+            weekly_reset_weekday: value.weekly_reset_weekday.into(),
+            monthly_reset_day: value.monthly_reset_day,
+        }
+    }
+}
+#[derive(Clone, Debug, InputObject)]
+pub struct EgressQuotaInput {
+    pub download_bytes: Option<u64>,
+    pub upload_soft_bytes: Option<u64>,
+    #[graphql(default = 2048)]
+    pub upload_trickle_bps: u64,
+    pub upload_hard_bytes: Option<u64>,
+    #[graphql(default)]
+    pub period: crate::servers::types::ServerDownloadQuotaPeriodGql,
+    #[graphql(default = 0)]
+    pub reset_time_minutes_local: u16,
+    #[graphql(default)]
+    pub weekly_reset_weekday: crate::servers::types::ServerDownloadQuotaWeekdayGql,
+    #[graphql(default = 1)]
+    pub monthly_reset_day: u8,
+}
+impl From<EgressQuotaInput> for core::EgressQuota {
+    fn from(value: EgressQuotaInput) -> Self {
+        Self {
+            download_bytes: value.download_bytes,
+            upload_soft_bytes: value.upload_soft_bytes,
+            upload_trickle_bps: value.upload_trickle_bps,
+            upload_hard_bytes: value.upload_hard_bytes,
+            period: value.period.into(),
+            reset_time_minutes_local: value.reset_time_minutes_local,
+            weekly_reset_weekday: value.weekly_reset_weekday.into(),
+            monthly_reset_day: value.monthly_reset_day,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+pub struct QuotaDirectionUsage {
+    pub used_bytes: u64,
+    /// Null when the direction has no cap.
+    pub remaining_bytes: Option<u64>,
+    pub state: QuotaStateGql,
+}
+impl From<weaver_server_core::servers::transfer_policy::DirectionUsage> for QuotaDirectionUsage {
+    fn from(value: weaver_server_core::servers::transfer_policy::DirectionUsage) -> Self {
+        Self {
+            used_bytes: value.used_bytes,
+            remaining_bytes: value.remaining_bytes,
+            state: value.state.into(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
+pub struct EgressQuotaUsageGql {
+    pub down: QuotaDirectionUsage,
+    pub up: QuotaDirectionUsage,
+    /// The tighter of the two directions.
+    pub state: QuotaStateGql,
+    pub period_start_epoch_ms: Option<f64>,
+    pub period_end_epoch_ms: Option<f64>,
+    pub timezone_name: String,
+}
+impl From<weaver_server_core::servers::transfer_policy::EgressQuotaUsage> for EgressQuotaUsageGql {
+    fn from(value: weaver_server_core::servers::transfer_policy::EgressQuotaUsage) -> Self {
+        Self {
+            down: value.download.into(),
+            up: value.upload.into(),
+            state: value.download.state.max(value.upload.state).into(),
+            period_start_epoch_ms: value
+                .window_start
+                .map(|start| start.timestamp_millis() as f64),
+            period_end_epoch_ms: value.window_end.map(|end| end.timestamp_millis() as f64),
+            timezone_name: value.timezone,
+        }
     }
 }
 #[derive(SimpleObject)]
@@ -952,6 +1090,10 @@ fn runtime(ctx: &Context<'_>) -> Result<Arc<ProxyRuntime>> {
 pub struct NetworkingQuery;
 #[Object]
 impl NetworkingQuery {
+    #[graphql(guard = "ReadGuard")]
+    async fn networking(&self) -> Networking {
+        Networking
+    }
     #[graphql(guard = "AdminGuard")]
     async fn egress_interfaces(&self, ctx: &Context<'_>) -> Result<Vec<EgressInterfaceGql>> {
         let runtime = runtime(ctx)?;
@@ -1115,9 +1257,7 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
-        let saved_quota = if input.download_quota.is_some() {
-            Default::default()
-        } else {
+        let saved_quota = {
             let db = db.clone();
             spawn_blocking_db("network.update_egress.saved_quota", move || {
                 db.list_egress_interfaces()
@@ -1125,7 +1265,7 @@ impl NetworkingMutation {
             .await?
             .into_iter()
             .find(|egress| egress.id == id)
-            .map(|egress| egress.download_quota)
+            .map(|egress| egress.quota)
             .unwrap_or_default()
         };
         let egress = input.egress(id, saved_quota)?;
@@ -1139,6 +1279,55 @@ impl NetworkingMutation {
             &runtime.network.interfaces(),
             &runtime.network,
         ))
+    }
+    #[graphql(guard = "AdminGuard")]
+    async fn set_egress_quota(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+        input: EgressQuotaInput,
+    ) -> Result<EgressInterfaceGql> {
+        let runtime = runtime(ctx)?;
+        let _guard = runtime.mutations.lock().await;
+        let db = ctx.data::<Database>()?.clone();
+        let quota = core::EgressQuota::from(input);
+        let saved = spawn_blocking_db("network.set_egress_quota", move || {
+            let mut egress = db
+                .list_egress_interfaces()?
+                .into_iter()
+                .find(|egress| egress.id == id)
+                .ok_or(NetworkRefusal::EgressNotFound)?;
+            egress.quota = quota;
+            db.update_egress_interface(&egress)
+        })
+        .await?;
+        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        Ok(egress_gql(
+            saved,
+            &runtime.network.interfaces(),
+            &runtime.network,
+        ))
+    }
+    #[graphql(guard = "ControlGuard")]
+    async fn set_bandwidth(
+        &self,
+        ctx: &Context<'_>,
+        input: BandwidthInput,
+    ) -> Result<BandwidthGql> {
+        let handle = ctx.data::<weaver_server_core::SchedulerHandle>()?;
+        let config = ctx.data::<weaver_server_core::settings::SharedConfig>()?;
+        let db = ctx.data::<Database>()?;
+        let bandwidth = core::Bandwidth::from(input);
+        handle
+            .save_bandwidth(db, config, bandwidth)
+            .await
+            .map_err(|error| match error {
+                weaver_server_core::SchedulerError::State(error) => {
+                    crate::observability::state_error(error)
+                }
+                error => async_graphql::Error::new(error.to_string()),
+            })?;
+        Ok(bandwidth.into())
     }
     #[graphql(guard = "AdminGuard")]
     async fn delete_egress_interface(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {

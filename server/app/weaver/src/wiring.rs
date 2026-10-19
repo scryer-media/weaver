@@ -285,8 +285,9 @@ mod tests {
                     name: "weaver-absent0".into(),
                 },
                 enabled: true,
-                max_download_speed: 0,
-                download_quota: Default::default(),
+                download_bps: None,
+                upload_bps: None,
+                quota: Default::default(),
             })
             .unwrap();
         db.save_proxy_routing_policy(
