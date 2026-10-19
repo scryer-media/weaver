@@ -740,6 +740,49 @@ impl Tree {
         }
     }
 
+    // A recovery object repaired the member, a leaf of `node`'s namespace:
+    // a refusal of it was a verdict on bytes it no longer holds. Every
+    // object that refused it goes, with what it kept, and each of its
+    // volumes is a member no object owns, asked again who owns it as a
+    // member whose front has just spoken. Returns those volumes; none when
+    // nothing refused the member.
+    pub fn reopen(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) -> Vec<MemberId> {
+        if self.child_of(node, member).is_some() {
+            return Vec::new();
+        }
+        let refusers: Vec<NodeId> = self
+            .refused_below(node)
+            .into_iter()
+            .filter(|object| {
+                self.volumes(*object)
+                    .is_some_and(|(_, volumes)| volumes.values().any(|bound| *bound == member))
+            })
+            .collect();
+        let mut reopened = Vec::new();
+        for refuser in refusers {
+            if let Some((_, volumes)) = self.volumes(refuser) {
+                reopened.extend(volumes.values().copied());
+            }
+            self.drop_subtree(refuser);
+            self.remove_node(refuser);
+        }
+        for volume in &reopened {
+            self.retired.remove(&(node, *volume));
+        }
+        // The repaired member first: what it binds is offered the rest.
+        reopened.sort_by_key(|volume| *volume != member);
+        for volume in &reopened {
+            self.identify_again(node, *volume, builder, effects);
+        }
+        reopened
+    }
+
     // What of a buried node stays: each member with a file of its own that
     // closed whole, and each member whose owner keeps something below it,
     // all of them leaves now. A member the object announced and never

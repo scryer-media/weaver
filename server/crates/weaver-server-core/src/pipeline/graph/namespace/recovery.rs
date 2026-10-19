@@ -352,7 +352,10 @@ impl NamespaceWriter {
     // it reads the members and its own volumes through the tree it lives
     // in. The ranges it repaired come back through the one write path as
     // repaired bytes, so a leaf is overwritten and a bound member's object
-    // takes them as any delivery. Returns what each set that ruled came to.
+    // takes them as any delivery. A member whose bytes a set rewrote or
+    // proved is offered again once the sets are done, so whatever refused
+    // it on the bytes it held before reads it as it is now. Returns what
+    // each set that ruled came to.
     pub(crate) fn repair(
         &mut self,
         tree: &mut Tree,
@@ -363,6 +366,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<Vec<(NodeId, RepairOutcome)>, WriteError> {
         let mut ruled = Vec::new();
+        let mut rewritten = std::collections::BTreeSet::new();
         for &set in due {
             let Some(mut object) = tree.take_object(set) else {
                 continue;
@@ -380,6 +384,7 @@ impl NamespaceWriter {
             self.read_backs += reads;
             ruled.extend(outcome.map(|outcome| (set, outcome)));
             for (member, offset, bytes) in repaired {
+                rewritten.insert(member);
                 let arrival = Arrival {
                     node,
                     member,
@@ -397,8 +402,11 @@ impl NamespaceWriter {
                 outcome,
                 Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
             ) {
-                self.vouched(tree, builder, segments, (node, set), out)?;
+                rewritten.extend(self.vouched(tree, builder, segments, (node, set), out)?);
             }
+        }
+        for member in rewritten {
+            self.reopen(tree, builder, segments, (node, member), out)?;
         }
         // A repair reads members back, so it may have identified one by its
         // content; the bind that follows gives it the name it is.
@@ -412,7 +420,7 @@ impl NamespaceWriter {
     // after all among them: it rewrites only the slices that were bad. Every
     // byte still marked damaged is delivered again as repaired, read back
     // from wherever it went, so the marks here and in every namespace below
-    // it say what the set proved.
+    // it say what the set proved. Returns the members it delivered again.
     fn vouched(
         &mut self,
         tree: &mut Tree,
@@ -420,7 +428,7 @@ impl NamespaceWriter {
         segments: &dyn Segments,
         (node, set): (NodeId, NodeId),
         out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Vec<MemberId>, WriteError> {
         let marked: Vec<(MemberId, ByteRange)> = tree
             .namespace(node)
             .map(|namespace| {
@@ -433,11 +441,37 @@ impl NamespaceWriter {
                     .collect()
             })
             .unwrap_or_default();
+        let members = marked.iter().map(|(member, _)| *member).collect();
         for (member, range) in marked {
             let proven = (node, member, range, Provenance::Repaired);
             self.redeliver(tree, builder, segments, proven, out)?;
         }
-        Ok(())
+        Ok(members)
+    }
+
+    // The member's bytes were rewritten or proved: any refusal of it was
+    // given on bytes it no longer holds. The tree takes it back and asks
+    // who owns it again; what the refusing object kept goes with it, and a
+    // member no object takes is a leaf for no reason.
+    fn reopen(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, member): (NodeId, MemberId),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let mut effects = Vec::new();
+        let reopened = tree.reopen(node, member, &mut self.placing(builder), &mut effects);
+        if reopened.is_empty() {
+            return Ok(());
+        }
+        let files = self.files_mut(node);
+        for volume in &reopened {
+            files.refused.remove(volume);
+        }
+        self.prune(tree)?;
+        self.apply_each(tree, builder, segments, effects, out)
     }
 
     // Deliver a range of a member again, read back from wherever it went,

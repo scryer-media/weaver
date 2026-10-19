@@ -85,6 +85,7 @@ mod plain_par2;
 mod rar;
 mod rar_engine;
 mod rar_rev;
+mod refused_then_repaired;
 mod restart;
 mod seek;
 mod sets;
