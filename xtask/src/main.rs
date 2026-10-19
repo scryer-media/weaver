@@ -2644,9 +2644,18 @@ fn ensure_cargo_nextest(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
 }
 
 fn run_weaver_nextest_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
-    prefixed_step(prefix, "Running cargo nextest run --workspace --locked");
+    prefixed_step(
+        prefix,
+        "Running cargo nextest run --workspace --locked --no-fail-fast",
+    );
     let mut nextest = ctx.command_in("cargo", &ctx.repo_root);
-    nextest.args(["nextest", "run", "--workspace", "--locked"]);
+    nextest.args([
+        "nextest",
+        "run",
+        "--workspace",
+        "--locked",
+        "--no-fail-fast",
+    ]);
     run_streaming(&mut nextest, prefix)?;
     prefixed_ok(prefix, "Rust tests passed");
     Ok(())

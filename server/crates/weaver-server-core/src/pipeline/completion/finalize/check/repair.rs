@@ -102,6 +102,7 @@ impl Pipeline {
         let mut touched_files = Vec::<NzbFileId>::new();
         let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
         let mut renamed_away = HashSet::<String>::new();
+        let mut file_renames = Vec::<crate::ingest::FileRename>::new();
         for (set_id, suggestion) in &suggestions {
             let old = &suggestion.current_path;
             let requested_correct_name = sanitize_download_filename(&suggestion.correct_name);
@@ -320,6 +321,11 @@ impl Pipeline {
                 .map(|name| name.to_string_lossy().to_string())
                 == Some(correct_name.clone())
             {
+                file_renames.push(crate::ingest::FileRename {
+                    from: old_name.clone(),
+                    to: correct_name,
+                    full_name: suggestion.correct_name.clone(),
+                });
                 continue;
             }
 
@@ -383,6 +389,13 @@ impl Pipeline {
             if !renamed_successfully {
                 continue;
             }
+            // The described name in full, before Weaver cleaned or shortened
+            // it into the one on disk.
+            file_renames.push(crate::ingest::FileRename {
+                from: old_name.clone(),
+                to: correct_name.clone(),
+                full_name: suggestion.correct_name.clone(),
+            });
 
             if let Some((file_id, is_complete)) = matched {
                 let Some((_, identity, _)) = file_rows
@@ -435,6 +448,8 @@ impl Pipeline {
                 }
             }
         }
+
+        self.record_file_renames(job_id, &file_renames);
 
         for (set_name, touched_filenames) in &touched_rar_files {
             self.invalidate_archive_set_for_identity_rebind(job_id, set_name, touched_filenames);

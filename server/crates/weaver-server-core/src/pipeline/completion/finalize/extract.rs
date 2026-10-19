@@ -2417,9 +2417,20 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
 ) -> Result<(Vec<String>, Option<String>), ExtractionError> {
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| ExtractionError::from_zip(format!("failed to read zip archive: {e}"), &e))?;
+    let mut file = BudgetedReader::new(file, Arc::clone(budget));
+    // Unless told where the archive starts, zip scans forward from the first
+    // byte for the zip64 end record, which blocks on payload ranges that have
+    // not downloaded yet. Only an archive with data in front of it falls back
+    // to that scan.
+    let starts_at_zero = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let mut archive = match zip::ZipArchive::with_config(starts_at_zero, &mut file) {
+        Ok(archive) => archive,
+        Err(_) => zip::ZipArchive::new(&mut file).map_err(|e| {
+            ExtractionError::from_zip(format!("failed to read zip archive: {e}"), &e)
+        })?,
+    };
     budget.check_archive_metadata(
         archive.len() as u64,
         archive
@@ -2431,7 +2442,10 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
     // header. Opening all members here would block the first extraction on
     // headers in payload ranges that have not downloaded yet.
     for raw_name in archive.file_names() {
-        validate_zip_entry_path(raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
+        let raw_name = raw_name.map_err(|error| {
+            ExtractionError::from_zip(format!("failed to read zip entry name: {error}"), &error)
+        })?;
+        validate_zip_entry_path(&raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
     }
     let known_total = archive
         .decompressed_size()
@@ -2491,8 +2505,16 @@ pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std:
         .map_err(|error| {
             ExtractionError::from_zip(format!("failed to read zip entry {i}: {error}"), &error)
         })?;
-        budget.check_member_metadata(entry.name(), entry.size())?;
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(|error| {
+                ExtractionError::from_zip(
+                    format!("failed to read zip entry {i} name: {error}"),
+                    &error,
+                )
+            })?
+            .into_owned();
+        budget.check_member_metadata(&raw_name, entry.size())?;
         let safe_path =
             validate_zip_entry_path(&raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
         let name = safe_path.to_string_lossy().replace('\\', "/");

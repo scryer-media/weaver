@@ -29,15 +29,8 @@ fn gzip_with_bad_trailer() -> Vec<u8> {
     bytes
 }
 
-fn sevenz_block(kind: sevenz_turbo::BlockErrorKind, message: &str) -> ExtractionError {
-    crate::pipeline::completion::finalize::extract::sevenz_extraction_error(
-        &sevenz_turbo::Error::BlockDecode {
-            block_index: 0,
-            packed_offset: 32,
-            kind,
-            message: message.into(),
-        },
-    )
+fn sevenz_block(cause: sevenz_turbo::Error) -> ExtractionError {
+    crate::pipeline::completion::finalize::extract::sevenz_extraction_error(&cause.in_block(0, 32))
 }
 
 // (engine, set name, error, class the engine's error maps to)
@@ -47,7 +40,6 @@ fn engine_errors() -> Vec<(
     ExtractionError,
     ExtractionErrorClass,
 )> {
-    use sevenz_turbo::BlockErrorKind;
     use zip::result::ZipError;
     let zip_crc = ZipError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -90,16 +82,15 @@ fn engine_errors() -> Vec<(
         (
             "7z",
             "archive.7z",
-            sevenz_block(BlockErrorKind::Corrupted, "data error"),
+            sevenz_block(sevenz_turbo::Error::Corrupted("data error".into())),
             ExtractionErrorClass::Recoverable,
         ),
         (
             "7z",
             "archive.7z",
-            sevenz_block(
-                BlockErrorKind::UnsupportedMethod,
-                "UnsupportedCompressionMethod(\"ARM64\")",
-            ),
+            sevenz_block(sevenz_turbo::Error::UnsupportedCompressionMethod(
+                "ARM64".into(),
+            )),
             ExtractionErrorClass::Terminal,
         ),
         (

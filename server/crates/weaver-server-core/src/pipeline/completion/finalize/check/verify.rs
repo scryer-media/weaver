@@ -674,6 +674,8 @@ impl Pipeline {
             return Ok(report);
         };
 
+        // The described name of each verified file, in full.
+        let mut full_names = HashMap::<NzbFileId, String>::new();
         let files_to_complete: Vec<(NzbFileId, String)> = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return Ok(report);
@@ -907,6 +909,7 @@ impl Pipeline {
                         report.contested.push(file_verification.filename.clone());
                     }
                     std::collections::hash_map::Entry::Vacant(slot) => {
+                        full_names.insert(file_id, file_verification.filename.clone());
                         slot.insert(verified_filename);
                     }
                 }
@@ -919,6 +922,7 @@ impl Pipeline {
             return Ok(report);
         }
 
+        let mut file_renames = Vec::<crate::ingest::FileRename>::new();
         for (file_id, verified_filename) in &files_to_complete {
             let Some(mut identity) = self.effective_file_identity(job_id, *file_id) else {
                 continue;
@@ -955,6 +959,14 @@ impl Pipeline {
                     ),
                 }
             }
+            file_renames.push(crate::ingest::FileRename {
+                from: identity.current_filename.clone(),
+                to: verified_filename.clone(),
+                full_name: full_names
+                    .get(file_id)
+                    .cloned()
+                    .unwrap_or_else(|| verified_filename.clone()),
+            });
             identity.current_filename = verified_filename.clone();
             identity.canonical_filename = Some(verified_filename.clone());
             if let Some(classification) =
@@ -965,6 +977,7 @@ impl Pipeline {
             identity.classification_source = crate::jobs::record::FileIdentitySource::Par2;
             self.set_file_identity(job_id, identity)?;
         }
+        self.record_file_renames(job_id, &file_renames);
 
         {
             let Some(state) = self.jobs.get_mut(&job_id) else {

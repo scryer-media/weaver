@@ -82,7 +82,13 @@ async fn resolved(
         .unwrap();
     assert_eq!(tests.len(), 1);
     let test = tests.remove(0);
-    (test.outcome, test.resolution.expect("a resolution"))
+    let resolution = test.resolution.unwrap_or_else(|| {
+        panic!(
+            "no resolution for {target:?}: outcome={:?}, failing_proxy={:?}",
+            test.outcome, test.failing_proxy
+        )
+    });
+    (test.outcome, resolution)
 }
 
 async fn refusal(runtime: &NetworkRuntime, path: LegPath, subject: TestSubject) -> NetworkRefusal {
@@ -238,8 +244,14 @@ async fn a_stream_proxy_is_reached_at_its_endpoint_through_each_path() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel() {
+// A probe owns fresh client sessions and shuts them down before returning.
+// Give each scenario fresh peers too: a peer retained after its client closes
+// can receive a Windows UDP reset and lose its receive loop.
+async fn nested_tunnel_fixture() -> (
+    Arc<NetworkRuntime>,
+    Route,
+    [weaver_tunnel::test_support::WireGuardTestPeer; 2],
+) {
     let (near, far) = stacked_peers().await;
     let runtime = runtime_with(
         vec![
@@ -250,6 +262,12 @@ async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel()
         vec![],
     );
     let route = draft(ladder(vec![Rung::Proxy { id: 1 }]));
+    (runtime, route, [near, far])
+}
+
+#[tokio::test]
+async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel() {
+    let (runtime, route, [near, _far]) = nested_tunnel_fixture().await;
     let tests = runtime
         .test_via(&route, TestSubject::Proxy(2), None)
         .await
@@ -273,7 +291,13 @@ async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel()
     assert_eq!(resolution.connected, Some(IpAddr::V4(TEST_PEER_ADDRESS)));
     assert_eq!(resolution.error, None);
 
-    // Given a target, the far tunnel carries a connection to it.
+    assert!(runtime.sessions.lock().unwrap().is_empty());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_nested_tunnel_probe_forwards_to_its_target() {
+    let (runtime, route, _peers) = nested_tunnel_fixture().await;
     let tests = runtime
         .test_via(
             &route,
@@ -286,7 +310,13 @@ async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel()
     let resolution = tests[0].resolution.clone().unwrap();
     assert_eq!(resolution.by, ResolvedBy::Literal);
     assert_eq!(resolution.connected, Some(IpAddr::V4(TEST_PEER_ADDRESS)));
-    // A name the far tunnel's DNS server does not know fails the lookup.
+    assert!(runtime.sessions.lock().unwrap().is_empty());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_nested_tunnel_probe_reports_a_missing_target_name() {
+    let (runtime, route, _peers) = nested_tunnel_fixture().await;
     let (outcome, resolution) = resolved(
         &runtime,
         &route,
@@ -627,9 +657,14 @@ async fn a_pool_carries_the_target_through_the_member_it_picks() {
         HashMap::from([(("named.invalid".into(), to.port()), to)]),
     )
     .await;
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead = closed.local_addr().unwrap().port();
-    drop(closed);
+    // An unmapped target gets an explicit SOCKS host-unreachable reply.
+    // A closed OS port can time out before Windows reports a refusal.
+    let refusing = ProxyServerDouble::start(
+        weaver_tunnel::transport::TransportKind::Socks5,
+        None,
+        HashMap::new(),
+    )
+    .await;
     let pool = |id, member_ids| ProxyPool {
         id,
         name: "pool".into(),
@@ -640,10 +675,7 @@ async fn a_pool_carries_the_target_through_the_member_it_picks() {
     let runtime = runtime_with(
         vec![
             socks_at(1, &double, Naming::Proxy, &[]),
-            ProxyProfile {
-                resolver: Naming::Proxy,
-                ..socks(2, dead)
-            },
+            socks_at(2, &refusing, Naming::Proxy, &[]),
         ],
         vec![pool(9, vec![2, 1]), pool(8, vec![2])],
         vec![],
@@ -688,19 +720,27 @@ async fn a_pool_carries_the_target_through_the_member_it_picks() {
         .test_via(&route, TestSubject::Pool(9), None)
         .await
         .unwrap();
-    assert_eq!(
-        rows(&tests),
-        [(None, Some(2), false), (None, Some(1), true)]
-    );
+    // Without a target this probes endpoints. The refusing proxy is live,
+    // even though it cannot carry the named destination.
+    assert_eq!(rows(&tests), [(None, Some(2), true), (None, Some(1), true)]);
+    for test in &tests {
+        assert_eq!(test.outcome, Ok(ProxyTestPass::Reachable));
+    }
 
-    // A pool no member of which answers picks none, and says what the last
-    // member to fail came to.
+    // A pool with no member that can carry the target picks none, and
+    // attributes the explicit refusal to the member that returned it.
     let tests = runtime
         .test_via(&route, TestSubject::Pool(8), named)
         .await
         .unwrap();
     assert_eq!(rows(&tests), [(Some(8), None, false)]);
-    assert_eq!(tests[0].outcome, Err(ProxyFault::ConnectionRefused));
-    assert_eq!(tests[0].failing_proxy, None);
+    assert_eq!(
+        tests[0].outcome,
+        Err(ProxyFault::DestinationUnreachable {
+            target: format!("named.invalid:{}", to.port()),
+            reply: "SOCKS reply 4".into(),
+        })
+    );
+    assert_eq!(tests[0].failing_proxy, Some(2));
     runtime.shutdown().await;
 }

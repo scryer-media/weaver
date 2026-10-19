@@ -193,7 +193,7 @@ impl ExtractionRoot {
         }
         #[cfg(windows)]
         {
-            use cap_fs_ext::MetadataExt;
+            use cap_primitives::fs::_WindowsByHandle;
             Ok(actual.volume_serial_number().is_some()
                 && actual.file_index().is_some()
                 && actual.volume_serial_number() == expected.volume_serial_number()

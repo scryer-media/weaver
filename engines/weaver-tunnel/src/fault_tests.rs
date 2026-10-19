@@ -238,14 +238,25 @@ fn a_reply_reads_back_as_written() {
 
 #[test]
 fn an_operating_system_error_is_read_by_its_number() {
+    #[cfg(unix)]
+    use libc::{ECONNREFUSED, ECONNRESET, EHOSTUNREACH, ENETDOWN, ENETUNREACH, EPIPE, ETIMEDOUT};
+    #[cfg(windows)]
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAECONNREFUSED as ECONNREFUSED, WSAECONNRESET as ECONNRESET,
+        WSAEHOSTUNREACH as EHOSTUNREACH, WSAENETDOWN as ENETDOWN, WSAENETUNREACH as ENETUNREACH,
+        WSAETIMEDOUT as ETIMEDOUT,
+    };
+    #[cfg(windows)]
+    const EPIPE: i32 = windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32;
+
     let cases = [
-        (libc::ECONNREFUSED, ProxyFault::ConnectionRefused),
-        (libc::EHOSTUNREACH, ProxyFault::HostUnreachable),
-        (libc::ENETUNREACH, ProxyFault::NetworkUnreachable),
-        (libc::ENETDOWN, ProxyFault::NetworkUnreachable),
-        (libc::ETIMEDOUT, ProxyFault::TimedOut { seconds: 30 }),
-        (libc::ECONNRESET, ProxyFault::ConnectionClosed),
-        (libc::EPIPE, ProxyFault::ConnectionClosed),
+        (ECONNREFUSED, ProxyFault::ConnectionRefused),
+        (EHOSTUNREACH, ProxyFault::HostUnreachable),
+        (ENETUNREACH, ProxyFault::NetworkUnreachable),
+        (ENETDOWN, ProxyFault::NetworkUnreachable),
+        (ETIMEDOUT, ProxyFault::TimedOut { seconds: 30 }),
+        (ECONNRESET, ProxyFault::ConnectionClosed),
+        (EPIPE, ProxyFault::ConnectionClosed),
     ];
     for (number, expected) in cases {
         let error = io::Error::from_raw_os_error(number);
@@ -515,7 +526,11 @@ fn wireguard_tunnel_failures_are_named() {
         ),
         ProxyFault::NameNotResolved
     );
+    #[cfg(unix)]
     let refused = io::Error::from_raw_os_error(libc::ECONNREFUSED);
+    #[cfg(windows)]
+    let refused =
+        io::Error::from_raw_os_error(windows_sys::Win32::Networking::WinSock::WSAECONNREFUSED);
     assert_eq!(
         classify(&connect(format!("{WIREGUARD_CARRIER}{refused}")), WAIT),
         ProxyFault::ConnectionRefused

@@ -652,7 +652,7 @@ async fn run_move_to_claimed_destination(
         Some(naming) => {
             deobfuscate::rename_obfuscated_members(job_id, &dest, &naming, &policy).await
         }
-        None => 0,
+        None => Vec::new(),
     };
 
     let output_dir = dest.clone();
@@ -1195,11 +1195,12 @@ impl Pipeline {
 
         match result {
             Ok(outcome) => {
-                if outcome.renamed_members > 0 {
+                if !outcome.renamed_members.is_empty() {
                     self.metrics
                         .deobfuscated_members_renamed
-                        .fetch_add(u64::from(outcome.renamed_members), Ordering::Relaxed);
+                        .fetch_add(outcome.renamed_members.len() as u64, Ordering::Relaxed);
                 }
+                self.record_file_renames(job_id, &outcome.renamed_members);
                 let Some(state) = self.jobs.get_mut(&job_id) else {
                     warn!(
                         job_id = job_id.0,
