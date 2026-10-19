@@ -184,7 +184,7 @@ impl Pipeline {
             return;
         };
         for (member, path) in graph.member_files() {
-            let is_recovery = graph.recovers(member)
+            let is_recovery = graph.spends(member)
                 || state
                     .spec
                     .files

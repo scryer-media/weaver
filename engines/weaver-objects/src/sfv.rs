@@ -280,6 +280,11 @@ impl Recovery for Sfv {
         self.bound.contains_key(&member)
     }
 
+    // A listing ships beside what it lists.
+    fn released(&self) -> bool {
+        true
+    }
+
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
         for segment in segments {
             self.grid.offer(member, WHOLE, segment);

@@ -110,6 +110,13 @@ pub trait Recovery {
     // Whether this object describes the member, by id, name or content.
     fn covers(&self, member: MemberId) -> bool;
 
+    // Whether this object's own volumes are part of the release. Recovery
+    // data is spent by the job and left out; a listing is kept beside what
+    // it lists.
+    fn released(&self) -> bool {
+        false
+    }
+
     // Evidence as bytes pass: the namespace calls this for every covered
     // member on every delivery and every repair.
     fn feed(&mut self, member: MemberId, segments: &[Segment]);

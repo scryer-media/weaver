@@ -246,13 +246,13 @@ impl GraphJob {
             .collect()
     }
 
-    // Seam for status: whether the root member is the volume of a recovery
-    // object, which rebuilds the set it covers and is never part of the
-    // release.
-    pub(crate) fn recovers(&self, member: MemberId) -> bool {
+    // Seam for status: whether the root member is a recovery object's volume
+    // the job spends, which is not part of the release.
+    pub(crate) fn spends(&self, member: MemberId) -> bool {
         self.tree
             .child_of(NodeId::ROOT, member)
-            .is_some_and(|(child, _)| self.tree.recovers(child))
+            .and_then(|(child, _)| self.tree.recovery(child))
+            .is_some_and(|recovery| !recovery.released())
     }
 
     // Articles the queues do not hold were fetched by an earlier run.
