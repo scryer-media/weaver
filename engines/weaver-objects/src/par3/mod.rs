@@ -74,6 +74,15 @@ impl Settled {
     }
 }
 
+// What the last repair came to: the verdict it reached, or that it came up
+// short with so many volumes closed. A repair spends recovery by reading the
+// volumes back, so what it waits for is in hand once another closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Ruling {
+    Reached(RepairOutcome),
+    Short { closed: usize },
+}
+
 #[derive(Debug, Default)]
 struct Volume {
     front: Vec<u8>,
@@ -105,7 +114,7 @@ pub struct Par3 {
     // Damaged blocks the last repair found while it waited.
     needed: u64,
     // What the last repair came to, for the members bound then.
-    outcome: Option<RepairOutcome>,
+    last: Option<Ruling>,
     // Each set as the last repair ruled it.
     ruled: Vec<SetRuling>,
     // Each set a repair settled, by its id: what it ruled and the members
@@ -125,7 +134,7 @@ impl Par3 {
             described: BTreeMap::new(),
             identified: BTreeMap::new(),
             needed: 0,
-            outcome: None,
+            last: None,
             ruled: Vec::new(),
             settled: BTreeMap::new(),
             memory_limit: REPAIR_MEMORY_LIMIT,
@@ -156,6 +165,10 @@ impl Par3 {
 
     fn coming(&self) -> bool {
         self.volumes.iter().any(|volume| !volume.closed)
+    }
+
+    fn closed(&self) -> usize {
+        self.volumes.iter().filter(|volume| volume.closed).count()
     }
 
     fn free(&self, path: &str) -> bool {
@@ -287,13 +300,8 @@ impl Object for Par3 {
         volume.front[offset..end].copy_from_slice(&delivery.bytes[..end - offset]);
     }
 
-    // A repair reads its recovery packets back from the volumes, so a wait
-    // ends as one closes: its packets are in hand, or no more can come.
     fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.volume(volume).closed = true;
-        if self.outcome == Some(RepairOutcome::Waiting) {
-            self.outcome = None;
-        }
     }
 
     // A loss is a hole in what arrived, which no packet in it passes; the
@@ -401,7 +409,7 @@ impl Recovery for Par3 {
             bound.insert(path, member);
         }
         if learned || bound != self.bound {
-            self.outcome = None;
+            self.last = None;
         }
         self.bound = bound;
     }
@@ -529,17 +537,26 @@ impl Recovery for Par3 {
             outcome = combine(outcome, result.outcome);
         }
         self.needed = waiting;
-        self.outcome = Some(outcome);
+        self.last = Some(match outcome {
+            RepairOutcome::Waiting => Ruling::Short {
+                closed: self.closed(),
+            },
+            reached => Ruling::Reached(reached),
+        });
         outcome
     }
 
     fn outcome(&self) -> Option<RepairOutcome> {
-        self.outcome
+        match self.last? {
+            Ruling::Reached(outcome) => Some(outcome),
+            Ruling::Short { closed } => (self.closed() == closed).then_some(RepairOutcome::Waiting),
+        }
     }
 
     fn sets(&self, out: &mut Vec<SetRuling>) {
-        // A bind since the last repair voids its rulings with its outcome.
-        let current = self.outcome.is_some();
+        // A bind since the last repair voids its rulings with its outcome,
+        // as a wait that is over does.
+        let current = self.outcome().is_some();
         out.extend(self.ruled.iter().map(|ruled| SetRuling {
             outcome: ruled.outcome.filter(|_| current),
             ..ruled.clone()

@@ -5,7 +5,7 @@
 // whether it closed; the described paths, whether a member carries each
 // name, and the member each is bound to; the members that may be a free
 // described file and the path a readback identified each as; the blocks
-// the last repair found damaged while it waited; that repair's outcome; and
+// the last repair found damaged while it waited; what that repair came to; and
 // each set a repair settled, with the members it was bound to then.
 //
 // The kept fronts are not recorded: they are a cache of the volumes' first
@@ -18,10 +18,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError};
 
-use super::{MAX_CARRIERS, Par3, Settled, Unnamed, Volume};
+use super::{MAX_CARRIERS, Par3, Ruling, Settled, Unnamed, Volume};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Par3Facts {
@@ -32,10 +31,7 @@ pub(super) struct Par3Facts {
     described: BTreeMap<String, bool>,
     pub(super) identified: BTreeMap<MemberId, String>,
     needed: u64,
-    outcome: Option<RepairOutcome>,
-    // Facts written before sets kept their settled rulings carry none, and
-    // every set is tried again.
-    #[serde(default)]
+    last: Option<Ruling>,
     settled: BTreeMap<String, Settled>,
 }
 
@@ -46,7 +42,8 @@ pub(super) struct VolumeFacts {
 }
 
 impl Durable for Par3Facts {
-    const VERSION: u16 = 1;
+    // 2: a repair that came up short kept with the volumes closed then.
+    const VERSION: u16 = 2;
 
     fn impossible(&self) -> Option<&'static str> {
         if self.volumes.len() > MAX_CARRIERS {
@@ -82,7 +79,7 @@ pub(super) fn of(par3: &Par3) -> Facts {
         described: par3.described.clone(),
         identified: par3.identified.clone(),
         needed: par3.needed,
-        outcome: par3.outcome,
+        last: par3.last,
         settled: par3.settled.clone(),
     };
     Facts::of(Kind::Par3, &facts)
@@ -105,7 +102,7 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
     par3.described = kept.described;
     par3.identified = kept.identified;
     par3.needed = kept.needed;
-    par3.outcome = kept.outcome;
+    par3.last = kept.last;
     par3.settled = kept.settled;
     Ok(par3)
 }

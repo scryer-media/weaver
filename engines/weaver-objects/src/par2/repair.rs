@@ -35,6 +35,9 @@ pub(super) struct SetRepair {
     // enough. A clean ruling without a read is the grid's alone.
     #[serde(default)]
     pub(super) read: bool,
+    // The recovery blocks it must hold before it is tried again: as many as
+    // the slices it found damaged, and more than it held.
+    pub(super) needed: u64,
 }
 
 impl SetRepair {
@@ -43,6 +46,7 @@ impl SetRepair {
             outcome: RepairOutcome::Clean,
             damaged: 0,
             read,
+            needed: 0,
         }
     }
 }
@@ -86,13 +90,18 @@ pub(super) fn repair_set(
     if own == 0 {
         return SetRepair::clean(read);
     }
-    let damaged = validity.iter().map(|(_, valid)| invalid(valid)).sum();
+    let damaged: u64 = validity.iter().map(|(_, valid)| invalid(valid)).sum();
+    let slices = spend(state, slice_size, damaged as usize, access);
+    // Short with every block it holds read, or with enough that would not
+    // rebuild: another has to come before it is worth trying again.
+    let needed = damaged.max(state.recovery.len() as u64 + 1);
     let short = |reachable: u64, access: &mut dyn MemberAccess| {
         if coming > 0 {
             return SetRepair {
                 outcome: RepairOutcome::Waiting,
                 damaged,
                 read,
+                needed,
             };
         }
         for &(member, range) in &proven {
@@ -102,9 +111,9 @@ pub(super) fn repair_set(
             outcome: RepairOutcome::Impossible { damaged, reachable },
             damaged,
             read,
+            needed,
         }
     };
-    let slices = spend(state, slice_size, damaged as usize, access);
     if (slices.len() as u64) < damaged {
         return short(slices.len() as u64, access);
     }
@@ -135,6 +144,7 @@ pub(super) fn repair_set(
         outcome: RepairOutcome::Repaired { slices: damaged },
         damaged,
         read,
+        needed,
     }
 }
 

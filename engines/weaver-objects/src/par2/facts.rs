@@ -5,7 +5,7 @@
 // and what has arrived, been lost or closed there; each set's metadata
 // packets and their hashes, its recovery packets by exponent and where they
 // lie, the members it binds by file and its last repair; the slice grid and
-// the members' lengths; the meter, the refusal, the outcome and the limits.
+// the members' lengths; the meter, the refusal and the limits.
 //
 // How a member was matched (described name, folded name, or the content of
 // its first 16 KiB) is not state the object keeps: the next bind matches
@@ -21,7 +21,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use par2_rs::packet::{CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket};
 use par2_rs::{FileId, Packet, RecoverySetId, SliceChecksum};
 use serde::{Deserialize, Serialize};
-use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{
     ByteRange, Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError, Sealed,
     VolumeIndex,
@@ -41,7 +40,6 @@ pub(super) struct Par2Facts {
     pub(super) sets: Vec<SetFacts>,
     grid: Grid,
     lengths: BTreeMap<MemberId, u64>,
-    outcome: Option<RepairOutcome>,
     meter: Meter,
     refused: bool,
     output_limit: u64,
@@ -197,7 +195,8 @@ impl Durable for Par2Facts {
     // 2: each set's packets sealed, nested as the bytes they encoded to.
     // 3: sealed parts kept apart from the facts' bytes, and the grid
     // shelved by chunk of blocks.
-    const VERSION: u16 = 3;
+    // 4: no outcome of the object's own; it is its sets' last repairs.
+    const VERSION: u16 = 4;
 
     fn impossible(&self) -> Option<&'static str> {
         let keys: BTreeSet<_> = self.sets.iter().map(|set| set.key).collect();
@@ -260,7 +259,6 @@ pub(super) fn of(par2: &Par2) -> Facts {
         sets,
         grid: par2.grid.clone(),
         lengths: par2.lengths.clone(),
-        outcome: par2.outcome,
         meter: par2.meter.clone(),
         refused: par2.refused,
         output_limit: par2.output_limit,
@@ -300,7 +298,6 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
     }
     par2.grid = kept.grid;
     par2.lengths = kept.lengths;
-    par2.outcome = kept.outcome;
     par2.meter = kept.meter;
     par2.refused = kept.refused;
     par2.output_limit = kept.output_limit;

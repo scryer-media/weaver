@@ -47,6 +47,13 @@ fn job() -> Job<RarRecovery> {
 // A recovery volume as the tree hands one over: claimed, bound, sized,
 // delivered in articles, closed.
 fn rev(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeIndex> {
+    let volume = arriving(job, name, bytes)?;
+    job.object.volume_closed(volume, &mut Vec::new());
+    Some(volume)
+}
+
+// A recovery volume every byte of which has arrived, not yet closed.
+fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeIndex> {
     let front = &bytes[..bytes.len().min(64)];
     let volume = match job.object.claim(name, front) {
         Some(volume) => volume,
@@ -72,7 +79,6 @@ fn rev(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeInd
             &mut out,
         );
     }
-    job.object.volume_closed(volume, &mut out);
     Some(volume)
 }
 
@@ -200,6 +206,33 @@ fn a_set_rules_on_how_many_volumes_are_missing_against_its_recovery_volumes() {
     let mut verdicts = Vec::new();
     job.object.verdicts(whole, &mut verdicts);
     assert_eq!(verdicts, vec![SliceVerdict::Intact]);
+}
+
+// A set short of recovery volumes waits while the one it needs arrives, and
+// is due again in the step that one closes: no repair between.
+#[test]
+fn a_short_set_waits_until_the_volumes_it_needs_are_in_hand() {
+    let mut job = job();
+    rev(
+        &mut job,
+        "lantern.part1.rev",
+        &rev5(3, 2, 3, &[300, 300, 300]),
+    );
+    data(&mut job, "lantern.part01.rar");
+    bind(&mut job);
+    let second = arriving(&mut job, "lantern.part2.rev", &rev5(3, 2, 4, &[]));
+    let second = second.expect("claimed");
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Waiting));
+    job.object.volume_closed(second, &mut Vec::new());
+    assert_eq!(job.object.outcome(), None);
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Impossible {
+            damaged: 2,
+            reachable: 2
+        }
+    );
 }
 
 // A namespace that keeps no files lends no scratch, and the restore, which

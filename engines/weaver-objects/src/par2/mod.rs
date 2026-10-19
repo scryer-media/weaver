@@ -54,8 +54,6 @@ pub struct Par2 {
     // inputs change (a member's slices in `feed`, a set's index in `take`,
     // its bindings and lengths in `bind`) and read everywhere else.
     evidence: BTreeMap<([u8; 16], MemberId), Evidence>,
-    // What the last repair came to, for the members bound then.
-    outcome: Option<RepairOutcome>,
     meter: Meter,
     // A job past the packet or set limits keeps none of its sets.
     refused: bool,
@@ -72,7 +70,6 @@ impl Par2 {
             grid: Grid::default(),
             lengths: BTreeMap::new(),
             evidence: BTreeMap::new(),
-            outcome: None,
             meter: Meter::default(),
             refused: false,
             output_limit: MAX_JOB_BYTES,
@@ -167,18 +164,11 @@ impl Par2 {
         }
     }
 
-    // A set that waited on recovery blocks waits no longer once the blocks
-    // in hand cover the slices it found damaged, or once its volumes can
-    // bring no more: the wait's outcome is taken back, so the set rules in
-    // this step and repairs or fails.
-    fn end_wait(&mut self) {
-        let over = self.sets.iter().any(|(key, state)| {
-            let needed = state.needed();
-            needed > 0 && (state.recovery.len() as u64 >= needed || self.coming(key) == 0)
-        });
-        if over {
-            self.outcome = None;
-        }
+    // Whether a set whose last repair came up short still waits: the blocks
+    // it needs are not all in hand, and its volumes may bring more.
+    fn waits(&self, key: &[u8; 16], needed: u64) -> bool {
+        let state = &self.sets[key];
+        (state.recovery.len() as u64) < needed && self.coming(key) > 0
     }
 
     fn take(&mut self, volume: VolumeIndex, found: Vec<Found>) {
@@ -254,12 +244,10 @@ impl Object for Par2 {
             .walker
             .deliver(delivery.offset, delivery.bytes, &mut found);
         self.take(delivery.volume, found);
-        self.end_wait();
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.volume(volume).closed = true;
-        self.end_wait();
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, _out: &mut Vec<Emit>) {
@@ -274,7 +262,6 @@ impl Object for Par2 {
                 .retain(|_, at| at.volume != volume || at.range.intersect(range).is_none());
         }
         self.take(volume, found);
-        self.end_wait();
     }
 
     fn wants(&mut self, out: &mut Vec<Seek>) {
@@ -309,14 +296,8 @@ impl Object for Par2 {
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
         self.volume(volume).name(name);
-        let mut reopened = false;
         for state in self.sets.values_mut() {
-            reopened |= state.reopen();
-        }
-        // The object's verdict is its sets' verdicts: one tried again leaves
-        // the object unruled until it repairs again.
-        if reopened {
-            self.outcome = None;
+            state.reopen();
         }
     }
 
@@ -351,7 +332,6 @@ impl Recovery for Par2 {
                 moved.insert(*key);
             }
         }
-        let voided = !moved.is_empty();
         let lengths: BTreeMap<MemberId, u64> = self
             .sets
             .values()
@@ -376,10 +356,6 @@ impl Recovery for Par2 {
         self.lengths = lengths;
         for key in moved {
             self.fold_set(key);
-        }
-        // The object's verdict is its sets' verdicts.
-        if voided {
-            self.outcome = None;
         }
     }
 
@@ -461,7 +437,10 @@ impl Recovery for Par2 {
         let packet = self.smallest_packet();
         for key in self.ordered() {
             let state = &self.sets[&key];
-            let wanted = state.needed().max(seen.get(&key).copied().unwrap_or(0));
+            let wanted = state
+                .short_of()
+                .unwrap_or(0)
+                .max(seen.get(&key).copied().unwrap_or(0));
             let mut shortfall = wanted.saturating_sub(state.recovery.len() as u64);
             for (index, volume) in self.volumes.iter_mut().enumerate() {
                 if shortfall == 0 {
@@ -493,12 +472,24 @@ impl Recovery for Par2 {
             };
             outcome = combine(outcome, result);
         }
-        self.outcome = Some(outcome);
         outcome
     }
 
+    // What the sets ruled, folded from Clean as `repair` folds it, each
+    // that came up short waiting while it still does. `None` while a set
+    // has not ruled since its bindings changed, or once one no longer waits,
+    // so it is tried again. No sets is Clean: there is nothing to rule on.
     fn outcome(&self) -> Option<RepairOutcome> {
-        self.outcome
+        let mut outcome = RepairOutcome::Clean;
+        for key in self.ordered() {
+            let last = self.sets[&key].last?;
+            let ruled = match last.outcome {
+                RepairOutcome::Waiting if !self.waits(&key, last.needed) => return None,
+                ruled => ruled,
+            };
+            outcome = combine(outcome, ruled);
+        }
+        Some(outcome)
     }
 
     fn sets(&self, out: &mut Vec<SetRuling>) {

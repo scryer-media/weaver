@@ -62,6 +62,46 @@ fn par3_repairs_one_damaged_member() {
     assert!(job.store.members[&second] == two);
 }
 
+// A set short of recovery waits while its volume's bytes arrive, and is due
+// again in the step the volume closes, its blocks in hand: no repair between.
+#[test]
+fn par3_short_of_blocks_waits_until_a_volume_is_in_hand() {
+    let one = payload(31, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
+    let mut job = job(&files[..1]);
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    let mut wrong = one.clone();
+    wrong[5000] ^= 0x42;
+    let member = job.member("one.bin", &wrong);
+    job.arrive(member, 4900, &wrong[4900..5100], Provenance::Damaged);
+    bind(&mut job);
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    let mut out = Vec::new();
+    for (index, piece) in bytes.chunks(700).enumerate() {
+        job.object.deliver(
+            Delivery {
+                volume,
+                offset: index as u64 * 700,
+                bytes: piece,
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut out,
+        );
+        assert_eq!(job.object.outcome(), Some(RepairOutcome::Waiting));
+    }
+    job.object.volume_closed(volume, &mut out);
+    assert_eq!(job.object.outcome(), None);
+    let outcome = job.object.repair(&mut job.store);
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
+        "{outcome:?}"
+    );
+    assert_eq!(job.object.outcome(), Some(outcome));
+    assert!(job.store.members[&member] == one);
+}
+
 #[test]
 fn par3_short_of_blocks_is_impossible() {
     let one = payload(5, 9000);
