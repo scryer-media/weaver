@@ -26,6 +26,9 @@
 //     .damaged(file, ordinal)     that article arrives with a checksum
 //                                 mismatch and corrupted bytes
 //     .lost(file, ordinal)        every server lacks that article
+//     .framed(size)               articles of `size` bytes, not ARTICLE
+//     .backwards()                every batch the download queue hands
+//                                 out arrives last article first
 //     .password(secret)           the password the job is submitted with
 //     .global_password(secret)    a password among the candidates every
 //                                 job is offered, the job has none of its own
@@ -55,18 +58,24 @@
 //                                 read files back
 //     graph: Option<GraphView>,   the graph job as last seen before it
 //                                 finished: namespace claims by output
-//                                 name, blocks reachable, repair outcomes
+//                                 name, blocks reachable, repair
+//                                 outcomes, and the delivery: the files
+//                                 handed over whole, damaged, unrepaired
 //   }
 //   Outcome::refetched()          articles asked for more than once
 //   Claim::{Complete, Damaged, Missing}
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
+mod caps;
 mod depth;
 mod divergence;
 mod embedded;
 mod harness;
+mod lines;
+mod nesting;
 mod par3;
+mod partial;
 mod plain_par2;
 mod rar;
 mod rar_engine;

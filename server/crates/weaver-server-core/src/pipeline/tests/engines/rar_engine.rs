@@ -5,12 +5,17 @@
 // the store cannot stream, so the graph hands their volumes to the RAR
 // engine and reads its members out of a run over the growing files.
 
-use super::harness::{Claim, Outcome, Post, Scenario, assert_same, run, run_both, try_run};
+use super::harness::{
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, payload, run, run_both, try_run,
+};
 use super::rar::{assert_classic_stalls, delivered, posts, with_par2};
+use weaver_graph::Why;
+
 use crate::history::failure_kind::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::obfuscate_volumes;
+use crate::pipeline::tests::direct_store::scenarios::{HeaderCheck, header_encrypted_store_set};
 use crate::pipeline::tests::rar5_fixture_bytes;
 
 const MIXED: &str = "rar5_multifile_lz.rar";
@@ -78,6 +83,24 @@ async fn a_compressed_rar5_volume_delivers_alike_in_every_frame_size_under_both_
     }
 }
 
+// The same frames served last article first, as a crowd of workers may:
+// every article but the first is in hand before the store learns from the
+// headers that the volume needs the engine.
+#[tokio::test]
+async fn a_compressed_rar5_volume_served_last_article_first_delivers_alike_in_every_frame_size_under_both_engines()
+ {
+    let mut seen = None;
+    for size in [usize::MAX, 4096, 64, 1] {
+        let (classic, graph) = run_both(&mixed().framed(size).backwards()).await;
+        assert_mixed_members(&classic);
+        assert_mixed_members(&graph);
+        assert_engine_ran(&graph);
+        assert_same(&classic, &graph);
+        let files = seen.get_or_insert_with(|| graph.files.clone());
+        assert_eq!(*files, graph.files, "frames of {size} bytes");
+    }
+}
+
 const VIDEO: &str = "test_clip.mkv";
 const VIDEO_SECRET: &str = "testpass123";
 // The video set is a quarter of a megabyte a volume: cut at 4 KiB, not at
@@ -114,10 +137,6 @@ fn assert_video(outcome: &Outcome) {
         "{}",
         outcome.engine
     );
-}
-
-fn kinds(graph: &Outcome) -> Vec<&str> {
-    graph.graph().kinds.iter().map(String::as_str).collect()
 }
 
 #[tokio::test]
@@ -161,6 +180,93 @@ async fn the_encrypted_five_volume_set_tries_a_wrong_candidate_once_then_the_rig
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
     let offered: Vec<_> = graph.graph().offered.values().copied().collect();
     assert_eq!(offered, [2], "one try for each of the two candidates");
+}
+
+// What nothing opened is withheld: the job fails at unpacking, naming the
+// volumes and the password they need, so its history says a password
+// failed it, with nothing whole, nothing short and nothing in the complete
+// directory.
+fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)]) {
+    let names: Vec<String> = volumes.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(
+        graph.failure,
+        Some(format!(
+            "{} needs a password and none was given",
+            names.join(", ")
+        )),
+        "{:?}",
+        graph.status
+    );
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let delivery = &graph.graph().delivery;
+    assert!(delivery.whole.is_empty(), "{delivery:?}");
+    assert!(delivery.damaged.is_empty(), "{delivery:?}");
+    assert!(delivery.files.is_empty(), "{delivery:?}");
+    let withheld: Vec<String> = delivery
+        .withheld
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(withheld, names);
+}
+
+// No password and no candidate: the store asks, nothing answers, and once
+// the whole set is in it gives the volumes back withheld. Divergence:
+// classic never settles.
+#[tokio::test]
+async fn the_encrypted_five_volume_set_with_no_password_fails_naming_the_password_under_graph() {
+    let scenario = video(posts(video_set()));
+    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_needs_password(&graph, &video_set());
+    assert_eq!(kinds(&graph), ["rar_store"]);
+}
+
+// The headers enciphered too, with no password. With a password check the
+// store asks and refuses the set itself; without one it hands the set to
+// the engine, which asks and is refused. Either way one wording. Classic
+// fails the job for the password too.
+#[tokio::test]
+async fn a_header_encrypted_set_with_no_password_fails_naming_the_password_under_both_engines() {
+    let body = payload(7 * ARTICLE + 13, 51);
+    for (check, kind) in [
+        (HeaderCheck::For(VIDEO_SECRET), "rar_store"),
+        (HeaderCheck::Absent, "rar_engine"),
+    ] {
+        let volumes = header_encrypted_store_set("beacon.bin", &body, 2, VIDEO_SECRET, check);
+        let scenario = Scenario::new(posts(volumes.clone()));
+        let (classic, graph) = run_both(&scenario).await;
+        assert!(
+            matches!(classic.status, Some(JobStatus::Failed { .. })),
+            "{:?}",
+            classic.status
+        );
+        assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Password));
+        assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
+        assert_needs_password(&graph, &volumes);
+        assert!(kinds(&graph).contains(&kind), "{:?}", kinds(&graph));
+    }
+}
+
+// A wrong candidate only: offered once, refuted by the member's password
+// check, and with none left the store gives the volumes back withheld, in
+// the same words. Divergence: classic never settles.
+#[tokio::test]
+async fn the_encrypted_five_volume_set_with_only_a_wrong_candidate_fails_naming_the_password_under_graph()
+ {
+    let scenario = video(posts(video_set())).global_password("cinder-wrong-guess");
+    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_needs_password(&graph, &video_set());
+    let offered: Vec<_> = graph.graph().offered.values().copied().collect();
+    assert_eq!(offered, [1], "one try for the one candidate");
 }
 
 // The first article of each volume, in the order it was asked for.
@@ -440,4 +546,81 @@ async fn a_solid_rar4_archive_delivers_what_the_rar5_one_does_under_graph() {
     let rar4 = solid_row("../rar4/rar4_solid.rar").await;
     let rar5 = solid_row("rar5_solid.rar").await;
     assert!(rar4.files == rar5.files, "the same members");
+}
+
+// A byte of the solid archive's first member, in its packed data, flipped
+// in the post itself, which goes up under a nameless name: every article
+// arrives intact, so nothing marks the volume, and the engine's run alone
+// finds the damage, when the member's CRC fails. It retracts the member it
+// left open and says its volume is damaged; with no PAR2 nothing repairs
+// it. A member is whole only when its engine closed it, so the run's end
+// closes nothing: the engine is refused for the member it left open
+// (`Why::Unmapped`), and the volume is handed back as it stands in its
+// place, withheld, with no file at any length for the member.
+const SOLID_CORRUPTED_AT: usize = 10 << 20;
+
+fn corrupted_solid() -> (String, Vec<u8>) {
+    let mut bytes = rar5_fixture_bytes("rar5_solid.rar");
+    bytes[SOLID_CORRUPTED_AT] ^= 0x01;
+    obfuscate_volumes(&[("solid.rar".into(), bytes)])
+        .pop()
+        .expect("one volume")
+}
+
+fn corrupted_solid_scenario() -> Scenario {
+    let (name, bytes) = corrupted_solid();
+    Scenario::new(vec![Post::plain(&name, bytes)])
+}
+
+fn assert_hands_back_the_volume(graph: &Outcome) {
+    let (name, bytes) = corrupted_solid();
+    assert_engine_ran(graph);
+    assert!(!graph.completed(), "{:?}", graph.status);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let delivery = &graph.graph().delivery;
+    assert!(delivery.whole.is_empty(), "{delivery:?}");
+    assert!(delivery.damaged.is_empty(), "{delivery:?}");
+    assert_eq!(
+        delivery.withheld,
+        [(name.clone(), Why::Unmapped)],
+        "the volume withheld as it stands"
+    );
+    assert_eq!(graph.graph().claims.get(&name), Some(&Claim::Damaged));
+    for (path, delivered_bytes) in &graph.files {
+        assert_eq!(*path, delivered(&name), "only the volume is a file");
+        assert_eq!(
+            delivered_bytes.len(),
+            bytes.len(),
+            "the volume at its length"
+        );
+    }
+}
+
+// Nothing of the payload is whole and the engine's verdict marks the whole
+// volume damaged, so no byte of it is delivery evidence: the job fails and
+// nothing moves to the complete directory. Divergence: classic never
+// settles on the solid fixture under the harness.
+#[tokio::test]
+async fn a_compressed_rar5_member_corrupted_without_par2_hands_back_its_volume_under_graph() {
+    let scenario = corrupted_solid_scenario().framed(1 << 20);
+    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_hands_back_the_volume(&graph);
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+}
+
+// The same post in articles of 768000 bytes, every batch arriving last
+// article first: whatever order the bytes come in, the member the engine
+// left open is no file, and the volume is what is handed back.
+#[tokio::test]
+async fn a_compressed_rar5_member_corrupted_without_par2_and_posted_backwards_hands_back_its_volume_under_graph()
+ {
+    let scenario = corrupted_solid_scenario().framed(768_000).backwards();
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_hands_back_the_volume(&graph);
 }

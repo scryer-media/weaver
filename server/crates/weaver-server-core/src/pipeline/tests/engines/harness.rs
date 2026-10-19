@@ -24,9 +24,13 @@ use super::super::{
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
+use crate::pipeline::download::DownloadWork;
+use crate::pipeline::extraction::ExtractionLimits;
 use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::status::Delivery;
 use crate::pipeline::{
-    DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, YencLayoutAssertions,
+    DecodeResult, DecodedChunk, Pipeline, PipelineEvent, SegmentEncoding, SegmentSource,
+    YencLayoutAssertions,
 };
 
 pub(super) const ARTICLE: usize = 64;
@@ -55,9 +59,18 @@ impl Post {
     }
 }
 
+// `len` bytes of a seeded xorshift: no period runs through them, so no two
+// blocks are alike and a compressing level cannot fold them, and the same
+// seed gives the same bytes every run.
 pub(super) fn payload(len: usize, seed: u8) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(seed);
     (0..len)
-        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed) | 0x80)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 56) as u8
+        })
         .collect()
 }
 
@@ -194,11 +207,21 @@ pub(super) struct Scenario {
     pub(super) posts: Vec<Post>,
     pub(super) damage: Vec<(u32, u32)>,
     pub(super) lost: Vec<(u32, u32)>,
+    // Articles the first ask is refused for, as a server without them
+    // answers: the article goes back on the queue the way the worker
+    // retries it after a 430, and the next ask is served.
+    pub(super) refused: Vec<(u32, u32)>,
     pub(super) password: Option<String>,
     pub(super) global_passwords: Vec<String>,
     // The decoded size of every article but each post's last; PAR2 slices
     // stay at ARTICLE whatever it is.
     pub(super) article: usize,
+    // Every batch the download queue hands out is served last article first.
+    pub(super) backwards: bool,
+    // The extraction limits the pipeline holds, when not the environment's.
+    pub(super) limits: Option<ExtractionLimits>,
+    // The operator's unacceptable extensions, when not the stored ones.
+    pub(super) unacceptable: Option<Vec<String>>,
 }
 
 impl Scenario {
@@ -207,10 +230,55 @@ impl Scenario {
             posts,
             damage: Vec::new(),
             lost: Vec::new(),
+            refused: Vec::new(),
             password: None,
             global_passwords: Vec::new(),
             article: ARTICLE,
+            backwards: false,
+            limits: None,
+            unacceptable: None,
         }
+    }
+
+    // The job runs under these extraction limits.
+    pub(super) fn limits(mut self, limits: ExtractionLimits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
+    // The settings refuse these extensions.
+    pub(super) fn unacceptable(mut self, extensions: &[&str]) -> Self {
+        self.unacceptable = Some(extensions.iter().map(|ext| ext.to_string()).collect());
+        self
+    }
+
+    // What the scenario sets on a pipeline before its job is admitted or
+    // restored: the settings' passwords and policy, and the limits.
+    pub(super) fn prepare(&self, pipeline: &mut Pipeline) {
+        if !self.global_passwords.is_empty() {
+            pipeline
+                .db
+                .save_archive_password_settings(Some(self.global_passwords.clone()), None)
+                .unwrap();
+        }
+        if let Some(extensions) = &self.unacceptable {
+            pipeline
+                .db
+                .save_unacceptable_extensions(extensions.clone())
+                .unwrap();
+            // A save forgets whether any script could run; the runtime works
+            // it out at startup, so the job's scripts gate does not wait.
+            crate::post_processing::events::refresh_admission_hint(&pipeline.db).unwrap();
+        }
+        if let Some(limits) = &self.limits {
+            pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
+        }
+    }
+
+    // Whatever the download queue hands out at once arrives in reverse.
+    pub(super) fn backwards(mut self) -> Self {
+        self.backwards = true;
+        self
     }
 
     // Every post cut into articles of `size` bytes instead of ARTICLE.
@@ -239,6 +307,11 @@ impl Scenario {
 
     pub(super) fn lost(mut self, file: u32, ordinal: u32) -> Self {
         self.lost.push((file, ordinal));
+        self
+    }
+
+    pub(super) fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
+        self.refused.push((file, ordinal));
         self
     }
 
@@ -295,6 +368,8 @@ pub(super) struct GraphView {
     pub(super) kinds: BTreeSet<String>,
     // How many password candidates each node was offered, at the last look.
     pub(super) offered: BTreeMap<weaver_graph::NodeId, usize>,
+    // The files the job hands over at every depth, by output name.
+    pub(super) delivery: Delivery,
 }
 
 #[derive(Debug)]
@@ -312,6 +387,13 @@ pub(super) struct Outcome {
     pub(super) graph: Option<GraphView>,
     // The posts that are PAR2 or PAR3 recovery volumes, by file index.
     pub(super) volumes: Vec<u32>,
+    // Every pipeline event the job's run sent, in order.
+    pub(super) events: Vec<PipelineEvent>,
+}
+
+// The kind of every object a graph run's tree held, by its name, sorted.
+pub(super) fn kinds(graph: &Outcome) -> Vec<&str> {
+    graph.graph().kinds.iter().map(String::as_str).collect()
 }
 
 impl Outcome {
@@ -342,6 +424,28 @@ impl Outcome {
     pub(super) fn graph(&self) -> &GraphView {
         self.graph.as_ref().expect("a graph run keeps its view")
     }
+}
+
+// The repair and terminal events the run sent, in order, as words a row
+// can compare: `RepairComplete <slices>`, `JobCompleted`, `JobFailed`.
+pub(super) fn repair_and_terminal_events(outcome: &Outcome) -> Vec<String> {
+    outcome
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            PipelineEvent::RepairComplete {
+                job_id,
+                slices_repaired,
+            } if *job_id == JOB => Some(format!("RepairComplete {slices_repaired}")),
+            PipelineEvent::JobCompleted { job_id } if *job_id == JOB => {
+                Some("JobCompleted".to_string())
+            }
+            PipelineEvent::JobFailed { job_id, .. } if *job_id == JOB => {
+                Some("JobFailed".to_string())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 pub(super) async fn run_both(scenario: &Scenario) -> (Outcome, Outcome) {
@@ -402,7 +506,12 @@ pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
 }
 
 // A run that may stall, for a row that asserts an engine does.
-pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outcome, Stall> {
+// A fresh pipeline with the scenario's job admitted under `engine`, nothing
+// asked yet.
+pub(super) async fn admit(
+    scenario: &Scenario,
+    engine: Engine,
+) -> (tempfile::TempDir, Pipeline, std::path::PathBuf) {
     let temp_dir = tempfile::tempdir().unwrap();
     // One server: an article it serves damaged has nowhere else to come
     // from, so both engines give it up for repair at once.
@@ -413,35 +522,46 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
     };
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers, 1).await;
-    if !scenario.global_passwords.is_empty() {
-        pipeline
-            .db
-            .save_archive_password_settings(Some(scenario.global_passwords.clone()), None)
-            .unwrap();
-    }
+    scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     pipeline.admit_graph_job(JOB, engine);
     assert_eq!(pipeline.is_graph_job(JOB), engine == Engine::Graph);
+    (temp_dir, pipeline, complete_dir)
+}
 
+pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outcome, Stall> {
+    let (_temp_dir, mut pipeline, complete_dir) = admit(scenario, engine).await;
+    // Events the run sends are heard from admission on; nothing sent before
+    // the job was admitted belongs to it.
+    let mut sent = pipeline.event_tx.subscribe();
+    let mut refused = BTreeSet::new();
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
     let mut graph = (engine == Engine::Graph).then(GraphView::default);
     let mut reads = 0;
     let mut stalled = None;
     loop {
-        while let Some(work) = pipeline
-            .jobs
-            .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
-        {
-            let article = (
-                work.segment_id.file_id.file_index,
-                work.segment_id.segment_number,
-            );
-            *requests.entry(article).or_insert(0usize) += 1;
-            order.push(article);
-            serve(&mut pipeline, scenario, article).await;
-            observe(&pipeline, &mut graph, &mut reads);
+        while let Some(batch) = handed_out(&mut pipeline, scenario.backwards) {
+            for work in batch {
+                let article = (
+                    work.segment_id.file_id.file_index,
+                    work.segment_id.segment_number,
+                );
+                *requests.entry(article).or_insert(0usize) += 1;
+                order.push(article);
+                if scenario.refused.contains(&article) && refused.insert(article) {
+                    // Rebuilt as the worker's retry rebuilds it: the retry
+                    // carries no promotion of its own, so where it is queued is
+                    // the job's answer to whether anything waits on it.
+                    let mut retry = work;
+                    retry.retry_count += 1;
+                    retry.completion_critical = false;
+                    pipeline.enqueue_download_work(retry);
+                    continue;
+                }
+                serve(&mut pipeline, scenario, article).await;
+                observe(&pipeline, &mut graph, &mut reads);
+            }
         }
         if finished(&pipeline) {
             break;
@@ -469,6 +589,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
+            observe(&pipeline, &mut graph, &mut reads);
             continue;
         }
         // Classic's extraction runs out on a task too, and says it is done
@@ -523,6 +644,14 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         .filter(|post| post.role.counts_toward_health())
         .map(|post| (post.name.clone(), delivered_claim(&files, post)))
         .collect();
+    let mut events = Vec::new();
+    loop {
+        match sent.try_recv() {
+            Ok(event) => events.push(event),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("the run's events were not all kept: {error}"),
+        }
+    }
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         engine,
@@ -550,18 +679,40 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             })
             .map(|(_, index)| index)
             .collect(),
+        events,
     })
 }
 
+// The next articles the download queue hands out: one, or with `backwards`
+// every one it holds, last first. `None` once it is dry.
+fn handed_out(pipeline: &mut Pipeline, backwards: bool) -> Option<Vec<DownloadWork>> {
+    let queue = &mut pipeline.jobs.get_mut(&JOB)?.download_queue;
+    let mut batch = Vec::new();
+    while let Some(work) = queue.pop() {
+        batch.push(work);
+        if !backwards {
+            break;
+        }
+    }
+    batch.reverse();
+    (!batch.is_empty()).then_some(batch)
+}
+
 // One article as the scenario's server answers it.
-pub(super) async fn serve(
+pub(super) async fn serve(pipeline: &mut Pipeline, scenario: &Scenario, article: (u32, u32)) {
+    serve_job(pipeline, JOB, scenario, article).await;
+}
+
+// [`serve`] for a job other than the run's own.
+pub(super) async fn serve_job(
     pipeline: &mut Pipeline,
+    job: JobId,
     scenario: &Scenario,
     (file, ordinal): (u32, u32),
 ) {
     let segment_id = SegmentId {
         file_id: NzbFileId {
-            job_id: JOB,
+            job_id: job,
             file_index: file,
         },
         segment_number: ordinal,
@@ -585,7 +736,7 @@ pub(super) async fn serve(
         body.iter_mut().take(8).for_each(|byte| *byte ^= 0x5a);
     }
     let len = body.len() as u64;
-    let checkpoint_plan = pipeline.par2_checkpoint_plan(JOB);
+    let checkpoint_plan = pipeline.par2_checkpoint_plan(job);
     pipeline
         .handle_decode_success(
             DecodeResult {
@@ -621,7 +772,7 @@ pub(super) async fn serve(
         .await;
     // What the select loop would pick up after the article: the read-back
     // a set's last article submits, and a demotion's handback.
-    settle_direct_verification_read(pipeline, JOB).await;
+    settle_direct_verification_read(pipeline, job).await;
     settle_direct_demotion_work(pipeline).await;
 }
 
@@ -667,6 +818,7 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
             .map(|kind| kind.to_string()),
     );
     view.offered = job.passwords_offered();
+    view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
     let namespace = job.namespace();
     view.claims = state
         .spec

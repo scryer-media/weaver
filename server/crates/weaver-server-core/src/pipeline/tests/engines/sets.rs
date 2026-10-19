@@ -129,7 +129,7 @@ async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
     assert_eq!(graph.claims["beacon.bin"], Claim::Complete);
     assert!(failed_with(
         &classic,
-        "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin, ember.bin): \
+        "PAR2 recovery failed for 1 set(s): lantern.par2 (ember.bin, lantern.bin): \
          not repairable: 2 damaged slices, only 1 recovery blocks advertised"
     ));
     assert_eq!(
@@ -145,12 +145,13 @@ async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
 // the posted bytes being the lantern set's. A name two sets answer
 // differently binds nothing by name; the posted bytes compute to the
 // lantern set's file id, so that set binds the member by id, finds it
-// clean, and the graph delivers it as posted. Classic completes too, but
-// delivers the beacon set's description of it, every byte rewritten, after
-// fetching the beacon volume whole; that classic outcome is recorded, not
-// explained.
+// clean, and the graph delivers it as posted, reading nothing back.
+// Classic binds the name to the beacon set as well, finds all three of its
+// slices wrong against two recovery blocks, and fails the job as a repair.
+// (It rewrote the file to the beacon set's bytes only while the harness
+// payload repeated every two slices, so two blocks rebuilt three slices.)
 #[tokio::test]
-async fn a_name_two_sets_describe_differently_is_bound_by_id_under_graph_and_rewritten_under_classic()
+async fn a_name_two_sets_describe_differently_is_bound_by_id_under_graph_and_fails_the_other_sets_repair_under_classic()
  {
     let quill = payload(3 * ARTICLE, 26);
     let other_quill = payload(3 * ARTICLE, 27);
@@ -177,14 +178,15 @@ async fn a_name_two_sets_describe_differently_is_bound_by_id_under_graph_and_rew
         assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
     }
 
-    assert!(classic.completed(), "{:?}", classic.failure);
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Repair));
     assert_eq!(
-        delivered(&classic, "quill.bin"),
-        Some(other_quill.as_slice())
+        classic.failure.as_deref(),
+        Some(
+            "PAR2 recovery failed for 1 set(s): beacon.par2 (beacon.bin, quill.bin): \
+             not repairable: 3 damaged slices, only 2 recovery blocks advertised"
+        )
     );
-    assert_eq!(classic.claims["quill.bin"], Claim::Damaged);
-    assert_eq!(classic.claims["lantern.bin"], Claim::Complete);
-    assert_eq!(classic.claims["beacon.bin"], Claim::Complete);
+    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
 
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
@@ -196,6 +198,10 @@ async fn a_name_two_sets_describe_differently_is_bound_by_id_under_graph_and_rew
         "bound by id, clean"
     );
     assert_eq!(view.outcomes, vec![Some(RepairOutcome::Clean)]);
+    assert_eq!(
+        graph.reads, 0,
+        "the segment checksums vouch for every slice"
+    );
 }
 
 // Hex names in place of the posted ones, the set named by a hex string

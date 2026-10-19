@@ -11,12 +11,17 @@ use std::io::Write;
 
 use weaver_graph::recovery::RepairOutcome;
 
+use weaver_model::files::FileRole;
+
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, Stall, assert_same, par2_set, payload, run, run_both,
-    try_run,
+    ARTICLE, Claim, JOB, Outcome, Post, Scenario, Stall, admit, assert_same, par2_set, payload,
+    run, run_both, serve_job, try_run,
 };
+use crate::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY;
 use crate::history::HistoryFailureKind;
+use crate::jobs::ids::JobId;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::Pipeline;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_rar4_store_set, encrypted_store_set, header_encrypted_store_set,
@@ -25,9 +30,14 @@ use crate::pipeline::tests::direct_store::{
     obfuscate_volumes, recovery_record_store_set, single_member_rar4_store_set_numbered,
     single_member_store_set,
 };
+use crate::pipeline::tests::{
+    debug_job_state, insert_active_job, job_status_for_assert, retire_pipeline_database,
+};
 
 const MEMBER: &str = "beacon.bin";
 const SECRET: &str = "quill-ember-secret";
+// A second job beside the harness's own.
+const OTHER: JobId = JobId(93_002);
 
 pub(super) fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
@@ -167,6 +177,18 @@ async fn a_four_volume_rar4_set_delivers_its_member_under_both_engines() {
     assert_same(&classic, &graph);
 }
 
+// Served last article first, as a crowd of workers may: each volume's data
+// is in hand before the headers that place it. Graph only: the batch the
+// harness serves backwards is in no queue classic can see.
+#[tokio::test]
+async fn a_four_volume_rar5_set_served_last_article_first_delivers_its_member_under_graph() {
+    let body = body();
+    let scenario = Scenario::new(posts(single_member_store_set(MEMBER, &body, 4))).backwards();
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_member(&graph, &body);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
 // Divergence: classic never settles on a stored set with a damaged article
 // beside PAR2. The graph repairs the slice in the stream, and every volume
 // ends complete: the one damaged mark was the article's, and its repair
@@ -202,6 +224,186 @@ async fn a_lost_article_beside_par2_is_rebuilt_under_both_engines() {
             .values()
             .all(|claim| *claim == Claim::Complete)
     );
+}
+
+// Every article of the scenario's recovery volumes.
+fn recovery_articles(scenario: &Scenario) -> Vec<(u32, u32)> {
+    scenario
+        .posts
+        .iter()
+        .zip(0u32..)
+        .filter(|(post, _)| {
+            matches!(
+                post.role,
+                FileRole::Par2 {
+                    is_index: false,
+                    ..
+                }
+            )
+        })
+        .flat_map(|(post, file)| {
+            (0..post.bytes.len().div_ceil(scenario.article) as u32)
+                .map(move |ordinal| (file, ordinal))
+        })
+        .collect()
+}
+
+// A RAR beside PAR2 whose opening article is gone, every article of its
+// recovery volumes refused at the first ask, as a primary that holds none
+// of them answers.
+fn opening_lost_recovery_refused() -> Scenario {
+    let mut scenario =
+        Scenario::new(with_par2(single_member_store_set(MEMBER, &body(), 1))).lost(0, 0);
+    let refused = recovery_articles(&scenario);
+    assert!(!refused.is_empty(), "the set has recovery volumes");
+    for (file, ordinal) in refused {
+        scenario = scenario.refused_once(file, ordinal);
+    }
+    scenario
+}
+
+// The set's opening article is gone, so nothing says what the volume is
+// until PAR2 rebuilds it: the recovery volume is asked for, and every
+// article of it the first ask is refused for is asked again, not parked,
+// until it is fetched and the slice repaired. The harness has one server,
+// so the second ask goes to it; the backup taking the ask is e2e's leg.
+#[tokio::test]
+async fn a_lost_opening_article_beside_par2_fetches_the_recovery_volume_under_graph() {
+    let scenario = opening_lost_recovery_refused();
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_member(&graph, &body());
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    // Asked again are the refused articles alone, each once more.
+    let refetched = graph.refetched();
+    assert!(!refetched.is_empty(), "{:?}", graph.requests);
+    assert!(
+        refetched
+            .iter()
+            .all(|article| scenario.refused.contains(article) && graph.requests[article] == 2),
+        "{refetched:?}"
+    );
+}
+
+// Serve `job` and run its completion gate until its delivery move is out.
+async fn drive_to_move(pipeline: &mut Pipeline, job: JobId, scenario: &Scenario) {
+    let mut idle = 0;
+    while !pipeline.inflight_moves.contains(&job) {
+        let mut served = false;
+        while let Some(work) = pipeline
+            .jobs
+            .get_mut(&job)
+            .and_then(|state| state.download_queue.pop())
+        {
+            served = true;
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            serve_job(pipeline, job, scenario, article).await;
+        }
+        if pipeline.inflight_moves.contains(&job) {
+            break;
+        }
+        if pipeline.write_buffered_bytes > 0 {
+            pipeline.flush_quiescent_write_backlog().await;
+        }
+        pipeline.check_job_completion(job).await;
+        while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(queued).await;
+        }
+        if pipeline
+            .graph_jobs
+            .get(&job)
+            .is_some_and(|graph| graph.runs().live())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        idle = if served { 0 } else { idle + 1 };
+        assert!(
+            idle < 2 || pipeline.inflight_moves.contains(&job),
+            "{job:?} stalled: {:?} {}",
+            job_status_for_assert(pipeline, job),
+            debug_job_state(pipeline, job)
+        );
+    }
+}
+
+// A graph job held at the post-repair hook stands at its move while another
+// graph job is delivered beside it: the hold is the held job's alone.
+#[test]
+fn a_graph_job_held_after_its_repair_holds_no_other_job() {
+    // The hook is read from the environment once per process and holds far
+    // past any run. The row ends on the other job's delivery, never on the
+    // hold, and the held thread is left behind when the runtime stops.
+    // SAFETY: nothing else in this test's process reads the environment yet.
+    unsafe {
+        std::env::set_var(
+            "WEAVER_E2E_DELAY",
+            format!("{DIRECT_STORE_POST_REPAIR_VERIFY}=3600000"),
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let held = opening_lost_recovery_refused();
+        let other = Scenario::new(vec![Post::plain("ember.bin", payload(3 * ARTICLE + 5, 23))]);
+        let (_temp_dir, mut pipeline, _) = admit(&held, Engine::Graph).await;
+        insert_active_job(&mut pipeline, OTHER, other.spec()).await;
+        pipeline.admit_graph_job(OTHER, Engine::Graph);
+
+        drive_to_move(&mut pipeline, JOB, &held).await;
+        assert!(
+            pipeline
+                .graph_recovery_summary(JOB)
+                .is_some_and(|summary| summary.repaired()),
+            "the held job repaired"
+        );
+        drive_to_move(&mut pipeline, OTHER, &other).await;
+        let done = pipeline.move_done_rx.recv().await.expect("a move reports");
+        assert_eq!(done.job_id, OTHER, "the held job's move is still held");
+        pipeline.handle_move_to_complete_done(done).await;
+        assert_eq!(
+            job_status_for_assert(&pipeline, OTHER),
+            Some(JobStatus::Complete)
+        );
+        assert!(pipeline.inflight_moves.contains(&JOB));
+        assert_eq!(
+            job_status_for_assert(&pipeline, JOB),
+            Some(JobStatus::Moving)
+        );
+    });
+    runtime.shutdown_background();
+}
+
+// Recovery a graph job has not asked for is not parked work: dispatch
+// schedules no completion check for it the way it does for classic's
+// parked queue, whose check is what unparks it.
+#[tokio::test]
+async fn dispatch_schedules_no_parked_recovery_check_for_a_graph_job() {
+    let scenario = Scenario::new(with_par2(single_member_store_set(MEMBER, &body(), 1)));
+    for engine in [Engine::Classic, Engine::Graph] {
+        let (_temp_dir, mut pipeline, _) = admit(&scenario, engine).await;
+        let state = pipeline.jobs.get_mut(&JOB).unwrap();
+        while state.download_queue.pop().is_some() {}
+        assert!(
+            !state.recovery_queue.is_empty(),
+            "{engine}: recovery queued"
+        );
+        pipeline.dispatch_downloads();
+        assert_eq!(
+            pipeline.pending_completion_checks.contains(&JOB),
+            engine == Engine::Classic,
+            "{engine}: a parked-recovery completion check"
+        );
+        retire_pipeline_database(pipeline).await;
+    }
 }
 
 #[tokio::test]
@@ -360,9 +562,9 @@ async fn a_header_encrypted_rar5_set_without_a_password_check_goes_to_the_engine
 // A three-volume set the RAR engine reads, posted without one volume. The
 // engine reads volume p as bound volume p, so the member cannot be read
 // whole: its object announced it and never closed it, so the refusal reads
-// the posted volumes back as they were, delivered as they stand, and the
-// job is Partial. Divergence: classic never settles.
-async fn assert_missing_volume_is_partial(missing: &str) {
+// the posted volumes back as they were, short, and with nothing whole the
+// job fails naming them. Divergence: classic never settles.
+async fn assert_missing_volume_fails(missing: &str) {
     let body = body();
     let volumes: Vec<(String, Vec<u8>)> =
         header_encrypted_store_set(MEMBER, &body, 3, SECRET, HeaderCheck::Absent)
@@ -384,32 +586,29 @@ async fn assert_missing_volume_is_partial(missing: &str) {
         "{:?}",
         graph.graph().kinds
     );
+    let short: Vec<&str> = posted.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        graph.failure
+        graph.failure,
+        Some(format!(
+            "no file was delivered whole; {} short: {}",
+            short.len(),
+            short.join(", ")
+        ))
     );
-    let mut names: Vec<String> = posted.iter().map(|(name, _)| delivered(name)).collect();
-    names.sort();
-    assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), names);
-    assert!(!graph.files.contains_key(&delivered(MEMBER)));
-    for (name, bytes) in &posted {
-        assert!(graph.files[&delivered(name)] == *bytes, "{name} as posted");
-    }
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
 // Without `.r01`, the last: the engine finds no volume past `.r00`.
 #[tokio::test]
-async fn a_three_volume_set_the_engine_reads_posted_without_its_r01_is_partial_under_graph() {
-    assert_missing_volume_is_partial("silver.horizon.r01").await;
+async fn a_three_volume_set_the_engine_reads_posted_without_its_r01_fails_under_graph() {
+    assert_missing_volume_fails("silver.horizon.r01").await;
 }
 
 // Without `.r00`, inside the set: the engine reads position 1 as lost.
 #[tokio::test]
-async fn a_three_volume_set_the_engine_reads_posted_without_its_r00_is_partial_under_graph() {
-    assert_missing_volume_is_partial("silver.horizon.r00").await;
+async fn a_three_volume_set_the_engine_reads_posted_without_its_r00_fails_under_graph() {
+    assert_missing_volume_fails("silver.horizon.r00").await;
 }
 
 #[tokio::test]

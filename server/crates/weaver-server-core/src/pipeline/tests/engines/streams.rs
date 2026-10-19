@@ -8,10 +8,9 @@
 use std::io::Write;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, payload, run, run_both,
 };
 use crate::history::HistoryFailureKind;
-use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
 
 fn ember() -> Vec<u8> {
@@ -31,6 +30,12 @@ pub(super) fn xz(bytes: &[u8]) -> Vec<u8> {
 
 pub(super) fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+pub(super) fn deflate(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(bytes).unwrap();
     encoder.finish().unwrap()
 }
@@ -130,6 +135,11 @@ async fn a_brotli_stream_delivers_the_file_it_holds_under_both_engines() {
     one_stream("ember.bin.br", brotli(&ember())).await;
 }
 
+#[tokio::test]
+async fn a_raw_deflate_stream_delivers_the_file_it_holds_under_both_engines() {
+    one_stream("ember.bin.deflate", deflate(&ember())).await;
+}
+
 pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![("ember.bin", ember()), ("quill.bin", quill())]
 }
@@ -148,6 +158,79 @@ async fn a_gzipped_tar_delivers_its_members_under_both_engines() {
     let (classic, graph) = run_both(&scenario).await;
     assert_delivered(&graph, &members());
     assert_same(&classic, &graph);
+}
+
+// One post cut into articles of every size from the whole file down to a
+// byte (4 KiB is the whole file again): one outcome and one set of files
+// under both engines, neither refetches, and the graph reads it through
+// `kinds`.
+async fn delivers_alike_in_every_frame_size(
+    name: &str,
+    bytes: Vec<u8>,
+    expected: &[(&str, Vec<u8>)],
+    expected_kinds: &[&str],
+) {
+    let mut seen = None;
+    for size in [usize::MAX, 4096, 64, 1] {
+        let scenario = Scenario::new(vec![Post::plain(name, bytes.clone())]).framed(size);
+        let (classic, graph) = run_both(&scenario).await;
+        assert_delivered(&classic, expected);
+        assert_delivered(&graph, expected);
+        assert_eq!(kinds(&graph), expected_kinds, "frames of {size} bytes");
+        assert_same(&classic, &graph);
+        let files = seen.get_or_insert_with(|| graph.files.clone());
+        assert_eq!(*files, graph.files, "frames of {size} bytes");
+    }
+}
+
+async fn one_stream_in_every_frame_size(name: &str, compressed: Vec<u8>, kind: &str) {
+    delivers_alike_in_every_frame_size(name, compressed, &[("ember.bin", ember())], &[kind]).await;
+}
+
+#[tokio::test]
+async fn an_xz_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+    one_stream_in_every_frame_size("ember.bin.xz", xz(&ember()), "stream_xz").await;
+}
+
+#[tokio::test]
+async fn a_gzip_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+    one_stream_in_every_frame_size("ember.bin.gz", gzip(&ember()), "stream_gz").await;
+}
+
+#[tokio::test]
+async fn a_bzip2_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+    one_stream_in_every_frame_size("ember.bin.bz2", bzip2(&ember()), "stream_bzip2").await;
+}
+
+#[tokio::test]
+async fn a_zstd_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+    one_stream_in_every_frame_size("ember.bin.zst", zstd(&ember()), "stream_zstd").await;
+}
+
+#[tokio::test]
+async fn a_brotli_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+    one_stream_in_every_frame_size("ember.bin.br", brotli(&ember()), "stream_brotli").await;
+}
+
+#[tokio::test]
+async fn a_raw_deflate_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+    one_stream_in_every_frame_size("ember.bin.deflate", deflate(&ember()), "stream_deflate").await;
+}
+
+#[tokio::test]
+async fn a_tar_delivers_alike_in_every_frame_size_under_both_engines() {
+    delivers_alike_in_every_frame_size("lantern.tar", tar(&members()), &members(), &["tar"]).await;
+}
+
+#[tokio::test]
+async fn a_gzipped_tar_delivers_alike_in_every_frame_size_under_both_engines() {
+    delivers_alike_in_every_frame_size(
+        "lantern.tar.gz",
+        gzip(&tar(&members())),
+        &members(),
+        &["stream_gz", "tar"],
+    )
+    .await;
 }
 
 // The compressed subtitle holds a different file of the plain one's name.
@@ -172,26 +255,27 @@ async fn subs_srt_beside_subs_srt_gz_delivers_both_and_overwrites_nothing() {
 // A PAR2 set that describes only a file never posted covers nothing here,
 // and an xz whose first article arrived damaged has no recovery behind it.
 // The set rules as soon as its volumes are in, so nothing waits on it: the
-// job ends with the xz delivered as it stands, its stream header unreadable,
-// Partial for unpacking. The file the set describes was never rebuilt, so
-// it is no file; the graph's claim on the xz is what was delivered of it.
+// job ends with the xz short as it stands, its stream header unreadable, and
+// with nothing whole it fails for unpacking, carrying the set's repair
+// failure. The file the set describes was never rebuilt, so it is no file;
+// the graph's claim on the xz is what arrived of it.
 #[tokio::test]
 async fn an_xz_damaged_at_its_front_beside_a_par2_set_covering_nothing_ends_without_waiting() {
     let other = payload(2 * ARTICLE + 7, 65);
     let mut posts = vec![Post::plain("ember.bin.xz", xz(&ember()))];
     posts.extend(par2_set("tinder", &[("tinder.bin", &other)], 2));
     let graph = run(&Scenario::new(posts).damaged(0, 0), Engine::Graph).await;
-    assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
+    assert!(
+        graph.failure.as_deref().is_some_and(
+            |error| error.starts_with("PAR2 recovery failed for 1 set(s): tinder.par2")
+        ),
         "{:?}",
-        graph.failure
+        graph.status
     );
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(graph.files.contains_key(&delivered("ember.bin.xz")));
-    assert!(!graph.files.contains_key(&delivered("ember.bin")));
-    assert!(!graph.files.contains_key(&delivered("tinder.bin")));
-    assert_eq!(graph.claims.get("ember.bin.xz"), Some(&Claim::Damaged));
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    // A failed job ships nothing; the graph's own claim keeps the damage.
+    assert_eq!(graph.claims.get("ember.bin.xz"), Some(&Claim::Missing));
     assert_eq!(
         graph.graph().claims.get("ember.bin.xz"),
         Some(&Claim::Damaged)

@@ -12,9 +12,10 @@ use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMet
 
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::graph::Engine;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, payload, run, run_both,
 };
 
 const SECRET: &str = "quill-ember-secret";
@@ -165,47 +166,44 @@ async fn an_aes_stored_7z_with_the_job_password_delivers_its_members_under_both_
     assert_same(&classic, &graph);
 }
 
-// Neither engine has a password claim to leave: classic fails the job for
-// the password after fetching the set again, graph leaves the container
-// whole and completes without naming the password.
+// No password for an AES-stored 7z: classic fails the job for the password
+// after fetching the set again. The graph's store gives the container back
+// withheld, since nothing opened it, so nothing is whole and the job fails
+// naming the password it needs, with no refetch.
 #[tokio::test]
-async fn an_aes_stored_7z_without_a_password_fails_for_it_under_classic_and_is_left_whole_under_graph()
- {
+async fn an_aes_stored_7z_without_a_password_fails_for_it_under_both_engines() {
     let archive = stored(Some(SECRET));
-    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive.clone())]);
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)]);
     let (classic, graph) = run_both(&scenario).await;
 
-    assert!(
-        matches!(classic.status, Some(JobStatus::Failed { .. })),
-        "classic: {:?}",
-        classic.status
-    );
+    for outcome in [&classic, &graph] {
+        assert!(
+            matches!(outcome.status, Some(JobStatus::Failed { .. })),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.status
+        );
+        assert_eq!(
+            outcome.failure_kind,
+            Some(HistoryFailureKind::Password),
+            "{}: failure kind",
+            outcome.engine
+        );
+        assert!(
+            outcome.files.is_empty(),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.files.keys()
+        );
+    }
     assert_eq!(
-        classic.failure_kind,
-        Some(HistoryFailureKind::Password),
-        "classic: failure kind"
+        graph.failure.as_deref(),
+        Some("lantern.7z needs a password and none was given")
     );
-    assert!(
-        classic.files.is_empty(),
-        "classic: {:?}",
-        classic.files.keys()
-    );
-
     assert!(
         graph.refetched().is_empty(),
         "graph: {:?}",
         graph.refetched()
-    );
-    assert!(graph.completed(), "graph: {:?}", graph.failure);
-    assert_eq!(graph.failure_kind, None, "graph: failure kind");
-    assert_eq!(
-        graph.files.keys().cloned().collect::<Vec<_>>(),
-        vec![delivered("lantern.7z")],
-        "graph: delivered names"
-    );
-    assert!(
-        graph.files[&delivered("lantern.7z")] == archive,
-        "graph: container bytes"
     );
 }
 
@@ -248,12 +246,8 @@ async fn a_damaged_lzma2_7z_under_par2_is_repaired_in_the_stream_and_decoded_und
     );
     assert_eq!(classic.refetched(), [(0, 0)]);
     assert_same_delivered_classic_refetching(&classic, &graph);
-    assert_eq!(graph.reads, 12, "the slices the repair read back");
-}
-
-// The kinds of object the graph bound, in name order.
-fn kinds(graph: &Outcome) -> Vec<&str> {
-    graph.graph().kinds.iter().map(String::as_str).collect()
+    // An 11-slice archive (661 bytes): the count follows its size.
+    assert_eq!(graph.reads, 20, "the slices the repair read back");
 }
 
 // How many candidates each node was offered.
@@ -385,6 +379,43 @@ async fn an_lzma2_7z_delivers_alike_in_every_frame_size_under_both_engines() {
     }
 }
 
+// The three parts served last article first, as a crowd of workers may:
+// the end header that maps the members is in hand first, the signature
+// header that finds it last. Graph only: the batch the harness serves
+// backwards is in no queue classic can see.
+#[tokio::test]
+async fn a_stored_7z_served_last_article_first_delivers_its_members_under_graph() {
+    let scenario = Scenario::new(split(&stored(None), 3)).backwards();
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_members(&graph);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// The same frames served last article first: the folder's packed stream is
+// in hand before the headers that say the container needs the engine.
+#[tokio::test]
+async fn an_lzma2_7z_served_last_article_first_delivers_alike_in_every_frame_size_under_both_engines()
+ {
+    let mut seen = None;
+    for size in [usize::MAX, 4096, 64, 1] {
+        let (classic, graph) = run_both(&lzma2().framed(size).backwards()).await;
+        assert_members(&classic);
+        assert_members(&graph);
+        assert!(
+            kinds(&graph).contains(&"sevenz_engine"),
+            "{:?}",
+            kinds(&graph)
+        );
+        if size >= 4096 {
+            assert_same(&classic, &graph);
+        } else {
+            assert_same_delivered_classic_refetching(&classic, &graph);
+        }
+        let files = seen.get_or_insert_with(|| graph.files.clone());
+        assert_eq!(*files, graph.files, "frames of {size} bytes");
+    }
+}
+
 // The packed streams end where the end header starts, which the signature
 // header names.
 fn packed_end(archive: &[u8]) -> usize {
@@ -475,15 +506,15 @@ fn beside_par2(archive: &[u8], blocks: u32) -> Scenario {
 }
 
 // The end header cut short and posted whole: every volume closes and the
-// store never maps. Graph refuses it (`Why::Unmapped`) and delivers the
-// container as it stands in place of its members; the object failed, so the
-// job is Partial for unpacking, never Complete with its members missing.
-// Classic fails the job: it cannot read the archive.
+// store never maps. Graph refuses it (`Why::Unmapped`) and gives the
+// container back withheld, as it stands, in place of its members; the
+// object failed and nothing is whole, so the job fails for unpacking, worded
+// by the refusal, never Complete with its members missing. Classic fails the job: it cannot read the archive.
 #[tokio::test]
-async fn a_7z_whose_end_header_is_cut_short_is_refused_with_the_container_delivered_under_graph() {
+async fn a_7z_whose_end_header_is_cut_short_is_refused_and_fails_under_graph() {
     let mut archive = stored(None);
     archive.truncate(archive.len() - 8);
-    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive.clone())]);
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)]);
     let (classic, graph) = run_both(&scenario).await;
     assert!(
         matches!(classic.status, Some(JobStatus::Failed { .. })),
@@ -491,21 +522,10 @@ async fn a_7z_whose_end_header_is_cut_short_is_refused_with_the_container_delive
         classic.status
     );
     assert_eq!(
-        graph.files.keys().cloned().collect::<Vec<_>>(),
-        [delivered("lantern.7z")],
-        "graph: {:?}",
-        graph.status
+        graph.failure.as_deref(),
+        Some("lantern.7z never placed every member it named")
     );
-    assert!(
-        graph.files[&delivered("lantern.7z")] == archive,
-        "the container as posted"
-    );
-    assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        graph.failure
-    );
+    assert!(graph.files.is_empty(), "graph: {:?}", graph.files.keys());
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
     assert!(
         graph.refetched().is_empty(),

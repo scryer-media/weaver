@@ -20,7 +20,7 @@ use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 
 // A stored 7z of `entries`, in order.
-fn stored(entries: &[(&str, &[u8])]) -> Vec<u8> {
+pub(super) fn stored(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
     writer.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
     for (name, bytes) in entries {

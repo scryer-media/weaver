@@ -13,7 +13,7 @@ use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, payload, run_both,
 };
 
 const SECRET: &str = "beacon-lantern-secret";
@@ -220,10 +220,6 @@ pub(super) fn deflated() -> Vec<u8> {
     archive(SimpleFileOptions::default().compression_method(CompressionMethod::Deflated))
 }
 
-fn kinds(graph: &Outcome) -> Vec<&str> {
-    graph.graph().kinds.iter().map(String::as_str).collect()
-}
-
 // The deflated zip cut into articles of every size from the whole file down
 // to a byte (4 KiB is the whole file again): one outcome and one set of files
 // under both engines, and neither refetches.
@@ -274,14 +270,15 @@ fn second_local(bytes: &[u8]) -> usize {
 
 // quill.bin's deflated stream damaged with no PAR2, in 16-byte articles: the
 // fifth article past its local header's, inside its data. The engine's run
-// closes ember.bin whole and then fails quill.bin's CRC, and the job ends
-// Partial with the archive as posted delivered. Divergence from the partial
-// extraction ruling (2026-10-18), not asserted: graph does not deliver
-// ember.bin, though the engine closed it; the 7z row above keeps its closed
-// member under the same refusal. Divergence: classic fails the job (Repair)
-// and delivers nothing.
+// closes ember.bin whole and then fails quill.bin's CRC; the archive is
+// given back short as posted and, with nothing whole, the job fails.
+// Divergence from the partial extraction ruling (2026-10-18), asserted as
+// the failure it causes: graph does not deliver ember.bin, though the engine
+// closed it, so the job fails where the ruling makes it Partial; the 7z row
+// above keeps its closed member under the same refusal. Divergence: classic
+// fails the job (Repair) and delivers nothing.
 #[tokio::test]
-async fn a_deflate_zip_with_a_damaged_member_and_no_par2_ends_partial_under_graph() {
+async fn a_deflate_zip_with_a_damaged_member_and_no_par2_fails_under_graph() {
     let bytes = deflated();
     let damaged = (second_local(&bytes) / 16 + 4) as u32;
     let scenario = Scenario::new(vec![Post::plain("lantern.zip", bytes.clone())])
@@ -307,10 +304,10 @@ async fn a_deflate_zip_with_a_damaged_member_and_no_par2_ends_partial_under_grap
     );
 
     assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
+        graph.failure.as_deref(),
+        Some("no file was delivered whole; 1 short: lantern.zip"),
         "graph: {:?}",
-        graph.failure
+        graph.status
     );
     assert!(
         graph.refetched().is_empty(),
@@ -318,12 +315,7 @@ async fn a_deflate_zip_with_a_damaged_member_and_no_par2_ends_partial_under_grap
         graph.refetched()
     );
     assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
-    assert!(!graph.files.contains_key(&delivered("quill.bin")));
-    assert_eq!(
-        graph.files.get(&delivered("lantern.zip")).map(Vec::len),
-        Some(bytes.len()),
-        "the archive as posted"
-    );
+    assert!(graph.files.is_empty(), "graph: {:?}", graph.files.keys());
     assert_eq!(
         graph.graph().claims.get("lantern.zip"),
         Some(&Claim::Damaged)

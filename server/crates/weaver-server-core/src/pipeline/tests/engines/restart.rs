@@ -19,8 +19,8 @@ use super::sfv::{crc, listing};
 use super::streams::{brotli, bzip2, gzip, members, tar, xz, zstd};
 use super::zip;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::Pipeline;
 use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
     Entry, build_7z_shaped, split_volumes,
 };
@@ -32,6 +32,7 @@ use crate::pipeline::tests::{
     insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
     pump_pipeline_runtime_queues, retire_pipeline_database,
 };
+use crate::pipeline::{Pipeline, PipelineEvent};
 
 const SECRET: &str = "lantern-restart-secret";
 
@@ -44,28 +45,23 @@ fn buffers() -> crate::runtime::buffers::BufferPoolConfig {
 }
 
 // What a restarted run came to.
-struct Restarted {
-    status: Option<JobStatus>,
-    files: BTreeMap<String, Vec<u8>>,
-    requests: BTreeMap<(u32, u32), usize>,
+pub(super) struct Restarted {
+    pub(super) status: Option<JobStatus>,
+    pub(super) files: BTreeMap<String, Vec<u8>>,
+    pub(super) requests: BTreeMap<(u32, u32), usize>,
     // Every article some restart found in memory.
-    in_memory: BTreeSet<(u32, u32)>,
-    restarts: usize,
+    pub(super) in_memory: BTreeSet<(u32, u32)>,
+    pub(super) restarts: usize,
 }
 
 // Called with each checkpoint as it stood when the pipeline went down.
-type Inspect<'a> = &'a mut dyn FnMut(&crate::jobs::graph_checkpoint::GraphCheckpoint);
+pub(super) type Inspect<'a> = &'a mut dyn FnMut(&crate::jobs::graph_checkpoint::GraphCheckpoint);
 
-async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) -> Restarted {
+pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) -> Restarted {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
-    if !scenario.global_passwords.is_empty() {
-        pipeline
-            .db
-            .save_archive_password_settings(Some(scenario.global_passwords.clone()), None)
-            .unwrap();
-    }
+    scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     stamp_graph(&pipeline.db);
     pipeline.admit_graph_job(JOB, Engine::Graph);
@@ -166,6 +162,20 @@ async fn restart(
     in_memory: &mut BTreeSet<(u32, u32)>,
     inspect: Inspect<'_>,
 ) -> Pipeline {
+    restart_heard(temp_dir, pipeline, scenario, in_memory, inspect)
+        .await
+        .0
+}
+
+// As `restart`, with every event the new pipeline sends from before it
+// restores the job.
+async fn restart_heard(
+    temp_dir: &tempfile::TempDir,
+    pipeline: Pipeline,
+    scenario: &Scenario,
+    in_memory: &mut BTreeSet<(u32, u32)>,
+    inspect: Inspect<'_>,
+) -> (Pipeline, tokio::sync::broadcast::Receiver<PipelineEvent>) {
     in_memory.extend(pipeline.graph_jobs[&JOB].in_memory());
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
@@ -173,6 +183,8 @@ async fn restart(
     drop(db);
 
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(temp_dir, buffers(), 1).await;
+    let heard = pipeline.event_tx.subscribe();
+    scenario.prepare(&mut pipeline);
     let rows = pipeline
         .db
         .load_graph_checkpoint(JOB)
@@ -207,7 +219,7 @@ async fn restart(
         "a checkpointed graph job restores"
     );
     assert!(pipeline.graph_jobs.contains_key(&JOB));
-    pipeline
+    (pipeline, heard)
 }
 
 // The restarted run finished as the uninterrupted one did, and asked again
@@ -232,7 +244,7 @@ fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
     assert!(again.is_empty(), "fetched again though on disk: {again:?}");
 }
 
-async fn restart_row(scenario: Scenario) {
+pub(super) async fn restart_row(scenario: Scenario) {
     let whole = run(&scenario, Engine::Graph).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
@@ -266,6 +278,155 @@ async fn a_plain_file_under_par2_restarted_after_every_article_is_repaired_with_
         2,
     );
     restart_row(Scenario::new(posts).damaged(0, 3)).await;
+}
+
+// Every event `pipeline` sent since `sent` subscribed, kept in order.
+fn drain(
+    sent: &mut tokio::sync::broadcast::Receiver<PipelineEvent>,
+    into: &mut Vec<PipelineEvent>,
+) {
+    loop {
+        match sent.try_recv() {
+            Ok(event) => into.push(event),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("the run's events were not all kept: {error}"),
+        }
+    }
+}
+
+// What a run restarted once after its repair came to.
+struct RestartedDone {
+    status: Option<JobStatus>,
+    files: BTreeMap<String, Vec<u8>>,
+    // Every event either pipeline sent from admission on, in order.
+    events: Vec<PipelineEvent>,
+}
+
+// The job served as `run` serves it, and the pipeline taken down once, the
+// first time the tree is done with its repair announced and the job's next
+// completion check, which starts the move, has not run.
+async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    stamp_graph(&pipeline.db);
+    pipeline.admit_graph_job(JOB, Engine::Graph);
+    let mut sent = pipeline.event_tx.subscribe();
+    let mut events = Vec::new();
+    let mut in_memory = BTreeSet::new();
+    let mut restarted = false;
+    let mut quiet = 0;
+    let mut asked = 0usize;
+    loop {
+        while let Some(work) = pipeline
+            .jobs
+            .get_mut(&JOB)
+            .and_then(|state| state.download_queue.pop())
+        {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            asked += 1;
+            serve(&mut pipeline, scenario, article).await;
+        }
+        if finished(&pipeline) {
+            break;
+        }
+        // Down once the repair is announced and before the job's next
+        // completion check starts its move.
+        drain(&mut sent, &mut events);
+        let announced = events.iter().any(
+            |event| matches!(event, PipelineEvent::RepairComplete { job_id, .. } if *job_id == JOB),
+        );
+        let done = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.phase() == RootPhase::Done);
+        if !restarted && announced && done {
+            (pipeline, sent) =
+                restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;
+            restarted = true;
+            continue;
+        }
+        let before = asked;
+        if pipeline.write_buffered_bytes > 0 {
+            pipeline.flush_quiescent_write_backlog().await;
+        }
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.runs().live())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        if asked == before {
+            quiet += 1;
+            assert!(
+                quiet < 3,
+                "restarted job stalled at {:?}",
+                job_status_for_assert(&pipeline, JOB)
+            );
+        } else {
+            quiet = 0;
+        }
+    }
+    assert!(restarted, "the tree was done before the job finished");
+    let status = job_status_for_assert(&pipeline, JOB);
+    pipeline.db.flush_write_queue().await.unwrap();
+    drain(&mut sent, &mut events);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    RestartedDone {
+        status,
+        files,
+        events,
+    }
+}
+
+// A slice repaired, the repair announced, and the pipeline down before the
+// job is through. The restored job is done as soon as it is restored, and
+// what it announced before going down is not announced again: one
+// `RepairComplete` for the one repair, then the job's completion.
+#[tokio::test]
+#[ignore = "a graph job restored already Done reports its phase again: restore leaves `reported` unset, so `phase_change` sees Done as a change and the repair is announced twice"]
+async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
+    let body = payload(9 * ARTICLE + 21, 71);
+    let posts = with_par2(vec![Post::plain("ember.bin", body.clone())], 2);
+    let restarted = run_restarted_once_done(&Scenario::new(posts).damaged(0, 3)).await;
+    assert_eq!(restarted.status, Some(JobStatus::Complete));
+    assert_eq!(
+        restarted.files.keys().cloned().collect::<Vec<_>>(),
+        vec!["lantern beacon/ember.bin".to_string()]
+    );
+    assert!(restarted.files["lantern beacon/ember.bin"] == body);
+    let said: Vec<String> = restarted
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            PipelineEvent::RepairComplete {
+                job_id,
+                slices_repaired,
+            } if *job_id == JOB => Some(format!("RepairComplete {slices_repaired}")),
+            PipelineEvent::JobCompleted { job_id } if *job_id == JOB => {
+                Some("JobCompleted".to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said, ["RepairComplete 1", "JobCompleted"]);
 }
 
 #[tokio::test]
@@ -715,14 +876,14 @@ async fn a_buried_refusal_restarted_after_every_article_is_offered_to_no_later_s
 
 // A three-volume set the RAR engine reads, posted without `.r00`. The engine
 // announces the member and never closes it, so its refusal leaves it buried
-// under the engine's node, and that buried member is what makes the job
-// Partial. A refusal of that kind waits for the payload to be in, so it lands
-// in the last settle, after the last checkpoint: restored after every
-// article before it, the job still ends Partial as the run that never
-// restarted does. That a checkpoint carries a buried member back is the
-// tree record's round trip.
+// under the engine's node, and that buried member leaves nothing whole, so
+// the job fails. A refusal of that kind waits for the payload to be in, so it
+// lands in the last settle, after the last checkpoint: restored after every
+// article before it, the job still fails as the run that never restarted
+// does. That a checkpoint carries a buried member back is the tree record's
+// round trip.
 #[tokio::test]
-async fn a_set_missing_a_volume_restarted_after_every_article_still_ends_partial() {
+async fn a_set_missing_a_volume_restarted_after_every_article_still_fails() {
     let body = payload(7 * ARTICLE + 13, 51);
     let posts: Vec<Post> =
         header_encrypted_store_set("beacon.bin", &body, 3, SECRET, HeaderCheck::Absent)
@@ -734,10 +895,8 @@ async fn a_set_missing_a_volume_restarted_after_every_article_still_ends_partial
     let scenario = Scenario::new(posts).password(SECRET);
     let whole = run(&scenario, Engine::Graph).await;
     assert_eq!(
-        whole.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        whole.failure
+        whole.failure.as_deref(),
+        Some("no file was delivered whole; 2 short: ember.rar, ember.r01")
     );
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);

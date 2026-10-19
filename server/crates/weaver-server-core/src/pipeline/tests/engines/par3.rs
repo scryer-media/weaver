@@ -14,8 +14,8 @@ use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMet
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, par3_set, payload, run,
-    run_both, try_run,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, par3_set, payload,
+    repair_and_terminal_events, run, run_both, try_run,
 };
 use super::rar::{assert_classic_stalls, delivered, posts};
 use crate::history::HistoryFailureKind;
@@ -128,12 +128,14 @@ async fn a_lost_article_under_par3_is_repaired_with_its_blocks_reported() {
     assert_repaired_once(&graph, 2);
 }
 
-// Divergence: two damaged slices and one recovery block. The graph fails
-// the repair with the shortfall named and leaves the member a damaged
-// leaf; classic completes the job with the posted bytes. That classic
-// outcome is recorded, not explained.
+// Two damaged slices and one recovery block. The graph fails the repair
+// with the shortfall named and leaves the member a damaged leaf. Classic
+// fails it too, when par3-rs runs out of recovery, and files it under
+// health rather than repair. (It completed only while the harness payload
+// repeated every two slices: classic's PAR3 scan found each damaged
+// block's bytes whole at another offset, so nothing was missing.)
 #[tokio::test]
-async fn recovery_short_of_blocks_under_par3_fails_as_repair_under_graph_and_completes_under_classic()
+async fn recovery_short_of_blocks_under_par3_fails_as_repair_under_graph_and_as_health_under_classic()
  {
     let data = payload(4 * ARTICLE, 65);
     let scenario = Scenario::new(covered(&[("lantern.bin", data.clone())], 1))
@@ -142,10 +144,15 @@ async fn recovery_short_of_blocks_under_par3_fails_as_repair_under_graph_and_com
     let (classic, graph) = run_both(&scenario).await;
     for outcome in [&classic, &graph] {
         assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
+        assert!(
+            outcome.files.is_empty(),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.files.keys()
+        );
     }
-    assert_delivers(&classic, &[("lantern.bin", &data)]);
+    assert_classic_exhausted(&classic);
 
-    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert_eq!(
         graph.failure.as_deref(),
@@ -164,6 +171,103 @@ async fn recovery_short_of_blocks_under_par3_fails_as_repair_under_graph_and_com
         })]
     );
     assert_eq!(view.claims["lantern.bin"], Claim::Damaged, "a damaged leaf");
+}
+
+// `lantern.bin` posted with `zeroed` of its blocks already zeroed, so every
+// article arrives with a good checksum and only the set's block
+// fingerprints can see the damage, against a set of `recovery` blocks
+// described over the bytes before the zeroing.
+fn zeroed_under_par3(blocks: usize, zeroed: std::ops::Range<usize>, recovery: u64) -> Scenario {
+    let original = payload(blocks * ARTICLE, 0);
+    let mut posted = original.clone();
+    posted[zeroed.start * ARTICLE..zeroed.end * ARTICLE].fill(0);
+    let mut posts = vec![Post::plain("lantern.bin", posted)];
+    posts.extend(par3_set("lantern", &[("lantern.bin", &original)], recovery));
+    Scenario::new(posts)
+}
+
+// Graph: the read-back finds the zeroed blocks, the set rules the repair
+// impossible with both counts and reports the ranges it proved bad, so the
+// member is a damaged leaf the failed set covers: unrepaired, not
+// delivered, and the job fails as a repair failure. Classic fails it when
+// par3-rs runs out of recovery, under health rather than repair.
+fn assert_fails_short_of_blocks(reachable: u64, (classic, graph): (Outcome, Outcome)) {
+    let damaged = 12;
+    for outcome in [&classic, &graph] {
+        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
+        assert!(
+            matches!(outcome.status, Some(JobStatus::Failed { .. })),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.status
+        );
+        assert!(
+            outcome.files.is_empty(),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.files.keys()
+        );
+    }
+
+    // Classic words it as par3-rs does and files it under health.
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Health));
+    let exhausted = format!(
+        "(lost {damaged}, available {reachable}, short {})",
+        damaged - reachable
+    );
+    assert!(
+        classic.failure.as_deref().is_some_and(|failure| {
+            failure.starts_with("PAR3 recovery exhausted") && failure.ends_with(&exhausted)
+        }),
+        "{:?}",
+        classic.failure
+    );
+
+    let view = graph.graph();
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert_eq!(
+        view.outcomes,
+        vec![Some(RepairOutcome::Impossible { damaged, reachable })]
+    );
+    assert_eq!(view.blocks_reachable, reachable);
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some(
+            format!(
+                "PAR3 recovery failed for 1 set(s): lantern.par3 (lantern.bin): not repairable: \
+                 {damaged} damaged slices, only {reachable} recovery blocks reachable"
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(view.claims["lantern.bin"], Claim::Damaged, "a damaged leaf");
+    assert_eq!(view.delivery.unrepaired, ["lantern.bin"]);
+    assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
+}
+
+// Twelve zeroed blocks against one recovery block, every article one block.
+#[tokio::test]
+async fn zeroed_blocks_in_clean_articles_short_of_par3_recovery_fail_as_repair_under_both_engines()
+{
+    const RECOVERY: u64 = 1;
+    let scenario = zeroed_under_par3(40, 20..32, RECOVERY);
+    assert_eq!(scenario.posts.len(), 3, "an index and one volume");
+    let outcomes = run_both(&scenario).await;
+    assert_fails_short_of_blocks(RECOVERY, outcomes);
+}
+
+// The same shortfall with four recovery blocks spread over three volumes
+// (1 + 2 + 1, as the creator lays them out) and articles of eleven and a
+// fraction blocks each, so the zeroed run straddles two articles at neither
+// edge of either.
+#[tokio::test]
+async fn zeroed_blocks_short_of_par3_recovery_over_three_volumes_fail_as_repair_under_both_engines()
+{
+    const RECOVERY: u64 = 4;
+    let scenario = zeroed_under_par3(96, 20..32, RECOVERY).framed(11 * ARTICLE + 46);
+    assert_eq!(scenario.posts.len(), 5, "an index and three volumes");
+    let outcomes = run_both(&scenario).await;
+    assert_fails_short_of_blocks(RECOVERY, outcomes);
 }
 
 // Hex names in place of the described ones, then the set under a hex name.
@@ -318,13 +422,30 @@ async fn a_member_a_par2_and_a_par3_set_describe_is_repaired_once() {
     );
 }
 
+// Classic's word for a PAR3 set short by one block: par3-rs ran out of
+// recovery, filed under health, and nothing delivered.
+fn assert_classic_exhausted(classic: &Outcome) {
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Health));
+    assert!(
+        classic.failure.as_deref().is_some_and(|failure| {
+            failure.starts_with("PAR3 recovery exhausted")
+                && failure.ends_with("(lost 2, available 1, short 1)")
+        }),
+        "{:?}",
+        classic.failure
+    );
+    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
+}
+
 // `beacon.bin` takes two damaged slices against one recovery block;
 // `lantern.bin` beside it arrives whole. The partial-delivery invariant
 // (2026-10-18) keeps the whole member delivered and ends the job Partial,
-// with `beacon.bin` left a damaged leaf. Classic completes the job with both
-// files as posted, recorded, not explained.
+// with `beacon.bin` left a damaged leaf. Classic fails the whole job when
+// par3-rs runs out of recovery, under health, and delivers nothing. (It
+// completed only while the harness payload repeated every two slices:
+// classic's PAR3 scan found each damaged block's bytes whole elsewhere.)
 #[tokio::test]
-async fn a_member_par3_cannot_repair_beside_a_whole_one_fails_the_job_under_graph_and_completes_under_classic()
+async fn a_member_par3_cannot_repair_beside_a_whole_one_ends_partial_under_graph_and_fails_under_classic()
  {
     let lantern = payload(3 * ARTICLE, 70);
     let beacon = payload(4 * ARTICLE, 71);
@@ -342,10 +463,7 @@ async fn a_member_par3_cannot_repair_beside_a_whole_one_fails_the_job_under_grap
     for outcome in [&classic, &graph] {
         assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
     }
-    assert_delivers(
-        &classic,
-        &[("lantern.bin", &lantern), ("beacon.bin", &beacon)],
-    );
+    assert_classic_exhausted(&classic);
 
     let view = graph.graph();
     assert_eq!(view.claims["lantern.bin"], Claim::Complete);
@@ -369,5 +487,41 @@ async fn a_member_par3_cannot_repair_beside_a_whole_one_fails_the_job_under_grap
         graph.files[&delivered("lantern.bin")] == lantern,
         "{:?}",
         graph.files.keys()
+    );
+}
+
+// `ember.bin` under a PAR2 set and `beacon.bin` under a PAR3 set, one
+// damaged article each: both sets repair, and the graph announces the
+// job's repair once, with the slices of both, before the job completes.
+#[tokio::test]
+async fn a_par2_and_a_par3_set_repairing_different_members_are_announced_once_under_graph() {
+    let ember = payload(3 * ARTICLE, 72);
+    let beacon = payload(3 * ARTICLE, 73);
+    let mut posts = vec![
+        Post::plain("ember.bin", ember.clone()),
+        Post::plain("beacon.bin", beacon.clone()),
+    ];
+    posts.extend(par2_set("ember", &[("ember.bin", &ember)], 2));
+    posts.extend(par3_set("beacon", &[("beacon.bin", &beacon)], 2));
+    let scenario = Scenario::new(posts).damaged(0, 1).damaged(1, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(
+        graph.completed(),
+        "{:?} {:?} {:?} {:?}",
+        graph.status,
+        graph.graph().outcomes,
+        graph.claims,
+        repair_and_terminal_events(&graph)
+    );
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![
+            Some(RepairOutcome::Repaired { slices: 1 }),
+            Some(RepairOutcome::Repaired { slices: 1 })
+        ]
+    );
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        vec!["RepairComplete 2".to_string(), "JobCompleted".to_string()]
     );
 }

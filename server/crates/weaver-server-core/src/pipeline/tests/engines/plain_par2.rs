@@ -6,10 +6,12 @@
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Post, Scenario, assert_same, one_block_article, par2_set, payload, run_both,
+    ARTICLE, Claim, Post, Scenario, assert_same, one_block_article, par2_set, payload,
+    repair_and_terminal_events, run, run_both,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::graph::Engine;
 
 // Plain files followed by one PAR2 set over them, the index then the
 // volume; the files are numbered as listed, the index and volume after.
@@ -111,13 +113,15 @@ async fn a_lost_recovery_article_lowers_the_blocks_reachable_and_the_repair_succ
     );
 }
 
-// Divergence: the graph counts what the lost volume article cost and fails
-// the repair as a PAR2 failure does; classic reports the job complete with
-// the posted bytes. That classic outcome is recorded, not explained: losing
-// the volume's article 1 or 1 and 2 leaves classic complete, losing article
-// 9 fails it on one advertised block.
+// Two damaged slices against a set of two blocks, one of them lost with its
+// volume article. The graph counts what the lost article cost and fails the
+// repair as one block reachable; classic fails it as one block advertised.
+// Both file it under repair and deliver nothing. (Classic completed only
+// while the harness payload repeated every two slices: its PAR2 scan found
+// each damaged slice's bytes whole at another offset, so nothing was
+// missing.)
 #[tokio::test]
-async fn a_lost_recovery_article_short_of_blocks_fails_under_graph_and_completes_under_classic() {
+async fn a_lost_recovery_article_short_of_blocks_fails_as_repair_under_both_engines() {
     let posts = covered(&[("lantern.bin", payload(4 * ARTICLE, 8))], 2);
     let lost = one_block_article(&posts[2]);
     let scenario = Scenario::new(posts)
@@ -127,11 +131,22 @@ async fn a_lost_recovery_article_short_of_blocks_fails_under_graph_and_completes
     let (classic, graph) = run_both(&scenario).await;
     for outcome in [&classic, &graph] {
         assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
+        assert_eq!(outcome.failure_kind, Some(HistoryFailureKind::Repair));
+        assert!(
+            outcome.files.is_empty(),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.files.keys()
+        );
     }
-    assert!(classic.completed(), "{:?}", classic.failure);
-    assert!(claims_all(&classic.claims, Claim::Complete));
+    assert_eq!(
+        classic.failure.as_deref(),
+        Some(
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+             2 damaged slices, only 1 recovery blocks advertised"
+        )
+    );
 
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     let view = graph.graph();
     assert_eq!(view.blocks_reachable, 1);
     assert_eq!(
@@ -152,10 +167,11 @@ async fn a_lost_recovery_article_short_of_blocks_fails_under_graph_and_completes
     );
 }
 
-// Divergence: the graph keeps a damaged article no recovery covers and
-// delivers it with the damage reported; classic fails the download.
+// A damaged article no recovery covers, in the job's only file. Divergence:
+// the graph keeps the article and claims the file damaged, and since nothing
+// is whole the job fails for the short file; classic fails the download.
 #[tokio::test]
-async fn a_damaged_article_without_par2_is_delivered_under_graph_and_fails_under_classic() {
+async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged_under_graph() {
     let scenario =
         Scenario::new(vec![Post::plain("lantern.bin", payload(10 * ARTICLE, 9))]).damaged(0, 4);
     let (classic, graph) = run_both(&scenario).await;
@@ -170,14 +186,13 @@ async fn a_damaged_article_without_par2_is_delivered_under_graph_and_fails_under
         "{:?}",
         classic.failure
     );
-    // Delivered as it stands, short of whole: the job ends Partial.
+    // Nothing is whole: the job fails, naming the short file.
     assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
-        "{:?}",
-        graph.failure
+        graph.failure.as_deref(),
+        Some("no file was delivered whole; 1 short: lantern.bin")
     );
-    assert_eq!(graph.claims["lantern.bin"], Claim::Damaged);
+    // A failed job ships nothing; the graph's own claim keeps the damage.
+    assert_eq!(graph.claims["lantern.bin"], Claim::Missing);
     assert_eq!(graph.graph().claims["lantern.bin"], Claim::Damaged);
 }
 
@@ -238,4 +253,103 @@ async fn a_clean_par2_job_reads_none_of_its_files_back_under_graph() {
     assert_eq!(graph.reads, 0, "the graph read a member back");
     assert_eq!(graph.volume_samples(&classic), vec![(3, 0)]);
     assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+}
+
+// A PAR2 set rebuilds the one damaged article: the graph announces the
+// repair once, with the slice it rebuilt, before the job completes.
+#[tokio::test]
+async fn a_par2_repair_is_announced_once_before_the_job_completes_under_graph() {
+    let data = payload(4 * ARTICLE, 21);
+    let scenario = Scenario::new(covered(&[("lantern.bin", data)], 2)).damaged(0, 1);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        vec!["RepairComplete 1".to_string(), "JobCompleted".to_string()]
+    );
+}
+
+// Three damaged slices against two recovery blocks: the repair did not
+// hold, so nothing announces one, and the job fails.
+#[tokio::test]
+async fn a_par2_set_short_of_blocks_announces_no_repair_and_fails_under_graph() {
+    let data = payload(4 * ARTICLE, 22);
+    let scenario = Scenario::new(covered(&[("lantern.bin", data)], 2))
+        .damaged(0, 0)
+        .damaged(0, 1)
+        .damaged(0, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Impossible {
+            damaged: 3,
+            reachable: 2
+        })]
+    );
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        vec!["JobFailed".to_string()]
+    );
+}
+
+// Twelve slices of `lantern.bin` zeroed before posting, so every article
+// arrives with a good checksum and only the set's slice checksums can see
+// the damage, against one recovery block.
+// Graph: the set rules the repair impossible and reports the slices it
+// proved bad, so the member is a damaged leaf the failed set covers:
+// unrepaired, not delivered, and the job fails as a repair failure. Classic
+// fails it as a repair failure too.
+#[tokio::test]
+async fn zeroed_slices_in_clean_articles_short_of_par2_recovery_fail_as_repair_under_both_engines()
+{
+    let original = payload(40 * ARTICLE, 0);
+    let mut posted = original.clone();
+    posted[20 * ARTICLE..32 * ARTICLE].fill(0);
+    let mut posts = vec![Post::plain("lantern.bin", posted)];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &original)], 1));
+    let (classic, graph) = run_both(&Scenario::new(posts)).await;
+    for outcome in [&classic, &graph] {
+        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
+        assert_eq!(
+            outcome.failure_kind,
+            Some(HistoryFailureKind::Repair),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.failure
+        );
+        assert!(
+            outcome.files.is_empty(),
+            "{}: {:?}",
+            outcome.engine,
+            outcome.files.keys()
+        );
+    }
+    // Classic counts the blocks the set advertises rather than reaches.
+    assert_eq!(
+        classic.failure.as_deref(),
+        Some(
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+             12 damaged slices, only 1 recovery blocks advertised"
+        )
+    );
+
+    let view = graph.graph();
+    assert_eq!(
+        view.outcomes,
+        vec![Some(RepairOutcome::Impossible {
+            damaged: 12,
+            reachable: 1
+        })]
+    );
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some(
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+             12 damaged slices, only 1 recovery blocks reachable"
+        )
+    );
+    assert_eq!(view.claims["lantern.bin"], Claim::Damaged, "a damaged leaf");
+    assert_eq!(view.delivery.unrepaired, ["lantern.bin"]);
+    assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
 }
