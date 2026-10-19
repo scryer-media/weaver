@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why};
+use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
 
 use super::{Decoder, Front};
 
@@ -67,17 +67,24 @@ impl<D: Decoder> Extraction for Run<D> {
             return;
         }
         let mut again = Front::new(volumes);
-        let damaged = D::damaged(&error, &mut again);
+        let damaged = D::damaged(&error, &mut again)
+            .map(|range| again.place(range))
+            .transpose();
         if again.failure().load(Ordering::Acquire) {
             return;
         }
-        sink(match damaged {
-            Some(range) => Emit::Damaged {
-                volume: VolumeIndex(0),
-                range,
-            },
-            None => Emit::Refuse(why(&error)),
-        });
+        match damaged {
+            Ok(Some(pieces)) if !pieces.is_empty() => {
+                for (volume, range) in pieces {
+                    if !sink(Emit::Damaged { volume, range }) {
+                        return;
+                    }
+                }
+            }
+            _ => {
+                sink(Emit::Refuse(why(&error)));
+            }
+        }
     }
 }
 

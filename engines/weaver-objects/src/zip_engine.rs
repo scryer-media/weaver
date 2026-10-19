@@ -18,6 +18,7 @@ pub struct ZipFormat;
 impl Format for ZipFormat {
     const KIND: Kind = Kind::ZipEngine;
     type Name = naming::VolumeName;
+    type Front = ();
 
     fn parse(name: &str) -> Option<naming::VolumeName> {
         naming::parse(name)

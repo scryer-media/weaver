@@ -278,3 +278,38 @@ async fn a_damaged_obfuscated_member_is_repaired_and_renamed_under_both_engines(
     );
     assert!(claims_all(&view.claims, Claim::Complete));
 }
+
+// Two files posted under each other's names, the set describing them under
+// their own: each member's front says which file it is, so the set binds
+// it by content over the name it was posted as, finds both clean, and the
+// namespace puts both names back. The index comes first, so under the graph
+// each member is bound by its name until its front is in, and the slices
+// checked against the wrong file in that while ask for the recovery volume
+// ahead; classic asks for none of it.
+#[tokio::test]
+async fn swapped_names_are_put_back_by_the_set_under_both_engines() {
+    let files = [
+        ("lantern.bin", payload(3 * ARTICLE, 34)),
+        ("beacon.bin", payload(2 * ARTICLE + 7, 35)),
+    ];
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .collect();
+    let mut posts = vec![
+        Post::plain("beacon.bin", files[0].1.clone()),
+        Post::plain("lantern.bin", files[1].1.clone()),
+    ];
+    posts.extend(par2_set("lantern", &described, 2));
+    let scenario = Scenario::new(posts);
+    let (classic, graph) = run_both(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    delivered_as_described(&graph, &files);
+    let view = graph.graph();
+    assert_eq!(view.outcomes, vec![Some(RepairOutcome::Clean)]);
+    assert!(claims_all(&view.claims, Claim::Complete));
+    assert_eq!(graph.reads, 0, "nothing was read back");
+    assert!(graph.refetched().is_empty());
+    assert!(classic.completed(), "{:?}", classic.failure);
+    delivered_as_described(&classic, &files);
+}

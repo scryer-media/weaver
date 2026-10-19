@@ -211,7 +211,7 @@ fn run(engine: &ZipEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
 fn named(names: &[&str]) -> ZipEngine {
     let mut engine = ZipEngine::new();
     for (volume, name) in names.iter().enumerate() {
-        engine.bound(VolumeIndex(volume as u32), name);
+        engine.bound(VolumeIndex(volume as u32), name, &[]);
     }
     engine
 }
@@ -359,7 +359,7 @@ fn claim_names_the_volumes_of_its_own_set_with_the_last_after_them() {
     assert_eq!(engine.claim("set.z00", b""), None);
     assert_eq!(engine.claim("other.z02", b""), None);
     assert_eq!(engine.claim("set.7z.002", b""), None);
-    engine.bound(VolumeIndex(u32::MAX), "set.zip");
+    engine.bound(VolumeIndex(u32::MAX), "set.zip", &[]);
     assert_eq!(engine.claim("set.zip", b""), None);
     assert_eq!(
         engine.claim("set.z02", b""),

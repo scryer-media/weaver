@@ -121,6 +121,32 @@ pub struct Extent {
     pub range: ByteRange,
 }
 
+// What an object parsed of one of its volumes, which travels with the member
+// when the object gives it back: the next owner adopts it in place of
+// reading the member's headers again. Only an object of the same kind can
+// read it; to everyone else, the tree among them, it is opaque.
+pub type Carried = Box<dyn std::any::Any + Send + Sync>;
+
+// What the tree records of an object's members and volumes, read when the
+// job is quiet. Read only: the record stays the tree's, and the object
+// rules on it.
+pub trait Standing {
+    // A member of mine still holds damage that nothing vouched for: no
+    // recovery object covering it, or covering what my volumes came out of,
+    // found it whole or made it so, and it is no volume an object below
+    // gave back, whose damage that object ruled on.
+    fn damaged(&self) -> bool;
+
+    // I named no member, or a member I named is not placed: it never
+    // closed, nor holds every byte it will, nor is a recovery object's
+    // volume.
+    fn unplaced(&self) -> bool;
+
+    // A range of my volumes was lost and nothing vouched for it: what
+    // `volume_lost` told just before.
+    fn lost(&self) -> bool;
+}
+
 // Send and Sync because a job's tree lives in the pipeline, which runs on a
 // multi-threaded runtime and is shared by reference across its awaits. An
 // object is plain state with no interior mutability, so both come free.
@@ -146,9 +172,12 @@ pub trait Object: Send + Sync {
 
     // The job is quiet: nothing more will arrive and no repair will come,
     // and every lost range of my volumes was told through `volume_lost`
-    // just before. A volume of my set no member ever became will never
-    // come either; an object that cannot read without it says so now.
-    fn quiet(&mut self, _out: &mut Vec<Emit>) {}
+    // just before. An object that cannot finish gives its volumes back now,
+    // for its own reason, read from its own state and from what the tree
+    // records of its members: a volume of its set that never came, a member
+    // still damaged, a password it is still asking for, a member it named
+    // and never placed. Nothing else rules for it.
+    fn quiet(&mut self, _standing: &dyn Standing, _out: &mut Vec<Emit>) {}
 
     // What I want ahead of the normal order, right now. The namespace lifts
     // each one to the parent and answers through `pulled`.
@@ -196,10 +225,12 @@ pub trait Object: Send + Sync {
     // Bytes of my envelope, for the inverse map's remainder.
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes>;
 
-    // A member of my parent's namespace, by its name there, is now this
-    // volume of mine. The name is how an object that chains its volumes by
-    // name knows its own set when a sibling asks to be claimed.
-    fn bound(&mut self, _volume: VolumeIndex, _name: &str) {}
+    // A member of my parent's namespace, by its name there and the first
+    // bytes it has so far, is now this volume of mine. They are how an
+    // object that chains its volumes, by name or by what their headers
+    // state, knows its own set when a sibling asks to be claimed: the same
+    // name and front a claim reads.
+    fn bound(&mut self, _volume: VolumeIndex, _name: &str, _front: &[u8]) {}
 
     // A new member appeared beside the one I am bound to. Is it one of my
     // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z
@@ -213,6 +244,30 @@ pub trait Object: Send + Sync {
     fn claim(&mut self, _name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
         None
     }
+
+    // A volume I said I give back: what I parsed of it, to travel with the
+    // member, or `None` when I keep nothing of it worth carrying or more
+    // than an object may carry, and the member is refused instead.
+    fn give_back(&mut self, _volume: VolumeIndex) -> Option<Carried> {
+        None
+    }
+
+    // A member a sibling gave back, offered with what that sibling parsed
+    // of it: is it one of my volumes? Answered from what was parsed, never
+    // by reading the member again; `None` from an object that cannot read
+    // what was carried.
+    fn reclaim(&mut self, _name: &str, _carried: &Carried) -> Option<VolumeIndex> {
+        None
+    }
+
+    // A member I reclaimed is now this volume of mine, and what was parsed
+    // of it is mine to keep: `bound`, for a member that brings its parse.
+    fn adopt(&mut self, volume: VolumeIndex, name: &str, _carried: Carried) {
+        self.bound(volume, name, &[]);
+    }
+
+    // My volume's member has another name now: a recovery set named it.
+    fn renamed(&mut self, _volume: VolumeIndex, _name: &str) {}
 
     // Whether I can use a volume only once every volume before it has been
     // read: an engine or a stream, which have no map to seek by.

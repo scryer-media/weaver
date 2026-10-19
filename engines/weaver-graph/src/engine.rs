@@ -59,6 +59,11 @@ pub trait Engine {
     // otherwise its own.
     fn reached(&mut self, _volume: VolumeIndex, _offset: u64) {}
 
+    // The run said it cannot read further without a password. The owner
+    // tells the object, as it tells it how far the run read, so the object
+    // knows it is asking until `offer_password` answers.
+    fn asked(&mut self) {}
+
     // The bytes a run holds resident while it runs: a decoder's window, read
     // from the first bytes the object was delivered. The owner reserves it
     // before it starts the run, and a run never holds more, so a reservation

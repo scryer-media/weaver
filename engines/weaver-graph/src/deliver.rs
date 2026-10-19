@@ -189,6 +189,10 @@ pub enum Emit {
     NeedsEngine(Why),
     // "Nothing here can read this; make it a plain file."
     Refuse(Why),
+    // "My own headers say this volume is not mine where I hold it." The
+    // claim that bound it was provisional: the member goes back to its
+    // namespace, with what I parsed of it, to be offered again.
+    GiveBack(VolumeIndex),
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use unrar_rs::{
 };
 use weaver_graph::{ByteRange, Emit, MemberId, RecoveryKind, VolumeIndex, Why};
 
-use super::{Entry, Lock, Out, Piece, RarStore};
+use super::{Entry, Lock, Out, Piece, RarStore, claim};
 use crate::runs::CrcRuns;
 
 // A name as the namespace numbers it: forward slashes, a directory with a
@@ -77,19 +77,19 @@ fn same(entry: &Entry, member: &StoredMember) -> bool {
 impl RarStore {
     // A fresh layout over every volume read far enough.
     fn build(&mut self, out: &mut Vec<Emit>) -> Option<StoredLayoutBuilder> {
-        let first = self.volumes.get(&VolumeIndex(0))?.walk.facts.as_ref()?;
+        // A volume held where its headers do not place it is mapped by no
+        // layout: it is given back at its close. One held first stops the
+        // layout before it starts.
+        let first = self
+            .volumes
+            .get(&VolumeIndex(0))?
+            .walk
+            .facts
+            .as_ref()
+            .filter(|facts| !claim::misplaced(VolumeIndex(0), facts))?;
         let format = first.archive_format();
-        let refusal = if !matches!(format, ArchiveFormat::Rar4 | ArchiveFormat::Rar5) {
-            Some(Emit::NeedsEngine(Why::Unsupported))
-        } else if first.volume_number.is_some_and(|number| number != 0) {
-            // The first volume bound is not the set's first: the bytes that
-            // would name the members before it never came.
-            Some(Emit::Refuse(Why::FirstBytesLost))
-        } else {
-            None
-        };
-        if let Some(emit) = refusal {
-            self.give_up(emit, out);
+        if !matches!(format, ArchiveFormat::Rar4 | ArchiveFormat::Rar5) {
+            self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
             return None;
         }
         let mut layout = StoredLayoutBuilder::new(format);
@@ -100,13 +100,11 @@ impl RarStore {
             let Some(facts) = found.walk.facts.as_ref() else {
                 break;
             };
-            if facts.members.is_empty() && !found.walk.ended {
+            if (facts.members.is_empty() && !found.walk.ended) || claim::misplaced(*index, facts) {
                 break;
             }
             let refusal = if facts.is_solid {
                 Some(Emit::NeedsEngine(Why::Compressed))
-            } else if facts.volume_number.is_some_and(|number| number != index.0) {
-                Some(Emit::Refuse(Why::Unsupported))
             } else {
                 layout
                     .add_volume(index.0, facts)

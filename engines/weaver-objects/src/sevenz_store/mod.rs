@@ -29,12 +29,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
-    Pull, RecoveryKind, Seek, VolumeIndex, Weight, Why,
+    Pull, RecoveryKind, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
 use crate::crypt::{Cbc, Chain, Padding};
-use crate::engine::{Format, SetName};
+use crate::engine::Format;
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
 use crate::keys::Keys;
@@ -250,6 +250,25 @@ impl SevenZipStore {
     fn give_up(&mut self, emit: Emit, out: &mut Vec<Emit>) {
         self.gone = true;
         out.push(emit);
+    }
+
+    // What shuts the container once no candidate is left to try: its header,
+    // when none opened it, or a folder none keys.
+    fn shut(&self) -> Option<Why> {
+        let header_shut = self.map.is_none()
+            && self.encrypted
+            && self
+                .candidates
+                .iter()
+                .all(|candidate| candidate.header_wrong);
+        let folders_shut = self.map.is_some()
+            && self.asked
+            && self.folders.iter().any(Lock::is_locked)
+            && self
+                .candidates
+                .iter()
+                .all(|candidate| candidate.folder_wrong);
+        (header_shut || folders_shut).then_some(Why::EncryptedHeader)
     }
 
     fn bid(&mut self, range: ByteRange, weight: Weight) {
@@ -548,21 +567,23 @@ impl Object for SevenZipStore {
         }
         // Everything that could arrive has: a password that has not opened
         // the container by now never will.
-        let header_shut = self.map.is_none()
-            && self.encrypted
-            && self
-                .candidates
-                .iter()
-                .all(|candidate| candidate.header_wrong);
-        let folders_shut = self.map.is_some()
-            && self.asked
-            && self.folders.iter().any(Lock::is_locked)
-            && self
-                .candidates
-                .iter()
-                .all(|candidate| candidate.folder_wrong);
-        if header_shut || folders_shut {
-            self.give_up(Emit::Refuse(Why::EncryptedHeader), out);
+        if let Some(why) = self.shut() {
+            self.give_up(Emit::Refuse(why), out);
+        }
+    }
+
+    // Nothing more will arrive. A member still damaged, a password that
+    // opened nothing, or a member named and never placed leaves the
+    // container unread.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if self.gone {
+            return;
+        }
+        let why = crate::quiet::damaged(standing)
+            .or_else(|| self.shut())
+            .or_else(|| crate::quiet::unplaced(standing));
+        if let Some(why) = why {
+            self.give_up(Emit::Refuse(why), out);
         }
     }
 
@@ -694,7 +715,11 @@ impl Object for SevenZipStore {
         self.kept.read(range).map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
+        self.names.insert(volume, name.to_owned());
+    }
+
+    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
         self.names.insert(volume, name.to_owned());
     }
 
@@ -704,14 +729,12 @@ impl Object for SevenZipStore {
         if first_bytes.starts_with(&header::MAGIC) {
             return None;
         }
-        let wanted = SevenZip::parse(name)?;
-        let volume = VolumeIndex(wanted.index());
-        let ours = self
-            .names
-            .values()
-            .filter_map(|bound| SevenZip::parse(bound))
-            .any(|bound| bound.same_set(&wanted));
-        (ours && wanted.index() != 0 && !self.names.contains_key(&volume)).then_some(volume)
+        // Its place is its number counted from the first volume's own, so a
+        // set renamed to numbers of its own chains as a plain one does.
+        let first = SevenZip::parse(self.names.get(&VolumeIndex(0))?)?;
+        let index = SevenZip::parse(name)?.index_from(&first)?;
+        let volume = VolumeIndex(index);
+        (index != 0 && !self.names.contains_key(&volume)).then_some(volume)
     }
     fn facts(&self) -> Facts {
         Facts::of(Kind::SevenZipStore, self)

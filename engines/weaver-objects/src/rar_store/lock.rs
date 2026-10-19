@@ -231,8 +231,19 @@ impl RarStore {
     // Everything that could arrive has: a password that has not opened the
     // set by now never will.
     pub(super) fn exhausted(&mut self, out: &mut Vec<Emit>) {
-        if !self.asked || !self.finished() {
+        if !self.finished() {
             return;
+        }
+        if let Some(why) = self.shut() {
+            self.give_up(Emit::Refuse(why), out);
+        }
+    }
+
+    // What the set is shut by while the store is still asking: its headers,
+    // when no candidate opened them, or a file no candidate keys.
+    pub(super) fn shut(&self) -> Option<Why> {
+        if !self.asked {
+            return None;
         }
         let headers_shut = self.headers_open.is_none()
             && self
@@ -244,14 +255,11 @@ impl RarStore {
                 .iter()
                 .all(|candidate| candidate.headers_wrong);
         if headers_shut {
-            return self.give_up(Emit::Refuse(Why::EncryptedHeader), out);
+            return Some(Why::EncryptedHeader);
         }
-        if self
-            .entries
+        self.entries
             .iter()
             .any(|entry| matches!(entry.lock, Lock::Locked | Lock::Sealed(_)))
-        {
-            self.give_up(Emit::Refuse(Why::Encrypted), out);
-        }
+            .then_some(Why::Encrypted)
     }
 }

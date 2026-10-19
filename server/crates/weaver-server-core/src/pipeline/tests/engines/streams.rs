@@ -115,6 +115,21 @@ async fn an_xz_stream_delivers_the_file_it_holds_under_both_engines() {
     one_stream("ember.bin.xz", xz(&ember())).await;
 }
 
+// A stream posted in numbered pieces is one stream: the first piece carries
+// the signature, the others only their names, which place them after it.
+#[tokio::test]
+async fn an_xz_stream_split_into_numbered_pieces_delivers_the_file_it_holds() {
+    let compressed = xz(&ember());
+    let chunk = compressed.len().div_ceil(3);
+    let pieces = compressed
+        .chunks(chunk)
+        .zip(1..)
+        .map(|(bytes, number)| Post::plain(&format!("ember.bin.xz.{number:03}"), bytes.to_vec()))
+        .collect();
+    let graph = run(&Scenario::new(pieces), Engine::Graph).await;
+    assert_delivered(&graph, &[("ember.bin", ember())]);
+}
+
 #[tokio::test]
 async fn a_gzip_stream_delivers_the_file_it_holds_under_both_engines() {
     one_stream("ember.bin.gz", gzip(&ember())).await;
@@ -272,7 +287,9 @@ async fn an_xz_damaged_at_its_front_beside_a_par2_set_covering_nothing_ends_with
         "{:?}",
         graph.status
     );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+    // The set's own file is short because the set could not rebuild it:
+    // the repair is the stage that left the job short.
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     // A failed job ships nothing; the graph's own claim keeps the damage.
     assert_eq!(graph.claims.get("ember.bin.xz"), Some(&Claim::Missing));

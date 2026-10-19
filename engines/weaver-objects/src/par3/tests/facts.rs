@@ -152,9 +152,11 @@ fn a_par3_object_restored_at_every_point_repairs_as_the_live_one() {
                 "cut {cut}: the restored object reads members back as the live one does"
             );
         }
+        // The repair that rebuilt the member stands: the bind after it
+        // only renamed what it had already bound.
         assert_eq!(
             again.job.object.outcome(),
-            Some(RepairOutcome::Clean),
+            Some(RepairOutcome::Repaired { slices: 1 }),
             "cut {cut}"
         );
         assert!(again.job.store.members[&again.hidden] == one, "cut {cut}");

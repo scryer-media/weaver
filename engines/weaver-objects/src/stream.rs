@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The stream objects: one compressed volume in, one member out. A decoder
-// cannot jump, so a stream reads its volume from the front and nothing else;
-// it is run by its owner the way an engine is, over the volume as a file that
+// The stream objects: one compressed stream in, one member out. A decoder
+// cannot jump, so a stream reads its volumes from the front and nothing else;
+// it is run by its owner the way an engine is, over the volumes as files that
 // may still be growing, and its bytes are its envelope, kept whole by the
 // owner, because nothing can rebuild compressed bytes from what they decode
-// to. A format supplies only how its decoder opens and how big a window the
-// stream's first bytes declare.
+// to. A stream posted in numbered pieces, `name.xz.001`, `name.xz.002`, …, is
+// one stream over several volumes: only the first carries the signature, and
+// the others' names place them. A format supplies only how its decoder opens
+// and how big a window the stream's first bytes declare.
 
 mod brotli;
 mod bzip2;
@@ -21,6 +23,7 @@ mod zstd;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeSet;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 
@@ -28,7 +31,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, MemberId, Object,
-    Placement, Pull, Seek, VolumeIndex,
+    Placement, Pull, Seek, Standing, VolumeIndex,
 };
 
 pub use self::brotli::Brotli;
@@ -38,6 +41,8 @@ pub use self::gzip::Gzip;
 pub use self::xz::Xz;
 pub use self::zstd::Zstd;
 pub use front::Front;
+
+use crate::split;
 
 // What one compression format knows.
 pub trait Decoder: Send + Sync + 'static {
@@ -69,7 +74,7 @@ pub type DeflateStream = Stream<Deflate>;
 // header up to the field that sizes its window.
 const FIRST: usize = 64;
 
-// Its facts are its name and its front. How far a run has read is the run's
+// Its facts are its first volume's name, its front and the pieces after it. How far a run has read is the run's
 // live progress, kept on the owner's shelf and never here: a restored stream
 // is one whose run has not started, and it replays from the stream's start
 // over the partial.
@@ -80,10 +85,13 @@ pub struct Stream<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
     first: Vec<u8>,
-    // The volume grows no further, so a front shorter than FIRST is the
-    // whole of it.
+    // The first volume grows no further, so a front shorter than FIRST is
+    // the whole of it.
     #[serde(default)]
     closed: bool,
+    // The volumes after the first, by index.
+    #[serde(default)]
+    pieces: BTreeSet<u32>,
 }
 
 impl<D: Decoder> Default for Stream<D> {
@@ -93,6 +101,7 @@ impl<D: Decoder> Default for Stream<D> {
             name: String::new(),
             first: Vec::new(),
             closed: false,
+            pieces: BTreeSet::new(),
         }
     }
 }
@@ -135,11 +144,18 @@ impl<D: Decoder> Object for Stream<D> {
         self.first[at..end].copy_from_slice(&delivery.bytes[..end - at]);
     }
 
-    fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {
-        self.closed = true;
+    fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
+        self.closed |= volume == VolumeIndex(0);
     }
 
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
+
+    // Nothing more will reach the run. A member it left damaged or never
+    // closed cannot be read whole, and the volume goes back as it stands.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        let why = crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing));
+        out.extend(why.map(Emit::Refuse));
+    }
 
     // One volume, read in order: there is nothing to bid for.
     fn wants(&mut self, _out: &mut Vec<Seek>) {}
@@ -160,8 +176,26 @@ impl<D: Decoder> Object for Stream<D> {
         None
     }
 
-    fn bound(&mut self, _volume: VolumeIndex, name: &str) {
-        name.clone_into(&mut self.name);
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
+        if volume == VolumeIndex(0) {
+            name.clone_into(&mut self.name);
+        } else {
+            self.pieces.insert(volume.0);
+        }
+    }
+
+    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
+        if volume == VolumeIndex(0) {
+            name.clone_into(&mut self.name);
+        }
+    }
+
+    // A piece numbered after the first volume's own, when the first is a
+    // piece: its place is its number counted from the first's.
+    fn claim(&mut self, name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
+        let first = split::parse(&self.name)?;
+        let index = split::parse(name)?.index_from(&first)?;
+        (index != 0 && !self.pieces.contains(&index)).then_some(VolumeIndex(index))
     }
 
     fn reads_in_order(&self) -> bool {
@@ -212,16 +246,17 @@ const EXTENSIONS: [(&str, &str); 11] = [
     (".deflate", ""),
 ];
 
-// The name the one member is announced under: the volume's name with its
-// compression extension taken off, or the name as it is when it carries
-// none, which the namespace numbers if it collides.
+// The name the one member is announced under: the first volume's name with
+// its piece number and compression extension taken off, or the name as it is
+// when it carries no extension, which the namespace numbers if it collides.
 pub fn member_name(volume: &str) -> String {
-    let lower = volume.to_ascii_lowercase();
+    let stream = split::whole(volume).unwrap_or(volume);
+    let lower = stream.to_ascii_lowercase();
     EXTENSIONS
         .iter()
         .find(|(extension, _)| lower.len() > extension.len() && lower.ends_with(extension))
         .map_or_else(
             || volume.to_owned(),
-            |(extension, left)| format!("{}{left}", &volume[..volume.len() - extension.len()]),
+            |(extension, left)| format!("{}{left}", &stream[..stream.len() - extension.len()]),
         )
 }

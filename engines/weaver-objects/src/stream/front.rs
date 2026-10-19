@@ -10,7 +10,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use weaver_graph::Volumes;
+use weaver_graph::{ByteRange, VolumeIndex, Volumes};
 
 use crate::engine::Joined;
 
@@ -31,6 +31,26 @@ impl Front {
     // will never come, which the owner already knows.
     pub(crate) fn failure(&self) -> Arc<AtomicBool> {
         self.input.failure()
+    }
+
+    // Where a range of the joined stream lies in its volumes, a piece per
+    // volume it crosses, waiting for each volume it reaches to close.
+    pub(crate) fn place(&self, range: ByteRange) -> io::Result<Vec<(VolumeIndex, ByteRange)>> {
+        let mut pieces = Vec::new();
+        let mut start = 0u64;
+        let mut at = None;
+        while start < range.end
+            && let Some(volume) = self.input.next(at)?
+        {
+            at = Some(volume);
+            let end = start + self.input.closed_len(volume)?;
+            let (from, to) = (range.start.max(start), range.end.min(end));
+            if from < to {
+                pieces.push((volume, ByteRange::new(from - start, to - start)));
+            }
+            start = end;
+        }
+        Ok(pieces)
     }
 
     fn len(&self) -> io::Result<u64> {

@@ -245,7 +245,7 @@ fn nameless_volumes_are_grouped_by_their_headers() {
 fn a_nameless_volume_without_its_predecessor_is_placed_where_it_states() {
     let volumes = write(&items(), &split(Version::Rar5));
     let mut object = store();
-    object.bound(VolumeIndex(0), "c0ffee");
+    object.bound(VolumeIndex(0), "c0ffee", &[]);
     // Volume 2 of the set states its number; volume 1, which nobody holds
     // yet, does not decide where it goes.
     let front = &volumes[2][..4096.min(volumes[2].len())];
@@ -651,10 +651,12 @@ fn unlock_bids_run_ahead_of_the_volume_being_read() {
 // The store is built on the second volume, and the first never comes: it
 // is a volume missing like any other, damaged whole once the rest are in,
 // and nothing is announced without the headers that name the members.
+// A store with no first volume once nothing more comes to it can open
+// none of what it holds: it gives every volume back, with what it read of
+// it, for the store that holds the first volume to claim.
 #[test]
-fn a_set_without_its_first_volume_says_it_damaged_whole() {
+fn a_set_without_its_first_volume_gives_its_volumes_back() {
     let volumes = write(&items(), &split(Version::Rar5));
-    let length = volumes[1].len() as u64;
     let named = volumes
         .into_iter()
         .enumerate()
@@ -667,10 +669,18 @@ fn a_set_without_its_first_volume_says_it_damaged_whole() {
     for volume in [1, 2] {
         owner.close(volume);
     }
-    assert!(owner.said.contains(&Emit::Damaged {
-        volume: VolumeIndex(0),
-        range: ByteRange::new(0, length),
-    }));
+    for volume in [1, 2] {
+        assert!(owner.said.contains(&Emit::GiveBack(VolumeIndex(volume))));
+        assert!(owner.object.give_back(VolumeIndex(volume)).is_some());
+    }
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Damaged { .. })),
+        "{:?}",
+        owner.said
+    );
     assert!(owner.members.is_empty());
 }
 

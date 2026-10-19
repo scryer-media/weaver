@@ -261,7 +261,7 @@ impl NamespaceWriter {
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
         }
-        self.bind_recoveries(tree, segments, node)
+        self.bind_recoveries(tree, builder, segments, node, out)
     }
 
     // Nothing more will arrive for the member. The tree closes it and says
@@ -298,10 +298,10 @@ impl NamespaceWriter {
     pub(crate) fn length_learned(
         &mut self,
         tree: &mut Tree,
+        builder: &mut dyn Builder,
         segments: &dyn Segments,
-        node: NodeId,
-        member: MemberId,
-        length: u64,
+        (node, member, length): (NodeId, MemberId, u64),
+        out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let record = tree
             .namespace_mut(node)
@@ -311,7 +311,7 @@ impl NamespaceWriter {
             return Ok(());
         }
         record.length = Some(length);
-        self.bind_recoveries(tree, segments, node)
+        self.bind_recoveries(tree, builder, segments, node, out)
     }
 
     // Effects the tree raised outside a delivery: an answered seek, a range
@@ -384,7 +384,7 @@ impl NamespaceWriter {
         tree.handed_over(node, member, &mut self.placing(builder), &mut effects);
         self.apply_each(tree, builder, segments, effects, out)?;
         if tree.recovers(child) {
-            self.bind_recoveries(tree, segments, node)?;
+            self.bind_recoveries(tree, builder, segments, node, out)?;
         }
         Ok(())
     }
@@ -518,7 +518,7 @@ impl NamespaceWriter {
         }
         // A repair reads members back, so it may have identified one by its
         // content; the bind that follows gives it the name it is.
-        self.bind_recoveries(tree, segments, node)?;
+        self.bind_recoveries(tree, builder, segments, node, out)?;
         self.release_held(tree, builder, segments, out)?;
         Ok(outcomes)
     }
@@ -722,8 +722,10 @@ impl NamespaceWriter {
     fn bind_recoveries(
         &mut self,
         tree: &mut Tree,
+        builder: &mut dyn Builder,
         segments: &dyn Segments,
         node: NodeId,
+        out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let recovery_nodes = tree.recovery_nodes(node);
         if recovery_nodes.is_empty() {
@@ -803,7 +805,8 @@ impl NamespaceWriter {
             }
         }
         // A member the recovery renamed in its namespace wants that name
-        // now; the tree's ledger places it.
+        // now; the tree's ledger places it, and the claims the name makes
+        // again, through the tree, bind as any claim does.
         let mut effects = Vec::new();
         for member in &renamed {
             let wanted = tree
@@ -815,7 +818,11 @@ impl NamespaceWriter {
             }
         }
         self.renamed = renamed;
-        self.moved(&effects)
+        let (moves, claims): (Vec<Effect>, Vec<Effect>) = effects
+            .into_iter()
+            .partition(|effect| matches!(effect, Effect::Renamed { .. }));
+        self.moved(&moves)?;
+        self.apply_each(tree, builder, segments, claims, out)
     }
 
     fn route(
@@ -850,7 +857,7 @@ impl NamespaceWriter {
             .and_then(|namespace| namespace.get(member))
             .is_some_and(|record| record.is_complete());
         if recovery_volume || front || complete {
-            self.bind_recoveries(tree, segments, node)?;
+            self.bind_recoveries(tree, builder, segments, node, out)?;
         }
         Ok(())
     }
@@ -983,7 +990,7 @@ impl NamespaceWriter {
                 if in_own_file {
                     self.close_leaf(tree, *node, *member)?;
                 }
-                self.bind_recoveries(tree, segments, *node)?;
+                self.bind_recoveries(tree, builder, segments, *node, out)?;
             }
             Effect::Bound {
                 node,
@@ -1007,6 +1014,12 @@ impl NamespaceWriter {
                 tree.bury(*node, *member);
                 self.prune(tree)?;
             }
+            Effect::GivenBack {
+                node,
+                member,
+                from,
+                volume,
+            } => self.given_back(tree, (*node, *member), (*from, *volume))?,
             Effect::Retracted { node, member } => {
                 self.retract(*node, *member)?;
                 self.prune(tree)?;
@@ -1105,8 +1118,37 @@ impl NamespaceWriter {
         );
         self.apply_each(tree, builder, segments, effects, out)?;
         if window.is_some() {
-            self.bind_recoveries(tree, segments, parent)?;
+            self.bind_recoveries(tree, builder, segments, parent, out)?;
         }
+        Ok(())
+    }
+
+    // A member its object gave back is a leaf, and its file is what the
+    // object kept of it, its envelope, which was always at the volume's own
+    // offsets: the envelope's file is moved to the member's name, never
+    // copied. What the object never placed is still held for the member and
+    // goes into that file as held bytes go into any leaf's. Until an object
+    // claims it, it is a container nothing opened, so it is withheld; the
+    // claim that takes it reads the file in place, as it reads any leaf's.
+    fn given_back(
+        &mut self,
+        tree: &mut Tree,
+        (node, member): (NodeId, MemberId),
+        (from, volume): (NodeId, VolumeIndex),
+    ) -> Result<(), WriteError> {
+        let output_name = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .map(|record| record.output_name.clone())
+            .ok_or(WriteError::UnknownMember { node, member })?;
+        if let Some(mut leaf) = self.envelopes.take(from, volume.0) {
+            leaf.rename(&self.working_dir, &output_name)?;
+            if let Some(stale) = self.files_mut(node).leaves.insert(member, leaf) {
+                stale.remove()?;
+            }
+        }
+        self.release_to_leaf(tree, node, member)?;
+        self.refuse(tree, node, member, Why::Unmapped);
         Ok(())
     }
 

@@ -167,6 +167,16 @@ impl Envelopes {
         kept.coverage.covered(range) && kept.leaf.read(range.start, len, into).is_ok()
     }
 
+    // An envelope the object at `node` gave back with its volume leaves the
+    // shelf, file and all: the file, at the volume's own offsets, is what
+    // the object kept of the volume. Nothing is read or copied.
+    pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Leaf> {
+        let shelf = self.shelves.get(&node)?;
+        shelf
+            .update(|state| state.kept.remove(&envelope))
+            .map(|kept| kept.leaf)
+    }
+
     // The node is gone, and its envelopes with it. A run still reading them
     // is stopped first.
     pub(crate) fn forget(&mut self, node: NodeId) -> Result<(), LeafError> {

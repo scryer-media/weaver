@@ -3,19 +3,28 @@
 
 // Verifying and rebuilding one PAR3 set through the namespace. par3-rs
 // repairs files on disk; here its layout, its streaming verifier and its
-// Cauchy decoder are driven directly, so every byte read and written goes
-// through the namespace and no member is ever held whole.
+// Cauchy and FFT decoders are driven directly, so every byte read and
+// written goes through the namespace and no member is ever held whole.
+//
+// A lost input block the set carries as a Data packet, whose bytes the
+// set's own fingerprints vouch for, is input the set holds: it is written
+// back as it is and costs no recovery block.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 use par3_rs::evidence::{ExtentVerdict, FileEvidence, StreamingVerifier};
+use par3_rs::fft::{FftCodec, FftGeometry, FftInput};
 use par3_rs::gf::{AnyField, for_set};
 use par3_rs::layout::{BlockLayout, ExtentKind, FileExtent, FileLayout};
-use par3_rs::runtime::ExecutionOptions;
+use par3_rs::runtime::{EngineError, ExecutionOptions};
 use par3_rs::source::{SourceId, SourceSnapshot};
-use par3_rs::{CodecLimits, Decoder, Geometry, PacketBody, Par3Set, RecoveredBlock};
+use par3_rs::{
+    CodecLimits, Decoder, FingerprintHasher, Geometry, PacketBody, Par3Set, RecoveredBlock,
+    RecoveryBlock,
+};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{ByteRange, MemberId};
 
@@ -28,12 +37,81 @@ pub(super) struct SetRepair {
     pub(super) lost: u64,
 }
 
-// Recovery blocks the set can spend: computed with its one Cauchy matrix,
-// carried with it, and of the set's block size. Ascending.
+// The one matrix a set's recovery blocks were computed with.
+enum Matrix {
+    // One code over every input block.
+    Cauchy,
+    // The blocks of `coverage` dealt round `cohorts` by index, each cohort
+    // its own code of at most `1 << capacity_log2` recovery blocks; a
+    // recovery block's cohort is its index round the cohorts too.
+    Fft {
+        coverage: Range<u64>,
+        cohorts: u64,
+        capacity_log2: i8,
+    },
+}
+
+impl Matrix {
+    fn of(set: &Par3Set) -> Option<(par3_rs::Fingerprint, Self)> {
+        let [only] = set.matrix_packets() else {
+            return None;
+        };
+        let matrix = match only.body() {
+            PacketBody::CauchyMatrix(_) => Self::Cauchy,
+            PacketBody::FftMatrix(fft) => {
+                let count = set.block_count();
+                let range = fft.range;
+                let coverage = match range.covers_all() {
+                    true => 0..count,
+                    false if range.first < range.end && range.end <= count => {
+                        range.first..range.end
+                    }
+                    false => return None,
+                };
+                Self::Fft {
+                    coverage,
+                    cohorts: fft.interleave.checked_add(1)?,
+                    capacity_log2: fft.max_recovery_blocks_log2,
+                }
+            }
+            _ => return None,
+        };
+        Some((only.hash(), matrix))
+    }
+
+    // Whether the recovery rows rebuild the lost blocks: as many rows as
+    // blocks, and under FFT that many in every cohort, over blocks the
+    // matrix covers.
+    fn rebuilds(&self, lost: &[u64], rows: &[u64]) -> bool {
+        match self {
+            Self::Cauchy => rows.len() >= lost.len(),
+            Self::Fft {
+                coverage, cohorts, ..
+            } => {
+                let have = by_cohort(rows, *cohorts);
+                lost.iter().all(|block| coverage.contains(block))
+                    && by_cohort(lost, *cohorts)
+                        .iter()
+                        .all(|(cohort, lost)| have.get(cohort).map_or(0, Vec::len) >= lost.len())
+            }
+        }
+    }
+}
+
+// Indices grouped by their cohort, ascending in each.
+fn by_cohort(indices: &[u64], cohorts: u64) -> BTreeMap<u64, Vec<u64>> {
+    let mut grouped: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for &index in indices {
+        grouped.entry(index % cohorts).or_default().push(index);
+    }
+    grouped
+}
+
+// Recovery blocks the set can spend: computed with its one matrix, carried
+// with it, and of the set's block size. Ascending.
 pub(super) fn usable_recovery(set: &Par3Set) -> Vec<u64> {
-    let matrix = match set.matrix_packets() {
-        [only] if matches!(only.body(), PacketBody::CauchyMatrix(_)) => only.hash(),
-        _ => return Vec::new(),
+    let Some((matrix, _)) = Matrix::of(set) else {
+        return Vec::new();
     };
     let mut rows: Vec<u64> = set
         .recovery_blocks()
@@ -48,6 +126,58 @@ pub(super) fn usable_recovery(set: &Par3Set) -> Vec<u64> {
     rows.sort_unstable();
     rows.dedup();
     rows
+}
+
+// The input blocks the set carries as Data packets whose bytes every
+// extent naming the block vouches for by its fingerprint. A block some
+// extent of has no fingerprint is not vouched for, and is not carried.
+fn carried<'s>(set: &'s Par3Set, layout: &BlockLayout) -> BTreeMap<u64, &'s [u8]> {
+    let mut carried = BTreeMap::new();
+    for packet in set.data_packets() {
+        let data = packet.data.as_slice();
+        if data.len() as u64 > set.block_size() || carried.contains_key(&packet.block_index) {
+            continue;
+        }
+        if vouched(layout, packet.block_index, data) {
+            carried.insert(packet.block_index, data);
+        }
+    }
+    carried
+}
+
+fn vouched(layout: &BlockLayout, block: u64, data: &[u8]) -> bool {
+    let Some(locations) = layout.locations(block) else {
+        return false;
+    };
+    let mut any = false;
+    for location in locations.iter() {
+        let Some(extent) = layout
+            .files()
+            .get(location.file)
+            .and_then(|shape| shape.extents.get(location.extent))
+        else {
+            return false;
+        };
+        let ExtentKind::Block {
+            offset,
+            fingerprint: Some(expected),
+            ..
+        } = extent.kind
+        else {
+            return false;
+        };
+        let length = extent.range.end - extent.range.start;
+        let mut hash = FingerprintHasher::new();
+        let start = (offset as usize).min(data.len());
+        let end = offset.saturating_add(length).min(data.len() as u64) as usize;
+        hash.update(&data[start..end.max(start)]);
+        hash.update_zeros(length - (end.max(start) - start) as u64);
+        if hash.finalize() != expected {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 pub(super) fn repair_set(
@@ -106,8 +236,18 @@ pub(super) fn repair_set(
             lost: 0,
         };
     }
+    let carried = carried(set, &layout);
+    let lost: Vec<u64> = lost
+        .into_iter()
+        .filter(|block| !carried.contains_key(block))
+        .collect();
     let available = usable_recovery(set);
-    if (available.len() as u64) < count {
+    let matrix = Matrix::of(set);
+    let rebuilds = lost.is_empty()
+        || matrix
+            .as_ref()
+            .is_some_and(|(_, matrix)| matrix.rebuilds(&lost, &available));
+    if !rebuilds {
         if coming {
             return SetRepair {
                 outcome: RepairOutcome::Waiting,
@@ -116,18 +256,35 @@ pub(super) fn repair_set(
         }
         return failed(count, available.len() as u64, &proven, access);
     }
-    let lost: Vec<u64> = lost.into_iter().collect();
-    let rows = &available[..lost.len()];
+    let rows = match &matrix {
+        Some((_, Matrix::Cauchy)) => &available[..lost.len()],
+        _ => &available[..],
+    };
     let solve = Solve {
         set,
         layout: &layout,
         bound,
         rewrite: &rewrite,
+        carried: &carried,
         lost: &lost,
         rows,
         limits: CodecLimits::new(memory_limit),
     };
-    if solve.run(access).is_none() {
+    solve.write_carried(access);
+    let solved = match &matrix {
+        _ if lost.is_empty() => Some(()),
+        Some((_, Matrix::Cauchy)) => solve.run(access),
+        Some((
+            _,
+            Matrix::Fft {
+                coverage,
+                cohorts,
+                capacity_log2,
+            },
+        )) => solve.fft(coverage, *cohorts, *capacity_log2, access),
+        None => None,
+    };
+    if solved.is_none() {
         return failed(count, available.len() as u64, &proven, access);
     }
     write_tails(&layout, set, bound, &rewrite, access);
@@ -217,19 +374,110 @@ fn overlap(extent: &FileExtent, stripe: &Range<u64>) -> Option<(u64, Range<usize
     })
 }
 
-// One rebuild: the lost blocks, the recovery rows spent on them, and the
-// members the rebuilt bytes go back into.
+// One rebuild: the lost blocks, the recovery rows spent on them, the
+// blocks the set carries, and the members the rebuilt bytes go back into.
 struct Solve<'a> {
     set: &'a Par3Set,
     layout: &'a BlockLayout,
     bound: &'a BTreeMap<String, MemberId>,
     rewrite: &'a BTreeSet<usize>,
+    carried: &'a BTreeMap<u64, &'a [u8]>,
     lost: &'a [u64],
     rows: &'a [u64],
     limits: CodecLimits,
 }
 
 impl Solve<'_> {
+    // Each carried block, into every damaged file that names it.
+    fn write_carried(&self, access: &mut dyn MemberAccess) {
+        let whole = 0..self.set.block_size();
+        let mut block = Vec::new();
+        for (&index, data) in self.carried {
+            block.clear();
+            block.extend_from_slice(data);
+            block.resize(whole.end as usize, 0);
+            self.put(index, &whole, &block, access);
+        }
+    }
+
+    // Each cohort with a lost block decoded on its own, a stripe at a time
+    // as the codec reads them; a cohort's last positions past the matrix's
+    // range are zero.
+    fn fft(
+        &self,
+        coverage: &Range<u64>,
+        cohorts: u64,
+        capacity_log2: i8,
+        access: &mut dyn MemberAccess,
+    ) -> Option<()> {
+        let span = coverage.end - coverage.start;
+        let geometry = FftGeometry::new(span.div_ceil(cohorts), capacity_log2).ok()?;
+        let codec = FftCodec::new(geometry, ExecutionOptions::default()).ok()?;
+        let access = RefCell::new(access);
+        let rows = by_cohort(self.rows, cohorts);
+        for (cohort, lost) in by_cohort(self.lost, cohorts) {
+            let first = coverage.start + (cohort + cohorts - coverage.start % cohorts) % cohorts;
+            let block = |local: usize| first + local as u64 * cohorts;
+            let lost: Vec<usize> = lost
+                .iter()
+                .map(|index| ((index - first) / cohorts) as usize)
+                .collect();
+            let recovery: BTreeMap<usize, &RecoveryBlock> = rows
+                .get(&cohort)?
+                .iter()
+                .map(|&row| Some(((row / cohorts) as usize, self.recovery(row)?)))
+                .collect::<Option<_>>()?;
+            let indices: Vec<usize> = recovery.keys().copied().collect();
+            let mut bytes = Vec::new();
+            let refused = || EngineError::InvalidState("a PAR3 input did not read back");
+            codec
+                .decode(
+                    self.set.block_size(),
+                    &lost,
+                    &indices,
+                    |row, offset, out| {
+                        let start = offset as usize;
+                        match row {
+                            FftInput::Original(local) if block(local) >= coverage.end => {
+                                out.fill(0);
+                            }
+                            FftInput::Original(local) => {
+                                let stripe = offset..offset + out.len() as u64;
+                                let mut access = access.borrow_mut();
+                                self.assemble(block(local), &stripe, &mut bytes, *access)
+                                    .ok_or_else(refused)?;
+                                out.copy_from_slice(&bytes);
+                            }
+                            FftInput::Recovery(local) => {
+                                let data = recovery
+                                    .get(&local)
+                                    .and_then(|row| row.data().get(start..start + out.len()))
+                                    .ok_or_else(refused)?;
+                                out.copy_from_slice(data);
+                            }
+                        }
+                        Ok(())
+                    },
+                    |local, offset, rebuilt| {
+                        let stripe = offset..offset + rebuilt.len() as u64;
+                        self.put(block(local), &stripe, rebuilt, *access.borrow_mut());
+                        Ok(())
+                    },
+                )
+                .ok()?;
+        }
+        Some(())
+    }
+
+    // The recovery block a row names, of the set's block size: a set may
+    // carry two copies of one block.
+    fn recovery(&self, row: u64) -> Option<&RecoveryBlock> {
+        self.set
+            .recovery_blocks()
+            .iter()
+            .find(|block| block.index() == row && block.data_len() as u64 == self.set.block_size())
+    }
+
     // The decoder holds two buffers per lost block and the matrix over them,
     // so the blocks are rebuilt a stripe at a time, each stripe as wide as
     // the memory limit leaves room for. The code is linear symbol by symbol,
@@ -279,17 +527,15 @@ impl Solve<'_> {
             decoder.add_input(block, &bytes)?;
         }
         let range = stripe.start as usize..stripe.end as usize;
-        // A set may carry two copies of one block; each row is added once.
         for &row in self.rows {
-            let recovery = self.set.recovery_blocks().iter().find(|block| {
-                block.index() == row && block.data_len() as u64 == self.set.block_size()
-            })?;
+            let recovery = self.recovery(row)?;
             decoder.add_recovery(row, recovery.data().get(range.clone())?)?;
         }
         decoder.solve()
     }
 
-    // A stripe of a surviving input block, from every extent that names it.
+    // A stripe of a surviving input block: from the set when it carries
+    // the block, and otherwise from every extent that names it.
     fn assemble(
         &self,
         block: u64,
@@ -299,6 +545,12 @@ impl Solve<'_> {
     ) -> Option<()> {
         bytes.clear();
         bytes.resize((stripe.end - stripe.start) as usize, 0);
+        if let Some(data) = self.carried.get(&block) {
+            let start = (stripe.start as usize).min(data.len());
+            let end = (stripe.end as usize).min(data.len());
+            bytes[..end - start].copy_from_slice(&data[start..end]);
+            return Some(());
+        }
         let Some(locations) = self.layout.locations(block) else {
             return Some(());
         };
@@ -334,29 +586,34 @@ impl Solve<'_> {
         access: &mut dyn MemberAccess,
     ) {
         for block in recovered {
-            let Some(locations) = self.layout.locations(block.index()) else {
+            self.put(block.index(), stripe, block.data(), access);
+        }
+    }
+
+    // One stripe of a rebuilt block into every damaged file that names it.
+    fn put(&self, block: u64, stripe: &Range<u64>, data: &[u8], access: &mut dyn MemberAccess) {
+        let Some(locations) = self.layout.locations(block) else {
+            return;
+        };
+        for location in locations.iter() {
+            let (true, Some(member)) = (
+                self.rewrite.contains(&location.file),
+                member_of(self.set, self.bound, location.file),
+            ) else {
                 continue;
             };
-            for location in locations.iter() {
-                let (true, Some(member)) = (
-                    self.rewrite.contains(&location.file),
-                    member_of(self.set, self.bound, location.file),
-                ) else {
-                    continue;
-                };
-                let Some(extent) = self
-                    .layout
-                    .files()
-                    .get(location.file)
-                    .and_then(|shape| shape.extents.get(location.extent))
-                else {
-                    continue;
-                };
-                if let Some((at, from)) = overlap(&extent, stripe)
-                    && let Some(bytes) = block.data().get(from)
-                {
-                    access.write_repaired(member, at, bytes);
-                }
+            let Some(extent) = self
+                .layout
+                .files()
+                .get(location.file)
+                .and_then(|shape| shape.extents.get(location.extent))
+            else {
+                continue;
+            };
+            if let Some((at, from)) = overlap(&extent, stripe)
+                && let Some(bytes) = data.get(from)
+            {
+                access.write_repaired(member, at, bytes);
             }
         }
     }

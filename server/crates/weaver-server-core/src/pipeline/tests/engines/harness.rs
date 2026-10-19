@@ -18,8 +18,8 @@ use weaver_model::files::FileRole;
 
 use super::super::{
     debug_job_state, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
-    pump_pipeline_runtime_queues, retire_pipeline_database, settle_direct_demotion_work,
-    settle_direct_verification_read,
+    pump_pipeline_runtime_queues, retention_client, retire_pipeline_database,
+    settle_direct_demotion_work, settle_direct_verification_read,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
@@ -165,6 +165,49 @@ pub(super) fn par3_set(base: &str, files: &[(&str, &[u8])], blocks: u64) -> Vec<
         .collect()
 }
 
+// A PAR3 set over `files` built as `options` say (its codec, its recovery
+// count, whether it carries its input as Data packets), blocks of one
+// article, named as the creator names them under `base`, the index first.
+pub(super) fn par3_set_with(
+    base: &str,
+    files: &[(&str, &[u8])],
+    options: par3_rs::creation::CreationOptions,
+) -> Vec<Post> {
+    use par3_rs::creation::{CreationPlan, CreationSource};
+    use par3_rs::source::{MemorySourceAccess, SourceId};
+    let mut access = MemorySourceAccess::default();
+    let mut sources = Vec::new();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        let source = SourceId(index as u64 + 1);
+        access.insert(source, 1, bytes.to_vec().into());
+        sources.push(CreationSource {
+            name: (*name).into(),
+            source,
+        });
+    }
+    let options = par3_rs::creation::CreationOptions {
+        block_size: ARTICLE as u64,
+        ..options
+    };
+    let plan = CreationPlan::build(std::sync::Arc::new(access), &sources, options).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut written = plan.execute(&out.path().join(base), out.path()).unwrap();
+    written.sort_by_key(|path| {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        (name != format!("{base}.par3"), name)
+    });
+    written
+        .iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            Post {
+                bytes: std::fs::read(path).unwrap(),
+                ..Post::plain(name, Vec::new())
+            }
+        })
+        .collect()
+}
+
 // For each recovery block of a PAR2 volume, the ordinals of the articles
 // holding its bytes.
 pub(super) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
@@ -211,6 +254,10 @@ pub(super) struct Scenario {
     // answers: the article goes back on the queue the way the worker
     // retries it after a 430, and the next ask is served.
     pub(super) refused: Vec<(u32, u32)>,
+    // Articles the primary server serves damaged while a backup serves them
+    // whole. A scenario with any has both servers, and an ask that excludes
+    // the primary is the backup's.
+    pub(super) corrupt_primary: Vec<(u32, u32)>,
     pub(super) password: Option<String>,
     pub(super) global_passwords: Vec<String>,
     // The decoded size of every article but each post's last; PAR2 slices
@@ -231,6 +278,7 @@ impl Scenario {
             damage: Vec::new(),
             lost: Vec::new(),
             refused: Vec::new(),
+            corrupt_primary: Vec::new(),
             password: None,
             global_passwords: Vec::new(),
             article: ARTICLE,
@@ -312,6 +360,11 @@ impl Scenario {
 
     pub(super) fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
         self.refused.push((file, ordinal));
+        self
+    }
+
+    pub(super) fn corrupt_on_primary(mut self, file: u32, ordinal: u32) -> Self {
+        self.corrupt_primary.push((file, ordinal));
         self
     }
 
@@ -522,6 +575,9 @@ pub(super) async fn admit(
     };
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers, 1).await;
+    if !scenario.corrupt_primary.is_empty() {
+        pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+    }
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     pipeline.admit_graph_job(JOB, engine);
@@ -559,7 +615,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
                     pipeline.enqueue_download_work(retry);
                     continue;
                 }
-                serve(&mut pipeline, scenario, article).await;
+                serve_from(&mut pipeline, JOB, scenario, article, &work.exclude_servers).await;
                 observe(&pipeline, &mut graph, &mut reads);
             }
         }
@@ -590,6 +646,22 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
             observe(&pipeline, &mut graph, &mut reads);
+            continue;
+        }
+        // A body a server spoiled is asked of the next server once the
+        // worker's backoff ends: the retry it scheduled is the job's next
+        // move.
+        if pipeline
+            .pending_retries_by_job
+            .get(&JOB)
+            .is_some_and(|pending| *pending > 0)
+        {
+            let retry = pipeline
+                .retry_rx
+                .recv()
+                .await
+                .expect("a scheduled retry is sent");
+            pipeline.receive_retry_work(retry);
             continue;
         }
         // Classic's extraction runs out on a task too, and says it is done
@@ -708,8 +780,21 @@ pub(super) async fn serve_job(
     pipeline: &mut Pipeline,
     job: JobId,
     scenario: &Scenario,
-    (file, ordinal): (u32, u32),
+    article: (u32, u32),
 ) {
+    serve_from(pipeline, job, scenario, article, &[]).await;
+}
+
+// [`serve_job`] for an ask that excludes `exclude`: the first server it
+// leaves answers.
+async fn serve_from(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    scenario: &Scenario,
+    (file, ordinal): (u32, u32),
+    exclude: &[usize],
+) {
+    let server = (0..).find(|server| !exclude.contains(server)).unwrap();
     let segment_id = SegmentId {
         file_id: NzbFileId {
             job_id: job,
@@ -721,7 +806,8 @@ pub(super) async fn serve_job(
         pipeline.book_failed_segment(segment_id);
         return;
     }
-    let intact = !scenario.damage.contains(&(file, ordinal));
+    let intact = !scenario.damage.contains(&(file, ordinal))
+        && !(server == 0 && scenario.corrupt_primary.contains(&(file, ordinal)));
     let post = &scenario.posts[file as usize];
     let offset = ordinal as usize * scenario.article;
     let posted = post
@@ -765,8 +851,8 @@ pub(super) async fn serve_job(
                 }],
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                source_server_idx: Some(server),
+                exclude_servers: exclude.to_vec(),
             },
         )
         .await;

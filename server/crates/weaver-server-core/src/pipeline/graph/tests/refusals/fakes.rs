@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use weaver_graph::{
     Builder, ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, MemberId, Object,
-    ObjectId, Placement, Pull, Seek, Sink, VolumeIndex, Volumes, Why,
+    ObjectId, Placement, Pull, Seek, Sink, Standing, VolumeIndex, Volumes, Why,
 };
 
 use crate::pipeline::graph::engine::echo::{Echoes, HEADER};
@@ -171,6 +171,15 @@ impl Object for Store {
     }
 
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+
+    // A locked store still asking once nothing more will come refuses
+    // itself: its header stays shut.
+    fn quiet(&mut self, _: &dyn Standing, out: &mut Vec<Emit>) {
+        if self.mode == Mode::Locked && self.asked && !self.opened {
+            out.push(Emit::Refuse(Why::EncryptedHeader));
+        }
+    }
+
     fn wants(&mut self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
 

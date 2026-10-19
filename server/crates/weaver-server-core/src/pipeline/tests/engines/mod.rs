@@ -26,6 +26,8 @@
 //     .damaged(file, ordinal)     that article arrives with a checksum
 //                                 mismatch and corrupted bytes
 //     .lost(file, ordinal)        every server lacks that article
+//     .corrupt_on_primary(file,   the primary serves that article damaged
+//          ordinal)               and a backup serves it whole
 //     .framed(size)               articles of `size` bytes, not ARTICLE
 //     .backwards()                every batch the download queue hands
 //                                 out arrives last article first

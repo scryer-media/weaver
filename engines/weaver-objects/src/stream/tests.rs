@@ -208,7 +208,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
 
 fn stream<D: Decoder>(name: &str) -> Stream<D> {
     let mut stream = Stream::<D>::new();
-    stream.bound(VolumeIndex(0), name);
+    stream.bound(VolumeIndex(0), name, &[]);
     stream
 }
 

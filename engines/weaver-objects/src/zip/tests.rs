@@ -208,12 +208,12 @@ fn a_spanned_set_streams_with_its_volumes_out_of_order() {
 #[test]
 fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set() {
     let mut zip = Zip::new();
-    zip.bound(VolumeIndex(0), "Alpha.Z01");
+    zip.bound(VolumeIndex(0), "Alpha.Z01", &[]);
     use weaver_graph::Object;
     assert_eq!(zip.claim("alpha.z02", b""), Some(VolumeIndex(1)));
-    zip.bound(VolumeIndex(1), "alpha.z02");
+    zip.bound(VolumeIndex(1), "alpha.z02", &[]);
     assert_eq!(zip.claim("alpha.zip", b""), Some(VolumeIndex(u32::MAX)));
-    zip.bound(VolumeIndex(u32::MAX), "alpha.zip");
+    zip.bound(VolumeIndex(u32::MAX), "alpha.zip", &[]);
     assert_eq!(
         zip.claim("alpha.z03", b""),
         Some(VolumeIndex(2)),
@@ -223,7 +223,7 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     assert_eq!(zip.claim("alpha.z02", b""), None);
 
     let mut lone = Zip::new();
-    lone.bound(VolumeIndex(0), "alpha.zip");
+    lone.bound(VolumeIndex(0), "alpha.zip", &[]);
     assert_eq!(
         lone.claim("alpha.z01", b""),
         None,

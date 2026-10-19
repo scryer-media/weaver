@@ -359,13 +359,14 @@ impl Pipeline {
         let outcomes = summary.outcomes();
         let failure = failure(&summary, &outcomes, job);
         let ignore = self.par2_ignore_extensions();
-        // Root members are numbered as the posted files they are.
+        // Root members are numbered as the posted files they are; one past
+        // them is a file a recovery object announced, which is payload.
         let payload = |member: MemberId| {
             state
                 .spec
                 .files
                 .get(member.0 as usize)
-                .is_some_and(|file| file.role.counts_toward_health())
+                .is_none_or(|file| file.role.counts_toward_health())
         };
         let failed = |object: NodeId| {
             failure
@@ -445,7 +446,7 @@ impl Pipeline {
             let summary = RootJob::recovery_summary(&*graph);
             let outcomes = summary.outcomes();
             metrics::repaired(&summary, &outcomes);
-            if let Some(slices_repaired) = repaired_slices(&outcomes) {
+            if let Some(slices_repaired) = repaired_slices(&summary, &outcomes, &*graph) {
                 self.metrics
                     .job_lifecycle
                     .note_repair(StageOutcomeKind::Complete, u64::from(slices_repaired));

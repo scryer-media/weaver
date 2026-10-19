@@ -9,7 +9,7 @@ use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{
     Builder, ByteRange, Delivery, Emit, Extent, Kind, MemberId, NodeId, Object, ObjectId,
-    Placement, Pull, Seek, VolumeIndex, Weight, Why,
+    Placement, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use weaver_model::files::FileRole;
 
@@ -67,6 +67,13 @@ impl Object for Probe {
         });
     }
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+    // Quiet with the member it announced still open, the probe refuses
+    // itself as a format object would: it never mapped what it named.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if standing.unplaced() {
+            out.push(Emit::Refuse(Why::Unmapped));
+        }
+    }
     fn wants(&mut self, out: &mut Vec<Seek>) {
         out.append(&mut self.wants);
     }
@@ -320,8 +327,8 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
     assert_eq!(job.phase(), RootPhase::Downloading);
 
     // Every volume in and the probe never closes the member it announced:
-    // the object is refused as unmapped in the settle that closes the last
-    // volume, and the job is done.
+    // the object refuses itself as unmapped once the job is quiet, in the
+    // settle that closes the last volume, and the job is done.
     job.intake(decoded(0, 1, 90, &[0; 90], Some(180)), 1)
         .unwrap();
     assert_eq!(job.phase(), RootPhase::Done);

@@ -79,13 +79,6 @@ impl Par2 {
         }
     }
 
-    fn covered_members(&self) -> BTreeSet<MemberId> {
-        self.sets
-            .values()
-            .flat_map(|state| state.members().values().copied())
-            .collect()
-    }
-
     // Set keys in the order their first packets were found.
     fn ordered(&self) -> Vec<[u8; 16]> {
         let mut keys: Vec<_> = self
@@ -287,7 +280,7 @@ impl Object for Par2 {
             .then(|| VolumeIndex(self.volumes.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
         self.volume(volume).name(name);
         let mut reopened = false;
         for state in self.sets.values_mut() {
@@ -311,7 +304,6 @@ impl Object for Par2 {
 
 impl Recovery for Par2 {
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
-        let before = self.covered_members();
         let (keys, indexes): (Vec<[u8; 16]>, Vec<&Par2FileSet>) = self
             .ordered()
             .into_iter()
@@ -326,8 +318,9 @@ impl Recovery for Par2 {
                 renamed.push(member);
             }
         }
+        let mut voided = false;
         for (key, state) in &mut self.sets {
-            state.bind(bound.remove(key).unwrap_or_default());
+            voided |= state.bind(bound.remove(key).unwrap_or_default());
         }
         self.lengths = self
             .sets
@@ -342,7 +335,8 @@ impl Recovery for Par2 {
             })
             .collect();
         self.seen_damaged = None;
-        if self.covered_members() != before {
+        // The object's verdict is its sets' verdicts.
+        if voided {
             self.outcome = None;
         }
     }

@@ -8,14 +8,13 @@
 // something to rule on rule, so a repair above is in place before anything
 // below rules on bytes it rewrote. What a repair rewrote goes down the one
 // write path as repaired bytes, to a leaf or to the object that owns the
-// member. Once nothing more can change, every lost range nothing vouched
-// for is heard by the objects it reached, deepest first, each ruling on
-// what the loss means to it; a namespace still left with damage no
-// recovery object there vouched for is refused by the object it came out
-// of, with that reason.
+// member. Once nothing more can change, every data object, deepest first,
+// hears the lost ranges nothing vouched for and that the job is quiet, and
+// an object that cannot finish refuses itself for its own reason. The
+// server tells; it chooses no reason.
 
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ByteRange, Effect, Emit, MemberId, NodeId, Object, VolumeIndex, Why};
+use weaver_graph::{ByteRange, Effect, Emit, MemberId, NodeId, Object};
 
 use super::{GraphError, GraphJob};
 
@@ -191,64 +190,32 @@ impl GraphJob {
     }
 
     // Once nothing more can change, every data object hears the lost
-    // ranges of its volumes that nothing vouched for, and says what each
-    // loss means to it: a header that will never come, the first bytes of
-    // its set. Children come first, so the deepest object the damage
-    // reached rules before any object above it, and a parent never speaks
-    // for bytes lost below it. An object still standing with a damaged leaf
-    // no recovery object there vouched for is refused by its object: the
-    // members that were its volumes are damaged leaves of the namespace it
-    // was bound in. A leaf that is itself a refused member refuses nothing
-    // more, so a refusal stops where the damage first had no cover. An
-    // object that never placed every member it named is refused the same
-    // way, since what it holds would otherwise ship as nothing: for the
-    // loss, when its own volumes lost bytes nothing repaired, since what it
-    // never placed lay in them, and otherwise for its map. So is one still
-    // asking for a password the job has none left to give. The root came out
-    // of no object, and keeps its damaged leaves. Asked only once every run
-    // is started, since a repair's bytes reach a namespace below by its run
-    // reading them again. Returns whether anything changed.
-    pub(super) fn refuse_unrepaired(&mut self) -> Result<bool, GraphError> {
+    // ranges of its volumes that nothing vouched for, then that the job is
+    // quiet, and rules for itself: the tree tells it and reads it what the
+    // tree records of it, and the server applies what it says. Children
+    // come first, so the deepest object the damage reached rules before any
+    // object above it, and a parent never speaks for bytes lost below it.
+    // What the losses set going is settled before the object hears quiet.
+    // Asked only once every run is started, since a repair's bytes reach a
+    // namespace below by its run reading them again. Returns whether
+    // anything changed.
+    pub(super) fn tell_quiet(&mut self) -> Result<bool, GraphError> {
         if !self.quiet() {
             return Ok(false);
         }
         let mut changed = false;
         for node in self.tree.live().into_iter().rev() {
-            if self.tree.volumes(node).is_none() || !self.tree.live().contains(&node) {
-                continue;
-            }
-            // A recovery object heard its losses when they were marked.
-            let lost = self.lost_below(node);
             let mut effects = Vec::new();
-            if !self.tree.recovers(node) {
-                self.hear(node, &mut effects, |object, out| {
-                    for (volume, range) in &lost {
-                        object.volume_lost(*volume, *range, out);
-                    }
-                    object.quiet(out);
-                });
-            }
+            self.tree.tell_lost(
+                node,
+                &mut self.writer.placing(&mut *self.builder),
+                &mut effects,
+            );
             changed |= !effects.is_empty();
             self.settle(effects)?;
-            if !self.tree.live().contains(&node) {
-                continue;
-            }
-            let why = if self.unrepaired(node) {
-                Why::Unrepairable
-            } else if self.passwords.unanswered(node) {
-                Why::EncryptedHeader
-            } else if self.unmapped(node) {
-                match lost.is_empty() {
-                    true => Why::Unmapped,
-                    false => Why::Unrepairable,
-                }
-            } else {
-                continue;
-            };
             let mut effects = Vec::new();
-            self.tree.emitted(
+            self.tree.quiet(
                 node,
-                vec![Emit::Refuse(why)],
                 &mut self.writer.placing(&mut *self.builder),
                 &mut effects,
             );
@@ -256,20 +223,6 @@ impl GraphJob {
             self.settle(effects)?;
         }
         Ok(changed)
-    }
-
-    // Every volume of the object is in and no run of it reads, yet it named
-    // no member, or left one it named open. A recovery object places
-    // nothing, and a member that is a recovery volume below may stay parked.
-    fn unmapped(&self, node: NodeId) -> bool {
-        let tree = &self.tree;
-        if tree.recovers(node) || !self.members_known(node) {
-            return false;
-        }
-        let Some(namespace) = tree.namespace(node) else {
-            return false;
-        };
-        namespace.members().next().is_none() || !self.namespace_in(node)
     }
 
     // The payload is in, no run is reading, and every recovery object in the
@@ -283,80 +236,6 @@ impl GraphJob {
                     .and_then(|recovery| recovery.outcome())
                     .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
             })
-    }
-
-    // A damaged leaf of the namespace that nothing vouched for: no recovery
-    // object covering it, nor one covering a member the namespace came out
-    // of at any depth above. A repair above rebuilt the bytes below, though
-    // the damage an object marked on what it read before is still recorded.
-    fn unrepaired(&self, node: NodeId) -> bool {
-        let tree = &self.tree;
-        let Some(namespace) = tree.namespace(node) else {
-            return false;
-        };
-        if self.vouched_above(node) {
-            return false;
-        }
-        namespace.members().any(|member| {
-            tree.child_of(node, member.id).is_none()
-                && member.coverage.damaged_ranges().next().is_some()
-                && self.writer.refused(node, member.id).is_none()
-                && !self.vouched(node, member.id)
-        })
-    }
-
-    // The ranges of the node's volumes held as damage, an article that never
-    // came or a range an object said was damaged, in its own volume's
-    // coordinates, unless a recovery object above vouched for what it came
-    // out of.
-    fn lost_below(&self, node: NodeId) -> Vec<(VolumeIndex, ByteRange)> {
-        let tree = &self.tree;
-        let Some((parent, volumes)) = tree.volumes(node) else {
-            return Vec::new();
-        };
-        let Some(namespace) = tree.namespace(parent) else {
-            return Vec::new();
-        };
-        if self.vouched_above(node) {
-            return Vec::new();
-        }
-        volumes
-            .iter()
-            .filter_map(|(volume, member)| Some((*volume, namespace.get(*member)?)))
-            .flat_map(|(volume, member)| {
-                member
-                    .coverage
-                    .damaged_ranges()
-                    .map(move |range| (volume, range))
-            })
-            .collect()
-    }
-
-    // Some member the namespace came out of, at any depth, is vouched for.
-    fn vouched_above(&self, node: NodeId) -> bool {
-        let mut at = node;
-        while let Some((parent, volumes)) = self.tree.volumes(at) {
-            if volumes.values().any(|member| self.vouched(parent, *member)) {
-                return true;
-            }
-            at = parent;
-        }
-        false
-    }
-
-    // A recovery object of the namespace covers the member and found it
-    // whole or made it so.
-    fn vouched(&self, node: NodeId, member: MemberId) -> bool {
-        let tree = &self.tree;
-        tree.recovery_nodes(node).into_iter().any(|recovery_node| {
-            tree.recovery(recovery_node).is_some_and(|recovery| {
-                recovery.covers(member)
-                    && matches!(
-                        recovery.outcome(),
-                        Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
-                    )
-            })
-        })
     }
 
     // Ranges of lost articles become damage in the tree as soon as they can

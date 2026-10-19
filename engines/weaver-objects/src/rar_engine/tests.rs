@@ -289,7 +289,7 @@ fn run(engine: &RarEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
 fn named(names: &[&str]) -> RarEngine {
     let mut engine = RarEngine::new();
     for (volume, name) in names.iter().enumerate() {
-        engine.bound(VolumeIndex(volume as u32), name);
+        engine.bound(VolumeIndex(volume as u32), name, &[]);
     }
     engine
 }
@@ -345,6 +345,46 @@ fn claim_names_the_volumes_of_its_own_set_only() {
     assert_eq!(old.claim("set.rar", b""), None);
 }
 
+// Names that number nothing of a RAR set: each volume is placed by what its
+// headers state beside the fronts of the volumes bound, as the store that
+// gave the set up placed them.
+#[test]
+fn claim_places_a_nameless_volume_by_its_headers() {
+    let volumes = two_volumes();
+    let mut engine = RarEngine::new();
+    engine.bound(VolumeIndex(0), "a1b2.101", &volumes[0]);
+    assert_eq!(engine.claim("a1b2.102", &volumes[1]), Some(VolumeIndex(1)));
+    assert_eq!(
+        engine.claim("a1b2.103", &volumes[0]),
+        None,
+        "its place is taken"
+    );
+    assert_eq!(
+        engine.claim("a1b2.103", &one_volume()),
+        None,
+        "no volume of a set"
+    );
+    assert_eq!(
+        engine.claim("a1b2.103", b""),
+        None,
+        "a front that says nothing"
+    );
+    let stranger = [
+        rar5::start(Some(1)),
+        rar5::file("other.bin", rar5::SPLIT_BEFORE, NOTES, 99, None),
+    ]
+    .concat();
+    assert_eq!(
+        engine.claim("a1b2.103", &stranger),
+        None,
+        "it continues no member of ours"
+    );
+
+    engine.bound(VolumeIndex(1), "a1b2.102", &volumes[1]);
+    let said = run(&engine, volumes);
+    assert_eq!(said[1], Said::Bytes(0, spanning()));
+}
+
 #[test]
 fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     let mut engine = named(&["set.part1.rar", "set.part2.rar", "set.part3.rar"]);
@@ -364,7 +404,7 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     assert_eq!(bids, vec![(1, 1, Purpose::Data), (2, 2, Purpose::Data)]);
 
     seeks.clear();
-    engine.bound(VolumeIndex(3), "set.part4.rar");
+    engine.bound(VolumeIndex(3), "set.part4.rar", &[]);
     engine.reached(VolumeIndex(1), 0);
     engine.wants(&mut seeks);
     let bids: Vec<_> = seeks

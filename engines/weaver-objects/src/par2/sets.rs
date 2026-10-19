@@ -112,12 +112,15 @@ impl SetState {
         &self.members
     }
 
-    // A verdict was on the members bound then; other members void it.
-    pub(super) fn bind(&mut self, members: BTreeMap<FileId, MemberId>) {
-        if members != self.members {
+    // A verdict was on the members bound then; other members, or the same
+    // members bound to other files, void it. Returns whether it was voided.
+    pub(super) fn bind(&mut self, members: BTreeMap<FileId, MemberId>) -> bool {
+        let changed = members != self.members;
+        if changed {
             self.members = members;
             self.last = None;
         }
+        changed
     }
 
     // An impossible verdict counted the blocks of the volumes bound then; a

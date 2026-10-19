@@ -53,7 +53,7 @@ impl Owner {
             next: 0,
         };
         let name = owner.volumes[0].0.clone();
-        owner.object.bound(VolumeIndex(0), &name);
+        owner.object.bound(VolumeIndex(0), &name, &[]);
         owner.bound[0] = true;
         owner.size(0);
         owner
@@ -84,7 +84,7 @@ impl Owner {
             Some(VolumeIndex(volume as u32))
         );
         let name = name.clone();
-        self.object.bound(VolumeIndex(volume as u32), &name);
+        self.object.bound(VolumeIndex(volume as u32), &name, &[]);
         self.bound[volume] = true;
         self.size(volume);
     }

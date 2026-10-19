@@ -186,12 +186,17 @@ impl Delivery {
     }
 
     // How a job that has nothing left to wait for ends: complete when
-    // nothing it hands over is short or withheld, partial when some file is
-    // whole beside what is not, and failed when nothing is whole, for
-    // `failure` when a recovery object could not rebuild what it found, and
-    // otherwise for what was withheld.
+    // nothing it hands over is short or withheld and no recovery object
+    // failed to rebuild what it found, partial when some file is whole
+    // beside what is not, and failed when nothing is whole, for `failure`
+    // when a recovery object could not rebuild what it found, and otherwise
+    // for what was withheld. A failed rebuild is short whether or not a
+    // member carries what it could not rebuild: a file the set describes
+    // and nothing delivered is short too.
     pub(crate) fn status(&self, failure: Option<&str>) -> JobStatus {
-        if self.damaged.is_empty() && self.unrepaired.is_empty() && self.withheld.is_empty() {
+        let short =
+            !(self.damaged.is_empty() && self.unrepaired.is_empty() && self.withheld.is_empty());
+        if !short && failure.is_none() {
             return JobStatus::Complete;
         }
         if !self.whole.is_empty() {

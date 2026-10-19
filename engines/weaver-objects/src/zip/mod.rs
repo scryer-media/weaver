@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement, Pull,
-    Seek, VolumeIndex, Weight, Why,
+    Seek, Standing, VolumeIndex, Weight, Why,
 };
 
 use crate::engine::{Format, SetName};
@@ -401,6 +401,19 @@ impl Object for Zip {
         }
     }
 
+    // Nothing more will arrive. A member still damaged, or one named and
+    // never placed, leaves the archive unread.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if self.gone {
+            return;
+        }
+        if let Some(why) =
+            crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
+        {
+            self.give_up(Emit::Refuse(why), out);
+        }
+    }
+
     fn wants(&mut self, out: &mut Vec<Seek>) {
         if self.gone {
             return;
@@ -463,7 +476,7 @@ impl Object for Zip {
         self.kept.read(range).map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
         let first = self.names.values().next();
         if let Some(parsed) = ZipFormat::parse(name)
             && first.is_none_or(|first| first.same_set(&parsed))
@@ -472,6 +485,17 @@ impl Object for Zip {
         }
         self.bound.insert(volume.0);
         self.stale = true;
+    }
+
+    // The name a recovery set gave the volume is the set's numbering now.
+    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
+        self.names.remove(&volume.0);
+        let first = self.names.values().next();
+        if let Some(parsed) = ZipFormat::parse(name)
+            && first.is_none_or(|first| first.same_set(&parsed))
+        {
+            self.names.insert(volume.0, parsed);
+        }
     }
 
     fn claim(&mut self, name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {

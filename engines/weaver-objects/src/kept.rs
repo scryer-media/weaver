@@ -45,6 +45,11 @@ impl Kept {
         })
     }
 
+    // How many bytes are kept.
+    pub(crate) fn len(&self) -> u64 {
+        self.pieces.values().map(|piece| piece.range.len()).sum()
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }

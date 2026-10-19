@@ -308,11 +308,16 @@ impl GraphJob {
         let member = MemberId(volume.0);
         let length = decoded.length;
         let arrival = self.root.receive(decoded);
-        if let Some(length) = length {
-            self.writer
-                .length_learned(&mut self.tree, &self.root, NodeId::ROOT, member, length)?;
-        }
         let mut out = Vec::new();
+        if let Some(length) = length {
+            self.writer.length_learned(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                (NodeId::ROOT, member, length),
+                &mut out,
+            )?;
+        }
         self.writer.deliver(
             &mut self.tree,
             &mut *self.builder,
