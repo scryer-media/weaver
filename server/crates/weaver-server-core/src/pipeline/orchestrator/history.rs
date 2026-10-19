@@ -563,6 +563,7 @@ impl Pipeline {
         });
 
         let row = crate::JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: job_id.0,
             job_hash: Some(state.job_hash.to_vec()),
             name: state.spec.name.clone(),
@@ -595,6 +596,7 @@ impl Pipeline {
         self.finished_jobs.insert(
             0,
             JobInfo {
+                protocol: crate::jobs::Protocol::Nzb,
                 job_id,
                 job_hash: Some(state.job_hash),
                 name: state.spec.name.clone(),

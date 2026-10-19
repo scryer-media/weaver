@@ -393,6 +393,7 @@ fn archive_job_moves_to_history() {
     .unwrap();
 
     let history = JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 1,
         job_hash: None,
         name: "test.nzb".to_string(),
@@ -608,6 +609,7 @@ fn cancellation_archive_preserves_directives_newer_than_the_runtime_snapshot() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(42)).unwrap();
     let history = JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 42,
         job_hash: None,
         name: "cancelled-script".into(),
@@ -652,6 +654,7 @@ fn archive_job_conflict_preserves_persisted_nzb_bytes_when_active_row_is_gone() 
     db.create_active_job(&sample_job(1)).unwrap();
 
     let mut history = JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 1,
         job_hash: None,
         name: "test.nzb".to_string(),
@@ -726,6 +729,7 @@ fn max_job_id_all_spans_both_tables() {
     db.create_active_job(&sample_job(5)).unwrap();
 
     let history = JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 10,
         job_hash: None,
         name: "old.nzb".to_string(),
@@ -1180,6 +1184,7 @@ fn archive_job_uses_requested_job_id_for_history_row() {
     db.archive_job(
         JobId(7),
         &JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: 999,
             job_hash: None,
             name: "mismatch.nzb".to_string(),
@@ -1216,6 +1221,7 @@ fn late_active_state_writes_noop_after_archive() {
     db.archive_job(
         JobId(1),
         &JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: 1,
             job_hash: None,
             name: "test.nzb".to_string(),
@@ -1690,6 +1696,7 @@ fn archive_job_records_that_the_job_had_a_submitted_password() {
 
     for job_id in [1, 2] {
         let history = JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id,
             job_hash: None,
             name: format!("test-{job_id}.nzb"),

@@ -154,6 +154,8 @@ fn executor(db: &Database) -> PostProcessingExecutor {
 
 fn config(data: &Path) -> SharedConfig {
     Arc::new(RwLock::new(Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: data.to_string_lossy().into_owned(),
         intermediate_dir: None,
         complete_dir: None,

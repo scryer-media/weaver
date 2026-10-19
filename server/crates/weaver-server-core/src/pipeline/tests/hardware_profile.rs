@@ -162,7 +162,8 @@ async fn a_scheduled_profile_overrides_the_choice_until_the_schedule_lets_go() {
             action: crate::bandwidth::ScheduleAction::SpeedLimit {
                 limits: vec![crate::bandwidth::SpeedLimitChange {
                     target: crate::bandwidth::SpeedTarget::Global,
-                    bytes_per_sec: 128 * 1024,
+                    bytes_per_sec: Some(128 * 1024),
+                    upload_bytes_per_sec: None,
                 }],
             },
             reply,
@@ -189,8 +190,11 @@ async fn a_scheduled_profile_overrides_the_choice_until_the_schedule_lets_go() {
             scheduled: Some(HardwareProfile::Efficient),
         })
     );
-    assert_eq!(pipeline.scheduled_rate_limit, Some(128 * 1024));
-    assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+    assert_eq!(
+        pipeline.scheduled_bandwidth.and_then(|b| b.download_bps),
+        Some(128 * 1024)
+    );
+    assert_eq!(pipeline.rate_limiter.rate(), Some(128 * 1024));
     assert!(!pipeline.global_paused);
 
     // The operator's choice is recorded but waits for the schedule.

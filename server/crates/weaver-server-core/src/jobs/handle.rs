@@ -403,7 +403,7 @@ impl SharedPipelineState {
             DownloadBlockKind::EgressQuota | DownloadBlockKind::ServerQuota
         );
         if quota_kind {
-            state.kind = if state.scheduled_speed_limit > 0 {
+            state.kind = if state.scheduled_speed_limit.is_some() {
                 DownloadBlockKind::Scheduled
             } else {
                 DownloadBlockKind::None
@@ -695,9 +695,9 @@ pub struct DownloadBlockState {
     pub window_starts_at_epoch_ms: Option<f64>,
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
-    // Speed limit imposed by the active schedule (0 = no scheduled limit).
+    // Download limit imposed by the active schedule.
     #[serde(default)]
-    pub scheduled_speed_limit: u64,
+    pub scheduled_speed_limit: Option<u64>,
     // Why a schedule rule is holding new downloads, while one is.
     #[serde(default)]
     pub schedule_hold_reason: Option<String>,
@@ -729,7 +729,7 @@ impl Default for DownloadBlockState {
             window_starts_at_epoch_ms: None,
             window_ends_at_epoch_ms: None,
             timezone_name: chrono::Local::now().offset().to_string(),
-            scheduled_speed_limit: 0,
+            scheduled_speed_limit: None,
             schedule_hold_reason: None,
         }
     }
@@ -902,12 +902,12 @@ pub enum SchedulerCommand {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    // Set global speed limit (bytes/sec). 0 means unlimited. With
-    // `replaces_schedule`, an operator's edit: it is in force at once, over
-    // a scheduled limit, until the next scheduled speed rule fires. Without,
-    // it is recorded and waits while a scheduled limit is in force.
-    SetSpeedLimit {
-        bytes_per_sec: u64,
+    // Set the global bandwidth limits. With `replaces_schedule`, an
+    // operator's edit: it is in force at once and the scheduled limit gives
+    // way until the next scheduled speed rule fires. Without, it is recorded
+    // and a scheduled limit in force still applies under it.
+    SetBandwidth {
+        bandwidth: crate::proxies::Bandwidth,
         replaces_schedule: bool,
         reply: oneshot::Sender<()>,
     },
@@ -1008,6 +1008,8 @@ pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job_id: JobId,
+    #[serde(default)]
+    pub protocol: crate::jobs::model::Protocol,
     pub job_hash: Option<[u8; 32]>,
     pub name: String,
     pub status: JobStatus,
@@ -1586,28 +1588,34 @@ impl SchedulerHandle {
         self.state.is_post_processing_paused()
     }
 
-    // Set the global download speed limit as the operator's edit. 0 means
-    // unlimited. It is in force at once, over a scheduled limit, until the
-    // next scheduled speed rule fires.
-    pub async fn set_speed_limit(&self, bytes_per_sec: u64) -> Result<(), SchedulerError> {
-        self.send_speed_limit(bytes_per_sec, true).await
-    }
-
-    // Load the saved global speed limit, as a configuration reload does. It
-    // waits while a scheduled limit is in force.
-    pub async fn restore_speed_limit(&self, bytes_per_sec: u64) -> Result<(), SchedulerError> {
-        self.send_speed_limit(bytes_per_sec, false).await
-    }
-
-    async fn send_speed_limit(
+    // Set the global bandwidth limits as the operator's edit. They are in
+    // force at once, and a scheduled limit gives way until the next
+    // scheduled speed rule fires.
+    pub async fn set_bandwidth(
         &self,
-        bytes_per_sec: u64,
+        bandwidth: crate::proxies::Bandwidth,
+    ) -> Result<(), SchedulerError> {
+        self.send_bandwidth(bandwidth, true).await
+    }
+
+    // Load the saved global bandwidth limits, as a configuration reload
+    // does. A scheduled limit in force still applies under them.
+    pub async fn restore_bandwidth(
+        &self,
+        bandwidth: crate::proxies::Bandwidth,
+    ) -> Result<(), SchedulerError> {
+        self.send_bandwidth(bandwidth, false).await
+    }
+
+    async fn send_bandwidth(
+        &self,
+        bandwidth: crate::proxies::Bandwidth,
         replaces_schedule: bool,
     ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::SetSpeedLimit {
-                bytes_per_sec,
+            .send(SchedulerCommand::SetBandwidth {
+                bandwidth,
                 replaces_schedule,
                 reply: tx,
             })

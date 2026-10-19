@@ -8,7 +8,8 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
-    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
+    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SeedingAction,
+    SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -43,9 +44,7 @@ impl Database {
             .cloned()
             .or_else(|| settings.get("output_dir").cloned());
         let complete_dir = settings.get("complete_dir").cloned();
-        let max_download_speed = settings
-            .get("max_download_speed")
-            .and_then(|v| v.parse().ok());
+        let bandwidth = self.network_bandwidth()?;
         let propagation_delay_secs = settings
             .get("propagation_delay_secs")
             .and_then(|v| v.parse().ok());
@@ -219,6 +218,9 @@ impl Database {
                 .unwrap_or_default(),
         };
 
+        let seeding = seeding_policy_from_settings(&settings);
+        let torrent = torrent_config_from_settings(&settings);
+
         Ok(Config {
             data_dir,
             intermediate_dir,
@@ -227,7 +229,7 @@ impl Database {
             servers,
             categories,
             retry,
-            max_download_speed,
+            bandwidth,
             cleanup_after_extract,
             propagation_delay_secs,
             watch_folder,
@@ -237,8 +239,68 @@ impl Database {
             delivery_naming,
             hardware_profile,
             metrics,
+            seeding,
+            torrent,
             config_path: None,
         })
+    }
+
+    // Write the global seeding policy; `None` removes it.
+    pub fn save_seeding_policy(&self, policy: Option<&SeedingPolicy>) -> Result<(), StateError> {
+        let Some(policy) = policy else {
+            for key in SEEDING_KEYS {
+                self.delete_setting(key)?;
+            }
+            return Ok(());
+        };
+        let optional = [
+            (SEEDING_RATIO_GOAL, policy.ratio_goal.map(|v| v.to_string())),
+            (
+                SEEDING_SEED_TIME_GOAL_MINUTES,
+                policy.seed_time_goal_minutes.map(|v| v.to_string()),
+            ),
+            (
+                SEEDING_INACTIVE_GOAL_MINUTES,
+                policy.inactive_goal_minutes.map(|v| v.to_string()),
+            ),
+            (
+                SEEDING_MAX_UPLOAD_BPS,
+                policy.max_upload_bps.map(|v| v.to_string()),
+            ),
+        ];
+        for (key, value) in optional {
+            match value {
+                Some(value) => self.set_setting(key, &value)?,
+                None => self.delete_setting(key)?,
+            }
+        }
+        self.set_setting(SEEDING_MODE, policy.mode.as_str())?;
+        self.set_setting(SEEDING_ACTION, policy.action.as_str())?;
+        Ok(())
+    }
+
+    pub fn save_torrent_config(&self, torrent: &TorrentConfig) -> Result<(), StateError> {
+        self.set_setting("torrent.enabled", &torrent.enabled.to_string())?;
+        self.set_setting("torrent.base_port", &torrent.base_port.to_string())?;
+        match torrent.announce_port {
+            Some(port) => self.set_setting("torrent.announce_port", &port.to_string())?,
+            None => self.delete_setting("torrent.announce_port")?,
+        }
+        self.set_setting("torrent.upnp", &torrent.upnp.to_string())?;
+        self.set_setting("torrent.encryption", torrent.encryption.as_str())?;
+        self.set_setting(
+            "torrent.max_active_downloads",
+            &torrent.max_active_downloads.to_string(),
+        )?;
+        self.set_setting(
+            "torrent.max_peers_total",
+            &torrent.max_peers_total.to_string(),
+        )?;
+        match torrent.session_dir.as_deref().and_then(|dir| dir.to_str()) {
+            Some(dir) => self.set_setting("torrent.session_dir", dir)?,
+            None => self.delete_setting("torrent.session_dir")?,
+        }
+        Ok(())
     }
 
     // Save a full `Config` to the settings and servers tables.
@@ -250,9 +312,7 @@ impl Database {
         if let Some(ref complete_dir) = config.complete_dir {
             self.set_setting("complete_dir", complete_dir)?;
         }
-        if let Some(speed) = config.max_download_speed {
-            self.set_setting("max_download_speed", &speed.to_string())?;
-        }
+        self.set_network_bandwidth(&config.bandwidth)?;
         if let Some(delay) = config.propagation_delay_secs {
             self.set_setting("propagation_delay_secs", &delay.to_string())?;
         }
@@ -391,10 +451,82 @@ impl Database {
             config.metrics.per_job_series.as_str(),
         )?;
 
+        self.save_seeding_policy(config.seeding.as_ref())?;
+        self.save_torrent_config(&config.torrent)?;
+
         self.replace_servers(&config.servers)?;
         self.replace_categories(&config.categories)?;
 
         Ok(())
+    }
+}
+
+const SEEDING_RATIO_GOAL: &str = "seeding.ratio_goal";
+const SEEDING_SEED_TIME_GOAL_MINUTES: &str = "seeding.seed_time_goal_minutes";
+const SEEDING_INACTIVE_GOAL_MINUTES: &str = "seeding.inactive_goal_minutes";
+const SEEDING_MODE: &str = "seeding.mode";
+const SEEDING_ACTION: &str = "seeding.action";
+const SEEDING_MAX_UPLOAD_BPS: &str = "seeding.max_upload_bps";
+const SEEDING_KEYS: [&str; 6] = [
+    SEEDING_RATIO_GOAL,
+    SEEDING_SEED_TIME_GOAL_MINUTES,
+    SEEDING_INACTIVE_GOAL_MINUTES,
+    SEEDING_MODE,
+    SEEDING_ACTION,
+    SEEDING_MAX_UPLOAD_BPS,
+];
+
+fn parsed_setting<T: std::str::FromStr>(
+    settings: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<T> {
+    settings.get(key).and_then(|v| v.parse().ok())
+}
+
+// The global policy exists once any of its keys does; a saved policy always
+// writes its mode and action.
+fn seeding_policy_from_settings(
+    settings: &std::collections::HashMap<String, String>,
+) -> Option<SeedingPolicy> {
+    if !SEEDING_KEYS.iter().any(|key| settings.contains_key(*key)) {
+        return None;
+    }
+    Some(SeedingPolicy {
+        ratio_goal: parsed_setting(settings, SEEDING_RATIO_GOAL),
+        seed_time_goal_minutes: parsed_setting(settings, SEEDING_SEED_TIME_GOAL_MINUTES),
+        inactive_goal_minutes: parsed_setting(settings, SEEDING_INACTIVE_GOAL_MINUTES),
+        mode: settings
+            .get(SEEDING_MODE)
+            .and_then(|v| SeedingGoalMode::parse(v))
+            .unwrap_or_default(),
+        action: settings
+            .get(SEEDING_ACTION)
+            .and_then(|v| SeedingAction::parse(v))
+            .unwrap_or_default(),
+        max_upload_bps: parsed_setting(settings, SEEDING_MAX_UPLOAD_BPS),
+    })
+}
+
+fn torrent_config_from_settings(
+    settings: &std::collections::HashMap<String, String>,
+) -> TorrentConfig {
+    let defaults = TorrentConfig::default();
+    TorrentConfig {
+        enabled: parsed_setting(settings, "torrent.enabled").unwrap_or(defaults.enabled),
+        base_port: parsed_setting(settings, "torrent.base_port").unwrap_or(defaults.base_port),
+        announce_port: parsed_setting(settings, "torrent.announce_port"),
+        upnp: parsed_setting(settings, "torrent.upnp").unwrap_or(defaults.upnp),
+        encryption: settings
+            .get("torrent.encryption")
+            .and_then(|v| TorrentEncryption::parse(v))
+            .unwrap_or(defaults.encryption),
+        max_active_downloads: parsed_setting(settings, "torrent.max_active_downloads")
+            .unwrap_or(defaults.max_active_downloads),
+        max_peers_total: parsed_setting(settings, "torrent.max_peers_total")
+            .unwrap_or(defaults.max_peers_total),
+        session_dir: settings
+            .get("torrent.session_dir")
+            .map(std::path::PathBuf::from),
     }
 }
 

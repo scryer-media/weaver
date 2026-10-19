@@ -158,12 +158,12 @@ impl ServersService {
         Ok(())
     }
 
-    // Save an egress's speed limit and put it in force, as an edit on the
-    // Networking screen does. 0 removes the limit.
+    // Save an egress's download limit and put it in force, as an edit on the
+    // Networking screen does. `None` removes the limit.
     pub async fn set_egress_speed_limit(
         &self,
         egress_id: u32,
-        bytes_per_sec: u64,
+        bytes_per_sec: Option<u64>,
     ) -> Result<(), String> {
         let runtime = self
             .handle
@@ -182,11 +182,11 @@ impl ServersService {
                 tracing::warn!(egress_id, "a speed rule names an egress that is gone");
                 return Ok(None);
             };
-            let previous = egress.max_download_speed;
+            let previous = egress.download_bps;
             if previous == bytes_per_sec {
                 return Ok(None);
             }
-            egress.max_download_speed = bytes_per_sec;
+            egress.download_bps = bytes_per_sec;
             db.update_egress_interface(&egress)?;
             Ok::<_, StateError>(Some(previous))
         })
@@ -206,7 +206,7 @@ impl ServersService {
                     .into_iter()
                     .find(|egress| egress.id == egress_id)
                     .ok_or_else(|| StateError::Database(format!("egress {egress_id} not found")))?;
-                egress.max_download_speed = previous;
+                egress.download_bps = previous;
                 db.update_egress_interface(&egress).map(|_| ())
             })
             .await;

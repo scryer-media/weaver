@@ -117,18 +117,24 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
         config.intermediate_dir = Some(intermediate_dir.display().to_string());
         config.categories = vec![
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "Movies".to_string(),
                 dest_dir: Some(complete_dir.display().to_string()),
                 aliases: String::new(),
             },
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 2,
                 name: "TV".to_string(),
                 dest_dir: None,
                 aliases: String::new(),
             },
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 3,
                 name: "Unavailable".to_string(),
                 dest_dir: Some(missing_dir.display().to_string()),

@@ -748,6 +748,8 @@ fn build_service_with_security(
     security: RuntimeSecurityConfig,
 ) -> RssService {
     let config = Arc::new(RwLock::new(Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: data_dir.display().to_string(),
         hardware_profile: None,
         intermediate_dir: None,
@@ -756,7 +758,7 @@ fn build_service_with_security(
         servers: vec![],
         categories: vec![],
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

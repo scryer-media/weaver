@@ -14,13 +14,15 @@ use weaver_server_core::{
 
 use crate::jobs::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::jobs::types::{
-    Attribute, DuplicateSummaryInfo, JobStatusGql, ParsedRelease, PreparedQueueFilter,
+    Attribute, DuplicateSummaryInfo, JobStatusGql, ParsedRelease, PreparedQueueFilter, ProtocolGql,
     QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct HistoryItem {
     pub id: u64,
+    #[serde(default)]
+    pub protocol: ProtocolGql,
     pub job_hash: Option<String>,
     pub name: String,
     pub display_title: String,
@@ -523,6 +525,7 @@ fn history_item_from_display(
     };
     HistoryItem {
         id: row.job_id,
+        protocol: row.protocol.into(),
         job_hash: row.job_hash.as_ref().map(hex::encode),
         name: row.name.clone(),
         display_title,

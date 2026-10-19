@@ -49,6 +49,24 @@ fn runtime_lanes_for_status(
             crate::jobs::model::RunState::Active,
             None,
         ),
+        JobStatus::FetchingMetadata | JobStatus::Stalled => (
+            crate::jobs::model::DownloadState::Downloading,
+            crate::jobs::model::PostState::Idle,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::CheckingFiles => (
+            crate::jobs::model::DownloadState::Checking,
+            crate::jobs::model::PostState::Idle,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Seeding => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::Completed,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
         JobStatus::Verifying => (
             crate::jobs::model::DownloadState::Complete,
             crate::jobs::model::PostState::Verifying,
@@ -121,6 +139,7 @@ fn runtime_lanes_for_status(
 fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
     jobs.values()
         .map(|state| JobInfo {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: state.job_id,
             job_hash: Some(state.job_hash),
             name: state.spec.name.clone(),
@@ -396,7 +415,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetPropagationDelay { reply, .. }
-                | SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                | SchedulerCommand::SetBandwidth { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::RebuildNntp { reply, .. } => {
@@ -1039,6 +1058,7 @@ fn job_download_rates_report_only_transferring_download_phases() {
 
     fn info(job_id: u64, phase_progress: Vec<JobPhaseProgress>) -> JobInfo {
         JobInfo {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: JobId(job_id),
             job_hash: None,
             name: format!("job-{job_id}"),

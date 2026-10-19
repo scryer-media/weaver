@@ -780,3 +780,39 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
         Some("downloading")
     );
 }
+
+// An article job a build before roots had kinds checkpointed restores as it
+// was: the article it had in hand reads back, nothing is fetched again, and
+// the restored job's checkpoint says what the first one's did.
+#[test]
+fn an_article_job_checkpointed_before_roots_had_kinds_restores() {
+    let files = [file("lantern.bin", &[100]), file("later.bin", &[100])];
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    job.intake(decoded(0, 0, 0, &[7; 90], Some(90)), 1).unwrap();
+    let taken = job.snapshot();
+    let mut rows = checkpoint::rows(&taken);
+    checkpoint::tests::as_version_2(&mut rows);
+    let snapshot = checkpoint::snapshot(&rows).unwrap();
+    assert_eq!(snapshot, taken);
+    let storage = crate::pipeline::graph::job::Storage {
+        working_dir: dir.path().to_path_buf(),
+        accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: u64::MAX,
+            scratch_total: u64::MAX,
+            scratch_ceiling: u64::MAX,
+            disk_reserve: 0,
+        })),
+        free_disk: CapacityReader::unknown(),
+        slots: 1,
+        mail: RunMail::default().sender(),
+        passwords: Vec::new(),
+        caps: crate::pipeline::graph::limits::Caps::unbounded(),
+        nesting: u32::MAX,
+    };
+    let restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
+    assert!(restored.refetched.is_empty());
+    assert!(restored.settled.contains(&(VolumeIndex(0), 0)));
+    let again = restored.job.snapshot();
+    assert_eq!(again.root, taken.root);
+    assert_eq!(again.job.read_backs, taken.job.read_backs);
+}

@@ -25,6 +25,24 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
             weaver_server_core::RunState::Active,
             None,
         ),
+        JobStatus::FetchingMetadata | JobStatus::Stalled => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::CheckingFiles => (
+            weaver_server_core::DownloadState::Checking,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Seeding => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Completed,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
         JobStatus::Checking => (
             weaver_server_core::DownloadState::Checking,
             weaver_server_core::PostState::Idle,
@@ -99,6 +117,7 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
         ),
     };
     weaver_server_core::JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: JobId(42),
         job_hash: None,
         name: "Facade.Test.Release".to_string(),

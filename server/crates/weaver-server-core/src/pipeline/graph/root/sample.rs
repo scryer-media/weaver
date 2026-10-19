@@ -26,7 +26,7 @@ pub(crate) const BOOTSTRAP_VOLUMES: usize = 4;
 // Bid the leading volumes of every set still being fetched: from its first
 // volume on, past the ones already in hand, stopping at the first volume no
 // member has been bound to yet.
-pub(crate) fn bootstrap(tree: &Tree, map: &ArticleMap, window: &mut Window) {
+pub(crate) fn bootstrap(tree: &Tree, waiting: impl Fn(VolumeIndex) -> bool, window: &mut Window) {
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return;
     };
@@ -47,7 +47,7 @@ pub(crate) fn bootstrap(tree: &Tree, map: &ArticleMap, window: &mut Window) {
             if volume.0 as usize != expected || asked == BOOTSTRAP_VOLUMES {
                 break;
             }
-            if !map.volume_waiting(*root) {
+            if !waiting(*root) {
                 continue;
             }
             window.bid(Bid {

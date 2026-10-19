@@ -51,6 +51,28 @@ pub(crate) async fn move_isp_cap_to_system_egress(
 }
 
 async fn move_at(conn: &mut SqlConn<'_>, now: DateTime<Local>) -> Result<(), StateError> {
+    if let Some(carried) = take_cap(conn, now).await? {
+        copy_cap(conn, &carried).await?;
+        carry_usage(conn, &carried, now).await?;
+    }
+    Ok(())
+}
+
+// An enabled cap as the quota it becomes, with the window it was in and the
+// bytes it had counted there.
+pub(crate) struct CarriedCap {
+    pub(crate) cap: ServerDownloadQuotaConfig,
+    pub(crate) window_start: i64,
+    pub(crate) window_end: i64,
+    pub(crate) used: i64,
+}
+
+// Reads the saved cap and removes the settings that held it. `None` when no
+// enabled cap was saved.
+pub(crate) async fn take_cap(
+    conn: &mut SqlConn<'_>,
+    now: DateTime<Local>,
+) -> Result<Option<CarriedCap>, StateError> {
     let placeholders = vec!["{}"; KEYS.len()].join(", ");
     let rows = conn
         .fetch_all(
@@ -66,14 +88,17 @@ async fn move_at(conn: &mut SqlConn<'_>, now: DateTime<Local>) -> Result<(), Sta
         saved.insert(row.text("key")?, row.text("value")?);
     }
 
-    match saved_cap(&saved) {
-        Some(cap) if cap.enabled => copy_cap(conn, &cap, now).await?,
-        Some(_) => {}
-        None if saved.is_empty() => {}
-        None => tracing::warn!(
-            "the saved bandwidth cap could not be read and was not carried onto the System egress"
-        ),
-    }
+    let carried = match saved_cap(&saved) {
+        Some(cap) if cap.enabled => carried_cap(conn, cap, now).await?,
+        Some(_) => None,
+        None if saved.is_empty() => None,
+        None => {
+            tracing::warn!(
+                "the saved bandwidth cap could not be read and was not carried onto the System egress"
+            );
+            None
+        }
+    };
 
     conn.execute(
         &format!("DELETE FROM settings WHERE key IN ({placeholders})"),
@@ -83,7 +108,7 @@ async fn move_at(conn: &mut SqlConn<'_>, now: DateTime<Local>) -> Result<(), Sta
             .collect::<Vec<_>>(),
     )
     .await?;
-    Ok(())
+    Ok(carried)
 }
 
 // The saved cap, read as the download quota it becomes.
@@ -125,38 +150,15 @@ fn saved_cap(
     valid.then_some(cap)
 }
 
-async fn copy_cap(
+async fn carried_cap(
     conn: &mut SqlConn<'_>,
-    cap: &ServerDownloadQuotaConfig,
+    cap: ServerDownloadQuotaConfig,
     now: DateTime<Local>,
-) -> Result<(), StateError> {
+) -> Result<Option<CarriedCap>, StateError> {
     // `saved_cap` only reads the three windowed periods.
-    let Some(window) = crate::bandwidth::service::compute_window(now, cap) else {
-        return Ok(());
+    let Some(window) = crate::bandwidth::service::compute_window(now, (&cap).into()) else {
+        return Ok(None);
     };
-    let period = cap.period.as_str();
-    conn.execute(
-        "UPDATE egress_interfaces
-            SET download_quota_enabled = TRUE,
-                download_quota_limit_bytes = {},
-                download_quota_period = {},
-                download_quota_reset_time_minutes_local = {},
-                download_quota_weekly_reset_weekday = {},
-                download_quota_monthly_reset_day = {}
-          WHERE id = {}",
-        &[
-            SqlArg::I64(cap.limit_bytes as i64),
-            SqlArg::Text(period.into()),
-            SqlArg::I64(i64::from(cap.reset_time_minutes_local)),
-            SqlArg::Text(
-                crate::servers::record::quota_weekday_str(cap.weekly_reset_weekday).into(),
-            ),
-            SqlArg::I64(i64::from(cap.monthly_reset_day)),
-            SqlArg::I64(SYSTEM_EGRESS_ID),
-        ],
-    )
-    .await?;
-
     // What the cap had counted in the window it was in: every metered byte
     // in the per-minute ledger between the window's edges.
     let start = window.starts_at().timestamp();
@@ -177,6 +179,48 @@ async fn copy_cap(
         .transpose()?
         .unwrap_or(0)
         .max(0);
+    Ok(Some(CarriedCap {
+        cap,
+        window_start: start,
+        window_end: end,
+        used,
+    }))
+}
+
+// The cap as the System egress's download quota, in the columns schema 53
+// keeps it in.
+async fn copy_cap(conn: &mut SqlConn<'_>, carried: &CarriedCap) -> Result<(), StateError> {
+    let cap = &carried.cap;
+    conn.execute(
+        "UPDATE egress_interfaces
+            SET download_quota_enabled = TRUE,
+                download_quota_limit_bytes = {},
+                download_quota_period = {},
+                download_quota_reset_time_minutes_local = {},
+                download_quota_weekly_reset_weekday = {},
+                download_quota_monthly_reset_day = {}
+          WHERE id = {}",
+        &[
+            SqlArg::I64(cap.limit_bytes as i64),
+            SqlArg::Text(cap.period.as_str().into()),
+            SqlArg::I64(i64::from(cap.reset_time_minutes_local)),
+            SqlArg::Text(
+                crate::servers::record::quota_weekday_str(cap.weekly_reset_weekday).into(),
+            ),
+            SqlArg::I64(i64::from(cap.monthly_reset_day)),
+            SqlArg::I64(SYSTEM_EGRESS_ID),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+// The bytes the cap had counted, as the System egress's usage in its window.
+pub(crate) async fn carry_usage(
+    conn: &mut SqlConn<'_>,
+    carried: &CarriedCap,
+    now: DateTime<Local>,
+) -> Result<(), StateError> {
     conn.execute(
         "INSERT INTO egress_download_usage
             (egress_id, lifetime_bytes, quota_baseline_bytes,
@@ -184,9 +228,9 @@ async fn copy_cap(
          VALUES ({}, {}, 0, {}, {}, {})",
         &[
             SqlArg::I64(SYSTEM_EGRESS_ID),
-            SqlArg::I64(used),
-            SqlArg::I64(start),
-            SqlArg::I64(end),
+            SqlArg::I64(carried.used),
+            SqlArg::I64(carried.window_start),
+            SqlArg::I64(carried.window_end),
             SqlArg::I64(now.timestamp()),
         ],
     )
@@ -287,7 +331,7 @@ mod tests {
             weekly_reset_weekday: QuotaWeekday::Wed,
             monthly_reset_day: 3,
         };
-        let window = crate::servers::transfer_policy::server_quota_window(now, &quota).unwrap();
+        let window = crate::servers::transfer_policy::quota_window(now, (&quota).into()).unwrap();
         let first = window.start.timestamp().div_euclid(60);
         let last = window.end.timestamp().div_euclid(60) - 1;
         // Counted: metered bytes inside the window.

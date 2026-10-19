@@ -2214,6 +2214,8 @@ fn settings_resolve_reads_the_config_table() {
     use crate::settings::DirectStoreOverrides;
 
     let mut config = crate::settings::Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: "/tmp/weaver-direct-store".to_string(),
         hardware_profile: None,
         intermediate_dir: None,
@@ -2222,7 +2224,7 @@ fn settings_resolve_reads_the_config_table() {
         servers: Vec::new(),
         categories: Vec::new(),
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         cleanup_after_extract: None,
         propagation_delay_secs: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

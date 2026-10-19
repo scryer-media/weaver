@@ -795,6 +795,8 @@ fn tv_category_config() -> SharedConfig {
         .unwrap()
         .categories
         .push(weaver_server_core::categories::CategoryConfig {
+            seeding: None,
+            torrent_route: false,
             id: 1,
             name: "TV".into(),
             dest_dir: None,
@@ -1374,6 +1376,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     ])
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 100,
         job_hash: None,
         name: "Complete.Release".into(),
@@ -1395,6 +1398,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     })
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 101,
         job_hash: None,
         name: "Failed.Release".into(),
@@ -1467,6 +1471,7 @@ async fn nzbget_history_reports_the_folder_named_after_the_original_title() {
     let folder = weaver_server_core::ingest::completed_folder_name(&display, &metadata);
     let db = Database::open_in_memory().unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 110,
         job_hash: None,
         name: display.clone(),
@@ -1899,6 +1904,8 @@ async fn nzbget_config_exposes_real_categories_and_keep_history() {
         config_write
             .categories
             .push(weaver_server_core::categories::CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "tv".into(),
                 dest_dir: Some("/media/tv".into()),
@@ -1961,6 +1968,8 @@ async fn nzbget_config_emits_virtual_literal_alias_categories_for_arr_test() {
         config_write
             .categories
             .push(weaver_server_core::categories::CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "TV".into(),
                 dest_dir: Some("/media/tv".into()),
@@ -4136,6 +4145,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
     db.archive_job(
         JobId(10_000),
         &weaver_server_core::JobHistoryRow {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id: 10_000,
             job_hash: None,
             name: "Silver Horizon".to_string(),
@@ -4216,6 +4226,7 @@ async fn job_output_file_download_handler_streams_history_file() {
     let file_path = output_dir.join("episode-01.mkv");
     std::fs::write(&file_path, b"video-bytes").unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 10_001,
         job_hash: None,
         name: "Silver Horizon".to_string(),

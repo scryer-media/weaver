@@ -389,3 +389,54 @@ async fn categories_query_stays_responsive_during_update_category_persist() {
         "television"
     );
 }
+
+#[tokio::test]
+async fn a_category_keeps_its_seeding_policy_and_torrent_route_until_told_otherwise() {
+    let h = TestHarness::new().await;
+    let added = h
+        .execute(
+            r#"mutation {
+                addCategory(input: { name: "linux", seeding: { ratioGoal: 3.0, action: REMOVE }, torrentRoute: true }) {
+                    id seeding { ratioGoal mode action } torrentRoute
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&added);
+    let data = response_data(&added);
+    let id = data["addCategory"]["id"].as_u64().unwrap();
+    assert_eq!(data["addCategory"]["seeding"]["ratioGoal"], 3.0);
+    assert_eq!(data["addCategory"]["seeding"]["mode"], "ANY");
+    assert_eq!(data["addCategory"]["seeding"]["action"], "REMOVE");
+    assert_eq!(data["addCategory"]["torrentRoute"], true);
+
+    // An update that names neither field keeps both.
+    let renamed = h
+        .execute(&format!(
+            r#"mutation {{ updateCategory(id: {id}, input: {{ name: "distros" }}) {{
+                seeding {{ ratioGoal }} torrentRoute
+            }} }}"#
+        ))
+        .await;
+    assert_no_errors(&renamed);
+    let data = response_data(&renamed);
+    assert_eq!(data["updateCategory"]["seeding"]["ratioGoal"], 3.0);
+    assert_eq!(data["updateCategory"]["torrentRoute"], true);
+
+    let cleared = h
+        .execute(&format!(
+            r#"mutation {{ updateCategory(id: {id}, input: {{ name: "distros", seeding: null, torrentRoute: false }}) {{
+                seeding {{ ratioGoal }} torrentRoute
+            }} }}"#
+        ))
+        .await;
+    assert_no_errors(&cleared);
+    let data = response_data(&cleared);
+    assert!(data["updateCategory"]["seeding"].is_null());
+    assert_eq!(data["updateCategory"]["torrentRoute"], false);
+
+    let stored = h.db.list_categories().unwrap();
+    assert_eq!(stored[0].name, "distros");
+    assert_eq!(stored[0].seeding, None);
+    assert!(!stored[0].torrent_route);
+}

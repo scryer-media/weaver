@@ -91,7 +91,8 @@ fn global_speed(bytes_per_sec: u64) -> ScheduleAction {
     ScheduleAction::SpeedLimit {
         limits: vec![crate::bandwidth::SpeedLimitChange {
             target: crate::bandwidth::SpeedTarget::Global,
-            bytes_per_sec,
+            bytes_per_sec: Some(bytes_per_sec),
+            upload_bytes_per_sec: None,
         }],
     }
 }
@@ -1186,7 +1187,8 @@ fn speeds(limits: &[(crate::bandwidth::SpeedTarget, u64)]) -> ScheduleAction {
             .map(
                 |&(target, bytes_per_sec)| crate::bandwidth::SpeedLimitChange {
                     target,
-                    bytes_per_sec,
+                    bytes_per_sec: Some(bytes_per_sec),
+                    upload_bytes_per_sec: None,
                 },
             )
             .collect(),

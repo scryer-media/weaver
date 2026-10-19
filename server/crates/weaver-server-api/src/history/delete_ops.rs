@@ -352,6 +352,7 @@ mod tests {
 
     fn history(job_id: u64) -> JobHistoryRow {
         JobHistoryRow {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id,
             job_hash: None,
             name: format!("job-{job_id}"),

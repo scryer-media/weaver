@@ -630,6 +630,11 @@ pub enum NetworkConsumerKind {
     Rss,
     // Default outbound. There is one, so its id is ignored.
     Outbound,
+    // The torrent route every category without its own takes. There is one,
+    // so its id is ignored.
+    TorrentDefault,
+    // One category's torrent route; the id is the category's.
+    TorrentCategory,
 }
 impl NetworkConsumerKind {
     pub(crate) fn consumer(self, id: u32) -> core::Consumer {
@@ -637,6 +642,8 @@ impl NetworkConsumerKind {
             Self::Server => core::Consumer::Server(id),
             Self::Rss => core::Consumer::Rss(id),
             Self::Outbound => core::Consumer::Outbound,
+            Self::TorrentDefault => core::Consumer::Torrent(core::TorrentScope::Default),
+            Self::TorrentCategory => core::Consumer::Torrent(core::TorrentScope::Category(id)),
         }
     }
 }
@@ -906,6 +913,12 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                 core::Consumer::Server(id) => (NetworkConsumerKind::Server, id),
                 core::Consumer::Rss(id) => (NetworkConsumerKind::Rss, id),
                 core::Consumer::Outbound => (NetworkConsumerKind::Outbound, 0),
+                core::Consumer::Torrent(core::TorrentScope::Default) => {
+                    (NetworkConsumerKind::TorrentDefault, 0)
+                }
+                core::Consumer::Torrent(core::TorrentScope::Category(id)) => {
+                    (NetworkConsumerKind::TorrentCategory, id)
+                }
             };
             NetworkConsumerFlow {
                 key: consumer.key(),
@@ -1222,7 +1235,13 @@ impl NetworkingMutation {
                     db.list_servers()?.iter().any(|server| server.id == id)
                 }
                 core::Consumer::Rss(id) => db.get_rss_feed(id)?.is_some(),
-                core::Consumer::Outbound => true,
+                core::Consumer::Outbound | core::Consumer::Torrent(core::TorrentScope::Default) => {
+                    true
+                }
+                core::Consumer::Torrent(core::TorrentScope::Category(id)) => db
+                    .list_categories()?
+                    .iter()
+                    .any(|category| category.id == id),
             };
             if !exists {
                 return Err(NetworkRefusal::RouteConsumerGone.into());

@@ -64,12 +64,32 @@ pub enum ScheduleAction {
     },
 }
 
-// One limit a speed rule sets.
+// One limit a speed rule sets, in bytes per second. `None` lifts the limit
+// at this level; `Some(0)` lets nothing through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeedLimitChange {
     pub target: SpeedTarget,
-    // Bytes per second. 0 = no limit at this level.
-    pub bytes_per_sec: u64,
+    // The download limit.
+    pub bytes_per_sec: Option<u64>,
+    // The upload limit. Only the global target has one.
+    #[serde(default)]
+    pub upload_bytes_per_sec: Option<u64>,
+}
+
+impl SpeedLimitChange {
+    // Why a rule cannot set this limit, if it cannot.
+    pub const fn fault(&self) -> Option<&'static str> {
+        match self.target {
+            SpeedTarget::Global => None,
+            _ if self.upload_bytes_per_sec.is_some() => {
+                Some("only the global speed limit has an upload limit")
+            }
+            SpeedTarget::Server(_) if matches!(self.bytes_per_sec, Some(0)) => {
+                Some("a provider's speed limit cannot be zero")
+            }
+            _ => None,
+        }
+    }
 }
 
 // What a speed limit applies to. The effective rate of a download is the

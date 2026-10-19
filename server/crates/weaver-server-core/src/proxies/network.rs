@@ -132,6 +132,168 @@ pub enum EgressBinding {
     SourceAddress { address: IpAddr },
 }
 
+// The largest byte count or rate the database can hold.
+pub const MAX_STORED_BANDWIDTH: u64 = i64::MAX as u64;
+
+// Uploads past an egress's soft cap fall to this rate unless it names its own.
+pub const DEFAULT_UPLOAD_TRICKLE_BPS: u64 = 2_048;
+
+// The global limits, one for the whole instance. `None` is no limit; `Some(0)`
+// lets nothing through.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bandwidth {
+    pub download_bps: Option<u64>,
+    pub upload_bps: Option<u64>,
+}
+
+impl Bandwidth {
+    pub fn validate(&self) -> Result<(), NetworkRefusal> {
+        if [self.download_bps, self.upload_bps]
+            .into_iter()
+            .flatten()
+            .any(|rate| rate > MAX_STORED_BANDWIDTH)
+        {
+            return Err(NetworkRefusal::BandwidthLimitTooLarge);
+        }
+        Ok(())
+    }
+
+    pub const fn limit(&self, direction: crate::bandwidth::Direction) -> Option<u64> {
+        match direction {
+            crate::bandwidth::Direction::Download => self.download_bps,
+            crate::bandwidth::Direction::Upload => self.upload_bps,
+        }
+    }
+}
+
+// What is out of bounds in an egress's quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressQuotaFault {
+    LimitTooLarge,
+    ResetTimeRange,
+    MonthlyResetDayRange,
+    SoftAboveHard,
+}
+
+impl EgressQuotaFault {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::LimitTooLarge => "egress quota limit exceeds database range",
+            Self::ResetTimeRange => "egress quota reset time must be between 0 and 1439",
+            Self::MonthlyResetDayRange => {
+                "egress quota monthly reset day must be between 1 and 31"
+            }
+            Self::SoftAboveHard => "egress upload soft cap must not exceed its hard cap",
+        }
+    }
+}
+
+// The bytes an egress may carry in each period. A cap of `None` is no cap;
+// `Some(0)` is a budget of nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressQuota {
+    // Raw BODY bytes downloaded, counted across every server routed over
+    // the egress. Reaching it stops downloads.
+    pub download_bytes: Option<u64>,
+    // Past it, uploads trickle.
+    pub upload_soft_bytes: Option<u64>,
+    pub upload_trickle_bps: u64,
+    // Past it, uploads stop.
+    pub upload_hard_bytes: Option<u64>,
+    pub period: crate::servers::ServerDownloadQuotaPeriod,
+    pub reset_time_minutes_local: u16,
+    pub weekly_reset_weekday: crate::bandwidth::QuotaWeekday,
+    pub monthly_reset_day: u8,
+}
+
+impl Default for EgressQuota {
+    fn default() -> Self {
+        Self {
+            download_bytes: None,
+            upload_soft_bytes: None,
+            upload_trickle_bps: DEFAULT_UPLOAD_TRICKLE_BPS,
+            upload_hard_bytes: None,
+            period: crate::servers::ServerDownloadQuotaPeriod::OneTime,
+            reset_time_minutes_local: 0,
+            weekly_reset_weekday: crate::bandwidth::QuotaWeekday::Mon,
+            monthly_reset_day: 1,
+        }
+    }
+}
+
+impl EgressQuota {
+    pub fn calendar(&self) -> crate::bandwidth::service::QuotaCalendar {
+        crate::bandwidth::service::QuotaCalendar {
+            period: self.period,
+            reset_time_minutes_local: self.reset_time_minutes_local,
+            weekly_reset_weekday: self.weekly_reset_weekday,
+            monthly_reset_day: self.monthly_reset_day,
+        }
+    }
+
+    // Whether either direction is capped, so usage has a period to count in.
+    pub fn is_set(&self) -> bool {
+        self.download_bytes.is_some()
+            || self.upload_soft_bytes.is_some()
+            || self.upload_hard_bytes.is_some()
+    }
+
+    // Where `used` bytes put `direction`.
+    pub fn state(
+        &self,
+        direction: crate::bandwidth::Direction,
+        used: u64,
+    ) -> crate::bandwidth::QuotaState {
+        match direction {
+            crate::bandwidth::Direction::Download => {
+                crate::bandwidth::QuotaState::of(used, None, self.download_bytes)
+            }
+            crate::bandwidth::Direction::Upload => crate::bandwidth::QuotaState::of(
+                used,
+                self.upload_soft_bytes,
+                self.upload_hard_bytes,
+            ),
+        }
+    }
+
+    // The trickle rate `direction` falls to past its soft cap.
+    pub const fn trickle_bps(&self, direction: crate::bandwidth::Direction) -> u64 {
+        match direction {
+            crate::bandwidth::Direction::Download => 0,
+            crate::bandwidth::Direction::Upload => self.upload_trickle_bps,
+        }
+    }
+
+    // The first bound this quota breaks.
+    pub fn fault(&self) -> Option<EgressQuotaFault> {
+        if [
+            self.download_bytes,
+            self.upload_soft_bytes,
+            self.upload_hard_bytes,
+            Some(self.upload_trickle_bps),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|bytes| bytes > MAX_STORED_BANDWIDTH)
+        {
+            return Some(EgressQuotaFault::LimitTooLarge);
+        }
+        if let (Some(soft), Some(hard)) = (self.upload_soft_bytes, self.upload_hard_bytes)
+            && soft > hard
+        {
+            return Some(EgressQuotaFault::SoftAboveHard);
+        }
+        if self.reset_time_minutes_local >= 24 * 60 {
+            return Some(EgressQuotaFault::ResetTimeRange);
+        }
+        if !(1..=31).contains(&self.monthly_reset_day) {
+            return Some(EgressQuotaFault::MonthlyResetDayRange);
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EgressInterface {
@@ -139,11 +301,10 @@ pub struct EgressInterface {
     pub name: String,
     pub binding: EgressBinding,
     pub enabled: bool,
-    pub max_download_speed: u64,
-    // Raw BODY bytes this egress may carry, counted across every server
-    // routed over it.
+    pub download_bps: Option<u64>,
+    pub upload_bps: Option<u64>,
     #[serde(default)]
-    pub download_quota: crate::servers::ServerDownloadQuotaConfig,
+    pub quota: EgressQuota,
 }
 
 impl EgressInterface {
@@ -153,8 +314,17 @@ impl EgressInterface {
             name: "System".into(),
             binding: EgressBinding::System,
             enabled: true,
-            max_download_speed: 0,
-            download_quota: crate::servers::ServerDownloadQuotaConfig::default(),
+            download_bps: None,
+            upload_bps: None,
+            quota: EgressQuota::default(),
+        }
+    }
+
+    // The egress's own cap on `direction`.
+    pub const fn cap(&self, direction: crate::bandwidth::Direction) -> Option<u64> {
+        match direction {
+            crate::bandwidth::Direction::Download => self.download_bps,
+            crate::bandwidth::Direction::Upload => self.upload_bps,
         }
     }
 
@@ -162,7 +332,14 @@ impl EgressInterface {
         if self.name.trim().is_empty() || self.name.chars().count() > 128 {
             return Err(NetworkRefusal::EgressNameLength);
         }
-        if let Some(fault) = self.download_quota.fault() {
+        if [self.download_bps, self.upload_bps]
+            .into_iter()
+            .flatten()
+            .any(|rate| rate > MAX_STORED_BANDWIDTH)
+        {
+            return Err(NetworkRefusal::EgressSpeedLimitTooLarge);
+        }
+        if let Some(fault) = self.quota.fault() {
             return Err(NetworkRefusal::EgressQuota(fault));
         }
         if self.id == SYSTEM_EGRESS_ID {

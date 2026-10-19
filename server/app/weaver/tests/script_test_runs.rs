@@ -39,6 +39,8 @@ fn fixture(execution_enabled: bool) -> Fixture {
     })
     .unwrap();
     let config = Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: data.path().to_string_lossy().into_owned(),
         intermediate_dir: None,
         complete_dir: None,

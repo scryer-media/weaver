@@ -155,6 +155,7 @@ async fn wait_at_gate(gate: PathBuf) {
 // A finished job for script runs to be recorded against.
 fn finished_job(db: &Database, job_id: u64, working_directory: &Path) {
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: "finished".into(),
@@ -726,6 +727,7 @@ async fn results_are_persisted_on_the_job_and_a_rerun_replaces_them() {
     let db = Database::open_in_memory().unwrap();
     enable_execution(&db);
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 106,
         job_hash: None,
         name: "rerun".into(),

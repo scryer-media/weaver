@@ -165,6 +165,7 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::OptText(history.server_attribution.clone()),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::I64(job_id.0 as i64),
+        SqlArg::Text(history.protocol.as_str().to_string()),
     ]
 }
 
@@ -221,7 +222,8 @@ async fn archive_job_sql(
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
                   created_at, completed_at, metadata,
-                  post_processing_summary, script_results_json, server_attribution, support_facts)
+                  post_processing_summary, script_results_json, server_attribution, support_facts,
+                  protocol)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
@@ -230,7 +232,8 @@ async fn archive_job_sql(
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
                          (SELECT script_results_json FROM active_jobs WHERE job_id = {}),
                          COALESCE({}, (SELECT server_attribution FROM active_jobs WHERE job_id = {})),
-                         (SELECT support_facts FROM active_jobs WHERE job_id = {}))
+                         (SELECT support_facts FROM active_jobs WHERE job_id = {}),
+                         {})
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
@@ -254,11 +257,12 @@ async fn archive_job_sql(
                     server_attribution =
                         COALESCE(excluded.server_attribution, job_history.server_attribution),
                     support_facts =
-                        COALESCE(excluded.support_facts, job_history.support_facts)
+                        COALESCE(excluded.support_facts, job_history.support_facts),
+                    protocol = excluded.protocol
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
-                    created_at, completed_at, metadata, server_attribution",
+                    created_at, completed_at, metadata, server_attribution, protocol",
                 &args,
             )
             .await?

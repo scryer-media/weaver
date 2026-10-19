@@ -8,6 +8,7 @@ use super::*;
 
 fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
     JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 42,
         job_hash: None,
         name: "job".into(),
@@ -46,6 +47,24 @@ fn job(status: JobStatus) -> JobInfo {
         JobStatus::Downloading => (
             weaver_server_core::DownloadState::Downloading,
             weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::FetchingMetadata | JobStatus::Stalled => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::CheckingFiles => (
+            weaver_server_core::DownloadState::Checking,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Seeding => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Completed,
             weaver_server_core::RunState::Active,
             None,
         ),
@@ -123,6 +142,7 @@ fn job(status: JobStatus) -> JobInfo {
         ),
     };
     JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: JobId(42),
         job_hash: None,
         name: "job".into(),

@@ -152,6 +152,7 @@ fn nzbget_history_row(
     metadata: Option<String>,
 ) -> weaver_server_core::JobHistoryRow {
     weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: format!("History.Release.{job_id}"),
@@ -182,6 +183,8 @@ fn test_scheduler_handle() -> SchedulerHandle {
 
 fn test_config() -> SharedConfig {
     Arc::new(RwLock::new(Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: "/tmp/weaver".to_string(),
         hardware_profile: None,
         intermediate_dir: None,
@@ -480,6 +483,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                     } else {
                         if let (Some(db), Some(job)) = (&db, cancelled) {
                             let _ = db.insert_job_history(&weaver_server_core::JobHistoryRow {
+                                protocol: weaver_server_core::Protocol::Nzb,
                                 job_id: job_id.0,
                                 job_hash: job.job_hash.map(|hash| hash.to_vec()),
                                 name: job.name,
@@ -545,6 +549,7 @@ fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
     let total_files = spec.files.len() as u32;
     let remaining_par_files = spec.par2_volume_count() as u32;
     JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: spec.name,
@@ -619,6 +624,7 @@ fn nzbget_test_job(
     metadata: Vec<(String, String)>,
 ) -> JobInfo {
     JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: JobId(job_id),
         job_hash: None,
         name: "Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR".into(),
@@ -1083,6 +1089,7 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
 
 fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
     JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: JobId(job_id),
         job_hash: None,
         name: name.into(),

@@ -2159,6 +2159,10 @@ impl Pipeline {
                 JobStatus::Failed { .. } => crate::jobs::model::PostState::Failed,
                 JobStatus::Paused => crate::jobs::model::PostState::Idle,
                 JobStatus::Downloading | JobStatus::Checking => crate::jobs::model::PostState::Idle,
+                JobStatus::FetchingMetadata | JobStatus::CheckingFiles | JobStatus::Stalled => {
+                    crate::jobs::model::PostState::Idle
+                }
+                JobStatus::Seeding => crate::jobs::model::PostState::Completed,
             }),
             run_state: run_state.unwrap_or({
                 if matches!(status, JobStatus::Paused) {

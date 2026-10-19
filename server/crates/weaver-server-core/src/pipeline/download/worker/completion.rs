@@ -167,7 +167,8 @@ impl Pipeline {
             .and_then(|runtime| runtime.network.egress_configuration(snapshot.server_id));
         let limit_bytes = egress
             .as_ref()
-            .map_or(0, |egress| egress.download_quota.limit_bytes);
+            .and_then(|egress| egress.quota.download_bytes)
+            .unwrap_or(0);
         let egress_name = egress
             .map(|egress| egress.name)
             .unwrap_or_else(|| format!("Egress {}", snapshot.server_id));

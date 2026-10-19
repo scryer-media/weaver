@@ -173,7 +173,7 @@ pub async fn reload_runtime_from_db(
         .await
         .map_err(|error| error.to_string())?;
     handle
-        .restore_speed_limit(loaded.max_download_speed.unwrap_or(0))
+        .restore_bandwidth(loaded.bandwidth)
         .await
         .map_err(|error| error.to_string())?;
     if load_global_pause_from_db(db).await? {
@@ -253,6 +253,8 @@ mod tests {
         .unwrap();
 
         let config: SharedConfig = Arc::new(RwLock::new(Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver-runtime-reload-test".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -261,7 +263,7 @@ mod tests {
             servers: vec![server],
             categories: Vec::new(),
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -289,6 +291,8 @@ mod tests {
     #[tokio::test]
     async fn missing_policy_registry_preserves_prior_generation() {
         let config: SharedConfig = Arc::new(RwLock::new(Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver-runtime-reload-missing-policy-test".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -297,7 +301,7 @@ mod tests {
             servers: vec![server(42)],
             categories: Vec::new(),
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -578,7 +582,7 @@ mod tests {
                 .into_iter()
                 .find(|egress| egress.id == id)
                 .unwrap()
-                .max_download_speed
+                .download_bps
         };
 
         let db = Database::open_in_memory().unwrap();
@@ -590,8 +594,9 @@ mod tests {
                     address: "192.0.2.1".parse().unwrap(),
                 },
                 enabled: true,
-                max_download_speed: 0,
-                download_quota: Default::default(),
+                download_bps: None,
+                upload_bps: None,
+                quota: Default::default(),
             })
             .unwrap()
             .id;
@@ -614,12 +619,20 @@ mod tests {
             &db,
             "INSERT INTO proxy_routes (consumer, policy) VALUES ('server:9', 'not a route')",
         );
-        assert!(service.set_egress_speed_limit(egress, 5_000).await.is_err());
-        assert_eq!(speed(&db, egress), 0);
+        assert!(
+            service
+                .set_egress_speed_limit(egress, Some(5_000))
+                .await
+                .is_err()
+        );
+        assert_eq!(speed(&db, egress), None);
 
         raw(&db, "DELETE FROM proxy_routes WHERE consumer = 'server:9'");
-        service.set_egress_speed_limit(egress, 5_000).await.unwrap();
-        assert_eq!(speed(&db, egress), 5_000);
+        service
+            .set_egress_speed_limit(egress, Some(5_000))
+            .await
+            .unwrap();
+        assert_eq!(speed(&db, egress), Some(5_000));
     }
 
     #[test]
@@ -658,7 +671,8 @@ mod tests {
                     .iter()
                     .map(|&(target, bytes_per_sec)| SpeedLimitChange {
                         target,
-                        bytes_per_sec,
+                        bytes_per_sec: Some(bytes_per_sec),
+                        upload_bytes_per_sec: None,
                     })
                     .collect(),
             },

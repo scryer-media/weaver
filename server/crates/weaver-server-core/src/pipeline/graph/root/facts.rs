@@ -1,36 +1,80 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The article root's facts: the post's file names, what each article of the
-// post came to, the offsets the decoder told exactly, the checksums it
-// computed, and the next node id of the tree. They are the root row's blob,
-// versioned like any object's. The post's own sizes are not here: a restore
-// has the spec, and the names are only there to prove it is the same post.
+// The root row's blob: the tree's next node id, what the job keeps of itself
+// (its count of repair reads and the phase it last reported), and the root's
+// own facts, named by the root that wrote them and versioned by it, so a
+// restore reads them only into a root of the same kind.
+//
+// The article root's facts are the post's file names, what each article of
+// the post came to, the offsets the decoder told exactly and the checksums
+// it computed. The post's own sizes are not here: a restore has the spec,
+// and the names are only there to prove it is the same post.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, VolumeIndex};
 
-use super::ArticleRoot;
 use super::phase::RootPhase;
+use super::{ArticleRoot, Root};
 use crate::pipeline::graph::job::RootFile;
 
+// The root row as it is written now.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RootFacts {
+pub(crate) struct RootRow {
     pub(crate) next_node: u32,
-    // Each file's name as the post lists it, in post order.
-    pub(crate) posted: Vec<String>,
-    pub(crate) volumes: Vec<VolumeFacts>,
-    // How many member reads the job's repairs made. The writer's count,
-    // kept here because the root row is the job's one row.
+    pub(crate) job: JobFacts,
+    pub(crate) root: RootBlob,
+}
+
+impl RootRow {
+    // Version 2 was the article root's facts with the job's beside them.
+    pub(crate) const VERSION: u16 = 3;
+}
+
+// What the job keeps of itself in the root row, whatever its root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct JobFacts {
+    // How many member reads the job's repairs made: the writer's count.
     pub(crate) read_backs: u64,
     // The phase the job last reported, so a restored job reports only a
-    // change from it. A checkpoint written before this was kept has none.
-    #[serde(default)]
+    // change from it.
     pub(crate) reported: Option<RootPhase>,
 }
 
-impl RootFacts {
-    pub(crate) const VERSION: u16 = 2;
+// A root's own facts, as the root that wrote them encoded them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RootBlob {
+    pub(crate) root: String,
+    pub(crate) version: u16,
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl RootBlob {
+    pub(crate) fn of<R: Root>(root: &R) -> Self {
+        Self {
+            root: R::NAME.to_owned(),
+            version: R::FACTS_VERSION,
+            // Plain structs of integers and strings always encode.
+            bytes: rmp_serde::to_vec(&root.facts()).unwrap_or_default(),
+        }
+    }
+
+    // The facts, for a root of the kind that wrote them.
+    pub(crate) fn read<R: Root>(&self) -> Result<R::Facts, RootFactsError> {
+        if self.root != R::NAME {
+            return Err(RootFactsError::Mismatch("another kind of root"));
+        }
+        read_version(R::FACTS_VERSION, self.version, &self.bytes)
+    }
+}
+
+// The article root's facts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PostFacts {
+    // Each file's name as the post lists it, in post order.
+    pub(crate) posted: Vec<String>,
+    pub(crate) volumes: Vec<VolumeFacts>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,22 +119,19 @@ pub(crate) enum RootFactsError {
 }
 
 impl ArticleRoot {
-    pub(crate) fn facts(&self, next_node: u32) -> RootFacts {
+    pub(crate) fn post_facts(&self) -> PostFacts {
         let mut volumes = self.map.facts();
         self.checksums.facts(&mut volumes);
-        RootFacts {
-            next_node,
+        PostFacts {
             posted: self.posted.clone(),
             volumes,
-            read_backs: 0,
-            reported: None,
         }
     }
 
     // The root at the state its facts describe, over the post's articles.
     // The post must be the one they were taken from: its files by name, as
     // the map checks them by their articles.
-    pub(crate) fn restore(files: &[RootFile], facts: &RootFacts) -> Result<Self, RootFactsError> {
+    pub(crate) fn restore(files: &[RootFile], facts: &PostFacts) -> Result<Self, RootFactsError> {
         let mut root = Self::new(files);
         if root.posted != facts.posted {
             return Err(RootFactsError::Mismatch("another file name"));
@@ -105,13 +146,57 @@ impl ArticleRoot {
     }
 }
 
-pub(crate) fn encode(facts: &RootFacts) -> Vec<u8> {
-    // A plain struct of integers always encodes.
-    rmp_serde::to_vec(facts).unwrap_or_default()
+impl PostFacts {
+    pub(crate) const VERSION: u16 = 1;
 }
 
-pub(crate) fn decode(version: u16, bytes: &[u8]) -> Result<RootFacts, RootFactsError> {
-    if version != RootFacts::VERSION {
+// The root row of version 2: the article root's facts, with the next node
+// and the job's own beside them. A checkpoint written before the reported
+// phase was kept has none.
+#[derive(Deserialize)]
+struct Version2 {
+    next_node: u32,
+    posted: Vec<String>,
+    volumes: Vec<VolumeFacts>,
+    read_backs: u64,
+    #[serde(default)]
+    reported: Option<RootPhase>,
+}
+
+pub(crate) fn encode(row: &RootRow) -> Vec<u8> {
+    // Plain structs of integers, strings and bytes always encode.
+    rmp_serde::to_vec(row).unwrap_or_default()
+}
+
+pub(crate) fn decode(version: u16, bytes: &[u8]) -> Result<RootRow, RootFactsError> {
+    if version != 2 {
+        return read_version(RootRow::VERSION, version, bytes);
+    }
+    let before: Version2 = read_version(2, version, bytes)?;
+    let post = PostFacts {
+        posted: before.posted,
+        volumes: before.volumes,
+    };
+    Ok(RootRow {
+        next_node: before.next_node,
+        job: JobFacts {
+            read_backs: before.read_backs,
+            reported: before.reported,
+        },
+        root: RootBlob {
+            root: ArticleRoot::NAME.to_owned(),
+            version: PostFacts::VERSION,
+            bytes: rmp_serde::to_vec(&post).unwrap_or_default(),
+        },
+    })
+}
+
+fn read_version<T: DeserializeOwned>(
+    expected: u16,
+    version: u16,
+    bytes: &[u8],
+) -> Result<T, RootFactsError> {
+    if version != expected {
         return Err(RootFactsError::Version(version));
     }
     rmp_serde::from_slice(bytes).map_err(|error| RootFactsError::Decode(error.to_string()))

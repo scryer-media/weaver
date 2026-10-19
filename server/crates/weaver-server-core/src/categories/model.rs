@@ -18,6 +18,14 @@ pub struct CategoryConfig {
     // Supports glob-style wildcards (`*` and `?`).
     #[serde(default)]
     pub aliases: String,
+    // Seeding policy for this category's torrents; a `None` field inherits
+    // the global one.
+    #[serde(default)]
+    pub seeding: Option<crate::settings::SeedingPolicy>,
+    // The category's torrents route through `torrent:category:<id>` instead
+    // of `torrent:default`.
+    #[serde(default)]
+    pub torrent_route: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -176,6 +184,8 @@ mod tests {
     #[test]
     fn configured_category_resolution_returns_the_canonical_record() {
         let categories = vec![CategoryConfig {
+            seeding: None,
+            torrent_route: false,
             id: 1,
             name: "Movies".to_string(),
             dest_dir: None,
@@ -201,12 +211,16 @@ mod tests {
     fn submission_resolution_canonicalizes_and_rejects_unsafe_fallbacks() {
         let categories = vec![
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "Movies".to_string(),
                 dest_dir: None,
                 aliases: "film*".to_string(),
             },
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 2,
                 name: "custom/name".to_string(),
                 dest_dir: Some("/trusted/output".to_string()),
@@ -239,6 +253,8 @@ mod tests {
         assert!(resolve_submission_category(&categories, Some("../../outside")).is_err());
 
         let unsafe_without_override = vec![CategoryConfig {
+            seeding: None,
+            torrent_route: false,
             id: 3,
             name: "unsafe/name".to_string(),
             dest_dir: None,

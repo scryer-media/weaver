@@ -8,6 +8,7 @@ use weaver_server_core::{CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobHistoryRow};
 #[test]
 fn history_item_roundtrips_attributes_and_client_request_id() {
     let row = JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 77,
         job_hash: None,
         name: "History Test".to_string(),
@@ -51,6 +52,7 @@ fn history_item_roundtrips_attributes_and_client_request_id() {
 #[test]
 fn history_item_builds_when_release_parse_is_not_media() {
     let row = JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 78,
         job_hash: None,
         name: "ubuntu-24.04.2-live-server-amd64".to_string(),
@@ -80,6 +82,7 @@ fn history_item_builds_when_release_parse_is_not_media() {
 #[test]
 fn history_filter_supports_exact_attribute_matches() {
     let row = JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 88,
         job_hash: None,
         name: "History Match".to_string(),
@@ -134,6 +137,7 @@ fn history_item_has_password_for_a_submitted_or_validated_password() {
         SUBMITTED_PASSWORD_ATTRIBUTE_KEY, VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY,
     };
     let row = |metadata: Vec<(String, String)>| JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 79,
         job_hash: None,
         name: "Password History".to_string(),

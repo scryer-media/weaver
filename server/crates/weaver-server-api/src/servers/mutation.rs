@@ -731,6 +731,8 @@ mod tests {
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
             intermediate_dir: None,

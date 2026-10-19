@@ -18,8 +18,9 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{ByteRange, Effect, Emit, MemberId, NodeId, Object, VolumeIndex, Why};
 
 use super::{GraphError, GraphJob};
+use crate::pipeline::graph::root::Root;
 
-impl GraphJob {
+impl<R: Root> GraphJob<R> {
     // Every recovery object in the tree, with the namespace it lives in,
     // parents first.
     pub(super) fn recovery_objects(&self) -> Vec<(NodeId, NodeId)> {

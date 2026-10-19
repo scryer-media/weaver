@@ -29,8 +29,9 @@ fn egress(binding: EgressBinding) -> EgressInterface {
         name: "Test egress".into(),
         binding,
         enabled: true,
-        max_download_speed: 0,
-        download_quota: Default::default(),
+        download_bps: None,
+        upload_bps: None,
+        quota: Default::default(),
     }
 }
 

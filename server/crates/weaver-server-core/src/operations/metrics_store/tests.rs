@@ -272,6 +272,7 @@ fn rollup_metrics_history_point_deserializes_legacy_metric_array_lengths() {
 
 fn job_info(job_id: u64, status: JobStatus) -> JobInfo {
     JobInfo {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: JobId(job_id),
         job_hash: None,
         name: format!("job-{job_id}"),

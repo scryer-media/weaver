@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::NetworkRefusal as R;
-use crate::servers::DownloadQuotaFault as Quota;
+use super::EgressQuotaFault as Quota;
 use crate::{Refusal, StateError};
 
 // Every refusal with the code and the sentence a client is promised. A code
@@ -64,22 +64,22 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
         (
             R::EgressQuota(Quota::LimitTooLarge),
             "EGRESS_QUOTA_LIMIT_TOO_LARGE",
-            "egress download quota limit exceeds database range",
+            "egress quota limit exceeds database range",
         ),
         (
-            R::EgressQuota(Quota::LimitRequired),
-            "EGRESS_QUOTA_LIMIT_REQUIRED",
-            "enabled egress download quota limit must be greater than zero",
+            R::EgressQuota(Quota::SoftAboveHard),
+            "EGRESS_QUOTA_SOFT_ABOVE_HARD",
+            "egress upload soft cap must not exceed its hard cap",
         ),
         (
             R::EgressQuota(Quota::ResetTimeRange),
             "EGRESS_QUOTA_RESET_TIME_RANGE",
-            "egress download quota reset time must be between 0 and 1439",
+            "egress quota reset time must be between 0 and 1439",
         ),
         (
             R::EgressQuota(Quota::MonthlyResetDayRange),
             "EGRESS_QUOTA_RESET_DAY_RANGE",
-            "egress download quota monthly reset day must be between 1 and 31",
+            "egress quota monthly reset day must be between 1 and 31",
         ),
         (R::EgressGone, "EGRESS_NOT_FOUND", "egress no longer exists"),
         (R::EgressNotFound, "EGRESS_NOT_FOUND", "egress not found"),
@@ -228,6 +228,21 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             R::RouteConsumerGone,
             "ROUTE_CONSUMER_NOT_FOUND",
             "routing consumer no longer exists",
+        ),
+        (
+            R::TorrentRouteLegs,
+            "TORRENT_ROUTE_LEGS",
+            "a torrent route has exactly one leg",
+        ),
+        (
+            R::TorrentRoutePool,
+            "TORRENT_ROUTE_POOL",
+            "a torrent route cannot use a pool",
+        ),
+        (
+            R::BandwidthLimitTooLarge,
+            "BANDWIDTH_LIMIT_TOO_LARGE",
+            "bandwidth limit is too large",
         ),
         (
             R::WireGuardPathConflict {
@@ -434,7 +449,7 @@ fn slot(refusal: &R) -> usize {
         R::EgressSourceAddressNotUnicast => 8,
         R::EgressSpeedLimitTooLarge => 9,
         R::EgressQuota(Quota::LimitTooLarge) => 10,
-        R::EgressQuota(Quota::LimitRequired) => 11,
+        R::EgressQuota(Quota::SoftAboveHard) => 11,
         R::EgressQuota(Quota::ResetTimeRange) => 12,
         R::EgressQuota(Quota::MonthlyResetDayRange) => 13,
         R::EgressGone => 14,
@@ -505,9 +520,12 @@ fn slot(refusal: &R) -> usize {
         R::TestSubjectInRoute => 79,
         R::TestPathCount { .. } => 80,
         R::TestNeedsRoute => 81,
+        R::TorrentRouteLegs => 82,
+        R::TorrentRoutePool => 83,
+        R::BandwidthLimitTooLarge => 84,
     }
 }
-const SLOTS: usize = 82;
+const SLOTS: usize = 85;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {
@@ -636,8 +654,9 @@ fn validators_refuse_with_the_variant_for_what_is_wrong() {
     egress.binding = EgressBinding::SourceAddress {
         address: "192.0.2.1".parse().unwrap(),
     };
-    egress.download_quota.enabled = true;
-    assert_eq!(egress.validate(), Err(R::EgressQuota(Quota::LimitRequired)));
+    egress.quota.upload_soft_bytes = Some(2);
+    egress.quota.upload_hard_bytes = Some(1);
+    assert_eq!(egress.validate(), Err(R::EgressQuota(Quota::SoftAboveHard)));
     egress.name = " ".into();
     assert_eq!(egress.validate(), Err(R::EgressNameLength));
 

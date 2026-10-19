@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub mod caps;
+pub mod limits;
 pub mod model;
 pub mod persistence;
 pub mod queries;
@@ -13,6 +14,7 @@ pub mod schedule_metrics;
 pub mod service;
 
 pub use caps::QuotaWeekday;
+pub use limits::{Direction, QuotaState, RateLimits, effective_rate};
 pub use model::{
     PruneFiles, QuotaTarget, ScheduleAction, ScheduleEntry, ScheduleTrack, SpeedLimitChange,
     SpeedTarget, Weekday,

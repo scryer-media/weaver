@@ -518,6 +518,8 @@ mod tests {
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -541,6 +543,7 @@ mod tests {
 
     fn finalizing_job_info() -> JobInfo {
         JobInfo {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id: JobId(PURGED_JOB_ID),
             job_hash: None,
             name: "Purged Completion".to_string(),

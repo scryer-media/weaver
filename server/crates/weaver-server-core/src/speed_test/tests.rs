@@ -27,6 +27,8 @@ async fn rig() -> Rig {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::open_in_memory().unwrap();
     let config = Arc::new(RwLock::new(Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: dir.path().display().to_string(),
         hardware_profile: None,
         intermediate_dir: None,
@@ -35,7 +37,7 @@ async fn rig() -> Rig {
         servers: vec![],
         categories: vec![],
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         propagation_delay_secs: None,
         cleanup_after_extract: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

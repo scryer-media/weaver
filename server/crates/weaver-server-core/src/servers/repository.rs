@@ -167,6 +167,59 @@ impl Database {
             Ok(())
         })
     }
+
+    // Bytes uploaded over an egress: ever, and when its current quota
+    // period began.
+    pub fn egress_upload_usage(&self, egress_id: u32) -> Result<Option<(u64, u64)>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT upload_lifetime_bytes, upload_quota_baseline_bytes
+                   FROM egress_download_usage
+                  WHERE egress_id = {}",
+                &[SqlArg::I64(i64::from(egress_id))],
+            )
+            .await?
+            .map(|row| {
+                Ok((
+                    u64_from_i64(row.i64("upload_lifetime_bytes")?, "upload lifetime bytes")?,
+                    u64_from_i64(
+                        row.i64("upload_quota_baseline_bytes")?,
+                        "upload quota baseline bytes",
+                    )?,
+                ))
+            })
+            .transpose()
+        })
+    }
+
+    // Store an egress's upload counts on its usage row, which
+    // `upsert_egress_download_usage` writes first.
+    pub fn set_egress_upload_usage(
+        &self,
+        egress_id: u32,
+        lifetime_bytes: u64,
+        baseline_bytes: u64,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let args = [
+            SqlArg::I64(i64_from_u64(lifetime_bytes, "upload lifetime bytes")?),
+            SqlArg::I64(i64_from_u64(baseline_bytes, "upload quota baseline bytes")?),
+            SqlArg::I64(i64::from(egress_id)),
+        ];
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE egress_download_usage
+                    SET upload_lifetime_bytes = {}, upload_quota_baseline_bytes = {}
+                  WHERE egress_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(())
+        })
+    }
 }
 
 fn server_download_usage_from_row(row: SqlRow) -> Result<ServerDownloadUsage, StateError> {

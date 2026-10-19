@@ -393,6 +393,8 @@ mod tests {
 
     fn shared_config(watch_folder: WatchFolderConfig) -> SharedConfig {
         Arc::new(tokio::sync::RwLock::new(Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -401,7 +403,7 @@ mod tests {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder,

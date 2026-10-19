@@ -799,3 +799,74 @@ async fn the_profile_in_force_is_reported_beside_the_choice() {
     assert_eq!(profile["active"], "EFFICIENT");
     assert!(profile["scheduled"].is_null());
 }
+
+#[tokio::test]
+async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
+    let h = TestHarness::new().await;
+    let defaults = h
+        .execute(
+            "{ settings { seeding { ratioGoal } torrent { enabled basePort announcePort upnp encryption maxActiveDownloads maxPeersTotal sessionDir } } }",
+        )
+        .await;
+    assert_no_errors(&defaults);
+    let data = response_data(&defaults);
+    assert!(data["settings"]["seeding"].is_null());
+    assert_eq!(data["settings"]["torrent"]["enabled"], false);
+    assert_eq!(data["settings"]["torrent"]["basePort"], 6881);
+    assert_eq!(data["settings"]["torrent"]["encryption"], "PREFER");
+
+    let saved = h
+        .execute(
+            r#"mutation { updateSettings(input: {
+                seeding: { ratioGoal: 2.0, seedTimeGoalMinutes: 90, mode: ALL, action: REMOVE_WITH_DATA }
+                torrent: { enabled: true, basePort: 51413, announcePort: 40000, encryption: REQUIRE, sessionDir: "/data/session" }
+            }) {
+                seeding { ratioGoal seedTimeGoalMinutes inactiveGoalMinutes mode action maxUploadBps }
+                torrent { enabled basePort announcePort upnp encryption sessionDir }
+            } }"#,
+        )
+        .await;
+    assert_no_errors(&saved);
+    let data = response_data(&saved);
+    let seeding = &data["updateSettings"]["seeding"];
+    assert_eq!(seeding["ratioGoal"], 2.0);
+    assert_eq!(seeding["seedTimeGoalMinutes"], 90);
+    assert!(seeding["inactiveGoalMinutes"].is_null());
+    assert_eq!(seeding["mode"], "ALL");
+    assert_eq!(seeding["action"], "REMOVE_WITH_DATA");
+    let torrent = &data["updateSettings"]["torrent"];
+    assert_eq!(torrent["enabled"], true);
+    assert_eq!(torrent["basePort"], 51413);
+    assert_eq!(torrent["announcePort"], 40000);
+    assert_eq!(torrent["upnp"], true);
+    assert_eq!(torrent["encryption"], "REQUIRE");
+    assert_eq!(torrent["sessionDir"], "/data/session");
+
+    let stored = h.db.load_config().unwrap();
+    assert_eq!(stored.seeding, h.config.read().await.seeding);
+    assert_eq!(stored.torrent, h.config.read().await.torrent);
+    assert_eq!(stored.torrent.base_port, 51413);
+
+    // Leaving a field out keeps it; null clears it.
+    let cleared = h
+        .execute(
+            r#"mutation { updateSettings(input: { seeding: null, torrent: { announcePort: null } }) {
+                seeding { ratioGoal } torrent { enabled announcePort }
+            } }"#,
+        )
+        .await;
+    assert_no_errors(&cleared);
+    let data = response_data(&cleared);
+    assert!(data["updateSettings"]["seeding"].is_null());
+    assert_eq!(data["updateSettings"]["torrent"]["enabled"], true);
+    assert!(data["updateSettings"]["torrent"]["announcePort"].is_null());
+    let stored = h.db.load_config().unwrap();
+    assert_eq!(stored.seeding, None);
+    assert_eq!(stored.torrent.announce_port, None);
+
+    let refused = h
+        .execute(r#"mutation { updateSettings(input: { seeding: { ratioGoal: -1.0 } }) { seeding { ratioGoal } } }"#)
+        .await;
+    assert!(!refused.errors.is_empty());
+    assert_eq!(h.db.load_config().unwrap().seeding, None);
+}

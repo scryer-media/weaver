@@ -30,6 +30,8 @@ async fn idle_pipeline(
     let complete_dir = temp_dir.path().join("complete");
     let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
     let config: SharedConfig = Arc::new(RwLock::new(Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: data_dir.display().to_string(),
         hardware_profile: None,
         intermediate_dir: Some(intermediate_dir.display().to_string()),
@@ -38,7 +40,7 @@ async fn idle_pipeline(
         servers: vec![],
         categories: vec![],
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

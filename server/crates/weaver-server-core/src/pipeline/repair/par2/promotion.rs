@@ -1416,6 +1416,7 @@ impl Pipeline {
                 download_state = crate::jobs::model::DownloadState::Queued;
             }
             list.push(JobInfo {
+                protocol: crate::jobs::Protocol::Nzb,
                 job_id: state.job_id,
                 job_hash: Some(state.job_hash),
                 name: state.spec.name.clone(),

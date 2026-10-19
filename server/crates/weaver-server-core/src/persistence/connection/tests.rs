@@ -84,6 +84,7 @@ fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
 
 fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
     JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: job_id.0,
         job_hash: Some(vec![0xA5; 32]),
         name: format!("postgres-{}", job_id.0),
@@ -643,6 +644,10 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
             | ("active_volume_status", "deleted")
             | ("rss_feeds", "enabled")
             | ("rss_rules", "enabled")
+            | ("categories", "torrent_route")
+            | ("torrents", "private")
+            | ("torrents", "forced")
+            | ("torrent_files", "selected")
     )
 }
 
@@ -2597,6 +2602,8 @@ async fn postgres_runtime_smoke_when_configured() {
     );
 
     let config = Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: "/tmp/weaver-pg".to_string(),
         hardware_profile: None,
         intermediate_dir: Some("/tmp/weaver-pg/intermediate".to_string()),
@@ -2633,6 +2640,8 @@ async fn postgres_runtime_smoke_when_configured() {
             tls_ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
         }],
         categories: vec![CategoryConfig {
+            seeding: None,
+            torrent_route: false,
             id: 3,
             name: "TV".to_string(),
             dest_dir: Some("/media/tv".to_string()),
@@ -2643,7 +2652,7 @@ async fn postgres_runtime_smoke_when_configured() {
             base_delay_secs: Some(4.0),
             multiplier: Some(1.5),
         }),
-        max_download_speed: Some(12_345),
+        bandwidth: crate::proxies::Bandwidth { download_bps: Some(12_345), upload_bps: None },
         cleanup_after_extract: Some(false),
         propagation_delay_secs: Some(0),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -2659,7 +2668,7 @@ async fn postgres_runtime_smoke_when_configured() {
     assert_eq!(loaded_config.data_dir, config.data_dir);
     assert_eq!(loaded_config.intermediate_dir, config.intermediate_dir);
     assert_eq!(loaded_config.complete_dir, config.complete_dir);
-    assert_eq!(loaded_config.max_download_speed, config.max_download_speed);
+    assert_eq!(loaded_config.bandwidth, config.bandwidth);
     assert_eq!(loaded_config.cleanup_after_extract, Some(false));
     assert_eq!(loaded_config.servers.len(), 1);
     assert_eq!(loaded_config.servers[0].host, "news.example.com");
@@ -2847,6 +2856,7 @@ async fn postgres_runtime_smoke_when_configured() {
     db.archive_job(
         job_id,
         &JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: job_id.0,
             job_hash: Some(vec![0xA5; 32]),
             name: "postgres-smoke".to_string(),
@@ -3117,6 +3127,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
 
     let job_id = 4242;
     db.insert_job_history(&crate::history::JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: "postgres roundtrip".into(),

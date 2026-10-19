@@ -196,7 +196,8 @@ mod tests {
         let configured = ScheduleAction::SpeedLimit {
             limits: vec![SpeedLimitChange {
                 target: SpeedTarget::Global,
-                bytes_per_sec: 9000,
+                bytes_per_sec: Some(9000),
+                upload_bytes_per_sec: None,
             }],
         };
         assert_eq!(

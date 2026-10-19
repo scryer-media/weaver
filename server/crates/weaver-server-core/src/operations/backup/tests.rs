@@ -28,6 +28,8 @@ async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
 
 fn sample_config() -> Config {
     Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: "/old/data".into(),
         hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
@@ -60,6 +62,8 @@ fn sample_config() -> Config {
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
+            seeding: None,
+            torrent_route: false,
             id: 1,
             name: "tv".into(),
             dest_dir: Some("/old/data/complete/tv".into()),
@@ -70,7 +74,7 @@ fn sample_config() -> Config {
             base_delay_secs: Some(1.0),
             multiplier: Some(2.0),
         }),
-        max_download_speed: Some(42),
+        bandwidth: crate::proxies::Bandwidth { download_bps: Some(42), upload_bps: None },
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -122,6 +126,7 @@ async fn export_and_import_stable_state_roundtrip() {
     src.insert_api_key("integration", &hash, "integration")
         .unwrap();
     src.insert_job_history(&JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 77,
         job_hash: None,
         name: "test".into(),
@@ -272,6 +277,7 @@ fn restore_target_is_not_pristine_with_history() {
     let db = Database::open_in_memory().unwrap();
     assert!(db.restore_target_is_pristine().unwrap());
     db.insert_job_history(&JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 1,
         job_hash: None,
         name: "x".into(),

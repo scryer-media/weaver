@@ -28,17 +28,8 @@ impl SettingsQuery {
     async fn settings(&self, ctx: &Context<'_>) -> Result<GeneralSettings> {
         let config = ctx.data::<SharedConfig>()?;
         Ok(
-            with_timed_config_read(config, "settings.query.settings", |cfg| GeneralSettings {
-                data_dir: cfg.data_dir.clone(),
-                intermediate_dir: cfg.intermediate_dir(),
-                complete_dir: cfg.complete_dir(),
-                cleanup_after_extract: cfg.cleanup_after_extract(),
-                max_download_speed: cfg.max_download_speed.unwrap_or(0),
-                propagation_delay_secs: cfg.propagation_delay_secs(),
-                max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
-                enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
-                watch_folder: (&cfg.watch_folder).into(),
-                duplicate_policy: cfg.duplicate_policy.into(),
+            with_timed_config_read(config, "settings.query.settings", |cfg| {
+                GeneralSettings::from(cfg)
             })
             .await,
         )

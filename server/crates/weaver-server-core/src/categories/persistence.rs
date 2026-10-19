@@ -2,24 +2,22 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
-use crate::categories::{CategoryConfig, record::CategoryRecord};
+use crate::categories::CategoryConfig;
+use crate::categories::record::{CATEGORY_COLUMNS, CategoryRecord};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 impl Database {
     pub fn insert_category(&self, category: &CategoryConfig) -> Result<(), StateError> {
         let datastore = self.datastore();
-        let record = CategoryRecord::from_config(category);
+        let args = CategoryRecord::from_config(category).into_args()?;
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.read_exec(),
-                "INSERT INTO categories (id, name, dest_dir, aliases) VALUES ({}, {}, {}, {})",
-                &[
-                    SqlArg::I64(i64::from(record.id)),
-                    SqlArg::Text(record.name),
-                    SqlArg::OptText(record.dest_dir),
-                    SqlArg::Text(record.aliases),
-                ],
+                &format!(
+                    "INSERT INTO categories ({CATEGORY_COLUMNS}) VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                ),
+                &args,
             )
             .await?;
             Ok(())
@@ -28,17 +26,16 @@ impl Database {
 
     pub fn update_category(&self, category: &CategoryConfig) -> Result<(), StateError> {
         let datastore = self.datastore();
-        let record = CategoryRecord::from_config(category);
+        // The id binds first in `into_args`, last here.
+        let mut args = CategoryRecord::from_config(category).into_args()?;
+        args.rotate_left(1);
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.read_exec(),
-                "UPDATE categories SET name = {}, dest_dir = {}, aliases = {} WHERE id = {}",
-                &[
-                    SqlArg::Text(record.name),
-                    SqlArg::OptText(record.dest_dir),
-                    SqlArg::Text(record.aliases),
-                    SqlArg::I64(i64::from(record.id)),
-                ],
+                "UPDATE categories
+                    SET name = {}, dest_dir = {}, aliases = {}, seeding = {}, torrent_route = {}
+                  WHERE id = {}",
+                &args,
             )
             .await?;
             Ok(())

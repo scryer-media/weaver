@@ -387,10 +387,10 @@ fn metered_egress(limit_bytes: u64) -> EgressInterface {
             address: "127.0.0.1".parse().unwrap(),
         },
         enabled: true,
-        max_download_speed: 0,
-        download_quota: crate::servers::ServerDownloadQuotaConfig {
-            enabled: true,
-            limit_bytes,
+        download_bps: None,
+        upload_bps: None,
+        quota: crate::proxies::EgressQuota {
+            download_bytes: Some(limit_bytes),
             period: crate::servers::ServerDownloadQuotaPeriod::OneTime,
             ..Default::default()
         },
@@ -478,7 +478,7 @@ async fn a_used_up_egress_quota_takes_its_leg_down_and_its_share_moves_to_the_ot
 
     // A larger allowance gives the leg back.
     let mut raised = metered.clone();
-    raised.download_quota.limit_bytes = 10_000_000;
+    raised.quota.download_bytes = Some(10_000_000);
     policy.reconfigure_egresses(&[raised]).unwrap();
     runtime.refresh_health();
     assert!(runtime.quota_blocked_egresses().is_empty());
@@ -514,7 +514,7 @@ async fn egress_quota_usage_survives_a_network_recompile_and_a_rebuilt_runtime()
     // An edit to the egress recompiles the network mid-window.
     let mut edited = metered.clone();
     edited.name = "Metered link, renamed".into();
-    edited.max_download_speed = 4_096;
+    edited.download_bps = Some(4_096);
     db.update_egress_interface(&edited).unwrap();
     runtime.reload().await.unwrap();
     let after_reload = policy.egress_snapshot(metered.id).unwrap();

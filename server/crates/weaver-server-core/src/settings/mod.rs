@@ -13,6 +13,8 @@ pub mod service;
 
 pub use model::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
-    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SharedConfig,
+    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SeedingAction,
+    SeedingGoalMode, SeedingPolicy, SharedConfig, TorrentConfig, TorrentEncryption,
+    resolve_seeding_policy,
 };
 pub use service::HARDWARE_PROFILE_SETTING;

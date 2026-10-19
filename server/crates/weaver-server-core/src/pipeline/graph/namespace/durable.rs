@@ -78,9 +78,32 @@ impl NamespaceWriter {
         range: ByteRange,
         into: &mut Vec<u8>,
     ) -> bool {
+        self.read_root(tree, member, range, false, into)
+    }
+
+    // The posted bytes of a root member's range as they are in hand now,
+    // held bytes included, as a peer reading them back is served.
+    pub(crate) fn read_in_hand(
+        &self,
+        tree: &Tree,
+        member: MemberId,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.read_root(tree, member, range, true, into)
+    }
+
+    fn read_root(
+        &self,
+        tree: &Tree,
+        member: MemberId,
+        range: ByteRange,
+        held: bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
         let start = into.len();
         let mut access = self.access(tree, NodeId::ROOT);
-        access.held = false;
+        access.held = held;
         let read = access.read_at(NodeId::ROOT, member, range, into);
         if !read {
             into.truncate(start);

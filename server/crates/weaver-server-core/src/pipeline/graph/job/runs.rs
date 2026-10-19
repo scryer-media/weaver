@@ -15,8 +15,9 @@ use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
 use crate::pipeline::graph::namespace::WriteError;
+use crate::pipeline::graph::root::Root;
 
-impl GraphJob {
+impl<R: Root> GraphJob<R> {
     // What a run said. A stopped run's words carry an old generation and
     // are not heard.
     pub(crate) fn run_said(&mut self, said: Said, limit: usize) -> Result<(), GraphError> {

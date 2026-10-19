@@ -1147,6 +1147,7 @@ mod tests {
 
     fn history(db: &Database, job_id: u64, name: &str) {
         db.insert_job_history(&crate::JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id,
             job_hash: None,
             name: name.into(),

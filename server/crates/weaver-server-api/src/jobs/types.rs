@@ -96,6 +96,10 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
             weaver_server_core::JobStatus::Partial
             | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
+            weaver_server_core::JobStatus::FetchingMetadata
+            | weaver_server_core::JobStatus::Stalled => Self::Downloading,
+            weaver_server_core::JobStatus::CheckingFiles => Self::Verifying,
+            weaver_server_core::JobStatus::Seeding => Self::Completed,
         }
     }
 }
@@ -228,9 +232,29 @@ impl From<weaver_server_core::JobPhaseProgress> for QueuePhaseProgress {
     }
 }
 
+// How a job's content is fetched.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Enum)]
+#[graphql(name = "Protocol")]
+pub enum ProtocolGql {
+    #[default]
+    Nzb,
+    Torrent,
+}
+
+impl From<weaver_server_core::Protocol> for ProtocolGql {
+    fn from(value: weaver_server_core::Protocol) -> Self {
+        match value {
+            weaver_server_core::Protocol::Nzb => Self::Nzb,
+            weaver_server_core::Protocol::Torrent => Self::Torrent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct QueueItem {
     pub id: u64,
+    #[serde(default)]
+    pub protocol: ProtocolGql,
     pub job_hash: Option<String>,
     pub name: String,
     pub display_title: String,
@@ -1052,6 +1076,10 @@ pub enum JobStatusGql {
     Complete,
     Failed,
     Paused,
+    FetchingMetadata,
+    CheckingFiles,
+    Seeding,
+    Stalled,
 }
 
 impl From<&weaver_server_core::JobStatus> for JobStatusGql {
@@ -1073,6 +1101,10 @@ impl From<&weaver_server_core::JobStatus> for JobStatusGql {
             weaver_server_core::JobStatus::Partial
             | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
+            weaver_server_core::JobStatus::FetchingMetadata => Self::FetchingMetadata,
+            weaver_server_core::JobStatus::CheckingFiles => Self::CheckingFiles,
+            weaver_server_core::JobStatus::Seeding => Self::Seeding,
+            weaver_server_core::JobStatus::Stalled => Self::Stalled,
         }
     }
 }
@@ -1224,6 +1256,7 @@ fn queue_item_from_display(
 ) -> QueueItem {
     QueueItem {
         id: info.job_id.0,
+        protocol: info.protocol.into(),
         job_hash: info.job_hash.as_ref().map(hex::encode),
         name: info.name.clone(),
         display_title,
@@ -1276,6 +1309,7 @@ pub fn queue_item_from_submission(
     });
     QueueItem {
         id: submitted.job_id.0,
+        protocol: ProtocolGql::Nzb,
         job_hash: Some(hex::encode(submitted.job_hash)),
         name: submitted.summary.name.clone(),
         display_title: display.display_title,

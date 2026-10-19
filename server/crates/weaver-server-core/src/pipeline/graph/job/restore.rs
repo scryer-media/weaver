@@ -7,10 +7,10 @@
 //
 //   2. every node is rebuilt from its facts, and each node that was offered
 //      a candidate is offered it again, so its keys are derived anew
-//   3. every article the root had in hand is read back through the inverse
-//      map and checked against the decoder's checksums; one that reads but
+//   3. every unit the root had in hand is read back through the inverse
+//      map and checked against what the root was handed; one that reads but
 //      does not match is damaged, one that does not read is fetched again
-//   4. each article read is delivered down the tree before the next is
+//   4. each unit read is delivered down the tree before the next is
 //      read, as it first came, so every object is where it was and a stream
 //      replays from its start
 //   5. the engines' runs are asked again for their slots; holds were in
@@ -30,8 +30,8 @@ use super::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::checkpoint::{Pending, Snapshot};
 use crate::pipeline::graph::engine::Runs;
 use crate::pipeline::graph::namespace::{Arrival, NamespaceWriter, WriteError};
-use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::RootFactsError;
+use crate::pipeline::graph::root::{ArticleRoot, Root};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RestoreFailure {
@@ -47,11 +47,11 @@ pub(crate) enum RestoreFailure {
     Step(#[from] GraphError),
 }
 
-pub(crate) struct Restored {
-    pub(crate) job: GraphJob,
-    // Articles this run does not fetch: read back, or lost for good.
+pub(crate) struct Restored<R = ArticleRoot> {
+    pub(crate) job: GraphJob<R>,
+    // Units this run does not fetch: read back, or lost for good.
     pub(crate) settled: Vec<(VolumeIndex, u32)>,
-    // Articles the checkpoint had that were not on disk.
+    // Units the checkpoint had that were not on disk.
     pub(crate) refetched: Vec<(VolumeIndex, u32)>,
 }
 
@@ -69,10 +69,24 @@ impl GraphJob {
         storage: Storage,
         limit: usize,
     ) -> Result<Restored, RestoreFailure> {
+        let root = ArticleRoot::restore(files, &snapshot.root.read::<ArticleRoot>()?)?;
+        Self::restore_with(snapshot, root, scope, storage, limit)
+    }
+}
+
+impl<R: Root> GraphJob<R> {
+    // The job its checkpoint describes, over a root already restored from
+    // the facts it kept.
+    pub(crate) fn restore_with(
+        snapshot: &Snapshot,
+        root: R,
+        scope: u64,
+        storage: Storage,
+        limit: usize,
+    ) -> Result<Restored<R>, RestoreFailure> {
         let mut tree = Tree::rebuild(&snapshot.tree, &weaver_objects::Objects)?;
         tree.nest_at_most(storage.nesting);
-        let root = ArticleRoot::restore(files, &snapshot.root)?;
-        same_post(&tree, files)?;
+        same_volumes(&tree, root.volume_count())?;
         let runs = Runs::new(
             scope,
             storage.slots,
@@ -103,7 +117,7 @@ impl GraphJob {
         unusable.sort_unstable();
         writer.restore_recovery_facts(
             unusable.into_iter().map(|(_, found)| found).collect(),
-            snapshot.root.read_backs,
+            snapshot.job.read_backs,
         );
         for kept in &snapshot.kept {
             writer.restore_kept(kept)?;
@@ -115,7 +129,7 @@ impl GraphJob {
             writer,
             runs,
             passwords: Passwords::new(storage.passwords),
-            reported: snapshot.root.reported,
+            reported: snapshot.job.reported,
             ruled_at: BTreeMap::new(),
             pending: Pending::default(),
         };
@@ -124,12 +138,12 @@ impl GraphJob {
         }
         let refetched = job.read_back()?;
         job.mark_damage()?;
-        for volume in 0..job.root.map.volume_count() {
+        for volume in 0..job.root.volume_count() {
             job.after_member(VolumeIndex(volume as u32))?;
         }
         job.step_runs(Vec::new(), limit)?;
         Ok(Restored {
-            settled: job.root.map.settled(),
+            settled: job.root.settled(),
             refetched,
             job,
         })
@@ -163,10 +177,10 @@ impl GraphJob {
     fn read_back(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
         let mut missing = Vec::new();
         let mut bytes = Vec::new();
-        for index in 0..self.root.map.volume_count() {
+        for index in 0..self.root.volume_count() {
             let volume = VolumeIndex(index as u32);
             let member = MemberId(volume.0);
-            for (ordinal, range) in self.root.map.arrived_ranges(volume) {
+            for (ordinal, range) in self.root.arrived_ranges(volume) {
                 bytes.clear();
                 if !self
                     .writer
@@ -182,14 +196,13 @@ impl GraphJob {
         }
         missing.extend(
             self.root
-                .map
                 .unseen()
                 .into_iter()
                 .map(|(volume, ordinal)| (volume, ordinal, None)),
         );
         let mut refetched = Vec::with_capacity(missing.len());
         for (volume, ordinal, range) in missing {
-            self.root.map.unarrive(volume, ordinal);
+            self.root.unarrive(volume, ordinal);
             if let Some(found) = self
                 .tree
                 .namespace_mut(NodeId::ROOT)
@@ -245,9 +258,9 @@ impl GraphJob {
     pub(crate) fn in_memory(&self) -> Vec<(u32, u32)> {
         let mut out = Vec::new();
         let mut bytes = Vec::new();
-        for index in 0..self.root.map.volume_count() {
+        for index in 0..self.root.volume_count() {
             let volume = VolumeIndex(index as u32);
-            for (ordinal, range) in self.root.map.arrived_ranges(volume) {
+            for (ordinal, range) in self.root.arrived_ranges(volume) {
                 bytes.clear();
                 if !self
                     .writer
@@ -259,7 +272,6 @@ impl GraphJob {
         }
         out.extend(
             self.root
-                .map
                 .unseen()
                 .into_iter()
                 .map(|(volume, ordinal)| (volume.0, ordinal)),
@@ -289,16 +301,17 @@ impl GraphJob {
     }
 }
 
-// A root member is the post's file of its number: its identity is that
+// A root member is the root's volume of its number: its identity is that
 // index, never its name, which a recovery set's rename changes. That the
-// post is the one checkpointed, by its names, is the root's facts' check.
-fn same_post(tree: &Tree, files: &[RootFile]) -> Result<(), RestoreFailure> {
+// volumes are the ones checkpointed, by their names, is the root's facts'
+// check.
+fn same_volumes(tree: &Tree, volumes: usize) -> Result<(), RestoreFailure> {
     let Some(namespace) = tree.namespace(NodeId::ROOT) else {
         return Err(RestoreFailure::Post(0));
     };
     match namespace
         .members()
-        .find(|member| member.id.0 as usize >= files.len())
+        .find(|member| member.id.0 as usize >= volumes)
     {
         Some(member) => Err(RestoreFailure::Post(member.id.0)),
         None => Ok(()),

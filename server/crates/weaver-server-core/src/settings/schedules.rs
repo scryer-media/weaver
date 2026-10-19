@@ -177,6 +177,9 @@ impl Holders {
                 ..
             } if !self.egresses.contains(id) => missing("egress", *id),
             ScheduleAction::SpeedLimit { limits } => {
+                if let Some(fault) = limits.iter().find_map(|limit| limit.fault()) {
+                    return Err(StateError::Database(fault.into()));
+                }
                 match limits.iter().find(|limit| !self.has(limit.target)) {
                     Some(limit) => match limit.target {
                         SpeedTarget::Egress(id) => missing("egress", id),

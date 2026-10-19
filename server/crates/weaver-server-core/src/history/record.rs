@@ -26,6 +26,7 @@ pub struct JobHistoryRow {
     // `None` for a job that attributed nothing, and for every job finished
     // before this was recorded.
     pub server_attribution: Option<String>,
+    pub protocol: crate::jobs::Protocol,
 }
 
 #[derive(Debug, Clone)]

@@ -2,7 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
-use crate::categories::{CategoryConfig, record::CategoryRecord};
+use crate::categories::CategoryConfig;
+use crate::categories::record::{CATEGORY_COLUMNS, CategoryRecord};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::SqlRuntime;
 
@@ -12,21 +13,13 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT id, name, dest_dir, aliases FROM categories ORDER BY name",
+                &format!("SELECT {CATEGORY_COLUMNS} FROM categories ORDER BY name"),
                 &[],
             )
             .await?;
 
-            rows.into_iter()
-                .map(|row| {
-                    Ok(CategoryRecord {
-                        id: row.i32("id")? as u32,
-                        name: row.text("name")?,
-                        dest_dir: row.opt_text("dest_dir")?,
-                        aliases: row.text("aliases")?,
-                    }
-                    .into_config())
-                })
+            rows.iter()
+                .map(|row| Ok(CategoryRecord::from_row(row)?.into_config()))
                 .collect()
         })
     }

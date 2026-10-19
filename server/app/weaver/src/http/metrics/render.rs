@@ -1692,6 +1692,10 @@ pub(crate) fn job_status_label(status: &JobStatus) -> &'static str {
         JobStatus::Partial => "partial",
         JobStatus::Failed { .. } => "failed",
         JobStatus::Paused => "paused",
+        JobStatus::FetchingMetadata => "fetching_metadata",
+        JobStatus::CheckingFiles => "checking_files",
+        JobStatus::Seeding => "seeding",
+        JobStatus::Stalled => "stalled",
     }
 }
 

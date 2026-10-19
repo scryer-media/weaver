@@ -126,6 +126,8 @@ mod tests {
     #[test]
     fn resolve_reads_the_config_table() {
         let mut config = Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver-direct-unpack".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -134,7 +136,7 @@ mod tests {
             servers: Vec::new(),
             categories: Vec::new(),
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),

@@ -110,6 +110,7 @@ pub async fn recover_server_state(
                 runtime_lanes_from_status_snapshot(&status);
             archive_unfinished_terminal_job(db, job_id, &recovered, &name, &status);
             initial_history.push(JobInfo {
+                protocol: crate::jobs::Protocol::Nzb,
                 job_id,
                 job_hash: Some(recovered.nzb_hash),
                 name,
@@ -270,6 +271,7 @@ pub async fn recover_server_state(
                 let (download_state, post_state, run_state) =
                     runtime_lanes_from_status_snapshot(&status);
                 initial_history.push(JobInfo {
+                    protocol: row.protocol,
                     job_id,
                     job_hash: row.job_hash.as_ref().and_then(|value| {
                         (value.len() == 32).then(|| {
@@ -414,6 +416,7 @@ fn archive_unfinished_terminal_job(
     };
     let completed_at = (crate::jobs::epoch_ms_now() / 1_000.0) as i64;
     let row = crate::JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: job_id.0,
         job_hash: Some(recovered.nzb_hash.to_vec()),
         name: name.to_string(),
@@ -596,6 +599,7 @@ mod tests {
         );
 
         db.insert_job_history(&JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: 2,
             job_hash: None,
             name: "failed-history".to_string(),
@@ -753,6 +757,7 @@ mod tests {
         db.set_active_job_status(JobId(12), "failed", Some("boom"))
             .unwrap();
         db.insert_job_history(&JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: 12,
             job_hash: None,
             name: "already-archived".to_string(),

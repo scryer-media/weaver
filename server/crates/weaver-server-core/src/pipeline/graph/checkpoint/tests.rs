@@ -9,11 +9,59 @@ use weaver_graph::{
 };
 
 use super::{CheckpointError, FileState, Snapshot, rows, snapshot};
+use crate::jobs::graph_checkpoint::GraphCheckpoint;
 use crate::pipeline::graph::envelope::durable::KeptRecord;
+use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::{
-    ArticleFacts, ClassFacts, RootFacts, VolumeFacts, decode, encode,
+    ArticleFacts, ClassFacts, JobFacts, PostFacts, RootBlob, RootFactsError, RootRow, VolumeFacts,
+    decode, encode,
 };
 use crate::pipeline::graph::root::phase::RootPhase;
+use crate::pipeline::graph::root::pieces::PieceRoot;
+
+// The root row of version 2, as builds before roots had kinds wrote it:
+// the article root's facts with the job's beside them.
+#[derive(serde::Serialize)]
+struct Version2<'a> {
+    next_node: u32,
+    posted: &'a [String],
+    volumes: &'a [VolumeFacts],
+    read_backs: u64,
+    reported: Option<RootPhase>,
+}
+
+// Rewrite an article job's root row as a build before roots had kinds
+// wrote it.
+pub(crate) fn as_version_2(checkpoint: &mut GraphCheckpoint) {
+    let row = checkpoint
+        .nodes
+        .iter_mut()
+        .find(|row| row.node == 0)
+        .expect("a root row");
+    let now = decode(RootRow::VERSION, &row.facts).unwrap();
+    let post = now.root.read::<ArticleRoot>().unwrap();
+    row.facts_version = 2;
+    row.facts = rmp_serde::to_vec(&Version2 {
+        next_node: now.next_node,
+        posted: &post.posted,
+        volumes: &post.volumes,
+        read_backs: now.job.read_backs,
+        reported: now.job.reported,
+    })
+    .unwrap();
+}
+
+fn article_blob(facts: PostFacts) -> RootBlob {
+    RootBlob {
+        root: "articles".to_owned(),
+        version: PostFacts::VERSION,
+        bytes: rmp_serde::to_vec(&facts).unwrap(),
+    }
+}
+
+fn post(blob: &RootBlob) -> PostFacts {
+    blob.read::<ArticleRoot>().unwrap()
+}
 
 fn member(id: u32, name: &str) -> MemberRecord {
     MemberRecord {
@@ -104,8 +152,11 @@ fn full() -> Snapshot {
             nodes: vec![root, store, retired],
             next_node: 3,
         },
-        root: RootFacts {
-            next_node: 3,
+        job: JobFacts {
+            read_backs: 7,
+            reported: Some(RootPhase::Done),
+        },
+        root: article_blob(PostFacts {
             posted: vec!["alpha.part1.rar".to_owned(), "alpha.par2".to_owned()],
             volumes: vec![
                 VolumeFacts {
@@ -126,9 +177,7 @@ fn full() -> Snapshot {
                     raised: vec![(0, ClassFacts::Recovery)],
                 },
             ],
-            read_backs: 7,
-            reported: Some(RootPhase::Done),
-        },
+        }),
         files: BTreeMap::from([
             (
                 (NodeId(1), MemberId(0)),
@@ -191,10 +240,30 @@ fn a_snapshot_comes_back_from_its_rows() {
 }
 
 #[test]
-fn the_phase_last_reported_comes_back_with_the_root() {
+fn the_phase_last_reported_comes_back_with_the_job() {
     let taken = full();
-    let facts = decode(RootFacts::VERSION, &encode(&taken.root)).unwrap();
-    assert_eq!(facts.reported, Some(RootPhase::Done));
+    let row = decode(
+        RootRow::VERSION,
+        &encode(&RootRow {
+            next_node: taken.tree.next_node,
+            job: taken.job,
+            root: taken.root.clone(),
+        }),
+    )
+    .unwrap();
+    assert_eq!(row.job.reported, Some(RootPhase::Done));
+    assert_eq!(row.root, taken.root);
+}
+
+// An article checkpoint a build before roots had kinds wrote comes back as
+// the same snapshot: the article root's facts, and the job's.
+#[test]
+fn an_article_checkpoint_from_before_roots_had_kinds_comes_back() {
+    let taken = full();
+    let mut checkpoint = rows(&taken);
+    as_version_2(&mut checkpoint);
+    assert_eq!(checkpoint.nodes[0].facts_version, 2);
+    assert_eq!(snapshot(&checkpoint), Ok(taken));
 }
 
 // Root facts written before the reported phase was kept: the rest reads as
@@ -208,22 +277,40 @@ fn root_facts_without_a_reported_phase_restore_none() {
         volumes: &'a [VolumeFacts],
         read_backs: u64,
     }
-    let taken = full().root;
+    let taken = full();
+    let facts = post(&taken.root);
     let before = rmp_serde::to_vec(&Before {
-        next_node: taken.next_node,
-        posted: &taken.posted,
-        volumes: &taken.volumes,
-        read_backs: taken.read_backs,
+        next_node: taken.tree.next_node,
+        posted: &facts.posted,
+        volumes: &facts.volumes,
+        read_backs: taken.job.read_backs,
     })
     .unwrap();
-    let facts = decode(RootFacts::VERSION, &before).unwrap();
+    let row = decode(2, &before).unwrap();
     assert_eq!(
-        facts,
-        RootFacts {
+        row.job,
+        JobFacts {
+            read_backs: 7,
             reported: None,
-            ..taken
         }
     );
+    assert_eq!(post(&row.root), facts);
+}
+
+#[test]
+fn facts_are_read_only_into_the_root_that_wrote_them() {
+    let taken = full();
+    assert_eq!(
+        taken.root.read::<PieceRoot>(),
+        Err(RootFactsError::Mismatch("another kind of root"))
+    );
+    let mut newer = taken.root.clone();
+    newer.version += 1;
+    assert_eq!(
+        newer.read::<ArticleRoot>(),
+        Err(RootFactsError::Version(newer.version))
+    );
+    assert_eq!(decode(1, &[]), Err(RootFactsError::Version(1)));
 }
 
 #[test]

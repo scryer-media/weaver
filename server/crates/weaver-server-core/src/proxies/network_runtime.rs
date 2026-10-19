@@ -355,6 +355,14 @@ impl NetworkRuntime {
     ) -> Option<crate::servers::transfer_policy::ServerDownloadQuotaSnapshot> {
         self.quota_policy.as_ref()?.egress_snapshot(egress_id)
     }
+    // An egress's usage in both directions, when this runtime enforces
+    // download policies.
+    pub fn egress_usage(
+        &self,
+        egress_id: u32,
+    ) -> Option<crate::servers::transfer_policy::EgressQuotaUsage> {
+        self.quota_policy.as_ref()?.egress_usage(egress_id)
+    }
     pub fn interfaces(&self) -> InterfaceSnapshot {
         self.interfaces.snapshot()
     }
@@ -1180,7 +1188,7 @@ impl Drop for NetworkRuntime {
     }
 }
 
-// Speed limits alone, for a runtime without download policies.
+// Download rates alone, for a runtime without download policies.
 fn configure_egress_rates(
     controls: &weaver_nntp::transfer::ServerTransferRegistry,
     configuration: &Configuration,
@@ -1188,10 +1196,7 @@ fn configure_egress_rates(
     for egress in configuration.egresses.values() {
         controls.configure(
             weaver_nntp::transfer::StableServerId(egress.id),
-            weaver_nntp::transfer::ServerTransferConfig {
-                rate_bytes_per_sec: egress.max_download_speed,
-                quota: None,
-            },
+            crate::servers::transfer_policy::rate_config(egress.download_bps, None, 1),
         );
     }
 }

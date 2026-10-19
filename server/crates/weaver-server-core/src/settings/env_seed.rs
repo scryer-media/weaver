@@ -221,11 +221,16 @@ pub fn apply_core_seed(
         seeded += 1;
     }
 
-    if config.max_download_speed.is_none()
-        && let Some(value) = seed.core.max_download_speed
+    // A seeded limit of 0 is no limit, as the setting it seeds always was.
+    if config.bandwidth.download_bps.is_none()
+        && let Some(value) = seed.core.max_download_speed.filter(|&value| value > 0)
     {
-        db.set_setting("max_download_speed", &value.to_string())?;
-        config.max_download_speed = Some(value);
+        let bandwidth = crate::proxies::Bandwidth {
+            download_bps: Some(value),
+            ..config.bandwidth
+        };
+        db.set_network_bandwidth(&bandwidth)?;
+        config.bandwidth = bandwidth;
         seeded += 1;
     }
 
@@ -868,16 +873,13 @@ mod tests {
             Some("/downloads/incomplete")
         );
         assert_eq!(config.complete_dir.as_deref(), Some("/downloads/complete"));
-        assert_eq!(config.max_download_speed, Some(1000));
+        assert_eq!(config.bandwidth.download_bps, Some(1000));
         assert_eq!(config.cleanup_after_extract, Some(false));
         assert_eq!(
             db.get_setting("data_dir").unwrap().as_deref(),
             Some("/config")
         );
-        assert_eq!(
-            db.get_setting("max_download_speed").unwrap().as_deref(),
-            Some("1000")
-        );
+        assert_eq!(db.network_bandwidth().unwrap().download_bps, Some(1000));
     }
 
     #[test]
@@ -924,7 +926,11 @@ mod tests {
     fn preserves_existing_core_settings() {
         let db = Database::open_in_memory().unwrap();
         db.set_setting("data_dir", "/db").unwrap();
-        db.set_setting("max_download_speed", "2000").unwrap();
+        db.set_network_bandwidth(&crate::proxies::Bandwidth {
+            download_bps: Some(2000),
+            upload_bps: None,
+        })
+        .unwrap();
         let mut config = db.load_config().unwrap();
         let seed = parse(&[
             ("WEAVER_DATA_DIR", "/env"),
@@ -936,7 +942,7 @@ mod tests {
 
         assert_eq!(seeded, 0);
         assert_eq!(config.data_dir, "/db");
-        assert_eq!(config.max_download_speed, Some(2000));
+        assert_eq!(config.bandwidth.download_bps, Some(2000));
         assert_eq!(db.get_setting("data_dir").unwrap().as_deref(), Some("/db"));
     }
 
@@ -1134,6 +1140,8 @@ mod tests {
     fn preserves_existing_servers() {
         let db = Database::open_in_memory().unwrap();
         let existing = Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/db".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -1141,13 +1149,15 @@ mod tests {
             buffer_pool: None,
             servers: vec![existing_server()],
             categories: vec![CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "Movies".to_string(),
                 dest_dir: None,
                 aliases: String::new(),
             }],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),

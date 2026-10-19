@@ -2995,10 +2995,10 @@ pub struct Pipeline {
     pub(crate) bandwidth_ledger: BandwidthLedgerRuntime,
     // Estimated bytes charged to the speed limiter for in-flight downloads.
     pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
-    // Persisted/general speed limit restored when no schedule speed action is active.
-    pub(super) configured_rate_limit: u64,
-    // Active schedule speed action, if any.
-    pub(super) scheduled_rate_limit: Option<u64>,
+    // The operator's global bandwidth limits.
+    pub(super) configured_bandwidth: crate::proxies::Bandwidth,
+    // The global limits a schedule rule has in force, if one does.
+    pub(super) scheduled_bandwidth: Option<crate::proxies::Bandwidth>,
     // Effective bandwidth rate limiter.
     pub(super) rate_limiter: TokenBucket,
     // Max pending segments per write reorder buffer (memory-adaptive).

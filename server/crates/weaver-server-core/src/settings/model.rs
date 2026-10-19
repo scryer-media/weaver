@@ -33,9 +33,9 @@ pub struct Config {
     pub categories: Vec<CategoryConfig>,
     #[serde(default)]
     pub retry: Option<RetryOverrides>,
-    // Maximum download speed in bytes/sec. 0 or absent means unlimited.
+    // The global bandwidth limits, kept in networking.
     #[serde(default)]
-    pub max_download_speed: Option<u64>,
+    pub bandwidth: crate::proxies::Bandwidth,
     // Minimum post age before downloading. Zero disables the hold.
     #[serde(default)]
     pub propagation_delay_secs: Option<u32>,
@@ -66,6 +66,12 @@ pub struct Config {
     // Prometheus exposition knobs.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    // The global seeding policy. Absent means no goal: a torrent seeds until
+    // it is stopped.
+    #[serde(default)]
+    pub seeding: Option<SeedingPolicy>,
+    #[serde(default)]
+    pub torrent: TorrentConfig,
     // Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -329,6 +335,156 @@ impl PerJobSeries {
     }
 }
 
+// When a torrent has seeded enough, at one level: the global config, a
+// category, or one torrent. A `None` field is unset at this level and
+// inherits from the next one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SeedingPolicy {
+    pub ratio_goal: Option<f32>,
+    pub seed_time_goal_minutes: Option<u32>,
+    pub inactive_goal_minutes: Option<u32>,
+    pub mode: SeedingGoalMode,
+    pub action: SeedingAction,
+    pub max_upload_bps: Option<u64>,
+}
+
+// Whether any one goal ends seeding, or only all of them together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedingGoalMode {
+    #[default]
+    Any,
+    All,
+}
+
+impl SeedingGoalMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::All => "all",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "any" => Some(Self::Any),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+// What happens to a torrent once its goal is met.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedingAction {
+    #[default]
+    Stop,
+    Remove,
+    RemoveWithData,
+}
+
+impl SeedingAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Remove => "remove",
+            Self::RemoveWithData => "remove_with_data",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "stop" => Some(Self::Stop),
+            "remove" => Some(Self::Remove),
+            "remove_with_data" => Some(Self::RemoveWithData),
+            _ => None,
+        }
+    }
+}
+
+// The policy a torrent seeds under: its own override, then its category's,
+// then the global one. Optional goals resolve field by field, each from the
+// most specific level that sets it. `mode` and `action` are always set, so
+// they come from the most specific level present. `None` when no level has a
+// policy.
+pub fn resolve_seeding_policy(
+    torrent: Option<&SeedingPolicy>,
+    category: Option<&SeedingPolicy>,
+    global: Option<&SeedingPolicy>,
+) -> Option<SeedingPolicy> {
+    let levels = || [torrent, category, global].into_iter().flatten();
+    let most_specific = levels().next()?;
+    Some(SeedingPolicy {
+        ratio_goal: levels().find_map(|p| p.ratio_goal),
+        seed_time_goal_minutes: levels().find_map(|p| p.seed_time_goal_minutes),
+        inactive_goal_minutes: levels().find_map(|p| p.inactive_goal_minutes),
+        mode: most_specific.mode,
+        action: most_specific.action,
+        max_upload_bps: levels().find_map(|p| p.max_upload_bps),
+    })
+}
+
+// The torrent client (`[torrent]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TorrentConfig {
+    pub enabled: bool,
+    // First port the listener tries; it walks up from here when taken.
+    pub base_port: u16,
+    // The port announced to trackers, when it differs from the one listened
+    // on (a forwarded port).
+    pub announce_port: Option<u16>,
+    pub upnp: bool,
+    pub encryption: TorrentEncryption,
+    pub max_active_downloads: u32,
+    pub max_peers_total: u32,
+    // Where the session keeps its resume state. Absent means under the data
+    // directory.
+    pub session_dir: Option<PathBuf>,
+}
+
+impl Default for TorrentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_port: 6881,
+            announce_port: None,
+            upnp: true,
+            encryption: TorrentEncryption::Prefer,
+            max_active_downloads: 3,
+            max_peers_total: 500,
+            session_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentEncryption {
+    #[default]
+    Prefer,
+    Require,
+}
+
+impl TorrentEncryption {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "prefer" => Some(Self::Prefer),
+            "require" => Some(Self::Require),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferPoolOverrides {
     pub small_count: Option<usize>,
@@ -375,7 +531,7 @@ mod tests {
             }],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             propagation_delay_secs: None,
             watch_folder: WatchFolderConfig::default(),
@@ -385,8 +541,153 @@ mod tests {
             delivery_naming: None,
             hardware_profile: None,
             metrics: Default::default(),
+            seeding: None,
+            torrent: TorrentConfig::default(),
             config_path: None,
         }
+    }
+
+    fn policy(ratio_goal: Option<f32>, seed_time_goal_minutes: Option<u32>) -> SeedingPolicy {
+        SeedingPolicy {
+            ratio_goal,
+            seed_time_goal_minutes,
+            ..SeedingPolicy::default()
+        }
+    }
+
+    #[test]
+    fn seeding_policy_resolves_field_by_field() {
+        let torrent = SeedingPolicy {
+            mode: SeedingGoalMode::All,
+            ..policy(Some(2.5), None)
+        };
+        let category = SeedingPolicy {
+            inactive_goal_minutes: Some(30),
+            action: SeedingAction::Remove,
+            ..policy(Some(1.0), Some(60))
+        };
+        let global = SeedingPolicy {
+            max_upload_bps: Some(1_000),
+            action: SeedingAction::RemoveWithData,
+            ..policy(Some(0.5), Some(120))
+        };
+
+        let resolved =
+            resolve_seeding_policy(Some(&torrent), Some(&category), Some(&global)).unwrap();
+
+        assert_eq!(resolved.ratio_goal, Some(2.5));
+        assert_eq!(resolved.seed_time_goal_minutes, Some(60));
+        assert_eq!(resolved.inactive_goal_minutes, Some(30));
+        assert_eq!(resolved.max_upload_bps, Some(1_000));
+        assert_eq!(resolved.mode, SeedingGoalMode::All);
+        assert_eq!(resolved.action, SeedingAction::Stop);
+    }
+
+    #[test]
+    fn seeding_policy_skips_absent_levels() {
+        let global = SeedingPolicy {
+            action: SeedingAction::Remove,
+            ..policy(None, Some(90))
+        };
+
+        assert_eq!(
+            resolve_seeding_policy(None, None, Some(&global)),
+            Some(global)
+        );
+        let category = policy(Some(1.5), None);
+        let resolved = resolve_seeding_policy(None, Some(&category), Some(&global)).unwrap();
+        assert_eq!(resolved.ratio_goal, Some(1.5));
+        assert_eq!(resolved.seed_time_goal_minutes, Some(90));
+        assert_eq!(resolved.action, SeedingAction::Stop);
+        assert_eq!(resolve_seeding_policy(None, None, None), None);
+    }
+
+    #[test]
+    fn a_config_without_torrent_keys_loads_the_defaults_and_round_trips() {
+        let config: Config = toml::from_str(
+            r#"
+data_dir = "/tmp/weaver-data"
+
+[[servers]]
+id = 1
+host = "news.example.com"
+port = 443
+tls = true
+username = "user"
+password = "pass"
+connections = 10
+active = true
+
+[[categories]]
+id = 1
+name = "tv"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.seeding, None);
+        assert_eq!(config.torrent, TorrentConfig::default());
+        assert!(!config.torrent.enabled);
+        assert_eq!(config.categories[0].seeding, None);
+        assert!(!config.categories[0].torrent_route);
+
+        let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.seeding, None);
+        assert_eq!(reparsed.torrent, TorrentConfig::default());
+        assert_eq!(reparsed.categories[0].seeding, None);
+        assert!(!reparsed.categories[0].torrent_route);
+    }
+
+    #[test]
+    fn torrent_and_seeding_tables_round_trip_through_toml() {
+        let mut config = config_with_server();
+        config.seeding = Some(SeedingPolicy {
+            inactive_goal_minutes: Some(15),
+            mode: SeedingGoalMode::All,
+            action: SeedingAction::RemoveWithData,
+            max_upload_bps: Some(65_536),
+            ..policy(Some(2.0), Some(1_440))
+        });
+        config.torrent = TorrentConfig {
+            enabled: true,
+            base_port: 51_413,
+            announce_port: Some(40_000),
+            upnp: false,
+            encryption: TorrentEncryption::Require,
+            max_active_downloads: 5,
+            max_peers_total: 200,
+            session_dir: Some(PathBuf::from("/var/lib/weaver/torrents")),
+        };
+
+        let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        assert_eq!(reparsed.seeding, config.seeding);
+        assert_eq!(reparsed.torrent, config.torrent);
+    }
+
+    #[test]
+    fn a_partial_seeding_table_fills_the_rest_with_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+data_dir = "/tmp/weaver-data"
+
+[seeding]
+ratio_goal = 1.0
+
+[torrent]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.seeding, Some(policy(Some(1.0), None)));
+        assert_eq!(
+            config.torrent,
+            TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            }
+        );
     }
 
     #[test]

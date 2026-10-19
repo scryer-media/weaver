@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// One graph job's runtime: its tree, its article root, the builder its
+// One graph job's runtime: its tree, its root, the builder its
 // objects come from, and the namespace writer its bytes go through. The
 // pipeline holds one per job admitted under the graph engine and hands it
 // what the download and decode paths learn; nothing else of the pipeline
 // reaches into the tree, and nothing else writes the job's files.
 
 mod passwords;
+mod pieces;
 mod repair;
 pub(crate) mod restore;
 mod runs;
@@ -31,11 +32,8 @@ use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
 use super::limits::Caps;
 use super::namespace::{NamespaceWriter, WriteError};
-use super::root::intake::Decoded;
 use super::root::phase::{self, RootPhase};
-use super::root::sample;
-use super::root::source::{Class, Move};
-use super::root::{ArticleRoot, Ask};
+use super::root::{ArticleRoot, Ask, Root};
 use crate::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
@@ -80,9 +78,9 @@ pub(crate) struct RecoverySummary {
     pub(crate) outcome: Option<RepairOutcome>,
 }
 
-pub(crate) struct GraphJob {
+pub(crate) struct GraphJob<R = ArticleRoot> {
     tree: Tree,
-    root: ArticleRoot,
+    root: R,
     builder: Box<dyn Builder + Send + Sync>,
     writer: NamespaceWriter,
     runs: Runs,
@@ -140,6 +138,30 @@ impl GraphJob {
 
     pub(crate) fn new(
         files: &[RootFile],
+        builder: Box<dyn Builder + Send + Sync>,
+        writer: NamespaceWriter,
+        runs: Runs,
+        nesting: u32,
+    ) -> Self {
+        // A post declares no file's length; the first decoded article does.
+        let members = files.iter().map(|file| (file.name.as_str(), None));
+        Self::with_root(
+            ArticleRoot::new(files),
+            members,
+            builder,
+            writer,
+            runs,
+            nesting,
+        )
+    }
+}
+
+impl<R: Root> GraphJob<R> {
+    // A job over `root`, whose volumes are `members` in order: each one's
+    // name and, when the root knows it before any byte, its length.
+    fn with_root<'a>(
+        root: R,
+        members: impl Iterator<Item = (&'a str, Option<u64>)>,
         mut builder: Box<dyn Builder + Send + Sync>,
         mut writer: NamespaceWriter,
         runs: Runs,
@@ -147,13 +169,12 @@ impl GraphJob {
     ) -> Self {
         let mut tree = Tree::new();
         tree.nest_at_most(nesting);
-        let root = ArticleRoot::new(files);
         let mut out = Vec::new();
-        for file in files {
+        for (name, length) in members {
             // Nothing is below the root yet, so no name moves; were one to,
             // its file would follow as any rename's does.
             let mut moved = Vec::new();
-            let member = tree.announce_root(&file.name, None, &mut moved);
+            let member = tree.announce_root(name, length, &mut moved);
             // A member that cannot be announced still downloads; its first
             // write reports the same failure where a step can carry it.
             if let Err(error) = writer
@@ -281,33 +302,32 @@ impl GraphJob {
 
     // Articles the queues do not hold were fetched by an earlier run.
     pub(crate) fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool) {
-        self.root.map.arrived_before(queued);
+        self.root.arrived_before(queued);
     }
 
     // A recovery object may still form: an object is known by its opening
     // bytes, and some member's have yet to arrive.
     pub(crate) fn recovery_may_form(&self) -> bool {
-        self.root.map.any_head_waiting()
+        self.root.any_head_waiting()
     }
 
     // The class the root fetches an article under now.
-    pub(crate) fn article_class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
-        self.root.map.class(volume, ordinal)
+    pub(crate) fn article_class(&self, volume: VolumeIndex, ordinal: u32) -> Option<R::Class> {
+        self.root.class(volume, ordinal)
     }
 
     // The first article of every member leads the payload.
-    pub(crate) fn sample(&mut self) -> Vec<Move> {
-        self.root.map.sample();
-        self.root.map.take_moves()
+    pub(crate) fn sample(&mut self) -> Vec<R::Move> {
+        self.root.sample();
+        self.root.take_moves()
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step
     // that asks or frees a run follows.
-    pub(crate) fn intake(&mut self, decoded: Decoded, limit: usize) -> Result<(), GraphError> {
-        let volume = decoded.volume;
-        let member = MemberId(volume.0);
-        let length = decoded.length;
-        let arrival = self.root.receive(decoded);
+    pub(crate) fn intake(&mut self, decoded: R::Intake, limit: usize) -> Result<(), GraphError> {
+        let (arrival, length) = self.root.receive(decoded);
+        let member = arrival.member;
+        let volume = VolumeIndex(member.0);
         if let Some(length) = length {
             self.writer
                 .length_learned(&mut self.tree, &self.root, NodeId::ROOT, member, length)?;
@@ -333,7 +353,7 @@ impl GraphJob {
         ordinal: u32,
         limit: usize,
     ) -> Result<(), GraphError> {
-        self.root.map.lost(volume, ordinal);
+        self.root.lost(volume, ordinal);
         self.mark_damage()?;
         self.after_member(volume)?;
         self.step_runs(Vec::new(), limit)
@@ -344,7 +364,7 @@ impl GraphJob {
     // repair when what they cover is in or what they waited for arrived.
     fn after_member(&mut self, volume: VolumeIndex) -> Result<(), GraphError> {
         let member = MemberId(volume.0);
-        if !self.root.map.volume_waiting(volume) && !self.closed(member) {
+        if !self.root.volume_waiting(volume) && !self.closed(member) {
             let mut out = Vec::new();
             self.writer.close(
                 &mut self.tree,
@@ -384,7 +404,7 @@ impl GraphJob {
     fn payload_waiting(&self) -> bool {
         self.namespace().members().any(|member| {
             self.is_recovery_volume(member.id).is_none()
-                && self.root.map.volume_waiting(VolumeIndex(member.id.0))
+                && self.root.volume_waiting(VolumeIndex(member.id.0))
         })
     }
 
@@ -394,9 +414,8 @@ impl GraphJob {
     pub(crate) fn seek_round(
         &mut self,
         queued: impl FnMut(VolumeIndex) -> bool,
-    ) -> Result<Vec<Move>, GraphError> {
-        sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
-        sample::fronts(&self.tree, &mut self.root.map);
+    ) -> Result<Vec<R::Move>, GraphError> {
+        self.root.bootstrap(&self.tree);
         let mut wants = Vec::new();
         self.tree.collect_wants(&mut wants);
         let mut asks = Vec::new();
@@ -426,7 +445,7 @@ impl GraphJob {
             );
         }
         self.settle(effects)?;
-        Ok(self.root.map.take_moves())
+        Ok(self.root.take_moves())
     }
 
     // The phase, when it changed since the last call.

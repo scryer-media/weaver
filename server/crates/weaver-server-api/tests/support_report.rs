@@ -74,6 +74,7 @@ fn seed_history_job_with_facts(h: &TestHarness, job_id: u64, facts: Option<Strin
     h.db.archive_job(
         JobId(job_id),
         &JobHistoryRow {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id,
             job_hash: None,
             name: SENTINEL.to_string(),

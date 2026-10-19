@@ -153,6 +153,7 @@ async fn job_detail_snapshot_names_the_servers_that_served_an_archived_job() {
     let stale_server_id = server_id + 1_000;
     let job_id = 8_150_u64;
     h.insert_history_row(&JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: "attributed-job".to_string(),

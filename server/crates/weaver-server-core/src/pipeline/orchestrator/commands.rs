@@ -134,6 +134,7 @@ impl Pipeline {
                         state.assembly.optional_recovery_bytes();
                     let health = health_milli(total, state.failed_bytes);
                     let row = crate::JobHistoryRow {
+                        protocol: crate::jobs::Protocol::Nzb,
                         job_id: job_id.0,
                         job_hash: Some(state.job_hash.to_vec()),
                         name: state.spec.name.clone(),
@@ -589,20 +590,18 @@ impl Pipeline {
                     });
                 let _ = reply.send(result);
             }
-            SchedulerCommand::SetSpeedLimit {
-                bytes_per_sec,
+            SchedulerCommand::SetBandwidth {
+                bandwidth,
                 replaces_schedule,
                 reply,
             } => {
-                self.configured_rate_limit = bytes_per_sec;
-                if replaces_schedule && self.scheduled_rate_limit.take().is_some() {
+                self.configured_bandwidth = bandwidth;
+                if replaces_schedule && self.scheduled_bandwidth.take().is_some() {
                     // The schedule's rate gives way until its next rule fires.
                     self.publish_download_block();
-                    info!(bytes_per_sec, "speed limit set over the scheduled one");
+                    info!(?bandwidth, "bandwidth set over the scheduled limit");
                 }
-                if self.scheduled_rate_limit.is_none() {
-                    self.rate_limiter.set_rate(bytes_per_sec);
-                }
+                self.apply_global_rate();
                 let _ = reply.send(());
             }
             SchedulerCommand::SetPropagationDelay { seconds, reply } => {
@@ -652,15 +651,14 @@ impl Pipeline {
                             .find(|limit| limit.target == crate::bandwidth::SpeedTarget::Global)
                         {
                             Some(limit) => {
-                                let bytes_per_sec = limit.bytes_per_sec;
-                                self.scheduled_rate_limit = Some(bytes_per_sec);
-                                self.rate_limiter.set_rate(bytes_per_sec);
-                                let mut block = self
-                                    .bandwidth_ledger
-                                    .to_download_block_state(self.global_pause());
-                                block.scheduled_speed_limit = bytes_per_sec;
-                                self.shared_state.set_download_block(block);
-                                info!(bytes_per_sec, "schedule: set speed limit");
+                                let scheduled = crate::proxies::Bandwidth {
+                                    download_bps: limit.bytes_per_sec,
+                                    upload_bps: limit.upload_bytes_per_sec,
+                                };
+                                self.scheduled_bandwidth = Some(scheduled);
+                                self.apply_global_rate();
+                                self.publish_download_block();
+                                info!(?scheduled, "schedule: set speed limit");
                             }
                             None => warn!(
                                 ?limits,

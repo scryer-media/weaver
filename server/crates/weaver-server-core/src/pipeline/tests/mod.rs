@@ -106,6 +106,8 @@ impl TestHarness {
         let complete_dir = temp_dir.path().join("complete");
         let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
         let config: SharedConfig = Arc::new(RwLock::new(Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: data_dir.display().to_string(),
             hardware_profile: None,
             intermediate_dir: Some(intermediate_dir.display().to_string()),
@@ -114,7 +116,7 @@ impl TestHarness {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -290,6 +292,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
 
 fn finished_job_info(job_id: JobId) -> JobInfo {
     JobInfo {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id,
         job_hash: Some([0; 32]),
         name: format!("finished-{}", job_id.0),
@@ -330,6 +333,7 @@ fn history_row_with_output_dir(
     output_dir: PathBuf,
 ) -> crate::JobHistoryRow {
     crate::JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: job_id.0,
         job_hash: None,
         name: name.to_string(),
@@ -525,6 +529,8 @@ async fn new_direct_pipeline_on_machine(
     // needs a key, exactly as a running server has one.
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let config: SharedConfig = Arc::new(RwLock::new(Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: data_dir.display().to_string(),
         hardware_profile: None,
         intermediate_dir: Some(intermediate_dir.display().to_string()),
@@ -533,7 +539,7 @@ async fn new_direct_pipeline_on_machine(
         servers: vec![],
         categories: vec![],
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

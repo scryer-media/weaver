@@ -60,6 +60,24 @@ fn runtime_lanes_for_status(
             weaver_server_core::RunState::Active,
             None,
         ),
+        JobStatus::FetchingMetadata | JobStatus::Stalled => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::CheckingFiles => (
+            weaver_server_core::DownloadState::Checking,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Seeding => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Completed,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
         JobStatus::Checking => (
             weaver_server_core::DownloadState::Checking,
             weaver_server_core::PostState::Idle,
@@ -209,6 +227,8 @@ impl TestHarness {
         let db = Database::open_in_memory().expect("failed to open in-memory DB");
 
         let config = Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: tempdir.path().to_string_lossy().to_string(),
             intermediate_dir: None,
             complete_dir: None,
@@ -1001,6 +1021,7 @@ fn spawn_test_scheduler(
 fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
     jobs.values()
         .map(|state| JobInfo {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id: state.job_id,
             job_hash: Some(state.job_hash),
             name: state.spec.name.clone(),

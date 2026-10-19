@@ -1209,6 +1209,10 @@ fn job_status_index(status: &JobStatus) -> Option<usize> {
         // key would orphan every stored chunk; clients read Partial as failed.
         JobStatus::Failed { .. } | JobStatus::Partial => "failed",
         JobStatus::Complete => "complete",
+        // Torrent states fold into the nearest stored key for the same reason.
+        JobStatus::FetchingMetadata | JobStatus::Stalled => "downloading",
+        JobStatus::CheckingFiles => "checking",
+        JobStatus::Seeding => "complete",
     };
     JOB_STATUS_KEYS
         .iter()

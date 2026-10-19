@@ -41,8 +41,9 @@ impl CategoriesMutation {
         if name.is_empty() {
             return Err(async_graphql::Error::new("category name must not be empty"));
         }
-        let dest_dir = input.dest_dir.filter(|value| !value.is_empty());
+        let dest_dir = input.dest_dir.clone().filter(|value| !value.is_empty());
         validate_category_name(&name, dest_dir.as_deref())?;
+        let (seeding, torrent_route) = input.torrent_fields(None)?;
 
         with_timed_config_read(config, "categories.mutation.add_category.validate", |cfg| {
             if cfg
@@ -72,6 +73,8 @@ impl CategoriesMutation {
             name: name.clone(),
             dest_dir,
             aliases: input.aliases,
+            seeding,
+            torrent_route,
         };
 
         let added = {
@@ -124,7 +127,7 @@ impl CategoriesMutation {
         if name.is_empty() {
             return Err(async_graphql::Error::new("category name must not be empty"));
         }
-        let dest_dir = input.dest_dir.filter(|value| !value.is_empty());
+        let dest_dir = input.dest_dir.clone().filter(|value| !value.is_empty());
         validate_category_name(&name, dest_dir.as_deref())?;
 
         let updated = with_timed_config_read(
@@ -148,11 +151,14 @@ impl CategoriesMutation {
                     )));
                 }
 
+                let (seeding, torrent_route) = input.torrent_fields(Some(current))?;
                 Ok(weaver_server_core::categories::CategoryConfig {
                     id,
                     name: name.clone(),
                     dest_dir: dest_dir.clone(),
                     aliases: input.aliases.clone(),
+                    seeding,
+                    torrent_route,
                 })
             },
         )
@@ -258,6 +264,8 @@ mod tests {
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -297,6 +305,8 @@ mod tests {
                     |cfg| {
                         cfg.categories
                             .push(weaver_server_core::categories::CategoryConfig {
+                                seeding: None,
+                                torrent_route: false,
                                 id: 1,
                                 name: "tv".to_string(),
                                 dest_dir: None,

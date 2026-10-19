@@ -754,7 +754,9 @@ async fn apply_speed_limits(
             SpeedTarget::Server(server_id) => {
                 servers
                     .ok_or("servers service is not available")?
-                    .set_server_speed_limit(server_id, limit.bytes_per_sec)
+                    // A provider's limit of 0 is no limit; a rule that would
+                    // close one is refused when it is saved.
+                    .set_server_speed_limit(server_id, limit.bytes_per_sec.unwrap_or(0))
                     .await?
             }
         }

@@ -299,11 +299,28 @@ fn compute_monthly_window(now: DateTime<Local>, reset_day: u8, reset_minutes: u1
     QuotaWindow::new(start, end)
 }
 
+// When a quota's periods begin and end, whatever holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaCalendar {
+    pub period: ServerDownloadQuotaPeriod,
+    pub reset_time_minutes_local: u16,
+    pub weekly_reset_weekday: QuotaWeekday,
+    pub monthly_reset_day: u8,
+}
+
+impl From<&ServerDownloadQuotaConfig> for QuotaCalendar {
+    fn from(quota: &ServerDownloadQuotaConfig) -> Self {
+        Self {
+            period: quota.period,
+            reset_time_minutes_local: quota.reset_time_minutes_local,
+            weekly_reset_weekday: quota.weekly_reset_weekday,
+            monthly_reset_day: quota.monthly_reset_day,
+        }
+    }
+}
+
 // The quota period containing `now`, or `None` for a one-time quota.
-pub(crate) fn compute_window(
-    now: DateTime<Local>,
-    quota: &ServerDownloadQuotaConfig,
-) -> Option<QuotaWindow> {
+pub(crate) fn compute_window(now: DateTime<Local>, quota: QuotaCalendar) -> Option<QuotaWindow> {
     Some(match quota.period {
         ServerDownloadQuotaPeriod::OneTime => return None,
         ServerDownloadQuotaPeriod::Daily => {
@@ -321,6 +338,26 @@ pub(crate) fn compute_window(
 }
 
 impl Pipeline {
+    // The rate one direction of the whole instance may move at: the
+    // operator's global limit under any scheduled one.
+    pub(crate) fn global_rate(&self, direction: crate::bandwidth::Direction) -> Option<u64> {
+        crate::bandwidth::effective_rate(crate::bandwidth::RateLimits {
+            global: self.configured_bandwidth.limit(direction),
+            schedule: self
+                .scheduled_bandwidth
+                .and_then(|scheduled| scheduled.limit(direction)),
+            ..crate::bandwidth::RateLimits::default()
+        })
+    }
+
+    // Put the global download rate in force on the dispatch limiter.
+    pub(crate) fn apply_global_rate(&mut self) {
+        let rate = self.global_rate(crate::bandwidth::Direction::Download);
+        if self.rate_limiter.rate() != rate {
+            self.rate_limiter.set_rate(rate);
+        }
+    }
+
     // The current global-pause origin, so every download-block refresh reports
     // a consistent Scheduled vs ManualPause kind.
     pub(crate) fn global_pause(&self) -> GlobalPause {
@@ -337,7 +374,9 @@ impl Pipeline {
         let mut block = self
             .bandwidth_ledger
             .to_download_block_state(self.global_pause());
-        block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
+        block.scheduled_speed_limit = self
+            .scheduled_bandwidth
+            .and_then(|scheduled| scheduled.download_bps);
         self.shared_state.set_download_block(block);
     }
 

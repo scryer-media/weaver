@@ -17,7 +17,7 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 #[derive(Default, Clone)]
 struct RuntimeCapture {
     updated_paths: StdArc<StdMutex<Option<(PathBuf, PathBuf, PathBuf)>>>,
-    speed_limits: StdArc<StdMutex<Vec<u64>>>,
+    speed_limits: StdArc<StdMutex<Vec<crate::proxies::Bandwidth>>>,
 }
 
 fn open_temp_db() -> Database {
@@ -112,12 +112,10 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
     tokio::spawn(async move {
         while let Some(command) = cmd_rx.recv().await {
             match command {
-                SchedulerCommand::SetSpeedLimit {
-                    bytes_per_sec,
-                    reply,
-                    ..
+                SchedulerCommand::SetBandwidth {
+                    bandwidth, reply, ..
                 } => {
-                    capture.speed_limits.lock().unwrap().push(bytes_per_sec);
+                    capture.speed_limits.lock().unwrap().push(bandwidth);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::RebuildNntp { reply, .. } => {
@@ -175,6 +173,8 @@ fn sample_server(id: u32) -> crate::servers::ServerConfig {
 
 fn sample_config() -> Config {
     Config {
+        seeding: None,
+        torrent: Default::default(),
         data_dir: "/old/data".into(),
         hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
@@ -183,12 +183,16 @@ fn sample_config() -> Config {
         servers: vec![],
         categories: vec![
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "tv".into(),
                 dest_dir: Some("/old/data/complete/tv".into()),
                 aliases: String::new(),
             },
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 2,
                 name: "movies".into(),
                 dest_dir: Some("/mnt/media/movies".into()),
@@ -196,7 +200,7 @@ fn sample_config() -> Config {
             },
         ],
         retry: None,
-        max_download_speed: Some(1234),
+        bandwidth: crate::proxies::Bandwidth { download_bps: Some(1234), upload_bps: None },
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -212,6 +216,7 @@ fn sample_config() -> Config {
 fn populate_source_db(db: &Database) {
     db.save_config(&sample_config()).unwrap();
     db.insert_job_history(&JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 41,
         job_hash: None,
         name: "Backup Fixture".into(),
@@ -714,6 +719,7 @@ async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() 
             let job_id = 50_000 + inserted;
             writer_db
                 .insert_job_history(&JobHistoryRow {
+                    protocol: crate::jobs::Protocol::Nzb,
                     job_id,
                     job_hash: None,
                     name: format!("Concurrent Fixture {job_id}"),
@@ -1209,6 +1215,8 @@ async fn restore_requires_category_remap_for_external_paths() {
     let target_db = open_temp_db();
     target_db
         .save_config(&Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/bootstrap".into(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -1217,7 +1225,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -1233,6 +1241,8 @@ async fn restore_requires_category_remap_for_external_paths() {
     let (target_service, _, _) = build_service(
         target_db.clone(),
         Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/bootstrap".into(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -1241,7 +1251,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -1379,7 +1389,7 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
     bootstrap.complete_dir = None;
     bootstrap.servers = vec![sample_server(7)];
     bootstrap.categories.clear();
-    bootstrap.max_download_speed = None;
+    bootstrap.bandwidth = Default::default();
     let mut target_db = open_temp_db();
     target_db.save_config(&bootstrap).unwrap();
 

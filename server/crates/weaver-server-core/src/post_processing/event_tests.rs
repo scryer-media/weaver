@@ -237,6 +237,7 @@ async fn disabling_execution_stops_an_event_waiting_for_capacity() {
 
 fn history(db: &Database, job_id: u64) {
     db.insert_job_history(&crate::JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: "script-history".into(),

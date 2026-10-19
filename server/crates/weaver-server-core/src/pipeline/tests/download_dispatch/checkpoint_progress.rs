@@ -208,7 +208,7 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
         let reserved = pipeline.rate_limit_reservations[&segment_id];
         // Keep a small unrelated debt after the refund: both a missing refund
         // and a duplicate refund produce a materially different balance.
-        pipeline.rate_limiter.set_rate(1);
+        pipeline.rate_limiter.set_rate(Some(1));
         pipeline.rate_limiter.consume(reserved + 100);
         if cancel {
             let (reply, done) = oneshot::channel();
@@ -299,7 +299,7 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
         assert!(!pipeline.pending_retries_by_job.contains_key(&HOT));
         assert_eq!(pipeline.active_downloads, 0);
         assert_eq!(pipeline.active_download_connections, 0);
-        pipeline.rate_limiter.set_rate(0);
+        pipeline.rate_limiter.set_rate(None);
         pipeline.dispatch_downloads();
         assert!(pipeline.active_download_connections_by_job[&PEER] > 0);
     }

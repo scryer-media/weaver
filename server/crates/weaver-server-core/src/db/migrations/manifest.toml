@@ -778,3 +778,42 @@ kind = "sql"
 file = "migrations/0067_graph_member_buried/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 68
+description = "torrent jobs, their files, trackers and seeding ledger; category seeding and torrent routing; history protocol"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0068_torrents/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0068_torrents/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 69
+description = "bandwidth limits move into networking: a global row, per-egress rates in both directions, and upload quotas"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0069_networking_bandwidth/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0069_networking_bandwidth/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_bandwidth_to_networking_v69"
+scope = "upgrade_only"

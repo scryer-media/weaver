@@ -23,7 +23,7 @@ use super::runner::Stop;
 use super::usenet::{self, UsenetLeg, UsenetPlan};
 use crate::proxies::{
     Consumer, DraftNetworkRoute, LegPath, NetworkRefusal, ProxyPool, ProxyProfile, ProxyRuntime,
-    RoutingPolicy, Rung, SpeedTestQuotaHolder,
+    RoutingPolicy, Rung, SpeedTestQuotaHolder, TorrentScope,
 };
 use crate::settings::SharedConfig;
 use crate::{Database, SchedulerHandle};
@@ -310,7 +310,7 @@ impl SpeedTestService {
                         SpeedTestError::Invalid(format!("server {id} does not exist"))
                     })?,
             ),
-            Consumer::Rss(_) | Consumer::Outbound => None,
+            Consumer::Rss(_) | Consumer::Outbound | Consumer::Torrent(_) => None,
         };
         let consumer_name = runtime
             .network
@@ -323,6 +323,8 @@ impl SpeedTestService {
                 Consumer::Server(id) => format!("server {id}"),
                 Consumer::Rss(id) => format!("feed {id}"),
                 Consumer::Outbound => "Default outbound".into(),
+                Consumer::Torrent(TorrentScope::Default) => "Default torrent".into(),
+                Consumer::Torrent(TorrentScope::Category(id)) => format!("torrent category {id}"),
             });
 
         let policy = match &request.route {
@@ -543,9 +545,10 @@ impl SpeedTestService {
 
 fn validate_request(request: &SpeedTestRequest) -> Result<(), SpeedTestError> {
     match (&request.kind, request.consumer) {
-        (SpeedTestKind::Usenet { .. }, Consumer::Rss(_) | Consumer::Outbound) => {
-            Err(NetworkRefusal::SpeedTestUsenetNeedsServer.into())
-        }
+        (
+            SpeedTestKind::Usenet { .. },
+            Consumer::Rss(_) | Consumer::Outbound | Consumer::Torrent(_),
+        ) => Err(NetworkRefusal::SpeedTestUsenetNeedsServer.into()),
         (SpeedTestKind::Bandwidth { provider }, _) => match provider {
             BandwidthProvider::Custom { url } if url.scheme() != "https" => Err(
                 SpeedTestError::Invalid("a custom bandwidth URL must use https".into()),

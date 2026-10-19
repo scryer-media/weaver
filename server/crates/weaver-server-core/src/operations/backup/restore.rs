@@ -761,6 +761,7 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
     let (download_state, post_state, run_state) = runtime_lanes_from_status_snapshot(&status);
 
     JobInfo {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: crate::jobs::ids::JobId(row.job_id),
         job_hash: row.job_hash.as_ref().and_then(|value| {
             (value.len() == 32).then(|| {
@@ -904,6 +905,7 @@ mod tests {
     #[test]
     fn history_snapshot_preserves_repairing_and_moving_status_shapes() {
         let repairing = job_info_from_history(crate::JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: 1,
             job_hash: None,
             name: "repairing".into(),
@@ -928,6 +930,7 @@ mod tests {
         assert_eq!(repairing.post_state, crate::PostState::Repairing);
 
         let moving = job_info_from_history(crate::JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: 2,
             job_hash: None,
             name: "moving".into(),

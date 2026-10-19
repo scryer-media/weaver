@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::persistence::Refusal;
-use crate::servers::DownloadQuotaFault;
+use super::EgressQuotaFault;
 
 // Why a networking edit was refused. Each variant is one sentence; `code`
 // names the condition and is part of the API, so a client words the refusal
@@ -21,7 +21,8 @@ pub enum NetworkRefusal {
     EgressSourceAddressInvalid,
     EgressSourceAddressNotUnicast,
     EgressSpeedLimitTooLarge,
-    EgressQuota(DownloadQuotaFault),
+    EgressQuota(EgressQuotaFault),
+    BandwidthLimitTooLarge,
     EgressGone,
     EgressNotFound,
     EgressSystemUndeletable,
@@ -58,6 +59,8 @@ pub enum NetworkRefusal {
     RouteChainTransport,
     RouteHasAdvancedLegs,
     RouteConsumerGone,
+    TorrentRouteLegs,
+    TorrentRoutePool,
 
     // WireGuard sessions across every route.
     WireGuardPathConflict {
@@ -145,14 +148,13 @@ impl NetworkRefusal {
             Self::EgressSourceAddressInvalid => "EGRESS_SOURCE_ADDRESS_INVALID",
             Self::EgressSourceAddressNotUnicast => "EGRESS_SOURCE_ADDRESS_NOT_UNICAST",
             Self::EgressSpeedLimitTooLarge => "EGRESS_SPEED_LIMIT_TOO_LARGE",
-            Self::EgressQuota(DownloadQuotaFault::LimitTooLarge) => "EGRESS_QUOTA_LIMIT_TOO_LARGE",
-            Self::EgressQuota(DownloadQuotaFault::LimitRequired) => "EGRESS_QUOTA_LIMIT_REQUIRED",
-            Self::EgressQuota(DownloadQuotaFault::ResetTimeRange) => {
-                "EGRESS_QUOTA_RESET_TIME_RANGE"
-            }
-            Self::EgressQuota(DownloadQuotaFault::MonthlyResetDayRange) => {
+            Self::EgressQuota(EgressQuotaFault::LimitTooLarge) => "EGRESS_QUOTA_LIMIT_TOO_LARGE",
+            Self::EgressQuota(EgressQuotaFault::ResetTimeRange) => "EGRESS_QUOTA_RESET_TIME_RANGE",
+            Self::EgressQuota(EgressQuotaFault::MonthlyResetDayRange) => {
                 "EGRESS_QUOTA_RESET_DAY_RANGE"
             }
+            Self::EgressQuota(EgressQuotaFault::SoftAboveHard) => "EGRESS_QUOTA_SOFT_ABOVE_HARD",
+            Self::BandwidthLimitTooLarge => "BANDWIDTH_LIMIT_TOO_LARGE",
             Self::EgressGone | Self::EgressNotFound => "EGRESS_NOT_FOUND",
             Self::EgressSystemUndeletable => "EGRESS_SYSTEM_UNDELETABLE",
             Self::EgressInUse => "EGRESS_IN_USE",
@@ -184,6 +186,8 @@ impl NetworkRefusal {
             Self::RouteChainTransport => "ROUTE_CHAIN_TRANSPORT",
             Self::RouteHasAdvancedLegs => "ROUTE_HAS_ADVANCED_LEGS",
             Self::RouteConsumerGone => "ROUTE_CONSUMER_NOT_FOUND",
+            Self::TorrentRouteLegs => "TORRENT_ROUTE_LEGS",
+            Self::TorrentRoutePool => "TORRENT_ROUTE_POOL",
 
             Self::WireGuardPathConflict { .. } => "WIREGUARD_PROXY_PATH_CONFLICT",
             Self::WireGuardInstanceLimit { .. } => "WIREGUARD_INSTANCE_LIMIT",
@@ -281,7 +285,8 @@ impl std::fmt::Display for NetworkRefusal {
             Self::EgressSourceAddressInvalid => "invalid source address",
             Self::EgressSourceAddressNotUnicast => "source address must be a unicast host address",
             Self::EgressSpeedLimitTooLarge => "egress speed limit is too large",
-            Self::EgressQuota(fault) => return f.write_str(&fault.message("egress")),
+            Self::EgressQuota(fault) => fault.message(),
+            Self::BandwidthLimitTooLarge => "bandwidth limit is too large",
             Self::EgressGone => "egress no longer exists",
             Self::EgressNotFound => "egress not found",
             Self::EgressSystemUndeletable => "the System egress cannot be deleted",
@@ -324,6 +329,8 @@ impl std::fmt::Display for NetworkRefusal {
                 "this route has advanced legs; edit it in Networking instead of replacing its legacy projection"
             }
             Self::RouteConsumerGone => "routing consumer no longer exists",
+            Self::TorrentRouteLegs => "a torrent route has exactly one leg",
+            Self::TorrentRoutePool => "a torrent route cannot use a pool",
 
             Self::WireGuardPathConflict {
                 proxy,

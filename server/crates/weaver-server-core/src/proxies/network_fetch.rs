@@ -265,6 +265,7 @@ impl NetworkRuntime {
             Consumer::Rss(feed) => Purpose::Feed { feed },
             Consumer::Outbound => Purpose::Outbound,
             Consumer::Server(_) => return Err("a server's route does not carry fetches".into()),
+            Consumer::Torrent(_) => return Err("a torrent's route does not carry fetches".into()),
         };
         let route = self.route(consumer, 1, Duration::from_secs(30))?;
         let config = self.configuration.read().expect("network configuration");

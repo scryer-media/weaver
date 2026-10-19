@@ -10,6 +10,7 @@ use weaver_server_core::JobHistoryRow;
 
 fn sample_history_row(job_id: u64, name: &str) -> JobHistoryRow {
     JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: name.to_string(),

@@ -350,6 +350,8 @@ pub enum Consumer {
     // Default outbound: everything Weaver fetches over HTTP that is not a
     // server, a feed or a speed test. It always exists and has cap 1.
     Outbound,
+    // Torrent peers and trackers.
+    Torrent(TorrentScope),
 }
 impl Consumer {
     pub fn key(self) -> String {
@@ -357,8 +359,39 @@ impl Consumer {
             Self::Server(id) => format!("server:{id}"),
             Self::Rss(id) => format!("rss:{id}"),
             Self::Outbound => "outbound".into(),
+            Self::Torrent(TorrentScope::Default) => "torrent:default".into(),
+            Self::Torrent(TorrentScope::Category(id)) => format!("torrent:category:{id}"),
         }
     }
+
+    // A torrent session dials through one path at a time, trying its rungs in
+    // order: it cannot spread over weighted legs or a pool.
+    pub fn validate_route(self, route: &super::Route) -> Result<(), super::NetworkRefusal> {
+        if !matches!(self, Self::Torrent(_)) {
+            return Ok(());
+        }
+        if route.legs.len() != 1 {
+            return Err(super::NetworkRefusal::TorrentRouteLegs);
+        }
+        let pooled = route.legs.iter().any(|leg| match &leg.path {
+            super::LegPath::Direct => false,
+            super::LegPath::Ladder { rungs, .. } => rungs
+                .iter()
+                .any(|rung| matches!(rung, super::Rung::Pool { .. })),
+        });
+        if pooled {
+            return Err(super::NetworkRefusal::TorrentRoutePool);
+        }
+        Ok(())
+    }
+}
+
+// Which torrents a torrent consumer carries: every torrent whose category
+// has no route of its own, or one category's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TorrentScope {
+    Default,
+    Category(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

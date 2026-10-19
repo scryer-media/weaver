@@ -857,7 +857,7 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
         .shared_state
         .set_download_block(crate::jobs::handle::DownloadBlockState {
             kind: crate::jobs::handle::DownloadBlockKind::Scheduled,
-            scheduled_speed_limit: 1_024,
+            scheduled_speed_limit: Some(1_024),
             ..Default::default()
         });
     assert_eq!(
@@ -895,33 +895,44 @@ async fn download_block_refresh_preserves_scheduled_speed_limit() {
     )
     .await;
 
-    pipeline.scheduled_rate_limit = Some(131_072);
-    pipeline.rate_limiter.set_rate(131_072);
+    pipeline.scheduled_bandwidth = Some(crate::proxies::Bandwidth {
+        download_bps: Some(131_072),
+        upload_bps: None,
+    });
+    pipeline.apply_global_rate();
     pipeline.publish_download_block();
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
-        131_072
+        Some(131_072)
     );
 
     pipeline.record_download_bandwidth_usage(1_024).unwrap();
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
-        131_072
+        Some(131_072)
     );
 
     pipeline.flush_download_bandwidth_usage().unwrap();
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
-        131_072
+        Some(131_072)
     );
 }
 
-fn global_speed(bytes_per_sec: u64) -> crate::bandwidth::ScheduleAction {
+fn global_speed(bytes_per_sec: Option<u64>) -> crate::bandwidth::ScheduleAction {
     crate::bandwidth::ScheduleAction::SpeedLimit {
         limits: vec![crate::bandwidth::SpeedLimitChange {
             target: crate::bandwidth::SpeedTarget::Global,
             bytes_per_sec,
+            upload_bytes_per_sec: None,
         }],
+    }
+}
+
+fn download_bandwidth(bytes_per_sec: u64) -> crate::proxies::Bandwidth {
+    crate::proxies::Bandwidth {
+        download_bps: Some(bytes_per_sec),
+        upload_bps: None,
     }
 }
 
@@ -932,8 +943,8 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
 
     let (reply, received) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::SetSpeedLimit {
-            bytes_per_sec: 512 * 1024,
+        .handle_command(SchedulerCommand::SetBandwidth {
+            bandwidth: download_bandwidth(512 * 1024),
             replaces_schedule: true,
             reply,
         })
@@ -943,12 +954,12 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
     let (reply, received) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: global_speed(128 * 1024),
+            action: global_speed(Some(128 * 1024)),
             reply,
         })
         .await;
     received.await.unwrap();
-    assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+    assert_eq!(pipeline.rate_limiter.rate(), Some(128 * 1024));
 
     for action in [
         crate::bandwidth::ScheduleAction::Pause,
@@ -966,26 +977,29 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
             pipeline.global_paused,
             action == crate::bandwidth::ScheduleAction::Pause
         );
-        assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
-        assert_eq!(pipeline.scheduled_rate_limit, Some(128 * 1024));
+        assert_eq!(pipeline.rate_limiter.rate(), Some(128 * 1024));
+        assert_eq!(
+            pipeline.scheduled_bandwidth,
+            Some(download_bandwidth(128 * 1024))
+        );
         assert_eq!(
             pipeline.shared_state.download_block().scheduled_speed_limit,
-            128 * 1024
+            Some(128 * 1024)
         );
     }
 
     let (reply, received) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::SetSpeedLimit {
-            bytes_per_sec: 768 * 1024,
+        .handle_command(SchedulerCommand::SetBandwidth {
+            bandwidth: download_bandwidth(768 * 1024),
             replaces_schedule: false,
             reply,
         })
         .await;
     received.await.unwrap();
     // A reload records the saved limit but leaves the scheduled one in force.
-    assert_eq!(pipeline.configured_rate_limit, 768 * 1024);
-    assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+    assert_eq!(pipeline.configured_bandwidth, download_bandwidth(768 * 1024));
+    assert_eq!(pipeline.rate_limiter.rate(), Some(128 * 1024));
 
     let (reply, received) = oneshot::channel();
     pipeline
@@ -995,18 +1009,28 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
         })
         .await;
     received.await.unwrap();
-    // Unlimited still means unlimited, even when the configured limit is nonzero.
+    // A schedule without a limit leaves the saved one in force.
     let (reply, received) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: global_speed(0),
+            action: global_speed(None),
             reply,
         })
         .await;
     received.await.unwrap();
-    assert_eq!(pipeline.scheduled_rate_limit, Some(0));
-    assert_eq!(pipeline.rate_limiter.rate(), 0);
+    assert_eq!(pipeline.rate_limiter.rate(), Some(768 * 1024));
     assert!(pipeline.global_paused);
+
+    // A schedule's zero lets nothing through.
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ApplyScheduleAction {
+            action: global_speed(Some(0)),
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert_eq!(pipeline.rate_limiter.rate(), Some(0));
 }
 
 #[tokio::test]
@@ -2127,7 +2151,7 @@ async fn active_rate_limit_does_not_prelease_multiple_bodies() {
     let spec = standalone_job_spec("Rate Limited Lease", &files);
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    pipeline.rate_limiter.set_rate(128 * 1024);
+    pipeline.rate_limiter.set_rate(Some(128 * 1024));
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 1);
@@ -2146,7 +2170,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
         segment_number: 0,
     };
 
-    pipeline.rate_limiter.set_rate(1_000);
+    pipeline.rate_limiter.set_rate(Some(1_000));
     pipeline.rate_limiter.refund(1_000);
     pipeline.rate_limiter.consume(1_500);
     pipeline.rate_limit_reservations.insert(segment_id, 1_500);
@@ -2185,7 +2209,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
         segment_number: 0,
     };
 
-    pipeline.rate_limiter.set_rate(1_000);
+    pipeline.rate_limiter.set_rate(Some(1_000));
     pipeline.rate_limiter.refund(1_000);
     pipeline.rate_limiter.consume(500);
     pipeline.rate_limit_reservations.insert(segment_id, 500);
@@ -2880,34 +2904,37 @@ async fn an_operator_speed_limit_replaces_the_scheduled_one_until_the_next_rule_
         )
     };
 
-    let (command, received) = apply(global_speed(128 * 1024));
+    let (command, received) = apply(global_speed(Some(128 * 1024)));
     pipeline.handle_command(command).await;
     received.await.unwrap();
-    assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+    assert_eq!(pipeline.rate_limiter.rate(), Some(128 * 1024));
 
     // The operator sets a limit: it is in force at once.
     let (reply, received) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::SetSpeedLimit {
-            bytes_per_sec: 640 * 1024,
+        .handle_command(SchedulerCommand::SetBandwidth {
+            bandwidth: download_bandwidth(640 * 1024),
             replaces_schedule: true,
             reply,
         })
         .await;
     received.await.unwrap();
-    assert_eq!(pipeline.scheduled_rate_limit, None);
-    assert_eq!(pipeline.configured_rate_limit, 640 * 1024);
-    assert_eq!(pipeline.rate_limiter.rate(), 640 * 1024);
+    assert_eq!(pipeline.scheduled_bandwidth, None);
+    assert_eq!(pipeline.configured_bandwidth, download_bandwidth(640 * 1024));
+    assert_eq!(pipeline.rate_limiter.rate(), Some(640 * 1024));
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
-        0
+        None
     );
 
     // The next scheduled speed rule takes over again.
-    let (command, received) = apply(global_speed(256 * 1024));
+    let (command, received) = apply(global_speed(Some(256 * 1024)));
     pipeline.handle_command(command).await;
     received.await.unwrap();
-    assert_eq!(pipeline.scheduled_rate_limit, Some(256 * 1024));
-    assert_eq!(pipeline.rate_limiter.rate(), 256 * 1024);
-    assert_eq!(pipeline.configured_rate_limit, 640 * 1024);
+    assert_eq!(
+        pipeline.scheduled_bandwidth,
+        Some(download_bandwidth(256 * 1024))
+    );
+    assert_eq!(pipeline.rate_limiter.rate(), Some(256 * 1024));
+    assert_eq!(pipeline.configured_bandwidth, download_bandwidth(640 * 1024));
 }

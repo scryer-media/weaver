@@ -49,6 +49,7 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     // Background HTTP requests also count toward egress usage on a fresh
     // instance. Job state and NNTP usage below guard against replacing downloads.
     table!("egress_download_usage", Export, Replace),
+    table!("network_bandwidth", Export, Replace),
     table!("proxy_pools", Export, RequireEmpty),
     table!("server_download_usage", Export, RequireZeroUsage),
     table!("server_tls_diagnostics", Export, Replace),
@@ -118,6 +119,12 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("graph_crypt", ResetOnRestore, RequireEmpty),
     table!("graph_recovery", ResetOnRestore, RequireEmpty),
     table!("graph_holds", ResetOnRestore, RequireEmpty),
+    // A torrent's rows describe its files in storage, which a database
+    // restore does not bring back.
+    table!("torrents", ResetOnRestore, RequireEmpty),
+    table!("torrent_files", ResetOnRestore, RequireEmpty),
+    table!("torrent_trackers", ResetOnRestore, RequireEmpty),
+    table!("torrent_counters", ResetOnRestore, RequireEmpty),
     table!("integration_events", ResetOnRestore, Replace),
     table!("metrics_history_chunks", ResetOnRestore, Replace),
     table!("async_operations", ResetOnRestore, Replace),

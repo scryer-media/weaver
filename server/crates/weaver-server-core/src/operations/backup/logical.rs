@@ -20,8 +20,8 @@ use super::catalog::{
 };
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
-    egress_quotas_v53, proxy_resolver_v64, script_concurrency_v58, script_instances_v55,
-    unwanted_extensions_v56,
+    egress_quotas_v53, networking_bandwidth_v69, proxy_resolver_v64, script_concurrency_v58,
+    script_instances_v55, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
@@ -851,6 +851,7 @@ async fn import_sqlite(
                 &tables_dir.join(format!("{table}.ndjson")),
                 expected.get(table).expect("validated import table"),
                 allow_older_catalog,
+                source_schema_version,
             )
             .await?;
         }
@@ -901,7 +902,9 @@ async fn import_sqlite(
         .await?;
         fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
             .await?;
-        name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
+        name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
+            .await?;
+        move_older_bandwidth_limits(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
     }
     .await;
     match result {
@@ -955,6 +958,7 @@ async fn import_postgres(
             &tables_dir.join(format!("{table}.ndjson")),
             expected.get(table).expect("validated import table"),
             allow_older_catalog,
+            source_schema_version,
         )
         .await?;
     }
@@ -996,12 +1000,14 @@ async fn import_postgres(
     .await?;
     fill_older_unwanted_extensions(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     name_older_proxy_resolvers(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
+    move_older_bandwidth_limits(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     tx.commit().await.map_err(db_err)
 }
 
 // A bundle written before egresses kept download quotas can carry the
-// bandwidth cap they replaced. No migration runs over a restore, so the step
-// that moves the cap onto the System egress on an upgrade is run here instead.
+// bandwidth cap they replaced. No migration runs over a restore, so the cap
+// is moved onto the System egress here, in the columns its quota is kept in
+// now.
 async fn move_older_bandwidth_cap(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
@@ -1012,7 +1018,7 @@ async fn move_older_bandwidth_cap(
     {
         return Ok(());
     }
-    egress_quotas_v53::move_isp_cap_to_system_egress(conn).await
+    networking_bandwidth_v69::move_older_cap(conn).await
 }
 
 // A bundle written before there were script instances carries the wiring
@@ -1063,8 +1069,41 @@ async fn name_older_proxy_resolvers(
     Ok(())
 }
 
+// A bundle written before bandwidth limits were kept in networking carries
+// the global limit as a setting and spells no limit as zero. No migration
+// runs over a restore, so the step that moves them on an upgrade is run here
+// instead.
+async fn move_older_bandwidth_limits(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+) -> Result<(), StateError> {
+    if source_schema_version < networking_bandwidth_v69::SCHEMA_VERSION {
+        networking_bandwidth_v69::move_bandwidth_to_networking(conn).await?;
+    }
+    Ok(())
+}
+
+// A row of an older bundle, in the columns this schema keeps it in. Column
+// lists are mapped by the same rule, as rows of nulls.
+fn upgrade_older_row(table: &str, source_schema_version: i64, row: &mut JsonMap<String, JsonValue>) {
+    if table == "egress_interfaces"
+        && source_schema_version < networking_bandwidth_v69::SCHEMA_VERSION
+    {
+        networking_bandwidth_v69::upgrade_egress_row(row);
+    }
+}
+
+fn upgrade_older_columns(table: &str, source_schema_version: i64, columns: &[String]) -> Vec<String> {
+    let mut row = columns
+        .iter()
+        .map(|column| (column.clone(), JsonValue::Null))
+        .collect::<JsonMap<_, _>>();
+    upgrade_older_row(table, source_schema_version, &mut row);
+    row.into_iter().map(|(column, _)| column).collect()
+}
+
 const EGRESS_CATALOG_SCHEMA_VERSION: i64 = 53;
-const SYSTEM_EGRESS_SEED: &str = "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, created_at, updated_at) VALUES (0, 'System', 'system', NULL, TRUE, 0, 0, 0)";
+const SYSTEM_EGRESS_SEED: &str = "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, created_at, updated_at) VALUES (0, 'System', 'system', NULL, TRUE, 0, 0)";
 
 // Chooses the tables to restore, in dependency order. A bundle from the
 // current schema must carry exactly the export catalog. A bundle from an older
@@ -1120,14 +1159,15 @@ async fn import_sqlite_table(
     path: &Path,
     source: &TablePartMetadata,
     allow_older_catalog: bool,
+    source_schema_version: i64,
 ) -> Result<(), StateError> {
+    let source_columns = upgrade_older_columns(table, source_schema_version, &source.columns);
     let target_columns = sqlite_import_column_info(conn, table).await?;
     let target = target_columns
         .iter()
         .map(|column| column.name.clone())
         .collect::<BTreeSet<_>>();
-    let unknown = source
-        .columns
+    let unknown = source_columns
         .iter()
         .filter(|column| !target.contains(*column))
         .cloned()
@@ -1138,7 +1178,7 @@ async fn import_sqlite_table(
             unknown.join(", ")
         )));
     }
-    let source_columns = source.columns.iter().collect::<BTreeSet<_>>();
+    let source_columns = source_columns.iter().collect::<BTreeSet<_>>();
     let missing = target_columns
         .iter()
         .filter(|column| !source_columns.contains(&column.name))
@@ -1152,7 +1192,8 @@ async fn import_sqlite_table(
         )));
     }
     for row in read_ndjson_rows(path)? {
-        let (line_number, object) = row?;
+        let (line_number, mut object) = row?;
+        upgrade_older_row(table, source_schema_version, &mut object);
         let columns = object
             .keys()
             .filter(|column| target.contains(*column))
@@ -1194,14 +1235,15 @@ async fn import_postgres_table(
     path: &Path,
     source: &TablePartMetadata,
     allow_older_catalog: bool,
+    source_schema_version: i64,
 ) -> Result<(), StateError> {
+    let source_columns = upgrade_older_columns(table, source_schema_version, &source.columns);
     let target = postgres_column_info(tx, table).await?;
     let target_names = target
         .iter()
         .map(|column| column.name.as_str())
         .collect::<BTreeSet<_>>();
-    let unknown = source
-        .columns
+    let unknown = source_columns
         .iter()
         .filter(|column| !target_names.contains(column.as_str()))
         .cloned()
@@ -1212,8 +1254,7 @@ async fn import_postgres_table(
             unknown.join(", ")
         )));
     }
-    let source_columns = source
-        .columns
+    let source_columns = source_columns
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
@@ -1230,7 +1271,8 @@ async fn import_postgres_table(
         )));
     }
     for row in read_ndjson_rows(path)? {
-        let (line_number, object) = row?;
+        let (line_number, mut object) = row?;
+        upgrade_older_row(table, source_schema_version, &mut object);
         let columns = target
             .iter()
             .filter(|column| object.contains_key(&column.name))
@@ -2276,7 +2318,14 @@ mod logical_reader_tests {
             checksum: String::new(),
         };
 
-        let error = import_sqlite_table(&mut conn, "rejected", &row_path, &metadata, true)
+        let error = import_sqlite_table(
+            &mut conn,
+            "rejected",
+            &row_path,
+            &metadata,
+            true,
+            networking_bandwidth_v69::SCHEMA_VERSION,
+        )
             .await
             .unwrap_err();
         assert!(
@@ -2285,7 +2334,14 @@ mod logical_reader_tests {
                 .contains("required target columns: required")
         );
 
-        import_sqlite_table(&mut conn, "accepted", &row_path, &metadata, true)
+        import_sqlite_table(
+            &mut conn,
+            "accepted",
+            &row_path,
+            &metadata,
+            true,
+            networking_bandwidth_v69::SCHEMA_VERSION,
+        )
             .await
             .unwrap();
         let restored: (Option<String>, String) =

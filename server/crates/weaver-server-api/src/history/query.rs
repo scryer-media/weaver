@@ -987,6 +987,7 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
 
     JobInfo {
         job_id: JobId(row.job_id),
+        protocol: row.protocol,
         job_hash: row.job_hash.as_ref().and_then(|value| {
             (value.len() == 32).then(|| {
                 let mut hash = [0u8; 32];
@@ -1035,6 +1036,7 @@ mod tests {
 
     fn history_row(job_id: u64, status: &str, completed_at: i64) -> JobHistoryRow {
         JobHistoryRow {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id,
             job_hash: None,
             name: format!("Release.{job_id}.1080p.WEB"),

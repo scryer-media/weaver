@@ -948,7 +948,7 @@ async fn a_refill_handout_is_two_ring_turns_deep() {
 
     // A limited link activates its reservations after the lease is finalized,
     // so every refill has to see the balance the last one left behind.
-    pipeline.rate_limiter.set_rate(1);
+    pipeline.rate_limiter.set_rate(Some(1));
     assert!(pipeline.rate_limiter.is_limited());
     assert_eq!(
         pipeline.download_refill_want(DownloadLaneMode::Pipelined { depth: 8 }),
@@ -4027,9 +4027,8 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
         .into_iter()
         .find(|egress| egress.id == crate::proxies::SYSTEM_EGRESS_ID)
         .expect("the system egress is seeded");
-    system.download_quota = crate::servers::ServerDownloadQuotaConfig {
-        enabled: true,
-        limit_bytes: 128,
+    system.quota = crate::proxies::EgressQuota {
+        download_bytes: Some(128),
         period: crate::servers::ServerDownloadQuotaPeriod::OneTime,
         ..Default::default()
     };

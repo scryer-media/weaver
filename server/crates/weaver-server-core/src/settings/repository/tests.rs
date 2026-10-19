@@ -88,6 +88,24 @@ fn config_roundtrip() {
     let db = Database::open_in_memory().unwrap();
 
     let config = Config {
+        seeding: Some(crate::settings::SeedingPolicy {
+            ratio_goal: Some(2.5),
+            seed_time_goal_minutes: Some(1_440),
+            inactive_goal_minutes: None,
+            mode: crate::settings::SeedingGoalMode::All,
+            action: crate::settings::SeedingAction::Remove,
+            max_upload_bps: Some(500_000),
+        }),
+        torrent: crate::settings::TorrentConfig {
+            enabled: true,
+            base_port: 51_413,
+            announce_port: Some(40_000),
+            upnp: false,
+            encryption: crate::settings::TorrentEncryption::Require,
+            max_active_downloads: 7,
+            max_peers_total: 120,
+            session_dir: Some("/data/session".into()),
+        },
         data_dir: "/tmp/weaver".to_string(),
         hardware_profile: None,
         intermediate_dir: Some("/tmp/intermediate".to_string()),
@@ -120,13 +138,18 @@ fn config_roundtrip() {
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
+            seeding: Some(crate::settings::SeedingPolicy {
+                ratio_goal: Some(1.0),
+                ..Default::default()
+            }),
+            torrent_route: true,
             id: 1,
             name: "Movies".to_string(),
             dest_dir: Some("/media/movies".to_string()),
             aliases: "movie*, film*".to_string(),
         }],
         retry: None,
-        max_download_speed: Some(1_000_000),
+        bandwidth: crate::proxies::Bandwidth { download_bps: Some(1_000_000), upload_bps: None },
         propagation_delay_secs: None,
         cleanup_after_extract: Some(false),
         watch_folder: crate::watch_folder::WatchFolderConfig {
@@ -165,7 +188,7 @@ fn config_roundtrip() {
         Some("/tmp/intermediate".to_string())
     );
     assert_eq!(loaded.complete_dir, Some("/tmp/complete".to_string()));
-    assert_eq!(loaded.max_download_speed, Some(1_000_000));
+    assert_eq!(loaded.bandwidth.download_bps, Some(1_000_000));
     assert_eq!(loaded.servers[0].max_download_speed, 4_000_000);
     assert_eq!(
         loaded.servers[0].download_quota,
@@ -189,6 +212,10 @@ fn config_roundtrip() {
         Some("/media/movies".to_string())
     );
     assert_eq!(loaded.categories[0].aliases, "movie*, film*");
+    assert_eq!(loaded.categories[0].seeding, config.categories[0].seeding);
+    assert!(loaded.categories[0].torrent_route);
+    assert_eq!(loaded.seeding, config.seeding);
+    assert_eq!(loaded.torrent, config.torrent);
     // Direct-store's switches are ordinary settings rows, so
     // they survive a save/load like everything else here.
     let direct_store = loaded
@@ -306,6 +333,8 @@ fn category_crud() {
     let db = Database::open_in_memory().unwrap();
 
     let cat = CategoryConfig {
+        seeding: None,
+        torrent_route: false,
         id: 1,
         name: "TV".to_string(),
         dest_dir: None,
@@ -333,4 +362,47 @@ fn category_crud() {
 fn next_category_id_empty() {
     let db = Database::open_in_memory().unwrap();
     assert_eq!(db.next_category_id().unwrap(), 1);
+}
+
+#[test]
+fn a_database_without_torrent_settings_loads_the_defaults() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_category(&CategoryConfig {
+        id: 1,
+        name: "TV".to_string(),
+        dest_dir: None,
+        aliases: String::new(),
+        seeding: None,
+        torrent_route: false,
+    })
+    .unwrap();
+
+    let loaded = db.load_config().unwrap();
+    assert_eq!(loaded.seeding, None);
+    assert_eq!(loaded.torrent, crate::settings::TorrentConfig::default());
+    assert_eq!(loaded.categories[0].seeding, None);
+    assert!(!loaded.categories[0].torrent_route);
+}
+
+#[test]
+fn clearing_the_global_seeding_policy_removes_it() {
+    let db = Database::open_in_memory().unwrap();
+    let policy = crate::settings::SeedingPolicy {
+        ratio_goal: Some(1.0),
+        inactive_goal_minutes: Some(60),
+        ..Default::default()
+    };
+    db.save_seeding_policy(Some(&policy)).unwrap();
+    assert_eq!(db.load_config().unwrap().seeding, Some(policy));
+
+    // Dropping one goal removes only that goal.
+    let narrower = crate::settings::SeedingPolicy {
+        inactive_goal_minutes: None,
+        ..policy
+    };
+    db.save_seeding_policy(Some(&narrower)).unwrap();
+    assert_eq!(db.load_config().unwrap().seeding, Some(narrower));
+
+    db.save_seeding_policy(None).unwrap();
+    assert_eq!(db.load_config().unwrap().seeding, None);
 }

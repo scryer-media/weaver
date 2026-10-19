@@ -91,6 +91,7 @@ fn accepted(admission: DuplicateAdmission) -> (weaver_server_core::JobId, Duplic
 
 fn history(job_id: u64, status: &str) -> JobHistoryRow {
     JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: "The.Release-Name".to_string(),

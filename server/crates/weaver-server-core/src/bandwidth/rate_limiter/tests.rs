@@ -13,7 +13,7 @@ fn freeze_refill(bucket: &mut TokenBucket) {
 
 #[test]
 fn unlimited_never_waits() {
-    let mut bucket = TokenBucket::new(0);
+    let mut bucket = TokenBucket::new(None);
     bucket.consume(1_000_000_000);
     assert!(!bucket.should_wait());
     assert_eq!(bucket.time_until_ready(), Duration::ZERO);
@@ -21,7 +21,7 @@ fn unlimited_never_waits() {
 
 #[test]
 fn limited_waits_after_exhaustion() {
-    let mut bucket = TokenBucket::new(1_000);
+    let mut bucket = TokenBucket::new(Some(1_000));
     // Consume more than capacity to guarantee negative balance.
     freeze_refill(&mut bucket);
     bucket.consume(1_500);
@@ -31,7 +31,7 @@ fn limited_waits_after_exhaustion() {
 
 #[test]
 fn refill_over_time() {
-    let mut bucket = TokenBucket::new(10_000);
+    let mut bucket = TokenBucket::new(Some(10_000));
     // Consume more than capacity to go clearly negative.
     freeze_refill(&mut bucket);
     bucket.consume(11_000);
@@ -51,7 +51,7 @@ fn refill_over_time() {
 
 #[test]
 fn time_until_ready() {
-    let mut bucket = TokenBucket::new(1_000);
+    let mut bucket = TokenBucket::new(Some(1_000));
     // Consume 1500 to create exactly a 500 token deficit.
     freeze_refill(&mut bucket);
     bucket.consume(1_500);
@@ -63,11 +63,11 @@ fn time_until_ready() {
 
 #[test]
 fn set_rate_changes_limit() {
-    let mut bucket = TokenBucket::new(0);
+    let mut bucket = TokenBucket::new(None);
     assert!(!bucket.is_limited());
 
     freeze_refill(&mut bucket);
-    bucket.set_rate(1_000);
+    bucket.set_rate(Some(1_000));
     assert!(bucket.is_limited());
 
     freeze_refill(&mut bucket);
@@ -77,15 +77,15 @@ fn set_rate_changes_limit() {
 }
 
 #[test]
-fn set_rate_to_zero_unlimited() {
-    let mut bucket = TokenBucket::new(1_000);
+fn set_rate_to_none_unlimited() {
+    let mut bucket = TokenBucket::new(Some(1_000));
     freeze_refill(&mut bucket);
     bucket.consume(1_500);
     freeze_refill(&mut bucket);
     assert!(bucket.should_wait());
 
     freeze_refill(&mut bucket);
-    bucket.set_rate(0);
+    bucket.set_rate(None);
     assert!(!bucket.is_limited());
     freeze_refill(&mut bucket);
     assert!(!bucket.should_wait());
@@ -93,7 +93,7 @@ fn set_rate_to_zero_unlimited() {
 
 #[test]
 fn negative_balance_recovery() {
-    let mut bucket = TokenBucket::new(1_000);
+    let mut bucket = TokenBucket::new(Some(1_000));
     // Consume 2x capacity — deficit of 1000 tokens.
     freeze_refill(&mut bucket);
     bucket.consume(2_000);
@@ -106,7 +106,7 @@ fn negative_balance_recovery() {
 
 #[test]
 fn refund_reduces_wait_without_exceeding_capacity() {
-    let mut bucket = TokenBucket::new(1_000);
+    let mut bucket = TokenBucket::new(Some(1_000));
     freeze_refill(&mut bucket);
     bucket.consume(1_500);
     freeze_refill(&mut bucket);
@@ -132,7 +132,7 @@ fn refund_reduces_wait_without_exceeding_capacity() {
 // bucket never sees them.
 #[test]
 fn a_global_speed_limit_holds_downloads_an_egress_or_provider_would_let_through() {
-    let mut global = TokenBucket::new(1_000);
+    let mut global = TokenBucket::new(Some(1_000));
     // Two bodies that a 4000 B/s provider behind an 8000 B/s egress would
     // read in half a second.
     for _ in 0..2 {
@@ -147,7 +147,7 @@ fn a_global_speed_limit_holds_downloads_an_egress_or_provider_would_let_through(
 
 #[test]
 fn reconcile_adjusts_estimate_to_actual_bytes() {
-    let mut bucket = TokenBucket::new(1_000);
+    let mut bucket = TokenBucket::new(Some(1_000));
     freeze_refill(&mut bucket);
     bucket.consume(500);
     freeze_refill(&mut bucket);
@@ -159,4 +159,21 @@ fn reconcile_adjusts_estimate_to_actual_bytes() {
     bucket.reconcile(1_200, 100);
     freeze_refill(&mut bucket);
     assert!(!bucket.should_wait());
+}
+
+#[test]
+fn a_zero_rate_lets_nothing_through() {
+    let mut bucket = TokenBucket::new(Some(0));
+    assert!(bucket.is_limited());
+    assert!(bucket.should_wait());
+    assert!(bucket.time_until_ready() > Duration::ZERO);
+    bucket.refund(1_000_000);
+    assert!(bucket.should_wait());
+
+    freeze_refill(&mut bucket);
+    bucket.set_rate(Some(1_000));
+    freeze_refill(&mut bucket);
+    assert!(!bucket.should_wait());
+    bucket.set_rate(Some(0));
+    assert!(bucket.should_wait());
 }

@@ -19,6 +19,7 @@ use std::fmt;
 use weaver_graph::{Builder, Effect, NodeId};
 
 use super::GraphJob;
+use crate::pipeline::graph::root::Root;
 
 #[derive(Default)]
 pub(super) struct Passwords {
@@ -78,7 +79,7 @@ impl Passwords {
     }
 }
 
-impl GraphJob {
+impl<R: Root> GraphJob<R> {
     // How many candidates each node has been offered, by node.
     #[cfg(test)]
     pub(crate) fn passwords_offered(&self) -> BTreeMap<NodeId, usize> {

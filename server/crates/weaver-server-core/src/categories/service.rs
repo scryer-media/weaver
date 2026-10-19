@@ -20,15 +20,15 @@ impl Database {
                     Box::pin(async move {
                         tx.execute("DELETE FROM categories", &[]).await?;
                         for category in categories {
-                            let record = crate::categories::record::CategoryRecord::from_config(&category);
+                            let args =
+                                crate::categories::record::CategoryRecord::from_config(&category)
+                                    .into_args()?;
                             tx.execute(
-                                "INSERT INTO categories (id, name, dest_dir, aliases) VALUES ({}, {}, {}, {})",
-                                &[
-                                    crate::persistence::sql_runtime::SqlArg::I64(i64::from(record.id)),
-                                    crate::persistence::sql_runtime::SqlArg::Text(record.name),
-                                    crate::persistence::sql_runtime::SqlArg::OptText(record.dest_dir),
-                                    crate::persistence::sql_runtime::SqlArg::Text(record.aliases),
-                                ],
+                                &format!(
+                                    "INSERT INTO categories ({}) VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}})",
+                                    crate::categories::record::CATEGORY_COLUMNS
+                                ),
+                                &args,
                             )
                             .await?;
                         }

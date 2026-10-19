@@ -391,6 +391,8 @@ mod tests {
 
     fn empty_config() -> Config {
         Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: String::new(),
             hardware_profile: None,
             intermediate_dir: None,

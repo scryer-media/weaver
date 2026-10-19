@@ -8,39 +8,50 @@ use std::time::{Duration, Instant};
 // Tokens represent bytes. The bucket refills at `rate` bytes/sec up to a
 // capacity of 1 second of bandwidth. Consuming more tokens than available
 // drives the balance negative — callers should wait before consuming more.
+//
+// A rate of `None` is no limit. A rate of `Some(0)` lets nothing through:
+// the bucket never refills and callers always wait.
 pub struct TokenBucket {
     tokens: f64,
-    rate: f64,
+    rate: Option<u64>,
     capacity: f64,
     last_refill: Instant,
 }
 
+// How long a closed bucket reports until it is ready. It never refills; the
+// change that reopens it wakes its caller first.
+const CLOSED_WAIT: Duration = Duration::from_secs(3600);
+
 impl TokenBucket {
-    // Create a new rate limiter. `rate` is bytes/sec; 0 means unlimited.
-    pub fn new(rate: u64) -> Self {
-        let rate_f = rate as f64;
+    pub fn new(rate: Option<u64>) -> Self {
+        let capacity = rate.unwrap_or(0) as f64;
         Self {
-            tokens: rate_f,
-            rate: rate_f,
-            capacity: rate_f,
+            tokens: capacity,
+            rate,
+            capacity,
             last_refill: Instant::now(),
         }
     }
 
+    // The refill rate of a bucket that is limited and open.
+    fn flowing(&self) -> Option<f64> {
+        self.rate.filter(|&rate| rate > 0).map(|rate| rate as f64)
+    }
+
     // Refill tokens based on elapsed time since last refill.
     fn refill(&mut self) {
-        if self.rate <= 0.0 {
+        let Some(rate) = self.flowing() else {
             return;
-        }
+        };
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.last_refill = now;
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+        self.tokens = (self.tokens + elapsed * rate).min(self.capacity);
     }
 
     // Consume `bytes` tokens. May drive balance negative.
     pub fn consume(&mut self, bytes: u64) {
-        if self.rate <= 0.0 {
+        if self.flowing().is_none() {
             return;
         }
         self.refill();
@@ -49,7 +60,7 @@ impl TokenBucket {
 
     // Refund previously consumed bytes, capped at the bucket capacity.
     pub fn refund(&mut self, bytes: u64) {
-        if self.rate <= 0.0 {
+        if self.flowing().is_none() {
             return;
         }
         self.refill();
@@ -65,47 +76,53 @@ impl TokenBucket {
         }
     }
 
-    // Returns true if the caller should wait (balance < 0 and rate limiting is active).
+    // Returns true if the caller should wait: the bucket is closed, or
+    // limited with a balance below zero.
     pub fn should_wait(&mut self) -> bool {
-        if self.rate <= 0.0 {
-            return false;
+        match self.rate {
+            None => false,
+            Some(0) => true,
+            Some(_) => {
+                self.refill();
+                self.tokens < 0.0
+            }
         }
-        self.refill();
-        self.tokens < 0.0
     }
 
-    // Duration until enough tokens are available. Returns `Duration::ZERO` if ready or unlimited.
+    // Duration until enough tokens are available. Returns `Duration::ZERO`
+    // if ready or unlimited.
     pub fn time_until_ready(&mut self) -> Duration {
-        if self.rate <= 0.0 {
+        let Some(rate) = self.rate else {
             return Duration::ZERO;
+        };
+        if rate == 0 {
+            return CLOSED_WAIT;
         }
         self.refill();
         if self.tokens >= 0.0 {
             return Duration::ZERO;
         }
-        Duration::from_secs_f64(-self.tokens / self.rate)
+        Duration::from_secs_f64(-self.tokens / rate as f64)
     }
 
-    // Update the rate limit. 0 means unlimited.
-    pub fn set_rate(&mut self, rate: u64) {
+    // Update the rate limit.
+    pub fn set_rate(&mut self, rate: Option<u64>) {
         self.refill();
-        let rate_f = rate as f64;
-        self.rate = rate_f;
-        self.capacity = rate_f;
+        self.rate = rate;
+        self.capacity = rate.unwrap_or(0) as f64;
         // Clamp existing tokens to new capacity (if capacity decreased).
-        if rate_f > 0.0 {
+        if rate.is_some() {
             self.tokens = self.tokens.min(self.capacity);
         }
     }
 
-    // Current rate in bytes/sec. 0 means unlimited.
-    pub fn rate(&self) -> u64 {
-        self.rate as u64
+    pub fn rate(&self) -> Option<u64> {
+        self.rate
     }
 
-    // Whether rate limiting is active (rate > 0).
+    // Whether rate limiting is active.
     pub fn is_limited(&self) -> bool {
-        self.rate > 0.0
+        self.rate.is_some()
     }
 }
 

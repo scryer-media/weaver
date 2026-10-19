@@ -121,6 +121,7 @@ fn history_report_carries_the_outcome_and_no_names() {
     db.archive_job(
         JobId(7),
         &JobHistoryRow {
+            protocol: crate::jobs::Protocol::Nzb,
             job_id: 7,
             job_hash: None,
             name: SENTINEL.to_string(),
@@ -170,6 +171,7 @@ fn history_report_carries_the_outcome_and_no_names() {
 
 fn live_info(id: u64) -> JobInfo {
     JobInfo {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: JobId(id),
         job_hash: None,
         name: SENTINEL.to_string(),
@@ -283,6 +285,7 @@ fn failure_messages_reduce_to_a_cause() {
 
 fn history_row(id: u64, status: &str) -> JobHistoryRow {
     JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: id,
         job_hash: None,
         name: SENTINEL.to_string(),

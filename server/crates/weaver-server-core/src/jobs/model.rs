@@ -322,6 +322,14 @@ pub enum JobStatus {
     Partial,
     Failed { error: String },
     Paused,
+    // A magnet link is asking its peers for the torrent's metainfo.
+    FetchingMetadata,
+    // A torrent's pieces already on disk are being hashed.
+    CheckingFiles,
+    // A finished torrent is uploading to its peers.
+    Seeding,
+    // A torrent that is downloading has no peer sending it data.
+    Stalled,
 }
 
 impl JobStatus {
@@ -343,6 +351,10 @@ impl JobStatus {
             Self::Partial => "partial",
             Self::Failed { .. } => "failed",
             Self::Paused => "paused",
+            Self::FetchingMetadata => "fetching_metadata",
+            Self::CheckingFiles => "checking_files",
+            Self::Seeding => "seeding",
+            Self::Stalled => "stalled",
         }
     }
 
@@ -535,6 +547,10 @@ pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobSt
             error: error.unwrap_or("unknown error").to_string(),
         },
         "paused" => JobStatus::Paused,
+        "fetching_metadata" => JobStatus::FetchingMetadata,
+        "checking_files" => JobStatus::CheckingFiles,
+        "seeding" => JobStatus::Seeding,
+        "stalled" => JobStatus::Stalled,
         "cancelled" => JobStatus::Failed {
             error: "cancelled".to_string(),
         },
@@ -607,6 +623,42 @@ pub fn runtime_lanes_from_status_snapshot(
         ),
         JobStatus::Failed { .. } => (DownloadState::Failed, PostState::Failed, RunState::Active),
         JobStatus::Paused => (DownloadState::Queued, PostState::Idle, RunState::Paused),
+        JobStatus::FetchingMetadata | JobStatus::Stalled => (
+            DownloadState::Downloading,
+            PostState::Idle,
+            RunState::Active,
+        ),
+        JobStatus::CheckingFiles => (DownloadState::Checking, PostState::Idle, RunState::Active),
+        JobStatus::Seeding => (
+            DownloadState::Complete,
+            PostState::Completed,
+            RunState::Active,
+        ),
+    }
+}
+
+// What a job downloads over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Protocol {
+    #[default]
+    Nzb,
+    Torrent,
+}
+
+impl Protocol {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nzb => "nzb",
+            Self::Torrent => "torrent",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "nzb" => Some(Self::Nzb),
+            "torrent" => Some(Self::Torrent),
+            _ => None,
+        }
     }
 }
 

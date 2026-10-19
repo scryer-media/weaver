@@ -158,6 +158,9 @@ pub struct GeneralSettings {
     pub enable_srrdb_lookup: bool,
     pub watch_folder: WatchFolderSettings,
     pub duplicate_policy: DuplicatePolicySettings,
+    // The global seeding policy, absent when none is set.
+    pub seeding: Option<SeedingPolicySettings>,
+    pub torrent: TorrentSettings,
 }
 
 #[derive(Debug, InputObject)]
@@ -171,6 +174,9 @@ pub struct GeneralSettingsInput {
     pub enable_srrdb_lookup: Option<bool>,
     pub watch_folder: Option<WatchFolderSettingsInput>,
     pub duplicate_policy: Option<DuplicatePolicySettingsInput>,
+    // Replaces the global seeding policy; null removes it.
+    pub seeding: MaybeUndefined<SeedingPolicyInput>,
+    pub torrent: Option<TorrentSettingsInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
@@ -967,5 +973,241 @@ mod schedule_input_tests {
             delete_files: false,
         });
         rule.validate(&probe()).unwrap();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "SeedingGoalMode")]
+pub enum SeedingGoalModeGql {
+    #[default]
+    Any,
+    All,
+}
+
+impl From<weaver_server_core::settings::SeedingGoalMode> for SeedingGoalModeGql {
+    fn from(value: weaver_server_core::settings::SeedingGoalMode) -> Self {
+        use weaver_server_core::settings::SeedingGoalMode;
+        match value {
+            SeedingGoalMode::Any => Self::Any,
+            SeedingGoalMode::All => Self::All,
+        }
+    }
+}
+
+impl From<SeedingGoalModeGql> for weaver_server_core::settings::SeedingGoalMode {
+    fn from(value: SeedingGoalModeGql) -> Self {
+        match value {
+            SeedingGoalModeGql::Any => Self::Any,
+            SeedingGoalModeGql::All => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "SeedingAction")]
+pub enum SeedingActionGql {
+    #[default]
+    Stop,
+    Remove,
+    RemoveWithData,
+}
+
+impl From<weaver_server_core::settings::SeedingAction> for SeedingActionGql {
+    fn from(value: weaver_server_core::settings::SeedingAction) -> Self {
+        use weaver_server_core::settings::SeedingAction;
+        match value {
+            SeedingAction::Stop => Self::Stop,
+            SeedingAction::Remove => Self::Remove,
+            SeedingAction::RemoveWithData => Self::RemoveWithData,
+        }
+    }
+}
+
+impl From<SeedingActionGql> for weaver_server_core::settings::SeedingAction {
+    fn from(value: SeedingActionGql) -> Self {
+        match value {
+            SeedingActionGql::Stop => Self::Stop,
+            SeedingActionGql::Remove => Self::Remove,
+            SeedingActionGql::RemoveWithData => Self::RemoveWithData,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, SimpleObject)]
+pub struct SeedingPolicySettings {
+    pub ratio_goal: Option<f32>,
+    pub seed_time_goal_minutes: Option<u32>,
+    pub inactive_goal_minutes: Option<u32>,
+    pub mode: SeedingGoalModeGql,
+    pub action: SeedingActionGql,
+    pub max_upload_bps: Option<u64>,
+}
+
+impl From<weaver_server_core::settings::SeedingPolicy> for SeedingPolicySettings {
+    fn from(value: weaver_server_core::settings::SeedingPolicy) -> Self {
+        Self {
+            ratio_goal: value.ratio_goal,
+            seed_time_goal_minutes: value.seed_time_goal_minutes,
+            inactive_goal_minutes: value.inactive_goal_minutes,
+            mode: value.mode.into(),
+            action: value.action.into(),
+            max_upload_bps: value.max_upload_bps,
+        }
+    }
+}
+
+// A whole policy: a goal left out is not set at this level.
+#[derive(Debug, Clone, Copy, InputObject)]
+pub struct SeedingPolicyInput {
+    pub ratio_goal: Option<f32>,
+    pub seed_time_goal_minutes: Option<u32>,
+    pub inactive_goal_minutes: Option<u32>,
+    #[graphql(default)]
+    pub mode: SeedingGoalModeGql,
+    #[graphql(default)]
+    pub action: SeedingActionGql,
+    pub max_upload_bps: Option<u64>,
+}
+
+impl SeedingPolicyInput {
+    pub fn into_policy(self) -> async_graphql::Result<weaver_server_core::settings::SeedingPolicy> {
+        if self
+            .ratio_goal
+            .is_some_and(|ratio| !ratio.is_finite() || ratio < 0.0)
+        {
+            return Err(async_graphql::Error::new(
+                "a ratio goal must be zero or more",
+            ));
+        }
+        Ok(weaver_server_core::settings::SeedingPolicy {
+            ratio_goal: self.ratio_goal,
+            seed_time_goal_minutes: self.seed_time_goal_minutes,
+            inactive_goal_minutes: self.inactive_goal_minutes,
+            mode: self.mode.into(),
+            action: self.action.into(),
+            max_upload_bps: self.max_upload_bps,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentEncryption")]
+pub enum TorrentEncryptionGql {
+    #[default]
+    Prefer,
+    Require,
+}
+
+impl From<weaver_server_core::settings::TorrentEncryption> for TorrentEncryptionGql {
+    fn from(value: weaver_server_core::settings::TorrentEncryption) -> Self {
+        use weaver_server_core::settings::TorrentEncryption;
+        match value {
+            TorrentEncryption::Prefer => Self::Prefer,
+            TorrentEncryption::Require => Self::Require,
+        }
+    }
+}
+
+impl From<TorrentEncryptionGql> for weaver_server_core::settings::TorrentEncryption {
+    fn from(value: TorrentEncryptionGql) -> Self {
+        match value {
+            TorrentEncryptionGql::Prefer => Self::Prefer,
+            TorrentEncryptionGql::Require => Self::Require,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct TorrentSettings {
+    pub enabled: bool,
+    pub base_port: u16,
+    pub announce_port: Option<u16>,
+    pub upnp: bool,
+    pub encryption: TorrentEncryptionGql,
+    pub max_active_downloads: u32,
+    pub max_peers_total: u32,
+    pub session_dir: Option<String>,
+}
+
+impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
+    fn from(value: &weaver_server_core::settings::TorrentConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            base_port: value.base_port,
+            announce_port: value.announce_port,
+            upnp: value.upnp,
+            encryption: value.encryption.into(),
+            max_active_downloads: value.max_active_downloads,
+            max_peers_total: value.max_peers_total,
+            session_dir: value
+                .session_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct TorrentSettingsInput {
+    pub enabled: Option<bool>,
+    pub base_port: Option<u16>,
+    pub announce_port: MaybeUndefined<u16>,
+    pub upnp: Option<bool>,
+    pub encryption: Option<TorrentEncryptionGql>,
+    pub max_active_downloads: Option<u32>,
+    pub max_peers_total: Option<u32>,
+    pub session_dir: MaybeUndefined<String>,
+}
+
+impl TorrentSettingsInput {
+    pub fn apply(&self, torrent: &mut weaver_server_core::settings::TorrentConfig) {
+        if let Some(enabled) = self.enabled {
+            torrent.enabled = enabled;
+        }
+        if let Some(port) = self.base_port {
+            torrent.base_port = port;
+        }
+        match self.announce_port {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => torrent.announce_port = None,
+            MaybeUndefined::Value(port) => torrent.announce_port = Some(port),
+        }
+        if let Some(upnp) = self.upnp {
+            torrent.upnp = upnp;
+        }
+        if let Some(encryption) = self.encryption {
+            torrent.encryption = encryption.into();
+        }
+        if let Some(limit) = self.max_active_downloads {
+            torrent.max_active_downloads = limit;
+        }
+        if let Some(limit) = self.max_peers_total {
+            torrent.max_peers_total = limit;
+        }
+        match &self.session_dir {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => torrent.session_dir = None,
+            MaybeUndefined::Value(dir) if dir.trim().is_empty() => torrent.session_dir = None,
+            MaybeUndefined::Value(dir) => torrent.session_dir = Some(dir.trim().into()),
+        }
+    }
+}
+
+impl From<&weaver_server_core::settings::Config> for GeneralSettings {
+    fn from(cfg: &weaver_server_core::settings::Config) -> Self {
+        Self {
+            data_dir: cfg.data_dir.clone(),
+            intermediate_dir: cfg.intermediate_dir(),
+            complete_dir: cfg.complete_dir(),
+            cleanup_after_extract: cfg.cleanup_after_extract(),
+            max_download_speed: cfg.max_download_speed.unwrap_or(0),
+            propagation_delay_secs: cfg.propagation_delay_secs(),
+            max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
+            enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
+            watch_folder: (&cfg.watch_folder).into(),
+            duplicate_policy: cfg.duplicate_policy.into(),
+            seeding: cfg.seeding.map(Into::into),
+            torrent: (&cfg.torrent).into(),
+        }
     }
 }

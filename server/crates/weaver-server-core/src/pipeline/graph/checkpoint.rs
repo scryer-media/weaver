@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A graph job's checkpoint: the tree's records, the root's facts, which
+// A graph job's checkpoint: the tree's records, the job's and the root's
+// facts, which
 // members have files, the kept envelopes and which candidate each node was
 // offered last, as the rows the database keeps. It is taken after every
 // step that reached the tree, when the step's bytes are written, so it only
@@ -26,22 +27,23 @@ use weaver_graph::{
 };
 
 use super::envelope::durable::KeptRecord;
-use super::root::facts::{self, RootFacts, RootFactsError};
+use super::root::facts::{self, JobFacts, RootBlob, RootFactsError, RootRow};
 use crate::jobs::graph_checkpoint::{
     CoverageRow, CryptRow, EnvelopeRow, GraphCheckpoint, MemberRow, NodeRow,
 };
 use crate::jobs::ids::JobId;
 use crate::pipeline::Pipeline;
 
-// The root row's kind: the root is the article object, not one the builder
-// makes.
+// The root row's kind: the root is the object that fetches, not one the
+// builder makes.
 const ROOT_KIND: &str = "root";
 
 // A job's checkpoint, as the graph layer reads and writes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) tree: TreeRecord,
-    pub(crate) root: RootFacts,
+    pub(crate) job: JobFacts,
+    pub(crate) root: RootBlob,
     // What the writer holds of each member it holds anything of.
     pub(crate) files: BTreeMap<(NodeId, MemberId), FileState>,
     pub(crate) kept: Vec<KeptRecord>,
@@ -127,8 +129,12 @@ pub(crate) fn rows(snapshot: &Snapshot) -> GraphCheckpoint {
         kind: ROOT_KIND.to_owned(),
         state: state_name(NodeState::Live).to_owned(),
         reason: None,
-        facts_version: i64::from(RootFacts::VERSION),
-        facts: facts::encode(&snapshot.root),
+        facts_version: i64::from(RootRow::VERSION),
+        facts: facts::encode(&RootRow {
+            next_node: snapshot.tree.next_node,
+            job: snapshot.job,
+            root: snapshot.root.clone(),
+        }),
         winning_password: None,
     });
     for node in &snapshot.tree.nodes {
@@ -419,7 +425,8 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             nodes: nodes.into_values().collect(),
             next_node: root.next_node,
         },
-        root,
+        job: root.job,
+        root: root.root,
         files,
         kept: kept.into_values().collect(),
         passwords,
@@ -545,4 +552,4 @@ fn why_named(name: &str) -> Option<Why> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

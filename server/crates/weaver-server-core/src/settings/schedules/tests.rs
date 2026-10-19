@@ -24,7 +24,8 @@ fn speeds(limits: &[(SpeedTarget, u64)]) -> ScheduleAction {
             .iter()
             .map(|&(target, bytes_per_sec)| SpeedLimitChange {
                 target,
-                bytes_per_sec,
+                bytes_per_sec: Some(bytes_per_sec),
+                upload_bytes_per_sec: None,
             })
             .collect(),
     }
@@ -38,8 +39,9 @@ fn second_egress(db: &Database) -> u32 {
             address: "192.0.2.1".parse().unwrap(),
         },
         enabled: true,
-        max_download_speed: 0,
-        download_quota: Default::default(),
+        download_bps: None,
+        upload_bps: None,
+        quota: Default::default(),
     })
     .unwrap()
     .id

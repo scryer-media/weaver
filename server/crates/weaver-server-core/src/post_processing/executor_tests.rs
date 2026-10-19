@@ -1136,6 +1136,7 @@ async fn a_waited_script_that_cannot_start_is_listed_among_the_jobs_runs() {
     })
     .unwrap();
     db.insert_job_history(&crate::JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 51,
         job_hash: None,
         name: "unstarted".into(),

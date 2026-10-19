@@ -413,18 +413,24 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         for category in [
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "tv".into(),
                 dest_dir: Some(category.to_string_lossy().into_owned()),
                 aliases: String::new(),
             },
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 2,
                 name: "movies".into(),
                 dest_dir: None,
                 aliases: String::new(),
             },
             CategoryConfig {
+                seeding: None,
+                torrent_route: false,
                 id: 3,
                 name: "future".into(),
                 dest_dir: Some(future_parent.join("tv").to_string_lossy().into_owned()),

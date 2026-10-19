@@ -8,6 +8,7 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 fn sample_history() -> JobHistoryRow {
     JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 1,
         job_hash: None,
         name: "test.nzb".to_string(),
@@ -51,6 +52,27 @@ fn insert_and_list() {
     assert_eq!(entries[0].optional_recovery_bytes, 200_000);
     assert_eq!(entries[0].optional_recovery_downloaded_bytes, 50_000);
     assert_eq!(db.get_job_history(1).unwrap().unwrap().name, "test.nzb");
+}
+
+#[test]
+fn history_rows_keep_their_protocol() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&sample_history()).unwrap();
+    db.insert_job_history(&JobHistoryRow {
+        job_id: 2,
+        protocol: crate::jobs::Protocol::Torrent,
+        ..sample_history()
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.get_job_history(1).unwrap().unwrap().protocol,
+        crate::jobs::Protocol::Nzb
+    );
+    assert_eq!(
+        db.get_job_history(2).unwrap().unwrap().protocol,
+        crate::jobs::Protocol::Torrent
+    );
 }
 
 #[test]

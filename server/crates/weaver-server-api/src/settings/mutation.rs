@@ -168,6 +168,19 @@ impl SettingsMutation {
             apply_watch_folder_update(&mut candidate, watch);
             candidate.validate().map_err(async_graphql::Error::new)?;
         }
+        let seeding_update = match input.seeding {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(None),
+            MaybeUndefined::Value(policy) => Some(Some(policy.into_policy()?)),
+        };
+        let torrent_update = match &input.torrent {
+            Some(update) => {
+                let mut torrent = config.read().await.torrent.clone();
+                update.apply(&mut torrent);
+                Some(torrent)
+            }
+            None => None,
+        };
         let should_reconcile_watch_folder = watch_folder_update.is_some();
         let should_update_paths =
             !normalized_intermediate_dir.is_undefined() || !normalized_complete_dir.is_undefined();
@@ -182,6 +195,8 @@ impl SettingsMutation {
             duplicate_policy_update.clone(),
             enable_srrdb_lookup,
             propagation_delay_secs,
+            seeding_update,
+            torrent_update.clone(),
         );
         let settings_persist = {
             let db = db.clone();
@@ -286,6 +301,12 @@ impl SettingsMutation {
                                 &enabled.to_string(),
                             )?;
                         }
+                        if let Some(policy) = persist_input.9 {
+                            db.save_seeding_policy(policy.as_ref())?;
+                        }
+                        if let Some(ref torrent) = persist_input.10 {
+                            db.save_torrent_config(torrent)?;
+                        }
                         Ok(())
                     },
                 )
@@ -342,6 +363,12 @@ impl SettingsMutation {
                 if let Some(ref duplicate_policy) = duplicate_policy_update {
                     apply_duplicate_policy_update(&mut cfg.duplicate_policy, duplicate_policy);
                 }
+                if let Some(policy) = seeding_update {
+                    cfg.seeding = policy;
+                }
+                if let Some(ref torrent) = torrent_update {
+                    cfg.torrent = torrent.clone();
+                }
 
                 let runtime_paths = should_update_paths.then(|| {
                     (
@@ -350,18 +377,7 @@ impl SettingsMutation {
                         PathBuf::from(cfg.complete_dir()),
                     )
                 });
-                let settings = GeneralSettings {
-                    data_dir: cfg.data_dir.clone(),
-                    intermediate_dir: cfg.intermediate_dir(),
-                    complete_dir: cfg.complete_dir(),
-                    cleanup_after_extract: cfg.cleanup_after_extract(),
-                    max_download_speed: cfg.max_download_speed.unwrap_or(0),
-                    propagation_delay_secs: cfg.propagation_delay_secs(),
-                    max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
-                    enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
-                    watch_folder: (&cfg.watch_folder).into(),
-                    duplicate_policy: cfg.duplicate_policy.into(),
-                };
+                let settings = GeneralSettings::from(&*cfg);
                 (settings, runtime_paths)
             },
         )
@@ -669,6 +685,8 @@ mod tests {
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
             intermediate_dir: None,

@@ -995,6 +995,8 @@ mod tests {
 
     fn category(name: &str) -> CategoryConfig {
         CategoryConfig {
+            seeding: None,
+            torrent_route: false,
             id: 1,
             name: name.to_string(),
             dest_dir: None,

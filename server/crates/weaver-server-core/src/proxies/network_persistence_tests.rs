@@ -2,7 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::proxies::{Failover, ProxyKind, ProxySecrets, Resolver, RouteLeg};
+use crate::proxies::{
+    Consumer, Failover, ProxyKind, ProxySecrets, Resolver, RouteLeg, TorrentScope,
+};
 
 // The code of the refusal a write was turned away with. A storage fault has
 // none, so a refusal that degrades into one fails here.
@@ -21,8 +23,9 @@ fn egress() -> EgressInterface {
             address: "192.0.2.1".parse().unwrap(),
         },
         enabled: true,
-        max_download_speed: 1_000_000,
-        download_quota: Default::default(),
+        download_bps: Some(1_000_000),
+        upload_bps: None,
+        quota: Default::default(),
     }
 }
 
@@ -102,7 +105,7 @@ fn migration_seeds_exactly_one_system_egress_and_backup_accepts_it() {
             .is_err()
     );
     let mut system = EgressInterface::system();
-    system.max_download_speed = 5_000_000;
+    system.download_bps = Some(5_000_000);
     assert_eq!(db.update_egress_interface(&system).unwrap(), system);
     system.name = "renamed".into();
     assert_eq!(
@@ -581,5 +584,77 @@ fn a_wireguard_proxy_is_saved_on_only_one_path_per_egress() {
     assert_eq!(
         serde_json::Value::Object(refusal.params),
         serde_json::json!({ "proxyId": 3, "egressId": 0, "paths": [[2, 3], [3]] })
+    );
+}
+
+#[test]
+fn a_torrent_route_is_one_leg_without_a_pool() {
+    let db = Database::open_in_memory().unwrap();
+    let pool = pool(&db);
+    let ladder = |rungs: Vec<Rung>| RouteLeg {
+        egress_id: 0,
+        weight: 100,
+        path: LegPath::Ladder {
+            rungs,
+            direct_fallback: false,
+        },
+    };
+    let policy = |legs: Vec<RouteLeg>| RoutingPolicy {
+        legs,
+        failover: Failover::Hold,
+        ..Default::default()
+    };
+    let split = policy(vec![
+        RouteLeg {
+            weight: 50,
+            ..ladder(vec![Rung::Proxy { id: 1 }])
+        },
+        RouteLeg {
+            weight: 50,
+            ..ladder(vec![Rung::Proxy { id: 3 }])
+        },
+    ]);
+    let pooled = policy(vec![ladder(vec![Rung::Pool { id: pool.id }])]);
+    let ordered = policy(vec![ladder(vec![
+        Rung::Proxy { id: 1 },
+        Rung::Proxy { id: 3 },
+    ])]);
+
+    for consumer in [
+        Consumer::Torrent(TorrentScope::Default),
+        Consumer::Torrent(TorrentScope::Category(4)),
+    ] {
+        assert_eq!(
+            refused(db.save_proxy_routing_policy(consumer, &split)),
+            "TORRENT_ROUTE_LEGS"
+        );
+        assert_eq!(
+            refused(db.save_proxy_routing_policy(consumer, &pooled)),
+            "TORRENT_ROUTE_POOL"
+        );
+        db.save_proxy_routing_policy(consumer, &ordered).unwrap();
+        db.save_proxy_routing_policy(
+            consumer,
+            &RoutingPolicy {
+                proxy_ids: vec![3, 1],
+                allow_direct: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    db.save_proxy_routing_policy(Consumer::Server(1), &pooled)
+        .unwrap();
+}
+
+#[test]
+fn torrent_consumers_have_their_own_keys() {
+    assert_eq!(
+        Consumer::Torrent(TorrentScope::Default).key(),
+        "torrent:default"
+    );
+    assert_eq!(
+        Consumer::Torrent(TorrentScope::Category(12)).key(),
+        "torrent:category:12"
     );
 }
