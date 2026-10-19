@@ -125,6 +125,11 @@
       "path": "/settings/servers",
       "owner": "ui-settings-crud",
       "oracle": "browser"
+    },
+    {
+      "path": "/settings/torrents",
+      "owner": "ui-torrents",
+      "oracle": "browser"
     }
   ],
   "mutations": [
@@ -710,6 +715,41 @@
       "name": "cancelSpeedTest",
       "owner": "speed-test",
       "oracle": "browser"
+    },
+    {
+      "name": "submitTorrent",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "removeTorrent",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "setTorrentForced",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "setTorrentSeeding",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "pauseTorrent",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "resumeTorrent",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "setTorrentCategory",
+      "owner": "torrents",
+      "oracle": "api-metrics"
     }
   ],
   "behaviors": [
@@ -896,6 +936,71 @@
     {
       "name": "nzbget-facade-script-status",
       "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-add-by-metainfo-and-magnet-to-verified-output",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-unpack-layout-store-and-compressed-rar-while-seeding",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-seed-to-ratio-goal-then-stopped-announce",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-pause-resume-forced",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-remove-keep-delete-and-private-unmet-goal",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-refusals-never-announce",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-duplicate-add",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-disabled-refusal",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-category-route-and-seeding-policy",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-restart-resumes-seeding",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-socks-egress-hides-weaver",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-global-download-cap-lower-bound",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-client-compatibility-facade",
+      "owner": "torrents",
       "oracle": "api-metrics"
     }
   ]

@@ -113,6 +113,59 @@ services:
       timeout: 2s
       retries: 5
 
+  # BitTorrent tracker for the torrent lane: HTTP announces on 8080, UDP on
+  # 8081, and an event log the harness reads at /events.
+  torrent-tracker:
+    image: ${E2E_WEAVER_PLAYWRIGHT_IMAGE:-weaver-e2e-playwright:local}
+    pull_policy: never
+    build:
+      context: ./playwright-weaver
+      dockerfile: Dockerfile
+    command: ["node", "tests/support/torrent-tracker-server.mjs"]
+    ports:
+      - "8080"
+    volumes:
+      - ./playwright-weaver/tests:/work/tests:ro
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8080/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  # rqbit peers built from the librqbit revision Weaver pins. The seeder holds
+  # every lane payload whole; the leecher starts empty and pulls from Weaver.
+  torrent-seeder:
+    image: ${E2E_TORRENT_PEER_IMAGE:-weaver-e2e-torrent-peer:local}
+    pull_policy: never
+    command: ["--disable-dht", "--disable-lsd", "--disable-upnp-port-forward", "--http-api-listen-addr", "0.0.0.0:3030", "--listen-port", "6881", "server", "start", "--disable-persistence", "/payload"]
+    depends_on:
+      torrent-tracker:
+        condition: service_healthy
+    ports:
+      - "3030"
+    volumes:
+      - ${FIXTURES_DIR:-./fixtures}/torrents/payload:/payload
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3030/"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  torrent-leecher:
+    image: ${E2E_TORRENT_PEER_IMAGE:-weaver-e2e-torrent-peer:local}
+    pull_policy: never
+    command: ["--disable-dht", "--disable-lsd", "--disable-upnp-port-forward", "--http-api-listen-addr", "0.0.0.0:3030", "--listen-port", "6881", "server", "start", "--disable-persistence", "/leech"]
+    depends_on:
+      torrent-tracker:
+        condition: service_healthy
+    ports:
+      - "3030"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3030/"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
   # Published Weaver image under test against fake NNTP.
   weaver:
     image: ${E2E_WEAVER_IMAGE:-ghcr.io/scryer-media/weaver:latest}

@@ -10,6 +10,7 @@
     "test:ui-post-processing": "playwright test tests/ui-post-processing.spec.ts",
     "test:ui-runtime-observability": "playwright test tests/ui-runtime-observability.spec.ts",
     "test:ui-backup-restore": "playwright test tests/ui-backup-restore.spec.ts",
+    "test:ui-torrents": "playwright test tests/ui-torrents.spec.ts",
     "test:rate-limits": "playwright test tests/rate-limits.spec.ts",
     "test:bandwidth-and-server-quotas": "playwright test tests/bandwidth-and-server-quotas.spec.ts",
     "test:provider-connection-cap": "playwright test tests/provider-connection-cap.spec.ts",

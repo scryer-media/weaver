@@ -94,6 +94,8 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	behaviorReleaseFlow("bandwidth-and-server-quotas", 8*time.Minute),
 	behaviorReleaseFlow("provider-connection-cap", 8*time.Minute),
 	proxyRoutingReleaseFlow(),
+	torrentsReleaseFlow(),
+	uiTorrentsReleaseFlow(),
 	encryptionKeyReleaseFlow(),
 	behaviorReleaseFlow("duplicate-and-queue-policy", 7*time.Minute),
 	{
@@ -386,7 +388,7 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 		return fmt.Errorf("validate Weaver Playwright project before release fanout: %w", err)
 	}
 	if slices.ContainsFunc(specs, func(spec weaverReleaseFlowSpec) bool {
-		return spec.Kind != weaverReleaseFlowCommand
+		return spec.Kind != weaverReleaseFlowCommand || slices.Contains(spec.Services, "weaver")
 	}) {
 		if err := ensureLocalWeaverImage(); err != nil {
 			manifest.FinishedAt = time.Now().UTC()
@@ -405,6 +407,14 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 			manifest.Status = "failed"
 			_ = writeWeaverReleaseJSON(manifestPath, manifest)
 			return fmt.Errorf("prepare networking fixture images before release fanout: %w", err)
+		}
+		if slices.ContainsFunc(specs, func(spec weaverReleaseFlowSpec) bool { return isTorrentFlow(spec.Name) }) {
+			if err := ensureTorrentPeerImage(); err != nil {
+				manifest.FinishedAt = time.Now().UTC()
+				manifest.Status = "failed"
+				_ = writeWeaverReleaseJSON(manifestPath, manifest)
+				return fmt.Errorf("prepare torrent peer image before release fanout: %w", err)
+			}
 		}
 	}
 
@@ -539,6 +549,11 @@ func assignWeaverReleaseNetworkSubnets(
 		}
 		if phase.Flow == "proxy-routing" {
 			if err := writeProxyRoutingNetwork(phase); err != nil {
+				return err
+			}
+		}
+		if isTorrentFlow(phase.Flow) {
+			if err := writeTorrentLaneNetwork(phase); err != nil {
 				return err
 			}
 		}
@@ -1034,6 +1049,8 @@ func runWeaverReleaseFlow(ctx context.Context, spec weaverReleaseFlowSpec, datas
 		case "adaptive-dispatch":
 			cmdAdaptiveDispatchTest()
 			return nil
+		case "torrents":
+			return runWeaverBrowserReleaseFlow(ctx, spec, datastore)
 		default:
 			return fmt.Errorf("release flow %s has no command runner", spec.Name)
 		}
@@ -1085,6 +1102,12 @@ func runWeaverBrowserReleaseFlow(ctx context.Context, spec weaverReleaseFlowSpec
 			return err
 		}
 		return runWeaverProviderConnectionCapReleaseFlow(ctx, spec, datastore)
+	}
+	if spec.Name == "torrents" {
+		return runWeaverTorrentsReleaseFlow(ctx, spec, datastore, artifactsDir)
+	}
+	if spec.Name == "ui-torrents" {
+		return runWeaverUITorrentsReleaseFlow(ctx, spec, datastore, artifactsDir)
 	}
 	if spec.Name == "rate-limits" {
 		if err := ensureLocalWeaverPlaywrightImage(); err != nil {

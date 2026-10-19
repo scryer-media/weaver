@@ -370,6 +370,10 @@ func Run(args []string, programName string) {
 		cmdSeed(args[1])
 	case "seed-all":
 		cmdSeedAll()
+	case "seed-torrents":
+		cmdSeedTorrentsCLI()
+	case "torrent-test":
+		cmdTorrentTest(args[1:])
 	case "functional":
 		cmdFunctional()
 	case "verify":

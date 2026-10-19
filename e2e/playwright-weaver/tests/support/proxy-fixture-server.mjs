@@ -79,6 +79,21 @@ export function parsePublicTargets(text) {
   });
 }
 
+// Compose-network destinations the fixture forwards as asked, by name or, for
+// host "*", any IPv4 literal on that port. The torrent lane routes its tracker
+// and peers through the SOCKS route this way.
+export function parsePassthrough(text) {
+  const targets = text ? JSON.parse(text) : [];
+  if (!Array.isArray(targets)) throw new Error("passthrough must be an array");
+  return targets.map(target => {
+    if (typeof target.host !== "string" || !/^(\*|[a-zA-Z0-9.-]+)$/.test(target.host)
+      || !Number.isInteger(target.port) || target.port < 1 || target.port > 65535) {
+      throw new Error("invalid passthrough target");
+    }
+    return { host: target.host.toLowerCase(), port: target.port };
+  });
+}
+
 export async function startProxyFixture(options = {}) {
   const ip = options.ip ?? process.env.PROXY_FIXTURE_IP;
   if (!net.isIPv4(ip)) throw new Error("PROXY_FIXTURE_IP must be an IPv4 address");
@@ -89,6 +104,7 @@ export async function startProxyFixture(options = {}) {
   // Public hosts the fixture forwards to and answers for, beside the fixture
   // destinations; the relay runs with publicOnly and forwards nothing else.
   const publicTargets = parsePublicTargets(options.publicTargets ? JSON.stringify(options.publicTargets) : process.env.PROXY_FIXTURE_PUBLIC_TARGETS);
+  const passthrough = parsePassthrough(options.passthrough ? JSON.stringify(options.passthrough) : process.env.PROXY_FIXTURE_PASSTHROUGH);
   const publicOnly = Boolean(options.publicOnly);
   const ports = {
     primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090,
@@ -168,14 +184,17 @@ export async function startProxyFixture(options = {}) {
     const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.test$/.test(host);
     const fixtureTarget = !publicOnly && allowedHost && [ports.dns, ports.nntp, ports.http].includes(port);
     const fixtureDns = (host === ip || addresses.includes(host)) && port === ports.dns;
-    if ((!publicTarget && !fixtureTarget && !fixtureDns) || !routes[route].up) {
+    const passed = !publicOnly && passthrough.some(target => target.port === port
+      && (target.host === host.toLowerCase() || (target.host === "*" && net.isIPv4(host))));
+    if ((!publicTarget && !fixtureTarget && !fixtureDns && !passed) || !routes[route].up) {
       reply(false); client.end(); return;
     }
     record("connected", { route, host, port, client: peer });
     reply(true);
     const targetHost = publicTarget ? publicTarget.addresses[0]
+      : passed ? host
       : port === ports.nntp ? (options.nntpHost ?? "nntp") : "127.0.0.1";
-    const targetPort = publicTarget ? publicTarget.port : port === ports.nntp ? (options.nntpPort ?? 119) : port;
+    const targetPort = publicTarget || passed ? port : port === ports.nntp ? (options.nntpPort ?? 119) : port;
     pipe(client, targetHost, targetPort, route);
     client.resume();
   }
