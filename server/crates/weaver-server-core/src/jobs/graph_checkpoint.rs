@@ -2,10 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A graph job's checkpoint as the database holds it: plain rows, keyed by
-// job, which the graph layer turns to and from its tree. A checkpoint
-// replaces every row of the job at once, in one transaction, so a restore
-// reads one whole checkpoint or none.
+// job, which the graph layer turns to and from its tree. A checkpoint is
+// written as what changed since the one before it: the rows that are new or
+// different, and the keys of the rows that went away, in one transaction,
+// so a restore reads one whole checkpoint or none, and a step costs the
+// database what the step changed.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::ids::JobId;
@@ -14,7 +17,7 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::{Database, StateError};
 
 // Every table a checkpoint writes. A job's rows go with the job.
-pub(crate) const TABLES: [&str; 7] = [
+pub(crate) const TABLES: [&str; 8] = [
     "graph_nodes",
     "graph_members",
     "graph_coverage",
@@ -22,12 +25,14 @@ pub(crate) const TABLES: [&str; 7] = [
     "graph_crypt",
     "graph_recovery",
     "graph_holds",
+    "graph_facts_parts",
 ];
 
-// Rows per INSERT: enough to keep a large tree to a few statements, few
-// enough to stay under every engine's bind limit.
+// Rows per statement: enough to keep a large change to a few statements,
+// few enough to stay under every engine's bind limit.
 const BATCH: usize = 64;
 
+// Every row, each table in key order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GraphCheckpoint {
     pub(crate) nodes: Vec<NodeRow>,
@@ -35,6 +40,7 @@ pub(crate) struct GraphCheckpoint {
     pub(crate) coverage: Vec<CoverageRow>,
     pub(crate) envelopes: Vec<EnvelopeRow>,
     pub(crate) crypt: Vec<CryptRow>,
+    pub(crate) parts: Vec<PartRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,19 +105,348 @@ pub(crate) struct CryptRow {
     pub(crate) seed: Vec<u8>,
 }
 
+// One sealed part of a node's facts. Its bytes are shared with the facts
+// they were taken from, so an unchanged part is known unchanged without
+// reading it.
+#[derive(Clone, Debug, Eq)]
+pub(crate) struct PartRow {
+    pub(crate) node: i64,
+    pub(crate) part: i64,
+    pub(crate) bytes: Arc<[u8]>,
+}
+
+impl PartialEq for PartRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node
+            && self.part == other.part
+            && (Arc::ptr_eq(&self.bytes, &other.bytes) || self.bytes == other.bytes)
+    }
+}
+
+// A row of one table: its key, its columns, and its values.
+pub(crate) trait Row: Clone + PartialEq {
+    type Key: Ord + Clone + std::fmt::Debug;
+    const TABLE: &'static str;
+    // The key's columns, after the job's.
+    const KEY: &'static [&'static str];
+    // Every column, the job's first.
+    const COLUMNS: &'static str;
+
+    fn key(&self) -> Self::Key;
+    fn key_args(key: &Self::Key) -> Vec<SqlArg>;
+    fn args(&self, job: i64) -> Vec<SqlArg>;
+
+    // The bytes of facts the row carries.
+    fn facts(&self) -> usize {
+        0
+    }
+}
+
+fn opt_pair(pair: Option<(i64, i64)>) -> [SqlArg; 2] {
+    [
+        SqlArg::OptI64(pair.map(|pair| pair.0)),
+        SqlArg::OptI64(pair.map(|pair| pair.1)),
+    ]
+}
+
+impl Row for NodeRow {
+    type Key = i64;
+    const TABLE: &'static str = "graph_nodes";
+    const KEY: &'static [&'static str] = &["node_id"];
+    const COLUMNS: &'static str = "job_id, node_id, parent_node_id, parent_member_id, volumes, \
+         window_start, window_end, kind, state, reason, facts_version, facts, winning_password";
+
+    fn key(&self) -> i64 {
+        self.node
+    }
+
+    fn key_args(key: &i64) -> Vec<SqlArg> {
+        vec![SqlArg::I64(*key)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        let [window_start, window_end] = opt_pair(self.window);
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.node),
+            SqlArg::OptI64(self.parent),
+            SqlArg::OptI64(self.parent_member),
+            SqlArg::OptBytes(self.volumes.clone()),
+            window_start,
+            window_end,
+            SqlArg::Text(self.kind.clone()),
+            SqlArg::Text(self.state.clone()),
+            SqlArg::OptText(self.reason.clone()),
+            SqlArg::I64(self.facts_version),
+            SqlArg::Bytes(self.facts.clone()),
+            SqlArg::OptI64(self.winning_password),
+        ]
+    }
+
+    fn facts(&self) -> usize {
+        self.facts.len()
+    }
+}
+
+impl Row for MemberRow {
+    type Key = (i64, i64);
+    const TABLE: &'static str = "graph_members";
+    const KEY: &'static [&'static str] = &["node_id", "member_id"];
+    const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, length, \
+         closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
+         given_up_volume, buried, undecided, has_file, refused, unusable_at";
+
+    fn key(&self) -> (i64, i64) {
+        (self.node, self.member)
+    }
+
+    fn key_args(key: &(i64, i64)) -> Vec<SqlArg> {
+        vec![SqlArg::I64(key.0), SqlArg::I64(key.1)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        let [owner_node, owner_volume] = opt_pair(self.owner);
+        let [given_up_node, given_up_volume] = opt_pair(self.given_up);
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.node),
+            SqlArg::I64(self.member),
+            SqlArg::Text(self.name.clone()),
+            SqlArg::Text(self.output_name.clone()),
+            SqlArg::OptI64(self.length),
+            SqlArg::Bool(self.closed),
+            SqlArg::OptI64(self.bound),
+            owner_node,
+            owner_volume,
+            given_up_node,
+            given_up_volume,
+            SqlArg::Bool(self.buried),
+            SqlArg::Bool(self.undecided),
+            SqlArg::Bool(self.has_file),
+            SqlArg::OptText(self.refused.clone()),
+            SqlArg::OptI64(self.unusable_at),
+        ]
+    }
+}
+
+impl Row for CoverageRow {
+    type Key = (i64, i64, i64);
+    const TABLE: &'static str = "graph_coverage";
+    const KEY: &'static [&'static str] = &["node_id", "member_id", "range_start"];
+    const COLUMNS: &'static str =
+        "job_id, node_id, member_id, range_start, range_end, provenance, verified";
+
+    fn key(&self) -> (i64, i64, i64) {
+        (self.node, self.member, self.start)
+    }
+
+    fn key_args(key: &(i64, i64, i64)) -> Vec<SqlArg> {
+        vec![SqlArg::I64(key.0), SqlArg::I64(key.1), SqlArg::I64(key.2)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.node),
+            SqlArg::I64(self.member),
+            SqlArg::I64(self.start),
+            SqlArg::I64(self.end),
+            SqlArg::Text(self.provenance.clone()),
+            SqlArg::Bool(self.verified),
+        ]
+    }
+}
+
+impl Row for EnvelopeRow {
+    type Key = (i64, i64, i64);
+    const TABLE: &'static str = "graph_envelopes";
+    const KEY: &'static [&'static str] = &["node_id", "volume", "range_start"];
+    const COLUMNS: &'static str =
+        "job_id, node_id, volume, range_start, range_end, provenance, closed, settled";
+
+    fn key(&self) -> (i64, i64, i64) {
+        (self.node, self.volume, self.start)
+    }
+
+    fn key_args(key: &(i64, i64, i64)) -> Vec<SqlArg> {
+        vec![SqlArg::I64(key.0), SqlArg::I64(key.1), SqlArg::I64(key.2)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.node),
+            SqlArg::I64(self.volume),
+            SqlArg::I64(self.start),
+            SqlArg::I64(self.end),
+            SqlArg::Text(self.provenance.clone()),
+            SqlArg::OptI64(self.closed),
+            SqlArg::Bool(self.settled),
+        ]
+    }
+}
+
+impl Row for CryptRow {
+    type Key = (i64, i64, i64);
+    const TABLE: &'static str = "graph_crypt";
+    const KEY: &'static [&'static str] = &["node_id", "member_id", "run_start"];
+    const COLUMNS: &'static str = "job_id, node_id, member_id, run_start, seed";
+
+    fn key(&self) -> (i64, i64, i64) {
+        (self.node, self.member, self.run_start)
+    }
+
+    fn key_args(key: &(i64, i64, i64)) -> Vec<SqlArg> {
+        vec![SqlArg::I64(key.0), SqlArg::I64(key.1), SqlArg::I64(key.2)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.node),
+            SqlArg::I64(self.member),
+            SqlArg::I64(self.run_start),
+            SqlArg::Bytes(self.seed.clone()),
+        ]
+    }
+}
+
+impl Row for PartRow {
+    type Key = (i64, i64);
+    const TABLE: &'static str = "graph_facts_parts";
+    const KEY: &'static [&'static str] = &["node_id", "part"];
+    const COLUMNS: &'static str = "job_id, node_id, part, bytes";
+
+    fn key(&self) -> (i64, i64) {
+        (self.node, self.part)
+    }
+
+    fn key_args(key: &(i64, i64)) -> Vec<SqlArg> {
+        vec![SqlArg::I64(key.0), SqlArg::I64(key.1)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.node),
+            SqlArg::I64(self.part),
+            SqlArg::Bytes(self.bytes.to_vec()),
+        ]
+    }
+
+    fn facts(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+// The rows of one table a checkpoint changes, by key: the row as it is now,
+// or `None` for one that went away.
+pub(crate) type Changes<R> = BTreeMap<<R as Row>::Key, Option<R>>;
+
+// What one checkpoint changes of the one before it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Delta {
+    // Nothing is known of what the database holds of the job, so every row
+    // of it goes before these are written.
+    pub(crate) whole: bool,
+    pub(crate) nodes: Changes<NodeRow>,
+    pub(crate) members: Changes<MemberRow>,
+    pub(crate) coverage: Changes<CoverageRow>,
+    pub(crate) envelopes: Changes<EnvelopeRow>,
+    pub(crate) crypt: Changes<CryptRow>,
+    pub(crate) parts: Changes<PartRow>,
+}
+
+impl Delta {
+    // What `after` changes of `before`, which is the checkpoint the
+    // database holds or will once what is queued is written; `None` when
+    // nothing says what it holds. Both are in key order.
+    pub(crate) fn between(before: Option<&GraphCheckpoint>, after: &GraphCheckpoint) -> Self {
+        let empty = GraphCheckpoint::default();
+        let was = before.unwrap_or(&empty);
+        Self {
+            whole: before.is_none(),
+            nodes: changes(&was.nodes, &after.nodes),
+            members: changes(&was.members, &after.members),
+            coverage: changes(&was.coverage, &after.coverage),
+            envelopes: changes(&was.envelopes, &after.envelopes),
+            crypt: changes(&was.crypt, &after.crypt),
+            parts: changes(&was.parts, &after.parts),
+        }
+    }
+
+    // This change followed by `later`, as one.
+    pub(crate) fn absorb(&mut self, later: Delta) {
+        if later.whole {
+            *self = later;
+            return;
+        }
+        self.nodes.extend(later.nodes);
+        self.members.extend(later.members);
+        self.coverage.extend(later.coverage);
+        self.envelopes.extend(later.envelopes);
+        self.crypt.extend(later.crypt);
+        self.parts.extend(later.parts);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.whole && self.rows() == 0
+    }
+
+    // How many rows it writes or deletes.
+    pub(crate) fn rows(&self) -> usize {
+        self.nodes.len()
+            + self.members.len()
+            + self.coverage.len()
+            + self.envelopes.len()
+            + self.crypt.len()
+            + self.parts.len()
+    }
+
+    // How many bytes of facts it writes.
+    pub(crate) fn facts(&self) -> usize {
+        fn of<R: Row>(changes: &Changes<R>) -> usize {
+            changes.values().flatten().map(Row::facts).sum()
+        }
+        of(&self.nodes) + of(&self.parts)
+    }
+}
+
+// The rows of `after` not in `before` as they are, and the keys of
+// `before` not in `after`. Both are in key order, so one pass over each
+// finds them.
+fn changes<R: Row>(before: &[R], after: &[R]) -> Changes<R> {
+    let mut out = BTreeMap::new();
+    let mut was = before.iter().peekable();
+    for row in after {
+        let key = row.key();
+        while let Some(gone) = was.next_if(|old| old.key() < key) {
+            out.insert(gone.key(), None);
+        }
+        match was.next_if(|old| old.key() == key) {
+            Some(old) if old == row => {}
+            _ => {
+                out.insert(key, Some(row.clone()));
+            }
+        }
+    }
+    out.extend(was.map(|gone| (gone.key(), None)));
+    out
+}
+
 impl Database {
-    // Replace the job's checkpoint with this one. A job whose active row is
-    // gone keeps none: its rows are deleted and nothing is written.
+    // Write what the checkpoint changed. A job whose active row is gone
+    // keeps none: its rows are deleted and nothing is written.
     pub(crate) fn save_graph_checkpoint(
         &self,
         job_id: JobId,
-        checkpoint: Arc<GraphCheckpoint>,
+        delta: Arc<Delta>,
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "save_graph_checkpoint", |tx| {
-                let checkpoint = Arc::clone(&checkpoint);
-                Box::pin(async move { write_checkpoint(tx, job_id, &checkpoint).await })
+                let delta = Arc::clone(&delta);
+                Box::pin(async move { write_delta(tx, job_id, &delta).await })
             })
             .await
         })
@@ -133,20 +468,9 @@ impl Database {
     }
 }
 
-async fn write_checkpoint(
-    tx: &mut SqlTx<'_>,
-    job_id: JobId,
-    checkpoint: &GraphCheckpoint,
-) -> Result<(), StateError> {
+async fn write_delta(tx: &mut SqlTx<'_>, job_id: JobId, delta: &Delta) -> Result<(), StateError> {
     lock_active_job_for_write_tx(tx, job_id).await?;
     let id = job_id.0 as i64;
-    for table in TABLES {
-        tx.execute(
-            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
-            &[SqlArg::I64(id)],
-        )
-        .await?;
-    }
     let live = tx
         .fetch_optional(
             "SELECT 1 AS live FROM active_jobs WHERE job_id = {}",
@@ -154,142 +478,66 @@ async fn write_checkpoint(
         )
         .await?
         .is_some();
+    if !live || delta.whole {
+        for table in TABLES {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+        }
+    }
     if !live {
         return Ok(());
     }
-    let job = || SqlArg::I64(id);
-    let opt_pair = |pair: Option<(i64, i64)>| {
-        (
-            SqlArg::OptI64(pair.map(|pair| pair.0)),
-            SqlArg::OptI64(pair.map(|pair| pair.1)),
-        )
-    };
-    let nodes = checkpoint.nodes.iter().map(|row| {
-        let (window_start, window_end) = opt_pair(row.window);
-        vec![
-            job(),
-            SqlArg::I64(row.node),
-            SqlArg::OptI64(row.parent),
-            SqlArg::OptI64(row.parent_member),
-            SqlArg::OptBytes(row.volumes.clone()),
-            window_start,
-            window_end,
-            SqlArg::Text(row.kind.clone()),
-            SqlArg::Text(row.state.clone()),
-            SqlArg::OptText(row.reason.clone()),
-            SqlArg::I64(row.facts_version),
-            SqlArg::Bytes(row.facts.clone()),
-            SqlArg::OptI64(row.winning_password),
-        ]
-    });
-    insert(
-        tx,
-        "graph_nodes (job_id, node_id, parent_node_id, parent_member_id, volumes, \
-         window_start, window_end, kind, state, reason, facts_version, facts, winning_password)",
-        nodes,
-    )
-    .await?;
-    let members = checkpoint.members.iter().map(|row| {
-        let (owner_node, owner_volume) = opt_pair(row.owner);
-        let (given_up_node, given_up_volume) = opt_pair(row.given_up);
-        vec![
-            job(),
-            SqlArg::I64(row.node),
-            SqlArg::I64(row.member),
-            SqlArg::Text(row.name.clone()),
-            SqlArg::Text(row.output_name.clone()),
-            SqlArg::OptI64(row.length),
-            SqlArg::Bool(row.closed),
-            SqlArg::OptI64(row.bound),
-            owner_node,
-            owner_volume,
-            given_up_node,
-            given_up_volume,
-            SqlArg::Bool(row.buried),
-            SqlArg::Bool(row.undecided),
-            SqlArg::Bool(row.has_file),
-            SqlArg::OptText(row.refused.clone()),
-            SqlArg::OptI64(row.unusable_at),
-        ]
-    });
-    insert(
-        tx,
-        "graph_members (job_id, node_id, member_id, name, output_name, length, closed, \
-         bound_node_id, owner_node_id, owner_volume, given_up_node_id, given_up_volume, \
-         buried, undecided, has_file, refused, unusable_at)",
-        members,
-    )
-    .await?;
-    let coverage = checkpoint.coverage.iter().map(|row| {
-        vec![
-            job(),
-            SqlArg::I64(row.node),
-            SqlArg::I64(row.member),
-            SqlArg::I64(row.start),
-            SqlArg::I64(row.end),
-            SqlArg::Text(row.provenance.clone()),
-            SqlArg::Bool(row.verified),
-        ]
-    });
-    insert(
-        tx,
-        "graph_coverage (job_id, node_id, member_id, range_start, range_end, provenance, verified)",
-        coverage,
-    )
-    .await?;
-    let envelopes = checkpoint.envelopes.iter().map(|row| {
-        vec![
-            job(),
-            SqlArg::I64(row.node),
-            SqlArg::I64(row.volume),
-            SqlArg::I64(row.start),
-            SqlArg::I64(row.end),
-            SqlArg::Text(row.provenance.clone()),
-            SqlArg::OptI64(row.closed),
-            SqlArg::Bool(row.settled),
-        ]
-    });
-    insert(
-        tx,
-        "graph_envelopes (job_id, node_id, volume, range_start, range_end, provenance, closed, settled)",
-        envelopes,
-    )
-    .await?;
-    let crypt = checkpoint.crypt.iter().map(|row| {
-        vec![
-            job(),
-            SqlArg::I64(row.node),
-            SqlArg::I64(row.member),
-            SqlArg::I64(row.run_start),
-            SqlArg::Bytes(row.seed.clone()),
-        ]
-    });
-    insert(
-        tx,
-        "graph_crypt (job_id, node_id, member_id, run_start, seed)",
-        crypt,
-    )
-    .await?;
+    write(tx, id, &delta.nodes).await?;
+    write(tx, id, &delta.members).await?;
+    write(tx, id, &delta.coverage).await?;
+    write(tx, id, &delta.envelopes).await?;
+    write(tx, id, &delta.crypt).await?;
+    write(tx, id, &delta.parts).await?;
     Ok(())
 }
 
-// Insert rows of one shape, a batch per statement.
-async fn insert(
+// One table's changes: every changed key's row is deleted, and the rows as
+// they are now inserted, a batch per statement.
+async fn write<R: Row>(
     tx: &mut SqlTx<'_>,
-    into: &str,
-    rows: impl Iterator<Item = Vec<SqlArg>>,
+    job: i64,
+    changes: &Changes<R>,
 ) -> Result<(), StateError> {
-    let rows: Vec<Vec<SqlArg>> = rows.collect();
+    let keys: Vec<&R::Key> = changes.keys().collect();
+    let matches = format!(
+        "({})",
+        R::KEY
+            .iter()
+            .map(|column| format!("{column} = {{}}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    );
+    for batch in keys.chunks(BATCH) {
+        let sql = format!(
+            "DELETE FROM {} WHERE job_id = {{}} AND ({})",
+            R::TABLE,
+            vec![matches.as_str(); batch.len()].join(" OR ")
+        );
+        let mut args = vec![SqlArg::I64(job)];
+        args.extend(batch.iter().flat_map(|key| R::key_args(key)));
+        tx.execute(&sql, &args).await?;
+    }
+    let rows: Vec<&R> = changes.values().flatten().collect();
     for batch in rows.chunks(BATCH) {
-        let Some(width) = batch.first().map(Vec::len) else {
+        let Some(width) = batch.first().map(|row| row.args(job).len()) else {
             continue;
         };
         let tuple = format!("({})", vec!["{}"; width].join(", "));
         let sql = format!(
-            "INSERT INTO {into} VALUES {}",
+            "INSERT INTO {} ({}) VALUES {}",
+            R::TABLE,
+            R::COLUMNS,
             vec![tuple; batch.len()].join(", ")
         );
-        let args: Vec<SqlArg> = batch.iter().flatten().cloned().collect();
+        let args: Vec<SqlArg> = batch.iter().flat_map(|row| row.args(job)).collect();
         tx.execute(&sql, &args).await?;
     }
     Ok(())
@@ -417,11 +665,28 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
+    let parts = tx
+        .fetch_all(
+            "SELECT node_id, part, bytes \
+             FROM graph_facts_parts WHERE job_id = {} ORDER BY node_id, part",
+            &args,
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(PartRow {
+                node: row.i64("node_id")?,
+                part: row.i64("part")?,
+                bytes: Arc::from(row.bytes("bytes")?),
+            })
+        })
+        .collect::<Result<_, StateError>>()?;
     Ok(Some(GraphCheckpoint {
         nodes,
         members,
         coverage,
         envelopes,
         crypt,
+        parts,
     }))
 }

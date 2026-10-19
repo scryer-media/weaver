@@ -86,7 +86,8 @@ pub struct Zip {
 }
 
 impl Durable for Zip {
-    const VERSION: u16 = 3;
+    // 4: the grid shelved by chunk of blocks, kept apart from the bytes.
+    const VERSION: u16 = 4;
 
     // A member said is an entry of the map, and every entry's member is one.
     fn impossible(&self) -> Option<&'static str> {

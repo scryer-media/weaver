@@ -6,9 +6,14 @@
 // computed, and the next node id of the tree. They are the root row's blob,
 // versioned like any object's. The post's own sizes are not here: a restore
 // has the spec, and the names are only there to prove it is the same post.
+//
+// What grows with the post is kept as parts, a chunk of articles to a part,
+// so a step that changes one article encodes and writes one part.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weaver_graph::{ByteRange, VolumeIndex};
+use weaver_graph::{ByteRange, Part, Sealed, Shelf, VolumeIndex, decode_parts, encode_parts};
 
 use super::ArticleRoot;
 use super::phase::RootPhase;
@@ -30,7 +35,8 @@ pub(crate) struct RootFacts {
 }
 
 impl RootFacts {
-    pub(crate) const VERSION: u16 = 2;
+    // 3: each volume's lists shelved a chunk of articles to a part.
+    pub(crate) const VERSION: u16 = 3;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,14 +111,141 @@ impl ArticleRoot {
     }
 }
 
-pub(crate) fn encode(facts: &RootFacts) -> Vec<u8> {
-    // A plain struct of integers always encodes.
-    rmp_serde::to_vec(facts).unwrap_or_default()
+// Articles to a part.
+const CHUNK: u32 = 16;
+
+// The facts as they are encoded: kept from one checkpoint to the next, so a
+// part whose entries did not change keeps its bytes and is not encoded again.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct Encoded {
+    next_node: u32,
+    posted: Sealed<Vec<String>>,
+    volumes: Vec<EncodedVolume>,
+    read_backs: u64,
+    reported: Option<RootPhase>,
 }
 
-pub(crate) fn decode(version: u16, bytes: &[u8]) -> Result<RootFacts, RootFactsError> {
+#[derive(Default, Serialize, Deserialize)]
+struct EncodedVolume {
+    // By ordinal.
+    articles: Shelf<Vec<(u32, ArticleFacts)>>,
+    // By boundary index.
+    known: Shelf<Vec<(u64, u64)>>,
+    ordered_only: bool,
+    // By the ordinal of the article whose decoded range starts at or before
+    // the segment.
+    segments: Shelf<Vec<(u64, u64, u32, bool)>>,
+    // By ordinal.
+    raised: Shelf<Vec<(u32, ClassFacts)>>,
+}
+
+// Entries grouped by the chunk each lies in.
+fn chunked<T: Clone>(entries: &[T], chunk: impl Fn(&T) -> u32) -> BTreeMap<u32, Vec<T>> {
+    let mut out: BTreeMap<u32, Vec<T>> = BTreeMap::new();
+    for entry in entries {
+        out.entry(chunk(entry)).or_default().push(entry.clone());
+    }
+    out
+}
+
+fn of_ordinal(ordinal: u32) -> u32 {
+    ordinal / CHUNK
+}
+
+fn of_boundary(boundary: u64) -> u32 {
+    u32::try_from(boundary / u64::from(CHUNK)).unwrap_or(u32::MAX)
+}
+
+impl EncodedVolume {
+    fn refresh(&mut self, facts: &VolumeFacts) {
+        let starts: BTreeMap<u64, u32> = facts
+            .articles
+            .iter()
+            .filter_map(|(ordinal, article)| match article {
+                ArticleFacts::Arrived(Some((start, _))) => Some((*start, *ordinal)),
+                _ => None,
+            })
+            .collect();
+        self.articles.set(chunked(&facts.articles, |(ordinal, _)| {
+            of_ordinal(*ordinal)
+        }));
+        self.known.set(chunked(&facts.known, |(boundary, _)| {
+            of_boundary(*boundary)
+        }));
+        self.ordered_only = facts.ordered_only;
+        self.segments.set(chunked(&facts.segments, |(start, ..)| {
+            starts
+                .range(..=*start)
+                .next_back()
+                .map_or(0, |(_, ordinal)| of_ordinal(*ordinal))
+        }));
+        self.raised
+            .set(chunked(&facts.raised, |(ordinal, _)| of_ordinal(*ordinal)));
+    }
+
+    fn facts(&self) -> VolumeFacts {
+        fn joined<T: Clone + Serialize, K: Ord>(
+            shelf: &Shelf<Vec<T>>,
+            key: impl Fn(&T) -> K,
+        ) -> Vec<T> {
+            let mut out: Vec<T> = shelf
+                .chunks()
+                .flat_map(|(_, entries)| entries.iter().cloned())
+                .collect();
+            out.sort_by_key(key);
+            out
+        }
+        VolumeFacts {
+            articles: joined(&self.articles, |(ordinal, _)| *ordinal),
+            known: joined(&self.known, |(boundary, _)| *boundary),
+            ordered_only: self.ordered_only,
+            segments: joined(&self.segments, |(start, ..)| *start),
+            raised: joined(&self.raised, |(ordinal, _)| *ordinal),
+        }
+    }
+}
+
+impl Encoded {
+    fn refresh(&mut self, facts: &RootFacts) {
+        self.next_node = facts.next_node;
+        self.posted.set(facts.posted.clone());
+        self.volumes
+            .resize_with(facts.volumes.len(), EncodedVolume::default);
+        for (encoded, volume) in self.volumes.iter_mut().zip(&facts.volumes) {
+            encoded.refresh(volume);
+        }
+        self.read_backs = facts.read_backs;
+        self.reported = facts.reported;
+    }
+
+    fn facts(&self) -> RootFacts {
+        RootFacts {
+            next_node: self.next_node,
+            posted: self.posted.get().clone(),
+            volumes: self.volumes.iter().map(EncodedVolume::facts).collect(),
+            read_backs: self.read_backs,
+            reported: self.reported,
+        }
+    }
+}
+
+// The facts' bytes and their parts, encoding again only the parts that
+// changed since `encoded` last encoded.
+pub(crate) fn encode(encoded: &mut Encoded, facts: &RootFacts) -> (Vec<u8>, Vec<Part>) {
+    encoded.refresh(facts);
+    // A plain struct of integers always encodes.
+    encode_parts(encoded).unwrap_or_default()
+}
+
+pub(crate) fn decode(
+    version: u16,
+    bytes: &[u8],
+    parts: &[Part],
+) -> Result<RootFacts, RootFactsError> {
     if version != RootFacts::VERSION {
         return Err(RootFactsError::Version(version));
     }
-    rmp_serde::from_slice(bytes).map_err(|error| RootFactsError::Decode(error.to_string()))
+    decode_parts::<Encoded>(bytes, parts)
+        .map(|encoded| encoded.facts())
+        .map_err(RootFactsError::Decode)
 }

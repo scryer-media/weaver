@@ -158,7 +158,8 @@ pub struct SevenZipStore {
 }
 
 impl Durable for SevenZipStore {
-    const VERSION: u16 = 2;
+    // 3: the grid shelved by chunk of blocks, kept apart from the bytes.
+    const VERSION: u16 = 3;
 
     // The folders and members said are the map's, a cipher only where the
     // map has AES, and the proof is a file of the map.

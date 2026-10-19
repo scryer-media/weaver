@@ -16,13 +16,16 @@ use crate::tree::NodeId;
 
 mod sealed;
 
-pub use sealed::Sealed;
+pub use sealed::{Part, Sealed, Shelf, decode_parts, encode_parts};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub kind: Kind,
     pub version: u16,
     pub bytes: Vec<u8>,
+    // The sealed parts `bytes` names, each kept apart so a checkpoint
+    // writes again only the ones that changed.
+    pub parts: Vec<Part>,
 }
 
 impl Facts {
@@ -35,17 +38,19 @@ impl Facts {
             kind,
             version: Self::UNSUPPORTED,
             bytes: Vec::new(),
+            parts: Vec::new(),
         }
     }
 
     // A state that does not encode is one nothing could restore, so it says
     // so as an unsupported blob rather than failing the checkpoint.
     pub fn of<T: Durable>(kind: Kind, state: &T) -> Self {
-        match rmp_serde::to_vec(state) {
-            Ok(bytes) => Self {
+        match encode_parts(state) {
+            Ok((bytes, parts)) => Self {
                 kind,
                 version: T::VERSION,
                 bytes,
+                parts,
             },
             Err(_) => Self::unsupported(kind),
         }
@@ -65,11 +70,8 @@ impl Facts {
             }
             _ => {}
         }
-        let state: T =
-            rmp_serde::from_slice(&self.bytes).map_err(|error| RestoreError::Decode {
-                kind,
-                reason: error.to_string(),
-            })?;
+        let state: T = decode_parts(&self.bytes, &self.parts)
+            .map_err(|reason| RestoreError::Decode { kind, reason })?;
         match state.impossible() {
             Some(reason) => Err(RestoreError::Impossible { kind, reason }),
             None => Ok(state),

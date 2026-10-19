@@ -741,7 +741,10 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
             .db
             .save_graph_checkpoint(
                 restored_id,
-                Arc::new(checkpoint::rows(&admitted.snapshot())),
+                Arc::new(crate::jobs::graph_checkpoint::Delta::between(
+                    None,
+                    &checkpoint::rows(&admitted.snapshot()),
+                )),
             )
             .unwrap();
         retire_pipeline_database(pipeline).await;

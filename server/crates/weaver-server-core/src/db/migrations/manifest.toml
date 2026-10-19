@@ -778,3 +778,20 @@ kind = "sql"
 file = "migrations/0067_graph_member_buried/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 68
+description = "a graph checkpoint keeps each sealed part of a node's facts as its own row"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0068_graph_facts_parts/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0068_graph_facts_parts/postgres.sql"
+engine = "postgres"
+scope = "all"

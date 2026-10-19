@@ -467,6 +467,9 @@ pub(super) struct GraphView {
     pub(super) offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
     pub(super) delivery: Delivery,
+    // What the job's checkpoints asked the database to write, at the last
+    // look.
+    pub(super) checkpoints: crate::pipeline::graph::checkpoint::Tally,
 }
 
 #[derive(Debug)]
@@ -1030,6 +1033,7 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
             .map(|kind| kind.to_string()),
     );
     view.offered = job.passwords_offered();
+    view.checkpoints = job.pending().tally();
     view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
     let namespace = job.namespace();
     view.claims = state

@@ -72,6 +72,7 @@
 // Files are indexed as the posts are listed; ordinals count from zero.
 
 mod caps;
+mod checkpoint_cost;
 mod depth;
 mod divergence;
 mod embedded;

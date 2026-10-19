@@ -41,7 +41,8 @@ pub struct Sfv {
 }
 
 impl Durable for Sfv {
-    const VERSION: u16 = 1;
+    // 2: the grid shelved by chunk of blocks, kept apart from the bytes.
+    const VERSION: u16 = 2;
 
     fn impossible(&self) -> Option<&'static str> {
         let sized = self

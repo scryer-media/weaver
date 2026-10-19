@@ -195,7 +195,9 @@ impl PacketFacts {
 
 impl Durable for Par2Facts {
     // 2: each set's packets sealed, nested as the bytes they encoded to.
-    const VERSION: u16 = 2;
+    // 3: sealed parts kept apart from the facts' bytes, and the grid
+    // shelved by chunk of blocks.
+    const VERSION: u16 = 3;
 
     fn impossible(&self) -> Option<&'static str> {
         let keys: BTreeSet<_> = self.sets.iter().map(|set| set.key).collect();
