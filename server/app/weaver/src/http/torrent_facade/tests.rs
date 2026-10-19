@@ -67,22 +67,35 @@ impl Routes for Offline {
     }
 }
 
-// A scheduler that answers every bandwidth change.
+// A scheduler that answers every bandwidth change and puts holds in force.
 fn scheduler() -> SchedulerHandle {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let (event_tx, _) = broadcast::channel(1);
+    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    let holds = state.clone();
     tokio::spawn(async move {
         while let Some(command) = cmd_rx.recv().await {
-            if let SchedulerCommand::SetBandwidth { reply, .. } = command {
-                let _ = reply.send(());
+            match command {
+                SchedulerCommand::SetBandwidth { reply, .. } => {
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::Pause { hold, reply } => {
+                    holds.hold(hold);
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::Resume {
+                    origin,
+                    owner,
+                    reply,
+                } => {
+                    holds.release(origin, owner);
+                    let _ = reply.send(());
+                }
+                _ => {}
             }
         }
     });
-    SchedulerHandle::new(
-        cmd_tx,
-        event_tx,
-        SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-    )
+    SchedulerHandle::new(cmd_tx, event_tx, state)
 }
 
 fn config(complete_dir: &std::path::Path) -> SharedConfig {
@@ -177,6 +190,7 @@ async fn rig_from(
             Arc::new(SystemClock),
         );
         torrents.start().await.unwrap();
+        torrents.publish_to(handle.clone());
         Some(torrents)
     } else {
         None
@@ -806,7 +820,8 @@ async fn stop_start_and_force_change_the_state() {
         StatusCode::OK
     );
     assert_ne!(rig.torrents().await[0]["state"], "stoppedDL");
-    rig.post("/api/v2/torrents/pause", "hashes=all").await;
+    rig.post("/api/v2/torrents/pause", &format!("hashes={hash}"))
+        .await;
     assert_eq!(rig.torrents().await[0]["state"], "stoppedDL");
     rig.post("/api/v2/torrents/resume", &format!("hashes={hash}"))
         .await;
@@ -816,6 +831,88 @@ async fn stop_start_and_force_change_the_state() {
     )
     .await;
     assert_eq!(rig.torrents().await[0]["force_start"], true);
+}
+
+// Pausing every torrent is one hold, not a pause of each: a torrent's own
+// pause stands under it and outlasts it, and the hold writes no torrent's
+// intent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
+    use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    rig.add_file(&metainfo("two.mkv", 4000, false), &[]).await;
+    let queue = rig.context.inner.handle.state().clone();
+    let held = || {
+        queue
+            .holds()
+            .held_by(HoldOrigin::Manual, HoldOwner::Torrents)
+    };
+    let named = |torrents: &[Value], name: &str, field: &str| {
+        torrents
+            .iter()
+            .find(|torrent| torrent["name"] == name)
+            .unwrap()[field]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // Send `form` to `path` and wait for the torrents to show whether each
+    // is stopped.
+    let send = |path: &'static str, form: String, stopped: (bool, bool)| {
+        let rig = &rig;
+        let mut published = queue.subscribe_job_changes();
+        published.borrow_and_update();
+        async move {
+            assert_eq!(rig.post(path, &form).await.status, StatusCode::OK);
+            loop {
+                let listed = rig.torrents().await;
+                let shown = (
+                    named(&listed, "one.mkv", "state") == "stoppedDL",
+                    named(&listed, "two.mkv", "state") == "stoppedDL",
+                );
+                if shown == stopped {
+                    break;
+                }
+                published.changed().await.unwrap();
+            }
+        }
+    };
+    let one = named(&rig.torrents().await, "one.mkv", "hash");
+
+    // A pause of one hash is that torrent's own and sets no hold.
+    send(
+        "/api/v2/torrents/pause",
+        format!("hashes={one}"),
+        (true, false),
+    )
+    .await;
+    assert!(!held());
+
+    for (pause, resume) in [
+        ("/api/v2/torrents/pause", "/api/v2/torrents/resume"),
+        ("/api/v2/torrents/stop", "/api/v2/torrents/start"),
+    ] {
+        send(pause, "hashes=all".to_owned(), (true, true)).await;
+        assert!(held());
+        // The torrent paused on its own stays paused once the hold lifts.
+        send(resume, "hashes=all".to_owned(), (true, false)).await;
+        assert!(!held());
+    }
+    let two = named(&rig.torrents().await, "two.mkv", "hash");
+    for (hash, intent) in [
+        (
+            one,
+            weaver_server_core::torrents::model::TorrentIntent::Paused,
+        ),
+        (
+            two,
+            weaver_server_core::torrents::model::TorrentIntent::Resumed,
+        ),
+    ] {
+        let job_id = rig.context.by_hash(&hash).await.unwrap().job_id;
+        assert_eq!(rig.db.get_torrent(job_id).unwrap().unwrap().intent, intent);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

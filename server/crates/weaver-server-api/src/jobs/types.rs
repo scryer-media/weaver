@@ -8,7 +8,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::duplicate::DuplicateJobSnapshot;
-use weaver_server_core::jobs::handle::DownloadBlockState;
+use weaver_server_core::jobs::handle::{DownloadBlockState, HoldOrigin, HoldOwner, HoldSet};
 use weaver_server_core::jobs::{
     DuplicateAction, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary, DuplicateMatch,
     DuplicateMode, FingerprintKind, JobId, SemanticAdmission, SemanticCandidateSnapshot,
@@ -330,6 +330,10 @@ pub struct QueueSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct GlobalQueueState {
     pub is_paused: bool,
+    /// Whether the operator's or the schedule's pause of every torrent is in
+    /// force.
+    #[serde(default)]
+    pub torrents_paused: bool,
     pub speed_limit_bytes_per_sec: Option<u64>,
     pub download_block: DownloadBlock,
 }
@@ -1490,12 +1494,15 @@ pub fn queue_event_from_record(id: i64, record: PersistedQueueEvent) -> QueueEve
 }
 
 pub fn global_queue_state(
-    is_paused: bool,
+    holds: &HoldSet,
     download_block: &DownloadBlockState,
     speed_limit_bytes_per_sec: Option<u64>,
 ) -> GlobalQueueState {
     GlobalQueueState {
-        is_paused,
+        is_paused: holds.stops(HoldOwner::All, false),
+        torrents_paused: [HoldOrigin::Manual, HoldOrigin::Scheduled]
+            .into_iter()
+            .any(|origin| holds.held_by(origin, HoldOwner::Torrents)),
         speed_limit_bytes_per_sec,
         download_block: DownloadBlock::from(download_block),
     }

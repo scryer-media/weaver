@@ -10,8 +10,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64 as StdAtomicU64;
 
 use crate::bandwidth::{BandwidthSplit, ScheduleAction, SplitRates, SplitState};
-use crate::jobs::QueueHold;
 use crate::jobs::handle::TorrentRate;
+use crate::jobs::{HoldOwner, HoldSet};
 
 const MB: u64 = 1_000_000;
 
@@ -182,33 +182,52 @@ async fn editing_the_limit_keeps_a_scheduled_split_and_setting_a_split_lifts_it(
     assert_eq!(pipeline.shared_state.bandwidth_split().in_force, split(60));
 }
 
+// What a hold set stops: usenet downloads, torrent downloads, seeding.
+fn stopped(holds: &HoldSet) -> (bool, bool, bool) {
+    (
+        holds.stops(HoldOwner::All, false),
+        holds.stops(HoldOwner::Torrents, false),
+        holds.stops(HoldOwner::Torrents, true),
+    )
+}
+
 #[tokio::test]
 async fn pauses_publish_what_they_stop_to_the_torrents() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let mut hold = pipeline.shared_state.subscribe_queue_hold();
+    let mut holds = pipeline.shared_state.subscribe_holds();
 
     for (action, expected) in [
-        (ScheduleAction::Pause, QueueHold::Downloads),
-        (ScheduleAction::Resume, QueueHold::None),
-        (ScheduleAction::PauseAll, QueueHold::Everything),
-        (ScheduleAction::Resume, QueueHold::None),
+        (ScheduleAction::Pause, (true, true, false)),
+        (ScheduleAction::Resume, (false, false, false)),
+        (ScheduleAction::PauseAll, (true, true, true)),
+        (ScheduleAction::Resume, (false, false, false)),
+        (ScheduleAction::PauseTorrents, (false, true, true)),
+        (ScheduleAction::Resume, (false, true, true)),
+        (ScheduleAction::ResumeTorrents, (false, false, false)),
     ] {
-        schedule(&mut pipeline, action).await;
-        assert!(hold.has_changed().unwrap());
-        assert_eq!(*hold.borrow_and_update(), expected);
+        schedule(&mut pipeline, action.clone()).await;
+        assert_eq!(stopped(&holds.borrow_and_update()), expected, "{action:?}");
     }
 
     let (reply, received) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
+        .handle_command(SchedulerCommand::Pause {
+            hold: crate::jobs::Hold::manual(HoldOwner::All),
+            reply,
+        })
         .await;
     received.await.unwrap();
-    assert_eq!(*hold.borrow_and_update(), QueueHold::Downloads);
+    assert!(holds.has_changed().unwrap());
+    assert_eq!(stopped(&holds.borrow_and_update()), (true, true, false));
     let (reply, received) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::ResumeAll { reply })
+        .handle_command(SchedulerCommand::Resume {
+            origin: crate::jobs::HoldOrigin::Manual,
+            owner: HoldOwner::All,
+            reply,
+        })
         .await;
     received.await.unwrap();
-    assert_eq!(*hold.borrow_and_update(), QueueHold::None);
+    assert_eq!(stopped(&holds.borrow_and_update()), (false, false, false));
 }

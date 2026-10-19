@@ -2,20 +2,24 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::Database;
+use crate::jobs::{Hold, HoldOrigin, HoldOwner, HoldSet};
 use crate::settings::{Config, SharedConfig};
 use crate::{NntpRuntimeActivation, SchedulerError, SchedulerHandle};
 
-pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
-    let db = db.clone();
-    let value = tokio::task::spawn_blocking(move || db.get_setting("global_paused"))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())?;
-
-    Ok(value
-        .as_deref()
-        .and_then(|raw| raw.parse::<bool>().ok())
-        .unwrap_or(false))
+// The operator's holds, as last kept.
+pub async fn load_holds_from_db(db: &Database) -> Result<HoldSet, String> {
+    let mut holds = HoldSet::default();
+    for owner in [HoldOwner::All, HoldOwner::Torrents] {
+        let db = db.clone();
+        let value = tokio::task::spawn_blocking(move || db.get_setting(owner.setting()))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        if value.as_deref().and_then(|raw| raw.parse::<bool>().ok()) == Some(true) {
+            holds.hold(Hold::manual(owner));
+        }
+    }
+    Ok(holds)
 }
 
 // Pool settings for every active server, in dial order. Startup and every
@@ -176,16 +180,14 @@ pub async fn reload_runtime_from_db(
         .restore_bandwidth(loaded.bandwidth)
         .await
         .map_err(|error| error.to_string())?;
-    if load_global_pause_from_db(db).await? {
-        handle
-            .pause_all()
-            .await
-            .map_err(|error| error.to_string())?;
-    } else {
-        handle
-            .resume_all()
-            .await
-            .map_err(|error| error.to_string())?;
+    let holds = load_holds_from_db(db).await?;
+    for owner in [HoldOwner::All, HoldOwner::Torrents] {
+        if holds.held_by(HoldOrigin::Manual, owner) {
+            handle.pause(Hold::manual(owner)).await
+        } else {
+            handle.resume(HoldOrigin::Manual, owner).await
+        }
+        .map_err(|error| error.to_string())?;
     }
 
     Ok(loaded)

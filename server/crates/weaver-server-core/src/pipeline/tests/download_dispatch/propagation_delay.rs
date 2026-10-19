@@ -810,7 +810,9 @@ async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
     );
 
     // A manual pause outranks it, and the egress details stay readable.
-    pipeline.global_paused = true;
+    pipeline
+        .shared_state
+        .hold(crate::jobs::Hold::manual(crate::jobs::HoldOwner::All));
     pipeline.publish_download_block();
     let state = pipeline.shared_state.download_block();
     assert_eq!(
@@ -818,7 +820,9 @@ async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
         crate::jobs::handle::DownloadBlockKind::ManualPause
     );
     assert_eq!(state.egress_id, Some(4));
-    pipeline.global_paused = false;
+    pipeline
+        .shared_state
+        .release(crate::jobs::HoldOrigin::Manual, crate::jobs::HoldOwner::All);
     pipeline.publish_download_block();
 
     // Once the egress clears, the server quota underneath shows again.
@@ -976,7 +980,7 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
             .await;
         received.await.unwrap();
         assert_eq!(
-            pipeline.global_paused,
+            pipeline.shared_state.is_paused(),
             action == crate::bandwidth::ScheduleAction::Pause
         );
         assert_eq!(pipeline.rate_limiter.rate(), Some(128 * 1024));
@@ -1024,7 +1028,7 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
         .await;
     received.await.unwrap();
     assert_eq!(pipeline.rate_limiter.rate(), Some(768 * 1024));
-    assert!(pipeline.global_paused);
+    assert!(pipeline.shared_state.is_paused());
 
     // A schedule's zero lets nothing through.
     let (reply, received) = oneshot::channel();
@@ -1040,21 +1044,40 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
 
 #[tokio::test]
 async fn speed_test_hold_preserves_later_schedule_pause() {
+    use crate::jobs::{Hold, HoldOrigin, HoldOwner, HoldScope};
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let speed_test = Hold {
+        origin: HoldOrigin::SpeedTest,
+        scope: HoldScope::Everything,
+        owner: HoldOwner::All,
+    };
     let (reply, received) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::SetSpeedTestPause {
-            paused: true,
+        .handle_command(SchedulerCommand::Pause {
+            hold: speed_test,
             reply,
         })
         .await;
     received.await.unwrap();
     assert!(pipeline.shared_state.is_paused());
-    assert!(
-        !pipeline.global_paused,
-        "the transient hold does not become a persisted pause"
+    assert_eq!(pipeline.global_pause(), Some(HoldOrigin::SpeedTest));
+    assert_eq!(
+        pipeline.db.get_setting("global_paused").unwrap(),
+        None,
+        "the speed test's hold is not persisted"
     );
+    // A manual resume leaves the running test's hold in place.
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::Resume {
+            origin: HoldOrigin::Manual,
+            owner: HoldOwner::All,
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert_eq!(pipeline.global_pause(), Some(HoldOrigin::SpeedTest));
     let (reply, received) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::ApplyScheduleAction {
@@ -1065,15 +1088,15 @@ async fn speed_test_hold_preserves_later_schedule_pause() {
     received.await.unwrap();
     let (reply, received) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::SetSpeedTestPause {
-            paused: false,
+        .handle_command(SchedulerCommand::Resume {
+            origin: HoldOrigin::SpeedTest,
+            owner: HoldOwner::All,
             reply,
         })
         .await;
     received.await.unwrap();
-    assert!(pipeline.global_paused);
-    assert!(pipeline.scheduled_pause);
     assert!(pipeline.shared_state.is_paused());
+    assert_eq!(pipeline.global_pause(), Some(HoldOrigin::Scheduled));
     let (reply, received) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::ApplyScheduleAction {

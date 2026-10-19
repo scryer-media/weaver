@@ -8,6 +8,7 @@ use librqbit_core::lengths::Lengths;
 use sha1::{Digest, Sha1};
 
 use super::*;
+use crate::jobs::{Hold, HoldScope};
 use crate::post_processing::model::PostProcessingSettings;
 use crate::settings::{SeedingAction, SeedingGoalMode};
 use crate::torrents::sessions::Routes;
@@ -1246,10 +1247,11 @@ async fn the_checkpoint_is_written_once_a_tick() {
     assert_eq!(written.borrow().checkpoints, base + 1);
 }
 
-// The global pause the queue publishes reaches the torrents: a pause stops
-// downloading and leaves what is complete seeding, pausing everything stops
-// seeding too, and a resume lets both run again. Neither touches a torrent's
-// own intent.
+// The holds the queue publishes reach the torrents: a pause stops
+// downloading and leaves what is complete seeding, pausing everything or
+// pausing the torrents stops seeding too, and a release lets both run again.
+// None of them touches a torrent's own intent, and a torrent its operator
+// paused stays paused through them all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_global_pause_reaches_the_torrents() {
     let rig = rig(set_clock());
@@ -1276,27 +1278,53 @@ async fn the_global_pause_reaches_the_torrents() {
         .record
         .completed_at_ms = Some(EPOCH_MS);
 
+    let kept = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("kept", 3))))
+        .await
+        .unwrap();
+    rig.service.pause(kept).await.unwrap();
+
     let mut published = queue.state().subscribe_job_changes();
     let paused = |job_id| {
         let service = rig.service.clone();
         async move { service.torrent(job_id).await.unwrap().state == TorrentState::Paused }
     };
-    for (hold, stopped) in [
-        (QueueHold::Downloads, (true, false)),
-        (QueueHold::Everything, (true, true)),
-        (QueueHold::None, (false, false)),
+    let scheduled = |scope, owner| Hold {
+        origin: HoldOrigin::Scheduled,
+        scope,
+        owner,
+    };
+    for (holds, stopped) in [
+        (vec![Hold::manual(HoldOwner::All)], (true, false)),
+        (
+            vec![scheduled(HoldScope::Everything, HoldOwner::All)],
+            (true, true),
+        ),
+        (vec![Hold::manual(HoldOwner::Torrents)], (true, true)),
+        (
+            vec![scheduled(HoldScope::Everything, HoldOwner::Torrents)],
+            (true, true),
+        ),
+        (vec![], (false, false)),
     ] {
         published.borrow_and_update();
-        queue.state().set_queue_hold(hold);
+        let mut set = HoldSet::default();
+        for hold in holds {
+            set.hold(hold);
+        }
+        queue.state().restore_holds(set);
         while (paused(downloading).await, paused(seeding).await) != stopped {
             published.changed().await.unwrap();
         }
+        assert!(paused(kept).await);
     }
-    for job_id in [downloading, seeding] {
-        assert_eq!(
-            rig.db.get_torrent(job_id).unwrap().unwrap().intent,
-            TorrentIntent::Resumed
-        );
+    for (job_id, intent) in [
+        (downloading, TorrentIntent::Resumed),
+        (seeding, TorrentIntent::Resumed),
+        (kept, TorrentIntent::Paused),
+    ] {
+        assert_eq!(rig.db.get_torrent(job_id).unwrap().unwrap().intent, intent);
     }
 }
 

@@ -372,7 +372,10 @@ async fn a_held_placement_write_leaves_the_pipeline_serving_and_commits_when_it_
     pipeline.demand_direct_store_barriers_for_pause(None).await;
     let (reply, paused) = tokio::sync::oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
+        .handle_command(SchedulerCommand::Pause {
+            hold: crate::jobs::Hold::manual(crate::jobs::HoldOwner::All),
+            reply,
+        })
         .await;
     paused.await.unwrap();
 
@@ -594,7 +597,10 @@ async fn a_completed_volumes_trailing_region_lands_through_the_lane_while_the_pi
     pipeline.demand_direct_store_barriers_for_pause(None).await;
     let (reply, paused) = tokio::sync::oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
+        .handle_command(SchedulerCommand::Pause {
+            hold: crate::jobs::Hold::manual(crate::jobs::HoldOwner::All),
+            reply,
+        })
         .await;
     paused.await.unwrap();
     assert!(pipeline.direct_set_has_pending_volume_tail(job_id, 0));

@@ -11,6 +11,7 @@ use super::fixture::{
     FixtureArticle, HttpFixture, NntpFixture, SilentFixture, librespeed_list, loopback_tls, nzb,
 };
 use super::*;
+use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
 use crate::proxies::{Consumer, Failover, LegPath, ProxyRuntime, Route, RouteLeg};
 use crate::settings::Config;
 use crate::{Database, PipelineMetrics, SchedulerCommand, SchedulerHandle, SharedPipelineState};
@@ -56,16 +57,16 @@ async fn rig() -> Rig {
     tokio::spawn(async move {
         while let Some(command) = cmd_rx.recv().await {
             match command {
-                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
-                    scheduler_state.set_speed_test_paused(paused);
+                SchedulerCommand::Pause { hold, reply } => {
+                    scheduler_state.hold(hold);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::PauseAll { reply } => {
-                    scheduler_state.set_queue_hold(crate::jobs::QueueHold::Downloads);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::ResumeAll { reply } => {
-                    scheduler_state.set_queue_hold(crate::jobs::QueueHold::None);
+                SchedulerCommand::Resume {
+                    origin,
+                    owner,
+                    reply,
+                } => {
+                    scheduler_state.release(origin, owner);
                     let _ = reply.send(());
                 }
                 _ => {}
@@ -319,14 +320,67 @@ async fn a_later_operator_pause_survives_speed_test_cancellation() {
         revision.changed().await.unwrap();
     }
     rig.handle.pause_all().await.unwrap();
+    let holds = rig.handle.state().holds();
+    assert!(holds.held_by(HoldOrigin::SpeedTest, HoldOwner::All));
+    assert!(holds.held_by(HoldOrigin::Manual, HoldOwner::All));
     assert!(rig.service.cancel(started.id));
     assert_eq!(
         finished(&rig, started.id).await.status,
         SpeedTestStatus::Cancelled
     );
-    assert!(rig.handle.is_globally_paused());
+    let holds = rig.handle.state().holds();
+    assert!(!holds.held_by(HoldOrigin::SpeedTest, HoldOwner::All));
+    assert_eq!(
+        holds.reason(HoldOwner::All, false),
+        Some(HoldOrigin::Manual)
+    );
     rig.handle.resume_all().await.unwrap();
     assert!(!rig.handle.is_globally_paused());
+}
+
+#[tokio::test]
+async fn an_operator_resume_leaves_a_running_test_held() {
+    let rig = rig().await;
+    let nntp = NntpFixture::start(vec![], None, None).await;
+    let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+    rig.metrics.set_active_downloads(1);
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let mut revision = rig.service.subscribe();
+    while rig
+        .service
+        .run(started.id)
+        .unwrap()
+        .phase_label()
+        .as_deref()
+        != Some("draining 1")
+    {
+        revision.changed().await.unwrap();
+    }
+    // The test holds everything, seeding included, through the one pause.
+    let holds = rig.handle.state().holds();
+    assert_eq!(
+        holds.reason(HoldOwner::Torrents, true),
+        Some(HoldOrigin::SpeedTest)
+    );
+    rig.handle.resume_all().await.unwrap();
+    assert_eq!(
+        rig.handle.state().holds().reason(HoldOwner::All, false),
+        Some(HoldOrigin::SpeedTest)
+    );
+    assert!(rig.service.cancel(started.id));
+    assert_eq!(
+        finished(&rig, started.id).await.status,
+        SpeedTestStatus::Cancelled
+    );
+    assert_eq!(rig.handle.state().holds(), HoldSet::default());
 }
 
 #[tokio::test]

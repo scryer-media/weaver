@@ -134,12 +134,16 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
                         Some((data_dir, intermediate_dir, complete_dir));
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::PauseAll { reply } => {
-                    task_state.set_queue_hold(crate::jobs::QueueHold::Downloads);
+                SchedulerCommand::Pause { hold, reply } => {
+                    task_state.hold(hold);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::ResumeAll { reply } => {
-                    task_state.set_queue_hold(crate::jobs::QueueHold::None);
+                SchedulerCommand::Resume {
+                    origin,
+                    owner,
+                    reply,
+                } => {
+                    task_state.release(origin, owner);
                     let _ = reply.send(());
                 }
                 _ => {}

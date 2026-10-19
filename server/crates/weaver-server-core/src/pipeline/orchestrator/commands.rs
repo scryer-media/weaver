@@ -472,57 +472,16 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
-            SchedulerCommand::SetSpeedTestPause { paused, reply } => {
-                self.shared_state.set_speed_test_paused(paused);
-                if paused {
-                    self.download_restart_durable_lead_retry_after.clear();
-                }
-                self.publish_download_block();
-                let _ = self.event_tx.send(if self.shared_state.is_paused() {
-                    PipelineEvent::GlobalPaused
-                } else {
-                    PipelineEvent::GlobalResumed
-                });
+            SchedulerCommand::Pause { hold, reply } => {
+                self.put_hold(hold).await;
                 let _ = reply.send(());
             }
-            SchedulerCommand::PauseAll { reply } => {
-                self.global_paused = true;
-                self.scheduled_pause = false;
-                self.download_restart_durable_lead_retry_after.clear();
-                // The operator's pause stops downloading; what is complete
-                // keeps seeding.
-                self.shared_state
-                    .set_queue_hold(crate::jobs::QueueHold::Downloads);
-                self.shared_state.set_download_block(
-                    self.bandwidth_ledger
-                        .to_download_block_state(self.global_pause()),
-                );
-                if let Err(e) = self
-                    .db_blocking(move |db| db.set_setting("global_paused", "true"))
-                    .await
-                {
-                    error!(error = %e, "db write failed for PauseAll");
-                }
-                let _ = self.event_tx.send(PipelineEvent::GlobalPaused);
-                let _ = reply.send(());
-            }
-            SchedulerCommand::ResumeAll { reply } => {
-                self.global_paused = false;
-                self.scheduled_pause = false;
-                self.shared_state
-                    .set_queue_hold(crate::jobs::QueueHold::None);
-                self.publish_download_block();
-                if let Err(e) = self
-                    .db_blocking(move |db| db.set_setting("global_paused", "false"))
-                    .await
-                {
-                    error!(error = %e, "db write failed for ResumeAll");
-                }
-                let _ = self.event_tx.send(if self.shared_state.is_paused() {
-                    PipelineEvent::GlobalPaused
-                } else {
-                    PipelineEvent::GlobalResumed
-                });
+            SchedulerCommand::Resume {
+                origin,
+                owner,
+                reply,
+            } => {
+                self.lift_hold(origin, owner).await;
                 let _ = reply.send(());
             }
             SchedulerCommand::PausePostProcessing { reply }
@@ -643,29 +602,37 @@ impl Pipeline {
             }
             SchedulerCommand::ApplyScheduleAction { action, reply } => {
                 use crate::bandwidth::ScheduleAction;
+                use crate::jobs::{Hold, HoldOrigin, HoldOwner, HoldScope};
+                let scheduled = |scope, owner| Hold {
+                    origin: HoldOrigin::Scheduled,
+                    scope,
+                    owner,
+                };
                 match action {
-                    ScheduleAction::Pause | ScheduleAction::PauseAll => {
-                        self.global_paused = true;
-                        self.scheduled_pause = true;
-                        // Pause stops downloading and leaves what is complete
-                        // seeding; pause all stops seeding too.
-                        self.shared_state.set_queue_hold(match action {
-                            ScheduleAction::PauseAll => crate::jobs::QueueHold::Everything,
-                            _ => crate::jobs::QueueHold::Downloads,
-                        });
-                        // The Scheduled kind now falls out of global_pause(), so
-                        // any later block-state refresh keeps reporting it
-                        // instead of reclassifying the pause as manual.
-                        self.publish_download_block();
-                        info!("schedule: paused downloads");
+                    // Pause stops downloading and leaves what is complete
+                    // seeding; pause all stops seeding too.
+                    ScheduleAction::Pause
+                    | ScheduleAction::PauseAll
+                    | ScheduleAction::PauseTorrents => {
+                        let hold = match action {
+                            ScheduleAction::Pause => {
+                                scheduled(HoldScope::Downloads, HoldOwner::All)
+                            }
+                            ScheduleAction::PauseAll => {
+                                scheduled(HoldScope::Everything, HoldOwner::All)
+                            }
+                            _ => scheduled(HoldScope::Everything, HoldOwner::Torrents),
+                        };
+                        self.put_hold(hold).await;
+                        info!(?hold, "schedule: paused");
                     }
-                    ScheduleAction::Resume => {
-                        self.global_paused = false;
-                        self.scheduled_pause = false;
-                        self.shared_state
-                            .set_queue_hold(crate::jobs::QueueHold::None);
-                        self.publish_download_block();
-                        info!("schedule: resumed downloads");
+                    ScheduleAction::Resume | ScheduleAction::ResumeTorrents => {
+                        let owner = match action {
+                            ScheduleAction::Resume => HoldOwner::All,
+                            _ => HoldOwner::Torrents,
+                        };
+                        self.lift_hold(HoldOrigin::Scheduled, owner).await;
+                        info!(?owner, "schedule: resumed");
                     }
                     ScheduleAction::SpeedLimit { limits } => {
                         // Only the global limit lives here; an egress or

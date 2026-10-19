@@ -9,6 +9,7 @@ use crate::jobs::types::{
     DuplicateSummaryInfo, PreparedQueueFilter, load_duplicate_summaries_chunked,
     matches_queue_event_filter_prepared, matches_queue_filter_prepared,
 };
+use weaver_server_core::jobs::handle::{HoldOwner, HoldSet};
 
 #[derive(Default)]
 pub(crate) struct JobsSubscription;
@@ -51,7 +52,7 @@ impl JobsSubscription {
             }
             let jobs = handle.list_jobs().iter().map(Job::from).collect();
             let metrics = Metrics::from(&state.metrics);
-            let is_paused = state.is_paused;
+            let is_paused = state.holds.stops(HoldOwner::All, false);
             let download_block = DownloadBlock::from(&state.download_block);
             last_state = Some(state);
 
@@ -163,7 +164,7 @@ impl JobsSubscription {
                         summary: queue_summary(&items, metrics),
                         metrics: metrics_from_snapshot(metrics),
                         global_state: global_queue_state(
-                            state.is_paused,
+                            &state.holds,
                             &state.download_block,
                             max_download_speed,
                         ),
@@ -295,7 +296,7 @@ async fn attach_duplicate_summaries(db: Database, items: &mut [QueueItem]) -> Re
 struct SnapshotState {
     revision: u64,
     metrics: weaver_server_core::operations::metrics::MetricsSnapshot,
-    is_paused: bool,
+    holds: HoldSet,
     download_block: weaver_server_core::jobs::handle::DownloadBlockState,
 }
 
@@ -304,7 +305,7 @@ impl SnapshotState {
         Self {
             revision: handle.job_revision(),
             metrics: handle.get_metrics(),
-            is_paused: handle.is_globally_paused(),
+            holds: handle.state().holds(),
             download_block: handle.get_download_block(),
         }
     }

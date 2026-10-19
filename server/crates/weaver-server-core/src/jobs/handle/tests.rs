@@ -402,16 +402,16 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::PauseAll { reply } => {
-                    shared_state.set_queue_hold(crate::jobs::QueueHold::Downloads);
+                SchedulerCommand::Pause { hold, reply } => {
+                    shared_state.hold(hold);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
-                    shared_state.set_speed_test_paused(paused);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::ResumeAll { reply } => {
-                    shared_state.set_queue_hold(crate::jobs::QueueHold::None);
+                SchedulerCommand::Resume {
+                    origin,
+                    owner,
+                    reply,
+                } => {
+                    shared_state.release(origin, owner);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetPropagationDelay { reply, .. }
@@ -1240,4 +1240,124 @@ fn the_queue_interleaves_owners_by_when_their_jobs_were_added() {
     state.publish_torrent_jobs(vec![owned_job(JobId(4), 200.0), owned_job(JobId(5), 400.0)]);
     let order: Vec<u64> = state.list_jobs().iter().map(|job| job.job_id.0).collect();
     assert_eq!(order, vec![1, 4, 2, 3, 5, 9]);
+}
+
+fn hold_set(holds: &[Hold]) -> HoldSet {
+    let mut set = HoldSet::default();
+    for hold in holds {
+        set.hold(*hold);
+    }
+    set
+}
+
+const fn hold(origin: HoldOrigin, scope: HoldScope, owner: HoldOwner) -> Hold {
+    Hold {
+        origin,
+        scope,
+        owner,
+    }
+}
+
+#[test]
+fn a_hold_stops_what_it_covers_and_names_who_stops_it() {
+    use HoldOrigin::{Manual, Scheduled, SpeedTest};
+    use HoldOwner::{All, Torrents};
+    use HoldScope::{Downloads, Everything};
+    // Usenet downloads, torrent downloads, seeding torrents.
+    let items = [(All, false), (Torrents, false), (Torrents, true)];
+    for (holds, expected) in [
+        (vec![], [None, None, None]),
+        (vec![Hold::manual(All)], [Some(Manual), Some(Manual), None]),
+        (
+            vec![hold(Scheduled, Everything, All)],
+            [Some(Scheduled), Some(Scheduled), Some(Scheduled)],
+        ),
+        (
+            vec![Hold::manual(Torrents)],
+            [None, Some(Manual), Some(Manual)],
+        ),
+        (
+            vec![hold(Scheduled, Everything, Torrents)],
+            [None, Some(Scheduled), Some(Scheduled)],
+        ),
+        (
+            vec![hold(SpeedTest, Everything, All)],
+            [Some(SpeedTest), Some(SpeedTest), Some(SpeedTest)],
+        ),
+        (
+            vec![hold(SpeedTest, Everything, All), Hold::manual(All)],
+            [Some(Manual), Some(Manual), Some(SpeedTest)],
+        ),
+        (
+            vec![
+                hold(SpeedTest, Everything, All),
+                hold(Scheduled, Downloads, All),
+            ],
+            [Some(Scheduled), Some(Scheduled), Some(SpeedTest)],
+        ),
+        (
+            vec![Hold::manual(Torrents), hold(Scheduled, Downloads, All)],
+            [Some(Scheduled), Some(Manual), Some(Manual)],
+        ),
+    ] {
+        let set = hold_set(&holds);
+        let reasons = items.map(|(owner, complete)| set.reason(owner, complete));
+        assert_eq!(reasons, expected, "{holds:?}");
+        for ((owner, complete), reason) in items.into_iter().zip(expected) {
+            assert_eq!(set.stops(owner, complete), reason.is_some());
+        }
+    }
+}
+
+#[test]
+fn a_hold_origin_releases_what_it_shares_and_nothing_else() {
+    use HoldOrigin::{Manual, Scheduled, SpeedTest};
+    use HoldOwner::{All, Torrents};
+    use HoldScope::{Downloads, Everything};
+    let speed_test = hold(SpeedTest, Everything, All);
+
+    // The operator and the schedule share one pause; each replaces and lifts
+    // the other's.
+    let mut set = hold_set(&[hold(Scheduled, Everything, All), Hold::manual(All)]);
+    assert_eq!(set, hold_set(&[Hold::manual(All)]));
+    set.hold(hold(Scheduled, Downloads, All));
+    set.release(Manual, All);
+    assert_eq!(set, HoldSet::default());
+
+    // Neither touches a speed test's hold, and it touches neither of theirs.
+    let mut set = hold_set(&[speed_test, Hold::manual(All)]);
+    set.release(Manual, All);
+    assert_eq!(set, hold_set(&[speed_test]));
+    set.hold(hold(Scheduled, Downloads, All));
+    set.release(SpeedTest, All);
+    assert_eq!(set, hold_set(&[hold(Scheduled, Downloads, All)]));
+
+    // A hold over the torrents stands apart from the queue's.
+    let mut set = hold_set(&[Hold::manual(Torrents), Hold::manual(All)]);
+    set.release(Manual, All);
+    assert_eq!(set, hold_set(&[Hold::manual(Torrents)]));
+    assert!(set.held_by(Manual, Torrents));
+    assert!(!set.held_by(Manual, All));
+    set.release(Scheduled, Torrents);
+    assert_eq!(set, HoldSet::default());
+}
+
+#[test]
+fn the_queue_is_paused_only_by_a_hold_over_it() {
+    let metrics = PipelineMetrics::new();
+    let state = SharedPipelineState::new(metrics, vec![]);
+    let mut holds = state.subscribe_holds();
+    state.hold(Hold::manual(HoldOwner::Torrents));
+    assert!(holds.has_changed().unwrap());
+    holds.borrow_and_update();
+    assert!(!state.is_paused());
+    state.hold(Hold::manual(HoldOwner::Torrents));
+    assert!(
+        !holds.has_changed().unwrap(),
+        "an unchanged set is not sent"
+    );
+    state.hold(Hold::manual(HoldOwner::All));
+    assert!(state.is_paused());
+    state.release(HoldOrigin::Manual, HoldOwner::All);
+    assert!(!state.is_paused());
 }

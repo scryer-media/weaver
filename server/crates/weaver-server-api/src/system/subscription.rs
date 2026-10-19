@@ -109,7 +109,6 @@ async fn build_system_metrics_snapshot(
 ) -> SystemMetricsSnapshot {
     let metrics = Metrics::from(&metrics);
     let download_block = handle.get_download_block();
-    let is_paused = handle.is_globally_paused();
     let speed_limit_bytes_per_sec = config.read().await.bandwidth.download_bps;
     let pool = handle.nntp_pool();
     let provider_holdoffs = pool.as_deref().map(provider_holdoffs).unwrap_or_default();
@@ -131,7 +130,11 @@ async fn build_system_metrics_snapshot(
 
     SystemMetricsSnapshot {
         metrics,
-        global_state: global_queue_state(is_paused, &download_block, speed_limit_bytes_per_sec),
+        global_state: global_queue_state(
+            &handle.state().holds(),
+            &download_block,
+            speed_limit_bytes_per_sec,
+        ),
         provider_holdoffs,
         job_download_rates,
         provider_connections,

@@ -322,6 +322,7 @@ impl From<weaver_server_core::watch_folder::MarkerRename> for WatchFolderMarkerR
 #[graphql(name = "ScheduleTrack")]
 pub enum ScheduleTrackGql {
     Downloads,
+    Torrents,
     PostProcessing,
     WatchFolder,
     Rss,
@@ -460,6 +461,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
         };
         let track = match e.action.tracks().first() {
             Some(ScheduleTrack::Downloads) => ScheduleTrackGql::Downloads,
+            Some(ScheduleTrack::Torrents) => ScheduleTrackGql::Torrents,
             Some(ScheduleTrack::PostProcessing) => ScheduleTrackGql::PostProcessing,
             Some(ScheduleTrack::WatchFolder) => ScheduleTrackGql::WatchFolder,
             Some(ScheduleTrack::Rss) => ScheduleTrackGql::Rss,
@@ -506,6 +508,8 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             ScheduleAction::Pause => "pause",
             ScheduleAction::Resume => "resume",
             ScheduleAction::PauseAll => "pause_all",
+            ScheduleAction::PauseTorrents => "pause_torrents",
+            ScheduleAction::ResumeTorrents => "resume_torrents",
             ScheduleAction::PausePostProcessing => "pause_post_processing",
             ScheduleAction::ResumePostProcessing => "resume_post_processing",
             ScheduleAction::PauseWatchFolderScanning => "pause_watch_folder_scanning",
@@ -643,6 +647,8 @@ impl ScheduleInput {
             "pause"
                 | "resume"
                 | "pause_all"
+                | "pause_torrents"
+                | "resume_torrents"
                 | "pause_post_processing"
                 | "resume_post_processing"
                 | "pause_watch_folder_scanning"
@@ -727,6 +733,8 @@ impl ScheduleInput {
             "pause" => ScheduleAction::Pause,
             "resume" => ScheduleAction::Resume,
             "pause_all" => ScheduleAction::PauseAll,
+            "pause_torrents" => ScheduleAction::PauseTorrents,
+            "resume_torrents" => ScheduleAction::ResumeTorrents,
             "pause_post_processing" => ScheduleAction::PausePostProcessing,
             "resume_post_processing" => ScheduleAction::ResumePostProcessing,
             "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,

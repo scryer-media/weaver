@@ -114,7 +114,7 @@ impl Harness {
             0,
             4,
             vec![],
-            false,
+            weaver_server_core::jobs::HoldSet::default(),
             state,
             db.clone(),
             config,

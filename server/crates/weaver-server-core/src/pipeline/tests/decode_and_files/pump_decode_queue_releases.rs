@@ -338,10 +338,13 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
 
     let (reply, recv) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
+        .handle_command(SchedulerCommand::Pause {
+            hold: crate::jobs::Hold::manual(crate::jobs::HoldOwner::All),
+            reply,
+        })
         .await;
     recv.await.unwrap();
-    assert!(pipeline.global_paused);
+    assert!(pipeline.shared_state.is_paused());
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
         Some("true")
@@ -349,10 +352,14 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
 
     let (reply, recv) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::ResumeAll { reply })
+        .handle_command(SchedulerCommand::Resume {
+            origin: crate::jobs::HoldOrigin::Manual,
+            owner: crate::jobs::HoldOwner::All,
+            reply,
+        })
         .await;
     recv.await.unwrap();
-    assert!(!pipeline.global_paused);
+    assert!(!pipeline.shared_state.is_paused());
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
         Some("false")

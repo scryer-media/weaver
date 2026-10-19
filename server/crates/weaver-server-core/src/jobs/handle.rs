@@ -112,14 +112,13 @@ pub struct SharedPipelineState {
     // The owner of the jobs published beside the pipeline's.
     owner: Arc<RwLock<Option<Arc<dyn QueueOwner>>>>,
     job_revision: tokio::sync::watch::Sender<u64>,
-    // The global pause in force, which the pipeline publishes and every
-    // owner of queue items follows.
-    queue_hold: tokio::sync::watch::Sender<QueueHold>,
+    // The holds in force, which the pipeline publishes and every owner of
+    // queue items follows.
+    holds: tokio::sync::watch::Sender<HoldSet>,
     // The torrent side of the global download limit, once torrents run.
     torrent_rate: Arc<RwLock<Option<Arc<dyn TorrentRate>>>>,
     // How the global download limit is shared out, as last put in force.
     bandwidth_split: Arc<RwLock<crate::bandwidth::SplitState>>,
-    speed_test_paused: Arc<AtomicBool>,
     schedule_replay_paused: Arc<AtomicBool>,
     // Why the schedule evaluator is holding download admission, while it is.
     schedule_hold_reason: Arc<RwLock<Option<String>>>,
@@ -216,10 +215,9 @@ impl SharedPipelineState {
             })),
             owner: Arc::new(RwLock::new(None)),
             job_revision,
-            queue_hold: tokio::sync::watch::channel(QueueHold::None).0,
+            holds: tokio::sync::watch::channel(HoldSet::default()).0,
             torrent_rate: Arc::new(RwLock::new(None)),
             bandwidth_split: Arc::new(RwLock::new(crate::bandwidth::SplitState::default())),
-            speed_test_paused: Arc::new(AtomicBool::new(false)),
             schedule_replay_paused: Arc::new(AtomicBool::new(false)),
             schedule_hold_reason: Arc::new(RwLock::new(None)),
             post_processing_paused: Arc::new(AtomicBool::new(false)),
@@ -305,25 +303,18 @@ impl SharedPipelineState {
             .cloned()
     }
 
+    // Whether the queue as a whole is held.
     pub fn is_paused(&self) -> bool {
-        *self.queue_hold.borrow() != QueueHold::None || self.speed_test_paused()
+        self.holds.borrow().stops(HoldOwner::All, false)
     }
 
-    pub fn queue_hold(&self) -> QueueHold {
-        *self.queue_hold.borrow()
+    pub fn holds(&self) -> HoldSet {
+        self.holds.borrow().clone()
     }
 
-    // Wakes on each change of the global pause.
-    pub fn subscribe_queue_hold(&self) -> tokio::sync::watch::Receiver<QueueHold> {
-        self.queue_hold.subscribe()
-    }
-
-    pub(crate) fn speed_test_paused(&self) -> bool {
-        self.speed_test_paused.load(Ordering::Acquire)
-    }
-
-    pub fn set_speed_test_paused(&self, paused: bool) {
-        self.speed_test_paused.store(paused, Ordering::Release);
+    // Wakes on each change of the holds.
+    pub fn subscribe_holds(&self) -> tokio::sync::watch::Receiver<HoldSet> {
+        self.holds.subscribe()
     }
 
     pub(crate) fn schedule_replay_paused(&self) -> bool {
@@ -454,9 +445,27 @@ impl SharedPipelineState {
         self.metrics_refreshes.load(Ordering::Relaxed)
     }
 
-    pub fn set_queue_hold(&self, hold: QueueHold) {
-        self.queue_hold
-            .send_if_modified(|current| std::mem::replace(current, hold) != hold);
+    // Put a hold in force, as one change of the holds.
+    pub fn hold(&self, hold: Hold) {
+        self.change_holds(|holds| holds.hold(hold));
+    }
+
+    // Lift what `origin` holds over `owner`, as one change of the holds.
+    pub fn release(&self, origin: HoldOrigin, owner: HoldOwner) {
+        self.change_holds(|holds| holds.release(origin, owner));
+    }
+
+    // Put back the holds kept across a restart.
+    pub fn restore_holds(&self, kept: HoldSet) {
+        self.change_holds(|holds| *holds = kept);
+    }
+
+    fn change_holds(&self, change: impl FnOnce(&mut HoldSet)) {
+        self.holds.send_if_modified(|holds| {
+            let before = holds.clone();
+            change(holds);
+            *holds != before
+        });
     }
 
     // Seat the torrent side of the global download limit.
@@ -725,26 +734,141 @@ pub trait QueueOwner: Send + Sync {
     async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError>;
 }
 
-// What the global pause stops. Every owner of queue items follows it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum QueueHold {
-    #[default]
-    None,
+// Who put a hold in force, in the order their reasons take precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HoldOrigin {
+    Manual,
+    Scheduled,
+    SpeedTest,
+}
+
+impl HoldOrigin {
+    // Whether a pause or resume from this origin replaces or lifts a hold
+    // from `other`. The operator and the schedule share one pause, each
+    // overriding the other's; a speed test's hold is its own.
+    const fn shares(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::SpeedTest, Self::SpeedTest)
+                | (
+                    Self::Manual | Self::Scheduled,
+                    Self::Manual | Self::Scheduled
+                )
+        )
+    }
+
+    // The reason an item a hold from this origin stops gives.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Manual => "paused",
+            Self::Scheduled => "scheduled",
+            Self::SpeedTest => "speed test",
+        }
+    }
+}
+
+// What a hold stops of the items it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HoldScope {
     // Downloading stops; what is complete keeps seeding.
     Downloads,
     // Everything stops, seeding too.
     Everything,
 }
 
-impl QueueHold {
-    // Whether this hold stops an item, given whether it has finished
-    // downloading.
-    pub const fn stops(self, complete: bool) -> bool {
+// Which items a hold covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HoldOwner {
+    // Every item in the queue.
+    All,
+    // The torrents alone.
+    Torrents,
+}
+
+impl HoldOwner {
+    // The setting an operator's hold over these items is kept in.
+    pub const fn setting(self) -> &'static str {
         match self {
-            Self::None => false,
-            Self::Downloads => !complete,
-            Self::Everything => true,
+            Self::All => "global_paused",
+            Self::Torrents => "torrents_paused",
         }
+    }
+}
+
+// One hold on the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Hold {
+    pub origin: HoldOrigin,
+    pub scope: HoldScope,
+    pub owner: HoldOwner,
+}
+
+impl Hold {
+    // The operator's hold over `owner`: the queue's pause leaves what is
+    // complete seeding, the torrents' pause stops them whole.
+    pub const fn manual(owner: HoldOwner) -> Self {
+        Self {
+            origin: HoldOrigin::Manual,
+            scope: match owner {
+                HoldOwner::All => HoldScope::Downloads,
+                HoldOwner::Torrents => HoldScope::Everything,
+            },
+            owner,
+        }
+    }
+
+    const fn stops(self, owner: HoldOwner, complete: bool) -> bool {
+        let covers = matches!(
+            (self.owner, owner),
+            (HoldOwner::All, _) | (HoldOwner::Torrents, HoldOwner::Torrents)
+        );
+        covers
+            && match self.scope {
+                HoldScope::Downloads => !complete,
+                HoldScope::Everything => true,
+            }
+    }
+}
+
+// The holds in force. Every owner of queue items follows them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HoldSet(Vec<Hold>);
+
+impl HoldSet {
+    // Put `hold` in force in place of any its origin shares over the same
+    // items.
+    pub fn hold(&mut self, hold: Hold) {
+        self.release(hold.origin, hold.owner);
+        self.0.push(hold);
+        self.0.sort_unstable();
+    }
+
+    // Lift what `origin` shares of the holds over `owner`.
+    pub fn release(&mut self, origin: HoldOrigin, owner: HoldOwner) {
+        self.0
+            .retain(|hold| hold.owner != owner || !origin.shares(hold.origin));
+    }
+
+    // Whether any hold stops an item of `owner`, given whether it has
+    // finished downloading.
+    pub fn stops(&self, owner: HoldOwner, complete: bool) -> bool {
+        self.reason(owner, complete).is_some()
+    }
+
+    // Who stops that item, by precedence, while anyone does.
+    pub fn reason(&self, owner: HoldOwner, complete: bool) -> Option<HoldOrigin> {
+        self.0
+            .iter()
+            .filter(|hold| hold.stops(owner, complete))
+            .map(|hold| hold.origin)
+            .min()
+    }
+
+    // Whether `origin` holds the items of `owner`.
+    pub fn held_by(&self, origin: HoldOrigin, owner: HoldOwner) -> bool {
+        self.0
+            .iter()
+            .any(|hold| hold.origin == origin && hold.owner == owner)
     }
 }
 
@@ -1017,17 +1141,16 @@ pub enum SchedulerCommand {
         moves: Vec<(JobId, QueueMoveTarget)>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    // Pause all jobs globally (pipeline-wide).
-    PauseAll {
+    // Put a hold in force in place of any its origin shares over the same
+    // items.
+    Pause {
+        hold: Hold,
         reply: oneshot::Sender<()>,
     },
-    // An in-memory hold independent of operator and schedule pauses.
-    SetSpeedTestPause {
-        paused: bool,
-        reply: oneshot::Sender<()>,
-    },
-    // Resume all jobs globally.
-    ResumeAll {
+    // Lift what `origin` shares of the holds over `owner`.
+    Resume {
+        origin: HoldOrigin,
+        owner: HoldOwner,
         reply: oneshot::Sender<()>,
     },
     // Pause admission of queued extension post-processing attempts.
@@ -1721,40 +1844,48 @@ impl SchedulerHandle {
             .map_err(|_| SchedulerError::ChannelClosed)
     }
 
-    // Change only the speed test's transient download hold.
-    pub(crate) async fn set_speed_test_pause(&self, paused: bool) -> Result<(), SchedulerError> {
-        let (reply, received) = oneshot::channel();
+    // Put a hold in force. Every pause, whoever asks for it, comes through
+    // here.
+    pub async fn pause(&self, hold: Hold) -> Result<(), SchedulerError> {
+        let (reply, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::SetSpeedTestPause { paused, reply })
+            .send(SchedulerCommand::Pause { hold, reply })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
-        received.await.map_err(|_| SchedulerError::ChannelClosed)
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)
     }
 
-    pub(crate) fn clear_speed_test_pause(&self) {
-        self.state.set_speed_test_paused(false);
+    // Lift what `origin` holds over `owner`. Every resume comes through
+    // here.
+    pub async fn resume(&self, origin: HoldOrigin, owner: HoldOwner) -> Result<(), SchedulerError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::Resume {
+                origin,
+                owner,
+                reply,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)
     }
 
-    // Pause all download dispatch globally.
+    // The operator's pause of the whole queue.
     pub async fn pause_all(&self) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::PauseAll { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(())
+        self.pause(Hold::manual(HoldOwner::All)).await
     }
 
-    // Resume all download dispatch globally.
     pub async fn resume_all(&self) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ResumeAll { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(())
+        self.resume(HoldOrigin::Manual, HoldOwner::All).await
+    }
+
+    // The operator's pause of every torrent, as one hold.
+    pub async fn pause_torrents(&self) -> Result<(), SchedulerError> {
+        self.pause(Hold::manual(HoldOwner::Torrents)).await
+    }
+
+    pub async fn resume_torrents(&self) -> Result<(), SchedulerError> {
+        self.resume(HoldOrigin::Manual, HoldOwner::Torrents).await
     }
 
     pub async fn pause_post_processing(&self) -> Result<(), SchedulerError> {

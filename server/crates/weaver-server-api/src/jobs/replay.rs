@@ -306,7 +306,7 @@ async fn queue_event_records_from_pipeline_event(
             previous_state: None,
             attention: None,
             global_state: Some(global_queue_state(
-                handle.is_globally_paused(),
+                &handle.state().holds(),
                 &handle.get_download_block(),
                 cfg.bandwidth.download_bps,
             )),

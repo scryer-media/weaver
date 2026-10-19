@@ -459,12 +459,16 @@ fn scheduler_handle_with_mock_commands_with_db(
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::PauseAll { reply } => {
-                    state.set_queue_hold(weaver_server_core::jobs::QueueHold::Downloads);
+                SchedulerCommand::Pause { hold, reply } => {
+                    state.hold(hold);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::ResumeAll { reply } => {
-                    state.set_queue_hold(weaver_server_core::jobs::QueueHold::None);
+                SchedulerCommand::Resume {
+                    origin,
+                    owner,
+                    reply,
+                } => {
+                    state.release(origin, owner);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetBandwidth { reply, .. } => {

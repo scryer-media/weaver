@@ -833,7 +833,7 @@ impl JobsMutation {
             message: None,
             item: None,
             global_state: Some(global_queue_state(
-                handle.is_globally_paused(),
+                &handle.state().holds(),
                 &handle.get_download_block(),
                 cfg.bandwidth.download_bps,
             )),
@@ -852,7 +852,7 @@ impl JobsMutation {
             message: None,
             item: None,
             global_state: Some(global_queue_state(
-                handle.is_globally_paused(),
+                &handle.state().holds(),
                 &handle.get_download_block(),
                 cfg.bandwidth.download_bps,
             )),
@@ -872,7 +872,7 @@ impl JobsMutation {
             message: None,
             item: None,
             global_state: Some(global_queue_state(
-                handle.is_globally_paused(),
+                &handle.state().holds(),
                 &handle.get_download_block(),
                 bandwidth.download_bps,
             )),

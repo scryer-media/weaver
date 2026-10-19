@@ -173,7 +173,7 @@ impl SystemQuery {
         )
         .await;
         let global_state = global_queue_state(
-            handle.is_globally_paused(),
+            &handle.state().holds(),
             &handle.get_download_block(),
             max_download_speed,
         );

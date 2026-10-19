@@ -831,6 +831,11 @@ input GeneralSettingsInput {
 
 type GlobalQueueState {
 	isPaused: Boolean!
+	"""
+	Whether the operator's or the schedule's pause of every torrent is in
+	force.
+	"""
+	torrentsPaused: Boolean!
 	speedLimitBytesPerSec: Int
 	downloadBlock: DownloadBlock!
 }
@@ -1973,6 +1978,15 @@ type MutationRoot {
 	removeTorrent(id: Int!, deleteFiles: Boolean! = false, confirmUnmetGoal: Boolean! = false): Boolean!
 	pauseTorrent(id: Int!): Boolean!
 	resumeTorrent(id: Int!): Boolean!
+	"""
+	Pause every torrent, seeding too, as one hold. Each torrent's own
+	pause or resume stands under it.
+	"""
+	pauseTorrents: Boolean!
+	"""
+	Lift the operator's pause of every torrent.
+	"""
+	resumeTorrents: Boolean!
 	setTorrentForced(id: Int!, forced: Boolean!): Boolean!
 	setTorrentCategory(id: Int!, category: String): Boolean!
 	"""
@@ -3368,6 +3382,7 @@ enum ScheduleTargetKind {
 
 enum ScheduleTrack {
 	DOWNLOADS
+	TORRENTS
 	POST_PROCESSING
 	WATCH_FOLDER
 	RSS

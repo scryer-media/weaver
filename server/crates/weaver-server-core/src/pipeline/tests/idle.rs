@@ -98,7 +98,7 @@ async fn idle_pipeline(
         0,
         4,
         history,
-        false,
+        crate::jobs::HoldSet::default(),
         shared_state.clone(),
         db,
         config,

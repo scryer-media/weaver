@@ -196,7 +196,11 @@ async fn blocked_placement_restore_stays_visible_across_restart_and_resume() {
             assert!(restored.blocked_restores.contains_key(&job_id));
             let (reply, done) = oneshot::channel();
             restored
-                .handle_command(SchedulerCommand::ResumeAll { reply })
+                .handle_command(SchedulerCommand::Resume {
+                    origin: crate::jobs::HoldOrigin::Manual,
+                    owner: crate::jobs::HoldOwner::All,
+                    reply,
+                })
                 .await;
             done.await.unwrap();
             restored.dispatch_downloads();

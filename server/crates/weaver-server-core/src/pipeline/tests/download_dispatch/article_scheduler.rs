@@ -518,7 +518,7 @@ async fn only_a_failed_pause_or_server_disable_holds_admission() {
             .is_some_and(|reason| reason.contains("Backup server")),
         "{block:?}"
     );
-    assert!(!pipeline.global_paused);
+    assert!(!pipeline.shared_state.is_paused());
     assert!(!pipeline.shared_state.is_paused());
     assert!(matches!(
         ask(&mut pipeline, SERVER_A, 8, None),
@@ -547,12 +547,16 @@ async fn every_whole_link_gate_yields_under_its_own_name() {
     let hot = JobId(71081);
     add_job(&mut pipeline, hot, "Gated Reel", 200).await;
 
-    pipeline.global_paused = true;
+    pipeline
+        .shared_state
+        .hold(crate::jobs::Hold::manual(crate::jobs::HoldOwner::All));
     assert!(matches!(
         ask(&mut pipeline, SERVER_A, 8, None),
         Handout::Yield(YieldReason::Paused)
     ));
-    pipeline.global_paused = false;
+    pipeline
+        .shared_state
+        .release(crate::jobs::HoldOrigin::Manual, crate::jobs::HoldOwner::All);
 
     pipeline.nntp_handoff_draining = true;
     assert!(matches!(

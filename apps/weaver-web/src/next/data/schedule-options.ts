@@ -13,6 +13,8 @@ export const SCHEDULE_ACTIONS = [
   { value: "pause", label: "next.schedules.pause" },
   { value: "resume", label: "next.schedules.resume" },
   { value: "pause_all", label: "next.schedules.pauseAll" },
+  { value: "pause_torrents", label: "next.schedules.pauseTorrents" },
+  { value: "resume_torrents", label: "next.schedules.resumeTorrents" },
   { value: "pause_post_processing", label: "next.schedules.pausePost" },
   { value: "resume_post_processing", label: "next.schedules.resumePost" },
   { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },

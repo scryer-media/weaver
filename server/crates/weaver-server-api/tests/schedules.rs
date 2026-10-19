@@ -761,3 +761,58 @@ async fn a_split_rule_holds_the_split_track_and_lifts_without_a_percentage() {
             .await,
     );
 }
+
+#[tokio::test]
+async fn torrent_pause_actions_round_trip_on_their_own_track() {
+    use weaver_server_core::bandwidth::ScheduleAction;
+    let h = TestHarness::new().await;
+    for (time, action) in [("22:00", "pause_torrents"), ("06:00", "resume_torrents")] {
+        let resp = h
+            .execute(&format!(
+                r#"mutation {{ createSchedule(input: {{ time: "{time}", actionType: "{action}" }}) {{ actionType track }} }}"#
+            ))
+            .await;
+        assert_no_errors(&resp);
+        let data = response_data(&resp);
+        let rules = data["createSchedule"].as_array().unwrap();
+        assert!(rules.iter().any(|rule| rule["actionType"] == action));
+        assert!(rules.iter().all(|rule| rule["track"] == "TORRENTS"));
+    }
+    let resp = h.execute("{ schedules { time actionType track } }").await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let mut listed: Vec<(String, String)> = data["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| {
+            assert_eq!(rule["track"], "TORRENTS");
+            (
+                rule["time"].as_str().unwrap().to_owned(),
+                rule["actionType"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            ("06:00".to_owned(), "resume_torrents".to_owned()),
+            ("22:00".to_owned(), "pause_torrents".to_owned()),
+        ]
+    );
+    let mut persisted: Vec<ScheduleAction> =
+        h.db.list_schedules()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.action)
+            .collect();
+    persisted.sort_by_key(|action| format!("{action:?}"));
+    assert_eq!(
+        persisted,
+        [
+            ScheduleAction::PauseTorrents,
+            ScheduleAction::ResumeTorrents
+        ]
+    );
+}

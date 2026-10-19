@@ -58,7 +58,7 @@ impl Pipeline {
         total_connections: usize,
         write_buf_max_pending: usize,
         mut initial_history: Vec<JobInfo>,
-        initial_global_paused: bool,
+        initial_holds: crate::jobs::HoldSet,
         shared_state: SharedPipelineState,
         db: crate::Database,
         config: crate::settings::SharedConfig,
@@ -227,11 +227,7 @@ impl Pipeline {
         let server_counters = Self::activate_server_counters(&metrics, &nntp);
         let owned_download_lane_pool =
             download::owned_lane::OwnedDownloadLanePool::new(total_connections.max(1));
-        shared_state.set_queue_hold(if initial_global_paused {
-            crate::jobs::QueueHold::Downloads
-        } else {
-            crate::jobs::QueueHold::None
-        });
+        shared_state.restore_holds(initial_holds);
         let pp_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
         );
@@ -412,8 +408,6 @@ impl Pipeline {
             script_data_dir: data_dir.clone(),
             pending_history_deletions: HashSet::new(),
             terminal_post_processing_cancellations: HashMap::new(),
-            global_paused: initial_global_paused,
-            scheduled_pause: false,
             bandwidth_ledger,
             rate_limit_reservations: HashMap::new(),
             configured_bandwidth: crate::proxies::Bandwidth::default(),
@@ -1515,8 +1509,9 @@ impl Pipeline {
     pub(crate) fn pause_barrier_scope(command: &SchedulerCommand) -> Option<Option<JobId>> {
         match command {
             SchedulerCommand::PauseJob { job_id, .. } => Some(Some(*job_id)),
-            SchedulerCommand::PauseAll { .. }
-            | SchedulerCommand::SetSpeedTestPause { paused: true, .. } => Some(None),
+            SchedulerCommand::Pause { hold, .. } if hold.owner == crate::jobs::HoldOwner::All => {
+                Some(None)
+            }
             _ => None,
         }
     }

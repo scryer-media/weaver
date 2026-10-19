@@ -195,7 +195,7 @@ async fn a_scheduled_profile_overrides_the_choice_until_the_schedule_lets_go() {
         Some(128 * 1024)
     );
     assert_eq!(pipeline.rate_limiter.rate(), Some(128 * 1024));
-    assert!(!pipeline.global_paused);
+    assert!(!pipeline.shared_state.is_paused());
 
     // The operator's choice is recorded but waits for the schedule.
     choose(&mut pipeline, HardwareProfile::Balanced).await;

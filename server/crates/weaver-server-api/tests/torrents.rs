@@ -417,3 +417,45 @@ async fn the_queue_events_carry_a_torrent() {
         ("ITEM_STATE_CHANGED".into(), "FAILED".into())
     );
 }
+
+// Pausing every torrent is one hold the queue reports, apart from its own
+// pause, and resuming lifts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
+    use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+    let harness = TestHarness::new().await;
+    let state = "{ globalQueueState { isPaused torrentsPaused } }";
+    let read = |response: Response| {
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        (
+            data["globalQueueState"]["isPaused"].as_bool().unwrap(),
+            data["globalQueueState"]["torrentsPaused"]
+                .as_bool()
+                .unwrap(),
+        )
+    };
+
+    let response = harness.execute("mutation { pauseTorrents }").await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(
+        harness
+            .handle
+            .state()
+            .holds()
+            .held_by(HoldOrigin::Manual, HoldOwner::Torrents)
+    );
+    assert_eq!(read(harness.execute(state).await), (false, true));
+
+    let response = harness.execute("mutation { pauseQueue { success } }").await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let response = harness
+        .execute("mutation { resumeQueue { success } }")
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(read(harness.execute(state).await), (false, true));
+
+    let response = harness.execute("mutation { resumeTorrents }").await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(read(harness.execute(state).await), (false, false));
+}

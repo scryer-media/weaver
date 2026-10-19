@@ -4,6 +4,7 @@
 /** The groups the schedule list is broken into, in the order it draws them. */
 export const SCHEDULE_TRACKS = [
   { value: "DOWNLOADS", label: "next.schedules.trackDownloads" },
+  { value: "TORRENTS", label: "next.schedules.trackTorrents" },
   { value: "POST_PROCESSING", label: "next.schedules.trackPost" },
   { value: "WATCH_FOLDER", label: "next.schedules.trackWatchFolder" },
   { value: "RSS", label: "next.schedules.trackRss" },

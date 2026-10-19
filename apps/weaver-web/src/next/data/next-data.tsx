@@ -94,7 +94,12 @@ interface ProviderHoldoff {
 
 interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
-  globalState: { isPaused: boolean; speedLimitBytesPerSec: number | null; downloadBlock: DownloadBlockState };
+  globalState: {
+    isPaused: boolean;
+    torrentsPaused?: boolean;
+    speedLimitBytesPerSec: number | null;
+    downloadBlock: DownloadBlockState;
+  };
   providerHoldoffs?: ProviderHoldoff[];
   providerConnections?: ProviderConnections[];
   /** Per-job download rates on the same tick as the speed; only the push carries them. */
@@ -116,6 +121,8 @@ export interface NextData {
   /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
   peakSpeed: number;
   isPaused: boolean;
+  /** Whether every torrent is held paused. */
+  torrentsPaused: boolean;
   /** The configured download limit in bytes per second; null is no limit, and 0 lets nothing through. */
   speedLimit: number | null;
   downloadBlock: DownloadBlockState;
@@ -363,6 +370,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const globalState = snapshot?.globalState;
   const downloadBlock = useSettled(globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK, shallowEqual);
   const isPaused = globalState?.isPaused ?? false;
+  const torrentsPaused = globalState?.torrentsPaused ?? false;
   const speedLimit = globalState?.speedLimitBytesPerSec ?? null;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const refreshCategories = useCallback(
@@ -409,6 +417,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       speed,
       peakSpeed,
       isPaused,
+      torrentsPaused,
       speedLimit,
       downloadBlock,
       queue,
@@ -436,6 +445,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       refreshHistoryCount,
       speed,
       speedLimit,
+      torrentsPaused,
       update,
       version,
     ],

@@ -8,8 +8,10 @@ import {
   CANCEL_JOB_MUTATION,
   PAUSE_ALL_MUTATION,
   PAUSE_JOB_MUTATION,
+  PAUSE_TORRENTS_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
+  RESUME_TORRENTS_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
@@ -125,7 +127,7 @@ function sortJobs(
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, downloadBlock } = useNextData();
+  const { queue, categories: configured, speed, isPaused, torrentsPaused, downloadBlock } = useNextData();
   const statusLabel = useStatusLabel();
   const t = useTranslate();
 
@@ -158,6 +160,8 @@ export function DownloadsPage() {
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
+  const [, pauseTorrents] = useMutation(PAUSE_TORRENTS_MUTATION);
+  const [, resumeTorrents] = useMutation(RESUME_TORRENTS_MUTATION);
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
@@ -515,6 +519,14 @@ export function DownloadsPage() {
             }}
           >
             {isPaused ? t("next.downloads.resumeAll") : t("next.downloads.pauseAll")}
+          </SecondaryButton>
+          <SecondaryButton
+            icon={torrentsPaused ? "resume" : "pause"}
+            onClick={() => {
+              void (torrentsPaused ? resumeTorrents({}) : pauseTorrents({}));
+            }}
+          >
+            {torrentsPaused ? t("next.downloads.resumeTorrents") : t("next.downloads.pauseTorrents")}
           </SecondaryButton>
           <SpeedLimitControl />
           <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>

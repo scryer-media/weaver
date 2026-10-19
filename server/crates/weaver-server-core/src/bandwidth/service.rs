@@ -15,17 +15,7 @@ use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
 use crate::servers::{ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 
-// Origin of a global download pause, so the download-block presentation can
-// distinguish a schedule-driven pause from a manual one across every refresh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GlobalPause {
-    // Not globally paused; a download quota may still block.
-    Running,
-    // Operator pressed pause.
-    Manual,
-    // A bandwidth schedule paused downloads.
-    Scheduled,
-}
+use crate::jobs::{HoldOrigin, HoldOwner};
 
 const BANDWIDTH_LEDGER_RETENTION_DAYS: i64 = 90;
 const BANDWIDTH_USAGE_FLUSH_BYTES: u64 = 1024 * 1024 * 1024;
@@ -135,16 +125,13 @@ impl BandwidthLedgerRuntime {
                 .is_some_and(|started| started.elapsed() >= BANDWIDTH_USAGE_FLUSH_INTERVAL)
     }
 
-    pub(crate) fn to_download_block_state(&self, pause: GlobalPause) -> DownloadBlockState {
-        // The origin of the pause is carried explicitly so every block-state
-        // refresh reports the same kind: deriving it from a single
-        // `global_paused` bool let a scheduled pause be silently reclassified
-        // as manual by any later refresh. Quota blocks are laid over this by
-        // the shared state.
-        let kind = match pause {
-            GlobalPause::Manual => DownloadBlockKind::ManualPause,
-            GlobalPause::Scheduled => DownloadBlockKind::Scheduled,
-            GlobalPause::Running => DownloadBlockKind::None,
+    // The block a hold puts on the queue, by who holds it. Quota blocks are
+    // laid over this by the shared state.
+    pub(crate) fn to_download_block_state(&self, held: Option<HoldOrigin>) -> DownloadBlockState {
+        let kind = match held {
+            Some(HoldOrigin::Manual | HoldOrigin::SpeedTest) => DownloadBlockKind::ManualPause,
+            Some(HoldOrigin::Scheduled) => DownloadBlockKind::Scheduled,
+            None => DownloadBlockKind::None,
         };
         DownloadBlockState {
             kind,
@@ -395,15 +382,47 @@ impl Pipeline {
             });
     }
 
-    // The current global-pause origin, so every download-block refresh reports
-    // a consistent Scheduled vs ManualPause kind.
-    pub(crate) fn global_pause(&self) -> GlobalPause {
-        if !self.global_paused && !self.shared_state.speed_test_paused() {
-            GlobalPause::Running
-        } else if self.scheduled_pause {
-            GlobalPause::Scheduled
-        } else {
-            GlobalPause::Manual
+    // Who holds the queue as a whole, while anyone does.
+    pub(crate) fn global_pause(&self) -> Option<HoldOrigin> {
+        self.shared_state.holds().reason(HoldOwner::All, false)
+    }
+
+    // Every pause, the operator's, the schedule's or a speed test's, puts
+    // its hold in force here.
+    pub(crate) async fn put_hold(&mut self, hold: crate::jobs::Hold) {
+        self.shared_state.hold(hold);
+        self.holds_changed(hold.origin, hold.owner).await;
+    }
+
+    // Every resume lifts only what its origin holds.
+    pub(crate) async fn lift_hold(&mut self, origin: HoldOrigin, owner: HoldOwner) {
+        self.shared_state.release(origin, owner);
+        self.holds_changed(origin, owner).await;
+    }
+
+    async fn holds_changed(&mut self, origin: HoldOrigin, owner: HoldOwner) {
+        let paused = self.shared_state.is_paused();
+        if paused {
+            self.download_restart_durable_lead_retry_after.clear();
+        }
+        self.publish_download_block();
+        // The operator's holds outlive a restart; the others are put back by
+        // whoever holds them.
+        if origin == HoldOrigin::Manual {
+            let held = self.shared_state.holds().held_by(origin, owner);
+            if let Err(error) = self
+                .db_blocking(move |db| db.set_setting(owner.setting(), &held.to_string()))
+                .await
+            {
+                tracing::error!(%error, ?owner, "db write failed for the operator's hold");
+            }
+        }
+        if owner == HoldOwner::All {
+            let _ = self.event_tx.send(if paused {
+                crate::events::model::PipelineEvent::GlobalPaused
+            } else {
+                crate::events::model::PipelineEvent::GlobalResumed
+            });
         }
     }
 

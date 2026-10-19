@@ -74,7 +74,7 @@ pub(crate) async fn run(
         weaver_server_core::security::RuntimeSecurityConfig::from_env()?.rss_allow_private_network,
     );
     let nntp = wiring::build_nntp_client(config, &profile, &server_transfer_policy, &proxies)?;
-    let initial_global_paused = weaver_server_core::runtime::load_global_pause_from_db(db).await?;
+    let initial_holds = weaver_server_core::runtime::load_holds_from_db(db).await?;
 
     // Set up scheduler channels and shared control-plane state.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
@@ -144,7 +144,7 @@ pub(crate) async fn run(
         total_connections,
         write_buf_max,
         vec![],
-        initial_global_paused,
+        initial_holds,
         shared_state,
         db.clone(),
         standalone_config,

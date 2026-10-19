@@ -20,7 +20,15 @@ async fn checkpoint_deadline_is_consumed_when_capacity_pressure_or_pause_bypasse
     assert_eq!(pipeline.active_download_connections, 4);
     assert_eq!(pipeline.active_download_connections_by_job[&PEER], 3);
     for mode in 0..3 {
-        pipeline.global_paused = mode == 1;
+        if mode == 1 {
+            pipeline
+                .shared_state
+                .hold(crate::jobs::Hold::manual(crate::jobs::HoldOwner::All));
+        } else {
+            pipeline
+                .shared_state
+                .release(crate::jobs::HoldOrigin::Manual, crate::jobs::HoldOwner::All);
+        }
         pipeline
             .metrics
             .write_buffered_bytes
@@ -47,7 +55,10 @@ async fn checkpoint_deadline_is_consumed_when_capacity_pressure_or_pause_bypasse
         .insert(HOT, Instant::now() + Duration::from_secs(3600));
     let (reply, result) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
+        .handle_command(SchedulerCommand::Pause {
+            hold: crate::jobs::Hold::manual(crate::jobs::HoldOwner::All),
+            reply,
+        })
         .await;
     result.await.unwrap();
     assert!(
@@ -57,7 +68,11 @@ async fn checkpoint_deadline_is_consumed_when_capacity_pressure_or_pause_bypasse
     );
     let (reply, result) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::ResumeAll { reply })
+        .handle_command(SchedulerCommand::Resume {
+            origin: crate::jobs::HoldOrigin::Manual,
+            owner: crate::jobs::HoldOwner::All,
+            reply,
+        })
         .await;
     result.await.unwrap();
     pipeline
@@ -565,10 +580,14 @@ async fn checkpoint_progress_is_single_article_on_every_handout() {
 async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
     let temp = tempfile::tempdir().unwrap();
     let mut pipeline = restored_with_parked_retries(&temp).await;
-    pipeline.global_paused = true;
+    pipeline
+        .shared_state
+        .hold(crate::jobs::Hold::manual(crate::jobs::HoldOwner::All));
     pipeline.dispatch_downloads();
     assert_eq!(pipeline.active_downloads, 0);
-    pipeline.global_paused = false;
+    pipeline
+        .shared_state
+        .release(crate::jobs::HoldOrigin::Manual, crate::jobs::HoldOwner::All);
     pipeline
         .metrics
         .write_buffered_bytes

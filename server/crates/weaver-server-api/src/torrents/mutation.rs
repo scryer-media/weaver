@@ -3,6 +3,7 @@
 
 use async_graphql::{Context, Object, Result};
 use base64::Engine;
+use weaver_server_core::SchedulerHandle;
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::torrents::service::{ActionError, AddError, AddRequest, AddSource};
 
@@ -107,6 +108,27 @@ impl TorrentsMutation {
             .resume(JobId(id))
             .await
             .map_err(action_error)?;
+        Ok(true)
+    }
+
+    /// Pause every torrent, seeding too, as one hold. Each torrent's own
+    /// pause or resume stands under it.
+    #[graphql(guard = "ControlGuard")]
+    async fn pause_torrents(&self, ctx: &Context<'_>) -> Result<bool> {
+        ctx.data::<SchedulerHandle>()?
+            .pause_torrents()
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        Ok(true)
+    }
+
+    /// Lift the operator's pause of every torrent.
+    #[graphql(guard = "ControlGuard")]
+    async fn resume_torrents(&self, ctx: &Context<'_>) -> Result<bool> {
+        ctx.data::<SchedulerHandle>()?
+            .resume_torrents()
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
         Ok(true)
     }
 

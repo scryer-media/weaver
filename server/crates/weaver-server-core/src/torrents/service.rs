@@ -26,8 +26,8 @@ use crate::categories::CategoryConfig;
 use crate::categories::model::{completion_parent, resolve_category_config};
 use crate::jobs::JobId;
 use crate::jobs::handle::{
-    CancellationOrigin, JobInfo, QueueAction, QueueHold, QueueMoveTarget, QueueOwner,
-    SchedulerHandle, TorrentRate,
+    CancellationOrigin, HoldOrigin, HoldOwner, HoldSet, JobInfo, QueueAction, QueueMoveTarget,
+    QueueOwner, SchedulerHandle, TorrentRate,
 };
 use crate::jobs::model::{
     FieldUpdate, JobStatus, JobUpdate, PRIORITY_ATTRIBUTE_KEY, Protocol,
@@ -460,8 +460,8 @@ struct Live {
     // takes the next change.
     run_error: Option<String>,
     queued: bool,
-    // Stopped by the global pause.
-    paused_globally: bool,
+    // Who holds it stopped, while a hold does.
+    paused_by: Option<HoldOrigin>,
     applied: Option<Vec<usize>>,
     speeds: (u64, u64),
     peers: (u32, u32),
@@ -488,7 +488,7 @@ impl Live {
             engine: Engine::Absent,
             run_error: None,
             queued: false,
-            paused_globally: false,
+            paused_by: None,
             applied: None,
             speeds: (0, 0),
             peers: (0, 0),
@@ -580,7 +580,7 @@ impl Live {
             complete: self.complete(),
             intent: self.record.intent,
             queued: self.queued,
-            paused_globally: self.paused_globally,
+            paused_by: self.paused_by,
             failed: self.refusal(),
             held: self.held.clone(),
             disk_full: self.holding(),
@@ -775,7 +775,7 @@ impl TorrentService {
         let seat = Arc::new(Seat(Arc::downgrade(&self.inner)));
         queue.state().seat_owner(seat.clone());
         queue.state().seat_torrent_rate(seat);
-        let mut hold = queue.state().subscribe_queue_hold();
+        let mut hold = queue.state().subscribe_holds();
         *self
             .inner
             .queue
@@ -790,10 +790,10 @@ impl TorrentService {
         }));
     }
 
-    // What the global pause stops.
-    fn queue_hold(&self) -> QueueHold {
+    // The holds the queue has in force.
+    fn holds(&self) -> HoldSet {
         self.queue()
-            .map_or(QueueHold::None, |queue| queue.state().queue_hold())
+            .map_or_else(HoldSet::default, |queue| queue.state().holds())
     }
 
     fn queue(&self) -> Option<SchedulerHandle> {
@@ -1452,7 +1452,9 @@ impl TorrentService {
                 layout,
                 intake,
                 torrent.record.storage_dir.clone().unwrap_or_default(),
-                !torrent.resumed() || torrent.queued || self.queue_hold().stops(torrent.complete()),
+                !torrent.resumed()
+                    || torrent.queued
+                    || self.holds().stops(HoldOwner::Torrents, torrent.complete()),
                 limit,
                 job.with(|job| initial_have(job)),
             )
@@ -1874,7 +1876,7 @@ impl TorrentService {
     // Which torrents the queue lets download, applied to their sessions.
     async fn apply_queue(&self) {
         let max_active = self.settings().torrent.max_active_downloads;
-        let hold = self.queue_hold();
+        let holds = self.holds();
         let mut live = self.inner.live.lock().await;
         let mut order: Vec<&Live> = live.values().collect();
         order.sort_by_key(|torrent| (torrent.record.added_at_ms, torrent.record.job_id));
@@ -1887,11 +1889,14 @@ impl TorrentService {
                 paused: !torrent.resumed(),
             })
             .collect();
-        let active = status::active(&queue, max_active, hold);
+        let active = status::active(&queue, max_active, &holds);
         for torrent in live.values_mut() {
             let active = active.contains(&torrent.record.job_id);
-            torrent.paused_globally = torrent.resumed() && hold.stops(torrent.complete());
-            torrent.queued = !active && torrent.resumed() && !torrent.paused_globally;
+            torrent.paused_by = torrent
+                .resumed()
+                .then(|| holds.reason(HoldOwner::Torrents, torrent.complete()))
+                .flatten();
+            torrent.queued = !active && torrent.resumed() && torrent.paused_by.is_none();
             let run = active && torrent.resumed();
             let Some(attached) = &torrent.attached else {
                 continue;

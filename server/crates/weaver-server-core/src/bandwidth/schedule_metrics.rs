@@ -22,6 +22,8 @@ pub enum ActionKind {
     Pause,
     Resume,
     PauseAll,
+    PauseTorrents,
+    ResumeTorrents,
     PausePostProcessing,
     ResumePostProcessing,
     PauseWatchFolderScanning,
@@ -37,10 +39,12 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::Pause,
         Self::Resume,
         Self::PauseAll,
+        Self::PauseTorrents,
+        Self::ResumeTorrents,
         Self::PausePostProcessing,
         Self::ResumePostProcessing,
         Self::PauseWatchFolderScanning,
@@ -60,6 +64,8 @@ impl ActionKind {
             ScheduleAction::Pause => Self::Pause,
             ScheduleAction::Resume => Self::Resume,
             ScheduleAction::PauseAll => Self::PauseAll,
+            ScheduleAction::PauseTorrents => Self::PauseTorrents,
+            ScheduleAction::ResumeTorrents => Self::ResumeTorrents,
             ScheduleAction::PausePostProcessing => Self::PausePostProcessing,
             ScheduleAction::ResumePostProcessing => Self::ResumePostProcessing,
             ScheduleAction::PauseWatchFolderScanning => Self::PauseWatchFolderScanning,
@@ -80,6 +86,8 @@ impl ActionKind {
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::PauseAll => "pause_all",
+            Self::PauseTorrents => "pause_torrents",
+            Self::ResumeTorrents => "resume_torrents",
             Self::PausePostProcessing => "pause_post_processing",
             Self::ResumePostProcessing => "resume_post_processing",
             Self::PauseWatchFolderScanning => "pause_watch_folder_scanning",
@@ -103,6 +111,7 @@ impl ActionKind {
     pub fn tracks(self) -> &'static [TrackKind] {
         match self {
             Self::Pause => &[TrackKind::Downloads],
+            Self::PauseTorrents | Self::ResumeTorrents => &[TrackKind::Torrents],
             Self::Resume | Self::PauseAll => {
                 &[TrackKind::Downloads, TrackKind::WatchFolder, TrackKind::Rss]
             }
@@ -124,6 +133,7 @@ impl ActionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TrackKind {
     Downloads,
+    Torrents,
     PostProcessing,
     WatchFolder,
     Rss,
@@ -136,8 +146,9 @@ pub enum TrackKind {
 }
 
 impl TrackKind {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Downloads,
+        Self::Torrents,
         Self::PostProcessing,
         Self::WatchFolder,
         Self::Rss,
@@ -152,6 +163,7 @@ impl TrackKind {
     pub fn of(track: ScheduleTrack) -> Self {
         match track {
             ScheduleTrack::Downloads => Self::Downloads,
+            ScheduleTrack::Torrents => Self::Torrents,
             ScheduleTrack::PostProcessing => Self::PostProcessing,
             ScheduleTrack::WatchFolder => Self::WatchFolder,
             ScheduleTrack::Rss => Self::Rss,
@@ -166,6 +178,7 @@ impl TrackKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Downloads => "downloads",
+            Self::Torrents => "torrents",
             Self::PostProcessing => "post_processing",
             Self::WatchFolder => "watch_folder",
             Self::Rss => "rss",

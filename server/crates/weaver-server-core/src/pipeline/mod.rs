@@ -2988,12 +2988,6 @@ pub struct Pipeline {
     pub(super) direct_demotion_in_flight: HashMap<JobId, HashMap<usize, DirectDemotionWork>>,
     pub(super) direct_demotion_done_tx: mpsc::Sender<DirectDemotionWorkDone>,
     pub(super) direct_demotion_done_rx: mpsc::Receiver<DirectDemotionWorkDone>,
-    // Whether all downloads are globally paused.
-    pub(super) global_paused: bool,
-    // Whether the active global pause came from a bandwidth schedule rather
-    // than an operator action. Only meaningful while `global_paused` is true;
-    // it selects the Scheduled vs ManualPause download-block presentation.
-    pub(super) scheduled_pause: bool,
     // The per-minute download ledger behind the bandwidth graph.
     pub(crate) bandwidth_ledger: BandwidthLedgerRuntime,
     // Estimated bytes charged to the speed limiter for in-flight downloads.

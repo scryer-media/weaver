@@ -737,16 +737,16 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
-                    scheduler_state.set_speed_test_paused(paused);
+                SchedulerCommand::Pause { hold, reply } => {
+                    scheduler_state.hold(hold);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::PauseAll { reply } => {
-                    scheduler_state.set_queue_hold(weaver_server_core::jobs::QueueHold::Downloads);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::ResumeAll { reply } => {
-                    scheduler_state.set_queue_hold(weaver_server_core::jobs::QueueHold::None);
+                SchedulerCommand::Resume {
+                    origin,
+                    owner,
+                    reply,
+                } => {
+                    scheduler_state.release(origin, owner);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetPropagationDelay { reply, .. }

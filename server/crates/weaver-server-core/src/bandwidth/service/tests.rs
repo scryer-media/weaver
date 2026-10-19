@@ -118,19 +118,28 @@ fn bandwidth_ledger_flushes_once_the_byte_threshold_is_reached() {
 fn global_pause_origin_selects_the_block_kind() {
     let runtime = BandwidthLedgerRuntime::default();
 
-    // A schedule-driven pause must present as Scheduled even though it shares
-    // the `global_paused` flag with a manual pause; a concurrent recomputation
-    // must not collapse it to ManualPause.
+    // The block follows who holds the queue: a schedule's hold presents as
+    // Scheduled, the operator's and a speed test's as a pause.
     assert_eq!(
-        runtime.to_download_block_state(GlobalPause::Running).kind,
+        runtime.to_download_block_state(None).kind,
         crate::DownloadBlockKind::None
     );
     assert_eq!(
-        runtime.to_download_block_state(GlobalPause::Manual).kind,
+        runtime
+            .to_download_block_state(Some(HoldOrigin::Manual))
+            .kind,
         crate::DownloadBlockKind::ManualPause
     );
     assert_eq!(
-        runtime.to_download_block_state(GlobalPause::Scheduled).kind,
+        runtime
+            .to_download_block_state(Some(HoldOrigin::SpeedTest))
+            .kind,
+        crate::DownloadBlockKind::ManualPause
+    );
+    assert_eq!(
+        runtime
+            .to_download_block_state(Some(HoldOrigin::Scheduled))
+            .kind,
         crate::DownloadBlockKind::Scheduled
     );
 }

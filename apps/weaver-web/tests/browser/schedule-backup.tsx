@@ -25,7 +25,7 @@ let passwordVerified = !location.search.includes("expired");
 let verificationRequests = 0;
 let acceptedBackupMutations = 0;
 let acceptedBackupCreates = 0;
-const track = (action: string) => ({ pause_all: "DOWNLOADS", pause_post_processing: "POST_PROCESSING", resume_post_processing: "POST_PROCESSING", set_server_active: "SERVER", set_quota_metering: "QUOTA", prune_history: "ONE_SHOT", speed_limit: "SPEED", bandwidth_split: "SPLIT", hardware_profile: "PROFILE", pause_watch_folder_scanning: "WATCH_FOLDER", resume_watch_folder_scanning: "WATCH_FOLDER", pause_rss: "RSS", resume_rss: "RSS" })[action] ?? "DOWNLOADS";
+const track = (action: string) => ({ pause_all: "DOWNLOADS", pause_post_processing: "POST_PROCESSING", resume_post_processing: "POST_PROCESSING", set_server_active: "SERVER", set_quota_metering: "QUOTA", prune_history: "ONE_SHOT", speed_limit: "SPEED", bandwidth_split: "SPLIT", hardware_profile: "PROFILE", pause_watch_folder_scanning: "WATCH_FOLDER", resume_watch_folder_scanning: "WATCH_FOLDER", pause_rss: "RSS", resume_rss: "RSS", pause_torrents: "TORRENTS", resume_torrents: "TORRENTS" })[action] ?? "DOWNLOADS";
 function graphql(name: string, variables: Record<string, any>) {
   let mutation = {};
   if (["UpdateBackupSettings", "UpdateAutoBackupSettings", "DeleteBackup", "BackupDownloadToken"].includes(name)) {

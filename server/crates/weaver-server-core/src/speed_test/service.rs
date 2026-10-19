@@ -21,6 +21,7 @@ use super::progress::{LegRecorder, Progress, UsenetFacts};
 use super::providers::{self, ProviderServer};
 use super::runner::Stop;
 use super::usenet::{self, UsenetLeg, UsenetPlan};
+use crate::jobs::{Hold, HoldOrigin, HoldOwner, HoldScope};
 use crate::proxies::{
     Consumer, DraftNetworkRoute, LegPath, NetworkRefusal, ProxyPool, ProxyProfile, ProxyRuntime,
     RoutingPolicy, Rung, SpeedTestQuotaHolder, TorrentScope,
@@ -834,25 +835,21 @@ impl ServiceInner {
 }
 
 // What a run holds while it has the line, given back on every exit path.
+// The loan and the draft give themselves back as they drop.
 struct Gate {
-    handle: SchedulerHandle,
-    // This run's transient hold never owns an operator or schedule pause.
-    paused: AtomicBool,
     loan: Mutex<Option<Arc<ConnectionLoan>>>,
     draft: Mutex<Option<Arc<DraftNetworkRoute>>>,
 }
 
 impl Gate {
-    // Restore the budget, release this run's hold, and revoke the draft.
+    // Restore the budget, lift this run's hold, and revoke the draft. Only
+    // the speed test's own hold is lifted, so a pause the operator or the
+    // schedule holds stands.
     async fn release(&self, handle: &SchedulerHandle) {
         let loan = self.loan.lock().expect("speed test loan").take();
         drop(loan);
-        if self.paused.load(Ordering::Acquire) {
-            if let Err(error) = handle.set_speed_test_pause(false).await {
-                warn!(%error, "speed test scheduler stopped; clearing its transient hold");
-                handle.clear_speed_test_pause();
-            }
-            self.paused.store(false, Ordering::Release);
+        if let Err(error) = handle.resume(HoldOrigin::SpeedTest, HoldOwner::All).await {
+            warn!(%error, "the scheduler stopped before the speed test's hold was lifted");
         }
         let draft = self.draft.lock().expect("speed test draft").take();
         if let Some(draft) = draft {
@@ -861,21 +858,8 @@ impl Gate {
     }
 }
 
-impl Drop for Gate {
-    // Weaver is shutting down mid-run: the scheduler is gone, so the pause
-    // this run made must not outlive the process. The loan and the draft
-    // give themselves back as they drop.
-    fn drop(&mut self) {
-        if self.paused.load(Ordering::Acquire) {
-            self.handle.clear_speed_test_pause();
-        }
-    }
-}
-
 async fn drive(inner: Arc<ServiceInner>, cell: Arc<RunCell>, plan: RunPlan) {
     let gate = Arc::new(Gate {
-        handle: inner.handle.clone(),
-        paused: AtomicBool::new(false),
         loan: Mutex::new(None),
         draft: Mutex::new(Some(plan.draft.clone())),
     });
@@ -1062,10 +1046,17 @@ async fn execute(
         None
     };
 
-    // Hold admission independently of any operator or schedule pause.
+    // Hold the queue, seeding too, through the one pause every holder uses.
     inner.set_phase(&cell, SpeedTestPhase::Pausing);
-    gate.paused.store(true, Ordering::Release);
-    if let Err(error) = inner.handle.set_speed_test_pause(true).await {
+    if let Err(error) = inner
+        .handle
+        .pause(Hold {
+            origin: HoldOrigin::SpeedTest,
+            scope: HoldScope::Everything,
+            owner: HoldOwner::All,
+        })
+        .await
+    {
         return Outcome::Failed(format!("could not pause downloads: {error}"));
     }
 

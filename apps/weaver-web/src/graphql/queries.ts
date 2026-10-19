@@ -853,6 +853,7 @@ export const LIVE_METRICS_QUERY = gql`
     }
     globalState: globalQueueState {
       isPaused
+      torrentsPaused
       speedLimitBytesPerSec
       downloadBlock {
         ...DownloadBlockFields
@@ -1056,6 +1057,18 @@ export const RESUME_ALL_MUTATION = gql`
   }
 `;
 
+export const PAUSE_TORRENTS_MUTATION = gql`
+  mutation PauseTorrents {
+    pauseTorrents
+  }
+`;
+
+export const RESUME_TORRENTS_MUTATION = gql`
+  mutation ResumeTorrents {
+    resumeTorrents
+  }
+`;
+
 export const UPDATE_JOBS_MUTATION = gql`
   mutation UpdateJobs($ids: [Int!]!, $category: String, $priority: String) {
     updateJobs(ids: $ids, category: $category, priority: $priority)
@@ -1105,6 +1118,7 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       }
       globalState {
         isPaused
+        torrentsPaused
         speedLimitBytesPerSec
         downloadBlock {
           ...DownloadBlockFields

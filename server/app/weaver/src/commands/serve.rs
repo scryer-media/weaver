@@ -195,7 +195,7 @@ pub(crate) async fn run(
             .await?;
     let initial_history = recovered_state.initial_history;
     let to_restore = recovered_state.to_restore;
-    let initial_global_paused = recovered_state.initial_global_paused;
+    let initial_holds = recovered_state.initial_holds;
 
     // Publish recovered history to shared state so the API has data immediately.
     shared_state.publish_jobs(initial_history.clone());
@@ -284,7 +284,7 @@ pub(crate) async fn run(
         total_connections,
         write_buf_max,
         initial_history,
-        initial_global_paused,
+        initial_holds,
         shared_state,
         db.clone(),
         pipeline_config,

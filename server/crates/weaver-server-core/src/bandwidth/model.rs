@@ -31,6 +31,10 @@ pub enum ScheduleAction {
     Pause,
     Resume,
     PauseAll,
+    // Stop every torrent, seeding too, as one hold; each torrent's own
+    // pause or resume stands under it.
+    PauseTorrents,
+    ResumeTorrents,
     PausePostProcessing,
     ResumePostProcessing,
     PauseWatchFolderScanning,
@@ -132,6 +136,7 @@ pub struct PruneFiles {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScheduleTrack {
     Downloads,
+    Torrents,
     PostProcessing,
     WatchFolder,
     Rss,
@@ -157,6 +162,7 @@ impl ScheduleAction {
                 ScheduleTrack::Rss,
             ],
             Self::Pause => vec![ScheduleTrack::Downloads],
+            Self::PauseTorrents | Self::ResumeTorrents => vec![ScheduleTrack::Torrents],
             Self::PausePostProcessing | Self::ResumePostProcessing => {
                 vec![ScheduleTrack::PostProcessing]
             }

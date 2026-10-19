@@ -166,7 +166,7 @@ impl TorrentFacadeContext {
     async fn targets(&self, params: &Params) -> Vec<TorrentView> {
         let wanted = params.get("hashes").unwrap_or_default();
         let views = self.views().await;
-        if wanted.trim() == "all" {
+        if names_all(params) {
             return views;
         }
         let wanted: Vec<&str> = wanted.split('|').map(str::trim).collect();
@@ -356,6 +356,18 @@ fn forbidden() -> Response {
 }
 
 // A failure inside weaver: logged, never shown to the caller.
+// Whether a `hashes` parameter names every torrent.
+fn names_all(params: &Params) -> bool {
+    params.get("hashes").unwrap_or_default().trim() == "all"
+}
+
+fn held(result: Result<(), weaver_server_core::SchedulerError>) -> Response {
+    match result {
+        Ok(()) => ok(),
+        Err(error) => internal(error),
+    }
+}
+
 fn internal(error: impl std::fmt::Display) -> Response {
     tracing::warn!(%error, "torrent client compatibility request failed");
     text(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
@@ -448,6 +460,14 @@ async fn handle(
         ("torrents", "trackers") => trackers(&ctx, &params).await,
         ("torrents", "add") => add(&ctx, params).await,
         ("torrents", "delete") => delete(&ctx, &params).await,
+        // Every torrent at once is one hold, which leaves each torrent's
+        // own pause or resume standing; named torrents are each paused.
+        ("torrents", "pause" | "stop") if names_all(&params) => {
+            held(ctx.inner.handle.pause_torrents().await)
+        }
+        ("torrents", "resume" | "start") if names_all(&params) => {
+            held(ctx.inner.handle.resume_torrents().await)
+        }
         ("torrents", "pause" | "stop") => {
             each(&ctx, &params, |torrents, view| async move {
                 torrents.pause(view.job_id).await

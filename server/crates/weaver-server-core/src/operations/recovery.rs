@@ -11,7 +11,7 @@ use crate::history::HistoryFilter;
 use crate::ingest;
 use crate::jobs::FINISHED_JOBS_RUNTIME_CAP;
 use crate::jobs::working_dir::is_weaver_owned_working_dir;
-use crate::runtime::load_global_pause_from_db;
+use crate::runtime::load_holds_from_db;
 use crate::{
     DownloadState, JobInfo, JobStatus, PostState, RestoreJobRequest, RunState,
     job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
@@ -20,7 +20,7 @@ use crate::{
 pub struct RecoveredServerState {
     pub initial_history: Vec<JobInfo>,
     pub to_restore: Vec<RestoreCandidate>,
-    pub initial_global_paused: bool,
+    pub initial_holds: crate::jobs::HoldSet,
 }
 
 pub struct RestoreCandidate {
@@ -362,12 +362,12 @@ pub async fn recover_server_state(
         )
     });
 
-    let initial_global_paused = load_global_pause_from_db(db).await?;
+    let initial_holds = load_holds_from_db(db).await?;
 
     Ok(RecoveredServerState {
         initial_history,
         to_restore,
-        initial_global_paused,
+        initial_holds,
     })
 }
 

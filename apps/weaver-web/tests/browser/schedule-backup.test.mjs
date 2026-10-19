@@ -78,7 +78,7 @@ test("backup settings, retained create, token download and delete use the render
 test("all new schedule actions support disabled create, edit, draft and list toggles, and delete", async () => {
   const page = await open("?schedules");
   try {
-    for (const [action, group] of [["Pause all intake", "Downloads"], ["Pause post-processing", "Post-processing"], ["Resume post-processing", "Post-processing"], ["Set server availability", "Servers"], ["Set quota metering", "Quota metering"], ["Pause RSS", "RSS"], ["Resume RSS", "RSS"], ["Prune history", "One-shot actions"]]) {
+    for (const [action, group] of [["Pause all intake", "Downloads"], ["Pause torrents", "Torrents"], ["Resume torrents", "Torrents"], ["Pause post-processing", "Post-processing"], ["Resume post-processing", "Post-processing"], ["Set server availability", "Servers"], ["Set quota metering", "Quota metering"], ["Pause RSS", "RSS"], ["Resume RSS", "RSS"], ["Prune history", "One-shot actions"]]) {
       await addSchedule(page).click();
       const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
       await form.getByLabel("Label", { exact: true }).fill(`fixture ${action}`);
@@ -215,7 +215,8 @@ test("the action picker offers the holds, then the settings a rule switches, and
     const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
     await form.getByRole("button", { name: "Action", exact: true }).click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
-      "Pause downloads", "Resume downloads", "Pause all intake", "Pause post-processing", "Resume post-processing",
+      "Pause downloads", "Resume downloads", "Pause all intake", "Pause torrents", "Resume torrents",
+      "Pause post-processing", "Resume post-processing",
       "Pause watch folder scanning", "Resume watch folder scanning", "Pause RSS", "Resume RSS", "Set a speed limit",
       "Bandwidth split", "Switch the hardware profile", "Set server availability", "Prune history", "Set quota metering",
     ]);
