@@ -496,10 +496,6 @@ impl Live {
         }
     }
 
-    fn have(&self) -> u64 {
-        self.file_have.iter().sum()
-    }
-
     fn complete(&self) -> bool {
         self.record.completed_at_ms.is_some()
     }
@@ -529,6 +525,52 @@ impl Live {
         self.intake.as_ref().is_some_and(|intake| intake.holding())
     }
 
+    // What the session says of the torrent now, over what was kept of it:
+    // the one reading the views show and the ledger keeps.
+    fn reading(&self, now: i64) -> Reading {
+        let Some(attached) = &self.attached else {
+            return Reading {
+                engine: Engine::Absent,
+                file_have: self.file_have.clone(),
+                counters: self.counters,
+                seen: self.seen,
+                speeds: (0, 0),
+                peers: (0, 0),
+            };
+        };
+        let stats = attached.handle.stats();
+        let engine = Engine::of(&stats);
+        let mut file_have = self.file_have.clone();
+        take_file_have(&mut file_have, &engine, &stats.file_progress);
+        let live = stats.live.as_ref();
+        let fetched = live.map_or(0, |live| live.snapshot.fetched_bytes);
+        let uploaded = stats.uploaded_bytes;
+        // The session counts from zero each time it takes the torrent.
+        let delta = |now: u64, then: u64| if now >= then { now - then } else { now };
+        let (up, down) = (delta(uploaded, self.seen.0), delta(fetched, self.seen.1));
+        let mut counters = self.counters;
+        counters.uploaded_bytes += up;
+        counters.downloaded_bytes += down;
+        if up + down > 0 {
+            counters.last_activity_ms = Some(now);
+        }
+        Reading {
+            engine,
+            file_have,
+            counters,
+            seen: (uploaded, fetched),
+            speeds: live.map_or((0, 0), |live| {
+                (live.download_speed.as_bytes(), live.upload_speed.as_bytes())
+            }),
+            peers: live.map_or((0, 0), |live| {
+                (
+                    live.snapshot.peer_stats.live,
+                    live.snapshot.peer_stats.live_seeders,
+                )
+            }),
+        }
+    }
+
     // Everything the state is read from, with the session reporting
     // `engine`.
     fn observed(&self, engine: Engine) -> Observed {
@@ -544,6 +586,19 @@ impl Live {
             disk_full: self.holding(),
         }
     }
+}
+
+// A torrent as the session reports it now.
+struct Reading {
+    engine: Engine,
+    // Each file's bytes in hand.
+    file_have: Vec<u64>,
+    // The ledger with what the session moved since it was last kept.
+    counters: TorrentCounters,
+    // The session's own totals, which the ledger's deltas are taken from.
+    seen: (u64, u64),
+    speeds: (u64, u64),
+    peers: (u32, u32),
 }
 
 // What the job side asks the service to look at: the jobs that changed,
@@ -752,7 +807,7 @@ impl TorrentService {
     // The torrents, as queue items, into the published queue.
     async fn publish(&self) {
         if let Some(queue) = self.queue() {
-            queue.state().publish_torrent_jobs(self.job_infos().await);
+            queue.publish_owned_jobs(self.job_infos().await);
         }
     }
 
@@ -1954,41 +2009,13 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 let before = torrent.counters;
-                if let Some(attached) = &torrent.attached {
-                    let stats = attached.handle.stats();
-                    torrent.engine = Engine::of(&stats);
-                    take_file_have(
-                        &mut torrent.file_have,
-                        &torrent.engine,
-                        &stats.file_progress,
-                    );
-                    let fetched = stats
-                        .live
-                        .as_ref()
-                        .map_or(0, |live| live.snapshot.fetched_bytes);
-                    let uploaded = stats.uploaded_bytes;
-                    let delta = |now: u64, then: u64| if now >= then { now - then } else { now };
-                    let up = delta(uploaded, torrent.seen.0);
-                    let down = delta(fetched, torrent.seen.1);
-                    torrent.seen = (uploaded, fetched);
-                    torrent.counters.uploaded_bytes += up;
-                    torrent.counters.downloaded_bytes += down;
-                    if up + down > 0 {
-                        torrent.counters.last_activity_ms = Some(now);
-                    }
-                    torrent.speeds = stats.live.as_ref().map_or((0, 0), |live| {
-                        (live.download_speed.as_bytes(), live.upload_speed.as_bytes())
-                    });
-                    torrent.peers = stats.live.as_ref().map_or((0, 0), |live| {
-                        (
-                            live.snapshot.peer_stats.live,
-                            live.snapshot.peer_stats.live_seeders,
-                        )
-                    });
-                } else {
-                    torrent.speeds = (0, 0);
-                    torrent.peers = (0, 0);
-                }
+                let reading = torrent.reading(now);
+                torrent.engine = reading.engine;
+                torrent.file_have = reading.file_have;
+                torrent.counters = reading.counters;
+                torrent.seen = reading.seen;
+                torrent.speeds = reading.speeds;
+                torrent.peers = reading.peers;
                 let (state, _) = status::project(&torrent.observed(torrent.engine.clone()));
                 if state == TorrentState::Seeding {
                     torrent.counters.finished_duration_s += elapsed_s;
@@ -2142,20 +2169,14 @@ impl TorrentService {
     }
 
     fn view(&self, settings: &TorrentSettings, torrent: &Live, now: i64) -> TorrentView {
-        // The session as it is now, not as the last tick found it.
-        let (state, detail) = status::project(
-            &torrent.observed(
-                torrent
-                    .attached
-                    .as_ref()
-                    .map_or(Engine::Absent, |attached| {
-                        Engine::of(&attached.handle.stats())
-                    }),
-            ),
-        );
+        // The session as it is now, not as the last tick found it: the
+        // state and every figure from one reading of it.
+        let reading = torrent.reading(now);
+        let (state, detail) = status::project(&torrent.observed(reading.engine));
+        let counters = &reading.counters;
         let record = &torrent.record;
         let total = torrent.total;
-        let have = torrent.have();
+        let have: u64 = reading.file_have.iter().sum();
         TorrentView {
             job_id: record.job_id,
             name: record.name.clone(),
@@ -2175,30 +2196,25 @@ impl TorrentService {
             },
             total_bytes: total,
             have_bytes: have,
-            uploaded_bytes: torrent.counters.uploaded_bytes,
-            downloaded_bytes: torrent.counters.downloaded_bytes,
-            ratio: status::ratio(&torrent.counters, total),
-            download_bps: torrent.speeds.0,
-            upload_bps: torrent.speeds.1,
-            eta_seconds: status::eta_seconds(total.saturating_sub(have), torrent.speeds.0),
-            peers: torrent.peers.0,
-            seeds: torrent.peers.1,
-            leechers: torrent.peers.0.saturating_sub(torrent.peers.1),
+            uploaded_bytes: counters.uploaded_bytes,
+            downloaded_bytes: counters.downloaded_bytes,
+            ratio: status::ratio(counters, total),
+            download_bps: reading.speeds.0,
+            upload_bps: reading.speeds.1,
+            eta_seconds: status::eta_seconds(total.saturating_sub(have), reading.speeds.0),
+            peers: reading.peers.0,
+            seeds: reading.peers.1,
+            leechers: reading.peers.0.saturating_sub(reading.peers.1),
             added_at_ms: record.added_at_ms,
             completed_at_ms: record.completed_at_ms,
             storage_dir: record.storage_dir.clone(),
-            seeding_left: status::goal_left(
-                settings.policy(record).as_ref(),
-                &torrent.counters,
-                total,
-                now,
-            ),
+            seeding_left: status::goal_left(settings.policy(record).as_ref(), counters, total, now),
             seeding_override: record.policy_override,
             seeding_policy: settings.policy(record).unwrap_or_default(),
             seeding_source: settings.seeding_source(record),
             route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
-            file_have: torrent.file_have.clone(),
+            file_have: reading.file_have,
             trackers: Vec::new(),
         }
     }

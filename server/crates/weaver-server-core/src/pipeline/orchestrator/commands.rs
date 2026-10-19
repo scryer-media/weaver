@@ -330,9 +330,13 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
+            // Another owner's job ends as the pipeline's do: in the finished
+            // jobs, then the event that says how it ended.
             SchedulerCommand::RetireJob { info } => {
+                let ended = info.ended_event();
                 self.finish_job(*info);
                 self.publish_snapshot();
+                self.publish_terminal_event(ended);
             }
             SchedulerCommand::UpdateHistory {
                 job_id,

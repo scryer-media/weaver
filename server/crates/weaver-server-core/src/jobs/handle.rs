@@ -398,11 +398,19 @@ impl SharedPipelineState {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
-    // Publish the torrents, kept beside whatever the pipeline publishes.
-    pub fn publish_torrent_jobs(&self, torrents: Vec<JobInfo>) {
-        self.jobs.write().unwrap().torrents = torrents;
+    // Publish the torrents, kept beside whatever the pipeline publishes, and
+    // say what the publish changed as the pipeline says it of its own jobs.
+    // The owner publishes through its handle, which carries the events.
+    fn publish_torrent_jobs(&self, torrents: Vec<JobInfo>) -> Vec<PipelineEvent> {
+        let events = {
+            let mut jobs = self.jobs.write().unwrap();
+            let events = owned_job_events(&jobs.torrents, &torrents);
+            jobs.torrents = torrents;
+            events
+        };
         self.job_revision
             .send_modify(|revision| *revision = revision.wrapping_add(1));
+        events
     }
 
     // Seat the owner of the jobs published beside the pipeline's.
@@ -1137,8 +1145,52 @@ pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
         .collect()
 }
 
+// The job events that take an owner's published jobs from `before` to
+// `after`: a job new to them is created, a job whose figures moved is paused,
+// resumed, or otherwise updated.
+fn owned_job_events(before: &[JobInfo], after: &[JobInfo]) -> Vec<PipelineEvent> {
+    let before: HashMap<JobId, &JobInfo> = before.iter().map(|job| (job.job_id, job)).collect();
+    after
+        .iter()
+        .filter_map(|job| {
+            let job_id = job.job_id;
+            let Some(was) = before.get(&job_id) else {
+                return Some(PipelineEvent::JobCreated {
+                    job_id,
+                    name: job.name.clone(),
+                    total_files: job.total_files,
+                    total_bytes: job.total_bytes,
+                });
+            };
+            let paused = |job: &JobInfo| job.status == JobStatus::Paused;
+            match (paused(was), paused(job)) {
+                _ if *was == job => None,
+                (false, true) => Some(PipelineEvent::JobPaused { job_id }),
+                (true, false) => Some(PipelineEvent::JobResumed { job_id }),
+                _ => Some(PipelineEvent::PhaseProgressUpdated { job_id }),
+            }
+        })
+        .collect()
+}
+
+impl JobInfo {
+    /// The event that says how a finished job ended, as the queue hears it.
+    /// None while the job has not ended.
+    pub fn ended_event(&self) -> Option<PipelineEvent> {
+        let job_id = self.job_id;
+        match &self.status {
+            JobStatus::Complete => Some(PipelineEvent::JobCompleted { job_id }),
+            JobStatus::Failed { error } => Some(PipelineEvent::JobFailed {
+                job_id,
+                error: error.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 // Summary info about a job (returned by queries).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job_id: JobId,
     #[serde(default)]
@@ -1418,6 +1470,16 @@ impl SchedulerHandle {
             self.act(job_id, QueueAction::Move(target)).await?;
         }
         Ok(())
+    }
+
+    // Publish the jobs another owner keeps beside the pipeline's. What the
+    // publish changed goes out on the job events, as the pipeline's own
+    // changes do: a job that appears is created, one that changes says so.
+    // A job that leaves is retired, which says how it ended.
+    pub fn publish_owned_jobs(&self, jobs: Vec<JobInfo>) {
+        for event in self.state.publish_torrent_jobs(jobs) {
+            let _ = self.event_tx.send(event);
+        }
     }
 
     // A job another owner finished joins the finished jobs.

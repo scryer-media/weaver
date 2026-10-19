@@ -1299,3 +1299,118 @@ async fn the_global_pause_reaches_the_torrents() {
         );
     }
 }
+
+// The rig's torrents dial out on loopback.
+fn on_loopback(routes: &FakeRoutes) {
+    use crate::torrents::net::{LegKind, LegSockets};
+
+    let loopback = Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+        weaver_tunnel::pipe::Egress::new(
+            4,
+            weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
+            // No connect deadline: the test waits on what it checks.
+            std::time::Duration::MAX,
+        ),
+    )));
+    routes.set_leg(
+        LegKind::Ladder,
+        Arc::new(LegSockets::new(loopback, &LegKind::Ladder)),
+    );
+}
+
+// The torrent's place in its session.
+async fn handle_of(service: &TorrentService, job_id: JobId) -> Arc<ManagedTorrent> {
+    let live = service.inner.live.lock().await;
+    Arc::clone(&live[&job_id].attached.as_ref().unwrap().handle)
+}
+
+// The torrent's view once it seeds, read as the queue publishes it.
+async fn seeding_view(
+    service: &TorrentService,
+    changes: &mut watch::Receiver<u64>,
+    job_id: JobId,
+) -> TorrentView {
+    loop {
+        changes.borrow_and_update();
+        let view = service.torrent(job_id).await.unwrap();
+        if view.state == TorrentState::Seeding {
+            return view;
+        }
+        changes.changed().await.unwrap();
+    }
+}
+
+// The bytes the seeder has sent.
+fn uploaded(seeder: &Session) -> u64 {
+    seeder
+        .get(TorrentIdOrHash::Id(0))
+        .unwrap()
+        .stats()
+        .uploaded_bytes
+}
+
+// A torrent shows what it has the moment it seeds, and after a restart it
+// seeds from what it kept: nothing is fetched again and its counters stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let private = metainfo("set", &files, 16_384, true);
+
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &private, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let bytes = announcing(&private, &tracker(peer).await);
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    rig.service.publish_to(handle);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let total = data.len() as u64;
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_completed()
+        .await
+        .unwrap();
+    let view = seeding_view(&rig.service, &mut changes, job_id).await;
+    assert_eq!(
+        (view.have_bytes, view.downloaded_bytes, view.progress),
+        (total, total, 1.0)
+    );
+    let sent = uploaded(&seeding);
+    assert!(sent >= total, "the seeder sent {sent} of {total}");
+    // The ledger as the running tick keeps it.
+    rig.service.tick().await;
+    rig.service.stop().await;
+    // What the server's recovery clears before anything starts.
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    again.publish_to(handle);
+    again.open().await.unwrap();
+    handle_of(&again, job_id)
+        .await
+        .wait_until_completed()
+        .await
+        .unwrap();
+    let view = seeding_view(&again, &mut changes, job_id).await;
+    assert_eq!(
+        (view.have_bytes, view.downloaded_bytes, view.progress),
+        (total, total, 1.0)
+    );
+    assert_eq!(view.file_have, [total]);
+    assert_eq!(uploaded(&seeding), sent);
+    again.stop().await;
+    seeding.stop().await;
+}

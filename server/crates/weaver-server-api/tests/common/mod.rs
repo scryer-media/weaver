@@ -613,6 +613,8 @@ fn spawn_test_scheduler(
 
     let task = tokio::spawn(async move {
         let mut jobs: HashMap<JobId, JobState> = HashMap::new();
+        // The jobs other owners retired, newest first.
+        let mut finished: Vec<JobInfo> = Vec::new();
         let mut nntp_generation = 0u64;
 
         while let Some(cmd) = cmd_rx.recv().await {
@@ -632,7 +634,8 @@ fn spawn_test_scheduler(
                     if jobs.contains_key(&job_id) {
                         let _ =
                             reply.send(Err(weaver_server_core::SchedulerError::JobExists(job_id)));
-                        scheduler_state.publish_jobs(build_job_list(&jobs));
+                        scheduler_state
+                            .publish_live_jobs(build_job_list(&jobs), Arc::from(finished.clone()));
                         continue;
                     }
                     let assembly = JobAssembly::new(job_id);
@@ -1009,12 +1012,23 @@ fn spawn_test_scheduler(
                 // reports a pipeline that did not respond, which is what a
                 // mock scheduler is.
                 SchedulerCommand::PipelineDiagnostics { .. } => {}
-                // This harness keeps no finished jobs.
-                SchedulerCommand::RetireJob { .. } => {}
+                // Another owner's job joins the finished jobs, then the
+                // event that says how it ended goes out, as in the pipeline.
+                SchedulerCommand::RetireJob { info } => {
+                    let ended = info.ended_event();
+                    finished.retain(|job| job.job_id != info.job_id);
+                    finished.insert(0, *info);
+                    scheduler_state
+                        .publish_live_jobs(build_job_list(&jobs), Arc::from(finished.clone()));
+                    if let Some(event) = ended {
+                        let _ = event_tx.send(event);
+                    }
+                    continue;
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
-            scheduler_state.publish_jobs(build_job_list(&jobs));
+            scheduler_state.publish_live_jobs(build_job_list(&jobs), Arc::from(finished.clone()));
         }
     });
 

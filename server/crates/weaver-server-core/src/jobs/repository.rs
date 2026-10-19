@@ -410,13 +410,8 @@ impl Database {
                                 "active_direct_coverage",
                             )
                             .await?,
-                            graph_checkpoint: {
-                                let mut removed = 0;
-                                for table in crate::jobs::graph_checkpoint::TABLES {
-                                    removed += delete_orphan_rows(tx, table).await?;
-                                }
-                                removed
-                            },
+                            graph_checkpoint: crate::jobs::graph_checkpoint::delete_orphans(tx)
+                                .await?,
                         })
                     })
                 })

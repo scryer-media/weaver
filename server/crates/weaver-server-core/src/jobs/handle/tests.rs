@@ -1185,9 +1185,7 @@ async fn a_queue_action_goes_to_the_jobs_owner() {
         .unwrap();
     let owner = Arc::new(RecordingOwner::default());
     handle.state().seat_owner(owner.clone());
-    handle
-        .state()
-        .publish_torrent_jobs(vec![owned_job(JobId(2), 0.0)]);
+    handle.publish_owned_jobs(vec![owned_job(JobId(2), 0.0)]);
 
     handle.pause_job(JobId(2)).await.unwrap();
     handle.resume_job(JobId(2)).await.unwrap();

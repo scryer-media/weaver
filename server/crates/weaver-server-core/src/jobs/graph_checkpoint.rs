@@ -133,6 +133,32 @@ impl Database {
     }
 }
 
+// Whether the job `job_id` names is live: while its queue row or its torrent
+// row is. A checkpoint is kept for exactly the live jobs.
+fn live_job(job_id: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {job_id})
+          OR EXISTS (SELECT 1 FROM torrents WHERE torrents.job_id = {job_id}))"
+    )
+}
+
+// Delete every checkpoint row whose job is not live. Returns how many went.
+pub(crate) async fn delete_orphans(tx: &mut SqlTx<'_>) -> Result<usize, StateError> {
+    let mut removed = 0;
+    for table in TABLES {
+        removed += tx
+            .execute(
+                &format!(
+                    "DELETE FROM {table} WHERE NOT {}",
+                    live_job(&format!("{table}.job_id"))
+                ),
+                &[],
+            )
+            .await? as usize;
+    }
+    Ok(removed)
+}
+
 async fn write_checkpoint(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -147,11 +173,9 @@ async fn write_checkpoint(
         )
         .await?;
     }
-    // A job is live while its queue row or its torrent row is.
     let live = tx
         .fetch_optional(
-            "SELECT 1 AS live FROM active_jobs WHERE job_id = {}
-             UNION ALL SELECT 1 AS live FROM torrents WHERE job_id = {}",
+            &format!("SELECT 1 AS live WHERE {}", live_job("{}")),
             &[SqlArg::I64(id), SqlArg::I64(id)],
         )
         .await?

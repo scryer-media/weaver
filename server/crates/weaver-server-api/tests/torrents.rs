@@ -352,3 +352,68 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
     let torrent = &read(detail(global)).await["torrent"];
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 4.0);
 }
+
+// A torrent's place in the queue reaches the queue's events as a job's does:
+// its arrival, a change of state, and its leaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_queue_events_carry_a_torrent() {
+    use tokio_stream::StreamExt;
+
+    let rig = rig().await;
+    rig.torrents.publish_to(rig.harness.handle.clone());
+    let cursor = rig
+        .harness
+        .execute_as("query { latestQueueCursor }", CallerScope::Read)
+        .await
+        .data
+        .into_json()
+        .unwrap()["latestQueueCursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut events = rig.harness.schema.execute_stream(
+        Request::new(format!(
+            r#"subscription {{ queueEvents(after: "{cursor}") {{ kind itemId state }} }}"#
+        ))
+        .data(CallerScope::Read),
+    );
+    // The next event for `id`, as (kind, state).
+    let mut next = async |id: u64| loop {
+        let response = events.next().await.expect("the queue's events stay open");
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let event = response.data.into_json().unwrap()["queueEvents"].clone();
+        if event["itemId"].as_u64() == Some(id) {
+            return (
+                event["kind"].as_str().unwrap().to_owned(),
+                event["state"].as_str().unwrap_or_default().to_owned(),
+            );
+        }
+    };
+
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(next(id).await, ("ITEM_CREATED".into(), "STALLED".into()));
+
+    let paused = rig
+        .execute(&format!("mutation {{ pauseTorrent(id: {id}) }}"))
+        .await;
+    assert!(paused.errors.is_empty(), "{:?}", paused.errors);
+    assert_eq!(
+        next(id).await,
+        ("ITEM_STATE_CHANGED".into(), "PAUSED".into())
+    );
+
+    let removed = rig
+        .execute(&format!("mutation {{ removeTorrent(id: {id}) }}"))
+        .await;
+    assert!(removed.errors.is_empty(), "{:?}", removed.errors);
+    assert_eq!(
+        next(id).await,
+        ("ITEM_STATE_CHANGED".into(), "FAILED".into())
+    );
+}

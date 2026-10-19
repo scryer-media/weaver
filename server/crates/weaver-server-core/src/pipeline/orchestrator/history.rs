@@ -683,7 +683,7 @@ impl Pipeline {
         self.publish_terminal_event_after_archive(archived, terminal_event);
     }
 
-    fn publish_terminal_event(&self, terminal_event: Option<PipelineEvent>) {
+    pub(crate) fn publish_terminal_event(&self, terminal_event: Option<PipelineEvent>) {
         if let Some(event) = terminal_event {
             let _ = self.event_tx.send(event);
         }
