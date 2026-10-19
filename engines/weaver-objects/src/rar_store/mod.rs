@@ -516,10 +516,9 @@ impl Object for RarStore {
         self.stale = true;
     }
 
+    // A store that gave its set up still claims the rest of it, so the rest
+    // goes where the set went.
     fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        if self.gone {
-            return None;
-        }
         self.claim_volume(name, first_bytes)
     }
 }

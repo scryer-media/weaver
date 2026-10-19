@@ -7,7 +7,7 @@
 // whatever it replays from its partials. A record that could not have come
 // from a tree is refused, never mended.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Binding, Node, NodeId, Tree};
 use crate::facts::{Restore, RestoreError};
@@ -45,8 +45,7 @@ impl Tree {
             } else {
                 NodeState::Live
             },
-            // The tree keeps no reason once a refusal is applied.
-            reason: None,
+            reason: found.refused,
             facts: found.object.as_ref().map(|object| object.facts()),
             members: namespace
                 .members()
@@ -147,6 +146,10 @@ impl Tree {
         }
         let mut node = Node::new(object, binding);
         node.retired = record.state == NodeState::Retired;
+        if record.reason.is_some() && !node.retired {
+            return Err(refuse("a live node has refused its volumes"));
+        }
+        node.refused = record.reason;
         for member in &record.members {
             if node.namespace.get(member.member).is_some() {
                 return Err(refuse("a member appears twice"));
@@ -220,6 +223,8 @@ impl Tree {
             parent,
             volumes,
             window: record.window,
+            // A checkpoint is taken between passes, when no hand-over is owed.
+            awaiting: BTreeSet::new(),
         }))
     }
 

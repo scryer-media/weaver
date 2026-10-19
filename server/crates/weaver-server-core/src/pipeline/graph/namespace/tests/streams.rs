@@ -163,7 +163,6 @@ fn a_set_a_stream_feeds_reads_its_volume_back_from_its_file() {
 // and the first piece binds a stream below: the member's object hears its
 // volume closed once, after it has every byte the member received.
 #[test]
-#[ignore = "the object hears its volume closed twice: `Tree::close` tells it, then `hand_over` at the end of the pass tells it again"]
 fn a_stream_bound_and_closed_in_one_pass_hears_its_volume_closed_once_after_its_bytes() {
     let mut job = Job::new(PLENTY);
     let node = stream(&mut job);

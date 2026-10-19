@@ -10,7 +10,10 @@ use weaver_graph::{
 
 use super::{CheckpointError, FileState, Snapshot, rows, snapshot};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
-use crate::pipeline::graph::root::facts::{ArticleFacts, ClassFacts, RootFacts, VolumeFacts};
+use crate::pipeline::graph::root::facts::{
+    ArticleFacts, ClassFacts, RootFacts, VolumeFacts, decode, encode,
+};
+use crate::pipeline::graph::root::phase::RootPhase;
 
 fn member(id: u32, name: &str) -> MemberRecord {
     MemberRecord {
@@ -124,6 +127,7 @@ fn full() -> Snapshot {
                 },
             ],
             read_backs: 7,
+            reported: Some(RootPhase::Done),
         },
         files: BTreeMap::from([
             (
@@ -184,6 +188,42 @@ fn full() -> Snapshot {
 fn a_snapshot_comes_back_from_its_rows() {
     let taken = full();
     assert_eq!(snapshot(&rows(&taken)), Ok(taken));
+}
+
+#[test]
+fn the_phase_last_reported_comes_back_with_the_root() {
+    let taken = full();
+    let facts = decode(RootFacts::VERSION, &encode(&taken.root)).unwrap();
+    assert_eq!(facts.reported, Some(RootPhase::Done));
+}
+
+// Root facts written before the reported phase was kept: the rest reads as
+// it was written, and no phase was reported.
+#[test]
+fn root_facts_without_a_reported_phase_restore_none() {
+    #[derive(serde::Serialize)]
+    struct Before<'a> {
+        next_node: u32,
+        posted: &'a [String],
+        volumes: &'a [VolumeFacts],
+        read_backs: u64,
+    }
+    let taken = full().root;
+    let before = rmp_serde::to_vec(&Before {
+        next_node: taken.next_node,
+        posted: &taken.posted,
+        volumes: &taken.volumes,
+        read_backs: taken.read_backs,
+    })
+    .unwrap();
+    let facts = decode(RootFacts::VERSION, &before).unwrap();
+    assert_eq!(
+        facts,
+        RootFacts {
+            reported: None,
+            ..taken
+        }
+    );
 }
 
 #[test]

@@ -5,12 +5,13 @@
 // what a graph job reports as its status, and it is stored with the job so a
 // restart shows the same phase before anything has been re-derived.
 
+use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{NodeId, Tree};
 
 use crate::jobs::model::JobStatus;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RootPhase {
     Downloading,
     Verifying,

@@ -2,7 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The job as a checkpoint takes it: the tree's records, the root's facts
-// with the job's count of repair reads, the writer's files and kept
+// with the job's count of repair reads and the phase it last reported, the
+// writer's files and kept
 // envelopes, and which candidate each node was offered last.
 
 use std::collections::BTreeMap;
@@ -24,6 +25,7 @@ impl GraphJob {
         }
         let mut root = self.root.facts(tree.next_node);
         root.read_backs = self.writer.read_backs();
+        root.reported = self.reported;
         Snapshot {
             root,
             tree,

@@ -115,7 +115,7 @@ impl GraphJob {
             writer,
             runs,
             passwords: Passwords::new(storage.passwords),
-            reported: None,
+            reported: snapshot.root.reported,
             ruled_at: BTreeMap::new(),
             pending: Pending::default(),
         };

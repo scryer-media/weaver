@@ -47,6 +47,10 @@ struct Binding {
     parent: NodeId,
     volumes: BTreeMap<VolumeIndex, MemberId>,
     window: Option<ByteRange>,
+    // Volumes bound by a `Bound` whose owner has not yet handed the object
+    // what their members received before: their close waits for the
+    // hand-over, so the object hears it once, after every byte.
+    awaiting: BTreeSet<VolumeIndex>,
 }
 
 struct Node {
@@ -66,6 +70,10 @@ struct Node {
     // only so its owner can read back where its bytes went; it says nothing
     // more, runs nothing and bids for nothing.
     retired: bool,
+    // Why the object refused its volumes, when no engine took them in its
+    // place. It stays for as long as its node does, and the later volumes
+    // of its set it still claims are refused with it.
+    refused: Option<Why>,
 }
 
 impl Node {
@@ -78,6 +86,7 @@ impl Node {
             windows: BTreeMap::new(),
             undecided: BTreeSet::new(),
             retired: false,
+            refused: None,
         }
     }
 }
@@ -358,7 +367,9 @@ impl Tree {
 
     // Nothing more will arrive for a member of `node`'s namespace. It takes
     // the length it reached when it declared none, the object it is bound
-    // to hears that its volume is closed, and the owner closes its file.
+    // to hears that its volume is closed (at its hand-over, when the owner
+    // still owes it the member's earlier bytes), and the owner closes its
+    // file.
     pub fn close(
         &mut self,
         node: NodeId,
@@ -378,18 +389,86 @@ impl Tree {
         record.closed = true;
         let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
         record.length.get_or_insert(reached);
-        self.volume_closed(node, member, builder, effects);
+        if self.awaiting(node, member).is_none() {
+            self.volume_closed(node, member, builder, effects);
+        }
         for window in self.windows_on(node, member) {
             self.close_window(window, builder, effects);
         }
         effects.push(Effect::Closed { node, member });
     }
 
+    // The owner handed the object bound at a member of `node`'s namespace
+    // everything the member received before the bind. A member that closed
+    // meanwhile, or before the bind, has its object hear that now: its close
+    // waited for this.
+    pub fn handed_over(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((child, volume)) = self.awaiting(node, member) else {
+            return;
+        };
+        if let Some(binding) = self
+            .nodes
+            .get_mut(&child)
+            .and_then(|found| found.binding.as_mut())
+        {
+            binding.awaiting.remove(&volume);
+        }
+        self.volume_closed(node, member, builder, effects);
+    }
+
+    // The object a member of `node`'s namespace is a volume of, while its
+    // owner still owes it the member's earlier bytes.
+    fn awaiting(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
+        let (child, volume) = self.nodes.get(&node)?.children.get(&member).copied()?;
+        self.nodes
+            .get(&child)?
+            .binding
+            .as_ref()?
+            .awaiting
+            .contains(&volume)
+            .then_some((child, volume))
+    }
+
+    // A member of `node`'s namespace is bound to `child`: the owner is told,
+    // and owes the object what the member received before.
+    fn bound(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        kind: Kind,
+        child: NodeId,
+        effects: &mut Vec<Effect>,
+    ) {
+        let volume = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.children.get(&member))
+            .map(|(_, volume)| *volume);
+        if let (Some(volume), Some(binding)) = (
+            volume,
+            self.nodes
+                .get_mut(&child)
+                .and_then(|found| found.binding.as_mut()),
+        ) {
+            binding.awaiting.insert(volume);
+        }
+        effects.push(Effect::Bound {
+            node,
+            member,
+            kind,
+            child,
+        });
+    }
+
     // The object a closed member is a volume of hears it closed, at its
-    // length: when the member closes, and when an object claims a member
-    // that closed before it was bound, once the owner has handed it the
-    // member's bytes again.
-    pub fn volume_closed(
+    // length.
+    fn volume_closed(
         &mut self,
         node: NodeId,
         member: MemberId,
@@ -554,11 +633,25 @@ impl Tree {
         self.retired.get(&(node, member)).copied().flatten()
     }
 
+    // The object that refused a member of `node`'s namespace: the one it
+    // was given up by, or the refused one that claimed it after.
+    pub fn refused_by(&self, node: NodeId, member: MemberId) -> Option<NodeId> {
+        self.retired(node, member)
+            .map(|(object, _)| object)
+            .or_else(|| {
+                self.refused_below(node).into_iter().find(|object| {
+                    self.volumes(*object)
+                        .is_some_and(|(_, volumes)| volumes.values().any(|bound| *bound == member))
+                })
+            })
+    }
+
     // The owner has read the member's bytes back. Once every volume of the
     // retired node is buried, what it closed whole stays, as it was
     // delivered, and the rest of it goes: the posted volumes stand in for
     // that. When an engine took the volumes it reads them again and makes
-    // every member over, so nothing of the node stays.
+    // every member over, so nothing of the node stays. A refused node stays
+    // whatever it keeps, to claim the rest of its set.
     pub fn bury(&mut self, node: NodeId, member: MemberId) {
         let Some((retired, _)) = self.retired.get_mut(&(node, member)).and_then(Option::take)
         else {
@@ -573,7 +666,11 @@ impl Tree {
             return;
         }
         let read_again = self.child_of(node, member).is_some();
-        if read_again || !self.keep_closed(retired) {
+        let refused = self
+            .nodes
+            .get(&retired)
+            .is_some_and(|found| found.refused.is_some());
+        if read_again || !(self.keep_closed(retired) || refused) {
             self.drop_subtree(retired);
             self.remove_node(retired);
         }
@@ -1045,7 +1142,8 @@ impl Tree {
     }
 
     // Who owns a member, from its front. First the objects already in its
-    // namespace are offered it, as one of their volumes; then the sniffer
+    // namespace are offered it, as one of their volumes, and so are the
+    // objects there that refused theirs; then the sniffer
     // says what it is. An object it builds is offered every member that
     // has no owner, so a volume that came before its set's first is its
     // volume all the same.
@@ -1057,7 +1155,8 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        let siblings = self.bound_below(node);
+        let mut siblings = self.bound_below(node);
+        siblings.extend(self.refused_below(node));
         if self.offer(node, member, prefix, &siblings, effects) {
             return;
         }
@@ -1086,12 +1185,7 @@ impl Tree {
                 };
                 match self.attach(node, kind, volumes, builder) {
                     Ok(child) => {
-                        effects.push(Effect::Bound {
-                            node,
-                            member,
-                            kind,
-                            child,
-                        });
+                        self.bound(node, member, kind, child, effects);
                         self.offer_unowned(node, child, effects);
                     }
                     Err(why) => effects.push(Effect::Refused { node, member, why }),
@@ -1148,23 +1242,44 @@ impl Tree {
             return false;
         };
         for child in objects {
-            if let Some(volume) = self
-                .nodes
-                .get_mut(child)
-                .filter(|found| {
-                    // A window owns none of its member, so it takes none.
-                    !found.retired
-                        && found
-                            .binding
-                            .as_ref()
-                            .is_some_and(|binding| binding.window.is_none())
-                })
-                .and_then(|found| found.object.as_mut())
+            let Some(found) = self.nodes.get_mut(child).filter(|found| {
+                // A window owns none of its member, so it takes none.
+                (!found.retired || found.refused.is_some())
+                    && found
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.window.is_none())
+            }) else {
+                continue;
+            };
+            let refused = found.refused;
+            let Some(volume) = found
+                .object
+                .as_mut()
                 .and_then(|object| object.claim(&name, prefix))
-            {
-                self.join(node, member, (*child, volume), &name, effects);
-                return true;
+            else {
+                continue;
+            };
+            match refused {
+                None => self.join(node, member, (*child, volume), &name, effects),
+                // A volume of a refused set is refused with it. The object
+                // never held any of it, so it is a leaf already, and settled.
+                Some(why) => {
+                    if let Some(binding) = self
+                        .nodes
+                        .get_mut(child)
+                        .and_then(|found| found.binding.as_mut())
+                    {
+                        binding.volumes.insert(volume, member);
+                    }
+                    if let Some(found) = self.nodes.get_mut(&node) {
+                        found.undecided.remove(&member);
+                    }
+                    self.retired.insert((node, member), None);
+                    effects.push(Effect::Refused { node, member, why });
+                }
             }
+            return true;
         }
         false
     }
@@ -1195,12 +1310,7 @@ impl Tree {
             object.kind()
         });
         if let Some(kind) = kind {
-            effects.push(Effect::Bound {
-                node,
-                member,
-                kind,
-                child,
-            });
+            self.bound(node, member, kind, child, effects);
         }
     }
 
@@ -1237,6 +1347,7 @@ impl Tree {
             parent: node,
             volumes,
             window: None,
+            awaiting: BTreeSet::new(),
         };
         self.nodes
             .insert(child, Node::new(Some(object), Some(binding)));
@@ -1278,6 +1389,7 @@ impl Tree {
             parent: node,
             volumes: BTreeMap::from([(VolumeIndex(0), member)]),
             window: Some(range),
+            awaiting: BTreeSet::new(),
         };
         self.nodes
             .insert(child, Node::new(Some(object), Some(binding)));
@@ -1535,8 +1647,13 @@ impl Tree {
                 },
             });
         }
-        if let Some(engine) = engine {
-            self.offer_unowned(parent, engine, effects);
+        match engine {
+            Some(engine) => self.offer_unowned(parent, engine, effects),
+            None => {
+                if let Some(found) = self.nodes.get_mut(&node) {
+                    found.refused = Some(why);
+                }
+            }
         }
     }
 
@@ -1550,6 +1667,21 @@ impl Tree {
         }
     }
 
+    // The objects bound in `node`'s namespace that refused their volumes.
+    fn refused_below(&self, node: NodeId) -> Vec<NodeId> {
+        self.nodes
+            .iter()
+            .filter(|(_, found)| {
+                found.refused.is_some()
+                    && found
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.parent == node)
+            })
+            .map(|(child, _)| *child)
+            .collect()
+    }
+
     // Remove a node and return the parent members that were its volumes.
     fn detach(&mut self, node: NodeId) -> Vec<MemberId> {
         self.remove_node(node)
@@ -1558,8 +1690,12 @@ impl Tree {
             .unwrap_or_default()
     }
 
+    // A node's subtree goes with it, the objects that refused their volumes
+    // in its namespace among it.
     fn drop_subtree(&mut self, node: NodeId) {
-        for child in self.bound_below(node) {
+        let mut below = self.bound_below(node);
+        below.extend(self.refused_below(node));
+        for child in below {
             self.drop_subtree(child);
             self.remove_node(child);
         }
@@ -2539,6 +2675,58 @@ mod tests {
             tree.namespace(NodeId::ROOT)
                 .unwrap()
                 .get(second)
+                .unwrap()
+                .is_leaf()
+        );
+    }
+
+    // A set's later volume joins the object of its set even after that
+    // object refused, and is refused with it, at the refusal's reason: it
+    // binds no object of its own.
+    #[test]
+    fn a_later_volume_of_a_refused_set_is_refused_with_it() {
+        let (mut tree, first, child, _) = bound_tree();
+        tree.deliver(
+            NodeId::ROOT,
+            first,
+            20,
+            Bytes::from_static(b"REFUSE"),
+            Provenance::Fresh,
+            &mut Build,
+            &mut Vec::new(),
+        );
+        tree.bury(NodeId::ROOT, first);
+        let later = tree.announce_root("show.r01", None, &mut Vec::new());
+        let mut bytes = SIGNATURE.to_vec();
+        bytes.extend_from_slice(b"hello");
+        let mut effects = Vec::new();
+        tree.deliver(
+            NodeId::ROOT,
+            later,
+            0,
+            bytes.into(),
+            Provenance::Fresh,
+            &mut Build,
+            &mut effects,
+        );
+        assert!(effects.contains(&Effect::Refused {
+            node: NodeId::ROOT,
+            member: later,
+            why: Why::Compressed
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Bound { .. })),
+            "{effects:?}"
+        );
+        assert_eq!(tree.live(), vec![NodeId::ROOT]);
+        assert_eq!(tree.refused_by(NodeId::ROOT, later), Some(child));
+        assert_eq!(tree.refused_by(NodeId::ROOT, first), Some(child));
+        assert!(
+            tree.namespace(NodeId::ROOT)
+                .unwrap()
+                .get(later)
                 .unwrap()
                 .is_leaf()
         );

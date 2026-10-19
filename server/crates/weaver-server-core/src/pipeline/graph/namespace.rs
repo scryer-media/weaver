@@ -363,8 +363,8 @@ impl NamespaceWriter {
     }
 
     // What the member received before it was bound: held, or in its file
-    // when it was a leaf first. A member that closed before then has its
-    // object hear that last. An object that gave the member up in the
+    // when it was a leaf first. A member that closed before then, or since
+    // in this pass, has its object hear that last, from the tree. An object that gave the member up in the
     // delivery that bound it was handed none of what was held: the holds
     // stay the record of that, for the refusal to carry on.
     fn hand_over(
@@ -381,7 +381,7 @@ impl NamespaceWriter {
         }
         self.replay_file(tree, builder, segments, node, member, out)?;
         let mut effects = Vec::new();
-        tree.volume_closed(node, member, &mut self.placing(builder), &mut effects);
+        tree.handed_over(node, member, &mut self.placing(builder), &mut effects);
         self.apply_each(tree, builder, segments, effects, out)?;
         if tree.recovers(child) {
             self.bind_recoveries(tree, segments, node)?;
@@ -1472,8 +1472,8 @@ impl NamespaceWriter {
         }
         // The object that gave the member back, if one had it.
         let kind = tree
-            .retired(node, member)
-            .and_then(|(object, _)| tree.kind(object))
+            .refused_by(node, member)
+            .and_then(|object| tree.kind(object))
             .map(|kind| kind.to_string())
             .unwrap_or_default();
         tracing::info!(

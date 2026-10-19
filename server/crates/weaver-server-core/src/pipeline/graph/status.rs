@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
-use weaver_graph::{Kind, MemberId, Namespace, NodeId};
+use weaver_graph::{Kind, MemberId, Namespace, NodeId, ObjectId};
 
 use super::job::GraphJob;
 use super::root::phase::RootPhase;
@@ -248,7 +248,7 @@ pub(crate) fn failure(
             // The members still damaged where the set lives, when its
             // namespace marks any; a check that failed on bytes that
             // arrived whole leaves none to name.
-            let damaged = Some(damaged_names(job.namespace(set.namespace)))
+            let damaged = Some(damaged_names(job.namespace(set.namespace), set.node))
                 .filter(|names| !names.is_empty())
                 .map(|names| format!(" ({names})"))
                 .unwrap_or_default();
@@ -275,8 +275,9 @@ fn label(kind: Kind) -> String {
     kind.to_string().to_ascii_uppercase()
 }
 
-// The members still carrying damage, as they are written.
-fn damaged_names(namespace: Option<&Namespace>) -> String {
+// The members still carrying damage, as they are written: the set's
+// members, never its own volumes.
+fn damaged_names(namespace: Option<&Namespace>, set: NodeId) -> String {
     let Some(namespace) = namespace else {
         return String::new();
     };
@@ -287,6 +288,7 @@ fn damaged_names(namespace: Option<&Namespace>) -> String {
     members
         .into_iter()
         .filter_map(|member| namespace.get(member))
+        .filter(|member| member.bound_to != Some(ObjectId(set.0)))
         .map(|member| member.output_name.as_str())
         .collect::<Vec<_>>()
         .join(", ")

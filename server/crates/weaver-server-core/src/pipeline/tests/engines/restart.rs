@@ -401,7 +401,6 @@ async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
 // what it announced before going down is not announced again: one
 // `RepairComplete` for the one repair, then the job's completion.
 #[tokio::test]
-#[ignore = "a graph job restored already Done reports its phase again: restore leaves `reported` unset, so `phase_change` sees Done as a change and the repair is announced twice"]
 async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
     let body = payload(9 * ARTICLE + 21, 71);
     let posts = with_par2(vec![Post::plain("ember.bin", body.clone())], 2);

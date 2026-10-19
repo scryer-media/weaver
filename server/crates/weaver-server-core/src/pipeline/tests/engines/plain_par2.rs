@@ -157,13 +157,13 @@ async fn a_lost_recovery_article_short_of_blocks_fails_as_repair_under_both_engi
         })]
     );
     assert_eq!(view.claims["lantern.bin"], Claim::Damaged, "a damaged leaf");
-    assert!(
-        graph
-            .failure
-            .as_deref()
-            .is_some_and(|error| error.starts_with("PAR2 recovery failed")),
-        "{:?}",
-        graph.failure
+    // The set's files are its members, never its own volumes.
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some(
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+             2 damaged slices, only 1 recovery blocks reachable"
+        )
     );
 }
 

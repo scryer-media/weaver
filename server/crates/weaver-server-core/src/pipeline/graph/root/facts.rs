@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, VolumeIndex};
 
 use super::ArticleRoot;
+use super::phase::RootPhase;
 use crate::pipeline::graph::job::RootFile;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +23,10 @@ pub(crate) struct RootFacts {
     // How many member reads the job's repairs made. The writer's count,
     // kept here because the root row is the job's one row.
     pub(crate) read_backs: u64,
+    // The phase the job last reported, so a restored job reports only a
+    // change from it. A checkpoint written before this was kept has none.
+    #[serde(default)]
+    pub(crate) reported: Option<RootPhase>,
 }
 
 impl RootFacts {
@@ -78,6 +83,7 @@ impl ArticleRoot {
             posted: self.posted.clone(),
             volumes,
             read_backs: 0,
+            reported: None,
         }
     }
 
