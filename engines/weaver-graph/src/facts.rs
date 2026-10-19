@@ -16,7 +16,7 @@ use crate::tree::NodeId;
 
 mod sealed;
 
-pub use sealed::{Part, Sealed, Shelf, decode_parts, encode_parts};
+pub use sealed::{Give, Part, Sealed, Shelf, Take, decode_parts, encode_parts};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
@@ -79,10 +79,21 @@ impl Facts {
     }
 }
 
-// A state that is its own facts: what it encodes to, at which version, and
-// what makes a decoded one impossible.
+// A state that is its own facts: what it encodes to, at which version, its
+// sealed values, and what makes a decoded one impossible.
 pub trait Durable: Serialize + DeserializeOwned {
     const VERSION: u16;
+
+    // Each sealed value the state holds, in the order its encoding meets
+    // them.
+    fn parts(&self, _take: &mut Take) -> Result<(), String> {
+        Ok(())
+    }
+
+    // Each sealed value of a decoded state its parts, in the same order.
+    fn restore_parts(&mut self, _give: &mut Give) -> Result<(), String> {
+        Ok(())
+    }
 
     fn impossible(&self) -> Option<&'static str> {
         None

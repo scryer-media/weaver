@@ -199,8 +199,8 @@ fn a_snapshot_comes_back_from_its_rows() {
 #[test]
 fn the_phase_last_reported_comes_back_with_the_root() {
     let taken = full();
-    let (bytes, parts) = encode(&mut Encoded::default(), &taken.root);
-    let facts = decode(RootFacts::VERSION, &bytes, &parts).unwrap();
+    let (version, bytes, parts) = encode(&mut Encoded::default(), &taken.root);
+    let facts = decode(version, &bytes, &parts).unwrap();
     assert_eq!(facts.reported, Some(RootPhase::Done));
 }
 

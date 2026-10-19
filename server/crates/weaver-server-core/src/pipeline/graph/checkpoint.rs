@@ -83,9 +83,8 @@ struct Slot {
     // `None` until a checkpoint is written or read: what the database holds
     // of the job is not known, so the next change is the whole job.
     last: Option<GraphCheckpoint>,
+    // The change a queued write takes: `Some` exactly while one is queued.
     queued: Option<Delta>,
-    // A write is queued that has not taken the change yet.
-    scheduled: bool,
     tally: Tally,
 }
 
@@ -118,25 +117,23 @@ impl Pending {
             return false;
         }
         match &mut slot.queued {
-            Some(queued) => queued.absorb(delta),
-            None => slot.queued = Some(delta),
+            Some(queued) => {
+                queued.absorb(delta);
+                false
+            }
+            None => {
+                slot.queued = Some(delta);
+                true
+            }
         }
-        !std::mem::replace(&mut slot.scheduled, true)
     }
 
     fn take(&self) -> Option<Delta> {
-        let mut slot = self.slot();
-        slot.scheduled = false;
-        slot.queued.take()
+        self.slot().queued.take()
     }
 
-    // The write was not queued: the next checkpoint queues one.
-    fn unschedule(&self) {
-        self.slot().scheduled = false;
-    }
-
-    // A write failed, so what the database holds is not known: the next
-    // checkpoint writes the whole job.
+    // A write failed or was never queued, so what the database holds is not
+    // known: the next checkpoint writes the whole job, and queues it.
     fn forget(&self) {
         let mut slot = self.slot();
         slot.last = None;
@@ -187,7 +184,7 @@ impl Pipeline {
                 written
             });
         if let Err(error) = queued {
-            pending.unschedule();
+            pending.forget();
             warn!(job_id = job_id.0, error = %error, "could not queue the graph checkpoint");
         }
     }
@@ -212,7 +209,7 @@ fn part_rows(node: i64, parts: &[Part]) -> impl Iterator<Item = PartRow> + '_ {
 // encoded again only where they changed since `root` last encoded them.
 fn rows_with(root: &mut facts::Encoded, snapshot: &Snapshot) -> GraphCheckpoint {
     let mut out = GraphCheckpoint::default();
-    let (root_facts, root_parts) = facts::encode(root, &snapshot.root);
+    let (root_version, root_facts, root_parts) = facts::encode(root, &snapshot.root);
     let root_id = i64::from(NodeId::ROOT.0);
     out.parts.extend(part_rows(root_id, &root_parts));
     out.nodes.push(NodeRow {
@@ -224,7 +221,7 @@ fn rows_with(root: &mut facts::Encoded, snapshot: &Snapshot) -> GraphCheckpoint 
         kind: ROOT_KIND.to_owned(),
         state: state_name(NodeState::Live).to_owned(),
         reason: None,
-        facts_version: i64::from(RootFacts::VERSION),
+        facts_version: i64::from(root_version),
         facts: root_facts,
         winning_password: None,
     });

@@ -12,22 +12,25 @@
 // for a value that grows. Either is reached for change only through
 // `change`, which encodes the part again before returning, so its bytes
 // always say what it holds and nothing outside has a copy to keep fresh.
-// Within its owner's facts it is only a number, the order the owner's
-// encoding met it in; its bytes are the facts' parts, each under that
+// Within its owner's facts it encodes as nothing: the owner walks its sealed
+// values in the order its encoding meets them, and each is numbered by its
+// place in that walk. Its bytes are the facts' parts, each under that
 // number and its chunk, so a checkpoint writes again only the parts whose
-// bytes changed. The values and their bytes are shared, so taking the
-// owner's facts copies neither.
+// bytes changed. A restore decodes the owner with each sealed value empty,
+// then walks them in the same order to give each its parts. The values and
+// their bytes are shared, so taking the owner's facts copies neither.
 //
-// A part does not hold another: a sealed value's bytes are its own, so one
-// inside another does not encode, and the owner's facts say so.
+// A part does not hold another: a part's own encoding is no owner's walk,
+// so a sealed value inside it keeps no bytes and comes back empty.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use serde::de::{self, DeserializeOwned, Visitor};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use super::Durable;
 
 // One part of a facts blob: its shelf in the high half of the key, its
 // chunk in the low half.
@@ -41,145 +44,141 @@ fn key(shelf: u32, chunk: u32) -> u64 {
     (u64::from(shelf) << 32) | u64::from(chunk)
 }
 
-thread_local! {
-    // The parts an encoding in progress has met, when one is.
-    static TAKING: RefCell<Option<Taking>> = const { RefCell::new(None) };
-    // The parts a decoding in progress reads from, when one is.
-    static READING: RefCell<Option<Reading>> = const { RefCell::new(None) };
+// A state's bytes and the parts they name.
+pub fn encode_parts<T: Durable>(state: &T) -> Result<(Vec<u8>, Vec<Part>), String> {
+    let mut take = Take::default();
+    state.parts(&mut take)?;
+    let bytes = rmp_serde::to_vec(state).map_err(|error| error.to_string())?;
+    Ok((bytes, take.parts))
 }
 
+// A state back from its bytes and every part they name: a part they do not
+// name is a blob that is not the one its bytes were taken with.
+pub fn decode_parts<T: Durable>(bytes: &[u8], parts: &[Part]) -> Result<T, String> {
+    let mut state: T = rmp_serde::from_slice(bytes).map_err(|error| error.to_string())?;
+    let mut give = Give::new(parts)?;
+    state.restore_parts(&mut give)?;
+    if give.parts.is_empty() {
+        Ok(state)
+    } else {
+        Err("a part the facts do not name".to_owned())
+    }
+}
+
+// The walk of an owner's sealed values as its facts are taken: each leaves
+// its parts under the next number.
 #[derive(Default)]
-struct Taking {
+pub struct Take {
     next: u32,
     parts: Vec<Part>,
 }
 
-struct Reading {
+impl Take {
+    pub fn sealed<T>(&mut self, sealed: &Sealed<T>) -> Result<(), String> {
+        let shelf = self.shelve()?;
+        self.keep(shelf, 0, sealed.bytes.as_ref())
+    }
+
+    pub fn shelf<T>(&mut self, shelf: &Shelf<T>) -> Result<(), String> {
+        let number = self.shelve()?;
+        shelf
+            .chunks
+            .iter()
+            .try_for_each(|(chunk, sealed)| self.keep(number, *chunk, sealed.bytes.as_ref()))
+    }
+
+    fn shelve(&mut self) -> Result<u32, String> {
+        let shelf = self.next;
+        self.next = shelf
+            .checked_add(1)
+            .ok_or_else(|| "more sealed parts than a key numbers".to_owned())?;
+        Ok(shelf)
+    }
+
+    fn keep(&mut self, shelf: u32, chunk: u32, bytes: Option<&Arc<[u8]>>) -> Result<(), String> {
+        let bytes = bytes.ok_or_else(|| "a sealed part does not encode".to_owned())?;
+        self.parts.push(Part {
+            key: key(shelf, chunk),
+            bytes: Arc::clone(bytes),
+        });
+        Ok(())
+    }
+}
+
+// The walk of an owner's sealed values as its facts are restored, in the
+// order they were taken: each is given the parts under its number.
+pub struct Give {
     parts: BTreeMap<u64, Arc<[u8]>>,
-    read: usize,
+    next: u32,
 }
 
-// Puts back what a thread's context held when it is dropped, so a panic in
-// the middle of an encoding leaves nothing behind.
-struct Scope<T: 'static> {
-    cell: &'static std::thread::LocalKey<RefCell<Option<T>>>,
-    previous: Option<Option<T>>,
-}
-
-impl<T: 'static> Scope<T> {
-    fn enter(cell: &'static std::thread::LocalKey<RefCell<Option<T>>>, value: Option<T>) -> Self {
-        Self {
-            cell,
-            previous: Some(cell.with(|slot| slot.replace(value))),
+impl Give {
+    fn new(parts: &[Part]) -> Result<Self, String> {
+        let kept: BTreeMap<u64, Arc<[u8]>> = parts
+            .iter()
+            .map(|part| (part.key, Arc::clone(&part.bytes)))
+            .collect();
+        if kept.len() != parts.len() {
+            return Err("a part recorded twice".to_owned());
         }
-    }
-
-    fn leave(mut self) -> Option<T> {
-        let previous = self.previous.take().flatten();
-        self.cell.with(|slot| slot.replace(previous))
-    }
-}
-
-impl<T: 'static> Drop for Scope<T> {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            self.cell.with(|slot| slot.replace(previous));
-        }
-    }
-}
-
-// A value's bytes and the parts they name.
-pub fn encode_parts<T: Serialize>(value: &T) -> Result<(Vec<u8>, Vec<Part>), String> {
-    let scope = Scope::enter(&TAKING, Some(Taking::default()));
-    let bytes = rmp_serde::to_vec(value).map_err(|error| error.to_string());
-    let taken = scope.leave().unwrap_or_default();
-    Ok((bytes?, taken.parts))
-}
-
-// A value back from its bytes and every part they name: a part they do not
-// name is a blob that is not the one its bytes were taken with.
-pub fn decode_parts<T: DeserializeOwned>(bytes: &[u8], parts: &[Part]) -> Result<T, String> {
-    let kept: BTreeMap<u64, Arc<[u8]>> = parts
-        .iter()
-        .map(|part| (part.key, Arc::clone(&part.bytes)))
-        .collect();
-    if kept.len() != parts.len() {
-        return Err("a part recorded twice".to_owned());
-    }
-    let scope = Scope::enter(
-        &READING,
-        Some(Reading {
+        Ok(Self {
             parts: kept,
-            read: 0,
-        }),
-    );
-    let value = rmp_serde::from_slice(bytes).map_err(|error| error.to_string());
-    let reading = scope.leave();
-    let value = value?;
-    match reading {
-        Some(reading) if reading.read == reading.parts.len() => Ok(value),
-        _ => Err("a part the facts do not name".to_owned()),
+            next: 0,
+        })
+    }
+
+    pub fn sealed<T: DeserializeOwned>(&mut self, sealed: &mut Sealed<T>) -> Result<(), String> {
+        let shelf = self.shelve();
+        match self.chunks(shelf).as_slice() {
+            [(0, bytes)] => {
+                *sealed = decode(Arc::clone(bytes))?;
+                Ok(())
+            }
+            _ => Err("a sealed part is not one part".to_owned()),
+        }
+    }
+
+    pub fn shelf<T: DeserializeOwned>(&mut self, shelf: &mut Shelf<T>) -> Result<(), String> {
+        let number = self.shelve();
+        shelf.chunks = self
+            .chunks(number)
+            .into_iter()
+            .map(|(chunk, bytes)| Ok((chunk, decode(bytes)?)))
+            .collect::<Result<_, String>>()?;
+        Ok(())
+    }
+
+    fn shelve(&mut self) -> u32 {
+        let shelf = self.next;
+        self.next = shelf.saturating_add(1);
+        shelf
+    }
+
+    // Every chunk of a shelf, in chunk order, each given once.
+    fn chunks(&mut self, shelf: u32) -> Vec<(u32, Arc<[u8]>)> {
+        let keys: Vec<u64> = self
+            .parts
+            .range(key(shelf, 0)..=key(shelf, u32::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.parts.remove_entry(&key))
+            .map(|(key, bytes)| (key as u32, bytes))
+            .collect()
     }
 }
 
-// A part's own bytes, encoded where no owner is taking parts, so a part
-// inside it does not encode.
-fn encode<T: Serialize>(value: &T) -> Option<Arc<[u8]>> {
-    let scope = Scope::enter(&TAKING, None);
-    let bytes = rmp_serde::to_vec(value).ok().map(Arc::from);
-    drop(scope);
-    bytes
-}
-
-fn decode<T: DeserializeOwned, E: de::Error>(bytes: Arc<[u8]>) -> Result<Sealed<T>, E> {
-    let value = rmp_serde::from_slice(&bytes).map_err(E::custom)?;
+fn decode<T: DeserializeOwned>(bytes: Arc<[u8]>) -> Result<Sealed<T>, String> {
+    let value = rmp_serde::from_slice(&bytes).map_err(|error| error.to_string())?;
     Ok(Sealed {
         value: Arc::new(value),
         bytes: Some(bytes),
     })
 }
 
-// The next shelf of the encoding in progress, with these chunks' bytes.
-fn take<'a, E: serde::ser::Error>(
-    chunks: impl Iterator<Item = (u32, Option<&'a Arc<[u8]>>)>,
-) -> Result<u32, E> {
-    TAKING.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(taking) = slot.as_mut() else {
-            return Err(E::custom(
-                "a sealed part encodes only inside its owner's facts",
-            ));
-        };
-        let shelf = taking.next;
-        taking.next += 1;
-        for (chunk, bytes) in chunks {
-            let bytes = bytes.ok_or_else(|| E::custom("a sealed part does not encode"))?;
-            taking.parts.push(Part {
-                key: key(shelf, chunk),
-                bytes: Arc::clone(bytes),
-            });
-        }
-        Ok(shelf)
-    })
-}
-
-// Every chunk of a shelf the decoding in progress holds, in chunk order.
-fn read<E: de::Error>(shelf: u32) -> Result<Vec<(u32, Arc<[u8]>)>, E> {
-    READING.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(reading) = slot.as_mut() else {
-            return Err(E::custom(
-                "a sealed part decodes only inside its owner's facts",
-            ));
-        };
-        let found: Vec<(u32, Arc<[u8]>)> = reading
-            .parts
-            .range(key(shelf, 0)..=key(shelf, u32::MAX))
-            .map(|(key, bytes)| (*key as u32, Arc::clone(bytes)))
-            .collect();
-        reading.read += found.len();
-        Ok(found)
-    })
+// A part's own bytes.
+fn encode<T: Serialize>(value: &T) -> Option<Arc<[u8]>> {
+    rmp_serde::to_vec(value).ok().map(Arc::from)
 }
 
 #[derive(Clone)]
@@ -248,18 +247,18 @@ impl<T: Eq> Eq for Sealed<T> {}
 
 impl<T> Serialize for Sealed<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let shelf = take::<S::Error>(std::iter::once((0, self.bytes.as_ref())))?;
-        serializer.serialize_u32(shelf)
+        serializer.serialize_unit()
     }
 }
 
-impl<'de, T: DeserializeOwned> Deserialize<'de> for Sealed<T> {
+// Empty: its owner's restore gives it its value.
+impl<'de, T: Default> Deserialize<'de> for Sealed<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let shelf = deserializer.deserialize_u32(ShelfNumber)?;
-        match read::<D::Error>(shelf)?.as_slice() {
-            [(0, bytes)] => decode(Arc::clone(bytes)),
-            _ => Err(de::Error::custom("a sealed part is not one part")),
-        }
+        <()>::deserialize(deserializer)?;
+        Ok(Self {
+            value: Arc::default(),
+            bytes: None,
+        })
     }
 }
 
@@ -343,37 +342,15 @@ impl<T: Eq> Eq for Shelf<T> {}
 
 impl<T> Serialize for Shelf<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let shelf = take::<S::Error>(
-            self.chunks
-                .iter()
-                .map(|(chunk, sealed)| (*chunk, sealed.bytes.as_ref())),
-        )?;
-        serializer.serialize_u32(shelf)
+        serializer.serialize_unit()
     }
 }
 
-impl<'de, T: DeserializeOwned> Deserialize<'de> for Shelf<T> {
+// Empty: its owner's restore gives it its chunks.
+impl<'de, T> Deserialize<'de> for Shelf<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let shelf = deserializer.deserialize_u32(ShelfNumber)?;
-        let chunks = read::<D::Error>(shelf)?
-            .into_iter()
-            .map(|(chunk, bytes)| Ok((chunk, decode(bytes)?)))
-            .collect::<Result<_, D::Error>>()?;
-        Ok(Self { chunks })
-    }
-}
-
-struct ShelfNumber;
-
-impl Visitor<'_> for ShelfNumber {
-    type Value = u32;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("the number of a sealed part")
-    }
-
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<u32, E> {
-        u32::try_from(value).map_err(|_| E::custom("a sealed part's number"))
+        <()>::deserialize(deserializer)?;
+        Ok(Self::default())
     }
 }
 
@@ -383,7 +360,8 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
 
-    use super::{Sealed, Shelf, decode_parts, encode_parts};
+    use super::{Give, Sealed, Shelf, Take, decode_parts, encode_parts};
+    use crate::facts::Durable;
 
     // Counts its own encodings, so a test can see when a value is encoded.
     #[derive(Clone, Debug, Default, Deserialize)]
@@ -413,6 +391,38 @@ mod tests {
         moving: u64,
         settled: Sealed<Counted>,
         grown: Shelf<Vec<u32>>,
+    }
+
+    impl Durable for Owner {
+        const VERSION: u16 = 1;
+
+        fn parts(&self, take: &mut Take) -> Result<(), String> {
+            take.sealed(&self.settled)?;
+            take.shelf(&self.grown)
+        }
+
+        fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+            give.sealed(&mut self.settled)?;
+            give.shelf(&mut self.grown)
+        }
+    }
+
+    // Holds a part inside a part.
+    #[derive(Serialize, Deserialize)]
+    struct Nested {
+        outer: Sealed<Sealed<Vec<u32>>>,
+    }
+
+    impl Durable for Nested {
+        const VERSION: u16 = 1;
+
+        fn parts(&self, take: &mut Take) -> Result<(), String> {
+            take.sealed(&self.outer)
+        }
+
+        fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+            give.sealed(&mut self.outer)
+        }
     }
 
     #[test]
@@ -488,10 +498,13 @@ mod tests {
     }
 
     #[test]
-    fn a_part_inside_a_part_does_not_encode() {
-        let inner = Sealed::new(vec![1u32]);
-        let outer = Sealed::new(inner);
-        assert_eq!(outer.bytes(), None);
-        assert!(encode_parts(&outer).is_err());
+    fn a_part_inside_a_part_comes_back_empty() {
+        let outer = Sealed::new(Sealed::new(vec![1u32]));
+        let (bytes, parts) = encode_parts(&Nested { outer }).unwrap();
+        assert_eq!(parts.len(), 1, "only the outer part is taken");
+        let restored: Nested = decode_parts(&bytes, &parts).unwrap();
+        let inner = restored.outer.get();
+        assert!(inner.get().is_empty());
+        assert_eq!(inner.bytes(), None);
     }
 }

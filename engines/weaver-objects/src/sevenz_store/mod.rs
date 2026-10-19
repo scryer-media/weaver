@@ -28,8 +28,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
-    Posting, Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Object,
+    Placement, Posting, Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
@@ -162,7 +162,16 @@ pub struct SevenZipStore {
 
 impl Durable for SevenZipStore {
     // 3: the grid shelved by chunk of blocks, kept apart from the bytes.
-    const VERSION: u16 = 3;
+    // 4: a sealed value encodes as nothing, numbered by its owner's walk.
+    const VERSION: u16 = 4;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        self.grid.parts(take)
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        self.grid.restore_parts(give)
+    }
 
     // The folders and members said are the map's, a cipher only where the
     // map has AES, and the proof is a file of the map.

@@ -13,7 +13,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weaver_graph::{ByteRange, Part, Sealed, Shelf, VolumeIndex, decode_parts, encode_parts};
+use weaver_graph::{
+    ByteRange, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
+    encode_parts,
+};
 
 use super::ArticleRoot;
 use super::phase::RootPhase;
@@ -36,7 +39,8 @@ pub(crate) struct RootFacts {
 
 impl RootFacts {
     // 3: each volume's lists shelved a chunk of articles to a part.
-    pub(crate) const VERSION: u16 = 3;
+    // 4: a sealed value encodes as nothing, numbered by its owner's walk.
+    pub(crate) const VERSION: u16 = 4;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +209,32 @@ impl EncodedVolume {
     }
 }
 
+impl Durable for Encoded {
+    const VERSION: u16 = RootFacts::VERSION;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        take.sealed(&self.posted)?;
+        for volume in &self.volumes {
+            take.shelf(&volume.articles)?;
+            take.shelf(&volume.known)?;
+            take.shelf(&volume.segments)?;
+            take.shelf(&volume.raised)?;
+        }
+        Ok(())
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        give.sealed(&mut self.posted)?;
+        for volume in &mut self.volumes {
+            give.shelf(&mut volume.articles)?;
+            give.shelf(&mut volume.known)?;
+            give.shelf(&mut volume.segments)?;
+            give.shelf(&mut volume.raised)?;
+        }
+        Ok(())
+    }
+}
+
 impl Encoded {
     fn refresh(&mut self, facts: &RootFacts) {
         self.next_node = facts.next_node;
@@ -229,12 +259,16 @@ impl Encoded {
     }
 }
 
-// The facts' bytes and their parts, encoding again only the parts that
-// changed since `encoded` last encoded.
-pub(crate) fn encode(encoded: &mut Encoded, facts: &RootFacts) -> (Vec<u8>, Vec<Part>) {
+// The facts' version, bytes and parts, encoding again only the parts that
+// changed since `encoded` last encoded. Facts that do not encode are facts
+// nothing could restore, so they say so as unsupported, which a restore
+// refuses.
+pub(crate) fn encode(encoded: &mut Encoded, facts: &RootFacts) -> (u16, Vec<u8>, Vec<Part>) {
     encoded.refresh(facts);
-    // A plain struct of integers always encodes.
-    encode_parts(encoded).unwrap_or_default()
+    match encode_parts(encoded) {
+        Ok((bytes, parts)) => (RootFacts::VERSION, bytes, parts),
+        Err(_) => (Facts::UNSUPPORTED, Vec::new(), Vec::new()),
+    }
 }
 
 pub(crate) fn decode(

@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weaver_graph::{ByteRange, MemberId, Segment, Shelf, SliceVerdict};
+use weaver_graph::{ByteRange, Give, MemberId, Segment, Shelf, SliceVerdict, Take};
 
 // A run is folded eagerly inside its block, so ordered traffic needs one per
 // grid, and these bounds only bite on pathological interleavings.
@@ -199,6 +199,19 @@ pub(crate) struct Grid {
 }
 
 impl Grid {
+    // Each member's shelf of blocks, in the order the grid encodes them.
+    pub(crate) fn parts(&self, take: &mut Take) -> Result<(), String> {
+        self.files
+            .values()
+            .try_for_each(|file| take.shelf(&file.blocks))
+    }
+
+    pub(crate) fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        self.files
+            .values_mut()
+            .try_for_each(|file| give.shelf(&mut file.blocks))
+    }
+
     // Record a segment on the member's grid of `block_size`.
     pub(crate) fn offer(&mut self, member: MemberId, block_size: u64, segment: &Segment) {
         if block_size == 0 || segment.range.is_empty() {

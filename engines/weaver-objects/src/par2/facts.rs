@@ -22,8 +22,8 @@ use par2_rs::packet::{CreatorPacket, FileDescriptionPacket, IfscPacket, MainPack
 use par2_rs::{FileId, Packet, RecoverySetId, SliceChecksum};
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError, Sealed,
-    VolumeIndex,
+    ByteRange, Coverage, Durable, Facts, Give, Kind, MemberId, Object, ObjectId, RestoreError,
+    Sealed, Take, VolumeIndex,
 };
 
 use super::Par2;
@@ -195,8 +195,23 @@ impl Durable for Par2Facts {
     // 2: each set's packets sealed, nested as the bytes they encoded to.
     // 3: sealed parts kept apart from the facts' bytes, and the grid
     // shelved by chunk of blocks.
-    // 4: no outcome of the object's own; it is its sets' last repairs.
+    // 4: no outcome of the object's own, it is its sets' last repairs; a
+    // sealed value encodes as nothing, numbered by its owner's walk.
     const VERSION: u16 = 4;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        for set in &self.sets {
+            take.sealed(&set.packets)?;
+        }
+        self.grid.parts(take)
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        for set in &mut self.sets {
+            give.sealed(&mut set.packets)?;
+        }
+        self.grid.restore_parts(give)
+    }
 
     fn impossible(&self) -> Option<&'static str> {
         let keys: BTreeSet<_> = self.sets.iter().map(|set| set.key).collect();

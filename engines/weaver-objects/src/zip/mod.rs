@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement, Pull,
-    Seek, Standing, VolumeIndex, Weight, Why,
+    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Object, Placement,
+    Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
 };
 
 use crate::engine::{Format, SetName};
@@ -87,7 +87,16 @@ pub struct Zip {
 
 impl Durable for Zip {
     // 4: the grid shelved by chunk of blocks, kept apart from the bytes.
-    const VERSION: u16 = 4;
+    // 5: a sealed value encodes as nothing, numbered by its owner's walk.
+    const VERSION: u16 = 5;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        self.grid.parts(take)
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        self.grid.restore_parts(give)
+    }
 
     // A member said is an entry of the map, and every entry's member is one.
     fn impossible(&self) -> Option<&'static str> {
