@@ -303,6 +303,9 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
     par2.refused = kept.refused;
     par2.output_limit = kept.output_limit;
     par2.memory_limit = kept.memory_limit;
+    for key in par2.ordered() {
+        par2.fold_set(key);
+    }
     Ok(par2)
 }
 
