@@ -181,6 +181,26 @@ func torrentScenarios() []torrentScenario {
 			},
 			Run: scenarioBandwidthSplit,
 		},
+		// Both read the client facade, so they run before client-facade's
+		// bad logins lock the lane's address out of logging in.
+		{
+			Name: "upload-cap",
+			Asserts: []string{
+				"setBandwidth uploadBps reads back, and the client facade's transfer/info up_rate_limit is that limit",
+				"with a 1 MiB/s global upload limit, a leecher pulling only from Weaver takes the last 75% of an 8 MiB torrent in at least 75% of its size over 1.25x the limit",
+			},
+			Run: scenarioUploadCap,
+		},
+		{
+			Name: "pause-all-torrents",
+			Asserts: []string{
+				"pauseTorrents holds every torrent PAUSED and reads torrentsPaused, with the usenet queue not paused",
+				"resumeTorrents lifts the hold: the torrent paused on its own stays PAUSED, the other seeds again",
+				"the client facade's torrents/stop hashes=all is the same hold: every torrent reads stoppedUP and torrentsPaused is true",
+				"torrents/start hashes=all lifts it: the other seeds again and the torrent paused on its own still reads stoppedUP",
+			},
+			Run: scenarioPauseAllTorrents,
+		},
 		{
 			Name: "client-facade",
 			Asserts: []string{
@@ -1391,4 +1411,307 @@ func scenarioRestart(lane *torrentLane, evidence map[string]any) error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return lane.leechFromWeaver(fixture, after, evidence)
+}
+
+// facadeLogin logs a new client into the facade with a fresh CONTROL key.
+func (lane *torrentLane) facadeLogin(keyName string) (*facadeClient, error) {
+	var key struct {
+		CreateApiKey struct{ RawKey string } `json:"createApiKey"`
+	}
+	if err := lane.gql(`mutation($name: String!) { createApiKey(name: $name, scope: CONTROL) { rawKey } }`,
+		map[string]any{"name": keyName}, &key); err != nil {
+		return nil, err
+	}
+	client := &facadeClient{base: lane.weaverURL, http: &http.Client{}}
+	status, body, resp, err := client.do(http.MethodPost, "auth/login",
+		strings.NewReader("username=lane&password="+urlEncode(key.CreateApiKey.RawKey)), "application/x-www-form-urlencoded")
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK || body != "Ok." {
+		return nil, fmt.Errorf("facade login: %d %q", status, body)
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "SID" {
+			client.sid = cookie.Value
+		}
+	}
+	if client.sid == "" {
+		return nil, errors.New("facade login set no SID cookie")
+	}
+	return client, nil
+}
+
+func (lane *torrentLane) setUploadCap(bps any) (*int64, error) {
+	var out struct {
+		SetBandwidth struct {
+			UploadBps *int64 `json:"uploadBps"`
+		} `json:"setBandwidth"`
+	}
+	err := lane.gql(`mutation($input: BandwidthInput!) { setBandwidth(input: $input) { uploadBps } }`,
+		map[string]any{"input": map[string]any{"uploadBps": bps}}, &out)
+	return out.SetBandwidth.UploadBps, err
+}
+
+func scenarioUploadCap(lane *torrentLane, evidence map[string]any) error {
+	const capBps = 1 * mib
+	fixture := lane.fixture("upload-capped")
+	view, err := lane.downloadOnly(fixture.Slug, submitOptions{})
+	if err != nil {
+		return err
+	}
+	defer lane.cleanupTorrent(view.ID, evidence)
+	readBack, err := lane.setUploadCap(capBps)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if _, err := lane.setUploadCap(nil); err != nil {
+			evidence["restore_cap_error"] = err.Error()
+		}
+	}()
+	if readBack == nil || *readBack != capBps {
+		return fmt.Errorf("setBandwidth uploadBps reads back %v, want %d", readBack, capBps)
+	}
+	client, err := lane.facadeLogin("torrent-lane-upload-cap")
+	if err != nil {
+		return err
+	}
+	status, body, _, err := client.do(http.MethodGet, "transfer/info", nil, "")
+	if err != nil {
+		return err
+	}
+	var transfer map[string]any
+	if status != http.StatusOK || json.Unmarshal([]byte(body), &transfer) != nil {
+		return fmt.Errorf("transfer/info: %d %q", status, body)
+	}
+	evidence["transfer_info"] = transfer
+	if limit, ok := transfer["up_rate_limit"].(float64); !ok || int64(limit) != capBps {
+		return fmt.Errorf("transfer/info up_rate_limit %v, want %d", transfer["up_rate_limit"], capBps)
+	}
+
+	// Only Weaver holds the torrent once the seeder lets go of it, so the
+	// leecher's progress is what Weaver uploaded under the limit.
+	if err := lane.peerAction(lane.seederURL, fixture.Infohash, "forget"); err != nil {
+		return fmt.Errorf("seeder forgets %s: %w", fixture.Slug, err)
+	}
+	if err := waitUntil("seeder lets go of "+fixture.Slug, func() (bool, string, error) {
+		stats, err := lane.peerStats(lane.seederURL, fixture.Infohash)
+		return stats == nil, "held", err
+	}); err != nil {
+		return err
+	}
+	defer func() {
+		if err := lane.peerAdd(lane.seederURL, fixture, "/payload/"+fixture.Slug); err != nil {
+			evidence["reseed_error"] = err.Error()
+		}
+	}()
+	baseline := view.UploadedBytes
+	// The bracket as cappedDownload reads it: the last reading at or below a
+	// quarter, from the add on, and the first reading of the whole. A reading
+	// is the larger of the leecher's progress and Weaver's upload counter.
+	type reading struct {
+		at    time.Time
+		bytes int64
+	}
+	var samples []string
+	defer func() { evidence["samples"] = samples }()
+	last := reading{at: time.Now()}
+	added := last.at
+	folder := "/leech/" + fixture.Slug
+	if err := lane.peerAdd(lane.leecherURL, fixture, folder); err != nil {
+		return err
+	}
+	defer func() { _ = lane.peerAction(lane.leecherURL, fixture.Infohash, "delete") }()
+	var full *reading
+	if err := waitUntil("leecher pulls "+fixture.Slug+" from Weaver under the upload limit", func() (bool, string, error) {
+		stats, err := lane.peerStats(lane.leecherURL, fixture.Infohash)
+		if err != nil {
+			return false, "", err
+		}
+		seen, err := lane.torrent(view.ID)
+		if err != nil {
+			return false, "", err
+		}
+		now := time.Now()
+		var progress, uploaded int64
+		finished := false
+		if stats != nil {
+			if stats.Error != "" {
+				return false, "", fmt.Errorf("leecher error: %s", stats.Error)
+			}
+			progress, finished = stats.ProgressBytes, stats.Finished
+		}
+		if seen != nil {
+			uploaded = seen.UploadedBytes - baseline
+		}
+		if len(samples) < 400 {
+			samples = append(samples, fmt.Sprintf("+%dms leecher=%d weaver_uploaded=%d", now.Sub(added).Milliseconds(), progress, uploaded))
+		}
+		bytes := max(progress, uploaded)
+		if full == nil && bytes >= fixture.TotalBytes {
+			full = &reading{at: now, bytes: bytes}
+		} else if full == nil && bytes <= fixture.TotalBytes/4 {
+			last = reading{at: now, bytes: bytes}
+		}
+		return finished && progress == fixture.TotalBytes, fmt.Sprintf("leecher %d/%d", progress, fixture.TotalBytes), nil
+	}); err != nil {
+		return err
+	}
+	if full == nil {
+		return errors.New("the leecher finished, but no reading ever reached the whole torrent")
+	}
+	window := full.at.Sub(last.at)
+	measured := fixture.TotalBytes - last.bytes
+	floor := time.Duration(float64(max(measured-capBps, 0)) / (1.25 * float64(capBps)) * float64(time.Second))
+	evidence["cap_bps"], evidence["bytes_measured"] = capBps, measured
+	evidence["window_ms"], evidence["floor_ms"] = window.Milliseconds(), floor.Milliseconds()
+	if window < floor {
+		return fmt.Errorf("%d bytes uploaded within %s under a %d B/s upload limit; at the limit they take at least %s", measured, window, capBps, floor)
+	}
+	for _, file := range fixture.Files {
+		got, err := remoteBLAKE3("torrent-leecher", folder+"/"+file.Path)
+		if err != nil {
+			return err
+		}
+		if got != file.BLAKE3 {
+			return fmt.Errorf("leecher %s BLAKE3 %s, want %s", file.Path, got, file.BLAKE3)
+		}
+	}
+	return nil
+}
+
+type queueHoldView struct {
+	IsPaused       bool `json:"isPaused"`
+	TorrentsPaused bool `json:"torrentsPaused"`
+}
+
+func (lane *torrentLane) queueHold() (*queueHoldView, error) {
+	var out struct {
+		GlobalQueueState queueHoldView `json:"globalQueueState"`
+	}
+	err := lane.gql(`{ globalQueueState { isPaused torrentsPaused } }`, nil, &out)
+	return &out.GlobalQueueState, err
+}
+
+// waitTorrentsHold waits until globalQueueState reads the torrents' hold as
+// want, and checks the usenet queue is not paused with it.
+func (lane *torrentLane) waitTorrentsHold(describe string, want bool) error {
+	var seen *queueHoldView
+	if err := waitUntil(describe, func() (bool, string, error) {
+		view, err := lane.queueHold()
+		if err != nil {
+			return false, "", err
+		}
+		seen = view
+		return view.TorrentsPaused == want, fmt.Sprintf("torrentsPaused=%t isPaused=%t", view.TorrentsPaused, view.IsPaused), nil
+	}); err != nil {
+		return err
+	}
+	if seen.IsPaused {
+		return fmt.Errorf("%s: the usenet queue reads paused", describe)
+	}
+	return nil
+}
+
+func paused(view *torrentView) bool { return view != nil && view.State == "PAUSED" }
+
+func scenarioPauseAllTorrents(lane *torrentLane, evidence map[string]any) error {
+	own, err := lane.downloadOnly("hold-own", submitOptions{})
+	if err != nil {
+		return err
+	}
+	defer lane.cleanupTorrent(own.ID, evidence)
+	only, err := lane.downloadOnly("hold-only", submitOptions{})
+	if err != nil {
+		return err
+	}
+	defer lane.cleanupTorrent(only.ID, evidence)
+	defer func() {
+		if err := lane.mutateBool("resumeTorrents", "", nil); err != nil {
+			evidence["restore_hold_error"] = err.Error()
+		}
+	}()
+	if err := lane.pause(own.ID); err != nil {
+		return err
+	}
+	if _, err := lane.waitTorrent(own.ID, "hold-own paused on its own", paused); err != nil {
+		return err
+	}
+
+	if err := lane.mutateBool("pauseTorrents", "", nil); err != nil {
+		return fmt.Errorf("pauseTorrents: %w", err)
+	}
+	held, err := lane.waitTorrent(only.ID, "the hold pauses hold-only", paused)
+	evidence["held"] = held
+	if err != nil {
+		return err
+	}
+	if err := lane.waitTorrentsHold("pauseTorrents reads torrentsPaused", true); err != nil {
+		return err
+	}
+	if view, err := lane.torrent(own.ID); err != nil || !paused(view) {
+		return fmt.Errorf("under the hold hold-own reads %s (%v)", view.summary(), err)
+	}
+
+	if err := lane.mutateBool("resumeTorrents", "", nil); err != nil {
+		return fmt.Errorf("resumeTorrents: %w", err)
+	}
+	if _, err := lane.waitTorrent(only.ID, "resumeTorrents lets hold-only seed", seeding); err != nil {
+		return err
+	}
+	if err := lane.waitTorrentsHold("resumeTorrents clears torrentsPaused", false); err != nil {
+		return err
+	}
+	stillOwn, err := lane.torrent(own.ID)
+	evidence["own_after_resume"] = stillOwn
+	if err != nil {
+		return err
+	}
+	if !paused(stillOwn) {
+		return fmt.Errorf("resumeTorrents resumed the torrent paused on its own: %s", stillOwn.summary())
+	}
+
+	// The client facade's every-torrent stop and start are the same hold.
+	ownHash, onlyHash := lane.fixture("hold-own").Infohash, lane.fixture("hold-only").Infohash
+	client, err := lane.facadeLogin("torrent-lane-pause-all")
+	if err != nil {
+		return err
+	}
+	if status, body, err := client.form("torrents/stop", map[string]string{"hashes": "all"}); err != nil || status != http.StatusOK {
+		return fmt.Errorf("torrents/stop hashes=all: %d %q %v", status, body, err)
+	}
+	for _, hash := range []string{ownHash, onlyHash} {
+		state, err := client.waitState(hash, "torrents/stop hashes=all stops "+hash, "stoppedUP")
+		if err != nil {
+			return err
+		}
+		evidence["facade_stopped_"+hash] = state
+	}
+	if err := lane.waitTorrentsHold("torrents/stop hashes=all reads torrentsPaused", true); err != nil {
+		return err
+	}
+	if status, body, err := client.form("torrents/start", map[string]string{"hashes": "all"}); err != nil || status != http.StatusOK {
+		return fmt.Errorf("torrents/start hashes=all: %d %q %v", status, body, err)
+	}
+	state, err := client.waitState(onlyHash, "torrents/start hashes=all lets hold-only seed", facadeSeedingStates...)
+	if err != nil {
+		return err
+	}
+	evidence["facade_started_only"] = state
+	if err := lane.waitTorrentsHold("torrents/start hashes=all clears torrentsPaused", false); err != nil {
+		return err
+	}
+	list, err := client.info(ownHash)
+	if err != nil {
+		return err
+	}
+	if len(list) != 1 {
+		return fmt.Errorf("torrents/info lists %d torrents for hold-own", len(list))
+	}
+	evidence["facade_started_own"] = list[0]["state"]
+	if list[0]["state"] != "stoppedUP" {
+		return fmt.Errorf("torrents/start hashes=all started the torrent paused on its own: %v", list[0]["state"])
+	}
+	return nil
 }

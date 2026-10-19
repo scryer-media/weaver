@@ -1004,6 +1004,16 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "torrent-global-upload-cap-lower-bound",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-pause-all-hold-keeps-own-pause",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "torrent-client-compatibility-facade",
       "owner": "torrents",
       "oracle": "api-metrics"
