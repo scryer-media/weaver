@@ -95,7 +95,7 @@ pub struct EngineObject<F: Format> {
     // The furthest volume the run has read.
     #[serde(skip)]
     reached: Option<VolumeIndex>,
-    // The run asked for a password and no offer has answered it since.
+    // The live run asked for a password and no offer has answered it since.
     #[serde(skip)]
     asking: bool,
 }
@@ -269,7 +269,8 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 }
 
 impl<F: Format + 'static> Engine for EngineObject<F> {
-    fn start(&self) -> Box<dyn Extraction> {
+    fn start(&mut self) -> Box<dyn Extraction> {
+        self.asking = false;
         F::run(self.password.clone())
     }
 

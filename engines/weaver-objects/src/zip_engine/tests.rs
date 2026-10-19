@@ -194,7 +194,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
     out
 }
 
-fn run_over(engine: &ZipEngine, gate: Arc<Gate>) -> Vec<Said> {
+fn run_over(engine: &mut ZipEngine, gate: Arc<Gate>) -> Vec<Said> {
     let mut emits = Vec::new();
     let mut sink = |emit| {
         emits.push(emit);
@@ -204,7 +204,7 @@ fn run_over(engine: &ZipEngine, gate: Arc<Gate>) -> Vec<Said> {
     said(&emits)
 }
 
-fn run(engine: &ZipEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
+fn run(engine: &mut ZipEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
     run_over(engine, Gate::whole(volumes))
 }
 
@@ -250,7 +250,7 @@ fn spanned(single: &[u8], parts: usize) -> Vec<Vec<u8>> {
 
 #[test]
 fn a_zip_extracts_its_files_in_directory_order_and_skips_the_rest() {
-    assert_eq!(run(&ZipEngine::new(), vec![plain()]), plain_said());
+    assert_eq!(run(&mut ZipEngine::new(), vec![plain()]), plain_said());
 }
 
 #[test]
@@ -301,20 +301,20 @@ fn a_spanned_set_extracts_as_one_once_its_last_volume_lands() {
 fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
     let mut engine = named(&["locked.zip"]);
     assert_eq!(
-        run(&engine, vec![encrypted()]),
+        run(&mut engine, vec![encrypted()]),
         vec![Said::NeedsPassword],
         "an encrypted member with no password is never announced"
     );
 
     let mut out = Vec::new();
     engine.offer_password("not-the-password", &mut out);
-    let wrong = run(&engine, vec![encrypted()]);
+    let wrong = run(&mut engine, vec![encrypted()]);
     assert_eq!(wrong.last(), Some(&Said::NeedsPassword));
     assert!(!wrong.iter().any(|said| matches!(said, Said::Closed(_))));
 
     engine.offer_password(PASSWORD, &mut out);
     assert!(out.is_empty());
-    assert_eq!(run(&engine, vec![encrypted()]), plain_said());
+    assert_eq!(run(&mut engine, vec![encrypted()]), plain_said());
 }
 
 #[test]
@@ -325,7 +325,7 @@ fn a_member_whose_checksum_fails_is_retracted_and_refused() {
         .position(|window| window == NOTES)
         .unwrap();
     archive[at + 3] ^= 0x20;
-    let said = run(&ZipEngine::new(), vec![archive]);
+    let said = run(&mut ZipEngine::new(), vec![archive]);
     assert_eq!(
         said[said.len() - 2..],
         [Said::Retract(0), Said::Refuse(Why::Unrepairable)]
@@ -338,7 +338,7 @@ fn a_set_the_names_disagree_with_is_refused_as_unsupported() {
     let volumes = spanned(&plain(), 3);
     assert_eq!(
         run(
-            &named(&["alpha.z01", "alpha.zip"]),
+            &mut named(&["alpha.z01", "alpha.zip"]),
             vec![volumes[0].clone(), volumes[2].clone()]
         ),
         vec![Said::Refuse(Why::Unsupported)]

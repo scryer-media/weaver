@@ -728,10 +728,11 @@ impl Tree {
 
     // A recovery object repaired the member, a leaf of `node`'s namespace:
     // a refusal of it was a verdict on bytes it no longer holds. Every
-    // object that refused it goes, with what it kept, and each of its
-    // volumes is a member no object owns, asked again who owns it as a
-    // member whose front has just spoken. Returns those volumes; none when
-    // nothing refused the member.
+    // object that refused it goes whole, as a buried node does when its
+    // volumes are read again: the reader offered them makes every member
+    // over. Each of its volumes is a member no object owns, asked again who
+    // owns it as a member whose front has just spoken. Returns those
+    // volumes; none when nothing refused the member.
     pub fn reopen(
         &mut self,
         node: NodeId,

@@ -503,8 +503,9 @@ impl NamespaceWriter {
 
     // The member's bytes were rewritten or proved: any refusal of it was
     // given on bytes it no longer holds. The tree takes it back and asks
-    // who owns it again; what the refusing object kept goes with it, and a
-    // member no object takes is a leaf for no reason.
+    // who owns it again; what the refusing object kept goes with it, made
+    // over by whatever reads the volumes again, and a member no object
+    // takes is a leaf for no reason.
     fn reopen(
         &mut self,
         tree: &mut Tree,

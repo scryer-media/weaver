@@ -12,6 +12,10 @@
 // into its file and an engine into its envelopes, by the one write path, so
 // refusing and handing to an engine differ only in what the tree bound.
 //
+// A member still in its own file was never handed to the object whole: the
+// file holds every byte it arrived with, so those go on from the file and
+// the object is asked for nothing.
+//
 // A range the map cannot reproduce is delivered as damage. A recovery object
 // that covers the member repairs it from there; with none, the member
 // completes with that damage tolerated, as a damaged article does.
@@ -34,6 +38,19 @@ impl NamespaceWriter {
         let Some((retired, volume)) = tree.retired(node, member) else {
             return Ok(());
         };
+        if self
+            .files
+            .get(&node)
+            .is_some_and(|files| files.leaves.contains_key(&member))
+        {
+            // What the object held came from the file, which still has it.
+            self.take_held(node, member, super::ALL)?;
+            if tree.child_of(node, member).is_some() {
+                self.replay_file(tree, builder, segments, node, member, out)?;
+            }
+            self.release_subtree(tree, retired)?;
+            return self.close_if_leaf(tree, node, member);
+        }
         // What the member's holds carry never reached the object, whatever
         // its map has since come to say of those bytes: they go on from the
         // holds, and the object is asked only for the rest.
@@ -81,6 +98,15 @@ impl NamespaceWriter {
                 }
             }
         }
+        self.close_if_leaf(tree, node, member)
+    }
+
+    fn close_if_leaf(
+        &mut self,
+        tree: &Tree,
+        node: NodeId,
+        member: MemberId,
+    ) -> Result<(), WriteError> {
         let closed_leaf = tree
             .namespace(node)
             .and_then(|namespace| namespace.get(member))

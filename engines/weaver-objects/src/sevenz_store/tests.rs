@@ -344,13 +344,15 @@ fn an_encrypted_header_asks_and_opens_by_the_second_candidate() {
 }
 
 #[test]
-fn an_encrypted_header_no_candidate_opens_is_refused_at_close() {
+fn an_encrypted_header_no_candidate_opens_is_refused_at_quiet() {
     let bytes = archive(aes(), true);
     let mut owner = Owner::single(store(), bytes);
     owner.frames(0, 4096);
     owner.offer("not-the-passphrase");
-    assert!(!has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
     owner.close(0);
+    // The question is still open: a candidate may yet answer it.
+    assert!(!has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
+    owner.quiet();
     assert!(has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
     assert!(owner.members.is_empty());
 }

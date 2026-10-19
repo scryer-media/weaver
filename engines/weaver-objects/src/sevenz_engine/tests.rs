@@ -211,7 +211,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
     out
 }
 
-fn run_over(engine: &SevenZipEngine, gate: Arc<Gate>) -> Vec<Said> {
+fn run_over(engine: &mut SevenZipEngine, gate: Arc<Gate>) -> Vec<Said> {
     let mut emits = Vec::new();
     let mut sink = |emit| {
         emits.push(emit);
@@ -221,7 +221,7 @@ fn run_over(engine: &SevenZipEngine, gate: Arc<Gate>) -> Vec<Said> {
     said(&emits)
 }
 
-fn run(engine: &SevenZipEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
+fn run(engine: &mut SevenZipEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
     run_over(engine, Gate::whole(volumes))
 }
 
@@ -239,7 +239,7 @@ fn split(bytes: &[u8], at: usize) -> Vec<Vec<u8>> {
 
 #[test]
 fn a_store_archive_extracts_its_files_by_name_and_skips_the_rest() {
-    assert_eq!(run(&SevenZipEngine::new(), vec![store()]), store_said());
+    assert_eq!(run(&mut SevenZipEngine::new(), vec![store()]), store_said());
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn an_lzma2_archive_extracts_its_members() {
     let archive = lzma2(&[("first.bin", &first), ("second.bin", &second)]);
     assert!(archive.len() < first.len(), "the fixture is compressed");
     assert_eq!(
-        run(&SevenZipEngine::new(), vec![archive]),
+        run(&mut SevenZipEngine::new(), vec![archive]),
         vec![
             Said::Member(0, "first.bin".into(), Some(20_000)),
             Said::Bytes(0, first),
@@ -264,10 +264,10 @@ fn an_lzma2_archive_extracts_its_members() {
 
 #[test]
 fn a_set_in_two_volumes_extracts_as_one() {
-    let engine = named(&["set.7z.001", "set.7z.002"]);
+    let mut engine = named(&["set.7z.001", "set.7z.002"]);
     for at in [1, 32, 45, store().len() - 1] {
         assert_eq!(
-            run(&engine, split(&store(), at)),
+            run(&mut engine, split(&store(), at)),
             store_said(),
             "split at {at}"
         );
@@ -320,21 +320,21 @@ fn a_run_over_a_set_waits_for_the_volume_holding_the_tail() {
 fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
     let mut engine = named(&["locked.7z"]);
     assert_eq!(
-        run(&engine, vec![encrypted()]),
+        run(&mut engine, vec![encrypted()]),
         vec![Said::NeedsPassword],
         "an encrypted member with no password is never announced"
     );
 
     let mut out = Vec::new();
     engine.offer_password("not-the-password", &mut out);
-    let wrong = run(&engine, vec![encrypted()]);
+    let wrong = run(&mut engine, vec![encrypted()]);
     assert_eq!(wrong.last(), Some(&Said::NeedsPassword));
     assert!(!wrong.iter().any(|said| matches!(said, Said::Closed(_))));
 
     engine.offer_password(PASSWORD, &mut out);
     assert!(out.is_empty());
     assert_eq!(
-        run(&engine, vec![encrypted()]),
+        run(&mut engine, vec![encrypted()]),
         vec![
             Said::Member(0, "notes.txt".into(), Some(NOTES.len() as u64)),
             Said::Bytes(0, NOTES.to_vec()),
@@ -351,7 +351,7 @@ fn a_member_whose_checksum_fails_is_retracted_and_refused() {
         .position(|window| window == NOTES)
         .unwrap();
     archive[at + 3] ^= 0x20;
-    let said = run(&SevenZipEngine::new(), vec![archive]);
+    let said = run(&mut SevenZipEngine::new(), vec![archive]);
     assert_eq!(
         said[said.len() - 2..],
         [Said::Retract(0), Said::Refuse(Why::Unrepairable)]
@@ -364,7 +364,7 @@ fn something_that_is_not_a_7z_is_refused_as_unsupported() {
     let mut archive = store();
     archive[0] ^= 0xff;
     assert_eq!(
-        run(&SevenZipEngine::new(), vec![archive]),
+        run(&mut SevenZipEngine::new(), vec![archive]),
         vec![Said::Refuse(Why::Unsupported)]
     );
 }

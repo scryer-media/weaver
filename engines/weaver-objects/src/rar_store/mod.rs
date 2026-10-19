@@ -451,7 +451,6 @@ impl Object for RarStore {
             return;
         }
         self.say_gaps(out);
-        self.exhausted(out);
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {

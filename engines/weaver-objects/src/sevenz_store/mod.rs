@@ -562,23 +562,12 @@ impl Object for SevenZipStore {
         self.route(range, bytes, delivery.provenance, read, out);
     }
 
-    fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
+    fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
         if self.gone {
             return;
         }
         self.stale = true;
         self.settle(out);
-        let Some(geometry) = self.geometry else {
-            return;
-        };
-        if self.gone || volume != geometry.last() {
-            return;
-        }
-        // Everything that could arrive has: a password that has not opened
-        // the container by now never will.
-        if let Some(why) = self.shut() {
-            self.give_up(Emit::Refuse(why), out);
-        }
     }
 
     // Nothing more will arrive. A member still damaged, a password that

@@ -163,7 +163,7 @@ impl GraphJob {
                 return Ok(Vec::new());
             }
         }
-        if let Some(extraction) = self.tree.engine(node).map(Engine::start) {
+        if let Some(extraction) = self.tree.engine_mut(node).map(Engine::start) {
             let shelf = self.writer.shelf(node);
             self.runs.start(node, extraction, shelf);
         }

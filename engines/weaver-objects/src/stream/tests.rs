@@ -215,7 +215,7 @@ fn stream<D: Decoder>(name: &str) -> Stream<D> {
 // A run over `bytes`, the test handing them out as `hand_out` says, then
 // closing the volume.
 fn decode<D: Decoder>(
-    stream: &Stream<D>,
+    stream: &mut Stream<D>,
     bytes: Vec<u8>,
     hand_out: impl FnOnce(&Gate),
 ) -> Vec<Said> {
@@ -239,11 +239,11 @@ fn decode<D: Decoder>(
     said(&runner.join().unwrap())
 }
 
-fn whole<D: Decoder>(stream: &Stream<D>, bytes: Vec<u8>) -> Vec<Said> {
+fn whole<D: Decoder>(stream: &mut Stream<D>, bytes: Vec<u8>) -> Vec<Said> {
     decode(stream, bytes, |_| {})
 }
 
-fn growing<D: Decoder>(stream: &Stream<D>, bytes: Vec<u8>, piece: usize) -> Vec<Said> {
+fn growing<D: Decoder>(stream: &mut Stream<D>, bytes: Vec<u8>, piece: usize) -> Vec<Said> {
     let len = bytes.len();
     decode(stream, bytes, |gate| {
         let mut released = 0;
@@ -264,12 +264,16 @@ fn decoded(name: &str, bytes: Vec<u8>) -> Vec<Said> {
 }
 
 fn each_piece<D: Decoder>(volume: &str, member: &str, bytes: &[u8], plain: &[u8]) {
-    let stream = stream::<D>(volume);
+    let mut stream = stream::<D>(volume);
     let expected = decoded(member, plain.to_vec());
-    assert_eq!(whole(&stream, bytes.to_vec()), expected, "{volume} whole");
+    assert_eq!(
+        whole(&mut stream, bytes.to_vec()),
+        expected,
+        "{volume} whole"
+    );
     for piece in [1, 4096] {
         assert_eq!(
-            growing(&stream, bytes.to_vec(), piece),
+            growing(&mut stream, bytes.to_vec(), piece),
             expected,
             "{volume} in {piece}-byte pieces"
         );
@@ -293,7 +297,7 @@ fn concatenated<D: Decoder>(encode: fn(&[u8]) -> Vec<u8>) {
     bytes.extend_from_slice(&encode(&second));
     let joined = [first, second].concat();
     assert_eq!(
-        whole(&stream::<D>("alpha.tar.gz"), bytes),
+        whole(&mut stream::<D>("alpha.tar.gz"), bytes),
         decoded("alpha.tar", joined)
     );
 }
@@ -339,29 +343,35 @@ fn a_corrupt_stream_is_refused() {
     };
     let gz = gzip(&plain);
     let at = gz.len() - 12;
-    refused_as("Gzip", &whole(&stream::<Gzip>("a.gz"), corrupt(gz, at)));
+    refused_as("Gzip", &whole(&mut stream::<Gzip>("a.gz"), corrupt(gz, at)));
     let bz = bzip2(&plain);
     let at = bz.len() / 2;
-    refused_as("Bzip2", &whole(&stream::<Bzip2>("a.bz2"), corrupt(bz, at)));
+    refused_as(
+        "Bzip2",
+        &whole(&mut stream::<Bzip2>("a.bz2"), corrupt(bz, at)),
+    );
     let zs = zstd(&plain);
     let at = zs.len() / 2;
-    refused_as("Zstd", &whole(&stream::<Zstd>("a.zst"), corrupt(zs, at)));
+    refused_as(
+        "Zstd",
+        &whole(&mut stream::<Zstd>("a.zst"), corrupt(zs, at)),
+    );
     let x = xz(&plain);
-    refused_as("Xz", &whole(&stream::<Xz>("a.xz"), corrupt(x, 13)));
+    refused_as("Xz", &whole(&mut stream::<Xz>("a.xz"), corrupt(x, 13)));
     // A block type no encoder writes.
     let mut raw = deflate(&plain);
     raw[0] |= 0x06;
-    refused_as("Deflate", &whole(&stream::<Deflate>("a"), raw));
+    refused_as("Deflate", &whole(&mut stream::<Deflate>("a"), raw));
     // Brotli checks nothing, so a flipped literal decodes; its window field
     // set to the large-window code a standard stream never carries does not.
     let mut br = brotli(&plain);
     br[0] = (br[0] & 0x80) | 0x11;
-    refused_as("Brotli", &whole(&stream::<Brotli>("a.br"), br));
+    refused_as("Brotli", &whole(&mut stream::<Brotli>("a.br"), br));
 }
 
 fn truncated<D: Decoder>(name: &str, mut bytes: Vec<u8>) {
     bytes.truncate(bytes.len() / 2);
-    refused(&whole(&stream::<D>(name), bytes));
+    refused(&whole(&mut stream::<D>(name), bytes));
 }
 
 #[test]
@@ -380,7 +390,7 @@ fn a_stream_short_of_its_end_waits_while_its_volume_is_open() {
     let plain = first_payload();
     let bytes = gzip(&plain);
     let half = bytes.len() / 2;
-    let said = decode(&stream::<Gzip>("a.gz"), bytes, |gate| {
+    let said = decode(&mut stream::<Gzip>("a.gz"), bytes, |gate| {
         gate.release(half);
         gate.await_reader();
     });
@@ -402,7 +412,7 @@ fn a_failed_xz_check_names_the_stream_it_failed_in() {
     let mut bytes = [first.clone(), second.clone()].concat();
     let at = xz_check_byte(&bytes, bytes.len());
     bytes[at] ^= 0x01;
-    let said = whole(&stream::<Xz>("a.xz"), bytes);
+    let said = whole(&mut stream::<Xz>("a.xz"), bytes);
     assert_eq!(
         ending(&said),
         [
@@ -498,9 +508,12 @@ fn zstd_window(log: u8) -> Vec<u8> {
 // refused, however little it holds.
 #[test]
 fn a_zstd_frame_wider_than_the_decoders_limit_is_refused() {
-    let stream = stream::<Zstd>("a.zst");
-    assert_eq!(whole(&stream, zstd_window(27)), decoded("a", b"z".to_vec()));
-    refused(&whole(&stream, zstd_window(28)));
+    let mut stream = stream::<Zstd>("a.zst");
+    assert_eq!(
+        whole(&mut stream, zstd_window(27)),
+        decoded("a", b"z".to_vec())
+    );
+    refused(&whole(&mut stream, zstd_window(28)));
 }
 
 #[test]

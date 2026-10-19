@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Object, Placement, Provenance, Pull, Seek, VolumeIndex,
+    ByteRange, Coverage, Delivery, Emit, Object, Placement, Provenance, Pull, Seek, Standing,
+    VolumeIndex,
 };
 
 use super::super::RarStore;
@@ -268,6 +269,25 @@ impl Owner {
         for volume in 0..self.volumes.len() {
             self.close(volume);
         }
+    }
+
+    // Nothing more will arrive, and every member stands whole and placed.
+    pub fn quiet(&mut self) {
+        struct Whole;
+        impl Standing for Whole {
+            fn damaged(&self) -> bool {
+                false
+            }
+            fn unplaced(&self) -> bool {
+                false
+            }
+            fn lost(&self) -> bool {
+                false
+            }
+        }
+        let mut out = Vec::new();
+        self.object.quiet(&Whole, &mut out);
+        self.apply(out);
     }
 
     pub fn offer(&mut self, secret: &str) {
