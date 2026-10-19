@@ -6,22 +6,18 @@
 
 use std::io::{Cursor, Read, Write};
 
-use sevenz_turbo::{BlockErrorKind, Error};
+use sevenz_turbo::Error;
 
 use super::*;
 
-fn block(kind: BlockErrorKind, message: String) -> Error {
-    Error::BlockDecode {
-        block_index: 0,
-        packed_offset: 32,
-        kind,
-        message,
-    }
+// A block error over the error the block failed on, which gives its kind.
+fn block(cause: Error) -> Error {
+    cause.in_block(0, 32)
 }
 
-// The message a block carries is the reader error's own rendering.
+// A block whose reader failed.
 fn read_failure(error: io::Error) -> Error {
-    block(BlockErrorKind::Io, Error::Io(error, "".into()).to_string())
+    block(Error::Io(error, "".into()))
 }
 
 #[test]
@@ -61,7 +57,7 @@ fn a_zip_member_whose_crc_fails_is_damage() {
 }
 
 #[test]
-fn sevenz_block_errors_are_read_from_their_rendering() {
+fn sevenz_block_errors_are_read_from_their_cause() {
     for error in [
         read_failure(io::ErrorKind::UnexpectedEof.into()),
         read_failure(io::Error::new(
@@ -69,14 +65,13 @@ fn sevenz_block_errors_are_read_from_their_rendering() {
             "kind: NotFound quoted in the message",
         )),
         read_failure(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
-        block(BlockErrorKind::Corrupted, "detail".to_string()),
-        block(BlockErrorKind::ChecksumMismatch, "detail".to_string()),
+        block(Error::Corrupted("detail".into())),
+        block(Error::ChecksumVerificationFailed),
     ] {
         assert_eq!(sevenz(&error), DAMAGED, "{error}");
     }
     for error in [
-        block(BlockErrorKind::UnsupportedMethod, "detail".to_string()),
-        block(BlockErrorKind::Io, "detail".to_string()),
+        block(Error::Unsupported("detail".into())),
         read_failure(io::ErrorKind::PermissionDenied.into()),
         read_failure(io::Error::new(
             io::ErrorKind::StorageFull,
@@ -85,23 +80,15 @@ fn sevenz_block_errors_are_read_from_their_rendering() {
     ] {
         assert_eq!(sevenz(&error), TERMINAL, "{error}");
     }
-    assert_eq!(
-        sevenz(&block(
-            BlockErrorKind::Password,
-            format!("{:?}", Error::PasswordRequired)
-        )),
-        PASSWORD
-    );
+    assert_eq!(sevenz(&block(Error::PasswordRequired)), PASSWORD);
 }
 
-// A password-kind block error that is not the reader's own missing-password
-// refusal cannot tell a wrong key from damage, so it asks for no password.
+// Verified bytes that fail to decode under a key indict the key, inside a
+// block as outside one.
 #[test]
-fn a_password_block_error_without_the_readers_refusal_asks_for_no_password() {
-    assert_eq!(
-        sevenz(&block(BlockErrorKind::Password, "detail".to_string())),
-        TERMINAL
-    );
+fn a_maybe_bad_password_in_a_block_asks_for_another() {
+    let error = io::Error::new(io::ErrorKind::InvalidData, "bad padding");
+    assert_eq!(sevenz(&block(Error::MaybeBadPassword(error))), PASSWORD);
 }
 
 // Verified bytes that fail to decode under a key indict the key, whatever
@@ -121,14 +108,18 @@ fn a_bad_read_in_an_encrypted_zip_entry_asks_for_another_password() {
     assert_eq!(zip_read(&bad(), false), DAMAGED);
 }
 
-// Only failures that name damage are damage; anything else, an unknown
-// shape or a text that names no checksum, no repair is known to change.
+// Only failures that name damage are damage, a checksum carried up a read
+// chain among them; anything else, an unknown shape or a text, no repair is
+// known to change.
 #[test]
 fn a_7z_failure_that_names_no_damage_is_terminal() {
     for error in [
         Error::NextHeaderCrcMismatch,
         Error::ChecksumVerificationFailed,
-        Error::Other("block checksum".into()),
+        Error::Io(
+            io::Error::other(Error::ChecksumVerificationFailed),
+            "".into(),
+        ),
     ] {
         assert_eq!(sevenz(&error), DAMAGED, "{error}");
     }

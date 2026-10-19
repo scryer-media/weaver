@@ -31,12 +31,23 @@ pub(crate) fn sevenz(error: &sevenz_turbo::Error) -> Emit {
             kind: BlockErrorKind::Corrupted | BlockErrorKind::ChecksumMismatch,
             ..
         } => DAMAGED,
-        Error::BlockDecode { kind, message, .. } => {
-            sevenz_0_28_block_error(*kind, message, &error.to_string())
+        // A block carries the error it failed on, so its cause answers; a
+        // read that came back wrong or short inside it is damage in the block.
+        Error::BlockDecode { cause, .. } => match cause.as_ref() {
+            Error::Io(error, _)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                DAMAGED
+            }
+            cause => sevenz(cause),
+        },
+        Error::ChecksumVerificationFailed | Error::NextHeaderCrcMismatch | Error::Corrupted(_) => {
+            DAMAGED
         }
-        Error::ChecksumVerificationFailed | Error::NextHeaderCrcMismatch => DAMAGED,
         Error::Io(error, _) | Error::FileOpen(error, _) => self::io(error),
-        Error::Other(text) if sevenz_0_28_other_names_checksum(text) => DAMAGED,
         _ => TERMINAL,
     }
 }
@@ -89,63 +100,6 @@ pub(crate) fn io(error: &io::Error) -> Emit {
 // nothing else, and each is pinned by a test against the rendering the pinned
 // crate version produces, so a bump that rewords it fails the test rather
 // than moving a failure from one answer to another.
-
-// sevenz-turbo 0.28.0: `Error::BlockDecode` keeps its cause only as the
-// rendered `message`, the debug form of the error the block failed on. The
-// password, the I/O kind, and a checksum failure wrapped in an I/O error are
-// all read back from it.
-fn sevenz_0_28_block_error(
-    kind: sevenz_turbo::BlockErrorKind,
-    message: &str,
-    rendering: &str,
-) -> Emit {
-    if kind == sevenz_turbo::BlockErrorKind::Password && message == "PasswordRequired" {
-        return PASSWORD;
-    }
-    if kind == sevenz_turbo::BlockErrorKind::Io
-        && matches!(
-            sevenz_0_28_block_io_error_kind(message),
-            Some(io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof)
-        )
-    {
-        return DAMAGED;
-    }
-    let lower = rendering.to_ascii_lowercase();
-    let damaged = lower.contains("checksum")
-        || lower.contains("crc mismatch")
-        || lower.contains("crcmismatch")
-        || std_read_exact_eof(&lower)
-        || zstd_0_13_checksum_mismatch(rendering);
-    if damaged { DAMAGED } else { TERMINAL }
-}
-
-// The kind of the read failure behind an I/O block error. Every shape of
-// `io::Error`'s debug form names the kind before anything else:
-// `Kind(UnexpectedEof)`, or `kind: InvalidData` in the custom, message and OS
-// shapes. The first kind named is the reader's own, never one quoted inside
-// its message.
-fn sevenz_0_28_block_io_error_kind(message: &str) -> Option<io::ErrorKind> {
-    let start = ["kind: ", "Kind("]
-        .iter()
-        .filter_map(|marker| message.find(marker).map(|at| at + marker.len()))
-        .min()?;
-    let rest = &message[start..];
-    let named = &rest[..rest
-        .find(|c: char| !c.is_ascii_alphanumeric())
-        .unwrap_or(rest.len())];
-    match named {
-        "InvalidData" => Some(io::ErrorKind::InvalidData),
-        "UnexpectedEof" => Some(io::ErrorKind::UnexpectedEof),
-        _ => None,
-    }
-}
-
-// sevenz-turbo 0.28.0: `Error::Other` raised outside a block carries only
-// text. One of its texts names a checksum, and a 7z failure naming one is
-// kept for repair.
-fn sevenz_0_28_other_names_checksum(text: &str) -> bool {
-    text.to_ascii_lowercase().contains("checksum")
-}
 
 // std: `Read::read_exact` past the end of its reader. Its error is a constant
 // with no typed cause beyond `UnexpectedEof`, which other short reads share

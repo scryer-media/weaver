@@ -91,7 +91,10 @@ impl Walk<'_, '_> {
             self.next += 1;
             self.say(Emit::Member {
                 member,
-                name: file.name().to_owned(),
+                name: file
+                    .name()
+                    .map_err(|error| Some(verdict::zip(&error)))?
+                    .into_owned(),
                 length: Some(file.size()),
             })?;
             self.open = Some(member);
