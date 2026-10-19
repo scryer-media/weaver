@@ -691,12 +691,12 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         if finished(&pipeline) {
             break;
         }
-        // A run out on a thread speaks through the pipeline's mail, as the
+        // A run or a repair out on a thread speaks through the pipeline's mail, as the
         // orchestrator hears it: what it says is the job's next move.
         if pipeline
             .graph_jobs
             .get(&JOB)
-            .is_some_and(|job| job.runs().live())
+            .is_some_and(|job| job.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
@@ -855,7 +855,7 @@ pub(super) async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOut
         if pipeline
             .graph_jobs
             .get(&JOB)
-            .is_some_and(|job| job.runs().live())
+            .is_some_and(|job| job.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);

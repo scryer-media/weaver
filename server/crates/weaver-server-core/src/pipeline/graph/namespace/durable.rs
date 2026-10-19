@@ -78,13 +78,8 @@ impl NamespaceWriter {
         range: ByteRange,
         into: &mut Vec<u8>,
     ) -> bool {
-        let start = into.len();
-        let mut access = self.access(tree, NodeId::ROOT);
+        let mut access = self.access(tree);
         access.held = false;
-        let read = access.read_at(NodeId::ROOT, member, range, into);
-        if !read {
-            into.truncate(start);
-        }
-        read
+        access.read_at(NodeId::ROOT, member, range, into)
     }
 }

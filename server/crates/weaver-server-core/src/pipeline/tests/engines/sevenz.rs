@@ -350,6 +350,21 @@ async fn a_damaged_stored_7z_under_par2_is_repaired_and_delivered_under_both_eng
     assert_same_delivered_classic_refetching(&classic, &graph);
 }
 
+// The same under AES: the damaged article is cipher bytes, and the repair
+// reads the volume back through the store's keys and chain.
+#[tokio::test]
+async fn a_damaged_aes_stored_7z_under_par2_is_repaired_and_delivered_under_both_engines_and_only_classic_refetches()
+ {
+    let archive = stored(Some(SECRET));
+    let mut posts = vec![Post::plain("lantern.7z", archive.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.7z", &archive)], 2));
+    let scenario = Scenario::new(posts).damaged(0, 1).password(SECRET);
+    let (classic, graph) = run_both(&scenario).await;
+    assert_members(&graph);
+    assert_members(&classic);
+    assert_same_delivered_classic_refetching(&classic, &graph);
+}
+
 // The coded stream damaged beside a PAR2 set: the engine waits at the
 // damaged article for its repair, then decodes the members once, and the
 // job ends with nothing parked. Divergence: classic demotes and fetches the

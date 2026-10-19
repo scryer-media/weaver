@@ -8,6 +8,8 @@
 // refute; a file with no check, every RAR4 file among them, opens on the
 // first candidate, and its CRC at the close is the backstop.
 
+use std::sync::Arc;
+
 use unrar_rs::{MemberKeying, PasswordCheck, RarVolumeHeaderEncryption, check_member_password};
 use weaver_graph::{Emit, Why};
 use zeroize::Zeroizing;
@@ -219,7 +221,7 @@ impl RarStore {
             let Ok(cbc) = opened else {
                 return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
             };
-            entry.lock = Lock::Open(Box::new(cbc));
+            entry.lock = Lock::Open(Arc::new(cbc));
             entry.hash_key = key.hash_key;
             self.stale = true;
         }

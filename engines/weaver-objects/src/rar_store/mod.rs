@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use unrar_rs::{EncryptedStore, StoredLayoutBuilder};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Provenance,
-    Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Posting,
+    Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
@@ -75,11 +75,12 @@ impl Volume {
 // A file's cipher, by what the object knows of its key. A sealed one was
 // open before a restart: it keeps the cipher blocks it held, which are on
 // no disk, and waits, as a locked one does, for the password that keys it
-// again.
+// again. An open one is shared with the postings handed out of the store,
+// and written on its own copy once one is out.
 enum Lock {
     Plain,
     Locked,
-    Open(Box<Cbc>),
+    Open(Arc<Cbc>),
     Sealed(Box<Chain>),
 }
 
@@ -98,8 +99,8 @@ struct Piece {
 
 // What has been said for one member: what of it was placed, which an open
 // cipher reads as what came out of it, and the plaintext its cipher stream
-// carries past it, which no member holds.
-#[derive(Default)]
+// carries past it, which no member holds. Shared, as an open cipher is.
+#[derive(Clone, Default)]
 struct Out {
     coverage: Coverage,
     closed: bool,
@@ -117,7 +118,7 @@ struct Entry {
     complete: bool,
     lock: Lock,
     hash_key: Option<Zeroizing<[u8; 32]>>,
-    out: Out,
+    out: Arc<Out>,
     // The plaintext's runs for the whole-file CRC, and every part's packed
     // runs, by piece, for its own.
     plain_runs: CrcRuns,
@@ -547,7 +548,12 @@ impl Object for RarStore {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
     ) -> bool {
-        self.rebuild_posted(volume, range, read, into)
+        self.posted_over(&[(volume, range)])
+            .posted(volume, range, read, into)
+    }
+
+    fn posting(&self, ranges: &[(VolumeIndex, ByteRange)]) -> Box<dyn Posting> {
+        Box::new(self.posted_over(ranges))
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {

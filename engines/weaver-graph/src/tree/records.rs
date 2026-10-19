@@ -39,14 +39,19 @@ impl Tree {
                 binding.volumes.iter().map(|(&v, &m)| (v, m)).collect()
             }),
             window: binding.and_then(|binding| binding.window),
-            kind: found.object.as_ref().map(|object| object.kind()),
+            kind: self.kind(node),
             state: if found.retired {
                 NodeState::Retired
             } else {
                 NodeState::Live
             },
             reason: found.refused,
-            facts: found.object.as_ref().map(|object| object.facts()),
+            // A lent object is recorded as it was when it left.
+            facts: found
+                .object
+                .as_ref()
+                .map(|object| object.facts())
+                .or_else(|| self.lent_facts(node).cloned()),
             members: namespace
                 .members()
                 .map(|member| MemberRecord {

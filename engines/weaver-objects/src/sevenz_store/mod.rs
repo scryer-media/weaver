@@ -29,7 +29,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
-    Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    Posting, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
@@ -53,11 +53,13 @@ const ENVELOPE: u32 = 0;
 // open before a restart: it keeps its chain and waits, as a locked one does,
 // for the password that keys it again. An open or sealed folder keeps the
 // plaintext its cipher stream carries past its files, which no member holds;
-// what else came out of the cipher is its members' coverage.
+// what else came out of the cipher is its members' coverage. An open one is
+// shared with the postings handed out of the store, and written on its own
+// copy once one is out.
 enum Lock {
     Plain,
     Locked,
-    Open(Box<Cbc>, Padding),
+    Open(Arc<Cbc>, Arc<Padding>),
     Sealed(Box<Chain>, Padding),
 }
 
@@ -81,7 +83,7 @@ impl Serialize for Lock {
         match self {
             Lock::Plain => LockFacts::Plain,
             Lock::Locked => LockFacts::Locked,
-            Lock::Open(cbc, padding) => LockFacts::Sealed(cbc.chain(), padding.clone()),
+            Lock::Open(cbc, padding) => LockFacts::Sealed(cbc.chain(), Padding::clone(padding)),
             Lock::Sealed(chain, padding) => LockFacts::Sealed(Chain::clone(chain), padding.clone()),
         }
         .serialize(serializer)
@@ -99,7 +101,7 @@ impl<'de> Deserialize<'de> for Lock {
 }
 
 // What has been said for one member.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Out {
     coverage: Coverage,
     closed: bool,
@@ -133,11 +135,12 @@ pub struct SevenZipStore {
     encrypted: bool,
     // Container ranges the header parse needs, the end header among them.
     header_ranges: Vec<ByteRange>,
-    map: Option<Map>,
+    // Shared, with what its members said, by the postings handed out.
+    map: Option<Arc<Map>>,
     // The header bytes the map was built on, by range and checksum.
     basis: Vec<(ByteRange, u32)>,
     folders: Vec<Lock>,
-    members: Vec<Out>,
+    members: Arc<Vec<Out>>,
     grid: Grid,
     #[serde(skip)]
     candidates: Vec<Candidate>,
@@ -208,7 +211,7 @@ impl SevenZipStore {
             map: None,
             basis: Vec::new(),
             folders: Vec::new(),
-            members: Vec::new(),
+            members: Arc::default(),
             grid: Grid::default(),
             candidates: Vec::new(),
             opened: None,
@@ -451,7 +454,7 @@ impl SevenZipStore {
                 None => Lock::Plain,
             })
             .collect();
-        self.members = map.entries.iter().map(|_| Out::default()).collect();
+        let mut members: Vec<Out> = map.entries.iter().map(|_| Out::default()).collect();
         // Every member is announced now, in id order, which is the order the
         // namespace numbers them in.
         for (id, entry) in map.entries.iter().enumerate() {
@@ -462,7 +465,7 @@ impl SevenZipStore {
                 length: Some(entry.length),
             });
             if entry.length == 0 {
-                self.members[id].closed = true;
+                members[id].closed = true;
                 out.push(Emit::MemberClosed(member));
             }
         }
@@ -474,7 +477,8 @@ impl SevenZipStore {
                 self.bid(range, Weight(1));
             }
         }
-        self.map = Some(map);
+        self.members = Arc::new(members);
+        self.map = Some(Arc::new(map));
     }
 
     // Repaired bytes changed the header the map was built on: everything
@@ -502,7 +506,7 @@ impl SevenZipStore {
         self.map = None;
         self.basis.clear();
         self.folders.clear();
-        self.members.clear();
+        self.members = Arc::default();
         self.grid = Grid::default();
         self.proof = None;
     }
@@ -669,7 +673,12 @@ impl Object for SevenZipStore {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
     ) -> bool {
-        self.rebuild_posted(volume, range, read, into)
+        self.posted_over(&[(volume, range)])
+            .posted(volume, range, read, into)
+    }
+
+    fn posting(&self, ranges: &[(VolumeIndex, ByteRange)]) -> Box<dyn Posting> {
+        Box::new(self.posted_over(ranges))
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {

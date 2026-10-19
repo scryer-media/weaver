@@ -13,18 +13,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
-use crate::deliver::{Delivery, Emit, Provenance, Why};
+use crate::deliver::{Emit, Provenance, Why};
 use crate::engine::Engine;
 use crate::member::{Member, MemberId, Namespace};
 use crate::names::{Moved, NameLedger, Position};
-use crate::object::{Carried, Extent, Kind, Object, ObjectId, Placement};
+use crate::object::{Carried, Extent, Kind, Object, ObjectId, Placement, Posting};
 use crate::recovery::Recovery;
 use crate::seek::{Pull, Seek, SeekUp};
 use crate::sniff::{Sniff, sniff};
 use crate::volume::{ByteRange, VolumeIndex};
 
+mod lent;
 mod quiet;
 mod records;
+
+use lent::{Arrived, Told, Waiting};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
@@ -79,6 +82,8 @@ struct Node {
     // its volumes are in: one bound below, where the member it names was
     // founded. Its volumes stay where they were posted.
     covers_in: Option<NodeId>,
+    // The object is lent out: what it is, and what waits for its return.
+    lent: Option<lent::Lent>,
 }
 
 impl Node {
@@ -93,6 +98,7 @@ impl Node {
             retired: false,
             refused: None,
             covers_in: None,
+            lent: None,
         }
     }
 }
@@ -353,23 +359,27 @@ impl Tree {
         self.nodes.get(&node)?.object.as_deref()
     }
 
-    // What the object at `node` is. `None` for the root and for a node
-    // whose object is lent out.
+    // What the object at `node` is, lent out or not. `None` for the root.
     pub fn kind(&self, node: NodeId) -> Option<Kind> {
-        self.object(node).map(Object::kind)
+        self.object(node)
+            .map(Object::kind)
+            .or_else(|| self.lent_kind(node))
     }
 
     pub fn reads_in_order(&self, node: NodeId) -> bool {
         self.object(node).is_some_and(Object::reads_in_order)
     }
 
-    // The recovery face of the object at `node`, if it has one.
+    // The recovery face of the object at `node`, if it has one and is in
+    // its node.
     pub fn recovery(&self, node: NodeId) -> Option<&dyn Recovery> {
         self.object(node)?.recovery()
     }
 
+    // Whether the object at `node` is a recovery object: only a recovery
+    // object is lent.
     pub fn recovers(&self, node: NodeId) -> bool {
-        self.recovery(node).is_some()
+        self.recovery(node).is_some() || self.lent(node)
     }
 
     // The recovery objects bound in `node`'s namespace, in binding order:
@@ -410,22 +420,19 @@ impl Tree {
     }
 
     // Where a range of `node`'s volume lies in the member it is bound to:
-    // the range itself for a whole member, and for a window the range moved
-    // to the window's start and clipped at its end, since nothing past the
-    // window is the node's. `None` when the range starts past the window.
+    // the range itself for a whole member, and for a window where the
+    // window puts it. `None` when the range starts past the window.
     pub fn in_member(&self, node: NodeId, range: ByteRange) -> Option<ByteRange> {
         let binding = self.nodes.get(&node)?.binding.as_ref()?;
-        let Some(window) = binding.window else {
-            return Some(range);
-        };
-        let start = window.start.saturating_add(range.start);
-        let end = window.start.saturating_add(range.end).min(window.end);
-        (start <= end).then(|| ByteRange::new(start, end))
+        match binding.window {
+            Some(window) => range.in_window(window),
+            None => Some(range),
+        }
     }
 
     // The range of its member a window is bound to; `None` for any other
     // node.
-    fn window(&self, node: NodeId) -> Option<ByteRange> {
+    pub fn window(&self, node: NodeId) -> Option<ByteRange> {
         self.nodes.get(&node)?.binding.as_ref()?.window
     }
 
@@ -553,18 +560,7 @@ impl Tree {
         let Some((child, volume)) = found.children.get(&member).copied() else {
             return;
         };
-        let mut emits = std::mem::take(&mut self.emits);
-        emits.clear();
-        if let Some(object) = self
-            .nodes
-            .get_mut(&child)
-            .and_then(|found| found.object.as_mut())
-        {
-            object.sized(volume, length, &mut emits);
-            object.volume_closed(volume, &mut emits);
-        }
-        self.apply(child, &mut emits, builder, effects);
-        self.emits = emits;
+        self.reach(child, Told::Closed { volume, length }, builder, effects);
     }
 
     fn windows_on(&self, node: NodeId, member: MemberId) -> Vec<NodeId> {
@@ -586,18 +582,8 @@ impl Tree {
         let Some(length) = self.window(window).map(|range| range.len()) else {
             return;
         };
-        let mut emits = std::mem::take(&mut self.emits);
-        emits.clear();
-        if let Some(object) = self
-            .nodes
-            .get_mut(&window)
-            .and_then(|found| found.object.as_mut())
-        {
-            object.sized(VolumeIndex(0), length, &mut emits);
-            object.volume_closed(VolumeIndex(0), &mut emits);
-        }
-        self.apply(window, &mut emits, builder, effects);
-        self.emits = emits;
+        let volume = VolumeIndex(0);
+        self.reach(window, Told::Closed { volume, length }, builder, effects);
     }
 
     // Lend the object at `node` out of the tree, so the owner can run it
@@ -994,6 +980,31 @@ impl Tree {
             .is_some_and(|object| object.posted(volume, range, read, into))
     }
 
+    // What `posted` answers for every volume of the object at `node`, as
+    // far as each has arrived, owned and apart from the tree. `None` for the
+    // root and for a node whose object is out.
+    pub fn posting(&self, node: NodeId) -> Option<Box<dyn Posting>> {
+        let object = self.object(node)?;
+        let (parent, volumes) = self.volumes(node)?;
+        let namespace = self.namespace(parent)?;
+        let window = self.window(node);
+        let ranges: Vec<(VolumeIndex, ByteRange)> = volumes
+            .iter()
+            .filter_map(|(volume, member)| {
+                let length = match window {
+                    Some(window) => window.len(),
+                    None => {
+                        let record = namespace.get(*member)?;
+                        let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
+                        record.length.unwrap_or(reached)
+                    }
+                };
+                Some((*volume, ByteRange::new(0, length)))
+            })
+            .collect();
+        Some(object.posting(&ranges))
+    }
+
     // Announce a member of the root namespace: the source's files. A root
     // member outranks every member below it, so one that wants a name a
     // member below holds takes it, and that member's move is an effect.
@@ -1071,10 +1082,15 @@ impl Tree {
         let Some((child, volume)) = self.child_of(node, member) else {
             return self.reoffer(node, member, effects);
         };
-        if let Some(object) = self
-            .nodes
-            .get_mut(&child)
-            .and_then(|found| found.object.as_mut())
+        let told = Told::Renamed {
+            volume,
+            name: name.clone(),
+        };
+        if self.wait(child, Waiting::Told(told)).is_some()
+            && let Some(object) = self
+                .nodes
+                .get_mut(&child)
+                .and_then(|found| found.object.as_mut())
         {
             object.renamed(volume, &name);
         }
@@ -1366,13 +1382,13 @@ impl Tree {
         match found.children.get(&member).copied() {
             Some((child, volume)) => {
                 let length = found.namespace.get(member).and_then(|record| record.length);
-                let delivery = Delivery {
+                let arrived = Arrived {
                     volume,
                     offset,
-                    bytes: &bytes,
+                    bytes,
                     provenance,
                 };
-                self.deliver_to_object(child, delivery, length, builder, effects);
+                self.deliver_to_object(child, &arrived, length, builder, effects);
             }
             None => {
                 effects.push(Effect::WriteLeaf {
@@ -1430,6 +1446,16 @@ impl Tree {
     ) {
         let mut siblings = self.bound_below(node);
         siblings.extend(self.refused_below(node));
+        // A sibling that is lent out cannot be asked whether the member is
+        // its volume: the member queues behind the loan, undecided, and is
+        // asked again when the sibling is back.
+        if let Some(lent) = siblings.iter().copied().find(|sibling| self.lent(*sibling)) {
+            self.queue_behind(lent, node, member);
+            if let Some(found) = self.nodes.get_mut(&node) {
+                found.undecided.insert(member);
+            }
+            return;
+        }
         if self.offer(node, member, prefix, &siblings, effects) {
             return;
         }
@@ -1735,24 +1761,35 @@ impl Tree {
             return;
         };
         let start = (piece.start - offset) as usize;
-        let piece_bytes = bytes.slice(start..start + piece.len() as usize);
-        let delivery = Delivery {
+        let arrived = Arrived {
             volume: VolumeIndex(0),
             offset: piece.start - range.start,
-            bytes: &piece_bytes,
+            bytes: bytes.slice(start..start + piece.len() as usize),
             provenance,
         };
-        self.deliver_to_object(window, delivery, Some(range.len()), builder, effects);
+        self.deliver_to_object(window, &arrived, Some(range.len()), builder, effects);
     }
 
     fn deliver_to_object(
         &mut self,
         node: NodeId,
-        delivery: Delivery<'_>,
+        arrived: &Arrived,
         length: Option<u64>,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        if let Some(lent) = self
+            .nodes
+            .get_mut(&node)
+            .and_then(|found| found.lent.as_mut())
+        {
+            let arrived = Arrived {
+                bytes: arrived.bytes.clone(),
+                ..*arrived
+            };
+            return lent.wait(Waiting::Delivered { arrived, length });
+        }
+        let delivery = arrived.delivery();
         let mut emits = std::mem::take(&mut self.emits);
         emits.clear();
         // The object is out of its node while it takes the delivery, so its
@@ -2211,17 +2248,7 @@ impl Tree {
                 continue;
             };
             let own = piece.shift(-(whole.start as i64));
-            let mut emits = std::mem::take(&mut self.emits);
-            emits.clear();
-            if let Some(object) = self
-                .nodes
-                .get_mut(&window)
-                .and_then(|found| found.object.as_mut())
-            {
-                object.volume_lost(VolumeIndex(0), own, &mut emits);
-            }
-            self.apply(window, &mut emits, builder, effects);
-            self.emits = emits;
+            self.volume_lost(window, VolumeIndex(0), own, builder, effects);
         }
     }
 
@@ -2246,24 +2273,14 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        let mut emits = std::mem::take(&mut self.emits);
-        emits.clear();
-        if let Some(object) = self
-            .nodes
-            .get_mut(&node)
-            .and_then(|found| found.object.as_mut())
-        {
-            object.pulled(seek, pull, &mut emits);
-        }
-        self.apply(node, &mut emits, builder, effects);
-        self.emits = emits;
+        self.reach(node, Told::Pulled { seek, pull }, builder, effects);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deliver::RecoveryKind;
+    use crate::deliver::{Delivery, RecoveryKind};
 
     mod windows;
 

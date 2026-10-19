@@ -350,7 +350,7 @@ async fn drive_to_move(pipeline: &mut Pipeline, job: JobId, scenario: &Scenario)
         if pipeline
             .graph_jobs
             .get(&job)
-            .is_some_and(|graph| graph.runs().live())
+            .is_some_and(|graph| graph.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);

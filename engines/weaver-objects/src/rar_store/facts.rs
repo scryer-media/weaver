@@ -19,6 +19,7 @@
 // cannot say, the plaintext past the payload, is the member's padding.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use unrar_rs::{
@@ -260,11 +261,11 @@ fn entry(facts: EntryFacts) -> Entry {
             (None, _) => Lock::Plain,
         },
         hash_key: None,
-        out: Out {
+        out: Arc::new(Out {
             coverage: facts.coverage,
             closed: facts.closed,
             padding: facts.padding,
-        },
+        }),
         plain_runs: CrcRuns::default(),
         parts: Default::default(),
     }

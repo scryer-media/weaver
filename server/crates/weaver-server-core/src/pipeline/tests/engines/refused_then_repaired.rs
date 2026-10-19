@@ -19,8 +19,8 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::Pipeline;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::{
-    debug_job_state, job_status_for_assert, pump_pipeline_runtime_queues, rar5_fixture_bytes,
-    retire_pipeline_database,
+    debug_job_state, hear_graph_mail, job_status_for_assert, pump_pipeline_runtime_queues,
+    rar5_fixture_bytes, retire_pipeline_database,
 };
 
 const MIXED: &str = "rar5_multifile_lz.rar";
@@ -92,7 +92,7 @@ async fn drive_to_finish(pipeline: &mut Pipeline, scenario: &Scenario) {
             && pipeline
                 .graph_jobs
                 .get(&JOB)
-                .is_some_and(|job| job.runs().live())
+                .is_some_and(|job| job.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
@@ -136,7 +136,8 @@ async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again_un
         "no set is in"
     );
 
-    // The set arrives, rules, and repairs the flipped slice.
+    // The set arrives, rules, and repairs the flipped slice: the repair goes
+    // out in the step its last block arrives, and what it came to is heard.
     let set = (0..index)
         .map(|ordinal| (1, ordinal))
         .chain((0..volume).map(|ordinal| (2, ordinal)));
@@ -144,6 +145,7 @@ async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again_un
         serve(&mut pipeline, &scenario, article).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
     }
+    hear_graph_mail(&mut pipeline, JOB).await;
     let outcomes: Vec<_> = pipeline
         .graph_jobs
         .get(&JOB)

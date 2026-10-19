@@ -49,7 +49,9 @@ pub use facts::{
 };
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
-pub use object::{Carried, Extent, Kind, Object, ObjectId, Placement, Standing};
+pub use object::{
+    Carried, Extent, Kind, Object, ObjectId, Placement, Placements, Posting, Standing,
+};
 pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
 };

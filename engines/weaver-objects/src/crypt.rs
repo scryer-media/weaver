@@ -221,6 +221,7 @@ impl Padding {
     }
 }
 
+#[derive(Clone)]
 pub struct Cbc {
     key: MemberCipherKey,
     chain: Chain,

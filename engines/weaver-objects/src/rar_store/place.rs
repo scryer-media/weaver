@@ -13,11 +13,13 @@
 // file's data stays held until a password opens it, and an open one's
 // padding past its length is envelope.
 
-use unrar_rs::{MappedSlice, StoredLayoutBuilder};
-use weaver_graph::{ByteRange, Extent, MemberId, Placement, VolumeIndex};
+use std::sync::Arc;
 
-use super::{Lock, RarStore, Volume};
-use crate::crypt::BLOCK;
+use unrar_rs::{MappedSlice, StoredLayoutBuilder};
+use weaver_graph::{ByteRange, Extent, MemberId, Placement, Placements, Posting, VolumeIndex};
+
+use super::{Entry, Lock, Out, RarStore, Volume};
+use crate::crypt::{BLOCK, Cbc};
 
 fn push(out: &mut Vec<Placement>, placement: Placement) {
     if placement.is_empty() {
@@ -316,26 +318,78 @@ impl RarStore {
         }
     }
 
-    pub(super) fn rebuild_posted(
+    // The posted bytes of these ranges of the store's volumes, as it stands
+    // now: their inverse map, and every open file's cipher with what came
+    // out of it, shared, so the cipher can be put back over the plaintext
+    // away from the store.
+    pub(super) fn posted_over(&self, ranges: &[(VolumeIndex, ByteRange)]) -> Posted {
+        let placed = Placements::take(ranges, |volume, range, out| self.place(volume, range, out));
+        let mut sealed = Vec::new();
+        for &(volume, range) in ranges {
+            for (id, part, stream) in self.linked(volume, range) {
+                if let Some(Entry {
+                    lock: Lock::Open(cbc),
+                    out,
+                    ..
+                }) = self.entries.get(id)
+                {
+                    sealed.push(Sealed {
+                        volume,
+                        part,
+                        stream: stream.start,
+                        member: MemberId(id as u32),
+                        cbc: Arc::clone(cbc),
+                        out: Arc::clone(out),
+                    });
+                }
+            }
+        }
+        Posted { placed, sealed }
+    }
+}
+
+// An open file's part of a volume: where its cipher stream starts in it, and
+// the cipher and the record of what came out of it, as they stood.
+struct Sealed {
+    volume: VolumeIndex,
+    part: ByteRange,
+    stream: u64,
+    member: MemberId,
+    cbc: Arc<Cbc>,
+    out: Arc<Out>,
+}
+
+// The store's posted bytes, apart from the store: a plain stretch is read
+// through its placements, an open file's part is sealed again from its
+// plaintext.
+pub(super) struct Posted {
+    placed: Placements,
+    sealed: Vec<Sealed>,
+}
+
+impl Posting for Posted {
+    fn posted(
         &self,
         volume: VolumeIndex,
         range: ByteRange,
-        read: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
     ) -> bool {
         let mut cursor = range.start;
-        for (id, part, stream) in self.linked(volume, range) {
-            let Some((Lock::Open(cbc), said)) =
-                self.entries.get(id).map(|entry| (&entry.lock, &entry.out))
-            else {
+        for sealed in self.sealed.iter().filter(|sealed| sealed.volume == volume) {
+            let Some(part) = sealed.part.intersect(range) else {
                 continue;
             };
             if part.start > cursor
-                && !self.read_placed(volume, ByteRange::new(cursor, part.start), read, into)
+                && !self
+                    .placed
+                    .posted(volume, ByteRange::new(cursor, part.start), read, into)
             {
                 return false;
             }
-            let member = MemberId(id as u32);
+            let stream =
+                ByteRange::at(sealed.stream + (part.start - sealed.part.start), part.len());
+            let member = sealed.member;
             let mut plain = |wanted: ByteRange, buffer: &mut Vec<u8>| -> bool {
                 read(
                     &Placement::Member {
@@ -345,25 +399,18 @@ impl RarStore {
                     buffer,
                 )
             };
-            if !cbc.seal(&said.coverage, &said.padding, stream, &mut plain, into) {
+            let said = &sealed.out;
+            if !sealed
+                .cbc
+                .seal(&said.coverage, &said.padding, stream, &mut plain, into)
+            {
                 return false;
             }
             cursor = part.end;
         }
         cursor >= range.end
-            || self.read_placed(volume, ByteRange::new(cursor, range.end), read, into)
-    }
-
-    fn read_placed(
-        &self,
-        volume: VolumeIndex,
-        range: ByteRange,
-        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
-        into: &mut Vec<u8>,
-    ) -> bool {
-        let mut placements = Vec::new();
-        self.place(volume, range, &mut placements);
-        placements.iter().map(Placement::len).sum::<u64>() == range.len()
-            && placements.iter().all(|placement| read(placement, into))
+            || self
+                .placed
+                .posted(volume, ByteRange::new(cursor, range.end), read, into)
     }
 }

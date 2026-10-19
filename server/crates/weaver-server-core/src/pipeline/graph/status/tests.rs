@@ -22,8 +22,8 @@ use crate::pipeline::download::queue::DownloadQueue;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::root::phase::{self, RootPhase};
 use crate::pipeline::tests::{
-    insert_active_job, job_status_for_assert, new_direct_pipeline, rar5_fixture_bytes,
-    standalone_job_spec, submit_decoded_segment,
+    hear_graph_mail, insert_active_job, job_status_for_assert, new_direct_pipeline,
+    rar5_fixture_bytes, standalone_job_spec, submit_decoded_segment,
 };
 
 // A graph job's reads, prepared by the test: a namespace, a summary, and the
@@ -185,6 +185,7 @@ async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, engine: Engi
         Some(crc),
     )
     .await;
+    hear_graph_mail(pipeline, job_id).await;
 }
 
 #[test]

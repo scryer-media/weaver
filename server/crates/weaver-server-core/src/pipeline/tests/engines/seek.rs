@@ -691,7 +691,7 @@ async fn run_restarting_once(
         if pipeline
             .graph_jobs
             .get(&JOB)
-            .is_some_and(|job| job.runs().live())
+            .is_some_and(|job| job.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);

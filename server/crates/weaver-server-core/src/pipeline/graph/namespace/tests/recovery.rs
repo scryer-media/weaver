@@ -17,15 +17,18 @@ impl Job {
     // done.
     fn rule(&mut self, reading: bool) {
         let mut build = self.build();
+        let mut lent = Inline::default();
         self.writer
             .rule(
                 &mut self.tree,
                 &mut build,
                 &Source,
                 (NodeId::ROOT, &|_| reading),
+                &mut lent,
                 &mut self.out,
             )
             .expect("rule");
+        self.run_lent(&mut build, lent);
     }
 
     fn set_node(&self) -> NodeId {

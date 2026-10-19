@@ -112,7 +112,7 @@ impl NamespaceWriter {
         else {
             return vec![(range, None)];
         };
-        let access = self.access(tree, retired);
+        let access = self.access(tree);
         let mut read = |placement: &Placement, into: &mut Vec<u8>| match placement {
             Placement::Member { member, range } => access.read_at(retired, *member, *range, into),
             Placement::Envelope { envelope, range } => {

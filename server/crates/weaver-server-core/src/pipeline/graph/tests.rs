@@ -340,6 +340,7 @@ async fn a_par2_set_beside_a_plain_file_adjudicates_it_clean_without_reading_bac
     // The volume's first article, which is what the sample fetches; the
     // rest stays parked.
     decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
+    hear_repair(&mut pipeline, job_id).await;
 
     let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
     let summaries = job.recovery_summary();
@@ -366,6 +367,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
     }
     pipeline.book_terminal_segment(segment_id(job_id, 0, 1), SegmentTerminalState::Missing);
+    hear_repair(&mut pipeline, job_id).await;
 
     // The repair waits for blocks, and its seek promoted the volume's
     // parked articles ahead of everything.
@@ -397,10 +399,21 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         );
     }
 
-    // The blocks arrive; the repair writes the lost slice.
+    // The blocks arrive and the repair goes out on a thread: the step that
+    // lent it returns with the slice still lost and the set not yet ruled.
     for ordinal in 1..volume_articles {
         decode(&mut pipeline, job_id, &posts, 2, ordinal, true).await;
     }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Damaged)));
+    let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
+    assert!(!matches!(
+        job.recovery_summary()[0].outcome,
+        Some(RepairOutcome::Repaired { .. })
+    ));
+
+    // What it came to returns through the run mail and is applied there.
+    hear_repair(&mut pipeline, job_id).await;
     let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
     assert_eq!(
         job.recovery_summary()[0].outcome,
@@ -499,6 +512,15 @@ async fn drain_runs(pipeline: &mut Pipeline, job_id: JobId) {
         if ended && !pipeline.graph_jobs[&job_id].runs().live() {
             return;
         }
+    }
+}
+
+// Hear the run mail until the job's repair is back, and no further: a run
+// beside it goes on.
+async fn hear_repair(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline.graph_jobs[&job_id].repair_out() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
     }
 }
 
@@ -674,6 +696,7 @@ async fn repair_the_wrong_article(pipeline: &mut Pipeline, job_id: JobId, posts:
     for ordinal in 1..posts[2].articles().count() as u32 {
         decode(pipeline, job_id, posts, 2, ordinal, true).await;
     }
+    hear_repair(pipeline, job_id).await;
     assert_eq!(
         pipeline.graph_jobs[&job_id].recovery_summary()[0].outcome,
         Some(RepairOutcome::Repaired { slices: 1 })

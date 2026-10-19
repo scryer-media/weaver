@@ -24,6 +24,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use weaver_graph::{ByteRange, MemberId, NodeId, Provenance, RestoreError, Tree, VolumeIndex};
 
+use super::loans::Loans;
 use super::passwords::Passwords;
 use super::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::checkpoint::{Pending, Snapshot};
@@ -112,6 +113,7 @@ impl GraphJob {
             root,
             builder: Box::new(weaver_objects::Objects),
             writer,
+            loans: Loans::new(runs.scope(), runs.mail()),
             runs,
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,
@@ -125,6 +127,7 @@ impl GraphJob {
         for volume in 0..job.root.map.volume_count() {
             job.after_member(VolumeIndex(volume as u32))?;
         }
+        job.repair()?;
         job.step_runs(Vec::new(), limit)?;
         Ok(Restored {
             settled: job.root.map.settled(),

@@ -115,6 +115,97 @@ impl Placement {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    // The part of this piece that starts `skip` bytes into it and runs
+    // `len` bytes: every placement maps its volume bytes one to one.
+    pub fn slice(&self, skip: u64, len: u64) -> Placement {
+        let cut = |range: &ByteRange| ByteRange::at(range.start + skip, len);
+        match self {
+            Placement::Member { member, range } => Placement::Member {
+                member: *member,
+                range: cut(range),
+            },
+            Placement::Envelope { envelope, range } => Placement::Envelope {
+                envelope: *envelope,
+                range: cut(range),
+            },
+            Placement::Held { range } => Placement::Held { range: cut(range) },
+        }
+    }
+}
+
+// The bytes posted for an object's volumes as the object stood when it
+// handed this out, read away from the object: a repair reads them on a
+// thread of its own while the object goes on taking deliveries. `read` hands
+// back what one placement holds, as it does for `Object::posted`.
+pub trait Posting: Send + Sync {
+    fn posted(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool;
+}
+
+// The inverse map of some ranges of an object's volumes, taken once: it
+// answers any range within them as `locate` did, and the bytes posted there
+// as the default `Object::posted` does.
+#[derive(Clone, Debug, Default)]
+pub struct Placements {
+    taken: Vec<(VolumeIndex, ByteRange, Vec<Placement>)>,
+}
+
+impl Placements {
+    pub fn take(
+        ranges: &[(VolumeIndex, ByteRange)],
+        mut locate: impl FnMut(VolumeIndex, ByteRange, &mut Vec<Placement>),
+    ) -> Self {
+        let taken = ranges
+            .iter()
+            .map(|&(volume, range)| {
+                let mut placements = Vec::new();
+                locate(volume, range, &mut placements);
+                (volume, range, placements)
+            })
+            .collect();
+        Self { taken }
+    }
+
+    // The pieces of `range`, cut from the ranges taken. Short of the range
+    // where it reaches past them.
+    pub fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+        let Some((_, whole, placements)) = self
+            .taken
+            .iter()
+            .find(|(at, whole, _)| *at == volume && whole.covers(range))
+        else {
+            return;
+        };
+        let mut at = whole.start;
+        for placement in placements {
+            let piece = ByteRange::at(at, placement.len());
+            at = piece.end;
+            if let Some(part) = piece.intersect(range) {
+                out.push(placement.slice(part.start - piece.start, part.len()));
+            }
+        }
+    }
+}
+
+impl Posting for Placements {
+    fn posted(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let mut placements = Vec::new();
+        self.locate(volume, range, &mut placements);
+        placements.iter().map(Placement::len).sum::<u64>() == range.len()
+            && placements.iter().all(|placement| read(placement, into))
+    }
 }
 
 // Where a range of a member lies in the object's own volumes: the forward
@@ -213,6 +304,16 @@ pub trait Object: Send + Sync {
         self.locate(volume, range, &mut placements);
         placements.iter().map(Placement::len).sum::<u64>() == range.len()
             && placements.iter().all(|placement| read(placement, into))
+    }
+
+    // What `posted` answers for these ranges of my volumes, as I stand now,
+    // owned and apart from me. An object that rebuilds its posted bytes
+    // itself hands out what that rebuilding needs, shared rather than
+    // copied.
+    fn posting(&self, ranges: &[(VolumeIndex, ByteRange)]) -> Box<dyn Posting> {
+        Box::new(Placements::take(ranges, |volume, range, out| {
+            self.locate(volume, range, out)
+        }))
     }
 
     // My volume's length is known: its member declared one, or it closed at

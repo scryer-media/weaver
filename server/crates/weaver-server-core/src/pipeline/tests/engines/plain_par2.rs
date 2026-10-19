@@ -357,11 +357,12 @@ async fn zeroed_slices_in_clean_articles_short_of_par2_recovery_fail_as_repair_u
 // A damaged slice under one volume of four blocks, the volume read front to
 // back after the payload. The set waits on its blocks, and rules the moment
 // the first of them is in: the three behind it, and the volume closing, are
-// not what it waited for.
+// not what it waited for. Its repair goes out in that step, and what it came
+// to is heard before the next article is served.
 #[tokio::test]
 async fn a_waiting_set_rules_in_the_step_its_first_block_arrives() {
     use super::harness::{JOB, admit, recovery_blocks, serve};
-    use crate::pipeline::tests::retire_pipeline_database;
+    use crate::pipeline::tests::{hear_graph_mail, retire_pipeline_database};
 
     let posts = covered(&[("lantern.bin", payload(4 * ARTICLE, 9))], 4);
     let volume = &posts[2];
@@ -380,6 +381,7 @@ async fn a_waiting_set_rules_in_the_step_its_first_block_arrives() {
     let mut ruled = None;
     for article in order {
         serve(&mut pipeline, &scenario, article).await;
+        hear_graph_mail(&mut pipeline, JOB).await;
         let outcomes: Vec<_> = pipeline.graph_jobs[&JOB]
             .recovery_summary()
             .iter()
