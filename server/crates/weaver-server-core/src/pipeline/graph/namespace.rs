@@ -121,9 +121,6 @@ pub(crate) struct NamespaceWriter {
     read_backs: u64,
     // Members carrying recovery data no object here reads, by namespace.
     unusable: Vec<(NodeId, MemberId)>,
-    // Per set, how many of its volumes were closed when it last ruled: one
-    // waiting on recovery bytes rules again once more are.
-    ruled_at: BTreeMap<NodeId, usize>,
     renamed: Vec<MemberId>,
     segments: Vec<Segment>,
     placements: Vec<Placement>,
@@ -146,7 +143,6 @@ impl NamespaceWriter {
             files: BTreeMap::new(),
             read_backs: 0,
             unusable: Vec::new(),
-            ruled_at: BTreeMap::new(),
             renamed: Vec::new(),
             segments: Vec::new(),
             placements: Vec::new(),

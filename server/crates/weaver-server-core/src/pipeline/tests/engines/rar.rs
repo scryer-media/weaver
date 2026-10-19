@@ -15,7 +15,7 @@ use weaver_model::files::FileRole;
 
 use super::harness::{
     ARTICLE, Claim, JOB, Outcome, Post, Scenario, Stall, admit, assert_same, par2_set, payload,
-    run, run_both, serve_job, try_run,
+    run, run_both, run_unprompted, serve_job, try_run,
 };
 use crate::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY;
 use crate::history::HistoryFailureKind;
@@ -856,4 +856,16 @@ async fn a_rar_set_whose_middle_volume_is_past_repair_delivers_no_volume_whole_u
         graph.status
     );
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+}
+
+// A stored RAR beside PAR2 with one article damaged: the set repairs, and
+// the delivery follows from the job's own steps, never from a look the
+// pipeline takes when it falls idle.
+#[tokio::test]
+async fn a_damaged_rar_store_under_par2_rules_and_delivers_without_an_idle_look() {
+    let scenario =
+        Scenario::new(with_par2(single_member_store_set(MEMBER, &body(), 1))).damaged(0, 2);
+    let (outcomes, moved) = run_unprompted(&scenario).await;
+    assert_eq!(outcomes, vec![Some(RepairOutcome::Repaired { slices: 1 })]);
+    assert!(moved, "the delivery waited for an idle look");
 }

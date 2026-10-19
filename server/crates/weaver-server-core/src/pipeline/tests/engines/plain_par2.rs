@@ -353,3 +353,43 @@ async fn zeroed_slices_in_clean_articles_short_of_par2_recovery_fail_as_repair_u
     assert_eq!(view.delivery.unrepaired, ["lantern.bin"]);
     assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
 }
+
+// A damaged slice under one volume of four blocks, the volume read front to
+// back after the payload. The set waits on its blocks, and rules the moment
+// the first of them is in: the three behind it, and the volume closing, are
+// not what it waited for.
+#[tokio::test]
+async fn a_waiting_set_rules_in_the_step_its_first_block_arrives() {
+    use super::harness::{JOB, admit, recovery_blocks, serve};
+    use crate::pipeline::tests::retire_pipeline_database;
+
+    let posts = covered(&[("lantern.bin", payload(4 * ARTICLE, 9))], 4);
+    let volume = &posts[2];
+    let needed = *recovery_blocks(volume)[0].last().unwrap();
+    let articles = |post: &Post| post.bytes.len().div_ceil(ARTICLE) as u32;
+    let (payload_articles, index_articles, volume_articles) =
+        (articles(&posts[0]), articles(&posts[1]), articles(volume));
+    assert!(needed + 1 < volume_articles, "blocks follow the first");
+    let scenario = Scenario::new(posts).damaged(0, 1);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario, Engine::Graph).await;
+    let order = (0..index_articles)
+        .map(|ordinal| (1, ordinal))
+        .chain([(2, 0)])
+        .chain((0..payload_articles).map(|ordinal| (0, ordinal)))
+        .chain((1..volume_articles).map(|ordinal| (2, ordinal)));
+    let mut ruled = None;
+    for article in order {
+        serve(&mut pipeline, &scenario, article).await;
+        let outcomes: Vec<_> = pipeline.graph_jobs[&JOB]
+            .recovery_summary()
+            .iter()
+            .map(|set| set.outcome)
+            .collect();
+        if outcomes == [Some(RepairOutcome::Repaired { slices: 1 })] {
+            ruled = Some(article);
+            break;
+        }
+    }
+    assert_eq!(ruled, Some((2, needed)));
+    retire_pipeline_database(pipeline).await;
+}

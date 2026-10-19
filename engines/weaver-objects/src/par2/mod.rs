@@ -167,6 +167,20 @@ impl Par2 {
         }
     }
 
+    // A set that waited on recovery blocks waits no longer once the blocks
+    // in hand cover the slices it found damaged, or once its volumes can
+    // bring no more: the wait's outcome is taken back, so the set rules in
+    // this step and repairs or fails.
+    fn end_wait(&mut self) {
+        let over = self.sets.iter().any(|(key, state)| {
+            let needed = state.needed();
+            needed > 0 && (state.recovery.len() as u64 >= needed || self.coming(key) == 0)
+        });
+        if over {
+            self.outcome = None;
+        }
+    }
+
     fn take(&mut self, volume: VolumeIndex, found: Vec<Found>) {
         for item in found {
             if self.refused {
@@ -240,10 +254,12 @@ impl Object for Par2 {
             .walker
             .deliver(delivery.offset, delivery.bytes, &mut found);
         self.take(delivery.volume, found);
+        self.end_wait();
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.volume(volume).closed = true;
+        self.end_wait();
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, _out: &mut Vec<Emit>) {
@@ -258,6 +274,7 @@ impl Object for Par2 {
                 .retain(|_, at| at.volume != volume || at.range.intersect(range).is_none());
         }
         self.take(volume, found);
+        self.end_wait();
     }
 
     fn wants(&mut self, out: &mut Vec<Seek>) {

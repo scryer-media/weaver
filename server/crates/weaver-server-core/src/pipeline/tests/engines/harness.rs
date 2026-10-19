@@ -810,6 +810,66 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
     })
 }
 
+// A graph run whose completion gate runs only when the pipeline itself
+// scheduled it, as the orchestrator's loop runs it: no idle look is taken.
+// Every article is answered one at a time and ends as a decode ends, each
+// check a step scheduled is run, and a live run is heard. Returns where the
+// job stands once nothing is queued, scheduled or running: the recovery
+// outcomes as last seen, and whether its delivery move is out.
+pub(super) async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOutcome>>, bool) {
+    fn look(pipeline: &Pipeline, outcomes: &mut Vec<Option<RepairOutcome>>) {
+        if let Some(job) = pipeline.graph_jobs.get(&JOB) {
+            *outcomes = job
+                .recovery_summary()
+                .iter()
+                .map(|set| set.outcome)
+                .collect();
+        }
+    }
+    let (_temp_dir, mut pipeline, _) = admit(scenario, Engine::Graph).await;
+    let mut outcomes = Vec::new();
+    loop {
+        while let Some(work) = pipeline
+            .jobs
+            .get_mut(&JOB)
+            .and_then(|state| state.download_queue.pop())
+        {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            serve(&mut pipeline, scenario, article).await;
+            // The tail of every decode: the last one ends the download pass.
+            if pipeline.jobs.contains_key(&JOB) && pipeline.job_decode_stage_drained(JOB) {
+                pipeline.maybe_finish_download_pass(JOB);
+            }
+            look(&pipeline, &mut outcomes);
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+        }
+        if let Some(queued) = pipeline.pending_completion_checks.pop_front() {
+            look(&pipeline, &mut outcomes);
+            pipeline.check_job_completion(queued).await;
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+            continue;
+        }
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.runs().live())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            look(&pipeline, &mut outcomes);
+            continue;
+        }
+        break;
+    }
+    look(&pipeline, &mut outcomes);
+    let moved = pipeline.inflight_moves.contains(&JOB) || finished(&pipeline);
+    retire_pipeline_database(pipeline).await;
+    (outcomes, moved)
+}
+
 // The next articles the download queue hands out: one, or with `backwards`
 // every one it holds, last first, or with `together` every one it holds, a
 // turn of each named post at a time, or with `leased` the batch a lane

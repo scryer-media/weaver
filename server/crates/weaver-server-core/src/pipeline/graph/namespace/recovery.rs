@@ -186,10 +186,7 @@ impl NamespaceWriter {
         if due.is_empty() {
             return Ok(());
         }
-        for (set, _) in self.repair(tree, builder, segments, node, &due, out)? {
-            let closed = closed_volumes(tree, set);
-            self.ruled_at.insert(set, closed);
-        }
+        self.repair(tree, builder, segments, node, &due, out)?;
         Ok(())
     }
 
@@ -258,13 +255,14 @@ impl NamespaceWriter {
     // The namespace's sets due to rule, each judged alone. A set that has
     // not ruled rules once every member it covers is closed and the
     // namespace has announced every member it will get, since a volume of
-    // its own may still be on its way behind them; one waiting on recovery
-    // bytes rules again once more of its volumes are closed than when it
-    // last ruled. It learns what it covers from its own bytes, so one that
-    // covers nothing yet rules only once a volume of its own is in: a
-    // verdict on nothing would read as settled to every member beside it,
-    // and a member it binds after would never be repaired before an engine
-    // reads it.
+    // its own may still be on its way behind them. A ruling stands until
+    // the object takes it back: a wait on recovery bytes ends in the step
+    // the object holds what it waited for, or knows it never will, and the
+    // set rules again then. It learns what it covers from its own bytes, so
+    // one that covers nothing yet rules only once a volume of its own is
+    // in: a verdict on nothing would read as settled to every member beside
+    // it, and a member it binds after would never be repaired before an
+    // engine reads it.
     fn due(&self, tree: &Tree, node: NodeId, reading: bool) -> Vec<NodeId> {
         let Some(namespace) = tree.namespace(node) else {
             return Vec::new();
@@ -275,21 +273,13 @@ impl NamespaceWriter {
             let Some(recovery) = tree.recovery(set) else {
                 return false;
             };
-            match recovery.outcome() {
-                None => {
-                    let covers = namespace.members().any(|member| recovery.covers(member.id));
-                    known
-                        && (covers || closed_volumes(tree, set) > 0)
-                        && namespace
-                            .members()
-                            .all(|member| !recovery.covers(member.id) || member.closed)
-                }
-                Some(RepairOutcome::Waiting) => {
-                    let ruled = self.ruled_at.get(&set).copied().unwrap_or(0);
-                    closed_volumes(tree, set) > ruled
-                }
-                Some(_) => false,
-            }
+            let covers = namespace.members().any(|member| recovery.covers(member.id));
+            recovery.outcome().is_none()
+                && known
+                && (covers || closed_volumes(tree, set) > 0)
+                && namespace
+                    .members()
+                    .all(|member| !recovery.covers(member.id) || member.closed)
         });
         due
     }

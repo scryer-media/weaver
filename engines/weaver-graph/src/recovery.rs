@@ -140,7 +140,9 @@ pub trait Recovery {
 
     // What the last repair came to, or `None` before one ran, and again
     // after a bind changed which members this object covers: the verdict
-    // was on other members.
+    // was on other members. A wait ends the same way, in the step the
+    // object holds the recovery data it waited for or knows no more of it
+    // can come: the owner rules again only on `None`.
     fn outcome(&self) -> Option<RepairOutcome>;
 
     // Each set the object holds, in the order it repairs them. An object

@@ -273,8 +273,13 @@ impl Object for RarRecovery {
         self.rev(volume).length = Some(length);
     }
 
+    // A recovery volume is spent whole, so a wait ends as one closes: it
+    // is in hand, or the last one is and no more can come.
     fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.rev(volume).closed = true;
+        if self.outcome == Some(RepairOutcome::Waiting) {
+            self.outcome = None;
+        }
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {

@@ -287,8 +287,13 @@ impl Object for Par3 {
         volume.front[offset..end].copy_from_slice(&delivery.bytes[..end - offset]);
     }
 
+    // A repair reads its recovery packets back from the volumes, so a wait
+    // ends as one closes: its packets are in hand, or no more can come.
     fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.volume(volume).closed = true;
+        if self.outcome == Some(RepairOutcome::Waiting) {
+            self.outcome = None;
+        }
     }
 
     // A loss is a hole in what arrived, which no packet in it passes; the

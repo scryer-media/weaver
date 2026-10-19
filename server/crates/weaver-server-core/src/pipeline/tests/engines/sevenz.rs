@@ -18,8 +18,8 @@ use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, payload, run, run_both,
-    try_run,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, par2_volumes_sliced,
+    payload, run, run_both, run_unprompted, try_run,
 };
 
 const SECRET: &str = "quill-ember-secret";
@@ -751,4 +751,41 @@ async fn a_split_7z_whose_last_volume_is_cut_short_delivers_no_volume_whole_unde
         graph.status
     );
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+}
+
+// A coded split set beside PAR2 with one article of a middle volume
+// damaged: the recovery blocks it needs are in by the time the payload is,
+// so the set rules and repairs in the step its last byte arrives, the run
+// reads on through the repaired bytes, and the delivery is scheduled by the
+// job's own steps, never by a look the pipeline takes when it falls idle.
+async fn damaged_split_rules_unprompted(count: usize, slice: u64, blocks: u32, volumes: u32) {
+    let archive = container(Lzma2Options::from_level(1).into(), None);
+    let parts = split(&archive, count);
+    let files: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let mut posts = par2_volumes_sliced("lantern", &files, slice, blocks, volumes);
+    let recovery: Vec<Post> = posts.split_off(1);
+    let first = posts.len() as u32;
+    posts.extend(parts);
+    posts.extend(recovery);
+    let scenario = Scenario::new(posts).damaged(first + 1, 1);
+    let (outcomes, moved) = run_unprompted(&scenario).await;
+    assert!(
+        matches!(outcomes.as_slice(), [Some(RepairOutcome::Repaired { .. })]),
+        "{outcomes:?}"
+    );
+    assert!(moved, "the delivery waited for an idle look");
+}
+
+#[tokio::test]
+async fn a_damaged_split_lzma2_7z_under_par2_rules_and_delivers_without_an_idle_look() {
+    damaged_split_rules_unprompted(3, ARTICLE as u64, 2, 1).await;
+}
+
+#[tokio::test]
+async fn a_damaged_six_volume_lzma2_7z_under_five_par2_volumes_rules_and_delivers_without_an_idle_look()
+ {
+    damaged_split_rules_unprompted(6, ARTICLE as u64 / 4, 16, 5).await;
 }
