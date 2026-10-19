@@ -4,10 +4,10 @@
 //! The torrents' download rate under the global download limit, laid over
 //! their open sessions.
 
-use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use librqbit::Session;
+use librqbit::limits::LimitKind;
 
 /// The download rate torrents may move at, shared between the open
 /// sessions by the same work-conserving predicate that shares the global
@@ -89,24 +89,17 @@ pub fn session_rates(rate: Option<u64>, used: &[u64]) -> Vec<Option<u64>> {
         .collect()
 }
 
-/// Put `rate` in force on `session`'s downloads. `None` is no limit.
+/// Put `rate` in force on `session`'s downloads. `None` is no limit, and
+/// zero closes them: nothing moves until the rate opens again.
 ///
 /// The session's limiter is read on every block request, so the rate is live
 /// on the session as it is: nothing is rebuilt or reattached, and the
 /// limiter is replaced only when the rate changes, since replacing it starts
 /// a fresh burst.
-///
-/// The limiter takes a nonzero rate and no rate at all, so a rate of zero is
-/// put in force as one byte a second, which lets a block through about every
-/// four and a half hours. Holding downloads at exactly nothing needs the
-/// limiter to take a closed state: `Limits::set_download_bps` taking a
-/// zero rate.
 pub fn apply_torrent_rate(session: &Session, rate: Option<u64>) {
-    let bps = rate.map(|rate| {
-        NonZeroU32::new(u32::try_from(rate).unwrap_or(u32::MAX).max(1)).unwrap_or(NonZeroU32::MIN)
-    });
-    if session.ratelimits.get_download_bps() != bps {
-        session.ratelimits.set_download_bps(bps);
+    let kind = LimitKind::from(rate.map(|rate| u32::try_from(rate).unwrap_or(u32::MAX)));
+    if session.ratelimits.get_download_bps() != kind {
+        session.ratelimits.set_download_bps(kind);
     }
 }
 

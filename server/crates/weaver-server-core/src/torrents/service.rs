@@ -5,13 +5,12 @@
 //! route, are read back as one state with its reason, and leave as history.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use librqbit::api::TorrentIdOrHash;
-use librqbit::limits::LimitsConfig;
+use librqbit::limits::{LimitKind, LimitsConfig};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent, Session,
     torrent_from_bytes,
@@ -1445,7 +1444,7 @@ impl TorrentService {
             let limit = settings
                 .policy(&torrent.record)
                 .and_then(|policy| policy.max_upload_bps)
-                .and_then(|bps| NonZeroU32::new(bps.min(u64::from(u32::MAX)) as u32));
+                .map(|bps| u32::try_from(bps).unwrap_or(u32::MAX));
             (
                 settings.scope(torrent.record.category_id),
                 bytes,
@@ -1480,8 +1479,8 @@ impl TorrentService {
             output_folder: Some(dir),
             storage_factory: Some(factory.boxed_factory()),
             ratelimits: LimitsConfig {
-                upload_bps: limit,
-                download_bps: None,
+                upload_bps: LimitKind::from(limit),
+                download_bps: LimitKind::Unlimited,
             },
             ..Default::default()
         };

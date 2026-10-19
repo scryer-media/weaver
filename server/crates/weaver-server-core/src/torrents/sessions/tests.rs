@@ -409,7 +409,7 @@ async fn a_route_that_goes_down_holds_closed_until_it_is_back() {
 // that opens later takes its share at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_torrent_rate_is_shared_across_the_open_sessions() {
-    use std::num::NonZeroU32;
+    use librqbit::limits::LimitKind;
 
     let dir = tempfile::tempdir().unwrap();
     let routes = Arc::new(FakeRoutes::default());
@@ -420,7 +420,11 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
-    let rate = |session: &Session| session.ratelimits.get_download_bps().map(NonZeroU32::get);
+    let rate = |session: &Session| match session.ratelimits.get_download_bps() {
+        LimitKind::Unlimited => None,
+        LimitKind::Closed => Some(0),
+        LimitKind::Bps(bps) => Some(bps.get()),
+    };
 
     let one = sessions
         .session(&routes.plan(TorrentScope::Default).unwrap())
@@ -437,9 +441,9 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
     assert_eq!((rate(&one), rate(&two)), (Some(500_000), Some(500_000)));
     assert_eq!(sessions.rates().download_bps(), 0);
 
-    // Nothing is a rate of one byte a second, the least the limiter takes.
+    // Nothing closes the sessions.
     sessions.rates().set(Some(0));
-    assert_eq!((rate(&one), rate(&two)), (Some(1), Some(1)));
+    assert_eq!((rate(&one), rate(&two)), (Some(0), Some(0)));
     sessions.rates().set(None);
     assert_eq!((rate(&one), rate(&two)), (None, None));
     sessions.stop_all().await;
