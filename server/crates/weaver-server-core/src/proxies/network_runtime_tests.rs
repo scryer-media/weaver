@@ -1218,8 +1218,8 @@ async fn torrent_scopes_on_one_leg_keep_its_stage_until_the_last_goes() {
         config.consumers.insert(consumer.key());
     }
     runtime.apply_configuration(config.clone()).unwrap();
-    let tv_leg = runtime.torrent_leg(tv, 1, timeout).unwrap();
-    let film_leg = runtime.torrent_leg(film, 1, timeout).unwrap();
+    let tv_leg = runtime.torrent_leg(tv, 0, 1, timeout).unwrap();
+    let film_leg = runtime.torrent_leg(film, 0, 1, timeout).unwrap();
     assert!(Arc::ptr_eq(&tv_leg.stage, &film_leg.stage));
     let server_stage = |id| {
         runtime
@@ -1238,7 +1238,7 @@ async fn torrent_scopes_on_one_leg_keep_its_stage_until_the_last_goes() {
     assert!(!film_leg.stage.is_revoked());
     assert!(Arc::ptr_eq(
         &film_leg.stage,
-        &runtime.torrent_leg(film, 1, timeout).unwrap().stage
+        &runtime.torrent_leg(film, 0, 1, timeout).unwrap().stage
     ));
 
     config.consumers.remove(&Consumer::Torrent(film).key());

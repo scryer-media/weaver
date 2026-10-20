@@ -23,8 +23,8 @@ use sha1::{Digest, Sha1};
 use crate::StateError;
 use crate::persistence::Database;
 use crate::proxies::{
-    Consumer, EgressBinding, EgressHealth, EgressInterface, LegPath, NetworkRuntime, RoutingPolicy,
-    SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope,
+    Consumer, EgressBinding, EgressHealth, EgressInterface, LegPath, NetworkRuntime, RouteLeg,
+    RoutingPolicy, SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope,
 };
 use crate::settings::TorrentEncryption;
 use crate::torrents::identity::ClientIdentity;
@@ -72,12 +72,31 @@ pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Rout
     }
 }
 
-/// A torrent scope's route as it stands: its one leg, and whether that leg
-/// is up.
+/// The leg a route runs on: the first that is up, else the first, with why
+/// it is down. `down` says why a leg is down, when it is.
+pub fn first_up(
+    legs: &[RouteLeg],
+    down: impl Fn(&RouteLeg) -> Option<String>,
+) -> Option<(usize, Option<String>)> {
+    let first = down(legs.first()?);
+    if first.is_none() {
+        return Some((0, None));
+    }
+    Some(
+        (1..legs.len())
+            .find(|position| down(&legs[*position]).is_none())
+            .map_or((0, first), |position| (position, None)),
+    )
+}
+
+/// A torrent scope's route as it stands: the leg it runs on, and whether that
+/// leg is up.
 #[derive(Clone, Debug)]
 pub struct RoutePlan {
     pub scope: TorrentScope,
     pub policy: RoutingPolicy,
+    /// The route's leg it runs on, by position.
+    pub leg: usize,
     pub egress_id: u32,
     pub kind: LegKind,
     pub key: RouteKey,
@@ -140,30 +159,29 @@ impl Routes for NetworkRoutes {
         consumer
             .validate_route(&route)
             .map_err(|refusal| refusal.to_string())?;
-        let leg = route.legs.first().ok_or("the route has no leg")?.clone();
-        let key = leg_key(&self.network, leg.egress_id, &leg.path);
-        let Some(egress) = leg_egress(&self.network, leg.egress_id) else {
-            return Ok(RoutePlan {
-                scope,
-                policy,
-                egress_id: leg.egress_id,
-                kind: LegKind::System,
-                key,
-                down: Some(format!("egress {} is missing", leg.egress_id)),
-            });
-        };
-        let down = match self.network.interfaces().health(&egress, None) {
-            EgressHealth::Down(reason) => Some(reason),
-            _ if self.network.quota_blocked_egresses().contains(&egress.id) => {
-                Some("quota reached".into())
+        let interfaces = self.network.interfaces();
+        let quota_blocked = self.network.quota_blocked_egresses();
+        let (position, down) = first_up(&route.legs, |leg| {
+            let Some(egress) = leg_egress(&self.network, leg.egress_id) else {
+                return Some(format!("egress {} is missing", leg.egress_id));
+            };
+            match interfaces.health(&egress, None) {
+                EgressHealth::Down(reason) => Some(reason),
+                _ if quota_blocked.contains(&egress.id) => Some("quota reached".into()),
+                _ => None,
             }
-            _ => None,
-        };
+        })
+        .ok_or("the route has no leg")?;
+        let leg = &route.legs[position];
+        let egress = leg_egress(&self.network, leg.egress_id);
         Ok(RoutePlan {
             scope,
-            egress_id: egress.id,
-            kind: LegKind::of(&egress.binding, &leg.path),
-            key,
+            leg: position,
+            egress_id: egress.as_ref().map_or(leg.egress_id, |egress| egress.id),
+            kind: egress
+                .as_ref()
+                .map_or(LegKind::System, |egress| LegKind::of(&egress.binding, &leg.path)),
+            key: leg_key(&self.network, leg.egress_id, &leg.path),
             policy,
             down,
         })
@@ -180,7 +198,9 @@ impl Routes for NetworkRoutes {
             });
         }
         let peers = u16::try_from(peers).unwrap_or(u16::MAX);
-        let leg = self.network.torrent_leg(plan.scope, peers, self.timeout)?;
+        let leg = self
+            .network
+            .torrent_leg(plan.scope, plan.leg, peers, self.timeout)?;
         let bridge = match plan.kind {
             LegKind::Ladder => Some(leg.bridge()?),
             _ => None,

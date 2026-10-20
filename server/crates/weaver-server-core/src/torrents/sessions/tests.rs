@@ -98,6 +98,7 @@ impl Routes for FakeRoutes {
         Ok(RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
+            leg: 0,
             egress_id: SYSTEM_EGRESS_ID,
             kind: self
                 .leg
@@ -539,4 +540,49 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
     });
     assert_eq!((rate(&one), rate(&two)), (None, None));
     sessions.stop_all().await;
+}
+
+// Two VPN legs, each its own proxy on the system egress.
+fn vpn_legs() -> Vec<RouteLeg> {
+    [1, 2]
+        .map(|proxy| RouteLeg {
+            egress_id: SYSTEM_EGRESS_ID,
+            weight: 50,
+            path: LegPath::Ladder {
+                rungs: vec![Rung::Proxy { id: proxy }],
+                direct_fallback: false,
+            },
+        })
+        .into()
+}
+
+#[test]
+fn a_route_runs_on_its_first_leg_that_is_up() {
+    let legs = vpn_legs();
+    let down = |downs: &'static [usize]| {
+        let legs = &legs;
+        move |leg: &RouteLeg| {
+            let position = legs.iter().position(|each| each == leg).unwrap();
+            downs
+                .contains(&position)
+                .then(|| format!("vpn {position} is down"))
+        }
+    };
+    let key = |position: usize| {
+        RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &legs[position].path)
+    };
+
+    assert_eq!(first_up(&legs, down(&[])), Some((0, None)));
+    // The first leg down: the second carries the route.
+    assert_eq!(first_up(&legs, down(&[0])), Some((1, None)));
+    // Every leg down: the route is down, for the first leg's reason.
+    assert_eq!(
+        first_up(&legs, down(&[0, 1])),
+        Some((0, Some("vpn 0 is down".into())))
+    );
+    // The first leg back: the route comes home, under a different key.
+    let (away, _) = first_up(&legs, down(&[0])).unwrap();
+    let (home, _) = first_up(&legs, down(&[])).unwrap();
+    assert_ne!(key(away), key(home));
+    assert_eq!(first_up(&[], down(&[])), None);
 }

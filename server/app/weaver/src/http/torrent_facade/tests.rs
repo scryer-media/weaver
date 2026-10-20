@@ -48,6 +48,7 @@ impl Routes for Offline {
         Ok(RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
+            leg: 0,
             egress_id: SYSTEM_EGRESS_ID,
             kind: LegKind::System,
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),
@@ -356,8 +357,8 @@ fn view(state: TorrentState) -> TorrentView {
         source: TorrentSource::Metainfo,
         state,
         detail: None,
-        category: None,
         paused_by: None,
+        category: None,
         private: false,
         forced: false,
         progress: 0.5,

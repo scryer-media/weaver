@@ -36,6 +36,7 @@ impl Routes for Offline {
         Ok(RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
+            leg: 0,
             egress_id: SYSTEM_EGRESS_ID,
             kind: LegKind::System,
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),

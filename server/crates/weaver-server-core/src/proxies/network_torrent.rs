@@ -123,11 +123,12 @@ impl TunnelProvider for TorrentProvider {
     }
 }
 impl NetworkRuntime {
-    /// The leg a torrent scope's session runs on: the first leg of the
-    /// scope's live route, which allows it `peers` connections.
+    /// The leg a torrent scope's session runs on: the scope's live route's
+    /// leg at `position`, which allows it `peers` connections.
     pub fn torrent_leg(
         &self,
         scope: TorrentScope,
+        position: usize,
         peers: u16,
         timeout: Duration,
     ) -> Result<Arc<TorrentLeg>, String> {
@@ -136,8 +137,8 @@ impl NetworkRuntime {
             .legs
             .read()
             .expect("network route legs")
-            .first()
-            .ok_or("the route has no leg")?
+            .get(position)
+            .ok_or("the route has no such leg")?
             .stage
             .clone();
         Ok(Arc::new(TorrentLeg {
