@@ -168,7 +168,7 @@ export function testedPlan(route: NetworkRoute, overrides: PathOverride, pools: 
     (leg.path.kind === "LADDER" && !leg.path.directFallback && rungDown[position]!.every(Boolean)));
   return { legDown, rungDown };
 }
-export type SpeedTestKind = "BANDWIDTH" | "USENET";
+export type SpeedTestKind = "BANDWIDTH" | "USENET" | "TORRENT";
 export type SpeedTestStatus = "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED";
 export type SabTestSize = "MB_100" | "GB_1" | "GB_10";
 /** `host` is where a run downloads from; null for a provider whose servers each carry their own. */
@@ -177,15 +177,17 @@ export type BandwidthProviderServer = { id: string; name: string; location: stri
 /**
  * A bandwidth run picks its own connections and ends itself once its rate holds steady.
  * A Usenet run takes exactly one NZB source: a SAB size, a URL, an uploaded file, or a
- * held run's uploaded file again.
+ * held run's uploaded file again. A torrent run pulls the test torrent for its duration
+ * and runs only on a torrent route.
  */
 export type SpeedTestInput = {
   kind: ConsumerKind; id: number; route?: ReturnType<typeof routeInput> | null; overrides?: PathOverride | null;
-  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null; uploadUrl?: string | null; uploadMib?: number | null } | null;
+  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null; uploadMib?: number | null } | null;
   usenet?: {
     sabSize?: SabTestSize | null; nzbUrl?: string | null; nzbUpload?: File | null; nzbRunId?: number | null;
     connections?: number | null; maxDurationSeconds: number;
   } | null;
+  torrent?: { maxDurationSeconds?: number | null } | null;
 };
 export type TestedLeg = { position: number; egressId: number; weight: number; down: boolean; downReason: string | null; path: Leg["path"]; target: number };
 export type SpeedTestResult = {
@@ -195,30 +197,32 @@ export type SpeedTestResult = {
   usenet: { articlesRequested: number; delivered: number; missing: number; failed: number; declaredBytes: number; decodedBytes: number; pipelining: boolean; tls: boolean; tlsCipherSuite: string | null } | null;
   /** `connections` is how many the run had open when it ended. */
   bandwidth: { providerId: string | null; server: string | null; url: string; connections: number } | null;
-  /** A bandwidth run's upload, once it has posted. */
+  /** A bandwidth or torrent run's upload, once it has sent. */
   upload: SpeedTestUpload | null;
   /** One per leg each second; `decodedBytes` is 0 for a bandwidth run. */
   samples: { atMs: number; leg: number; bytes: number; decodedBytes: number }[];
 };
 /**
- * What a run was asked for, as the daemon kept it: exactly one of bandwidth and usenet.
+ * What a run was asked for, as the daemon kept it: exactly one of bandwidth, usenet and torrent.
  * An uploaded NZB is named by `nzbFilename`; `nzbRunId` is set when it came from an earlier run.
  */
 export type SpeedTestRequest = {
-  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null; uploadUrl: string | null; uploadMib: number | null } | null;
+  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null; uploadMib: number | null } | null;
   usenet: {
     sabSize: SabTestSize | null; nzbUrl: string | null; nzbFilename: string | null; nzbRunId: number | null;
     connections: number | null; maxDurationSeconds: number;
   } | null;
+  torrent: { maxDurationSeconds: number } | null;
 };
-export type UploadOutcome = "NOT_CONFIGURED" | "MEASURED" | "FAILED" | "NO_DEMAND";
+export type UploadOutcome = "UNAVAILABLE" | "MEASURED" | "FAILED" | "NO_DEMAND";
 /**
- * What a bandwidth run sent: a post to its upload URL, and the test torrent's
- * pieces to leechers while torrents are on. `peers` counts only what peers
- * asked for, so its rate is a floor.
+ * What a run sent: a bandwidth run's post to its provider, and the test torrent's
+ * pieces to leechers while torrents are on. `peers` counts only what peers asked
+ * for, so its rate is a floor. A torrent run posts nothing, so `http` is null.
+ * `provider` names a provider that takes no upload.
  */
 export type SpeedTestUpload = {
-  http: { outcome: UploadOutcome; url: string | null; bytes: number | null; elapsedMs: number | null; bps: number | null; failure: SpeedTestFailure | null };
+  http: { outcome: UploadOutcome; provider: string | null; url: string | null; bytes: number | null; elapsedMs: number | null; bps: number | null; failure: SpeedTestFailure | null } | null;
   peers: { outcome: UploadOutcome; bytes: number | null; elapsedMs: number | null; bps: number | null; peers: number | null; error: string | null } | null;
 };
 /** Why a run failed: the web words each code; OTHER, or a code it does not know, shows `message`. */

@@ -6,6 +6,7 @@ import { useLocation } from "react-router";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import {
+  isTorrentConsumer,
   noOverrides,
   routeInput,
   routeTargets,
@@ -103,9 +104,12 @@ function nzbLabel(t: Translate, usenet: NonNullable<SpeedTestRun["request"]["use
   return usenet.nzbFilename ?? urlHost(usenet.nzbUrl ?? "") ?? t("next.networking.speed.nzbUrl");
 }
 
-/** What a run measured with, as it was asked: the provider, or the NZB. */
+/** What a run measured with, as it was asked: the provider, the NZB, or how long it pulled a torrent. */
 function kindSummary(t: Translate, run: SpeedTestRun, providers: BandwidthProvider[]): string {
-  const { bandwidth, usenet } = run.request;
+  const { bandwidth, usenet, torrent } = run.request;
+  if (torrent) {
+    return t("next.networking.speed.kindTorrent", { seconds: torrent.maxDurationSeconds });
+  }
   if (bandwidth) {
     const id = bandwidth.providerId;
     return id ? (providers.find((provider) => provider.id === id)?.name ?? id) : t("next.networking.speed.customUrl");
@@ -119,11 +123,17 @@ function kindSummary(t: Translate, run: SpeedTestRun, providers: BandwidthProvid
 
 /** What a run measured against, as the box its route's flow ends at: its name, then where it is. */
 function runEndpoint(t: Translate, run: SpeedTestRun, providers: BandwidthProvider[]): { title: string; detail: string } {
-  const { bandwidth, usenet } = run.request;
+  const { bandwidth, usenet, torrent } = run.request;
   if (usenet) {
     return {
       title: consumerName(t, run.consumer, run.consumerName),
       detail: `${t("next.networking.speed.usenet")} · ${nzbLabel(t, usenet)}`,
+    };
+  }
+  if (torrent) {
+    return {
+      title: consumerName(t, run.consumer, run.consumerName),
+      detail: t("next.networking.speed.kindTorrent", { seconds: torrent.maxDurationSeconds }),
     };
   }
   const id = bandwidth?.providerId;
@@ -191,7 +201,7 @@ function livePools(run: SpeedTestRun): PoolFlow[] {
  * with the run, so the new run names the run instead.
  */
 function requestInput(run: SpeedTestRun, owner: Consumer): SpeedTestInput {
-  const { bandwidth, usenet } = run.request;
+  const { bandwidth, usenet, torrent } = run.request;
   return {
     kind: owner.kind,
     id: owner.id,
@@ -209,7 +219,6 @@ function requestInput(run: SpeedTestRun, owner: Consumer): SpeedTestInput {
             providerId: bandwidth.providerId,
             server: bandwidth.server,
             customUrl: bandwidth.customUrl,
-            uploadUrl: bandwidth.uploadUrl,
             uploadMib: bandwidth.uploadMib,
           },
         }
@@ -225,6 +234,7 @@ function requestInput(run: SpeedTestRun, owner: Consumer): SpeedTestInput {
           },
         }
       : {}),
+    ...(torrent ? { torrent: { maxDurationSeconds: torrent.maxDurationSeconds } } : {}),
   };
 }
 
@@ -485,9 +495,11 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
     setPicked([null, null]);
     if (next) {
       // The test carries over; only what the new route cannot take gives way: only
-      // a server has a Usenet test, and it takes no more connections than its cap.
+      // a server has a Usenet test, and it takes no more connections than its cap;
+      // only a torrent route has a torrent test.
       setForm((current) =>
-        next.kind !== "SERVER"
+        (current.kind === "USENET" && next.kind !== "SERVER") ||
+        (current.kind === "TORRENT" && !isTorrentConsumer(next.kind))
           ? { ...current, kind: "BANDWIDTH" }
           : { ...current, connections: Math.min(current.connections, Math.max(1, next.cap)) },
       );
@@ -498,11 +510,15 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
     testedPlan(route, overrides, data.proxyPools)
       .legDown.flatMap((isDown, position) => (isDown ? [position] : [])),
   );
-  // A bandwidth test opens one connection on each leg still up and adds more while the rate keeps rising.
+  // A bandwidth test opens one connection on each leg still up and adds more while the rate keeps rising;
+  // a torrent test joins the swarm on the first leg still up.
+  const firstUp = route.legs.findIndex((_, position) => !down.has(position));
   const targets =
     form.kind === "USENET"
       ? routeTargets(route, form.connections, down)
-      : route.legs.map((_, position) => (down.has(position) ? 0 : 1));
+      : form.kind === "TORRENT"
+        ? route.legs.map((_, position) => (position === firstUp ? 1 : 0))
+        : route.legs.map((_, position) => (down.has(position) ? 0 : 1));
   // While this route's test runs, the flow is the route it took, moving as it measures.
   const measuring = active?.status === "RUNNING" && active.consumer === consumer.key ? active : null;
   const endpoint: FlowEndpoint = measuring

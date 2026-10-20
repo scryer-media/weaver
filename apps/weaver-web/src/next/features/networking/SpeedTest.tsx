@@ -12,6 +12,7 @@ import {
 } from "@/graphql/networking";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import {
+  isTorrentConsumer,
   type BandwidthProvider,
   type BandwidthProviderServer,
   type PathOverride,
@@ -40,8 +41,6 @@ export type TestForm = {
   providerId: string;
   server: string;
   customUrl: string;
-  /** Where a bandwidth run posts its upload; empty posts nothing. */
-  uploadUrl: string;
   nzb: SabTestSize | "URL" | "FILE";
   nzbUrl: string;
   /** One NZB file, sent with the request and held by the daemon only for as long as the run is. */
@@ -49,6 +48,8 @@ export type TestForm = {
   connections: number;
   /** How long a Usenet test may take. A bandwidth test ends itself once its rate holds steady. */
   maxDuration: number;
+  /** How long a torrent test pulls from the swarm. */
+  torrentDuration: number;
 };
 
 /** The decode chart's line, apart from the download chart's accent. */
@@ -64,12 +65,12 @@ export function defaultForm(consumer: Pick<Consumer, "kind" | "cap">): TestForm 
     providerId: "cloudflare",
     server: "",
     customUrl: "",
-    uploadUrl: "",
     nzb: "MB_100",
     nzbUrl: "",
     nzbFile: null,
     connections: consumer.cap,
     maxDuration: 120,
+    torrentDuration: 20,
   };
 }
 
@@ -110,6 +111,9 @@ export function formEndpoint(
   provider: BandwidthProvider | undefined,
   servers: BandwidthProviderServer[],
 ): { title: string; detail: string } {
+  if (form.kind === "TORRENT") {
+    return { title: consumer.name, detail: t("next.networking.speed.torrent") };
+  }
   if (form.kind === "USENET") {
     const nzb =
       form.nzb === "URL"
@@ -138,11 +142,11 @@ export function formProblem(
   if (form.kind === "USENET" && consumer.kind !== "SERVER") {
     return t("next.networking.speed.usenetNeedsServer");
   }
+  if (form.kind === "TORRENT" && !isTorrentConsumer(consumer.kind)) {
+    return t("next.networking.speed.torrentNeedsTorrentRoute");
+  }
   if (form.kind === "BANDWIDTH" && !form.providerId && !/^https:\/\/\S+$/i.test(form.customUrl.trim())) {
     return t("next.networking.speed.customUrlInvalid");
-  }
-  if (form.kind === "BANDWIDTH" && form.uploadUrl.trim() && !/^https:\/\/\S+$/i.test(form.uploadUrl.trim())) {
-    return t("next.networking.speed.uploadUrlInvalid");
   }
   if (form.kind === "USENET" && form.nzb === "URL" && !/^https?:\/\/\S+$/i.test(form.nzbUrl.trim())) {
     return t("next.networking.speed.nzbUrlInvalid");
@@ -174,8 +178,9 @@ export function speedTestInput(
       ...(form.providerId
         ? { providerId: form.providerId, ...(provider?.needsServer && form.server ? { server: form.server } : {}) }
         : { customUrl: form.customUrl.trim() }),
-      ...(form.uploadUrl.trim() ? { uploadUrl: form.uploadUrl.trim() } : {}),
     };
+  } else if (form.kind === "TORRENT") {
+    input.torrent = { maxDurationSeconds: Math.max(1, Math.min(MAX_DURATION, Math.round(form.torrentDuration))) };
   } else {
     input.usenet = {
       ...(form.nzb === "URL"
@@ -366,8 +371,9 @@ export function TestControls({
           onChange={(kind) => set({ kind })}
           className="self-start"
           options={[
-            { value: "BANDWIDTH", label: t("next.networking.speed.bandwidth") },
-            { value: "USENET", label: t("next.networking.speed.usenet"), disabled: consumer.kind !== "SERVER" },
+            { value: "BANDWIDTH" as const, label: t("next.networking.speed.bandwidth") },
+            { value: "USENET" as const, label: t("next.networking.speed.usenet"), disabled: consumer.kind !== "SERVER" },
+            ...(isTorrentConsumer(consumer.kind) ? [{ value: "TORRENT" as const, label: t("next.networking.speed.torrent") }] : []),
           ]}
         />
       </ControlLabel>
@@ -413,17 +419,18 @@ export function TestControls({
                 />
               </ControlLabel>
             )}
-            <ControlLabel label={t("next.networking.speed.uploadUrl")} className="min-w-0 flex-[0_1_480px]">
-              <TextField
-                label={t("next.networking.speed.uploadUrl")}
-                value={form.uploadUrl}
-                onChange={(uploadUrl) => set({ uploadUrl })}
-                placeholder="https://"
-                type="url"
-                className="w-full min-w-0"
-              />
-            </ControlLabel>
           </>
+        ) : form.kind === "TORRENT" ? (
+          <ControlLabel label={t("next.networking.speed.maxDuration")}>
+            <NumberField
+              label={t("next.networking.speed.maxDuration")}
+              value={form.torrentDuration}
+              min={1}
+              max={MAX_DURATION}
+              suffix="s"
+              onChange={(torrentDuration) => set({ torrentDuration })}
+            />
+          </ControlLabel>
         ) : (
           <>
             <ControlLabel label={t("next.networking.speed.nzb")}>
@@ -720,9 +727,9 @@ export function RunResult({ run, better = {} }: { run: SpeedTestRun; better?: Be
 }
 
 /**
- * What a bandwidth run sent: the post to its upload URL, and, while torrents
- * are on, the test torrent's pieces to leechers. Leechers take only what they
- * ask for, so that rate is a floor.
+ * What a run sent: a bandwidth run's post to its provider, and, while torrents
+ * are on or for a torrent run, the test torrent's pieces to leechers. Leechers
+ * take only what they ask for, so that rate is a floor.
  */
 function UploadResult({ upload }: { upload: SpeedTestUpload }) {
   const t = useTranslate();
@@ -730,7 +737,7 @@ function UploadResult({ upload }: { upload: SpeedTestUpload }) {
   const { http, peers } = upload;
   return (
     <MetricStrip min={140}>
-      {http.outcome === "MEASURED" ? (
+      {http === null ? null : http.outcome === "MEASURED" ? (
         <MetricCell variant="stat" eyebrow={t("next.networking.speed.upload")} {...rate(http.bps)} note={splitBytesLabel(http.bytes)} />
       ) : (
         <MetricCell
@@ -740,7 +747,7 @@ function UploadResult({ upload }: { upload: SpeedTestUpload }) {
           note={
             http.outcome === "FAILED" && http.failure
               ? failureMessage(t, http.failure)
-              : t(`next.networking.speed.uploadOutcome.${http.outcome}`)
+              : t(`next.networking.speed.uploadOutcome.${http.outcome}`, { provider: http.provider ?? "" })
           }
         />
       )}
