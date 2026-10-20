@@ -1278,7 +1278,11 @@ pub fn queue_item_from_submission(
         display_title: display.display_title,
         original_title: display.original_title,
         parsed_release: display.parsed_release,
-        state: QueueItemState::Queued,
+        state: if submitted.paused {
+            QueueItemState::Paused
+        } else {
+            QueueItemState::Queued
+        },
         download_state: QueueDownloadState::Queued,
         post_state: QueuePostState::Idle,
         wait_reason: None,
