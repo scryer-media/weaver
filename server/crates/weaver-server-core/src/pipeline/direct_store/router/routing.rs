@@ -1487,9 +1487,9 @@ impl DirectSetRouter {
                     Some(crypt)
                 })
                 .or_else(|| {
-                    sevenz_keys
-                        .get(&name)
-                        .map(|(keys, facts)| MemberCrypt::new_sevenz(keys.clone(), facts, unpacked_size))
+                    sevenz_keys.get(&name).map(|(keys, facts)| {
+                        MemberCrypt::new_sevenz(keys.clone(), facts, unpacked_size)
+                    })
                 });
             let member_id = self.next_member_id;
             self.next_member_id = self.next_member_id.saturating_add(1);
