@@ -107,6 +107,7 @@ const en: LocaleDictionary = {
   "jobs.egressQuotaEta": "Until {{resetAt}}",
   "jobs.serverQuotaBadge": "Server Quota",
   "jobs.serverQuotaEta": "Waiting for server quota",
+  "jobs.speedTestBadge": "Testing",
 
   // Table headers
   "table.name": "Name",

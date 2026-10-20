@@ -129,7 +129,8 @@ impl BandwidthLedgerRuntime {
     // laid over this by the shared state.
     pub(crate) fn to_download_block_state(&self, held: Option<HoldOrigin>) -> DownloadBlockState {
         let kind = match held {
-            Some(HoldOrigin::Manual | HoldOrigin::SpeedTest) => DownloadBlockKind::ManualPause,
+            Some(HoldOrigin::Manual) => DownloadBlockKind::ManualPause,
+            Some(HoldOrigin::SpeedTest) => DownloadBlockKind::SpeedTest,
             Some(HoldOrigin::Scheduled) => DownloadBlockKind::Scheduled,
             None => DownloadBlockKind::None,
         };

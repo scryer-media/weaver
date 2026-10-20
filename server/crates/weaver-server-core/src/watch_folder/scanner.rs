@@ -11,10 +11,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::categories::CategoryConfig;
-use crate::ingest::{SubmissionOptions, SubmitNzbError, submit_nzb_bytes_with_options};
+use crate::ingest::{SubmissionOptions, SubmitNzbError, classify, submit_nzb_bytes_with_options};
 use crate::jobs::SubmissionOrigin;
 use crate::runtime::fs as runtime_fs;
 use crate::settings::SharedConfig;
+use crate::torrents::service::{AddError, AddRequest, AddSource, TorrentService};
 use crate::{Database, SchedulerHandle};
 use weaver_model::files::{FileRole, archive_base_name};
 
@@ -101,6 +102,8 @@ pub struct WatchFolderScanner {
     db: Database,
     handle: SchedulerHandle,
     config: SharedConfig,
+    // The torrent client the torrents found here go to, once it runs.
+    torrents: Arc<std::sync::OnceLock<TorrentService>>,
     scan_lock: Arc<Mutex<()>>,
     transient_tracker: Arc<Mutex<TransientTracker>>,
 }
@@ -111,9 +114,15 @@ impl WatchFolderScanner {
             db,
             handle,
             config,
+            torrents: Arc::default(),
             scan_lock: Arc::new(Mutex::new(())),
             transient_tracker: Arc::new(Mutex::new(TransientTracker::default())),
         }
+    }
+
+    /// Send the torrents found from now on to `torrents`.
+    pub fn use_torrents(&self, torrents: TorrentService) {
+        let _ = self.torrents.set(torrents);
     }
 
     pub async fn scan_once(
@@ -271,40 +280,25 @@ impl WatchFolderScanner {
         for reason in intake_output.permanent_errors {
             report.push_permanent(&source_path, reason);
         }
-        for nzb in intake_output.nzbs {
-            let metadata = vec![
-                ("source".to_string(), "watch_folder".to_string()),
-                ("watch_path".to_string(), display_path(&source_path)),
-            ];
-            match submit_nzb_bytes_with_options(
-                &self.db,
-                &self.handle,
-                &self.config,
-                &nzb.bytes,
-                Some(nzb.filename.clone()),
-                None,
-                candidate.category.clone(),
-                metadata,
-                SubmissionOptions {
-                    origin: SubmissionOrigin::WatchFolder,
-                    ..SubmissionOptions::default()
-                },
-            )
-            .await
-            {
-                Ok(job) => {
+        for entry in intake_output.nzbs {
+            let added = match classify(&entry.bytes).torrent(entry.bytes) {
+                Ok(source) => self.add_torrent(source, candidate.category.clone()).await,
+                Err(bytes) => self.submit_nzb(&bytes, &entry.filename, &candidate).await,
+            };
+            match added {
+                Added::Queued(job_id) => {
                     queued += 1;
                     report
                         .queued_nzbs
-                        .push(format!("{}:{}", job.job_id.0, nzb.filename));
+                        .push(format!("{job_id}:{}", entry.filename));
                 }
-                Err(error) if is_permanent_submit_error(&error) => {
+                Added::Permanent(error) => {
                     permanent += 1;
-                    report.push_permanent(&source_path, format!("{}: {error}", nzb.filename));
+                    report.push_permanent(&source_path, format!("{}: {error}", entry.filename));
                 }
-                Err(error) => {
+                Added::Transient(error) => {
                     transient += 1;
-                    report.push_transient(&source_path, format!("{}: {error}", nzb.filename));
+                    report.push_transient(&source_path, format!("{}: {error}", entry.filename));
                 }
             }
         }
@@ -335,6 +329,58 @@ impl WatchFolderScanner {
             SourceDisposition::MarkPartial => {
                 claimed.mark(".partial", report);
                 self.clear_transient(&source_path).await;
+            }
+        }
+    }
+
+    async fn submit_nzb(&self, bytes: &[u8], filename: &str, candidate: &Candidate) -> Added {
+        let metadata = vec![
+            ("source".to_string(), "watch_folder".to_string()),
+            ("watch_path".to_string(), display_path(&candidate.path)),
+        ];
+        match submit_nzb_bytes_with_options(
+            &self.db,
+            &self.handle,
+            &self.config,
+            bytes,
+            Some(filename.to_owned()),
+            None,
+            candidate.category.clone(),
+            metadata,
+            SubmissionOptions {
+                origin: SubmissionOrigin::WatchFolder,
+                ..SubmissionOptions::default()
+            },
+        )
+        .await
+        {
+            Ok(job) => Added::Queued(job.job_id.0),
+            Err(error) if is_permanent_submit_error(&error) => Added::Permanent(error.to_string()),
+            Err(error) => Added::Transient(error.to_string()),
+        }
+    }
+
+    // A torrent goes to the torrent client with the folder's category, whose
+    // route it takes. A refusal that a change of route or settings can lift
+    // is tried again.
+    async fn add_torrent(&self, source: AddSource, category: Option<String>) -> Added {
+        let Some(torrents) = self.torrents.get() else {
+            return Added::Transient("the torrent client is not running".into());
+        };
+        let request = AddRequest {
+            source,
+            category,
+            policy_override: None,
+            paused: false,
+            forced: false,
+        };
+        match torrents.add(request).await {
+            Ok(job_id) => Added::Queued(job_id.0),
+            Err(error @ (AddError::Invalid(_) | AddError::Refused(_) | AddError::Duplicate(_))) => {
+                Added::Permanent(error.to_string())
+            }
+            Err(error @ (AddError::NoNetwork(_) | AddError::Off | AddError::State(_))) => {
+                Added::Transient(error.to_string())
             }
         }
     }
@@ -370,6 +416,13 @@ impl WatchFolderScanner {
     async fn clear_transient(&self, path: &Path) {
         self.transient_tracker.lock().await.clear(path);
     }
+}
+
+// How one entry of a source went.
+enum Added {
+    Queued(u64),
+    Permanent(String),
+    Transient(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1249,5 +1302,195 @@ mod tests {
     fn make_stale(path: &Path) {
         let stale_time = SystemTime::now() - CLAIM_STALE_AFTER - Duration::from_secs(1);
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(stale_time)).unwrap();
+    }
+
+    mod torrents {
+        use super::*;
+        use crate::settings::Config;
+        use crate::torrents::service::{JobEnv, SystemClock, TorrentSettings};
+        use crate::torrents::sessions::tests::{FakeRoutes, env};
+        use crate::torrents::sessions::{Routes, Sessions};
+        use crate::{PipelineMetrics, SharedPipelineState};
+        use sha1::{Digest, Sha1};
+
+        struct Rig {
+            scanner: WatchFolderScanner,
+            torrents: TorrentService,
+            routes: Arc<FakeRoutes>,
+            db: Database,
+            folder: tempfile::TempDir,
+            _dir: tempfile::TempDir,
+        }
+
+        fn tv() -> CategoryConfig {
+            CategoryConfig {
+                torrent_route: true,
+                ..category("tv")
+            }
+        }
+
+        async fn rig() -> Rig {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = tempfile::tempdir().unwrap();
+            let db = Database::open_in_memory().unwrap();
+            let routes = Arc::new(FakeRoutes::default());
+            let sessions = Sessions::new(
+                Arc::clone(&routes) as Arc<dyn Routes>,
+                env(&dir.path().join("sessions")),
+                db.clone(),
+            );
+            let settings = TorrentSettings {
+                complete_dir: dir.path().join("complete"),
+                categories: vec![tv()],
+                seeding: None,
+                torrent: crate::settings::TorrentConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            };
+            let torrents = TorrentService::new(
+                db.clone(),
+                sessions,
+                settings,
+                JobEnv::unbounded(),
+                Arc::new(SystemClock),
+            );
+            torrents.open().await.unwrap();
+            let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(16);
+            let (event_tx, _) = tokio::sync::broadcast::channel(16);
+            let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+            let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
+            let config = Arc::new(tokio::sync::RwLock::new(Config {
+                seeding: None,
+                torrent: Default::default(),
+                data_dir: dir.path().display().to_string(),
+                hardware_profile: None,
+                intermediate_dir: None,
+                complete_dir: None,
+                buffer_pool: None,
+                servers: vec![],
+                categories: vec![tv()],
+                retry: None,
+                bandwidth: Default::default(),
+                cleanup_after_extract: None,
+                propagation_delay_secs: None,
+                watch_folder: WatchFolderConfig::default(),
+                duplicate_policy: Default::default(),
+                direct_store: None,
+                direct_unpack: None,
+                delivery_naming: None,
+                metrics: Default::default(),
+                config_path: None,
+            }));
+            let scanner = WatchFolderScanner::new(db.clone(), handle, config);
+            Rig {
+                scanner,
+                torrents,
+                routes,
+                db,
+                folder,
+                _dir: dir,
+            }
+        }
+
+        impl Rig {
+            async fn scan(&self) -> WatchFolderScanReport {
+                self.scanner
+                    .scan_once(WatchFolderConfig {
+                        mode: crate::watch_folder::WatchFolderMode::Polling,
+                        path: Some(self.folder.path().display().to_string()),
+                        poll_interval_secs: 60,
+                        stability_secs: 0,
+                        category_from_subfolders: true,
+                        scanning_paused: false,
+                    })
+                    .await
+                    .unwrap()
+            }
+
+            fn put(&self, name: &str, bytes: &[u8]) -> PathBuf {
+                let tv = self.folder.path().join("tv");
+                fs::create_dir_all(&tv).unwrap();
+                let path = tv.join(name);
+                fs::write(&path, bytes).unwrap();
+                path
+            }
+        }
+
+        fn bstr(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(format!("{}:", bytes.len()).as_bytes());
+            out.extend_from_slice(bytes);
+        }
+
+        // A one-file torrent's metainfo.
+        fn metainfo(name: &str) -> Vec<u8> {
+            let data = [7u8; 3000];
+            let pieces: Vec<u8> = data
+                .chunks(1024)
+                .flat_map(|chunk| Sha1::digest(chunk).to_vec())
+                .collect();
+            let mut out = b"d4:infod6:lengthi3000e".to_vec();
+            bstr(&mut out, b"name");
+            bstr(&mut out, name.as_bytes());
+            out.extend_from_slice(b"12:piece lengthi1024e");
+            bstr(&mut out, b"pieces");
+            bstr(&mut out, &pieces);
+            out.extend_from_slice(b"ee");
+            out
+        }
+
+        // The file's name says nothing: what it holds decides.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_torrent_file_is_added_with_the_folders_category_and_marked_queued() {
+            let rig = rig().await;
+            rig.scanner.use_torrents(rig.torrents.clone());
+            let source = rig.put("set.torrent", &metainfo("set.bin"));
+
+            let report = rig.scan().await;
+
+            assert_eq!(report.queued_nzbs.len(), 1, "{report:?}");
+            assert!(!source.exists());
+            assert!(rig.folder.path().join("tv/set.torrent.queued").exists());
+            let stored = rig.db.list_torrents().unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].name, "set.bin");
+            assert_eq!(stored[0].category_id, Some(1));
+
+            // The same torrent again is refused for good.
+            let again = rig.put("again.nzb", &metainfo("set.bin"));
+            let report = rig.scan().await;
+            assert!(report.queued_nzbs.is_empty());
+            assert!(!again.exists());
+            assert!(rig.folder.path().join("tv/again.nzb.error").exists());
+        }
+
+        // A magnet the route cannot fetch yet waits in the folder for the next scan.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_magnet_file_goes_to_the_torrent_client_and_waits_while_it_refuses() {
+            let rig = rig().await;
+            let hash = "0123456789abcdef0123456789abcdef01234567";
+            let source = rig.put(
+                "set.magnet",
+                format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce\n")
+                    .as_bytes(),
+            );
+
+            let report = rig.scan().await;
+            assert!(source.exists(), "{report:?}");
+            assert!(
+                report
+                    .transient_errors
+                    .iter()
+                    .any(|issue| issue.reason.contains("the torrent client is not running")),
+                "{report:?}"
+            );
+
+            rig.scanner.use_torrents(rig.torrents.clone());
+            rig.routes.set_down(Some("tunnel gone"));
+            let report = rig.scan().await;
+            assert!(source.exists(), "{report:?}");
+            assert!(report.queued_nzbs.is_empty());
+            assert!(rig.db.list_torrents().unwrap().is_empty());
+        }
     }
 }

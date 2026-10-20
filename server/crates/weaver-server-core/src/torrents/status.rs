@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use librqbit::{TorrentStats, TorrentStatsState, TrackerAnnounce};
 
 use crate::jobs::JobId;
+use crate::jobs::handle::HoldTarget;
 use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
 use crate::settings::{SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
@@ -240,16 +241,31 @@ pub struct Queued {
     pub complete: bool,
     pub forced: bool,
     pub paused: bool,
+    /// Under a tracker rule that never pauses, still downloading or with
+    /// its seeding goal to meet.
+    pub runs_through_schedule: bool,
+}
+
+impl Queued {
+    /// The torrent as the holds are asked about it.
+    pub fn target(&self) -> HoldTarget {
+        HoldTarget {
+            owner: HoldOwner::Torrents,
+            complete: self.complete,
+            runs_through_schedule: self.runs_through_schedule,
+        }
+    }
 }
 
 /// The torrents the queue lets run: of those no hold stops, every forced
 /// or complete one, and the first `max_active` of the rest that are not
-/// paused.
+/// paused. Only a torrent still downloading takes one of the `max_active`
+/// slots.
 pub fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> BTreeSet<JobId> {
     let mut slots = max_active as usize;
     let mut active = BTreeSet::new();
     for torrent in torrents {
-        if holds.stops(HoldOwner::Torrents, torrent.complete) {
+        if holds.reason_for(torrent.target()).is_some() {
             continue;
         }
         if torrent.forced || torrent.complete {
@@ -575,6 +591,7 @@ mod tests {
             complete,
             forced,
             paused,
+            runs_through_schedule: false,
         };
         let torrents = [
             torrent(1, true, false, false),
@@ -611,6 +628,101 @@ mod tests {
         assert!(ids(hold(HoldScope::Everything, HoldOwner::Torrents)).is_empty());
         assert_eq!(eta_seconds(1000, 300), Some(4));
         assert_eq!(eta_seconds(1000, 0), None);
+    }
+
+    // The limit counts the torrents still downloading: however many are
+    // complete, forced or paused, the first `max_active` of the rest run,
+    // and a limit of zero runs none of them.
+    #[test]
+    fn only_downloading_torrents_take_a_slot() {
+        let torrent = |id, complete| Queued {
+            job_id: JobId(id),
+            complete,
+            forced: false,
+            paused: false,
+            runs_through_schedule: false,
+        };
+        let torrents = [
+            torrent(1, true),
+            torrent(2, true),
+            torrent(3, false),
+            torrent(4, true),
+            torrent(5, false),
+            torrent(6, false),
+        ];
+        let ids = |max_active| {
+            active(&torrents, max_active, &HoldSet::default())
+                .into_iter()
+                .map(|id| id.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(0), [1, 2, 4]);
+        assert_eq!(ids(1), [1, 2, 3, 4]);
+        assert_eq!(ids(2), [1, 2, 3, 4, 5]);
+        assert_eq!(ids(9), [1, 2, 3, 4, 5, 6]);
+    }
+
+    // The schedule's torrent pause leaves a torrent that seeds through it;
+    // the operator's pause, a speed test's and a pause of the downloads
+    // reach it as they reach any other.
+    #[test]
+    fn a_torrent_that_seeds_through_the_schedule_runs_through_its_holds_alone() {
+        use crate::jobs::{Hold, HoldScope};
+
+        let held = |origin, scope, owner| {
+            let mut holds = HoldSet::default();
+            holds.hold(Hold {
+                origin,
+                scope,
+                owner,
+            });
+            holds
+        };
+        let through = Queued {
+            job_id: JobId(1),
+            complete: true,
+            forced: false,
+            paused: false,
+            runs_through_schedule: true,
+        };
+        let plain = Queued {
+            job_id: JobId(2),
+            runs_through_schedule: false,
+            ..through
+        };
+        let window = held(
+            HoldOrigin::Scheduled,
+            HoldScope::Everything,
+            HoldOwner::Torrents,
+        );
+        assert_eq!(
+            active(&[through, plain], 3, &window),
+            BTreeSet::from([JobId(1)])
+        );
+        assert!(window.spares(through.target()));
+        assert!(!window.spares(plain.target()));
+        assert_eq!(
+            window.reason_for(plain.target()),
+            Some(HoldOrigin::Scheduled)
+        );
+        let everything = held(HoldOrigin::Scheduled, HoldScope::Everything, HoldOwner::All);
+        assert_eq!(everything.reason_for(through.target()), None);
+
+        for holds in [
+            held(
+                HoldOrigin::Manual,
+                HoldScope::Everything,
+                HoldOwner::Torrents,
+            ),
+            held(HoldOrigin::SpeedTest, HoldScope::Everything, HoldOwner::All),
+        ] {
+            assert!(active(&[through], 3, &holds).is_empty());
+            assert!(!holds.spares(through.target()));
+        }
+        // Nothing to spare when no hold reaches it.
+        let downloads = held(HoldOrigin::Scheduled, HoldScope::Downloads, HoldOwner::All);
+        assert!(!downloads.spares(through.target()));
+        assert!(!HoldSet::default().spares(through.target()));
     }
 
     #[test]

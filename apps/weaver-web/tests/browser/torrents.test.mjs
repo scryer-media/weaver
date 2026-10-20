@@ -45,54 +45,49 @@ test("a wait reason that is a sentence is shown as the daemon wrote it", async (
   await page.close();
 });
 
-test("the add dialog takes a torrent file and a magnet link, each sent through submitTorrent", async () => {
+test("the add dialog sends a torrent file and a magnet link through submit, read for what they are", async () => {
   const { page, errors } = await open("add");
   const dialog = page.getByRole("dialog", { name: "Add", exact: true });
   await dialog.waitFor();
-  // Torrent options show only once there is a torrent to add.
-  assert.equal(await dialog.getByRole("switch", { name: "Add paused", exact: true }).count(), 0);
-  await page.locator("input[type=file]").setInputFiles({ name: "fixture.torrent", mimeType: "application/x-bittorrent", buffer: Buffer.from(METAINFO) });
-  await dialog.getByText("fixture.torrent", { exact: true }).waitFor();
-  assert.equal(await dialog.getByText("Only .nzb", { exact: false }).count(), 0);
+  // The name says nothing: the daemon reads the bytes, and a torrent is not staged.
+  await page.locator("input[type=file]").setInputFiles({ name: "fixture.bin", mimeType: "application/octet-stream", buffer: Buffer.from(METAINFO) });
+  await dialog.getByText("fixture.bin", { exact: true }).waitFor();
+  await dialog.getByText("staged", { exact: true }).waitFor();
   await dialog.getByRole("switch", { name: "Add paused", exact: true }).click();
-  await dialog.getByRole("switch", { name: "Force", exact: true }).click();
 
-  // Text that is not a magnet link is named as such, and holds the submit back.
-  const magnet = dialog.getByRole("textbox", { name: "Magnet link", exact: true });
-  await magnet.fill("https://example.invalid/file");
-  await dialog.getByText("Not a magnet link", { exact: true }).waitFor();
+  const link = dialog.getByRole("textbox", { name: "Link", exact: true });
+  await link.fill("magnet:?xt=urn:btih:duplicate");
   const submit = dialog.getByRole("button", { name: /^Add/ });
-  assert.equal(await submit.isDisabled(), true);
-  await magnet.fill("magnet:?xt=urn:btih:duplicate");
-  assert.equal(await submit.isDisabled(), false);
   await submit.click();
 
   // The daemon's refusal is shown as it gave it, and the dialog stays open for it.
   await dialog.getByText("This torrent is already in the queue.", { exact: true }).waitFor();
-  const submitted = (await sent(page)).filter((entry) => entry.name === "SubmitTorrent").map((entry) => entry.variables.input);
+  const input = { upload: null, category: null, paused: true, password: null };
+  const submitted = (await sent(page)).filter((entry) => entry.name === "Submit").map((entry) => entry.variables);
   assert.deepEqual(submitted, [
-    { category: null, paused: true, forced: true, metainfoBase64: Buffer.from(METAINFO).toString("base64") },
-    { category: null, paused: true, forced: true, magnet: "magnet:?xt=urn:btih:duplicate" },
+    { input: { ...input, text: "magnet:?xt=urn:btih:duplicate" } },
+    { input: { ...input, text: null }, file: "fixture.bin" },
   ]);
   assert.equal(await page.locator("#status").innerText(), "");
 
   // Sent again, the file already in is not sent twice, and the dialog closes once nothing is refused.
-  await magnet.fill("magnet:?xt=urn:btih:fresh");
+  await link.fill("magnet:?xt=urn:btih:fresh");
   await submit.click();
   await page.locator("#status").filter({ hasText: /^closed$/ }).waitFor();
-  const again = (await sent(page)).filter((entry) => entry.name === "SubmitTorrent").slice(2).map((entry) => entry.variables.input);
-  assert.deepEqual(again, [{ category: null, paused: true, forced: true, magnet: "magnet:?xt=urn:btih:fresh" }]);
+  const again = (await sent(page)).filter((entry) => entry.name === "Submit").slice(2).map((entry) => entry.variables);
+  assert.deepEqual(again, [{ input: { ...input, text: "magnet:?xt=urn:btih:fresh" } }]);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
 
-test("a file that is neither an NZB nor a torrent is refused", async () => {
+test("a file the daemon cannot read shows its refusal on its row", async () => {
   const { page, errors } = await open("add");
   const dialog = page.getByRole("dialog", { name: "Add", exact: true });
   await dialog.waitFor();
   await page.locator("input[type=file]").setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("x") });
-  await dialog.getByText(/\.nzb/).first().waitFor();
-  assert.equal(await dialog.getByText("notes.txt", { exact: true }).count(), 0);
+  await dialog.getByText("notes.txt", { exact: true }).waitFor();
+  await dialog.getByText("not an NZB", { exact: true }).waitFor();
+  assert.equal(await dialog.getByRole("button", { name: /^Add/ }).isDisabled(), true);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });

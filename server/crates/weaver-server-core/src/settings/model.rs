@@ -404,17 +404,18 @@ impl SeedingAction {
     }
 }
 
-// The policy a torrent seeds under: its own override, then its category's,
-// then the global one. Optional goals resolve field by field, each from the
-// most specific level that sets it. `mode` and `action` are always set, so
-// they come from the most specific level present. `None` when no level has a
-// policy.
+// The policy a torrent seeds under: its own override, then its tracker
+// rule's, then its category's, then the global one. Optional goals resolve
+// field by field, each from the most specific level that sets it. `mode` and
+// `action` are always set, so they come from the most specific level present.
+// `None` when no level has a policy.
 pub fn resolve_seeding_policy(
     torrent: Option<&SeedingPolicy>,
+    rule: Option<&SeedingPolicy>,
     category: Option<&SeedingPolicy>,
     global: Option<&SeedingPolicy>,
 ) -> Option<SeedingPolicy> {
-    let levels = || [torrent, category, global].into_iter().flatten();
+    let levels = || [torrent, rule, category, global].into_iter().flatten();
     let most_specific = levels().next()?;
     Some(SeedingPolicy {
         ratio_goal: levels().find_map(|p| p.ratio_goal),
@@ -424,6 +425,78 @@ pub fn resolve_seeding_policy(
         action: most_specific.action,
         max_upload_bps: levels().find_map(|p| p.max_upload_bps),
     })
+}
+
+// The seeding terms of every torrent that announces to a host a pattern
+// names: goals that sit between the torrent's own and its category's, and
+// whether the schedule's torrent pause may stop the torrent while they are
+// unmet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackerRule {
+    pub id: u32,
+    // A host, or `*.` and a host, which names that host and every host
+    // under it.
+    pub host_pattern: String,
+    pub seeding: Option<SeedingPolicy>,
+    pub never_pause: bool,
+}
+
+impl TrackerRule {
+    // The pattern as a rule keeps it: trimmed and lower case, without a
+    // trailing dot. An error when it names no host.
+    pub fn pattern(pattern: &str) -> Result<String, String> {
+        let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+        let host = pattern.strip_prefix("*.").unwrap_or(&pattern);
+        let named = !host.is_empty()
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            });
+        if named {
+            Ok(pattern)
+        } else {
+            Err(format!("{pattern} is not a host, nor *. and a host"))
+        }
+    }
+
+    // How closely the pattern names `host`, or `None` when it does not: a
+    // host closer than any wildcard, and a longer wildcard closer than a
+    // shorter one.
+    fn closeness(&self, host: &str) -> Option<usize> {
+        match self.host_pattern.strip_prefix("*.") {
+            Some(domain) => (host == domain
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|rest| rest.ends_with('.')))
+            .then_some(domain.len()),
+            None => (host == self.host_pattern).then_some(usize::MAX),
+        }
+    }
+}
+
+// The rule a torrent announcing to `trackers` seeds under: the one whose
+// pattern names one of their hosts most closely, the lower id on a tie.
+pub fn tracker_rule_for<'r, 't>(
+    rules: &'r [TrackerRule],
+    trackers: impl IntoIterator<Item = &'t str>,
+) -> Option<&'r TrackerRule> {
+    let hosts: Vec<String> = trackers
+        .into_iter()
+        .filter_map(|url| {
+            let url = reqwest::Url::parse(url.trim()).ok()?;
+            Some(url.host_str()?.trim_end_matches('.').to_ascii_lowercase())
+        })
+        .collect();
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let closeness = hosts.iter().filter_map(|host| rule.closeness(host)).max()?;
+            Some((rule, closeness))
+        })
+        .min_by_key(|(rule, closeness)| (std::cmp::Reverse(*closeness), rule.id))
+        .map(|(rule, _)| rule)
 }
 
 // The torrent client (`[torrent]`).
@@ -574,7 +647,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_seeding_policy(Some(&torrent), Some(&category), Some(&global)).unwrap();
+            resolve_seeding_policy(Some(&torrent), None, Some(&category), Some(&global)).unwrap();
 
         assert_eq!(resolved.ratio_goal, Some(2.5));
         assert_eq!(resolved.seed_time_goal_minutes, Some(60));
@@ -582,6 +655,80 @@ mod tests {
         assert_eq!(resolved.max_upload_bps, Some(1_000));
         assert_eq!(resolved.mode, SeedingGoalMode::All);
         assert_eq!(resolved.action, SeedingAction::Stop);
+
+        // A tracker rule sits between the torrent and its category.
+        let rule = SeedingPolicy {
+            inactive_goal_minutes: Some(45),
+            action: SeedingAction::Remove,
+            ..policy(None, Some(600))
+        };
+        let resolved =
+            resolve_seeding_policy(None, Some(&rule), Some(&category), Some(&global)).unwrap();
+        assert_eq!(resolved.ratio_goal, Some(1.0));
+        assert_eq!(resolved.seed_time_goal_minutes, Some(600));
+        assert_eq!(resolved.inactive_goal_minutes, Some(45));
+        assert_eq!(resolved.max_upload_bps, Some(1_000));
+        assert_eq!(resolved.action, SeedingAction::Remove);
+        let resolved =
+            resolve_seeding_policy(Some(&torrent), Some(&rule), Some(&category), None).unwrap();
+        assert_eq!(resolved.ratio_goal, Some(2.5));
+        assert_eq!(resolved.seed_time_goal_minutes, Some(600));
+        assert_eq!(resolved.action, SeedingAction::Stop);
+    }
+
+    fn rule(id: u32, host_pattern: &str) -> TrackerRule {
+        TrackerRule {
+            id,
+            host_pattern: TrackerRule::pattern(host_pattern).unwrap(),
+            seeding: None,
+            never_pause: false,
+        }
+    }
+
+    #[test]
+    fn a_tracker_rule_names_a_host_or_every_host_under_one() {
+        assert_eq!(
+            TrackerRule::pattern(" *.Example.ORG. ").as_deref(),
+            Ok("*.example.org")
+        );
+        for bad in [
+            "",
+            "*.",
+            "http://example.org",
+            "example.org/announce",
+            "a..b",
+            "*",
+        ] {
+            assert!(TrackerRule::pattern(bad).is_err(), "{bad}");
+        }
+        let rules = [
+            rule(1, "*.example.org"),
+            rule(2, "tracker.example.org"),
+            rule(3, "*.tracker.example.org"),
+            rule(4, "other.invalid"),
+        ];
+        let id = |trackers: &[&str]| {
+            tracker_rule_for(&rules, trackers.iter().copied()).map(|rule| rule.id)
+        };
+        assert_eq!(id(&["https://tracker.example.org/announce"]), Some(2));
+        assert_eq!(id(&["udp://Tracker.Example.org.:1337"]), Some(2));
+        assert_eq!(id(&["http://a.tracker.example.org/x"]), Some(3));
+        assert_eq!(id(&["http://example.org/x"]), Some(1));
+        assert_eq!(id(&["http://cdn.example.org/x"]), Some(1));
+        assert_eq!(id(&["http://notexample.org/x"]), None);
+        assert_eq!(id(&["http://public.invalid/x", "not a url"]), None);
+        // The closest pattern over every tracker wins, wherever it is listed.
+        assert_eq!(
+            id(&["http://cdn.example.org/x", "http://other.invalid/x"]),
+            Some(4)
+        );
+        assert_eq!(id(&[]), None);
+        // On a tie, the lower id.
+        let tied = [rule(9, "*.example.org"), rule(5, "*.example.org")];
+        assert_eq!(
+            tracker_rule_for(&tied, ["http://a.example.org/"]).map(|rule| rule.id),
+            Some(5)
+        );
     }
 
     #[test]
@@ -592,15 +739,15 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_seeding_policy(None, None, Some(&global)),
+            resolve_seeding_policy(None, None, None, Some(&global)),
             Some(global)
         );
         let category = policy(Some(1.5), None);
-        let resolved = resolve_seeding_policy(None, Some(&category), Some(&global)).unwrap();
+        let resolved = resolve_seeding_policy(None, None, Some(&category), Some(&global)).unwrap();
         assert_eq!(resolved.ratio_goal, Some(1.5));
         assert_eq!(resolved.seed_time_goal_minutes, Some(90));
         assert_eq!(resolved.action, SeedingAction::Stop);
-        assert_eq!(resolve_seeding_policy(None, None, None), None);
+        assert_eq!(resolve_seeding_policy(None, None, None, None), None);
     }
 
     #[test]

@@ -746,3 +746,102 @@ async fn a_downed_rung_is_absent_from_every_connection_path() {
             .any(|n| n["kind"] == "proxy" && n["name"] == "Gateway")
     );
 }
+
+#[tokio::test]
+async fn a_bandwidth_run_posts_to_its_upload_url_and_reports_the_upload() {
+    let h = harness().await;
+    let (acceptor, cert_der, _) = loopback_tls();
+    let http = HttpFixture::start(String::new(), 200_000, Some(acceptor)).await;
+    let service = SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true);
+    service.trust_roots_for_tests(vec![cert_der]);
+    service.measure_until_stopped_for_tests();
+    egress_quota(&h, 300_000);
+    let url = format!("https://127.0.0.1:{}/blob", http.addr.port());
+    let upload = format!("https://127.0.0.1:{}/upload", http.addr.port());
+
+    let response = h
+        .execute(&format!(
+            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},bandwidth:{{customUrl:"{url}",uploadUrl:"{upload}",uploadMib:1}}}}){{id request{{bandwidth{{uploadUrl uploadMib}}}}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    let started = response_data(&response)["startSpeedTest"].clone();
+    assert_eq!(
+        started["request"]["bandwidth"],
+        serde_json::json!({"uploadUrl": upload, "uploadMib": 1})
+    );
+    let id = started["id"].as_u64().unwrap();
+    wait_until(&h, id, |run| run.status != SpeedTestStatus::Running).await;
+    let response = h
+        .execute(&format!(
+            "{{speedTestRun(id:{id}){{status result{{upload{{http{{outcome url bytes elapsedMs bps failure{{code}}}} peers{{outcome}}}}}}}}}}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    let done = response_data(&response)["speedTestRun"].clone();
+
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    let posted = &done["result"]["upload"]["http"];
+    assert_eq!(posted["outcome"], "MEASURED", "{done}");
+    assert_eq!(posted["url"], upload);
+    assert_eq!(posted["bytes"], 1_048_576.0);
+    assert!(posted["bps"].as_f64().unwrap() > 0.0, "{done}");
+    assert_eq!(posted["failure"], serde_json::Value::Null);
+    assert_eq!(done["result"]["upload"]["peers"], serde_json::Value::Null);
+    assert_eq!(*http.uploaded().borrow(), 1_048_576);
+}
+
+#[tokio::test]
+async fn an_upload_url_must_use_https() {
+    let h = harness().await;
+    let response = h
+        .execute(&format!(
+            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},bandwidth:{{customUrl:"https://127.0.0.1:1/blob",uploadUrl:"http://127.0.0.1:1/upload"}}}}){{id}}}}"#
+        ))
+        .await;
+    let (message, _) = refusal(&response);
+    assert_eq!(message, "an upload URL must use https");
+}
+
+// A torrent route's Test via runs the test torrent over its path and
+// reports each rung.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_via_a_torrent_route_reports_the_test_torrent_rungs() {
+    use weaver_server_core::speed_test::torrent_fixture::{Answer, TorrentFixture};
+
+    let h = harness().await;
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder()],
+        seeders: 1,
+        leechers: 0,
+        failure: None,
+        connect_in: true,
+    });
+    let request = common::local_request(format!(
+        "mutation{{testVia(route:{DIRECT},torrent:true){{success p2p{{rungs{{step outcome message}} mappedPort}}}}}}"
+    ))
+    .data(fixture.source.clone());
+    let response = h.schema.execute(request).await;
+    assert_no_errors(&response);
+    let tests = response_data(&response)["testVia"].clone();
+
+    assert_eq!(tests.as_array().unwrap().len(), 1, "{tests}");
+    assert_eq!(tests[0]["success"], true, "{tests}");
+    let p2p = &tests[0]["p2p"];
+    let steps: Vec<_> = p2p["rungs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rung| (rung["step"].clone(), rung["outcome"].clone()))
+        .collect();
+    assert_eq!(
+        steps,
+        ["TORRENT", "ANNOUNCE", "HANDSHAKE", "PIECE", "INBOUND"]
+            .map(|step| (serde_json::json!(step), serde_json::json!("PASSED")))
+            .to_vec(),
+        "{p2p}"
+    );
+    assert_eq!(p2p["mappedPort"], serde_json::Value::Null);
+    fixture.stop().await;
+}

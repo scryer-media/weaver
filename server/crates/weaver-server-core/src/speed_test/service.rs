@@ -20,6 +20,8 @@ use super::overrides::{TestedLeg, TestedRoute};
 use super::progress::{LegRecorder, Progress, UsenetFacts};
 use super::providers::{self, ProviderServer};
 use super::runner::Stop;
+use super::torrent::{P2pOutcome, P2pPath, P2pPlan, PeerUpload, TestTorrentSource};
+use super::upload;
 use super::usenet::{self, UsenetLeg, UsenetPlan};
 use crate::jobs::{Hold, HoldOrigin, HoldOwner, HoldScope};
 use crate::proxies::{
@@ -27,6 +29,7 @@ use crate::proxies::{
     RoutingPolicy, Rung, SpeedTestQuotaHolder, TorrentScope,
 };
 use crate::settings::SharedConfig;
+use crate::torrents::net::LegKind;
 use crate::{Database, SchedulerHandle};
 
 // Finished runs kept beside the running one.
@@ -80,6 +83,8 @@ pub struct ServiceInner {
     // Bandwidth runs measure until cancelled or until every connection has
     // ended; only tests set it.
     until_stopped: AtomicBool,
+    // Where the test torrent is found; only tests set it.
+    torrent_source: Mutex<Option<TestTorrentSource>>,
 }
 
 #[derive(Default)]
@@ -88,6 +93,8 @@ struct State {
     // Newest last.
     runs: VecDeque<Arc<RunCell>>,
     active: Option<Arc<RunCell>>,
+    // The task driving the newest run, by run id.
+    drive: Option<(u32, tokio::task::AbortHandle)>,
 }
 
 struct RunCell {
@@ -109,11 +116,21 @@ struct Life {
     finished_at_ms: Option<i64>,
     result: Option<SpeedTestResult>,
     bandwidth: Option<BandwidthResult>,
+    upload: Option<UploadResult>,
 }
 
 impl RunCell {
     fn usenet(&self) -> bool {
         matches!(self.request.kind, SpeedTestKind::Usenet { .. })
+    }
+
+    // What the run has measured so far.
+    fn result(&self, life: &Life) -> Option<SpeedTestResult> {
+        let mut result = self
+            .progress
+            .result(self.usenet(), life.bandwidth.clone())?;
+        result.upload = life.upload.clone();
+        Some(result)
     }
 }
 
@@ -139,6 +156,7 @@ impl SpeedTestService {
                 server_list_url: Mutex::new(None),
                 roots: Mutex::new(Vec::new()),
                 until_stopped: AtomicBool::new(false),
+                torrent_source: Mutex::new(None),
             }),
         }
     }
@@ -185,6 +203,29 @@ impl SpeedTestService {
     #[cfg(any(test, feature = "test-support"))]
     pub fn measure_until_stopped_for_tests(&self) {
         self.inner.until_stopped.store(true, Ordering::Release);
+    }
+
+    // Fetch the test torrent from this directory in place of Debian's.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_torrent_source_for_tests(&self, source: TestTorrentSource) {
+        *self
+            .inner
+            .torrent_source
+            .lock()
+            .expect("speed test torrent source") = Some(source);
+    }
+
+    // Abort the task driving run `id`, as a runtime shutting down would.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn abort_drive_for_tests(&self, id: u32) -> bool {
+        let state = self.inner.state.lock().expect("speed test state");
+        match &state.drive {
+            Some((run, task)) if *run == id => {
+                task.abort();
+                true
+            }
+            _ => false,
+        }
     }
 
     // Bumped on every change of a run's status or phase, and whenever an
@@ -431,9 +472,11 @@ impl SpeedTestService {
         let bandwidth_url = match &request.kind {
             SpeedTestKind::Bandwidth {
                 provider: BandwidthProvider::Custom { url },
+                ..
             } => Some(url.clone()),
             SpeedTestKind::Bandwidth {
                 provider: BandwidthProvider::Builtin { id, .. },
+                ..
             } => {
                 let provider = providers::provider(id).ok_or_else(|| {
                     SpeedTestError::Invalid(format!("no bandwidth provider is called {id}"))
@@ -525,6 +568,7 @@ impl SpeedTestService {
                     finished_at_ms: None,
                     result: None,
                     bandwidth: None,
+                    upload: None,
                 }),
             });
             state.active = Some(cell.clone());
@@ -539,7 +583,9 @@ impl SpeedTestService {
         );
         inner.bump();
         let snapshot = inner.snapshot(&cell);
-        tokio::spawn(drive(inner.clone(), cell, plan));
+        let id = cell.id;
+        let task = tokio::spawn(drive(inner.clone(), cell, plan));
+        inner.state.lock().expect("speed test state").drive = Some((id, task.abort_handle()));
         Ok(snapshot)
     }
 }
@@ -550,19 +596,22 @@ fn validate_request(request: &SpeedTestRequest) -> Result<(), SpeedTestError> {
             SpeedTestKind::Usenet { .. },
             Consumer::Rss(_) | Consumer::Outbound | Consumer::Torrent(_),
         ) => Err(NetworkRefusal::SpeedTestUsenetNeedsServer.into()),
-        (SpeedTestKind::Bandwidth { provider }, _) => match provider {
-            BandwidthProvider::Custom { url } if url.scheme() != "https" => Err(
-                SpeedTestError::Invalid("a custom bandwidth URL must use https".into()),
-            ),
-            // A list provider run without a server takes the nearest one.
-            BandwidthProvider::Builtin { id, .. } => {
-                providers::provider(id).ok_or_else(|| {
-                    SpeedTestError::Invalid(format!("no bandwidth provider is called {id}"))
-                })?;
-                Ok(())
+        (SpeedTestKind::Bandwidth { provider, upload }, _) => {
+            upload::validate(upload).map_err(SpeedTestError::Invalid)?;
+            match provider {
+                BandwidthProvider::Custom { url } if url.scheme() != "https" => Err(
+                    SpeedTestError::Invalid("a custom bandwidth URL must use https".into()),
+                ),
+                // A list provider run without a server takes the nearest one.
+                BandwidthProvider::Builtin { id, .. } => {
+                    providers::provider(id).ok_or_else(|| {
+                        SpeedTestError::Invalid(format!("no bandwidth provider is called {id}"))
+                    })?;
+                    Ok(())
+                }
+                BandwidthProvider::Custom { .. } => Ok(()),
             }
-            BandwidthProvider::Custom { .. } => Ok(()),
-        },
+        }
         (
             SpeedTestKind::Usenet {
                 nzb, max_duration, ..
@@ -787,7 +836,7 @@ impl ServiceInner {
     fn snapshot(&self, cell: &RunCell) -> SpeedTestRun {
         let life = cell.life.lock().expect("speed test run");
         let result = match life.status {
-            SpeedTestStatus::Running => cell.progress.result(cell.usenet(), life.bandwidth.clone()),
+            SpeedTestStatus::Running => cell.result(&life),
             _ => life.result.clone(),
         };
         let draining = (life.phase == Some(SpeedTestPhase::Draining)).then(|| {
@@ -828,6 +877,44 @@ impl ServiceInner {
         tested
     }
 
+    // Serve the test torrent's piece to the leechers its trackers send,
+    // through `stage`. Peers are dialled out, so any path can serve.
+    async fn serve_test_torrent(
+        &self,
+        stage: Arc<dyn weaver_tunnel::pipe::Dialer>,
+        stop: &mut Stop,
+    ) -> PeerUpload {
+        let source = self
+            .torrent_source
+            .lock()
+            .expect("speed test torrent source")
+            .clone()
+            .unwrap_or_default();
+        let plan = P2pPlan {
+            source,
+            upload_budget: Some(PEER_UPLOAD_BYTES),
+        };
+        let path = P2pPath {
+            stage,
+            kind: LegKind::Ladder,
+            gateway: None,
+            internal_port: 0,
+        };
+        let stopped = std::pin::pin!(stop.stopped());
+        let report = super::torrent::probe(path, &plan, stopped).await;
+        report.upload.unwrap_or_else(|| {
+            let error = report
+                .rungs
+                .into_iter()
+                .find_map(|rung| match rung.outcome {
+                    P2pOutcome::Failed(error) => Some(error),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "the test torrent did not run".into());
+            PeerUpload::Failed(error)
+        })
+    }
+
     fn set_phase(&self, cell: &RunCell, phase: SpeedTestPhase) {
         cell.life.lock().expect("speed test run").phase = Some(phase);
         self.bump();
@@ -863,15 +950,70 @@ async fn drive(inner: Arc<ServiceInner>, cell: Arc<RunCell>, plan: RunPlan) {
         loan: Mutex::new(None),
         draft: Mutex::new(Some(plan.draft.clone())),
     });
-    // The run works in its own task so a panic still reaches the release.
-    let work = tokio::spawn(execute(inner.clone(), cell.clone(), plan, gate.clone()));
-    let outcome = match work.await {
+    // Whatever ends the drive, the run ends with it and gives back what it
+    // holds.
+    let mut ending = Ending {
+        run: Some((inner.clone(), cell.clone(), gate.clone())),
+    };
+    // The run works in its own task so a panic still reaches the release,
+    // and the work goes with the drive when the drive is aborted.
+    let work = Owned(tokio::spawn(execute(inner, cell, plan, gate)));
+    let outcome = match work.join().await {
         Ok(outcome) => outcome,
         Err(error) if error.is_panic() => {
             Outcome::FailedWith(SpeedTestFailure::StoppedUnexpectedly)
         }
         Err(_) => Outcome::FailedWith(SpeedTestFailure::Stopped),
     };
+    ending.end(outcome);
+}
+
+// A task aborted when its owner drops it.
+struct Owned<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Owned<T> {
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for Owned<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+// The end of a run, owned by its drive. Ending it, or dropping it unended,
+// finishes the run in a task of its own, so the release runs to the end
+// whatever happens to the drive.
+struct Ending {
+    run: Option<(Arc<ServiceInner>, Arc<RunCell>, Arc<Gate>)>,
+}
+
+impl Ending {
+    fn end(&mut self, outcome: Outcome) {
+        let Some((inner, cell, gate)) = self.run.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(finish(inner, cell, gate, outcome));
+            }
+            Err(_) => warn!(
+                run = cell.id,
+                "the runtime stopped before the speed test's hold was lifted"
+            ),
+        }
+    }
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        self.end(Outcome::FailedWith(SpeedTestFailure::Stopped));
+    }
+}
+
+async fn finish(inner: Arc<ServiceInner>, cell: Arc<RunCell>, gate: Arc<Gate>, outcome: Outcome) {
     cell.progress.finish();
     inner.set_phase(&cell, SpeedTestPhase::Releasing);
     gate.release(&inner.handle).await;
@@ -884,7 +1026,7 @@ async fn drive(inner: Arc<ServiceInner>, cell: Arc<RunCell>, plan: RunPlan) {
     };
     let result = {
         let mut life = cell.life.lock().expect("speed test run");
-        let result = cell.progress.result(cell.usenet(), life.bandwidth.clone());
+        let result = cell.result(&life);
         life.status = status;
         life.phase = None;
         life.error = error.clone();
@@ -971,7 +1113,7 @@ async fn execute(
         },
         _ => None,
     };
-    let bandwidth = if let SpeedTestKind::Bandwidth { provider } = &cell.request.kind {
+    let bandwidth = if let SpeedTestKind::Bandwidth { provider, .. } = &cell.request.kind {
         let (provider_id, server) = match provider {
             BandwidthProvider::Builtin { id, server } => (Some(id.clone()), server.clone()),
             BandwidthProvider::Custom { .. } => (None, None),
@@ -1181,7 +1323,7 @@ async fn execute(
                 stop.with_duration(max_duration),
             )
             .await;
-            sampler.abort();
+            drop(sampler);
         }
         (None, _, Some((url, size))) => {
             let runtime = match inner.runtime() {
@@ -1224,7 +1366,7 @@ async fn execute(
                 stop.clone(),
             )
             .await;
-            sampler.abort();
+            drop(sampler);
         }
         _ => return Outcome::Failed("the run has nothing to measure".into()),
     }
@@ -1244,15 +1386,42 @@ async fn execute(
             None => SpeedTestFailure::NoBytes,
         });
     }
+    if let SpeedTestKind::Bandwidth { upload, .. } = &cell.request.kind {
+        // Uploading: the queue is still held, so the route sends nothing
+        // else.
+        inner.set_phase(&cell, SpeedTestPhase::Uploading);
+        let stage = match plan.draft.leg_stage(first.position) {
+            Ok(stage) => stage,
+            Err(error) => return Outcome::Failed(error),
+        };
+        let leg = HttpLeg {
+            stage: stage.clone(),
+        };
+        let options = inner.options();
+        let http = tokio::select! {
+            biased;
+            _ = stop.stopped() => return Outcome::Cancelled,
+            http = upload::run(&leg, upload, &options) => http,
+        };
+        cell.life.lock().expect("speed test run").upload = Some(UploadResult { http, peers: None });
+        inner.bump();
+        if inner.config.read().await.torrent.enabled {
+            let peers = inner.serve_test_torrent(stage, &mut stop).await;
+            if stop.cancelled() {
+                return Outcome::Cancelled;
+            }
+            if let Some(upload) = &mut cell.life.lock().expect("speed test run").upload {
+                upload.peers = Some(peers);
+            }
+            inner.bump();
+        }
+    }
     Outcome::Completed
 }
 
 // Close a sample bin every second, and for Usenet read the header gauge.
-fn spawn_sampler(
-    progress: Arc<Progress>,
-    gauge: Option<SchedulerHandle>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+fn spawn_sampler(progress: Arc<Progress>, gauge: Option<SchedulerHandle>) -> Owned<()> {
+    Owned(tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
@@ -1263,7 +1432,7 @@ fn spawn_sampler(
             }
             progress.sample();
         }
-    })
+    }))
 }
 
 // Counters the Prometheus exporter reads.

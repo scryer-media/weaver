@@ -25,6 +25,7 @@ use weaver_server_core::auth::{
 use weaver_server_core::categories::{
     CategoryConfig, completion_parent, validate_category_path_component,
 };
+use weaver_server_core::ingest::{Kind, classify, fetch_torrent_url};
 use weaver_server_core::proxies::{Bandwidth, TorrentScope};
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
@@ -32,8 +33,7 @@ use weaver_server_core::settings::{
     SeedingAction, SeedingPolicy, TorrentEncryption, resolve_seeding_policy,
 };
 use weaver_server_core::torrents::service::{
-    ActionError, AddError, AddRequest, AddSource, SeedingSource, TorrentService, TorrentSettings,
-    TorrentView,
+    ActionError, AddError, AddRequest, SeedingSource, TorrentService, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{TorrentState, TorrentTracker, TrackerStatus, status};
 use weaver_server_core::watch_folder::WatchFolderService;
@@ -644,7 +644,9 @@ fn share_limits(view: &TorrentView) -> [(&'static str, Value); 6] {
     );
     let own = |value: &Value| match view.seeding_source {
         SeedingSource::Global => json!(-2),
-        SeedingSource::Torrent | SeedingSource::Category => value.clone(),
+        SeedingSource::Torrent | SeedingSource::TrackerRule(_) | SeedingSource::Category => {
+            value.clone()
+        }
     };
     [
         ("ratio_limit", own(&ratio)),
@@ -900,34 +902,6 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
     let Some(torrents) = &ctx.inner.torrents else {
         return text(StatusCode::CONFLICT, "torrents are not enabled");
     };
-    let mut sources: Vec<AddSource> = params
-        .files
-        .iter()
-        .cloned()
-        .map(AddSource::Metainfo)
-        .collect();
-    // Weaver fetches nothing for a client, so a url is a magnet link.
-    for url in params
-        .get("urls")
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-    {
-        if !url
-            .get(..7)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("magnet:"))
-        {
-            return text(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "url must be a magnet link",
-            );
-        }
-        sources.push(AddSource::Magnet(url.to_owned()));
-    }
-    if sources.is_empty() {
-        return text(StatusCode::BAD_REQUEST, "no torrents or urls");
-    }
     let category = params
         .get("category")
         .map(str::trim)
@@ -940,6 +914,39 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
             Err(response) => return response,
         }
     };
+    // Each file, and each url's text, is read for what it is. A url is
+    // fetched on the route its torrent takes, with the client's cookie.
+    let mut bodies = params.files.clone();
+    for line in params
+        .get("urls")
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Kind::Url(url) = classify(line.as_bytes()) else {
+            bodies.push(line.as_bytes().to_vec());
+            continue;
+        };
+        let Some(runtime) = ctx.inner.handle.proxy_runtime() else {
+            return text(StatusCode::CONFLICT, "torrent request has no route");
+        };
+        let scope = torrents.scope_of(category.as_deref());
+        match fetch_torrent_url(&runtime, scope, &url, params.get("cookie")).await {
+            Ok(body) => bodies.push(body),
+            Err(error) => return text(StatusCode::CONFLICT, error),
+        }
+    }
+    let mut sources = Vec::with_capacity(bodies.len());
+    for body in bodies {
+        match classify(&body).torrent(body) {
+            Ok(source) => sources.push(source),
+            Err(_) => return text(StatusCode::UNSUPPORTED_MEDIA_TYPE, "not a torrent"),
+        }
+    }
+    if sources.is_empty() {
+        return text(StatusCode::BAD_REQUEST, "no torrents or urls");
+    }
     let paused = params
         .flag("stopped")
         .or_else(|| params.flag("paused"))
@@ -973,7 +980,8 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
     }
 }
 
-// The seeding policy a torrent in `category` inherits.
+// The seeding policy a torrent added to `category` inherits before its
+// trackers are known; the tracker rule it matches is applied as it is added.
 fn inherited(config: &Config, category: Option<&str>) -> Option<SeedingPolicy> {
     let category = category.and_then(|name| {
         config
@@ -982,6 +990,7 @@ fn inherited(config: &Config, category: Option<&str>) -> Option<SeedingPolicy> {
             .find(|category| category.name.eq_ignore_ascii_case(name))
     });
     resolve_seeding_policy(
+        None,
         None,
         category.and_then(|category| category.seeding.as_ref()),
         config.seeding.as_ref(),
@@ -1055,8 +1064,7 @@ async fn set_share_limits(ctx: &TorrentFacadeContext, params: &Params) -> Respon
         return ok();
     };
     for view in ctx.targets(params).await {
-        let inherited = inherited(&*ctx.inner.config.read().await, view.category.as_deref());
-        let policy = match share_policy(params, inherited, view.seeding_override) {
+        let policy = match share_policy(params, view.seeding_inherited, view.seeding_override) {
             Ok(policy) => policy,
             Err(response) => return response,
         };

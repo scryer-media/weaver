@@ -640,7 +640,11 @@ fn spawn_test_scheduler(
                     }
                     let assembly = JobAssembly::new(job_id);
                     let par2_bytes = spec.par2_bytes();
-                    let status = JobStatus::Queued;
+                    let status = if options.initially_paused {
+                        JobStatus::Paused
+                    } else {
+                        JobStatus::Queued
+                    };
                     let (download_state, post_state, run_state, failure_error) =
                         runtime_lanes_for_status(&status);
                     let state = JobState {

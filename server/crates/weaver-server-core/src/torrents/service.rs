@@ -26,8 +26,8 @@ use crate::categories::model::{completion_parent, resolve_category_config};
 use crate::jobs::JobId;
 use crate::jobs::graph_checkpoint::Delta;
 use crate::jobs::handle::{
-    CancellationOrigin, HoldOrigin, HoldOwner, HoldSet, JobInfo, QueueAction, QueueMoveTarget,
-    QueueOwner, SchedulerHandle, TorrentRate,
+    CancellationOrigin, HoldOrigin, HoldSet, JobInfo, QueueAction, QueueMoveTarget, QueueOwner,
+    SchedulerHandle, TorrentRate,
 };
 use crate::jobs::model::{
     FieldUpdate, JobStatus, JobUpdate, PRIORITY_ATTRIBUTE_KEY, Protocol,
@@ -45,6 +45,7 @@ use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::PieceLayout;
 use crate::proxies::TorrentScope;
+use crate::settings::model::{TrackerRule, tracker_rule_for};
 use crate::settings::{
     Config, SeedingAction, SeedingPolicy, TorrentConfig, resolve_seeding_policy,
 };
@@ -60,6 +61,7 @@ use crate::torrents::{
 
 #[cfg(test)]
 mod tests;
+pub mod updates;
 
 /// How often torrents are read and their routes checked.
 pub const TICK: Duration = Duration::from_secs(10);
@@ -110,9 +112,20 @@ impl TorrentSettings {
         }
     }
 
-    fn policy(&self, record: &TorrentRecord) -> Option<SeedingPolicy> {
+    fn policy(&self, record: &TorrentRecord, rules: &[TrackerRule]) -> Option<SeedingPolicy> {
         resolve_seeding_policy(
             record.policy_override.as_ref(),
+            rule_of(record, rules).and_then(|rule| rule.seeding.as_ref()),
+            self.category_seeding(record),
+            self.seeding.as_ref(),
+        )
+    }
+
+    // The policy the torrent would have without its own override.
+    fn inherited(&self, record: &TorrentRecord, rules: &[TrackerRule]) -> Option<SeedingPolicy> {
+        resolve_seeding_policy(
+            None,
+            rule_of(record, rules).and_then(|rule| rule.seeding.as_ref()),
             self.category_seeding(record),
             self.seeding.as_ref(),
         )
@@ -124,9 +137,12 @@ impl TorrentSettings {
     }
 
     // The most specific level that sets a policy.
-    fn seeding_source(&self, record: &TorrentRecord) -> SeedingSource {
+    fn seeding_source(&self, record: &TorrentRecord, rules: &[TrackerRule]) -> SeedingSource {
+        let rule = rule_of(record, rules).filter(|rule| rule.seeding.is_some());
         if record.policy_override.is_some() {
             SeedingSource::Torrent
+        } else if let Some(rule) = rule {
+            SeedingSource::TrackerRule(rule.host_pattern.clone())
         } else if self.category_seeding(record).is_some() {
             SeedingSource::Category
         } else {
@@ -135,13 +151,28 @@ impl TorrentSettings {
     }
 }
 
+// The tracker rule `record` matched, while it stands.
+fn rule_of<'r>(record: &TorrentRecord, rules: &'r [TrackerRule]) -> Option<&'r TrackerRule> {
+    let id = record.tracker_rule_id?;
+    rules.iter().find(|rule| rule.id == id)
+}
+
 /// Where a torrent's seeding policy comes from: the most specific level that
 /// sets one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeedingSource {
     Torrent,
+    /// The tracker rule its trackers matched, by its host pattern.
+    TrackerRule(String),
     Category,
     Global,
+}
+
+/// The torrents the schedule's pause leaves seeding under one tracker rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleSeeding {
+    pub host_pattern: String,
+    pub torrents: u32,
 }
 
 /// What torrent jobs are built with.
@@ -317,8 +348,10 @@ pub struct TorrentView {
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,
     pub seeding_left: Option<String>,
-    /// The torrent's own seeding policy, when it sets one.
+    /// The torrent's own seeding policy, when it sets one, and what it
+    /// would have without it.
     pub seeding_override: Option<SeedingPolicy>,
+    pub seeding_inherited: Option<SeedingPolicy>,
     /// The seeding policy in force, and the level it comes from.
     pub seeding_policy: SeedingPolicy,
     pub seeding_source: SeedingSource,
@@ -462,6 +495,32 @@ struct Live {
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
+}
+
+// `torrent` as the download queue and its holds see it. A complete torrent
+// under a tracker rule that never pauses seeds through the schedule's holds
+// until its goal is met.
+fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now: i64) -> Queued {
+    let complete = torrent.complete();
+    // A torrent under a never-pause rule still owes its tracker while it
+    // downloads, and while it seeds with a goal left.
+    let runs_through_schedule = rule_of(&torrent.record, rules)
+        .is_some_and(|rule| rule.never_pause)
+        && (!complete
+            || status::goal_left(
+                settings.policy(&torrent.record, rules).as_ref(),
+                &torrent.counters,
+                torrent.total,
+                now,
+            )
+            .is_some());
+    Queued {
+        job_id: torrent.record.job_id,
+        complete,
+        forced: torrent.record.forced,
+        paused: !torrent.resumed(),
+        runs_through_schedule,
+    }
 }
 
 impl Live {
@@ -676,6 +735,8 @@ struct Inner {
     db: Database,
     sessions: Sessions,
     settings: RwLock<TorrentSettings>,
+    // The tracker rules, as the database last held them.
+    rules: RwLock<Arc<[TrackerRule]>>,
     env: JobEnv,
     clock: Arc<dyn Clock>,
     live: tokio::sync::Mutex<BTreeMap<JobId, Live>>,
@@ -708,6 +769,7 @@ impl TorrentService {
                 db,
                 sessions,
                 settings: RwLock::new(settings),
+                rules: RwLock::new(Arc::from([])),
                 env,
                 clock,
                 live: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -731,6 +793,91 @@ impl TorrentService {
             .clone()
     }
 
+    fn rules(&self) -> Arc<[TrackerRule]> {
+        Arc::clone(
+            &self
+                .inner
+                .rules
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    // The rule a torrent announcing to `trackers` follows.
+    fn rule_id<'t>(&self, trackers: impl IntoIterator<Item = &'t TrackerEntry>) -> Option<u32> {
+        let rules = self.rules();
+        tracker_rule_for(
+            &rules,
+            trackers.into_iter().map(|tracker| tracker.url.as_str()),
+        )
+        .map(|rule| rule.id)
+    }
+
+    /// Take the tracker rules as the database holds them now, match every
+    /// torrent's trackers against them again, and apply what that changes.
+    pub async fn reload_tracker_rules(&self) -> Result<(), String> {
+        self.load_rules()?;
+        {
+            let mut live = self.inner.live.lock().await;
+            for torrent in live.values_mut() {
+                let job_id = torrent.record.job_id;
+                let trackers = self
+                    .inner
+                    .db
+                    .list_torrent_trackers(job_id)
+                    .map_err(state_error)?;
+                let rule_id = self.rule_id(&trackers);
+                if rule_id != torrent.record.tracker_rule_id {
+                    self.inner
+                        .db
+                        .set_torrent_tracker_rule(job_id, rule_id)
+                        .map_err(state_error)?;
+                    torrent.record.tracker_rule_id = rule_id;
+                }
+            }
+        }
+        self.apply_queue().await;
+        self.publish().await;
+        Ok(())
+    }
+
+    fn load_rules(&self) -> Result<(), String> {
+        let rules = self.inner.db.list_tracker_rules().map_err(state_error)?;
+        *self
+            .inner
+            .rules
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::from(rules);
+        Ok(())
+    }
+
+    /// The torrents the schedule's pause leaves seeding, by the tracker
+    /// rule that keeps them: none while no such pause is in force.
+    pub async fn schedule_seeding(&self) -> Vec<ScheduleSeeding> {
+        let settings = self.settings();
+        let rules = self.rules();
+        let holds = self.holds();
+        let now = self.inner.clock.now_ms();
+        let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
+        for torrent in self.inner.live.lock().await.values() {
+            if torrent.resumed()
+                && holds.spares(queued(&settings, &rules, torrent, now).target())
+                && let Some(id) = torrent.record.tracker_rule_id
+            {
+                *counts.entry(id).or_default() += 1;
+            }
+        }
+        rules
+            .iter()
+            .filter_map(|rule| {
+                counts.get(&rule.id).map(|&torrents| ScheduleSeeding {
+                    host_pattern: rule.host_pattern.clone(),
+                    torrents,
+                })
+            })
+            .collect()
+    }
+
     /// Take the settings as they are now. Turning torrents off closes every
     /// session and leaves each torrent stopped until they are turned on.
     pub async fn set_settings(&self, settings: TorrentSettings) {
@@ -751,6 +898,10 @@ impl TorrentService {
         if on != was {
             self.turn(on).await;
         }
+        // The download limit and the seeding levels take hold now, not at
+        // the next tick.
+        self.apply_queue().await;
+        self.publish().await;
     }
 
     async fn turn(&self, on: bool) {
@@ -1131,7 +1282,7 @@ impl TorrentService {
                 let dir = self
                     .claim_dir(&settings, category.as_ref(), &parsed.manifest, job_id)
                     .await?;
-                let record = self.record(
+                let mut record = self.record(
                     job_id,
                     &request,
                     category.as_ref(),
@@ -1142,7 +1293,7 @@ impl TorrentService {
                     parsed.private,
                     Some(dir.clone()),
                 );
-                if let Err(error) = self.insert(&record, &parsed.files, &parsed.trackers) {
+                if let Err(error) = self.insert(&mut record, &parsed.files, &parsed.trackers) {
                     give_back(&dir).await;
                     return Err(error);
                 }
@@ -1183,7 +1334,7 @@ impl TorrentService {
                     .map_err(|error| AddError::NoNetwork(error.to_string()))?;
                 let job_id = self.reserve()?;
                 let name = magnet.name.clone().unwrap_or_else(|| hex::encode(infohash));
-                let record = self.record(
+                let mut record = self.record(
                     job_id,
                     &request,
                     category.as_ref(),
@@ -1199,7 +1350,7 @@ impl TorrentService {
                     .iter()
                     .filter_map(|url| tracker(0, url.as_bytes()))
                     .collect();
-                self.insert(&record, &[], &trackers)?;
+                self.insert(&mut record, &[], &trackers)?;
                 let mut torrent = Live::new(record, TorrentCounters::default());
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
@@ -1294,15 +1445,18 @@ impl TorrentService {
             completed_at_ms: None,
             storage_dir,
             policy_override: request.policy_override.clone(),
+            tracker_rule_id: None,
         }
     }
 
+    // Keep `record` with the rule its trackers match.
     fn insert(
         &self,
-        record: &TorrentRecord,
+        record: &mut TorrentRecord,
         files: &[TorrentFile],
         trackers: &[TrackerEntry],
     ) -> Result<(), AddError> {
+        record.tracker_rule_id = self.rule_id(trackers);
         match self.inner.db.insert_torrent(record, files, trackers) {
             Ok(TorrentInsert::Inserted) => Ok(()),
             Ok(TorrentInsert::Duplicate(existing)) => Err(AddError::Duplicate(existing)),
@@ -1377,6 +1531,12 @@ impl TorrentService {
         torrent.record.private = parsed.private;
         torrent.record.storage_dir = Some(dir.clone());
         torrent.record.metainfo = Some(bytes.clone());
+        let rule_id = self.rule_id(&parsed.trackers);
+        self.inner
+            .db
+            .set_torrent_tracker_rule(job_id, rule_id)
+            .map_err(|error| AddError::State(state_error(error)))?;
+        torrent.record.tracker_rule_id = rule_id;
         self.inner
             .db
             .set_torrent_metainfo(
@@ -1440,6 +1600,8 @@ impl TorrentService {
     // down.
     async fn attach(&self, job_id: JobId) {
         let settings = self.settings();
+        let rules = self.rules();
+        let now = self.inner.clock.now_ms();
         let (scope, bytes, layout, intake, dir, paused, limit, have) = {
             let live = self.inner.live.lock().await;
             let Some(torrent) = live.get(&job_id) else {
@@ -1457,7 +1619,7 @@ impl TorrentService {
                 return;
             };
             let limit = settings
-                .policy(&torrent.record)
+                .policy(&torrent.record, &rules)
                 .and_then(|policy| policy.max_upload_bps)
                 .map(|bps| u32::try_from(bps).unwrap_or(u32::MAX));
             (
@@ -1468,7 +1630,10 @@ impl TorrentService {
                 torrent.record.storage_dir.clone().unwrap_or_default(),
                 !torrent.resumed()
                     || torrent.queued
-                    || self.holds().stops(HoldOwner::Torrents, torrent.complete()),
+                    || self
+                        .holds()
+                        .reason_for(queued(&settings, &rules, torrent, now).target())
+                        .is_some(),
                 limit,
                 job.with(|job| initial_have(job)),
             )
@@ -1654,7 +1819,7 @@ impl TorrentService {
         let mut live = self.inner.live.lock().await;
         let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
         if torrent.record.private && !confirm_unmet_goal {
-            let policy = settings.policy(&torrent.record);
+            let policy = settings.policy(&torrent.record, &self.rules());
             if let Some(left) =
                 status::goal_left(policy.as_ref(), &torrent.counters, torrent.total, now)
             {
@@ -1765,7 +1930,11 @@ impl TorrentService {
                 Ok(torrent.record.clone())
             })
             .await?;
-        self.save_options(&record)
+        self.save_options(&record)?;
+        // New goals move what the holds and the queue make of the torrent.
+        self.apply_queue().await;
+        self.publish().await;
+        Ok(())
     }
 
     /// Move a torrent to another category; when that category routes
@@ -1851,6 +2020,7 @@ impl TorrentService {
 
     // Bring back every stored torrent.
     async fn restore(&self) -> Result<(), String> {
+        self.load_rules()?;
         let records = self.inner.db.list_torrents().map_err(state_error)?;
         for record in records {
             let job_id = record.job_id;
@@ -1889,26 +2059,28 @@ impl TorrentService {
 
     // Which torrents the queue lets download, applied to their sessions.
     async fn apply_queue(&self) {
-        let max_active = self.settings().torrent.max_active_downloads;
+        let settings = self.settings();
+        let rules = self.rules();
+        let now = self.inner.clock.now_ms();
         let holds = self.holds();
         let mut live = self.inner.live.lock().await;
         let mut order: Vec<&Live> = live.values().collect();
         order.sort_by_key(|torrent| (torrent.record.added_at_ms, torrent.record.job_id));
         let queue: Vec<Queued> = order
             .iter()
-            .map(|torrent| Queued {
-                job_id: torrent.record.job_id,
-                complete: torrent.complete(),
-                forced: torrent.record.forced,
-                paused: !torrent.resumed(),
-            })
+            .map(|torrent| queued(&settings, &rules, torrent, now))
             .collect();
-        let active = status::active(&queue, max_active, &holds);
+        let active = status::active(&queue, settings.torrent.max_active_downloads, &holds);
+        let targets: BTreeMap<JobId, _> = queue
+            .iter()
+            .map(|torrent| (torrent.job_id, torrent.target()))
+            .collect();
         for torrent in live.values_mut() {
-            let active = active.contains(&torrent.record.job_id);
+            let job_id = torrent.record.job_id;
+            let active = active.contains(&job_id);
             torrent.paused_by = torrent
                 .resumed()
-                .then(|| holds.reason(HoldOwner::Torrents, torrent.complete()))
+                .then(|| holds.reason_for(targets[&job_id]))
                 .flatten();
             torrent.queued = !active && torrent.resumed() && torrent.paused_by.is_none();
             let run = active && torrent.resumed();
@@ -2070,6 +2242,7 @@ impl TorrentService {
     // A complete torrent whose seeding goal is met does what its policy says.
     async fn apply_goals(&self, now: i64) {
         let settings = self.settings();
+        let rules = self.rules();
         let mut actions = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
@@ -2078,7 +2251,7 @@ impl TorrentService {
                 if !torrent.complete() || !torrent.resumed() || torrent.record.forced {
                     continue;
                 }
-                let Some(policy) = settings.policy(&torrent.record) else {
+                let Some(policy) = settings.policy(&torrent.record, &rules) else {
                     continue;
                 };
                 if status::goal_left(Some(&policy), &torrent.counters, torrent.total, now).is_some()
@@ -2196,6 +2369,8 @@ impl TorrentService {
         let record = &torrent.record;
         let total = torrent.total;
         let have: u64 = reading.file_have.iter().sum();
+        let rules = self.rules();
+        let policy = settings.policy(record, &rules);
         TorrentView {
             job_id: record.job_id,
             name: record.name.clone(),
@@ -2227,10 +2402,11 @@ impl TorrentService {
             added_at_ms: record.added_at_ms,
             completed_at_ms: record.completed_at_ms,
             storage_dir: record.storage_dir.clone(),
-            seeding_left: status::goal_left(settings.policy(record).as_ref(), counters, total, now),
+            seeding_left: status::goal_left(policy.as_ref(), counters, total, now),
             seeding_override: record.policy_override,
-            seeding_policy: settings.policy(record).unwrap_or_default(),
-            seeding_source: settings.seeding_source(record),
+            seeding_inherited: settings.inherited(record, &rules),
+            seeding_policy: policy.unwrap_or_default(),
+            seeding_source: settings.seeding_source(record, &rules),
             route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
             file_have: reading.file_have,
@@ -2289,6 +2465,15 @@ impl TorrentService {
                 report(view, status, now).job_info()
             })
             .collect()
+    }
+
+    /// The scope whose route a torrent added in `category` takes.
+    pub fn scope_of(&self, category: Option<&str>) -> TorrentScope {
+        let settings = self.settings();
+        let id = category
+            .and_then(|name| resolve_category_config(&settings.categories, name))
+            .map(|category| category.id);
+        settings.scope(id)
     }
 }
 

@@ -744,3 +744,47 @@ async fn a_pool_carries_the_target_through_the_member_it_picks() {
     assert_eq!(tests[0].failing_proxy, Some(2));
     runtime.shutdown().await;
 }
+
+// A torrent route's test runs the test torrent over each path that reached
+// the torrent's host: every rung passes on a path that can take peers in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_route_runs_the_test_torrent_over_each_path() {
+    use crate::speed_test::P2pStep;
+    use crate::speed_test::torrent_fixture::{Answer, TorrentFixture};
+
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder()],
+        seeders: 1,
+        leechers: 0,
+        failure: None,
+        connect_in: true,
+    });
+    let runtime = runtime_with(vec![], vec![], vec![]);
+    let tests = runtime
+        .test_via_torrent(
+            &draft(LegPath::Direct),
+            TestSubject::Route,
+            None,
+            fixture.source.clone(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tests.len(), 1);
+    assert_eq!(tests[0].outcome, Ok(ProxyTestPass::Connected));
+    let report = tests[0].p2p.as_ref().expect("the torrent ran");
+    for step in [
+        P2pStep::Torrent,
+        P2pStep::Announce,
+        P2pStep::Handshake,
+        P2pStep::Piece,
+        P2pStep::Inbound,
+    ] {
+        assert!(report.passed(step), "{step:?} in {report:?}");
+    }
+    assert_eq!(report.mapped_port, None);
+    fixture.stop().await;
+    runtime.shutdown().await;
+}

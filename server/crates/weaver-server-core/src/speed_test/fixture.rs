@@ -212,11 +212,12 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
 }
 
 // An HTTP/1.1 source: `/blob` answers `blob_len` bytes, each page its own
-// body, `/limited` answers HTTP 429 as a rate-limiting provider does, and
-// anything else 404. With `tls`, HTTPS.
+// body, `/limited` answers HTTP 429 as a rate-limiting provider does, a POST
+// to `/upload` takes its body, and anything else 404. With `tls`, HTTPS.
 pub struct HttpFixture {
     pub addr: SocketAddr,
     requests: watch::Sender<usize>,
+    uploaded: watch::Sender<u64>,
 }
 
 impl HttpFixture {
@@ -239,6 +240,8 @@ impl HttpFixture {
         let addr = listener.local_addr().unwrap();
         let requests = watch::channel(0).0;
         let counter = requests.clone();
+        let uploaded = watch::channel(0).0;
+        let taken = uploaded.clone();
         let pages: Arc<HashMap<String, Vec<u8>>> = Arc::new(
             pages
                 .into_iter()
@@ -250,6 +253,7 @@ impl HttpFixture {
                 let tls = tls.clone();
                 let pages = pages.clone();
                 let counter = counter.clone();
+                let taken = taken.clone();
                 tokio::spawn(async move {
                     let stream: Box<dyn Io> = match tls {
                         Some(acceptor) => match acceptor.accept(stream).await {
@@ -258,15 +262,24 @@ impl HttpFixture {
                         },
                         None => Box::new(stream),
                     };
-                    let _ = serve_http(stream, &pages, blob_len, &counter).await;
+                    let _ = serve_http(stream, &pages, blob_len, &counter, &taken).await;
                 });
             }
         });
-        Self { addr, requests }
+        Self {
+            addr,
+            requests,
+            uploaded,
+        }
     }
 
     pub fn requests(&self) -> watch::Receiver<usize> {
         self.requests.subscribe()
+    }
+
+    // Body bytes posted to `/upload` so far.
+    pub fn uploaded(&self) -> watch::Receiver<u64> {
+        self.uploaded.subscribe()
     }
 }
 
@@ -338,20 +351,45 @@ async fn serve_http(
     pages: &HashMap<String, Vec<u8>>,
     blob_len: usize,
     counter: &watch::Sender<usize>,
+    uploaded: &watch::Sender<u64>,
 ) -> std::io::Result<()> {
     let mut stream = BufReader::new(stream);
     let mut request_line = String::new();
     stream.read_line(&mut request_line).await?;
     let mut header = String::new();
+    let mut content_length = 0u64;
     loop {
         header.clear();
         if stream.read_line(&mut header).await? == 0 || header == "\r\n" {
             break;
         }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
     }
     counter.send_modify(|count| *count += 1);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     let path = path.split('?').next().unwrap_or(path);
+    if request_line.starts_with("POST ") && path == "/upload" {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut left = content_length;
+        while left > 0 {
+            let want = buffer.len().min(left as usize);
+            let read = stream.read(&mut buffer[..want]).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            left -= read as u64;
+            uploaded.send_modify(|bytes| *bytes += read as u64);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        stream.flush().await?;
+        return stream.shutdown().await;
+    }
     let body: Vec<u8> = match (path, pages.get(path)) {
         (_, Some(body)) => body.clone(),
         ("/blob", None) => (0..blob_len).map(|i| (i % 253) as u8).collect(),

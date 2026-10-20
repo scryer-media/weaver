@@ -374,6 +374,7 @@ fn view(state: TorrentState) -> TorrentView {
         storage_dir: Some("/complete/tv/a".into()),
         seeding_left: None,
         seeding_override: None,
+        seeding_inherited: None,
         seeding_policy: SeedingPolicy::default(),
         seeding_source: SeedingSource::Global,
         route: None,
@@ -822,6 +823,87 @@ async fn an_added_torrent_is_listed_with_its_paths_and_state() {
     assert_eq!(filtered.json().as_array().unwrap().len(), 1);
     let none = rig.get("/api/v2/torrents/info?filter=completed").await;
     assert_eq!(none.json(), Value::Array(Vec::new()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // One server that answers each request with the next body, and hands
+    // back the requests it read.
+    async fn serve(bodies: Vec<Vec<u8>>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+                requests.push(String::from_utf8_lossy(&request).to_ascii_lowercase());
+            }
+            requests
+        });
+        (format!("http%3A%2F%2F{addr}%2Fa.torrent"), server)
+    }
+
+    let handle = scheduler();
+    handle.set_proxy_runtime(
+        weaver_server_core::proxies::ProxyRuntime::new(
+            Database::open_in_memory().unwrap(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap(),
+    );
+    let rig = rig_from(true, RuntimeSecurityConfig::default(), handle).await;
+
+    let (url, server) = serve(vec![metainfo("fetched.mkv", 4096, false)]).await;
+    let added = rig
+        .post(
+            "/api/v2/torrents/add",
+            &format!("urls={url}&cookie=uid%3D1%3B%20pass%3D2"),
+        )
+        .await;
+    assert_eq!((added.status, added.body.as_str()), (StatusCode::OK, "Ok."));
+    let requests = server.await.unwrap();
+    assert!(
+        requests[0].contains("cookie: uid=1; pass=2"),
+        "{requests:?}"
+    );
+    let listed = rig.torrents().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["name"], "fetched.mkv");
+
+    // A body that is not a torrent is refused for what it is, and the cookie
+    // went with its request only.
+    let (url, server) = serve(vec![b"<?xml version=\"1.0\"?><nzb/>".to_vec()]).await;
+    let refused = rig
+        .post("/api/v2/torrents/add", &format!("urls={url}"))
+        .await;
+    assert_eq!(
+        (refused.status, refused.body.as_str()),
+        (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not a torrent")
+    );
+    let requests = server.await.unwrap();
+    assert!(!requests[0].contains("cookie:"), "{requests:?}");
+
+    // A file is read for what it holds, whatever it is called.
+    let not_torrent = rig.add_file(b"<nzb/>", &[]).await;
+    assert_eq!(not_torrent.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(rig.torrents().await.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1275,6 +1357,15 @@ async fn share_limits_are_set_on_add_and_after() {
         ratio_goal: Some(1.0),
         ..SeedingPolicy::default()
     });
+    // The torrents learn of the setting the way the server hands it on.
+    let settings = TorrentSettings::of(&*rig.config.read().await);
+    rig.context
+        .inner
+        .torrents
+        .as_ref()
+        .unwrap()
+        .set_settings(settings)
+        .await;
     let refused = rig
         .post("/api/v2/torrents/setShareLimits", &limits("ratioLimit=-1"))
         .await;
@@ -1314,10 +1405,7 @@ async fn the_stub_endpoints_answer_and_a_url_must_be_a_magnet() {
         .await;
     assert_eq!(
         (url.status, url.body.as_str()),
-        (
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "url must be a magnet link"
-        )
+        (StatusCode::CONFLICT, "torrent request has no route")
     );
     assert!(rig.torrents().await.is_empty());
     // The offline rig's route is a system leg, which carries DHT.

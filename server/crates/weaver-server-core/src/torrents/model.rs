@@ -129,6 +129,8 @@ pub struct TorrentRecord {
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,
     pub policy_override: Option<SeedingPolicy>,
+    // The tracker rule its trackers matched, if any.
+    pub tracker_rule_id: Option<u32>,
 }
 
 impl TorrentRecord {

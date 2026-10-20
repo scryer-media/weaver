@@ -26,7 +26,7 @@ export interface LiveConnectionState {
 }
 
 export interface DownloadBlockState {
-  kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "EGRESS_QUOTA" | "SERVER_QUOTA";
+  kind: "NONE" | "MANUAL_PAUSE" | "SPEED_TEST" | "SCHEDULED" | "EGRESS_QUOTA" | "SERVER_QUOTA";
   /** The egress whose download quota is holding downloads, while one is. */
   egressId?: number | null;
   egressName?: string | null;

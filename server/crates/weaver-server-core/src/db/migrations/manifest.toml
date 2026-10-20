@@ -851,3 +851,37 @@ kind = "sql"
 file = "migrations/0071_graph_facts_parts/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 72
+description = "tracker rules set seeding goals and the schedule's pause by announce host"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0072_tracker_rules/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0072_tracker_rules/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 73
+description = "a torrent tracker row keeps only its place in the announce list"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0073_torrent_trackers_listing/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0073_torrent_trackers_listing/postgres.sql"
+engine = "postgres"
+scope = "all"

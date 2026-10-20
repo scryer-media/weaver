@@ -198,6 +198,23 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     );
     assert!(scheduled.contains("weaver_pipeline_download_gate{reason=\"scheduled\"} 1"));
     assert!(scheduled.contains("weaver_pipeline_download_gate{reason=\"none\"} 0"));
+
+    // A speed test's hold is its own reason, not the operator's pause.
+    let speed_test = metrics::render_prometheus_metrics(
+        &snapshot,
+        &jobs,
+        false,
+        &DownloadBlockState {
+            kind: DownloadBlockKind::SpeedTest,
+            ..DownloadBlockState::default()
+        },
+        &[],
+        0,
+    );
+    assert_valid_prometheus_exposition(&speed_test);
+    assert!(speed_test.contains("weaver_pipeline_download_gate{reason=\"speed_test\"} 1"));
+    assert!(speed_test.contains("weaver_pipeline_download_gate{reason=\"manual_pause\"} 0"));
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"speed_test\"} 0"));
 }
 
 #[test]

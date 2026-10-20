@@ -35,6 +35,7 @@ use crate::torrents::rate::SessionRates;
 pub const MAX_SESSIONS: usize = 8;
 
 const SLOTS_KEY: &str = "torrent.session_slots";
+const MAPPED_KEY: &str = "torrent.mapped_ports";
 
 /// A resolved route's identity: the leg it dials over.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -49,6 +50,21 @@ impl RouteKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// The egress a leg names: its configured one, the system egress, or none.
+fn leg_egress(network: &NetworkRuntime, egress_id: u32) -> Option<EgressInterface> {
+    network
+        .egress_configuration(egress_id)
+        .or_else(|| (egress_id == SYSTEM_EGRESS_ID).then(EgressInterface::system))
+}
+
+/// The key of the session a route through `egress_id` and `path` opens.
+pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> RouteKey {
+    match leg_egress(network, egress_id) {
+        Some(egress) => RouteKey::of(egress.id, &egress.binding, path),
+        None => RouteKey::of(egress_id, &EgressBinding::System, path),
     }
 }
 
@@ -119,17 +135,14 @@ impl Routes for NetworkRoutes {
             .validate_route(&route)
             .map_err(|refusal| refusal.to_string())?;
         let leg = route.legs.first().ok_or("the route has no leg")?.clone();
-        let egress = self
-            .network
-            .egress_configuration(leg.egress_id)
-            .or_else(|| (leg.egress_id == SYSTEM_EGRESS_ID).then(EgressInterface::system));
-        let Some(egress) = egress else {
+        let key = leg_key(&self.network, leg.egress_id, &leg.path);
+        let Some(egress) = leg_egress(&self.network, leg.egress_id) else {
             return Ok(RoutePlan {
                 scope,
                 policy,
                 egress_id: leg.egress_id,
                 kind: LegKind::System,
-                key: RouteKey::of(leg.egress_id, &EgressBinding::System, &leg.path),
+                key,
                 down: Some(format!("egress {} is missing", leg.egress_id)),
             });
         };
@@ -144,7 +157,7 @@ impl Routes for NetworkRoutes {
             scope,
             egress_id: egress.id,
             kind: LegKind::of(&egress.binding, &leg.path),
-            key: RouteKey::of(egress.id, &egress.binding, &leg.path),
+            key,
             policy,
             down,
         })
@@ -364,12 +377,13 @@ impl Sessions {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    // The route's port slot, read or taken off the async threads.
-    async fn port_slot(&self, key: &RouteKey) -> Result<u16, String> {
+    // The route's port slot, read or taken off the async threads, and the
+    // port a gateway mapped to it.
+    async fn port_slot(&self, key: &RouteKey) -> Result<(u16, Option<u16>), String> {
         let (db, key, table) = (self.db.clone(), key.clone(), Arc::clone(&self.port_slots));
         tokio::task::spawn_blocking(move || {
             let _table = table.lock().unwrap_or_else(PoisonError::into_inner);
-            port_slot(&db, &key)
+            Ok::<_, StateError>((port_slot(&db, &key)?, mapped_port(&db, &key)?))
         })
         .await
         .map_err(|error| error.to_string())?
@@ -382,7 +396,9 @@ impl Sessions {
         let (db, table) = (self.db.clone(), Arc::clone(&self.port_slots));
         let released = tokio::task::spawn_blocking(move || {
             let _table = table.lock().unwrap_or_else(PoisonError::into_inner);
-            release_slots(&db, |key| !existing.iter().any(|kept| kept.as_str() == key))
+            let gone = |key: &str| !existing.iter().any(|kept| kept.as_str() == key);
+            release_slots(&db, gone)?;
+            release_mapped(&db, gone)
         })
         .await;
         match released {
@@ -476,10 +492,10 @@ impl Sessions {
     async fn build(
         &self,
         plan: &RoutePlan,
-        slot: Result<u16, String>,
+        slot: Result<(u16, Option<u16>), String>,
         peers: usize,
     ) -> Result<(Arc<Session>, Option<Arc<TorrentLeg>>, u16), String> {
-        let slot = slot?;
+        let (slot, mapped) = slot?;
         let port = self
             .env
             .base_port
@@ -488,7 +504,12 @@ impl Sessions {
         let dir = self.env.root.join(plan.key.as_str());
         std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
         let leg = self.routes.open(plan).await?;
-        let options = session_options(&self.env, &leg, port, &dir, peers, self.encryption());
+        // A port a gateway mapped to the route is the one it announces.
+        let env = SessionEnv {
+            announce_port: mapped.or(self.env.announce_port),
+            ..self.env.clone()
+        };
+        let options = session_options(&env, &leg, port, &dir, peers, self.encryption());
         Session::new_with_opts(dir.join("output"), options)
             .await
             .map(|session| (session, leg.leg, port))
@@ -582,6 +603,13 @@ fn save_slots(db: &Database, slots: &BTreeMap<String, u16>) -> Result<(), StateE
     db.set_setting(SLOTS_KEY, &value)
 }
 
+/// The port the route's session listens on: its slot's, or the first
+/// slot's while it has none.
+pub fn listen_port(db: &Database, base_port: u16, key: &RouteKey) -> Result<u16, StateError> {
+    let slot = load_slots(db)?.get(key.as_str()).copied().unwrap_or(0);
+    Ok(base_port.saturating_add(slot))
+}
+
 /// The route's port slot, kept across restarts: the lowest free one the
 /// first time the route opens.
 pub fn port_slot(db: &Database, key: &RouteKey) -> Result<u16, StateError> {
@@ -595,6 +623,45 @@ pub fn port_slot(db: &Database, key: &RouteKey) -> Result<u16, StateError> {
     slots.insert(key.as_str().to_owned(), slot);
     save_slots(db, &slots)?;
     Ok(slot)
+}
+
+fn load_mapped(db: &Database) -> Result<BTreeMap<String, u16>, StateError> {
+    Ok(db
+        .get_setting(MAPPED_KEY)?
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+fn save_mapped(db: &Database, mapped: &BTreeMap<String, u16>) -> Result<(), StateError> {
+    let value =
+        serde_json::to_string(mapped).map_err(|error| StateError::Database(error.to_string()))?;
+    db.set_setting(MAPPED_KEY, &value)
+}
+
+/// The port a tunnel's gateway mapped to the route, kept across restarts.
+pub fn mapped_port(db: &Database, key: &RouteKey) -> Result<Option<u16>, StateError> {
+    Ok(load_mapped(db)?.get(key.as_str()).copied())
+}
+
+/// Keep the port a tunnel's gateway mapped to the route: the route's
+/// session announces it from the next time it opens.
+pub fn set_mapped_port(db: &Database, key: &RouteKey, port: u16) -> Result<(), StateError> {
+    let mut mapped = load_mapped(db)?;
+    if mapped.insert(key.as_str().to_owned(), port) != Some(port) {
+        save_mapped(db, &mapped)?;
+    }
+    Ok(())
+}
+
+// Forget the mapped ports of the routes `gone` names.
+fn release_mapped(db: &Database, gone: impl Fn(&str) -> bool) -> Result<(), StateError> {
+    let mut mapped = load_mapped(db)?;
+    let before = mapped.len();
+    mapped.retain(|key, _| !gone(key));
+    if mapped.len() != before {
+        save_mapped(db, &mapped)?;
+    }
+    Ok(())
 }
 
 // Free the slots of the routes `gone` names.

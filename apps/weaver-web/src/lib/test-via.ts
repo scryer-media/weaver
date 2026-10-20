@@ -36,7 +36,15 @@ export type PathTestResult = {
   connectMillis: number;
   /** How the host the path's final dial named was resolved. */
   resolution: HostResolution | null;
+  /** The test torrent over the path, for a torrent route's test. */
+  p2p: P2pTestResult | null;
 };
+
+/** The test torrent's steps, in the order a path takes them. */
+export type P2pStep = "TORRENT" | "ANNOUNCE" | "HANDSHAKE" | "PIECE" | "INBOUND";
+export type P2pRung = { step: P2pStep; outcome: "PASSED" | "FAILED" | "NOT_REACHED"; message: string | null };
+/** `mappedPort` is the port a tunnel's gateway opened, which the route now announces. */
+export type P2pTestResult = { rungs: P2pRung[]; mappedPort: number | null };
 
 /** Who turned a test's host into addresses. */
 export type ResolvedBy = "LITERAL" | "HOST" | "SERVERS" | "PROXY" | "PROXY_SERVERS";

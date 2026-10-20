@@ -19,6 +19,7 @@ import {
   type SpeedTestInput,
   type SpeedTestKind,
   type SpeedTestRun,
+  type SpeedTestUpload,
 } from "@/lib/networking";
 import { codedSentence, refusalMessage } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
@@ -26,6 +27,7 @@ import { Eyebrow, MetricCell, MetricStrip } from "../../components/chrome";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { DangerButton, NumberField, PrimaryButton, SecondaryButton, Segmented, Select, TextField } from "../../components/controls";
 import { EM_DASH, splitBytes, splitSpeed } from "../../data/format";
+import { countLabel } from "../../i18n/labels";
 import { useNextDataSelector } from "../../data/next-data";
 import type { Consumer } from "./data";
 import { LiveChart, type RatePoint } from "./LiveChart";
@@ -38,6 +40,8 @@ export type TestForm = {
   providerId: string;
   server: string;
   customUrl: string;
+  /** Where a bandwidth run posts its upload; empty posts nothing. */
+  uploadUrl: string;
   nzb: SabTestSize | "URL" | "FILE";
   nzbUrl: string;
   /** One NZB file, sent with the request and held by the daemon only for as long as the run is. */
@@ -60,6 +64,7 @@ export function defaultForm(consumer: Pick<Consumer, "kind" | "cap">): TestForm 
     providerId: "cloudflare",
     server: "",
     customUrl: "",
+    uploadUrl: "",
     nzb: "MB_100",
     nzbUrl: "",
     nzbFile: null,
@@ -136,6 +141,9 @@ export function formProblem(
   if (form.kind === "BANDWIDTH" && !form.providerId && !/^https:\/\/\S+$/i.test(form.customUrl.trim())) {
     return t("next.networking.speed.customUrlInvalid");
   }
+  if (form.kind === "BANDWIDTH" && form.uploadUrl.trim() && !/^https:\/\/\S+$/i.test(form.uploadUrl.trim())) {
+    return t("next.networking.speed.uploadUrlInvalid");
+  }
   if (form.kind === "USENET" && form.nzb === "URL" && !/^https?:\/\/\S+$/i.test(form.nzbUrl.trim())) {
     return t("next.networking.speed.nzbUrlInvalid");
   }
@@ -162,9 +170,12 @@ export function speedTestInput(
   };
   if (form.kind === "BANDWIDTH") {
     // The daemon picks the download, the connections and when to stop.
-    input.bandwidth = form.providerId
-      ? { providerId: form.providerId, ...(provider?.needsServer && form.server ? { server: form.server } : {}) }
-      : { customUrl: form.customUrl.trim() };
+    input.bandwidth = {
+      ...(form.providerId
+        ? { providerId: form.providerId, ...(provider?.needsServer && form.server ? { server: form.server } : {}) }
+        : { customUrl: form.customUrl.trim() }),
+      ...(form.uploadUrl.trim() ? { uploadUrl: form.uploadUrl.trim() } : {}),
+    };
   } else {
     input.usenet = {
       ...(form.nzb === "URL"
@@ -402,6 +413,16 @@ export function TestControls({
                 />
               </ControlLabel>
             )}
+            <ControlLabel label={t("next.networking.speed.uploadUrl")} className="min-w-0 flex-[0_1_480px]">
+              <TextField
+                label={t("next.networking.speed.uploadUrl")}
+                value={form.uploadUrl}
+                onChange={(uploadUrl) => set({ uploadUrl })}
+                placeholder="https://"
+                type="url"
+                className="w-full min-w-0"
+              />
+            </ControlLabel>
           </>
         ) : (
           <>
@@ -523,7 +544,7 @@ export function rateSeries(run: SpeedTestRun, field: "bytes" | "decodedBytes" = 
 }
 
 /** What a running test reports doing, in the order it does it. */
-const PHASES = ["preparing", "pausing", "draining", "leasing", "measuring", "releasing"];
+const PHASES = ["preparing", "pausing", "draining", "leasing", "measuring", "uploading", "releasing"];
 
 /** What the gate is doing, in words: pausing downloads, waiting for what is in flight, or measuring. */
 export function phaseLabel(t: Translate, phase: string | null): string {
@@ -691,11 +712,63 @@ export function RunResult({ run, better = {} }: { run: SpeedTestRun; better?: Be
               />
             </MetricStrip>
           ) : null}
+          {result.upload ? <UploadResult upload={result.upload} /> : null}
         </>
       ) : null}
     </section>
   );
 }
+
+/**
+ * What a bandwidth run sent: the post to its upload URL, and, while torrents
+ * are on, the test torrent's pieces to leechers. Leechers take only what they
+ * ask for, so that rate is a floor.
+ */
+function UploadResult({ upload }: { upload: SpeedTestUpload }) {
+  const t = useTranslate();
+  const rate = (bps: number | null) => splitSpeed(bps ?? 0);
+  const { http, peers } = upload;
+  return (
+    <MetricStrip min={200}>
+      {http.outcome === "MEASURED" ? (
+        <MetricCell variant="stat" eyebrow={t("next.networking.speed.upload")} {...rate(http.bps)} note={splitBytesLabel(http.bytes)} />
+      ) : (
+        <MetricCell
+          variant="stat"
+          eyebrow={t("next.networking.speed.upload")}
+          value={EM_DASH}
+          note={
+            http.outcome === "FAILED" && http.failure
+              ? failureMessage(t, http.failure)
+              : t(`next.networking.speed.uploadOutcome.${http.outcome}`)
+          }
+        />
+      )}
+      {peers ? (
+        peers.outcome === "MEASURED" ? (
+          <MetricCell
+            variant="stat"
+            eyebrow={t("next.networking.speed.uploadPeers")}
+            {...rate(peers.bps)}
+            note={countLabel(t, "next.networking.speed.uploadPeerCount", peers.peers ?? 0)}
+          />
+        ) : (
+          <MetricCell
+            variant="stat"
+            eyebrow={t("next.networking.speed.uploadPeers")}
+            value={EM_DASH}
+            note={peers.outcome === "FAILED" && peers.error ? peers.error : t(`next.networking.speed.uploadOutcome.${peers.outcome}`)}
+          />
+        )
+      ) : null}
+    </MetricStrip>
+  );
+}
+
+const splitBytesLabel = (bytes: number | null) => {
+  const { value, unit } = splitBytes(bytes ?? 0);
+  return `${value} ${unit}`;
+};
 
 /**
  * Run a test and follow it: the Run button, the one-line refusal when it cannot

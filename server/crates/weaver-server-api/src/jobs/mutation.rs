@@ -16,14 +16,15 @@ use crate::jobs::types::{
     DuplicateDecisionInfo, DuplicateModeGql, PRIORITY_ATTRIBUTE_KEY, PersistedQueueEvent,
     QueueCommandResult, QueueEventKind, QueueMoveKind, SemanticDuplicateAdmissionInfo,
     SemanticPromotionResult, StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult,
-    SubmissionResult, SubmissionStatus, SubmitNzbInput, SubmitStagedNzbsInput,
-    SubmitStagedNzbsResult, global_queue_state, normalize_priority_value, queue_item_from_job,
-    queue_item_from_submission, submit_metadata,
+    SubmissionKind, SubmissionResult, SubmissionStatus, SubmitInput, SubmitNzbInput,
+    SubmitStagedNzbsInput, SubmitStagedNzbsResult, global_queue_state, normalize_priority_value,
+    queue_item_from_job, queue_item_from_submission, submit_metadata,
 };
+use crate::torrents::TorrentsMutation;
 use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
-    ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError,
-    SubmittedJob, fetch_nzb_from_url, materialize_semantic_promotion,
+    FetchedNzb, Kind, ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions,
+    SubmitNzbError, SubmittedJob, classify, fetch_nzb_from_url, materialize_semantic_promotion,
     normalize_archive_password_candidate, submit_nzb_bytes_with_options,
     submit_staged_nzb_zstd_with_options, submit_staged_prepared_nzb_with_options,
     submit_uploaded_nzb_reader_with_options,
@@ -34,6 +35,7 @@ use weaver_server_core::jobs::{
 };
 use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::settings::SharedConfig;
+use weaver_server_core::torrents::service::{AddRequest, AddSource};
 use weaver_server_core::{
     Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
 };
@@ -87,6 +89,88 @@ impl JobsMutation {
     ) -> Result<SubmissionResult> {
         submit_from_facade_input(ctx, input).await
     }
+
+    /// Add an NZB or a torrent, told apart by what it holds. Text is an NZB
+    /// or torrent URL, a magnet link or an infohash; an upload is an NZB,
+    /// torrent or magnet file.
+    #[graphql(guard = "ControlGuard")]
+    async fn submit(&self, ctx: &Context<'_>, input: SubmitInput) -> Result<SubmissionResult> {
+        let caller = caller_identity(ctx)?;
+        let mut options = graphql_submission_options(&caller, None, None, None, None, None, None);
+        options.add_paused = input.paused;
+        let category = input.category;
+        let (source, filename, source_url) = match (input.text, input.upload) {
+            (Some(text), None) => {
+                let mut bytes = text.trim().as_bytes().to_vec();
+                let mut kind = classify(&bytes);
+                let mut source_url = None;
+                let mut filename = None;
+                if let Kind::Url(url) = kind {
+                    let fetched = fetch_url(ctx, url.as_str(), category.as_deref()).await?;
+                    options.supplied_password_candidates =
+                        weaver_server_core::ingest::header_archive_password_candidates(
+                            fetched.header_passwords.iter().map(String::as_str),
+                        );
+                    bytes = fetched.bytes;
+                    kind = classify(&bytes);
+                    filename = fetched.filename;
+                    source_url = Some(url.to_string());
+                }
+                match kind.torrent(bytes) {
+                    Ok(source) => {
+                        let added = add_torrent(ctx, source, category.clone(), input.paused).await;
+                        if let Some(url) = source_url {
+                            let status = if added.is_ok() {
+                                UrlStatus::Success
+                            } else {
+                                UrlStatus::ScanFailure
+                            };
+                            raise_url_completed(
+                                ctx.data::<Database>()?,
+                                &url,
+                                category.as_deref(),
+                                status,
+                            )
+                            .await;
+                        }
+                        return added;
+                    }
+                    Err(bytes) => (NzbSource::Bytes(bytes), filename, source_url),
+                }
+            }
+            (None, Some(upload)) => {
+                let upload = upload
+                    .value(ctx)
+                    .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
+                let filename =
+                    (!upload.filename.trim().is_empty()).then_some(upload.filename.clone());
+                match torrent_upload(upload) {
+                    Ok(source) => return add_torrent(ctx, source, category, input.paused).await,
+                    Err(upload) => (NzbSource::Upload(upload), filename, None),
+                }
+            }
+            _ => {
+                return Err(graphql_error(
+                    "INVALID_INPUT",
+                    "submit requires exactly one of text or upload",
+                ));
+            }
+        };
+        submit_nzb_source(
+            ctx,
+            NzbSubmission {
+                source,
+                filename,
+                source_url,
+                password: input.password,
+                category,
+                metadata: Vec::new(),
+                options,
+                client_request_id: None,
+            },
+        )
+        .await
+    }
     #[graphql(guard = "ControlGuard")]
     async fn stage_nzb_upload(
         &self,
@@ -105,6 +189,14 @@ impl JobsMutation {
                 ));
             }
         };
+        // A torrent is not staged: it is added whole, through `submit`.
+        if classify(&upload.content).is_torrent() {
+            return Ok(StagedNzbUploadResult {
+                kind: SubmissionKind::Torrent,
+                error: None,
+                ..rejected_stage_upload_result(filename, String::new())
+            });
+        }
 
         let db = ctx.data::<Database>()?.clone();
         let scan_before_parse = tokio::task::spawn_blocking(move || {
@@ -132,6 +224,7 @@ impl JobsMutation {
             .await
         {
             Ok(staged) => Ok(StagedNzbUploadResult {
+                kind: SubmissionKind::Nzb,
                 accepted: true,
                 staged_upload_id: Some(staged.staged_upload_id),
                 filename: Some(staged.filename),
@@ -171,6 +264,7 @@ impl JobsMutation {
         let dupe_key = input.dupe_key.clone();
         let dupe_score = input.dupe_score;
         let dupe_mode = input.dupe_mode;
+        let paused = input.paused;
         let (entries, missing) =
             manager.take_for_submit(&caller_identity, &input.staged_upload_ids);
         let mut found_by_id = entries
@@ -204,15 +298,18 @@ impl JobsMutation {
                 .as_deref()
                 .or(client_request_id.as_deref())
                 .map(|key| format!("{key}:staged:{staged_upload_id}"));
-            let options = graphql_submission_options(
-                &caller_identity,
-                None,
-                staged_idempotency_key.as_deref(),
-                force,
-                dupe_key.as_deref(),
-                dupe_score,
-                dupe_mode,
-            );
+            let options = SubmissionOptions {
+                add_paused: paused,
+                ..graphql_submission_options(
+                    &caller_identity,
+                    None,
+                    staged_idempotency_key.as_deref(),
+                    force,
+                    dupe_key.as_deref(),
+                    dupe_score,
+                    dupe_mode,
+                )
+            };
 
             let original_title = entry.preparation.as_ref().and_then(|preparation| {
                 preparation
@@ -923,6 +1020,7 @@ fn caller_identity(ctx: &Context<'_>) -> Result<CallerIdentity> {
 
 fn rejected_stage_upload_result(filename: Option<String>, error: String) -> StagedNzbUploadResult {
     StagedNzbUploadResult {
+        kind: SubmissionKind::Nzb,
         accepted: false,
         staged_upload_id: None,
         filename,
@@ -1119,9 +1217,6 @@ async fn submit_from_facade_input(
     ctx: &Context<'_>,
     input: SubmitNzbInput,
 ) -> Result<SubmissionResult> {
-    let handle = ctx.data::<SchedulerHandle>()?;
-    let db = ctx.data::<Database>()?;
-    let config = ctx.data::<SharedConfig>()?;
     let caller = caller_identity(ctx)?;
     let source_url = input.url.clone();
     let mut supplied_password_candidates =
@@ -1142,14 +1237,7 @@ async fn submit_from_facade_input(
             (Some(bytes), None, input.filename)
         }
         (None, Some(url), None) => {
-            let fetched = match handle.proxy_runtime() {
-                Some(runtime) => fetch_nzb_from_url(&runtime, &url).await,
-                None => Err(SubmitNzbError::Fetch("NZB request has no route".into())),
-            };
-            if fetched.is_err() {
-                raise_url_completed(db, &url, input.category.as_deref(), UrlStatus::Failure).await;
-            }
-            let fetched = fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+            let fetched = fetch_url(ctx, &url, input.category.as_deref()).await?;
             supplied_password_candidates.extend(
                 weaver_server_core::ingest::header_archive_password_candidates(
                     fetched.header_passwords.iter().map(String::as_str),
@@ -1178,8 +1266,6 @@ async fn submit_from_facade_input(
     };
 
     let client_request_id = input.client_request_id.clone();
-    let category = input.category.clone();
-    let url_event = source_url.clone().map(|url| (url, category.clone()));
     let mut options = graphql_submission_options(
         &caller,
         client_request_id.as_deref(),
@@ -1190,44 +1276,98 @@ async fn submit_from_facade_input(
         input.dupe_mode,
     );
     options.supplied_password_candidates = supplied_password_candidates;
-    let mut metadata = submit_metadata(input.attributes, input.client_request_id.clone())
+    let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
-    if let Some(url) = source_url {
+    let source = match (nzb_bytes, upload) {
+        (_, Some(upload)) => NzbSource::Upload(upload),
+        (bytes, None) => NzbSource::Bytes(bytes.expect("nzb bytes should be present")),
+    };
+    submit_nzb_source(
+        ctx,
+        NzbSubmission {
+            source,
+            filename,
+            source_url,
+            password: input.password,
+            category: input.category,
+            metadata,
+            options,
+            client_request_id,
+        },
+    )
+    .await
+}
+
+// An NZB to submit: its bytes in hand, or an upload parsed as it is read.
+enum NzbSource {
+    Bytes(Vec<u8>),
+    Upload(UploadValue),
+}
+
+struct NzbSubmission {
+    source: NzbSource,
+    filename: Option<String>,
+    source_url: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
+    client_request_id: Option<String>,
+}
+
+async fn submit_nzb_source(ctx: &Context<'_>, nzb: NzbSubmission) -> Result<SubmissionResult> {
+    let handle = ctx.data::<SchedulerHandle>()?;
+    let db = ctx.data::<Database>()?;
+    let config = ctx.data::<SharedConfig>()?;
+    let NzbSubmission {
+        source,
+        filename,
+        source_url,
+        password,
+        category,
+        mut metadata,
+        options,
+        client_request_id,
+    } = nzb;
+    if let Some(url) = &source_url {
         metadata.push((
             weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
-            url,
+            url.clone(),
         ));
     }
 
-    let submitted = if let Some(upload) = upload {
-        submit_uploaded_nzb(
-            db,
-            handle,
-            config,
-            upload,
-            filename,
-            input.password,
-            category,
-            metadata,
-            options,
-        )
-        .await
-    } else {
-        submit_nzb_bytes_with_options(
-            db,
-            handle,
-            config,
-            &nzb_bytes.expect("nzb bytes should be present"),
-            filename,
-            input.password,
-            category,
-            metadata,
-            options,
-        )
-        .await
+    let submitted = match source {
+        NzbSource::Upload(upload) => {
+            submit_uploaded_nzb(
+                db,
+                handle,
+                config,
+                upload,
+                filename,
+                password,
+                category.clone(),
+                metadata,
+                options,
+            )
+            .await
+        }
+        NzbSource::Bytes(bytes) => {
+            submit_nzb_bytes_with_options(
+                db,
+                handle,
+                config,
+                &bytes,
+                filename,
+                password,
+                category.clone(),
+                metadata,
+                options,
+            )
+            .await
+        }
     };
     // The URL outcome is known only once its NZB has been accepted or refused.
-    if let Some((url, category)) = url_event {
+    if let Some(url) = source_url {
         let status = if submitted.is_ok() {
             UrlStatus::Success
         } else {
@@ -1243,6 +1383,56 @@ async fn submit_from_facade_input(
         Err(error) => submission_result_from_error(client_request_id, error)
             .map_err(|e| graphql_error("INVALID_INPUT", e.to_string())),
     }
+}
+
+// Fetch a URL on the default outbound. A fetch that fails is the URL's outcome.
+async fn fetch_url(ctx: &Context<'_>, url: &str, category: Option<&str>) -> Result<FetchedNzb> {
+    let fetched = match ctx.data::<SchedulerHandle>()?.proxy_runtime() {
+        Some(runtime) => fetch_nzb_from_url(&runtime, url).await,
+        None => Err(SubmitNzbError::Fetch("NZB request has no route".into())),
+    };
+    if fetched.is_err() {
+        raise_url_completed(ctx.data::<Database>()?, url, category, UrlStatus::Failure).await;
+    }
+    fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))
+}
+
+async fn add_torrent(
+    ctx: &Context<'_>,
+    source: AddSource,
+    category: Option<String>,
+    paused: bool,
+) -> Result<SubmissionResult> {
+    let job_id = TorrentsMutation::add(
+        ctx,
+        AddRequest {
+            source,
+            category,
+            policy_override: None,
+            paused,
+            forced: false,
+        },
+    )
+    .await?;
+    Ok(SubmissionResult {
+        accepted: true,
+        status: SubmissionStatus::Accepted,
+        job_id: Some(job_id.0),
+        client_request_id: None,
+        item: None,
+        duplicate_decision: None,
+        semantic_duplicate: None,
+        error_code: None,
+        message: None,
+    })
+}
+
+// A torrent or magnet upload as the torrent client takes it; any other
+// upload comes back.
+fn torrent_upload(upload: UploadValue) -> Result<AddSource, UploadValue> {
+    classify(&upload.content)
+        .torrent(upload.content.to_vec())
+        .map_err(|_| upload)
 }
 
 async fn raise_url_completed(db: &Database, url: &str, category: Option<&str>, status: UrlStatus) {

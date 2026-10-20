@@ -87,6 +87,16 @@ impl SettingsQuery {
     }
 
     #[graphql(guard = "AdminGuard")]
+    async fn tracker_rules(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let rules = tokio::task::spawn_blocking(move || db.list_tracker_rules()).await??;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+
+    #[graphql(guard = "AdminGuard")]
     async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::settings::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();
         let entries: Vec<weaver_server_core::bandwidth::ScheduleEntry> =

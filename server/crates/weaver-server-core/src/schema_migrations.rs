@@ -34,7 +34,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 71;
+const CURRENT_SCHEMA_VERSION: i64 = 73;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1560,6 +1560,82 @@ mod tests {
                 .unwrap(),
             Some(crate::pipeline::graph::Engine::Classic)
         );
+    }
+
+    // Migration 73 keeps each tracker's place in the announce list and drops
+    // the announce columns, which the session answers instead.
+    #[tokio::test]
+    async fn sqlite_migration_73_keeps_only_the_tracker_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-tracker-listing.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(72), true)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
+             VALUES (7, ?, 'listing', 'magnet', 1, 'queued')",
+        )
+        .bind(vec![7_u8; 20])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO torrent_trackers (job_id, tier, url, status, seeders)
+             VALUES (7, 0, 'http://a/announce', 'working', 3),
+                    (7, 1, 'udp://b:80', 'not_contacted', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let dropped = [
+            "status",
+            "last_announce_ms",
+            "next_announce_ms",
+            "message",
+            "seeders",
+            "leechers",
+        ];
+        assert_eq!(
+            pragma_column_count(&pool, "torrent_trackers", &dropped).await,
+            0
+        );
+        let rows: Vec<(i64, i64, String)> =
+            sqlx::query_as("SELECT job_id, tier, url FROM torrent_trackers ORDER BY tier")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (7, 0, "http://a/announce".to_string()),
+                (7, 1, "udp://b:80".to_string()),
+            ]
+        );
+        let sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'torrent_trackers'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(sql.contains("WITHOUT ROWID"), "{sql}");
+        sqlx::query("DELETE FROM torrents WHERE job_id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM torrent_trackers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        pool.close().await;
     }
 
     #[tokio::test]

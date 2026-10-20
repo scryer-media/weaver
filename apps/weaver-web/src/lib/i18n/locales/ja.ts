@@ -91,6 +91,7 @@ const ja: LocaleDictionary = {
   "jobs.egressQuotaEta": "{{resetAt}} まで",
   "jobs.serverQuotaBadge": "サーバークォータ",
   "jobs.serverQuotaEta": "サーバークォータ待ち",
+  "jobs.speedTestBadge": "測定中",
 
   // Table headers
   "table.name": "名前",

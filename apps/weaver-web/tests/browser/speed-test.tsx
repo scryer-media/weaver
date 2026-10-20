@@ -71,13 +71,13 @@ const MIB = 1024 * 1024;
 const runs: SpeedTestRun[] = [
   {
     id: 1, consumer: "server:1", consumerName: "news.fixture.invalid", kind: "BANDWIDTH",
-    request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null }, usenet: null },
+    request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null, uploadUrl: null, uploadMib: null }, usenet: null },
     status: "COMPLETED", phase: null, startedAt: 1790640000000, finishedAt: 1790640010000, failure: null,
     tested: { legs: [{ position: 0, egressId: 0, weight: 100, down: false, downReason: null, path: { kind: "DIRECT" }, target: 4 }], failover: "REDISTRIBUTE", overrides: noOverrides(), names: [{ kind: "egress", id: 0, name: "System" }] },
     result: {
       bytes: 100 * MIB, elapsedMs: 10000, averageBps: 10 * MIB, peakBps: 12 * MIB,
       legs: [{ position: 0, bytes: 100 * MIB, averageBps: 10 * MIB, peakBps: 12 * MIB, connections: 4, sourceAddresses: ["192.0.2.10"] }],
-      connections: [], usenet: null, bandwidth: { providerId: "cloudflare", server: null, url: "https://speed.fixture.invalid/__down", connections: 4 },
+      connections: [], usenet: null, bandwidth: { providerId: "cloudflare", server: null, url: "https://speed.fixture.invalid/__down", connections: 4 }, upload: null,
       samples: [{ atMs: 1000, leg: 0, bytes: 10 * MIB, decodedBytes: 0 }],
     },
   },
@@ -105,6 +105,7 @@ function report(run: SpeedTestRun): SpeedTestRun {
       connections: live.map((leg) => ({ leg: leg.position, connectMs: 18, path: { egressId: leg.egressId, rung: null, poolId: null, memberId: null, proxyIds: [] }, sourceAddress: "192.0.2.10:45123", bytes: 240 * MIB / live.length, bytesPerSecond: 0, error: null })),
       usenet: usenet ? { articlesRequested: 320, delivered: 318, missing: 2, failed: 0, declaredBytes: 100_000_000, decodedBytes: 230 * MIB, pipelining: true, tls: true, tlsCipherSuite: "TLS13_AES_256_GCM_SHA384" } : null,
       bandwidth: usenet ? null : { providerId: "cloudflare", server: null, url: "https://speed.fixture.invalid/__down", connections: 4 },
+      upload: null,
       samples: live.flatMap((leg) => [1000, 2000].map((atMs) => ({ atMs, leg: leg.position, bytes: 10 * MIB, decodedBytes: usenet ? 9 * MIB : 0 }))),
     },
   });
@@ -158,6 +159,7 @@ function measure(id: number, seconds = 1) {
       }),
       usenet: run.kind === "USENET" ? { articlesRequested: 320, delivered: 120, missing: 0, failed: 0, declaredBytes: 100_000_000, decodedBytes: Math.round(total * live.length * 0.97), pipelining: true, tls: true, tlsCipherSuite: "TLS13_AES_256_GCM_SHA384" } : null,
       bandwidth: null,
+      upload: null,
       samples: Array.from({ length: seconds }, (_, index) => index + 1).flatMap((second) => live.map((leg) => ({
         atMs: second * 1000, leg: leg.position, bytes: binBytes(second),
         decodedBytes: run.kind === "USENET" ? Math.round(binBytes(second) * (0.9 + 0.08 * Math.cos(second))) : 0,
@@ -192,7 +194,7 @@ function graphql(name: string, variables: Record<string, unknown>) {
       consumer: owner.key, consumerName: owner.name, kind: input.usenet ? "USENET" : "BANDWIDTH",
       // Kept as the daemon keeps it: every field present, absent ones null.
       request: {
-        bandwidth: input.bandwidth ? { providerId: input.bandwidth.providerId ?? null, server: input.bandwidth.server ?? null, customUrl: input.bandwidth.customUrl ?? null } : null,
+        bandwidth: input.bandwidth ? { providerId: input.bandwidth.providerId ?? null, server: input.bandwidth.server ?? null, customUrl: input.bandwidth.customUrl ?? null, uploadUrl: input.bandwidth.uploadUrl ?? null, uploadMib: input.bandwidth.uploadMib ?? null } : null,
         usenet: usenet
           ? {
               sabSize: usenet.sabSize ?? null, nzbUrl: usenet.nzbUrl ?? null, nzbFilename: uploaded?.upload ?? held,
@@ -206,7 +208,7 @@ function graphql(name: string, variables: Record<string, unknown>) {
         failover: tested.failover, overrides, names: [],
       },
       // Nothing is sampled before the run measures.
-      result: { bytes: 0, elapsedMs: 0, averageBps: 0, peakBps: 0, legs: [], connections: [], usenet: null, bandwidth: null, samples: [] },
+      result: { bytes: 0, elapsedMs: 0, averageBps: 0, peakBps: 0, legs: [], connections: [], usenet: null, bandwidth: null, upload: null, samples: [] },
     };
     runs.unshift(run);
     return { data: { startSpeedTest: run } };

@@ -198,6 +198,33 @@ impl RoutedClient {
         Ok(response)
     }
 
+    // One POST of `body`, refused unless it answers with a success status.
+    pub(crate) async fn post(
+        &self,
+        url: &reqwest::Url,
+        body: bytes::Bytes,
+    ) -> Result<reqwest::Response, SpeedTestFailure> {
+        let response = self
+            .client
+            .post(url.clone())
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| {
+                if weaver_nntp::tls::is_tls_error(&error) {
+                    SpeedTestFailure::TlsVerification {
+                        host: self.host.clone(),
+                    }
+                } else {
+                    format!("POST {url} failed: {error}").into()
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(SpeedTestFailure::answered(url, response.status()));
+        }
+        Ok(response)
+    }
+
     pub(crate) async fn close(self) {
         drop(self.client);
         self.bridge.revoke().await;

@@ -181,7 +181,7 @@ export type BandwidthProviderServer = { id: string; name: string; location: stri
  */
 export type SpeedTestInput = {
   kind: ConsumerKind; id: number; route?: ReturnType<typeof routeInput> | null; overrides?: PathOverride | null;
-  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null } | null;
+  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null; uploadUrl?: string | null; uploadMib?: number | null } | null;
   usenet?: {
     sabSize?: SabTestSize | null; nzbUrl?: string | null; nzbUpload?: File | null; nzbRunId?: number | null;
     connections?: number | null; maxDurationSeconds: number;
@@ -195,6 +195,8 @@ export type SpeedTestResult = {
   usenet: { articlesRequested: number; delivered: number; missing: number; failed: number; declaredBytes: number; decodedBytes: number; pipelining: boolean; tls: boolean; tlsCipherSuite: string | null } | null;
   /** `connections` is how many the run had open when it ended. */
   bandwidth: { providerId: string | null; server: string | null; url: string; connections: number } | null;
+  /** A bandwidth run's upload, once it has posted. */
+  upload: SpeedTestUpload | null;
   /** One per leg each second; `decodedBytes` is 0 for a bandwidth run. */
   samples: { atMs: number; leg: number; bytes: number; decodedBytes: number }[];
 };
@@ -203,11 +205,21 @@ export type SpeedTestResult = {
  * An uploaded NZB is named by `nzbFilename`; `nzbRunId` is set when it came from an earlier run.
  */
 export type SpeedTestRequest = {
-  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null } | null;
+  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null; uploadUrl: string | null; uploadMib: number | null } | null;
   usenet: {
     sabSize: SabTestSize | null; nzbUrl: string | null; nzbFilename: string | null; nzbRunId: number | null;
     connections: number | null; maxDurationSeconds: number;
   } | null;
+};
+export type UploadOutcome = "NOT_CONFIGURED" | "MEASURED" | "FAILED" | "NO_DEMAND";
+/**
+ * What a bandwidth run sent: a post to its upload URL, and the test torrent's
+ * pieces to leechers while torrents are on. `peers` counts only what peers
+ * asked for, so its rate is a floor.
+ */
+export type SpeedTestUpload = {
+  http: { outcome: UploadOutcome; url: string | null; bytes: number | null; elapsedMs: number | null; bps: number | null; failure: SpeedTestFailure | null };
+  peers: { outcome: UploadOutcome; bytes: number | null; elapsedMs: number | null; bps: number | null; peers: number | null; error: string | null } | null;
 };
 /** Why a run failed: the web words each code; OTHER, or a code it does not know, shows `message`. */
 export type SpeedTestFailureCode =

@@ -101,6 +101,7 @@ pub struct SubscriptionRoot(
     history_subscription::HistorySubscription,
     jobs_subscription::JobsSubscription,
     system_subscription::SystemSubscription,
+    crate::torrents::TorrentsSubscription,
 );
 
 #[path = "auth/query.rs"]

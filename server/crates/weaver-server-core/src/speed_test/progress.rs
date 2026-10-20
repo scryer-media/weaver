@@ -446,6 +446,7 @@ impl Progress {
             connections,
             usenet,
             bandwidth,
+            upload: None,
             samples,
         })
     }

@@ -1,41 +1,37 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useState } from "react";
-import { useMutation, useQuery } from "urql";
-import { SET_TORRENT_SEEDING_MUTATION, TORRENT_QUERY } from "@/graphql/queries";
+import { useState } from "react";
+import { useMutation, useSubscription } from "urql";
+import { SET_TORRENT_SEEDING_MUTATION, TORRENT_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { torrentErrorText, type SeedingSource, type TorrentData } from "@/lib/torrents";
+import { torrentErrorText, type TorrentData } from "@/lib/torrents";
 import { DetailBlock, Field } from "@/next/components/chrome";
 import { Dialog } from "@/next/components/Dialog";
 import { PrimaryButton, SecondaryButton } from "@/next/components/controls";
 import { GridRow } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
+import { useNextData } from "@/next/data/next-data";
 import { FieldRows } from "@/next/pages/settings/framework";
 import { EMPTY_SEEDING, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
-
-/** Peers, trackers and seeding move on their own, with nothing pushed to say so. */
-const REFRESH_MS = 3000;
 
 const TRACKER_COLUMNS = { base: "minmax(0,1fr) 112px", sm: "minmax(0,1fr) 112px minmax(0,1fr)" };
 const FILE_COLUMNS = { base: "minmax(0,1fr) 56px 90px" };
 
-/** A torrent job's torrent, read while the page shows it and again as it moves. */
-export function useTorrent(id: number, active: boolean, live: boolean) {
-  const [{ data }, refresh] = useQuery<{ torrent: TorrentData | null }>({
-    query: TORRENT_QUERY,
+/**
+ * A torrent job's torrent, followed while the page shows it. Following it
+ * again reads it at once, as a change that pushes nothing still shows.
+ */
+export function useTorrent(id: number, active: boolean) {
+  const { connection } = useNextData("connection");
+  const [{ data }, follow] = useSubscription<{ torrentUpdates: TorrentData[] }>({
+    query: TORRENT_UPDATES_SUBSCRIPTION,
     variables: { id },
-    pause: !active,
-    requestPolicy: "network-only",
+    pause: !active || connection.isDisconnected,
   });
-  useEffect(() => {
-    if (!active || !live) return;
-    const timer = window.setInterval(() => refresh({ requestPolicy: "network-only" }), REFRESH_MS);
-    return () => window.clearInterval(timer);
-  }, [active, live, refresh]);
   return {
-    torrent: active ? (data?.torrent ?? null) : null,
-    refresh: () => refresh({ requestPolicy: "network-only" }),
+    torrent: active ? (data?.torrentUpdates[0] ?? null) : null,
+    refresh: () => follow(),
   };
 }
 
@@ -64,13 +60,15 @@ function seedingRows(t: Translate, policy: SeedingPolicy): { label: string; valu
   ];
 }
 
-/** Where the policy in effect comes from: the torrent's own override, its category, or the global one. */
-function seedingSourceText(t: Translate, source: SeedingSource, category: string | null): string {
-  switch (source) {
+/** Where the policy in effect comes from: the torrent's own override, its tracker rule, its category, or the global one. */
+function seedingSourceText(t: Translate, torrent: TorrentData): string {
+  switch (torrent.seedingSource) {
     case "TORRENT":
       return t("next.torrent.seedingFromTorrent");
+    case "TRACKER_RULE":
+      return t("next.torrent.seedingFromTrackerRule", { name: torrent.seedingRule ?? "" });
     case "CATEGORY":
-      return t("next.torrent.seedingFromCategory", { name: category ?? "" });
+      return t("next.torrent.seedingFromCategory", { name: torrent.category ?? "" });
     case "GLOBAL":
       return t("next.torrent.seedingFromGlobal");
   }
@@ -143,7 +141,7 @@ export function TorrentDetail({
         <div className="grid gap-x-4 gap-y-[13px]" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))" }}>
           <Field
             label={t("next.torrent.seedingFrom")}
-            value={seedingSourceText(t, torrent.seedingSource, torrent.category)}
+            value={seedingSourceText(t, torrent)}
           />
           {seedingRows(t, torrent.seedingPolicy).map((row) => (
             <Field key={row.label} label={row.label} value={row.value} />

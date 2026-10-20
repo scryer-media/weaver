@@ -76,6 +76,7 @@ impl From<weaver_server_core::runtime::log_filter::LogFilterState> for LogFilter
 pub enum DownloadBlockKindGql {
     None,
     ManualPause,
+    SpeedTest,
     Scheduled,
     EgressQuota,
     ServerQuota,
@@ -86,6 +87,7 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
         match value {
             DownloadBlockKind::None => Self::None,
             DownloadBlockKind::ManualPause => Self::ManualPause,
+            DownloadBlockKind::SpeedTest => Self::SpeedTest,
             DownloadBlockKind::Scheduled => Self::Scheduled,
             DownloadBlockKind::EgressQuota => Self::EgressQuota,
             DownloadBlockKind::ServerQuota => Self::ServerQuota,

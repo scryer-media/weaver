@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use async_graphql::{Enum, InputObject, SimpleObject};
-use weaver_server_core::torrents::service::{SeedingSource, TorrentView};
+use weaver_server_core::torrents::service::{ScheduleSeeding, SeedingSource, TorrentView};
 use weaver_server_core::torrents::{TorrentState, TorrentTracker, TrackerStatus};
 
 use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
@@ -64,14 +64,33 @@ pub enum SeedingSourceGql {
     Category,
     Global,
     Torrent,
+    TrackerRule,
 }
 
-impl From<SeedingSource> for SeedingSourceGql {
-    fn from(source: SeedingSource) -> Self {
+impl From<&SeedingSource> for SeedingSourceGql {
+    fn from(source: &SeedingSource) -> Self {
         match source {
             SeedingSource::Category => Self::Category,
             SeedingSource::Global => Self::Global,
             SeedingSource::Torrent => Self::Torrent,
+            SeedingSource::TrackerRule(_) => Self::TrackerRule,
+        }
+    }
+}
+
+/// The torrents the schedule's pause leaves seeding under one tracker rule.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "ScheduleSeeding")]
+pub struct ScheduleSeedingGql {
+    pub host_pattern: String,
+    pub torrents: u32,
+}
+
+impl From<ScheduleSeeding> for ScheduleSeedingGql {
+    fn from(seeding: ScheduleSeeding) -> Self {
+        Self {
+            host_pattern: seeding.host_pattern,
+            torrents: seeding.torrents,
         }
     }
 }
@@ -148,6 +167,9 @@ pub struct Torrent {
     /// The seeding policy in effect.
     pub seeding_policy: SeedingPolicySettings,
     pub seeding_source: SeedingSourceGql,
+    /// The host pattern of the tracker rule the policy comes from, when it
+    /// does.
+    pub seeding_rule: Option<String>,
     pub route: Option<String>,
     pub files: Vec<TorrentFileGql>,
     pub trackers: Vec<TorrentTrackerGql>,
@@ -193,7 +215,11 @@ impl From<TorrentView> for Torrent {
             seeding_left: view.seeding_left,
             seeding_override: view.seeding_override.map(Into::into),
             seeding_policy: view.seeding_policy.into(),
-            seeding_source: view.seeding_source.into(),
+            seeding_source: (&view.seeding_source).into(),
+            seeding_rule: match view.seeding_source {
+                SeedingSource::TrackerRule(pattern) => Some(pattern),
+                _ => None,
+            },
             route: view.route,
             files,
             trackers: view.trackers.into_iter().map(Into::into).collect(),

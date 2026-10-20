@@ -119,7 +119,7 @@ fn global_pause_origin_selects_the_block_kind() {
     let runtime = BandwidthLedgerRuntime::default();
 
     // The block follows who holds the queue: a schedule's hold presents as
-    // Scheduled, the operator's and a speed test's as a pause.
+    // Scheduled, the operator's as a pause and a speed test's as its own.
     assert_eq!(
         runtime.to_download_block_state(None).kind,
         crate::DownloadBlockKind::None
@@ -134,7 +134,7 @@ fn global_pause_origin_selects_the_block_kind() {
         runtime
             .to_download_block_state(Some(HoldOrigin::SpeedTest))
             .kind,
-        crate::DownloadBlockKind::ManualPause
+        crate::DownloadBlockKind::SpeedTest
     );
     assert_eq!(
         runtime

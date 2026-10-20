@@ -12,12 +12,18 @@ mod failure;
 pub mod fixture;
 mod http;
 mod model;
+mod natpmp;
 mod nearest;
 mod overrides;
 mod progress;
 pub mod providers;
 mod runner;
 mod service;
+pub(crate) mod torrent;
+#[cfg(any(test, feature = "test-support"))]
+pub mod torrent_fixture;
+mod torrent_net;
+mod upload;
 mod usenet;
 
 #[cfg(test)]
@@ -25,9 +31,13 @@ mod tests;
 
 pub use failure::SpeedTestFailure;
 pub use model::*;
+pub(crate) use natpmp::gateway_of;
 pub use overrides::{TestedLeg, TestedRoute};
 pub use providers::{PROVIDERS, ProviderInfo, ProviderServer};
 pub use service::{
     ServiceInner, SpeedTestError, SpeedTestMetricsSnapshot, SpeedTestService,
     speed_test_metrics_snapshot,
+};
+pub use torrent::{
+    DEBIAN_TORRENTS, P2pOutcome, P2pReport, P2pRung, P2pStep, PeerUpload, TestTorrentSource,
 };

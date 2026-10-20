@@ -92,6 +92,7 @@ const ko: LocaleDictionary = {
   "jobs.egressQuotaEta": "{{resetAt}}까지",
   "jobs.serverQuotaBadge": "서버 할당량",
   "jobs.serverQuotaEta": "서버 할당량 대기 중",
+  "jobs.speedTestBadge": "측정중",
 
   // Table headers
   "table.name": "이름",

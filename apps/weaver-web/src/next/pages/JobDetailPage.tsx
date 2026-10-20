@@ -247,7 +247,7 @@ function JobDetailContent() {
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
   const progress = useJobProgress(job ?? NO_JOB);
   const isTorrent = job?.protocol === "TORRENT";
-  const { torrent, refresh: refreshTorrent } = useTorrent(jobId, isTorrent, inQueue);
+  const { torrent, refresh: refreshTorrent } = useTorrent(jobId, isTorrent);
   // The output folder fills in as the job moves through post-processing and
   // settles when it finishes, so the listing is re-read on each status change
   // rather than kept from the page's first render.

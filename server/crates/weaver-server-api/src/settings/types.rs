@@ -1220,6 +1220,57 @@ impl SeedingPolicyInput {
     }
 }
 
+/// Seeding goals for the torrents announcing to a host, and whether the
+/// schedule's pause leaves them seeding until their goal is met.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct TrackerRule {
+    pub id: u32,
+    /// A host, or `*.` and a host for it and every host under it.
+    pub host_pattern: String,
+    /// The goals this rule sets; absent leaves them to the category and the
+    /// global policy.
+    pub seeding: Option<SeedingPolicySettings>,
+    pub never_pause: bool,
+}
+
+impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
+    fn from(rule: weaver_server_core::settings::model::TrackerRule) -> Self {
+        Self {
+            id: rule.id,
+            host_pattern: rule.host_pattern,
+            seeding: rule.seeding.map(Into::into),
+            never_pause: rule.never_pause,
+        }
+    }
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct TrackerRuleInput {
+    pub host_pattern: String,
+    pub seeding: Option<SeedingPolicyInput>,
+    #[graphql(default)]
+    pub never_pause: bool,
+}
+
+impl TrackerRuleInput {
+    pub fn into_rule(
+        self,
+        id: u32,
+    ) -> async_graphql::Result<weaver_server_core::settings::model::TrackerRule> {
+        use weaver_server_core::settings::model::TrackerRule;
+        Ok(TrackerRule {
+            id,
+            host_pattern: TrackerRule::pattern(&self.host_pattern)
+                .map_err(async_graphql::Error::new)?,
+            seeding: self
+                .seeding
+                .map(SeedingPolicyInput::into_policy)
+                .transpose()?,
+            never_pause: self.never_pause,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
 #[graphql(name = "TorrentEncryption")]
 pub enum TorrentEncryptionGql {

@@ -92,6 +92,7 @@ const zh: LocaleDictionary = {
   "jobs.egressQuotaEta": "直到 {{resetAt}}",
   "jobs.serverQuotaBadge": "服务器配额",
   "jobs.serverQuotaEta": "等待服务器配额",
+  "jobs.speedTestBadge": "测速中",
 
   // Table headers
   "table.name": "名称",

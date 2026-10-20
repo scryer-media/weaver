@@ -459,3 +459,119 @@ async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
     assert!(response.errors.is_empty(), "{:?}", response.errors);
     assert_eq!(read(harness.execute(state).await), (false, false));
 }
+
+// A follower of the torrents gets them as they are, then each change the
+// service publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn torrent_updates_push_what_the_service_publishes() {
+    use tokio_stream::StreamExt;
+
+    let rig = rig().await;
+    rig.torrents.publish_to(rig.harness.handle.clone());
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+
+    let request = Request::new(format!(
+        "subscription {{ torrentUpdates(id: {id}) {{ id name state }} }}"
+    ))
+    .data(CallerScope::Local)
+    .data(CallerIdentity::Local([7; 32]))
+    .data(rig.torrents.clone());
+    let mut updates = rig.harness.schema.execute_stream(request);
+    let first = updates.next().await.unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let first = first.data.into_json().unwrap();
+    assert_eq!(first["torrentUpdates"][0]["id"], id);
+    assert_eq!(first["torrentUpdates"][0]["name"], "one.mkv");
+    assert_eq!(first["torrentUpdates"][0]["state"], "STALLED");
+
+    let paused = rig
+        .execute(&format!("mutation {{ pauseTorrent(id: {id}) }}"))
+        .await;
+    assert!(paused.errors.is_empty(), "{:?}", paused.errors);
+    loop {
+        let next = updates.next().await.expect("the updates stay open");
+        assert!(next.errors.is_empty(), "{:?}", next.errors);
+        if next.data.into_json().unwrap()["torrentUpdates"][0]["state"] == "PAUSED" {
+            break;
+        }
+    }
+}
+
+// A torrent announcing to a host a tracker rule names takes the rule's
+// goals, and names the rule as their source until the rule is deleted. A
+// pattern that is no host, or one another rule has, is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts() {
+    let rig = rig().await;
+    let rig = &rig;
+    let read = |query: String| async move {
+        let response = rig.execute(&query).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()
+    };
+    let rule = |id: &str, pattern: &str| {
+        format!(
+            r#"mutation {{ saveTrackerRule({id} input: {{
+                hostPattern: "{pattern}", neverPause: true, seeding: {{ ratioGoal: 3 }}
+            }}) {{ id hostPattern neverPause seeding {{ ratioGoal }} }} }}"#
+        )
+    };
+
+    let saved = read(rule("", " *.Tracker.TEST. ")).await;
+    let saved = &saved["saveTrackerRule"][0];
+    assert_eq!(saved["hostPattern"], "*.tracker.test");
+    assert_eq!(saved["neverPause"], true);
+    assert_eq!(saved["seeding"]["ratioGoal"], 3.0);
+    let rule_id = saved["id"].as_u64().unwrap();
+    for refused in [rule("", "*.tracker.test"), rule("", "not a host")] {
+        assert!(!rig.execute(&refused).await.errors.is_empty());
+    }
+
+    // The metainfo with an announce URL under the rule's host.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(metainfo("ruled.mkv", 3000, false))
+        .unwrap();
+    let mut announcing = b"d".to_vec();
+    bstr(&mut announcing, b"announce");
+    bstr(&mut announcing, b"http://a.tracker.test/announce");
+    announcing.extend_from_slice(&bytes[1..]);
+    let announcing = base64::engine::general_purpose::STANDARD.encode(announcing);
+    let id = read(submit(&announcing, "")).await["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let source = || async move {
+        let data = read(format!(
+            "{{ torrent(id: {id}) {{ seedingSource seedingRule seedingPolicy {{ ratioGoal }} }} }}"
+        ))
+        .await;
+        data["torrent"].clone()
+    };
+    let torrent = source().await;
+    assert_eq!(torrent["seedingSource"], "TRACKER_RULE");
+    assert_eq!(torrent["seedingRule"], "*.tracker.test");
+    assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 3.0);
+    // No schedule pause is in force, so none is left seeding through one.
+    assert_eq!(
+        read("{ scheduleSeeding { hostPattern torrents } }".into()).await["scheduleSeeding"],
+        serde_json::json!([])
+    );
+
+    let left = read(format!(
+        "mutation {{ deleteTrackerRule(id: {rule_id}) {{ id }} }}"
+    ))
+    .await;
+    assert_eq!(left["deleteTrackerRule"], serde_json::json!([]));
+    let torrent = source().await;
+    assert_eq!(torrent["seedingSource"], "GLOBAL");
+    assert_eq!(torrent["seedingRule"], Value::Null);
+    assert_eq!(
+        read("{ trackerRules { id } }".into()).await["trackerRules"],
+        serde_json::json!([])
+    );
+}

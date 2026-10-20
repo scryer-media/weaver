@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
-import { TORRENT_SETTINGS_QUERY, UPDATE_TORRENT_SETTINGS_MUTATION } from "@/graphql/queries";
-import { useTranslate } from "@/lib/context/translate-context";
-import { SettingsBlocks, useDraft, usePanelState, type SettingsBlock } from "../framework";
 import {
+  DELETE_TRACKER_RULE_MUTATION,
+  SAVE_TRACKER_RULE_MUTATION,
+  TORRENT_SETTINGS_QUERY,
+  TRACKER_RULES_QUERY,
+  UPDATE_TORRENT_SETTINGS_MUTATION,
+} from "@/graphql/queries";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import { ConfirmDialog } from "../../../components/ConfirmDialog";
+import { RecordEditor } from "../../../components/RecordEditor";
+import { Cell } from "../../../components/rows";
+import { EM_DASH } from "../../../data/format";
+import { SettingsBlocks, useDraft, usePanelState, type FieldSpec, type SettingsBlock } from "../framework";
+import {
+  EMPTY_SEEDING,
   GoalControl,
   seedingFields,
   seedingFrom,
@@ -16,11 +27,206 @@ import {
 } from "../seeding";
 
 /**
- * Torrents: the global seeding policy, and how the torrent session connects.
+ * Torrents: the global seeding policy, the tracker rules, and how the
+ * torrent session connects.
  *
- * Both save through `updateSettings`, each only when it was edited. A
- * seeding policy with no goal and no cap saves as none at all.
+ * The policy and the connection save through `updateSettings`, each only
+ * when it was edited. A seeding policy with no goal and no cap saves as none
+ * at all. A tracker rule saves from its own editor.
  */
+
+interface TrackerRule {
+  id: number;
+  hostPattern: string;
+  /** Null while the rule leaves the goals to the category and the global policy. */
+  seeding: SeedingPolicy | null;
+  neverPause: boolean;
+}
+
+interface TrackerRuleForm {
+  hostPattern: string;
+  seeding: SeedingPolicy | null;
+  neverPause: boolean;
+}
+
+const NEW_TRACKER_RULE: TrackerRuleForm = { hostPattern: "", seeding: null, neverPause: false };
+
+/** A rule's goals in one line, as its row shows them. */
+function goalsText(t: Translate, policy: SeedingPolicy | null): string {
+  if (!policy) {
+    return EM_DASH;
+  }
+  const minutes = t("next.seeding.minutes");
+  const goals = [
+    policy.ratioGoal === null ? null : `${t("next.seeding.ratioGoal")} ${policy.ratioGoal}`,
+    policy.seedTimeGoalMinutes === null ? null : `${t("next.seeding.seedTimeGoal")} ${policy.seedTimeGoalMinutes} ${minutes}`,
+    policy.inactiveGoalMinutes === null ? null : `${t("next.seeding.inactiveGoal")} ${policy.inactiveGoalMinutes} ${minutes}`,
+  ].filter((goal): goal is string => goal !== null);
+  return goals.length > 0 ? goals.join(" · ") : EM_DASH;
+}
+
+/** The tracker rules' table, and the editor and confirmation it opens. */
+function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactNode } {
+  const [{ data }, reexecute] = useQuery<{ trackerRules: TrackerRule[] }>({ query: TRACKER_RULES_QUERY });
+  const [, saveRule] = useMutation(SAVE_TRACKER_RULE_MUTATION);
+  const [, deleteRule] = useMutation(DELETE_TRACKER_RULE_MUTATION);
+  const [editingId, setEditingId] = useState<number | "new" | null>(null);
+  const [form, setForm] = useState<TrackerRuleForm>(NEW_TRACKER_RULE);
+  const [opened, setOpened] = useState<TrackerRuleForm>(NEW_TRACKER_RULE);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<TrackerRule | null>(null);
+
+  const rules = useMemo(() => data?.trackerRules ?? [], [data?.trackerRules]);
+  const editing = typeof editingId === "number" ? rules.find((rule) => rule.id === editingId) : null;
+
+  const open = (rule: TrackerRule | null) => {
+    setError(null);
+    const start = rule
+      ? { hostPattern: rule.hostPattern, seeding: rule.seeding ? seedingFrom(rule.seeding) : null, neverPause: rule.neverPause }
+      : NEW_TRACKER_RULE;
+    setForm(start);
+    setOpened(start);
+    setEditingId(rule ? rule.id : "new");
+  };
+
+  const save = async () => {
+    setBusy(true);
+    const result = await saveRule({
+      id: editingId === "new" ? null : editingId,
+      input: {
+        hostPattern: form.hostPattern.trim(),
+        seeding: form.seeding ? seedingInput(form.seeding) : null,
+        neverPause: form.neverPause,
+      },
+    });
+    setBusy(false);
+    if (result.error) {
+      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      return;
+    }
+    setEditingId(null);
+    void reexecute({ requestPolicy: "network-only" });
+  };
+
+  const remove = async () => {
+    if (!confirmDelete) {
+      return;
+    }
+    setBusy(true);
+    await deleteRule({ id: confirmDelete.id });
+    setBusy(false);
+    setConfirmDelete(null);
+    setEditingId(null);
+    void reexecute({ requestPolicy: "network-only" });
+  };
+
+  const block: SettingsBlock = {
+    kind: "table",
+    id: "trackerRules",
+    title: t("next.torrents.trackerRules"),
+    columns: "minmax(0, 1fr) minmax(0, 1.6fr) minmax(0, 0.6fr)",
+    headers: [t("next.torrents.trackerRuleHost"), t("next.torrents.trackerRuleGoals"), t("next.torrents.trackerRuleNeverPause")],
+    centered: [2],
+    empty: t("next.torrents.trackerRulesEmpty"),
+    add: { label: t("next.torrents.trackerRuleAdd"), onClick: () => open(null) },
+    onRowClick: (id) => {
+      const rule = rules.find((entry) => String(entry.id) === id);
+      if (rule) {
+        open(rule);
+      }
+    },
+    rows: rules.map((rule) => ({
+      id: String(rule.id),
+      searchText: rule.hostPattern,
+      cells: [
+        <Cell key="host" mono>
+          {rule.hostPattern}
+        </Cell>,
+        <Cell key="goals" className="text-wv-secondary">
+          {goalsText(t, rule.seeding)}
+        </Cell>,
+        <Cell key="neverPause" mono className="text-wv-muted">
+          {rule.neverPause ? "✓" : EM_DASH}
+        </Cell>,
+      ],
+    })),
+  };
+
+  const overlays = (
+    <>
+      <RecordEditor
+        open={editingId !== null}
+        title={editingId === "new" ? t("next.torrents.trackerRuleAdd") : (editing?.hostPattern ?? t("next.torrents.trackerRule"))}
+        note={editingId === "new" ? undefined : `#${editing?.id ?? ""}`}
+        error={error}
+        busy={busy}
+        onSave={() => void save()}
+        onDismiss={() => setEditingId(null)}
+        onDelete={editing ? () => setConfirmDelete(editing) : undefined}
+        deleteLabel={t("next.torrents.trackerRuleDelete")}
+        sections={[
+          {
+            id: "trackerRule",
+            title: t("next.torrents.trackerRule"),
+            fields: [
+              {
+                id: "hostPattern",
+                label: t("next.torrents.trackerRuleHost"),
+                keywords: "tracker host announce",
+                control: {
+                  kind: "text",
+                  value: form.hostPattern,
+                  placeholder: "*.tracker.example",
+                  onChange: (hostPattern) => setForm((current) => ({ ...current, hostPattern })),
+                },
+              },
+              {
+                id: "neverPause",
+                label: t("next.torrents.trackerRuleNeverPause"),
+                keywords: "schedule pause seed",
+                control: {
+                  kind: "toggle",
+                  value: form.neverPause,
+                  onChange: (neverPause) => setForm((current) => ({ ...current, neverPause })),
+                },
+              },
+              {
+                id: "ownSeeding",
+                label: t("next.categories.ownSeeding"),
+                keywords: "seed seeding policy",
+                control: {
+                  kind: "toggle",
+                  value: form.seeding !== null,
+                  onChange: (on) =>
+                    setForm((current) => ({ ...current, seeding: on ? (opened.seeding ?? EMPTY_SEEDING) : null })),
+                },
+              },
+              ...(form.seeding
+                ? seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
+                    inherits: true,
+                    idPrefix: "trackerRuleSeeding",
+                  })
+                : ([] as FieldSpec[])),
+            ],
+          },
+        ]}
+      />
+
+      <ConfirmDialog
+        open={confirmDelete !== null}
+        title={t("next.torrents.trackerRuleDelete")}
+        busy={busy}
+        confirmLabel={t("next.torrents.trackerRuleDelete")}
+        body={confirmDelete?.hostPattern}
+        onConfirm={() => void remove()}
+        onDismiss={() => setConfirmDelete(null)}
+      />
+    </>
+  );
+
+  return { block, overlays };
+}
 
 type TorrentEncryption = "PREFER" | "REQUIRE";
 
@@ -74,6 +280,7 @@ export function TorrentsPanel() {
   const [updateState, updateSettings] = useMutation(UPDATE_TORRENT_SETTINGS_MUTATION);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const trackerRules = useTrackerRules(t);
 
   const source = useMemo<TorrentForm | null>(() => {
     const settings = data?.settings;
@@ -140,6 +347,7 @@ export function TorrentsPanel() {
           title: t("next.torrents.seeding"),
           fields: seedingFields(t, values.seeding, (seeding) => draft.set({ seeding }), { inherits: false }),
         },
+        trackerRules.block,
         {
           kind: "section",
           id: "connection",
@@ -222,5 +430,10 @@ export function TorrentsPanel() {
       ]
     : [];
 
-  return <SettingsBlocks blocks={blocks} loading={fetching && !data} />;
+  return (
+    <>
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
+      {trackerRules.overlays}
+    </>
+  );
 }

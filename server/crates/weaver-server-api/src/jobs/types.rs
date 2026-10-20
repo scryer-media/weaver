@@ -850,8 +850,28 @@ pub struct StageNzbUploadInput {
     pub filename: Option<String>,
 }
 
+/// What a submission became, read from its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum SubmissionKind {
+    Nzb,
+    Torrent,
+}
+
+/// One thing to add: text that is an NZB or torrent URL, a magnet link or
+/// an infohash, or an uploaded NZB, torrent or magnet file.
+#[derive(Debug, InputObject)]
+pub struct SubmitInput {
+    pub text: Option<String>,
+    pub upload: Option<Upload>,
+    pub category: Option<String>,
+    #[graphql(default)]
+    pub paused: bool,
+    pub password: Option<String>,
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct StagedNzbUploadResult {
+    pub kind: SubmissionKind,
     pub accepted: bool,
     pub staged_upload_id: Option<String>,
     pub filename: Option<String>,
@@ -873,6 +893,8 @@ pub struct SubmitStagedNzbsInput {
     pub dupe_key: Option<String>,
     pub dupe_score: Option<i64>,
     pub dupe_mode: Option<DuplicateModeGql>,
+    #[graphql(default)]
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, SimpleObject)]

@@ -410,3 +410,67 @@ fn clearing_the_global_seeding_policy_removes_it() {
     db.save_seeding_policy(None).unwrap();
     assert_eq!(db.load_config().unwrap().seeding, None);
 }
+
+#[test]
+fn tracker_rules_crud() {
+    use crate::settings::model::TrackerRule;
+    use crate::settings::{SeedingAction, SeedingPolicy};
+
+    let db = Database::open_in_memory().unwrap();
+    assert!(db.list_tracker_rules().unwrap().is_empty());
+    let seeding = SeedingPolicy {
+        ratio_goal: Some(1.5),
+        seed_time_goal_minutes: Some(4_320),
+        action: SeedingAction::Stop,
+        ..SeedingPolicy::default()
+    };
+    let first = db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "*.example.org".into(),
+                seeding: Some(seeding),
+                never_pause: true,
+            },
+            1,
+        )
+        .unwrap();
+    let second = db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "tracker.invalid".into(),
+                seeding: None,
+                never_pause: false,
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!((first.id, second.id), (1, 2));
+    assert_eq!(
+        db.list_tracker_rules().unwrap(),
+        [first.clone(), second.clone()]
+    );
+
+    // A pattern names one rule.
+    assert!(
+        db.insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                ..first.clone()
+            },
+            3
+        )
+        .is_err()
+    );
+
+    let changed = TrackerRule {
+        seeding: None,
+        never_pause: false,
+        ..first.clone()
+    };
+    assert!(db.update_tracker_rule(&changed, 4).unwrap());
+    assert!(db.delete_tracker_rule(second.id).unwrap());
+    assert!(!db.delete_tracker_rule(second.id).unwrap());
+    assert_eq!(db.list_tracker_rules().unwrap(), [changed]);
+}

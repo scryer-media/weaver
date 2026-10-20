@@ -13,7 +13,7 @@ export type TorrentState =
   | "STOPPED";
 
 /** Where a torrent's seeding policy comes from. */
-export type SeedingSource = "CATEGORY" | "GLOBAL" | "TORRENT";
+export type SeedingSource = "CATEGORY" | "GLOBAL" | "TORRENT" | "TRACKER_RULE";
 
 /** A seeding policy as the daemon sends it. */
 export interface SeedingPolicyData {
@@ -76,6 +76,8 @@ export interface TorrentData extends TorrentSummaryData {
   /** The policy in effect. */
   seedingPolicy: SeedingPolicyData;
   seedingSource: SeedingSource;
+  /** The host pattern of the tracker rule the policy comes from, when it does. */
+  seedingRule: string | null;
   route: string | null;
   files: TorrentFileData[];
   trackers: TorrentTrackerData[];
@@ -84,30 +86,6 @@ export interface TorrentData extends TorrentSummaryData {
 /** A torrent seeding, or stopped by its goal, shows its ratio and upload in the queue. */
 export function showsSeeding(state: TorrentState): boolean {
   return state === "SEEDING" || state === "STOPPED";
-}
-
-/** What a dropped or picked file adds: an NZB, a torrent, or nothing this dialog takes. */
-export type AddFileKind = "nzb" | "torrent" | null;
-
-export function addFileKind(filename: string): AddFileKind {
-  const name = filename.toLowerCase();
-  if (name.endsWith(".torrent")) return "torrent";
-  if (name.endsWith(".nzb") || name.endsWith(".nzb.xz")) return "nzb";
-  return null;
-}
-
-/** Whether pasted text is a magnet link. */
-export function isMagnetLink(text: string): boolean {
-  return /^magnet:\?/i.test(text.trim());
-}
-
-/** A file's bytes as base64, as `submitTorrent` takes a metainfo file. */
-export function base64Of(bytes: Uint8Array): string {
-  let binary = "";
-  for (let start = 0; start < bytes.length; start += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(start, start + 0x8000));
-  }
-  return btoa(binary);
 }
 
 /** As much of a failed GraphQL request as a torrent action reads. */

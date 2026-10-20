@@ -12,10 +12,8 @@ use crate::torrents::{
 };
 
 // A tracker row holds where the tracker sits in the announce list; how
-// announcing to it goes is read from the session. The status column is NOT
-// NULL in the schema, and nothing reads it.
-const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url, status)
-     VALUES ({}, {}, {}, 'not_contacted')";
+// announcing to it goes is read from the session.
+const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url) VALUES ({}, {}, {})";
 
 fn stored(value: u64) -> Result<i64, StateError> {
     i64::try_from(value)
@@ -43,6 +41,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptI64(torrent.completed_at_ms),
         SqlArg::OptText(torrent.storage_dir.clone()),
         SqlArg::OptText(policy_override),
+        SqlArg::OptI64(torrent.tracker_rule_id.map(i64::from)),
     ])
 }
 
@@ -96,7 +95,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO torrents ({TORRENT_COLUMNS})
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &torrent_args,
                     )
@@ -232,6 +231,29 @@ impl Database {
                 datastore.read_exec(),
                 "UPDATE torrents SET category_id = {}, forced = {}, policy_override = {}
                   WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The tracker rule the torrent's trackers matched. Returns whether the
+    // torrent exists.
+    pub fn set_torrent_tracker_rule(
+        &self,
+        job_id: JobId,
+        rule_id: Option<u32>,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptI64(rule_id.map(i64::from)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET tracker_rule_id = {} WHERE job_id = {}",
                 &args,
             )
             .await?;

@@ -355,12 +355,16 @@ input BandwidthTestInput {
 	providerId: String
 	server: String
 	customUrl: String
+	uploadUrl: String
+	uploadMib: Int
 }
 
 type BandwidthTestRequest {
 	providerId: String
 	server: String
 	customUrl: String
+	uploadUrl: String
+	uploadMib: Int
 }
 
 type Category {
@@ -525,6 +529,7 @@ type DownloadBlock {
 enum DownloadBlockKindGql {
 	NONE
 	MANUAL_PAUSE
+	SPEED_TEST
 	SCHEDULED
 	EGRESS_QUOTA
 	SERVER_QUOTA
@@ -1162,6 +1167,15 @@ type HttpBindAddressStatus {
 	bindFallback: String
 }
 
+type HttpUploadResult {
+	outcome: UploadOutcome!
+	url: String
+	bytes: Float!
+	elapsedMs: Int!
+	bps: Float!
+	failure: SpeedTestFailure
+}
+
 """
 A scalar that can represent any JSON value.
 """
@@ -1595,7 +1609,7 @@ type MutationRoot {
 	updateProxyPool(id: Int!, input: ProxyPoolInput!): ProxyPool!
 	deleteProxyPool(id: Int!): Boolean!
 	saveNetworkRoute(kind: NetworkConsumerKind!, id: Int!, input: RouteInput!): NetworkRoute!
-	testVia(route: RouteInput!, subject: TestSubjectInput, target: TestTargetInput): [PathTestResult!]!
+	testVia(route: RouteInput!, subject: TestSubjectInput, target: TestTargetInput, torrent: Boolean! = false): [PathTestResult!]!
 	testEgressInterface(id: Int!, proxyId: Int, host: String!, port: Int!): EgressTestResult! @deprecated(reason: "Use testVia with a direct route on the egress.")
 	testProxyPool(id: Int!, egressId: Int!, host: String, port: Int): [EgressTestResult!]! @deprecated(reason: "Use testVia with a direct route on the egress.")
 	saveProxyProfile(id: Int, input: ProxyProfileInput!): ProxyProfile!
@@ -1736,6 +1750,12 @@ type MutationRoot {
 	Submit an NZB for download through the public integration facade.
 	"""
 	submitNzb(input: SubmitNzbInput!): SubmissionResult!
+	"""
+	Add an NZB or a torrent, told apart by what it holds. Text is an NZB
+	or torrent URL, a magnet link or an infohash; an upload is an NZB,
+	torrent or magnet file.
+	"""
+	submit(input: SubmitInput!): SubmissionResult!
 	stageNzbUpload(input: StageNzbUploadInput!): StagedNzbUploadResult!
 	submitStagedNzbs(input: SubmitStagedNzbsInput!): SubmitStagedNzbsResult!
 	discardStagedNzbs(ids: [String!]!): Boolean!
@@ -1976,6 +1996,16 @@ type MutationRoot {
 	updateSchedule(id: String!, input: ScheduleInput!): [Schedule!]!
 	deleteSchedule(id: String!): [Schedule!]!
 	toggleSchedule(id: String!, enabled: Boolean!): [Schedule!]!
+	"""
+	Add a tracker rule, or replace the one `id` names. Every torrent's
+	trackers are matched against the rules again.
+	"""
+	saveTrackerRule(id: Int, input: TrackerRuleInput!): [TrackerRule!]!
+	"""
+	Delete a tracker rule. The torrents it matched follow the rule their
+	trackers match next, or none.
+	"""
+	deleteTrackerRule(id: Int!): [TrackerRule!]!
 	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
 	"""
 	Check for a new release now instead of waiting for the next scheduled
@@ -2017,12 +2047,6 @@ type MutationRoot {
 	and the global one.
 	"""
 	setTorrentSeeding(id: Int!, seeding: SeedingPolicyInput): Boolean!
-}
-
-type NamedId {
-	kind: String!
-	id: Int!
-	name: String!
 }
 
 type NamedId {
@@ -2215,6 +2239,31 @@ enum OperatingSystemGql {
 	UNKNOWN
 }
 
+type P2pRung {
+	step: P2pStep!
+	outcome: P2pRungOutcome!
+	message: String
+}
+
+enum P2pRungOutcome {
+	PASSED
+	FAILED
+	NOT_REACHED
+}
+
+enum P2pStep {
+	TORRENT
+	ANNOUNCE
+	HANDSHAKE
+	PIECE
+	INBOUND
+}
+
+type P2pTestResult {
+	rungs: [P2pRung!]!
+	mappedPort: Int
+}
+
 type ParsedEpisode {
 	season: Int
 	episodeNumbers: [Int!]!
@@ -2283,6 +2332,16 @@ type PathTestResult {
 	sourceAddress: String
 	connectMillis: Float!
 	resolution: HostResolution
+	p2p: P2pTestResult
+}
+
+type PeerUploadResult {
+	outcome: UploadOutcome!
+	bytes: Float!
+	elapsedMs: Int!
+	bps: Float!
+	peers: Int!
+	error: String
 }
 
 type PipelineEventGql {
@@ -2722,6 +2781,7 @@ type QueryRoot {
 	access model, and what it needs to say where.
 	"""
 	securityUpgradeNotice: SecurityUpgradeNotice!
+	trackerRules: [TrackerRule!]!
 	schedules: [Schedule!]!
 	"""
 	The running weaver binary version.
@@ -2798,6 +2858,11 @@ type QueryRoot {
 	"""
 	diskUsage: [DiskUsage!]!
 	torrent(id: Int!): Torrent
+	"""
+	The torrents the schedule's pause leaves seeding, by the tracker rule
+	that keeps them; empty while no such pause is in force.
+	"""
+	scheduleSeeding: [ScheduleSeeding!]!
 	torrents(category: String): [Torrent!]!
 }
 
@@ -3364,6 +3429,14 @@ type SchedulePruneFiles {
 
 input SchedulePruneFilesInput {
 	deleteFiles: Boolean!
+}
+
+"""
+The torrents the schedule's pause leaves seeding under one tracker rule.
+"""
+type ScheduleSeeding {
+	hostPattern: String!
+	torrents: Int!
 }
 
 """
@@ -4002,6 +4075,7 @@ enum SeedingSource {
 	CATEGORY
 	GLOBAL
 	TORRENT
+	TRACKER_RULE
 }
 
 type SemanticCandidateSnapshotInfo {
@@ -4370,6 +4444,7 @@ type SpeedTestResult {
 	connections: [ConnectionResult!]!
 	usenet: UsenetResult
 	bandwidth: BandwidthResult
+	upload: UploadResult
 	samples: [Sample!]!
 }
 
@@ -4411,6 +4486,7 @@ type StagedNzbSubmissionResult {
 }
 
 type StagedNzbUploadResult {
+	kind: SubmissionKind!
 	accepted: Boolean!
 	stagedUploadId: String
 	filename: String
@@ -4430,6 +4506,14 @@ found this tag and version, or the request is refused.
 input StartApplicationUpgradeInput {
 	expectedTag: String!
 	expectedVersion: String!
+}
+
+"""
+What a submission became, read from its bytes.
+"""
+enum SubmissionKind {
+	NZB
+	TORRENT
 }
 
 type SubmissionResult {
@@ -4453,6 +4537,18 @@ enum SubmissionStatus {
 	IDEMPOTENT_REPLAY
 	IDEMPOTENCY_CONFLICT
 	FORCE_ACCEPTED
+}
+
+"""
+One thing to add: text that is an NZB or torrent URL, a magnet link or
+an infohash, or an uploaded NZB, torrent or magnet file.
+"""
+input SubmitInput {
+	text: String
+	upload: Upload
+	category: String
+	paused: Boolean! = false
+	password: String
 }
 
 input SubmitNzbInput {
@@ -4483,6 +4579,7 @@ input SubmitStagedNzbsInput {
 	dupeKey: String
 	dupeScore: Int
 	dupeMode: DuplicateMode
+	paused: Boolean! = false
 }
 
 type SubmitStagedNzbsResult {
@@ -4553,6 +4650,12 @@ type SubscriptionRoot {
 	Subscribe to cadence-driven system metrics and global queue state.
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
+	"""
+	The torrents as they move: the one `id` names, or every torrent. The
+	first push is the torrents as they are; each later one comes when one
+	of them changes, a tracker's answer as soon as it lands.
+	"""
+	torrentUpdates(id: Int): [Torrent!]!
 }
 
 """
@@ -4749,6 +4852,11 @@ type Torrent {
 	"""
 	seedingPolicy: SeedingPolicySettings!
 	seedingSource: SeedingSource!
+	"""
+	The host pattern of the tracker rule the policy comes from, when it
+	does.
+	"""
+	seedingRule: String
 	route: String
 	files: [TorrentFile!]!
 	trackers: [TorrentTracker!]!
@@ -4814,6 +4922,30 @@ type TorrentTracker {
 	nextAnnounceMs: Int
 }
 
+"""
+Seeding goals for the torrents announcing to a host, and whether the
+schedule's pause leaves them seeding until their goal is met.
+"""
+type TrackerRule {
+	id: Int!
+	"""
+	A host, or `*.` and a host for it and every host under it.
+	"""
+	hostPattern: String!
+	"""
+	The goals this rule sets; absent leaves them to the category and the
+	global policy.
+	"""
+	seeding: SeedingPolicySettings
+	neverPause: Boolean!
+}
+
+input TrackerRuleInput {
+	hostPattern: String!
+	seeding: SeedingPolicyInput
+	neverPause: Boolean! = false
+}
+
 enum TrackerStatus {
 	NOT_CONTACTED
 	UPDATING
@@ -4841,6 +4973,18 @@ type UpdateStatus {
 A multipart file upload
 """
 scalar Upload
+
+enum UploadOutcome {
+	NOT_CONFIGURED
+	MEASURED
+	FAILED
+	NO_DEMAND
+}
+
+type UploadResult {
+	http: HttpUploadResult!
+	peers: PeerUploadResult
+}
 
 type UsenetResult {
 	articlesRequested: Int!

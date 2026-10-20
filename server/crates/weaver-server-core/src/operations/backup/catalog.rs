@@ -54,6 +54,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("server_download_usage", Export, RequireZeroUsage),
     table!("server_tls_diagnostics", Export, Replace),
     table!("categories", Export, Replace),
+    // Tracker rules are configuration. The torrents that matched one are
+    // reset on restore and match the rules again when added.
+    table!("tracker_rules", Export, Replace),
     table!("api_keys", Export, RequireEmpty),
     table!("auth_credentials", Export, Replace),
     // Restoring configuration must never resurrect browser authority.

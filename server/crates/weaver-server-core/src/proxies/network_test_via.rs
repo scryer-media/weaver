@@ -14,6 +14,10 @@ pub use weaver_tunnel::resolution::record::{
 };
 use weaver_tunnel::{fault, pipe::Purpose, resolution::record::Recording};
 
+use crate::speed_test::torrent::{P2pPath, P2pPlan, probe as p2p_probe};
+use crate::speed_test::{P2pReport, TestTorrentSource, gateway_of};
+use crate::torrents::net::LegKind;
+
 // The most paths one test tries, counting a pool under test by its members.
 pub const MAX_TEST_PATHS: usize = 64;
 
@@ -55,6 +59,16 @@ pub struct PathTest {
     // How the host the path's last dial named was resolved: the target,
     // else the DNS server or proxy endpoint the test reached.
     pub resolution: Option<HostResolution>,
+    // The test torrent's rungs, on a torrent route's path that reached its
+    // target.
+    pub p2p: Option<P2pReport>,
+}
+
+// A test torrent run over each path that reaches its target.
+struct P2pTest {
+    source: TestTorrentSource,
+    // The port a tunnel's gateway is asked to map.
+    internal_port: u16,
 }
 
 // A path's stages: the one beneath the proxy under test, and that proxy on
@@ -71,6 +85,10 @@ struct Probe {
     // How long the path's last hop waits.
     wait: Duration,
     stages: Stages,
+    // How a torrent session would ride the path.
+    kind: LegKind,
+    // The gateway of the WireGuard tunnel the path ends in.
+    gateway: Option<std::net::IpAddr>,
 }
 
 // The runtime a test builds its paths in. It is shut down when the test
@@ -157,12 +175,43 @@ impl NetworkRuntime {
         subject: TestSubject,
         target: Option<(String, u16)>,
     ) -> Result<Vec<PathTest>, NetworkRefusal> {
+        self.test_paths(route, subject, target, None).await
+    }
+
+    // Tests a torrent route the same way, and then runs the test torrent
+    // over each path that reached its target, the source's host when no
+    // target is given. A tunnel's gateway is asked to map `internal_port`.
+    pub async fn test_via_torrent(
+        &self,
+        route: &Route,
+        subject: TestSubject,
+        target: Option<(String, u16)>,
+        source: TestTorrentSource,
+        internal_port: u16,
+    ) -> Result<Vec<PathTest>, NetworkRefusal> {
+        let target = target
+            .filter(|(host, _)| !host.trim().is_empty())
+            .or_else(|| Some(source.target()));
+        let p2p = P2pTest {
+            source,
+            internal_port,
+        };
+        self.test_paths(route, subject, target, Some(p2p)).await
+    }
+
+    async fn test_paths(
+        &self,
+        route: &Route,
+        subject: TestSubject,
+        target: Option<(String, u16)>,
+        p2p: Option<P2pTest>,
+    ) -> Result<Vec<PathTest>, NetworkRefusal> {
         let target = target.filter(|(host, _)| !host.trim().is_empty());
         let probe = ProbeRuntime(Some(self.isolated_probe_runtime()));
         let (probes, concurrency) = probe
             .runtime()
             .plan_test(route, subject, target.is_some())?;
-        let tests = run_probes(probes, target, concurrency).await;
+        let tests = run_probes(probes, target, concurrency, p2p.map(Arc::new)).await;
         probe.shutdown().await;
         for test in &tests {
             if let Err(fault) = &test.outcome {
@@ -289,10 +338,22 @@ impl NetworkRuntime {
         } else {
             4
         };
+        // The gateway of a WireGuard proxy, asked for a port mapping when a
+        // path ends in it.
+        let gateway = |id: Option<&u32>| {
+            id.and_then(|id| config.profiles.get(id))
+                .filter(|profile| profile.kind == ProxyKind::WireGuard)
+                .and_then(|profile| gateway_of(&profile.tunnel_addresses))
+        };
         let mut probes = Vec::new();
         for (leg, egress_id, carriers) in paths {
             let bottom = Self::bottom(&config, egress_id, ROUTE_TEST_WAIT)
                 .map_err(|_| NetworkRefusal::RouteEgressMissing)?;
+            let direct = match bottom.binding() {
+                SocketEgress::System => LegKind::System,
+                SocketEgress::Interface(name) => LegKind::Interface(name.clone()),
+                SocketEgress::SourceAddress(address) => LegKind::SourceAddress(*address),
+            };
             let beneath = self.carriers(&config, &carriers, &bottom);
             if let Some(pool) = pool {
                 let stages = beneath.and_then(|stage| {
@@ -314,6 +375,8 @@ impl NetworkRuntime {
                     carriers,
                     subject: None,
                     pool: Some(pool),
+                    kind: LegKind::Ladder,
+                    gateway: None,
                     wait: subjects
                         .iter()
                         .flatten()
@@ -333,10 +396,17 @@ impl NetworkRuntime {
                         .map(|top| (stage, Some(top)))
                         .map_err(|detail| (ProxyFault::Other { detail }, Some(*id))),
                 });
+                let kind = match (subject, carriers.is_empty()) {
+                    (None, true) => direct.clone(),
+                    _ => LegKind::Ladder,
+                };
+                let gateway = gateway(subject.as_ref().or(carriers.last()));
                 let subject = subject.and_then(|id| config.profiles.get(&id).cloned());
                 probes.push(Probe {
                     leg,
                     egress_id,
+                    kind,
+                    gateway,
                     carriers: carriers.clone(),
                     wait: subject
                         .as_ref()
@@ -378,6 +448,7 @@ async fn run_probes(
     probes: Vec<Probe>,
     target: Option<(String, u16)>,
     concurrency: usize,
+    p2p: Option<Arc<P2pTest>>,
 ) -> Vec<PathTest> {
     let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let target = Arc::new(target);
@@ -386,9 +457,10 @@ async fn run_probes(
     for (index, probe) in probes.into_iter().enumerate() {
         let permits = permits.clone();
         let target = target.clone();
+        let p2p = p2p.clone();
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await;
-            (index, probe.run((*target).as_ref()).await)
+            (index, probe.run((*target).as_ref(), p2p.as_deref()).await)
         });
     }
     let mut tests: Vec<Option<PathTest>> = (0..count).map(|_| None).collect();
@@ -409,7 +481,7 @@ enum Stopped {
 }
 
 impl Probe {
-    async fn run(self, target: Option<&(String, u16)>) -> PathTest {
+    async fn run(self, target: Option<&(String, u16)>, p2p: Option<&P2pTest>) -> PathTest {
         let started = tokio::time::Instant::now();
         let wait = self.wait;
         let mut resolution = None;
@@ -459,7 +531,31 @@ impl Probe {
                 }
             }
         };
+        // The test torrent runs over a path that reached its target.
+        let p2p = match (p2p, &outcome, &self.stages) {
+            (Some(test), Ok(_), Ok((beneath, top))) => {
+                let stop = std::pin::pin!(std::future::pending::<()>());
+                Some(
+                    p2p_probe(
+                        P2pPath {
+                            stage: top.as_ref().unwrap_or(beneath).clone(),
+                            kind: self.kind.clone(),
+                            gateway: self.gateway,
+                            internal_port: test.internal_port,
+                        },
+                        &P2pPlan {
+                            source: test.source.clone(),
+                            upload_budget: None,
+                        },
+                        stop,
+                    )
+                    .await,
+                )
+            }
+            _ => None,
+        };
         PathTest {
+            p2p,
             leg: self.leg,
             egress_id: self.egress_id,
             carriers: self.carriers,

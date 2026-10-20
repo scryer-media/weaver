@@ -25,6 +25,7 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         completed_at_ms: None,
         storage_dir: None,
         policy_override: None,
+        tracker_rule_id: None,
     }
 }
 
@@ -230,4 +231,44 @@ fn torrents_list_by_category_in_the_order_added() {
     assert_eq!(ids(Some(3)), vec![4]);
     assert_eq!(ids(None), vec![2]);
     assert!(ids(Some(9)).is_empty());
+}
+
+#[test]
+fn a_torrent_keeps_the_tracker_rule_it_matched_until_the_rule_goes() {
+    use crate::settings::model::TrackerRule;
+
+    let db = Database::open_in_memory().unwrap();
+    let rule = db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "*.invalid".into(),
+                seeding: None,
+                never_pause: true,
+            },
+            1,
+        )
+        .unwrap();
+    let mut record = torrent(1, Some([1; 20]), None);
+    record.tracker_rule_id = Some(rule.id);
+    db.insert_torrent(&record, &[], &trackers()).unwrap();
+    assert_eq!(db.get_torrent(JobId(1)).unwrap(), Some(record.clone()));
+
+    assert!(db.set_torrent_tracker_rule(JobId(1), None).unwrap());
+    assert_eq!(
+        db.get_torrent(JobId(1)).unwrap().unwrap().tracker_rule_id,
+        None
+    );
+    assert!(
+        db.set_torrent_tracker_rule(JobId(1), Some(rule.id))
+            .unwrap()
+    );
+    assert!(!db.set_torrent_tracker_rule(JobId(2), None).unwrap());
+
+    // A rule that goes leaves its torrents with none.
+    db.delete_tracker_rule(rule.id).unwrap();
+    assert_eq!(
+        db.get_torrent(JobId(1)).unwrap().unwrap().tracker_rule_id,
+        None
+    );
 }

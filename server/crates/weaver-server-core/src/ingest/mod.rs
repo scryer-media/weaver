@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod classify;
 mod import;
 pub mod metadata;
 pub mod naming;
 mod persisted_nzb;
 mod submission;
+mod torrent_fetch;
 mod xz;
 
+pub use classify::{Kind, classify};
 pub use import::{
     ImportError, dnzb_header_passwords, header_archive_password_candidates, import_nzb,
     integration_archive_password_candidates, normalize_archive_password_candidate,
@@ -36,5 +39,6 @@ pub use submission::{
     submit_staged_parsed_nzb_with_options, submit_staged_prepared_nzb_with_options,
     submit_uploaded_nzb_reader, submit_uploaded_nzb_reader_with_options,
 };
+pub use torrent_fetch::fetch_torrent_url;
 pub use xz::{XZ_DECODER_MEMORY_LIMIT_BYTES, xz_multistream_decoder};
 pub(crate) use xz::{XzFilesystemDecoderKind, xz_filesystem_decoder_kind, xz_parallel_decoder};

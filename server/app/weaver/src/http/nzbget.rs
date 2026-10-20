@@ -1548,6 +1548,8 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let session_downloaded = metrics.bytes_downloaded;
     let average_rate = session_downloaded / uptime_secs.max(1);
     let arr_average_rate = average_rate.min(i32::MAX as u64);
+    // NZBGet has no word for a speed test, so a speed test's hold reads as
+    // DownloadPaused, the same as a manual pause.
     let download_paused = ctx.handle.is_globally_paused();
     let download_block = ctx.handle.get_download_block();
     let quota_reached = matches!(

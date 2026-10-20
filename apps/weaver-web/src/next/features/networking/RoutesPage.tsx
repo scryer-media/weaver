@@ -14,6 +14,7 @@ import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framewo
 import { defaultRoute, speedPage, type Consumer, type NetworkingAction, type NetworkingData } from "./data";
 import { RouteEditor } from "./RouteEditor";
 import { stateLabel, StatusMark } from "./presentation";
+import { TestViaDialog } from "./TestViaDialog";
 
 /**
  * "20 NNTP connections · 2 legs": what a consumer is, and how its route splits
@@ -166,6 +167,7 @@ export function RouteDialog({
   const t = useTranslate();
   const [route, setRoute] = useState<NetworkRoute>(consumer.route ?? defaultRoute());
   const [error, setError] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
 
   const save = async () => {
     const failure = await action(SAVE_ROUTE, { kind: consumer.kind, id: consumer.id, input: routeInput(route) });
@@ -187,6 +189,11 @@ export function RouteDialog({
       onDismiss={onClose}
       footer={
         <>
+          {consumer.kind === "TORRENT_DEFAULT" || consumer.kind === "TORRENT_CATEGORY" ? (
+            <SecondaryButton icon="test" disabled={problem !== null} onClick={() => setTesting(true)}>
+              {t("next.networking.testVia.title")}
+            </SecondaryButton>
+          ) : null}
           <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
           <PrimaryButton icon="save" disabled={busy || problem !== null} onClick={() => void save()}>
             {busy ? t("settings.saving") : t("next.networking.routes.save")}
@@ -210,6 +217,9 @@ export function RouteDialog({
         <div role="alert" className="flex-none border-t border-wv-hairline px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
           {error}
         </div>
+      ) : null}
+      {testing && (consumer.kind === "TORRENT_DEFAULT" || consumer.kind === "TORRENT_CATEGORY") ? (
+        <TestViaDialog subject={null} route={route} torrent={consumer.kind} onClose={() => setTesting(false)} />
       ) : null}
     </Dialog>
   );

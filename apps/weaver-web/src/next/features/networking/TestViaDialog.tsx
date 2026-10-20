@@ -5,7 +5,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { NETWORKING_QUERY, TEST_VIA } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import { routeInput, routeProblem, type NetworkRoute } from "@/lib/networking";
+import { routeInput, routeProblem, type ConsumerKind, type NetworkRoute } from "@/lib/networking";
 import { proxyLabels } from "@/lib/proxies";
 import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
@@ -15,6 +15,7 @@ import {
   resolutionParts,
   routeChoices,
   testSummary,
+  type P2pTestResult,
   type PathTestResult,
   type ResolutionParts,
   type TestSubject,
@@ -40,10 +41,15 @@ const millis = (value: number) => `${value < 10 ? value.toFixed(1) : Math.round(
  * and the draft is never saved. The daemon tries every path through it, with
  * the proxy or the pool on top; a pool names the member it picked. A proxy
  * cannot carry itself, so the draft is not offered the subject's proxies.
+ *
+ * A torrent route's test also runs the test torrent over each path that
+ * reached its target, the torrent's own host when no host is given.
  */
 export function TestViaDialog({
   subject,
   egressId,
+  route: initial,
+  torrent,
   onTested,
   onClose,
 }: {
@@ -51,6 +57,10 @@ export function TestViaDialog({
   subject: TestSubject;
   /** The egress the draft starts on, else the first enabled one. */
   egressId?: number;
+  /** The route the draft starts as, in place of one on `egressId`. */
+  route?: NetworkRoute | null;
+  /** The torrent consumer whose route is tested, running the test torrent too. */
+  torrent?: Extract<ConsumerKind, "TORRENT_DEFAULT" | "TORRENT_CATEGORY">;
   /** Hears each run in one sentence: its refusal, or what its paths came to. */
   onTested?: (summary: string) => void;
   onClose: () => void;
@@ -77,11 +87,12 @@ export function TestViaDialog({
     }
   }, [results, refusal]);
 
-  const route = edited ?? (data ? draftRoute(data.egressInterfaces, egressId) : null);
-  const problem = data && route ? routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools }) : null;
+  const route = edited ?? initial ?? (data ? draftRoute(data.egressInterfaces, egressId) : null);
+  const kind: ConsumerKind = torrent ?? "OUTBOUND";
+  const problem = data && route ? routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools, kind }) : null;
   const choices = data ? routeChoices(data.proxyProfiles, data.proxyPools, subject) : null;
   // A destination folded away is not tested, whatever was typed into it.
-  const target = (subject === null || destinationOpen) && host.trim() ? { host: host.trim(), port } : null;
+  const target = ((subject === null && !torrent) || destinationOpen) && host.trim() ? { host: host.trim(), port } : null;
 
   const egressName = (id: number) => data?.egressInterfaces.find((egress) => egress.id === id)?.name ?? String(id);
   const proxyName = (id: number) =>
@@ -105,7 +116,7 @@ export function TestViaDialog({
     }
     setResults(null);
     setRefusal(null);
-    const result = await testVia({ route: routeInput(route), subject, target });
+    const result = await testVia({ route: routeInput(route), subject, target, torrent: torrent !== undefined });
     if (result.error) {
       const sentence = refusalMessage(t, result.error);
       setRefusal(sentence);
@@ -132,7 +143,7 @@ export function TestViaDialog({
           <SecondaryButton onClick={onClose}>{t("next.networking.close")}</SecondaryButton>
           <PrimaryButton
             icon="test"
-            disabled={!route || running || problem !== null || (subject === null && target === null)}
+            disabled={!route || running || problem !== null || (subject === null && target === null && !torrent)}
             onClick={() => void run()}
           >
             {running ? t("next.networking.testVia.running") : t("next.networking.testVia.run")}
@@ -160,11 +171,11 @@ export function TestViaDialog({
               egresses={data.egressInterfaces}
               profiles={choices.profiles}
               pools={choices.pools}
-              kind="OUTBOUND"
+              kind={kind}
             />
           </div>
           {/* A route alone needs somewhere to connect; a proxy or pool is tested without one. */}
-          {subject === null ? (
+          {subject === null && !torrent ? (
             <SectionHeader label={t("next.networking.testVia.destination")} sticky={false} />
           ) : (
             <button
@@ -177,7 +188,7 @@ export function TestViaDialog({
               {t("next.networking.testVia.optional")}
             </button>
           )}
-          {subject === null || destinationOpen ? (
+          {(subject === null && !torrent) || destinationOpen ? (
             <FieldRows
               fields={[
                 {
@@ -293,7 +304,37 @@ function PathRow({
           parts={resolutionParts(t, result.resolution, { egress: egressName(result.egressId), proxy: proxyName })}
         />
       ) : null}
+      {result.p2p ? <P2pRungs p2p={result.p2p} /> : null}
     </li>
+  );
+}
+
+/** The test torrent's steps over one path, each with what passed or stopped it. */
+function P2pRungs({ p2p }: { p2p: P2pTestResult }) {
+  const t = useTranslate();
+  return (
+    <ul aria-label={t("next.networking.testVia.torrent")} className="flex flex-col gap-[2px]">
+      {p2p.rungs.map((rung) => (
+        <li key={rung.step} className="flex min-w-0 flex-wrap items-baseline gap-x-2 font-wv-mono text-[11px] leading-[1.5]">
+          <span
+            className={cn(
+              "w-[72px] flex-none",
+              rung.outcome === "PASSED" ? "text-wv-fg" : rung.outcome === "FAILED" ? "text-wv-error-text" : "text-wv-muted",
+            )}
+          >
+            {t(`next.networking.testVia.step.${rung.step}`)}
+          </span>
+          <span className="min-w-0 break-words text-wv-muted">
+            {rung.outcome === "NOT_REACHED" ? t("next.networking.testVia.notReached") : rung.message}
+          </span>
+        </li>
+      ))}
+      {p2p.mappedPort === null ? null : (
+        <li className="font-wv-mono text-[11px] leading-[1.5] text-wv-fg">
+          {t("next.networking.testVia.mappedPort", { port: p2p.mappedPort })}
+        </li>
+      )}
+    </ul>
   );
 }
 

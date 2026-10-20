@@ -209,7 +209,7 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     await runAgain.click();
     await page.waitForFunction(() => window.speedFixture.requests.filter((request) => request.name === "StartSpeedTest").length === 3);
     const stored = (await sent(page, "StartSpeedTest"))[2];
-    assert.deepEqual(stored.input.bandwidth, { providerId: "cloudflare", server: null, customUrl: null });
+    assert.deepEqual(stored.input.bandwidth, { providerId: "cloudflare", server: null, customUrl: null, uploadUrl: null, uploadMib: null });
     assert.equal(stored.input.kind, "SERVER");
     assert.equal(errors.length, 0, errors.join("\n"));
   } finally {

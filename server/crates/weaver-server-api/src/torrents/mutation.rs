@@ -37,6 +37,13 @@ fn action_error(error: ActionError) -> async_graphql::Error {
 #[derive(Default)]
 pub struct TorrentsMutation;
 
+impl TorrentsMutation {
+    /// Add a torrent, with the client's refusal in its own words.
+    pub(crate) async fn add(ctx: &Context<'_>, request: AddRequest) -> Result<JobId> {
+        service(ctx)?.add(request).await.map_err(add_error)
+    }
+}
+
 #[Object]
 impl TorrentsMutation {
     #[graphql(guard = "ControlGuard")]
@@ -64,16 +71,17 @@ impl TorrentsMutation {
             .seeding
             .map(SeedingPolicyInput::into_policy)
             .transpose()?;
-        let job_id = torrents
-            .add(AddRequest {
+        let job_id = Self::add(
+            ctx,
+            AddRequest {
                 source,
                 category: input.category,
                 policy_override,
                 paused: input.paused,
                 forced: input.forced,
-            })
-            .await
-            .map_err(add_error)?;
+            },
+        )
+        .await?;
         torrents
             .torrent(job_id)
             .await

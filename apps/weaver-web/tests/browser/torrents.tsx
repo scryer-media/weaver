@@ -27,7 +27,7 @@ const t = (key: string, values?: Record<string, unknown>) =>
   Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key);
 const status = document.getElementById("status")!;
 
-// Every mutation the page sends, and the refusals the daemon gives: a duplicate magnet, and a remove whose goal is unmet.
+// Every mutation the page sends, and the refusals the daemon gives: a duplicate magnet, a file it cannot read, and a remove whose goal is unmet.
 const sent: { name: string; variables: Record<string, unknown> }[] = [];
 Object.assign(window, { torrentsFixture: { sent } });
 const refusal = (message: string, code: string) =>
@@ -38,14 +38,6 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
   const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
   const variables = operation.variables as Record<string, unknown>;
   if (operation.kind === "mutation") sent.push({ name, variables });
-  if (name === "SubmitTorrent") {
-    const input = variables.input as { magnet?: string };
-    return fromValue(
-      input.magnet?.includes("duplicate")
-        ? { operation, error: refusal("This torrent is already in the queue.", "DUPLICATE") }
-        : { operation, data: { submitTorrent: { id: sent.length } } },
-    );
-  }
   if (name === "RemoveTorrent") {
     return fromValue(
       variables.confirmUnmetGoal
@@ -56,6 +48,39 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
   const answer = name === "Categories" ? { categories: [{ id: 1, name: "movies", destDir: null, aliases: "", seeding: null, torrentRoute: false }] } : {};
   return fromValue({ operation, data: answer });
 }))] });
+
+// The Add dialog speaks to the daemon with fetch, a file as multipart. The daemon reads what each one is:
+// a bencoded dictionary is a torrent, an NZB document is staged, anything else is refused.
+const answer = (data: unknown) => new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
+const passThrough = window.fetch.bind(window);
+window.fetch = async (input, init) => {
+  const url = String(input instanceof Request ? input.url : input);
+  if (url.endsWith("/api/auth/csrf")) return answer({ csrfToken: "fixture" });
+  if (!url.endsWith("/graphql")) return passThrough(input, init);
+  const body = init?.body;
+  const operations = JSON.parse(body instanceof FormData ? String(body.get("operations")) : String(body));
+  const file = body instanceof FormData ? (body.get("0") as File | null) : null;
+  const content = file ? await file.text() : "";
+  const name = /mutation (\w+)/.exec(operations.query)?.[1] ?? "";
+  sent.push({ name, variables: file ? { ...operations.variables, file: file.name } : operations.variables });
+  if (name === "StageNzbUpload") {
+    if (/^d\d/.test(content)) return answer({ data: { stageNzbUpload: { kind: "TORRENT", accepted: false } } });
+    return answer({
+      data: {
+        stageNzbUpload: content.includes("<nzb")
+          ? { kind: "NZB", accepted: true, stagedUploadId: `staged-${sent.length}`, displayName: file?.name }
+          : { kind: "NZB", accepted: false, error: "not an NZB" },
+      },
+    });
+  }
+  if (name === "Submit") {
+    const text = (operations.variables.input as { text?: string | null }).text ?? "";
+    return text.includes("duplicate")
+      ? answer({ errors: [{ message: "This torrent is already in the queue.", extensions: { code: "DUPLICATE" } }] })
+      : answer({ data: { submit: { accepted: true, status: "ACCEPTED", message: null } } });
+  }
+  return answer({ data: {} });
+};
 
 const job = (rest: Partial<JobData>): JobData => ({
   id: 1, name: "fixture", displayTitle: "fixture", originalTitle: "fixture", parsedRelease: {} as JobData["parsedRelease"],
@@ -114,6 +139,7 @@ const torrent = (id: number, source: SeedingSource, override: SeedingPolicyData 
   seedingOverride: override,
   seedingPolicy: override ?? policy({ ratioGoal: source === "CATEGORY" ? 1.5 : 1 }),
   seedingSource: source,
+  seedingRule: null,
   files: [{ index: 0, path: "fixture.mkv", length: 2048, selected: true, progress: 0.25 }],
   trackers: [],
 });

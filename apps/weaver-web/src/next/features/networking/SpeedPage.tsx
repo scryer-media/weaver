@@ -204,7 +204,15 @@ function requestInput(run: SpeedTestRun, owner: Consumer): SpeedTestInput {
       downEgresses: run.tested.overrides.downEgresses,
     },
     ...(bandwidth
-      ? { bandwidth: { providerId: bandwidth.providerId, server: bandwidth.server, customUrl: bandwidth.customUrl } }
+      ? {
+          bandwidth: {
+            providerId: bandwidth.providerId,
+            server: bandwidth.server,
+            customUrl: bandwidth.customUrl,
+            uploadUrl: bandwidth.uploadUrl,
+            uploadMib: bandwidth.uploadMib,
+          },
+        }
       : {}),
     ...(usenet
       ? {

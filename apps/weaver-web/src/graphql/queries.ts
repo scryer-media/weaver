@@ -1436,12 +1436,61 @@ export const UPDATE_TORRENT_SETTINGS_MUTATION = gql`
   ${TORRENT_SETTINGS_FIELDS}
 `;
 
+const TRACKER_RULE_FIELDS = `
+  fragment TrackerRuleFields on TrackerRule {
+    id
+    hostPattern
+    seeding {
+      ...SeedingPolicyFields
+    }
+    neverPause
+  }
+  ${SEEDING_POLICY_FIELDS}
+`;
+
+export const TRACKER_RULES_QUERY = gql`
+  query TrackerRules {
+    trackerRules {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+export const SAVE_TRACKER_RULE_MUTATION = gql`
+  mutation SaveTrackerRule($id: Int, $input: TrackerRuleInput!) {
+    saveTrackerRule(id: $id, input: $input) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+export const DELETE_TRACKER_RULE_MUTATION = gql`
+  mutation DeleteTrackerRule($id: Int!) {
+    deleteTrackerRule(id: $id) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+/** The torrents the schedule's pause leaves seeding, by tracker rule. */
+export const SCHEDULE_SEEDING_QUERY = gql`
+  query ScheduleSeeding {
+    scheduleSeeding {
+      hostPattern
+      torrents
+    }
+  }
+`;
+
 // --- Torrents ---
 
-/** What the queue reads of each torrent beside its job. */
-export const TORRENT_SUMMARIES_QUERY = gql`
-  query TorrentSummaries {
-    torrents {
+/** What the queue reads of each torrent beside its job, pushed as it moves. */
+export const TORRENT_SUMMARY_UPDATES_SUBSCRIPTION = gql`
+  subscription TorrentSummaryUpdates {
+    torrentUpdates {
       id
       state
       forced
@@ -1451,9 +1500,10 @@ export const TORRENT_SUMMARIES_QUERY = gql`
   }
 `;
 
-export const TORRENT_QUERY = gql`
-  query Torrent($id: Int!) {
-    torrent(id: $id) {
+/** A torrent, pushed as it moves; empty once it is gone. */
+export const TORRENT_UPDATES_SUBSCRIPTION = gql`
+  subscription TorrentUpdates($id: Int!) {
+    torrentUpdates(id: $id) {
       id
       name
       infohash
@@ -1481,6 +1531,7 @@ export const TORRENT_QUERY = gql`
         ...SeedingPolicyFields
       }
       seedingSource
+      seedingRule
       route
       files {
         index
@@ -1500,14 +1551,6 @@ export const TORRENT_QUERY = gql`
     }
   }
   ${SEEDING_POLICY_FIELDS}
-`;
-
-export const SUBMIT_TORRENT_MUTATION = gql`
-  mutation SubmitTorrent($input: SubmitTorrentInput!) {
-    submitTorrent(input: $input) {
-      id
-    }
-  }
 `;
 
 export const REMOVE_TORRENT_MUTATION = gql`

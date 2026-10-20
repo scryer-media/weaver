@@ -54,6 +54,7 @@ import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
+import { ScheduleSeedingNote } from "../features/torrents/ScheduleSeedingNote";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { useTorrentSummaries } from "../data/use-torrents";
 import { SpeedLimitControl } from "../features/SpeedLimitDialog";
@@ -482,17 +483,21 @@ export function DownloadsPage() {
   const blockLabel =
     downloadBlock.kind === "SERVER_QUOTA" ? t("jobs.serverQuotaBadge") : t("jobs.egressQuotaBadge");
 
+  // A speed test holds the queue on its own, apart from a pause.
+  const heldBy =
+    downloadBlock.kind === "SPEED_TEST" ? t("jobs.speedTestBadge") : t("next.downloads.waitPaused");
+
   /** What stands in for time left while a download is held; null when it is not. */
   const heldValue = useCallback(
     (job: JobData): string | null => {
       if (statusToken(job.status) === "paused") return t("next.downloads.waitPaused");
       if (HELD_BACK_STATUSES.has(job.status)) {
         if (blocked) return blockEta;
-        if (isPaused) return t("next.downloads.waitPaused");
+        if (isPaused) return heldBy;
       }
       return null;
     },
-    [blockEta, blocked, isPaused, t],
+    [blockEta, blocked, heldBy, isPaused, t],
   );
   const holdValue = useCallback(
     (job: JobData): string | null => (blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null),
@@ -520,6 +525,7 @@ export function DownloadsPage() {
           >
             {isPaused ? t("next.downloads.resumeAll") : t("next.downloads.pauseAll")}
           </SecondaryButton>
+          <ScheduleSeedingNote torrents={torrents} />
           <SecondaryButton
             icon={torrentsPaused ? "resume" : "pause"}
             onClick={() => {

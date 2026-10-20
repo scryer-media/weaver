@@ -15,6 +15,7 @@ pub enum SpeedTestKind {
     // route, over as many connections as the line takes.
     Bandwidth {
         provider: BandwidthProvider,
+        upload: UploadRequest,
     },
     // The live fused article fetch of every article in a test NZB from the
     // server. `None` takes the server's whole connection allowance.
@@ -67,6 +68,23 @@ pub enum BandwidthProvider {
     // Any HTTPS URL. The egress block rules apply to it.
     Custom { url: reqwest::Url },
 }
+
+// What a bandwidth run sends after it has pulled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UploadRequest {
+    // An HTTPS endpoint that takes a POST. The egress block rules apply to
+    // it. Without one, nothing is posted.
+    pub url: Option<reqwest::Url>,
+    // How much is posted; `DEFAULT_UPLOAD_BYTES` when not given.
+    pub bytes: Option<u64>,
+}
+
+// What a post sends when the request names no size.
+pub const DEFAULT_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
+// The most a post may send.
+pub const MAX_UPLOAD_BYTES: u64 = 128 * 1024 * 1024;
+// The most the test torrent serves to peers.
+pub const PEER_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SabTestSize {
@@ -223,6 +241,8 @@ pub enum SpeedTestPhase {
     // Taking the server's connections from the live pool.
     Leasing,
     Measuring,
+    // Posting to the upload endpoint, then serving the test torrent.
+    Uploading,
     // Giving the connections, the queue and the draft back.
     Releasing,
 }
@@ -316,6 +336,33 @@ pub struct BandwidthResult {
     pub connections: u32,
 }
 
+// A post to the upload endpoint, through the route.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HttpUpload {
+    // The request named no endpoint.
+    NotConfigured,
+    Measured {
+        url: String,
+        bytes: u64,
+        elapsed_ms: u64,
+        bps: f64,
+    },
+    Failed {
+        url: String,
+        error: SpeedTestFailure,
+    },
+}
+
+// What a bandwidth run sent. The post measures the route's upload; the
+// peers' figure is at least what the route can send, since it is only what
+// the peers asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UploadResult {
+    pub http: HttpUpload,
+    // `None` while torrents are off.
+    pub peers: Option<super::PeerUpload>,
+}
+
 // Bytes one leg moved in one second of the measurement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
@@ -336,6 +383,7 @@ pub struct SpeedTestResult {
     pub connections: Vec<ConnectionResult>,
     pub usenet: Option<UsenetResult>,
     pub bandwidth: Option<BandwidthResult>,
+    pub upload: Option<UploadResult>,
     pub samples: Vec<Sample>,
 }
 
@@ -373,6 +421,7 @@ impl SpeedTestRun {
             SpeedTestPhase::Draining => format!("draining {}", self.draining.unwrap_or(0)),
             SpeedTestPhase::Leasing => "leasing".into(),
             SpeedTestPhase::Measuring => "measuring".into(),
+            SpeedTestPhase::Uploading => "uploading".into(),
             SpeedTestPhase::Releasing => "releasing".into(),
         })
     }

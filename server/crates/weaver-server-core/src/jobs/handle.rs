@@ -679,6 +679,7 @@ pub struct ServerTransportHealth {
 pub enum DownloadBlockKind {
     None,
     ManualPause,
+    SpeedTest,
     Scheduled,
     EgressQuota,
     ServerQuota,
@@ -688,9 +689,10 @@ impl DownloadBlockKind {
     // Every variant, in gate-reason label order. The Prometheus exporter
     // renders one series per variant; deriving the label set from `ALL` keeps
     // a new gate reason from silently vanishing off `/metrics`.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::None,
         Self::ManualPause,
+        Self::SpeedTest,
         Self::Scheduled,
         Self::EgressQuota,
         Self::ServerQuota,
@@ -700,6 +702,7 @@ impl DownloadBlockKind {
         match self {
             Self::None => "none",
             Self::ManualPause => "manual_pause",
+            Self::SpeedTest => "speed_test",
             Self::Scheduled => "scheduled",
             Self::EgressQuota => "egress_quota",
             Self::ServerQuota => "server_quota",
@@ -817,16 +820,45 @@ impl Hold {
         }
     }
 
-    const fn stops(self, owner: HoldOwner, complete: bool) -> bool {
+    // Whether the hold covers `target` and what it stops of it, before
+    // what the target says of the schedule.
+    const fn reaches(self, target: HoldTarget) -> bool {
         let covers = matches!(
-            (self.owner, owner),
+            (self.owner, target.owner),
             (HoldOwner::All, _) | (HoldOwner::Torrents, HoldOwner::Torrents)
         );
         covers
             && match self.scope {
-                HoldScope::Downloads => !complete,
+                HoldScope::Downloads => !target.complete,
                 HoldScope::Everything => true,
             }
+    }
+
+    // Whether the hold stops `target`. The schedule's holds leave a target
+    // that runs through them.
+    const fn stops(self, target: HoldTarget) -> bool {
+        self.reaches(target)
+            && !(target.runs_through_schedule && matches!(self.origin, HoldOrigin::Scheduled))
+    }
+}
+
+// An item a hold is asked about: whose it is, whether it has finished
+// downloading, and whether it runs through the schedule's holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldTarget {
+    pub owner: HoldOwner,
+    pub complete: bool,
+    pub runs_through_schedule: bool,
+}
+
+impl HoldTarget {
+    // An item of `owner` that every hold over it may stop.
+    pub const fn of(owner: HoldOwner, complete: bool) -> Self {
+        Self {
+            owner,
+            complete,
+            runs_through_schedule: false,
+        }
     }
 }
 
@@ -857,11 +889,22 @@ impl HoldSet {
 
     // Who stops that item, by precedence, while anyone does.
     pub fn reason(&self, owner: HoldOwner, complete: bool) -> Option<HoldOrigin> {
+        self.reason_for(HoldTarget::of(owner, complete))
+    }
+
+    // Who stops `target`, by precedence, while anyone does.
+    pub fn reason_for(&self, target: HoldTarget) -> Option<HoldOrigin> {
         self.0
             .iter()
-            .filter(|hold| hold.stops(owner, complete))
+            .filter(|hold| hold.stops(target))
             .map(|hold| hold.origin)
             .min()
+    }
+
+    // Whether `target` runs only because it runs through the schedule's
+    // holds: one of them reaches it and no hold stops it.
+    pub fn spares(&self, target: HoldTarget) -> bool {
+        self.reason_for(target).is_none() && self.0.iter().any(|hold| hold.reaches(target))
     }
 
     // Whether `origin` holds the items of `owner`.

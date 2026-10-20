@@ -558,6 +558,63 @@ impl SettingsMutation {
         drop(schedules_guard);
         schedule_response(ctx, entries).await
     }
+
+    /// Add a tracker rule, or replace the one `id` names. Every torrent's
+    /// trackers are matched against the rules again.
+    #[graphql(guard = "AdminGuard")]
+    async fn save_tracker_rule(
+        &self,
+        ctx: &Context<'_>,
+        id: Option<u32>,
+        input: crate::settings::types::TrackerRuleInput,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let rule = input.into_rule(id.unwrap_or(0))?;
+        let db = ctx.data::<Database>()?.clone();
+        let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        let rules = tokio::task::spawn_blocking(move || {
+            let rules = db.list_tracker_rules()?;
+            if rules
+                .iter()
+                .any(|other| other.host_pattern == rule.host_pattern && Some(other.id) != id)
+            {
+                return Ok(Err(format!("a rule for {} exists", rule.host_pattern)));
+            }
+            let now = chrono::Utc::now().timestamp_millis();
+            match id {
+                Some(_) if !db.update_tracker_rule(&rule, now)? => {
+                    return Ok(Err(format!("no tracker rule {}", rule.id)));
+                }
+                Some(_) => {}
+                None => {
+                    db.insert_tracker_rule(&rule, now)?;
+                }
+            }
+            db.list_tracker_rules().map(Ok)
+        })
+        .await??
+        .map_err(async_graphql::Error::new)?;
+        crate::torrents::reload_tracker_rules(ctx).await?;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+
+    /// Delete a tracker rule. The torrents it matched follow the rule their
+    /// trackers match next, or none.
+    #[graphql(guard = "AdminGuard")]
+    async fn delete_tracker_rule(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        let rules = tokio::task::spawn_blocking(move || {
+            db.delete_tracker_rule(id)?;
+            db.list_tracker_rules()
+        })
+        .await??;
+        crate::torrents::reload_tracker_rules(ctx).await?;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
 }
 
 fn normalize_settings_path_update(input: &MaybeUndefined<String>) -> MaybeUndefined<String> {

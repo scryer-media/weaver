@@ -8,7 +8,7 @@ use librqbit_core::lengths::Lengths;
 use sha1::{Digest, Sha1};
 
 use super::*;
-use crate::jobs::{Hold, HoldScope};
+use crate::jobs::{Hold, HoldOwner, HoldScope};
 use crate::post_processing::model::PostProcessingSettings;
 use crate::settings::{SeedingAction, SeedingGoalMode};
 use crate::torrents::TrackerStatus;
@@ -441,6 +441,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         trackers: Vec::new(),
         file_have: Vec::new(),
         seeding_override: None,
+        seeding_inherited: None,
         seeding_policy: SeedingPolicy::default(),
         seeding_source: SeedingSource::Global,
     };
@@ -1553,4 +1554,277 @@ async fn a_trackers_status_follows_its_announces() {
     assert_eq!((failed.seeders, failed.leechers), (None, None));
     assert!(failed.last_announce_ms.is_some());
     rig.service.stop().await;
+}
+
+// A follower hears a tracker's answer as it lands, with nothing in the queue
+// to say so: the rig has no queue, and the beat is far past the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_followed_torrent_pushes_its_trackers_answer() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(announcing(
+            &plain("pushed", 2),
+            &url,
+        ))))
+        .await
+        .unwrap();
+    let mut updates = rig
+        .service
+        .updates(Some(job_id), Duration::from_secs(86_400));
+
+    let mut started = heard_announce(&listener).await;
+    let first = updates.next().await;
+    assert_eq!(first[0].trackers[0].status, TrackerStatus::Updating);
+
+    let body = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    started
+        .write_all(&[head.as_bytes(), body].concat())
+        .await
+        .unwrap();
+    let working = loop {
+        let views = updates.next().await;
+        if views[0].trackers[0].status == TrackerStatus::Working {
+            break views[0].trackers[0].clone();
+        }
+    };
+    assert_eq!((working.seeders, working.leechers), (Some(3), Some(5)));
+    rig.service.stop().await;
+}
+
+// Who holds `job_id` stopped, as the queue last applied the holds.
+async fn paused_by(service: &TorrentService, job_id: JobId) -> Option<HoldOrigin> {
+    service.inner.live.lock().await[&job_id].paused_by
+}
+
+// A torrent under a tracker rule that never pauses seeds through the
+// schedule's pause until its goal is met; the operator's pause stops it, and
+// so does the schedule once the rule is gone. A torrent under no rule pauses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
+    let rig = rig(set_clock());
+    // No session is built while the route is down.
+    rig.routes.set_down(Some("down"));
+    let queue = queue();
+    rig.service.publish_to(queue.clone());
+    rig.service.open().await.unwrap();
+    let rule = rig
+        .db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "*.test".into(),
+                seeding: Some(SeedingPolicy {
+                    ratio_goal: Some(2.0),
+                    ..SeedingPolicy::default()
+                }),
+                never_pause: true,
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    let kept = rig
+        .service
+        .add(request(AddSource::Metainfo(announcing(
+            &plain("kept", 1),
+            "http://tracker.test/announce",
+        ))))
+        .await
+        .unwrap();
+    let plain = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("plain", 2))))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.db.get_torrent(kept).unwrap().unwrap().tracker_rule_id,
+        Some(rule.id)
+    );
+    assert_eq!(
+        rig.db.get_torrent(plain).unwrap().unwrap().tracker_rule_id,
+        None
+    );
+    for job_id in [kept, plain] {
+        rig.service
+            .inner
+            .live
+            .lock()
+            .await
+            .get_mut(&job_id)
+            .unwrap()
+            .record
+            .completed_at_ms = Some(EPOCH_MS);
+    }
+    assert_eq!(
+        rig.service.torrent(kept).await.unwrap().seeding_source,
+        SeedingSource::TrackerRule("*.test".into())
+    );
+
+    let hold = |hold: Hold| {
+        let mut set = HoldSet::default();
+        set.hold(hold);
+        queue.state().restore_holds(set);
+    };
+    let schedule = Hold {
+        origin: HoldOrigin::Scheduled,
+        scope: HoldScope::Everything,
+        owner: HoldOwner::Torrents,
+    };
+    // Subscribed before the first look, so the publish that follows the
+    // change wakes it.
+    let wait = |job_id, origin| {
+        let service = rig.service.clone();
+        let mut published = queue.state().subscribe_job_changes();
+        async move {
+            while paused_by(&service, job_id).await != origin {
+                published.changed().await.unwrap();
+            }
+        }
+    };
+
+    for owner in [HoldOwner::Torrents, HoldOwner::All] {
+        hold(Hold { owner, ..schedule });
+        wait(plain, Some(HoldOrigin::Scheduled)).await;
+        assert_eq!(paused_by(&rig.service, kept).await, None);
+        assert_eq!(
+            rig.service.schedule_seeding().await,
+            [ScheduleSeeding {
+                host_pattern: "*.test".into(),
+                torrents: 1,
+            }]
+        );
+        queue.state().restore_holds(HoldSet::default());
+        wait(plain, None).await;
+    }
+
+    // Still downloading, it owes its tracker as much.
+    let complete = |job_id, at| {
+        let service = rig.service.clone();
+        async move {
+            service
+                .inner
+                .live
+                .lock()
+                .await
+                .get_mut(&job_id)
+                .unwrap()
+                .record
+                .completed_at_ms = at;
+        }
+    };
+    complete(kept, None).await;
+    hold(schedule);
+    wait(plain, Some(HoldOrigin::Scheduled)).await;
+    assert_eq!(paused_by(&rig.service, kept).await, None);
+    queue.state().restore_holds(HoldSet::default());
+    wait(plain, None).await;
+    complete(kept, Some(EPOCH_MS)).await;
+
+    hold(Hold::manual(HoldOwner::Torrents));
+    wait(kept, Some(HoldOrigin::Manual)).await;
+    assert_eq!(
+        paused_by(&rig.service, plain).await,
+        Some(HoldOrigin::Manual)
+    );
+    assert!(rig.service.schedule_seeding().await.is_empty());
+    queue.state().restore_holds(HoldSet::default());
+    wait(kept, None).await;
+
+    // Its ratio goal met, it pauses with the rest.
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&kept)
+        .unwrap()
+        .counters
+        .uploaded_bytes = 6000;
+    hold(schedule);
+    wait(kept, Some(HoldOrigin::Scheduled)).await;
+    assert!(rig.service.schedule_seeding().await.is_empty());
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&kept)
+        .unwrap()
+        .counters
+        .uploaded_bytes = 0;
+    rig.service.reload_tracker_rules().await.unwrap();
+    assert_eq!(paused_by(&rig.service, kept).await, None);
+
+    // With its rule gone it pauses as a torrent under no rule.
+    assert!(rig.db.delete_tracker_rule(rule.id).unwrap());
+    rig.service.reload_tracker_rules().await.unwrap();
+    assert_eq!(
+        paused_by(&rig.service, kept).await,
+        Some(HoldOrigin::Scheduled)
+    );
+    assert_eq!(
+        rig.db.get_torrent(kept).unwrap().unwrap().tracker_rule_id,
+        None
+    );
+    assert_eq!(
+        rig.service.torrent(kept).await.unwrap().seeding_source,
+        SeedingSource::Global
+    );
+}
+
+// The download limit counts the torrents still downloading, and a change to
+// it applies when the settings are taken, not at the next tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_download_limit_counts_downloading_torrents_as_it_is_set() {
+    let rig = rig(set_clock());
+    // No session is built while the route is down.
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let mut ids = Vec::new();
+    for seed in 1..=4 {
+        ids.push(
+            rig.service
+                .add(request(AddSource::Metainfo(plain(
+                    &format!("set{seed}"),
+                    seed,
+                ))))
+                .await
+                .unwrap(),
+        );
+    }
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&ids[0])
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+    let queued = || async {
+        let live = rig.service.inner.live.lock().await;
+        ids.iter().map(|id| live[id].queued).collect::<Vec<_>>()
+    };
+    let set = |max_active_downloads| {
+        let mut settings = rig.service.settings();
+        settings.torrent.max_active_downloads = max_active_downloads;
+        rig.service.set_settings(settings)
+    };
+    set(1).await;
+    assert_eq!(queued().await, [false, false, true, true]);
+    set(0).await;
+    assert_eq!(queued().await, [false, true, true, true]);
+    set(3).await;
+    assert_eq!(queued().await, [false, false, false, false]);
 }

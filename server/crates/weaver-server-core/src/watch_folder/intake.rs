@@ -10,6 +10,9 @@ use weaver_model::files::{FileRole, archive_base_name};
 
 use crate::security::RuntimeSecurityConfig;
 
+// Files read whole, as they are; their bytes say what they hold. A `.magnet`
+// file holds one magnet URI.
+const PLAIN_SUFFIXES: [&str; 3] = [".nzb", ".torrent", ".magnet"];
 const MAX_NZB_MEMBERS_PER_INPUT: usize = 256;
 const MAX_TOTAL_NZB_BYTES_PER_INPUT: u64 = 512 * 1024 * 1024;
 // Largest end header a 7z input dropped into a watch folder may declare.
@@ -100,7 +103,7 @@ pub(super) fn is_supported_candidate(path: &Path) -> bool {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".nzb")
+    is_plain(&lower)
         || lower.ends_with(".nzb.gz")
         || lower.ends_with(".nzb.zst")
         || lower.ends_with(".nzb.zstd")
@@ -122,6 +125,12 @@ pub(super) fn is_supported_candidate(path: &Path) -> bool {
                 | FileRole::XzArchive
                 | FileRole::SplitFile { number: 0 }
         )
+}
+
+fn is_plain(lower_name: &str) -> bool {
+    PLAIN_SUFFIXES
+        .iter()
+        .any(|suffix| lower_name.ends_with(suffix))
 }
 
 pub(super) fn related_candidate_paths(path: &Path) -> Result<Vec<PathBuf>, IntakeError> {
@@ -159,8 +168,7 @@ pub(super) fn read_nzbs_from_path_with_name(
     // Despite the test-oriented name, this is the existing runtime env reader
     // plus safe defaults when no security env vars are present.
     let limit = RuntimeSecurityConfig::from_env_or_default_for_tests().nzb_decompressed_limit_bytes;
-    let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".nzb") {
+    if is_plain(&name.to_ascii_lowercase()) {
         return Ok(IntakeOutput::one(ExtractedNzb {
             filename: name.to_string(),
             bytes: read_file_limited(path, limit)?,

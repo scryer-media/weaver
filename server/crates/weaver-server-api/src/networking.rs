@@ -646,6 +646,82 @@ pub struct PathTestResult {
     pub connect_millis: f64,
     // How the host the path's final dial named was resolved.
     pub resolution: Option<HostResolution>,
+    // The test torrent over the path, when the test asked for it and the
+    // path reached its target.
+    #[graphql(name = "p2p")]
+    pub p2p: Option<P2pTestResult>,
+}
+// One step of the test torrent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "P2pStep")]
+pub enum P2pStep {
+    // The torrent, fetched through the path.
+    Torrent,
+    // An announce to its tracker.
+    Announce,
+    // Peers dialled and answering the handshake.
+    Handshake,
+    // One piece downloaded and verified.
+    Piece,
+    // Peers able to connect in.
+    Inbound,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "P2pRungOutcome")]
+pub enum P2pRungOutcome {
+    Passed,
+    Failed,
+    // An earlier step failed.
+    NotReached,
+}
+#[derive(SimpleObject)]
+#[graphql(name = "P2pRung")]
+pub struct P2pRung {
+    pub step: P2pStep,
+    pub outcome: P2pRungOutcome,
+    // What passed, or what stopped it, in the words of whatever did.
+    pub message: Option<String>,
+}
+#[derive(SimpleObject)]
+#[graphql(name = "P2pTestResult")]
+pub struct P2pTestResult {
+    pub rungs: Vec<P2pRung>,
+    // The port a tunnel's gateway mapped; the route announces it.
+    pub mapped_port: Option<u16>,
+}
+impl From<weaver_server_core::speed_test::P2pReport> for P2pTestResult {
+    fn from(report: weaver_server_core::speed_test::P2pReport) -> Self {
+        use weaver_server_core::speed_test as speed;
+        Self {
+            rungs: report
+                .rungs
+                .into_iter()
+                .map(|rung| {
+                    let (outcome, message) = match rung.outcome {
+                        speed::P2pOutcome::Passed(message) => {
+                            (P2pRungOutcome::Passed, Some(message))
+                        }
+                        speed::P2pOutcome::Failed(message) => {
+                            (P2pRungOutcome::Failed, Some(message))
+                        }
+                        speed::P2pOutcome::NotReached => (P2pRungOutcome::NotReached, None),
+                    };
+                    P2pRung {
+                        step: match rung.step {
+                            speed::P2pStep::Torrent => P2pStep::Torrent,
+                            speed::P2pStep::Announce => P2pStep::Announce,
+                            speed::P2pStep::Handshake => P2pStep::Handshake,
+                            speed::P2pStep::Piece => P2pStep::Piece,
+                            speed::P2pStep::Inbound => P2pStep::Inbound,
+                        },
+                        outcome,
+                        message,
+                    }
+                })
+                .collect(),
+            mapped_port: report.mapped_port,
+        }
+    }
 }
 // Who turned a test's host into addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
@@ -754,6 +830,7 @@ impl From<core::PathTest> for PathTestResult {
             source_address: test.source_address.map(|s| s.to_string()),
             connect_millis: test.elapsed.as_secs_f64() * 1000.0,
             resolution: test.resolution.map(Into::into),
+            p2p: test.p2p.map(Into::into),
         }
     }
 }
@@ -784,6 +861,67 @@ async fn test_via(
         >,
     > = Box::pin(runtime.network.test_via(route, subject, target));
     test.await.map_err(refusal_error)
+}
+// The test torrent over every path through a route of one torrent leg. A
+// port the leg's tunnel gateway maps becomes the port the route announces.
+async fn test_via_torrent(
+    ctx: &Context<'_>,
+    runtime: &ProxyRuntime,
+    route: &core::Route,
+    subject: core::TestSubject,
+    target: Option<(String, u16)>,
+) -> Result<Vec<core::PathTest>> {
+    use weaver_server_core::torrents::sessions;
+    let leg = route.legs.first().ok_or("the route has no leg")?;
+    let key = sessions::leg_key(&runtime.network, leg.egress_id, &leg.path);
+    let base_port = ctx
+        .data::<weaver_server_core::settings::SharedConfig>()?
+        .read()
+        .await
+        .torrent
+        .base_port;
+    let db = ctx.data::<Database>()?.clone();
+    let internal_port = {
+        let (db, key) = (db.clone(), key.clone());
+        spawn_blocking_db("network.test_via_torrent", move || {
+            sessions::listen_port(&db, base_port, &key)
+        })
+        .await?
+    };
+    // Tests point the test torrent at a loopback source.
+    let source = ctx
+        .data_opt::<weaver_server_core::speed_test::TestTorrentSource>()
+        .cloned()
+        .unwrap_or_default();
+    let tests = {
+        let _guard = runtime.mutations.lock().await;
+        let test: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<Vec<core::PathTest>, NetworkRefusal>,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(runtime.network.test_via_torrent(
+            route,
+            subject,
+            target,
+            source,
+            internal_port,
+        ));
+        test.await.map_err(refusal_error)?
+    };
+    let mapped = tests
+        .iter()
+        .filter(|test| test.leg == 0)
+        .find_map(|test| test.p2p.as_ref()?.mapped_port);
+    if let Some(port) = mapped {
+        spawn_blocking_db("network.test_via_torrent", move || {
+            sessions::set_mapped_port(&db, &key, port)
+        })
+        .await?;
+    }
+    Ok(tests)
 }
 #[derive(Clone, Debug, InputObject)]
 pub struct ProxyPoolInput {
@@ -1511,6 +1649,9 @@ impl NetworkingMutation {
     // top of it. A pool carries the target through the member it picks;
     // without a target each member is tried on its own. Nothing is dialled
     // outside the route.
+    // With `torrent`, the route is a torrent leg: each path that reaches
+    // its target, the test torrent's host when none is given, also runs the
+    // test torrent.
     #[graphql(guard = "AdminGuard")]
     async fn test_via(
         &self,
@@ -1518,6 +1659,7 @@ impl NetworkingMutation {
         route: RouteInput,
         subject: Option<TestSubjectInput>,
         target: Option<TestTargetInput>,
+        #[graphql(default = false)] torrent: bool,
     ) -> Result<Vec<PathTestResult>> {
         let runtime = runtime(ctx)?;
         let route = route.route()?;
@@ -1527,11 +1669,12 @@ impl NetworkingMutation {
             Some(TestSubjectInput::Pool(id)) => core::TestSubject::Pool(id),
         };
         let target = target.map(|target| (target.host, target.port));
-        Ok(test_via(&runtime, &route, subject, target)
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        let tests = if torrent {
+            test_via_torrent(ctx, &runtime, &route, subject, target).await?
+        } else {
+            test_via(&runtime, &route, subject, target).await?
+        };
+        Ok(tests.into_iter().map(Into::into).collect())
     }
     #[graphql(
         guard = "AdminGuard",

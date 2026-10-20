@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { addFileKind } from "@/lib/torrents";
+import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { submissionStatusCanForceRetry } from "@/next/features/duplicates/duplicate-presentation";
 import { useUploadNzb, type UploadNzbEntry } from "@/next/features/upload/use-upload-nzb";
-import { ADD_DIALOG_ACCEPT } from "@/next/features/upload/upload-file-types";
-import { useAddTorrents, type TorrentEntry } from "@/next/features/torrents/use-add-torrents";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/next/components/ConfirmDialog";
 import { Dialog } from "@/next/components/Dialog";
@@ -25,11 +22,6 @@ function isBlocked(entry: UploadNzbEntry): boolean {
   return entry.status === "staged" && submissionStatusCanForceRetry(entry.submissionStatus);
 }
 
-function torrentTone(entry: TorrentEntry): string {
-  if (entry.status === "failed") return WV.error;
-  return entry.status === "submitting" ? WV.idle : WV.accent;
-}
-
 function entryTone(entry: UploadNzbEntry): string {
   if (entry.status === "failed") return WV.error;
   if (isBlocked(entry)) return WV.warn;
@@ -38,13 +30,12 @@ function entryTone(entry: UploadNzbEntry): string {
 }
 
 /**
- * "Add NZB", in the Next vocabulary.
+ * "Add": one drop zone and one text box for NZBs and torrents alike.
  *
- * The whole upload pipeline — staging, duplicate scoring, submission — is the
- * existing `useUploadNzb` hook untouched; this is only a second view of it, so
- * the two interfaces cannot drift in behaviour. Files picked or dropped here
- * are added to the list rather than replacing it, so a second trip through the
- * file browser keeps the first.
+ * The daemon reads each file and the text for what they are, so nothing here
+ * tells an NZB from a torrent. Files picked or dropped are added to the list
+ * rather than replacing it, so a second trip through the file browser keeps
+ * the first.
  */
 export function AddNzbDialog({
   open,
@@ -57,31 +48,8 @@ export function AddNzbDialog({
   initialFiles?: readonly File[] | null;
 }) {
   const t = useTranslate();
-  const torrents = useAddTorrents();
-  // NZBs close the dialog once they are in, unless a torrent was refused beside them.
-  const torrentRefused = useRef(false);
-  const upload = useUploadNzb({
-    open,
-    resetOnOpen: true,
-    onSubmitted: () => {
-      if (!torrentRefused.current) onClose();
-    },
-  });
-  const { addFiles: addNzbFiles, fileInputRef } = upload;
-  const { addFiles: addTorrentFiles, reset: resetTorrents } = torrents;
-  // A torrent file goes to the torrent side; everything else to the NZB side, which names what it cannot take.
-  const addFiles = useCallback(
-    (files: File[]) => {
-      const torrentFiles = files.filter((file) => addFileKind(file.name) === "torrent");
-      const rest = files.filter((file) => addFileKind(file.name) !== "torrent");
-      addTorrentFiles(torrentFiles);
-      addNzbFiles(rest);
-    },
-    [addNzbFiles, addTorrentFiles],
-  );
-  useEffect(() => {
-    if (open) resetTorrents();
-  }, [open, resetTorrents]);
+  const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
+  const { addFiles, fileInputRef } = upload;
   const blocked = upload.entries.filter(isBlocked);
   // Set once a submit has answered, so its verdict is read from the entries it updated.
   const [awaitingVerdict, setAwaitingVerdict] = useState(false);
@@ -100,20 +68,10 @@ export function AddNzbDialog({
   // goes in, and only what the duplicate policy turned away comes back as one
   // question about adding those anyway.
   const submit = async () => {
-    const clean = await torrents.submit({
-      category: upload.category === NO_CATEGORY_VALUE ? null : upload.category,
-      paused: torrents.paused,
-      forced: torrents.forced,
-    });
-    torrentRefused.current = !clean;
-    if (upload.readyCount === 0) {
-      if (clean) onClose();
-      return;
-    }
     await upload.submit();
     setAwaitingVerdict(true);
   };
-  const readyCount = upload.readyCount + torrents.readyCount;
+  const readyCount = upload.readyCount;
 
   // The hook clears the list as the dialog opens; this runs after that, and
   // only once for a given drop.
@@ -154,7 +112,7 @@ export function AddNzbDialog({
           <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
           <PrimaryButton
             disabled={
-              readyCount === 0 || torrents.magnetInvalid || upload.staging || upload.fetching || torrents.submitting
+              readyCount === 0 || upload.staging || upload.fetching
             }
             onClick={() => void submit()}
           >
@@ -190,7 +148,6 @@ export function AddNzbDialog({
           <input
             ref={fileInputRef}
             type="file"
-            accept={ADD_DIALOG_ACCEPT}
             multiple
             className="hidden"
             onChange={(event) => {
@@ -199,11 +156,9 @@ export function AddNzbDialog({
             }}
           />
           <span className="font-medium text-wv-fg">{t("next.addNzb.dropZone")}</span>
-          {upload.entries.length + torrents.entries.length === 0 ? null : (
+          {upload.entries.length === 0 ? null : (
             <span className="font-wv-mono text-[11px] text-wv-faint">
-              {`${t("bulk.selected", { count: upload.entries.length + torrents.entries.length })} · ${formatSize(
-                upload.totalBytes + torrents.entries.reduce((sum, entry) => sum + entry.file.size, 0),
-              )}`}
+              {`${t("bulk.selected", { count: upload.entries.length })} · ${formatSize(upload.totalBytes)}`}
             </span>
           )}
         </button>
@@ -214,7 +169,7 @@ export function AddNzbDialog({
           </div>
         )}
 
-        {upload.entries.length + torrents.entries.length === 0 ? null : (
+        {upload.entries.length === 0 ? null : (
           <div className="mt-5 flex flex-col">
             <div className="flex h-[30px] flex-none items-center border-y border-wv-hairline bg-wv-section px-4 sm:px-6">
               <Eyebrow>{t("next.common.files")}</Eyebrow>
@@ -251,55 +206,21 @@ export function AddNzbDialog({
                 </button>
               </div>
             ))}
-            {torrents.entries.map((entry) => (
-              <div
-                key={entry.localId}
-                className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-wv-hairline px-4 sm:px-6 py-3"
-              >
-                <div className="flex min-w-0 flex-[1_1_260px] flex-col gap-1">
-                  <span title={entry.file.name} className="truncate text-[13px] text-wv-fg">
-                    {entry.file.name}
-                  </span>
-                  {entry.error === undefined ? null : (
-                    <span className="text-[11.5px] text-wv-error-text">{entry.error}</span>
-                  )}
-                </div>
-                <span
-                  style={{ color: torrentTone(entry) }}
-                  className="flex-none font-wv-mono text-[10.5px] tracking-[0.1em] uppercase"
-                >
-                  {t(`next.addNzb.status.${entry.status}`)}
-                </span>
-                <span className="w-[72px] flex-none text-right font-wv-mono text-[11.5px] text-wv-muted">
-                  {formatSize(entry.file.size)}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => torrents.removeFile(entry.localId)}
-                  aria-label={t("upload.removeFile")}
-                  className="flex-none text-[12px] text-wv-error-text hover:text-wv-error"
-                >
-                  {t("next.common.remove")}
-                </button>
-              </div>
-            ))}
           </div>
         )}
 
         <div className="mt-2 flex flex-col">
-          <FormRow label={t("next.addTorrent.magnet")}>
+          <FormRow label={t("next.addNzb.link")}>
             <div className="flex w-full min-w-0 flex-col gap-1">
               <TextField
-                label={t("next.addTorrent.magnet")}
-                value={torrents.magnet}
-                onChange={torrents.setMagnet}
-                placeholder="magnet:?"
+                label={t("next.addNzb.link")}
+                value={upload.text}
+                onChange={upload.setText}
+                placeholder="https:// · magnet:?"
                 className="w-full"
               />
-              {torrents.magnetInvalid ? (
-                <span className="text-[11.5px] text-wv-error-text">{t("next.addTorrent.notMagnet")}</span>
-              ) : torrents.magnetError === null ? null : (
-                <span className="text-[11.5px] text-wv-error-text">{torrents.magnetError}</span>
+              {upload.textError === null ? null : (
+                <span className="text-[11.5px] text-wv-error-text">{upload.textError}</span>
               )}
             </div>
           </FormRow>
@@ -319,16 +240,9 @@ export function AddNzbDialog({
               onChange={upload.setPriority}
             />
           </FormRow>
-          {torrents.hasSources ? (
-            <>
-              <FormRow label={t("next.addTorrent.paused")}>
-                <Toggle label={t("next.addTorrent.paused")} checked={torrents.paused} onChange={torrents.setPaused} />
-              </FormRow>
-              <FormRow label={t("next.torrent.force")}>
-                <Toggle label={t("next.torrent.force")} checked={torrents.forced} onChange={torrents.setForced} />
-              </FormRow>
-            </>
-          ) : null}
+          <FormRow label={t("next.addNzb.paused")}>
+            <Toggle label={t("next.addNzb.paused")} checked={upload.paused} onChange={upload.setPaused} />
+          </FormRow>
           <FormRow label={t("servers.password")}>
             <TextField
               label={t("servers.password")}

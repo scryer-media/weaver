@@ -179,6 +179,7 @@ async fn history_item_exposes_full_file_names_but_not_as_an_attribute() {
     let row = JobHistoryRow {
         job_id: 79,
         job_hash: None,
+        protocol: weaver_server_core::Protocol::Nzb,
         name: "Posted Names".to_string(),
         status: "complete".to_string(),
         error_message: None,

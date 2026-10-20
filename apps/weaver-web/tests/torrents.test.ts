@@ -3,30 +3,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { addFileKind, base64Of, isMagnetLink, removeOutcome, showsSeeding } from "../src/lib/torrents.ts";
-
-test("a dropped or picked file is told apart by its extension", () => {
-  assert.equal(addFileKind("Some.Release.torrent"), "torrent");
-  assert.equal(addFileKind("SOME.TORRENT"), "torrent");
-  assert.equal(addFileKind("release.nzb"), "nzb");
-  assert.equal(addFileKind("release.nzb.xz"), "nzb");
-  assert.equal(addFileKind("release.txt"), null);
-  assert.equal(addFileKind("torrent.nzb"), "nzb");
-});
-
-test("only text starting with a magnet scheme is a magnet link", () => {
-  assert.equal(isMagnetLink("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"), true);
-  assert.equal(isMagnetLink("  MAGNET:?xt=urn:btih:abc  "), true);
-  assert.equal(isMagnetLink("https://example.invalid/file.torrent"), false);
-  assert.equal(isMagnetLink("magnet:xt"), false);
-  assert.equal(isMagnetLink(""), false);
-});
-
-test("a metainfo file is sent as base64 of its exact bytes", () => {
-  const bytes = new Uint8Array(70000).map((_, index) => index % 251);
-  assert.equal(base64Of(bytes), Buffer.from(bytes).toString("base64"));
-  assert.equal(base64Of(new Uint8Array()), "");
-});
+import { removeOutcome, showsSeeding } from "../src/lib/torrents.ts";
 
 test("only a refusal over an unmet seeding goal asks for a second confirm", () => {
   assert.deepEqual(removeOutcome(undefined), { kind: "removed" });
