@@ -62,11 +62,21 @@ pub enum TrackerCommsStatsState {
     Live,
 }
 
+/// The counters an announce reports (BEP 3), all for the current run: the
+/// tracker task of a run sends `started` first, so "since `started`" and
+/// "during this run" are the same span.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TrackerCommsStats {
+    /// Payload bytes sent to peers during this run.
     pub uploaded_bytes: u64,
+    /// Bytes of the pieces downloaded during this run that passed their hash
+    /// check. Pieces the torrent already had when the run began are not
+    /// counted, and neither is a piece that failed its check.
     pub downloaded_bytes: u64,
-    pub total_bytes: u64,
+    /// Bytes of the selected files still to download, 0 once they are all
+    /// here. None while the torrent's size is unknown (a magnet still
+    /// resolving its metadata).
+    pub left_bytes: Option<u64>,
     pub torrent_state: TrackerCommsStatsState,
     /// The torrent was incomplete when its current run began and has every
     /// wanted piece now. Each tracker hears `completed` (BEP 3) once for such a
@@ -75,17 +85,15 @@ pub struct TrackerCommsStats {
 }
 
 impl TrackerCommsStats {
-    pub fn get_left_to_download_bytes(&self) -> u64 {
-        let total = self.total_bytes;
-        let down = self.downloaded_bytes;
-        if total >= down {
-            return total - down;
-        }
-        0
+    /// `left` as announced. An unknown size is announced as one block still
+    /// to come, so the announce never reads as a seed's.
+    pub fn announced_left(&self) -> u64 {
+        const UNKNOWN_LEFT: u64 = 16 * 1024;
+        self.left_bytes.unwrap_or(UNKNOWN_LEFT)
     }
 
     pub fn is_completed(&self) -> bool {
-        self.downloaded_bytes >= self.total_bytes
+        self.left_bytes == Some(0)
     }
 }
 
@@ -779,7 +787,7 @@ impl TrackerComms {
             port: self.announce_port,
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
-            left: stats.get_left_to_download_bytes(),
+            left: stats.announced_left(),
             compact: true,
             no_peer_id: false,
             event,
@@ -878,7 +886,7 @@ impl TrackerComms {
             info_hash: self.info_hash,
             peer_id: self.peer_id,
             downloaded: stats.downloaded_bytes,
-            left: stats.get_left_to_download_bytes(),
+            left: stats.announced_left(),
             uploaded: stats.uploaded_bytes,
             event: udp_event(event),
             key: self.key,
@@ -972,11 +980,11 @@ mod tests {
         assert_eq!(tier.current(), &http("a"));
     }
 
-    fn live(downloaded: u64, total: u64, finished_during_run: bool) -> TrackerCommsStats {
+    fn live(downloaded: u64, left: u64, finished_during_run: bool) -> TrackerCommsStats {
         TrackerCommsStats {
             uploaded_bytes: 0,
             downloaded_bytes: downloaded,
-            total_bytes: total,
+            left_bytes: Some(left),
             torrent_state: TrackerCommsStatsState::Live,
             finished_during_run,
         }
@@ -985,7 +993,7 @@ mod tests {
     #[test]
     fn test_completed_is_sent_once_after_finishing_during_the_run() {
         let mut state = AnnounceState::default();
-        let downloading = live(10, 100, false);
+        let downloading = live(10, 90, false);
         assert_eq!(
             state.next_event(&downloading),
             Some(TrackerRequestEvent::Started)
@@ -994,7 +1002,7 @@ mod tests {
         assert_eq!(state.next_event(&downloading), None);
         assert!(state.awaits_completion(&downloading));
 
-        let finished = live(100, 100, true);
+        let finished = live(100, 0, true);
         assert!(state.awaits_completion(&finished));
         assert_eq!(
             state.next_event(&finished),
@@ -1009,7 +1017,7 @@ mod tests {
     fn test_completed_is_retried_until_accepted() {
         let mut state = AnnounceState::default();
         state.on_accepted(Some(TrackerRequestEvent::Started));
-        let finished = live(100, 100, true);
+        let finished = live(100, 0, true);
         // The completed announce failed: nothing was accepted.
         assert_eq!(
             state.next_event(&finished),
@@ -1024,7 +1032,7 @@ mod tests {
     #[test]
     fn test_no_completed_for_a_torrent_complete_from_the_start() {
         let mut state = AnnounceState::default();
-        let seeding = live(100, 100, false);
+        let seeding = live(0, 0, false);
         assert_eq!(
             state.next_event(&seeding),
             Some(TrackerRequestEvent::Started)
@@ -1039,6 +1047,16 @@ mod tests {
         let state = AnnounceState::default();
         // A magnet still resolving its metadata: nothing is known yet.
         assert!(state.awaits_completion(&TrackerCommsStats::default()));
+    }
+
+    #[test]
+    fn test_unknown_size_never_announces_as_complete() {
+        let unknown = TrackerCommsStats::default();
+        assert!(!unknown.is_completed());
+        assert_eq!(unknown.announced_left(), 16 * 1024);
+        let done = live(0, 0, false);
+        assert!(done.is_completed());
+        assert_eq!(done.announced_left(), 0);
     }
 
     #[test]
@@ -1166,7 +1184,7 @@ mod tests {
         .unwrap();
 
         let stats = Arc::new(ManualStats {
-            stats: Mutex::new(live(10, 100, false)),
+            stats: Mutex::new(live(0, 90, false)),
             completed: tokio::sync::watch::channel(false).0,
         });
         let token = CancellationToken::new();
@@ -1201,11 +1219,12 @@ mod tests {
 
         let q = announce!();
         assert_eq!(query_param(&q, "event"), Some("started"));
+        assert_eq!(query_param(&q, "downloaded"), Some("0"));
         assert_eq!(query_param(&q, "left"), Some("90"));
 
         *stats.stats.lock() = TrackerCommsStats {
             uploaded_bytes: 7,
-            ..live(100, 100, true)
+            ..live(90, 0, true)
         };
         stats.completed.send_replace(true);
         let q = announce!();
@@ -1215,13 +1234,13 @@ mod tests {
         *stats.stats.lock() = TrackerCommsStats {
             uploaded_bytes: 42,
             torrent_state: TrackerCommsStatsState::Paused,
-            ..live(100, 100, false)
+            ..live(90, 0, false)
         };
         drop(peers);
         let q = next_announce(&listener).await;
         assert_eq!(query_param(&q, "event"), Some("stopped"));
         assert_eq!(query_param(&q, "uploaded"), Some("42"));
-        assert_eq!(query_param(&q, "downloaded"), Some("100"));
+        assert_eq!(query_param(&q, "downloaded"), Some("90"));
         assert_eq!(query_param(&q, "left"), Some("0"));
 
         stopped.wait_idle().await;

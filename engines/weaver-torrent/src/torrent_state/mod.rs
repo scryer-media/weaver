@@ -212,12 +212,16 @@ pub struct ManagedTorrentShared {
     pub(crate) last_run: parking_lot::Mutex<Option<RunCounters>>,
 }
 
-/// Transfer counters of one live run of a torrent.
+/// Transfer counters of one live run of a torrent, as its tracker announces
+/// report them (see `TrackerCommsStats`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RunCounters {
+    /// Payload bytes uploaded during the run.
     pub uploaded_bytes: u64,
-    pub progress_bytes: u64,
-    pub total_bytes: u64,
+    /// Bytes of the pieces downloaded during the run that passed their check.
+    pub downloaded_bytes: u64,
+    /// Bytes of the selected pieces still missing.
+    pub left_bytes: u64,
 }
 
 impl ManagedTorrentShared {
