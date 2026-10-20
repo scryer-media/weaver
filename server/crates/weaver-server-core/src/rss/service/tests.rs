@@ -5,6 +5,7 @@ use super::*;
 use std::time::Duration;
 mod proxy_body;
 mod proxy_routing;
+mod torrents;
 
 use std::io::Write;
 use std::path::Path;
@@ -93,6 +94,31 @@ async fn feed_item_parsing_prefers_enclosure_and_supports_direct_link_fallback()
         .into_iter()
         .next()
         .unwrap();
+    assert_eq!(
+        item.download_url.as_deref(),
+        Some("https://example.com/api?t=get&id=1")
+    );
+}
+
+// An element's text is whole across its references.
+#[test]
+fn feed_item_text_keeps_every_piece_around_its_references() {
+    let rss = r#"<?xml version="1.0"?>
+            <rss version="2.0">
+              <channel>
+                <item>
+                  <guid>guid-1</guid>
+                  <title>Silver &amp; Horizon &#x31;</title>
+                  <link>https://example.com/api?t=get&amp;id=1</link>
+                </item>
+              </channel>
+            </rss>"#;
+    let item = parse_feed_items(rss.as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(item.title, "Silver & Horizon 1");
     assert_eq!(
         item.download_url.as_deref(),
         Some("https://example.com/api?t=get&id=1")

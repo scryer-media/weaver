@@ -9,6 +9,7 @@ use quick_xml::{Reader, XmlVersion};
 use regex::Regex;
 use tracing::warn;
 
+use crate::ingest::{Kind, classify};
 use crate::rss::{RssFeedRow, RssRuleRow};
 
 pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u32 = 900;
@@ -35,6 +36,10 @@ struct ParsedFeedEntry {
     categories: Vec<String>,
     links: Vec<ParsedFeedLink>,
     enclosures: Vec<ParsedFeedLink>,
+    // The torznab/newznab attributes an indexer adds.
+    size: Option<u64>,
+    magnet: Option<String>,
+    infohash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,7 +216,6 @@ pub(crate) fn build_submission_metadata(
 
 pub(crate) fn parse_feed_items(xml: &[u8]) -> Result<Vec<FeedItem>, String> {
     let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
     let mut text_buf = String::new();
@@ -241,12 +245,19 @@ pub(crate) fn parse_feed_items(xml: &[u8]) -> Result<Vec<FeedItem>, String> {
                 }
                 text_buf.clear();
             }
-            Ok(Event::Text(e)) => {
-                let decoded = e.xml_content(XmlVersion::Implicit1_0);
-                text_buf = quick_xml::escape::unescape(&decoded)
-                    .map_err(|e| e.to_string())?
-                    .into_owned();
-            }
+            // An element's text arrives in pieces, split at each reference.
+            Ok(Event::Text(e)) => text_buf.push_str(&e.xml_content(XmlVersion::Implicit1_0)),
+            Ok(Event::GeneralRef(e)) => match e.resolve_char_ref().map_err(|e| e.to_string())? {
+                Some(ch) => text_buf.push(ch),
+                None => match quick_xml::escape::resolve_predefined_entity(&e) {
+                    Some(text) => text_buf.push_str(text),
+                    None => {
+                        text_buf.push('&');
+                        text_buf.push_str(&e);
+                        text_buf.push(';');
+                    }
+                },
+            },
             Ok(Event::End(e)) => {
                 let name = e.name();
                 let local = local_name(name.as_ref()).to_ascii_lowercase();
@@ -273,15 +284,31 @@ fn feed_item_from_entry(entry: ParsedFeedEntry) -> FeedItem {
         .title
         .clone()
         .unwrap_or_else(|| "Untitled RSS Item".to_string());
+    // The feed's own enclosure first, then a magnet, then a link that names
+    // a download.
     let media_content = entry.enclosures.iter().find(|link| !link.href.is_empty());
+    let magnet = || {
+        entry.magnet.clone().or_else(|| {
+            entry
+                .links
+                .iter()
+                .map(|link| link.href.as_str())
+                .chain(entry.infohash.as_deref())
+                .find_map(|href| match classify(href.as_bytes()) {
+                    Kind::Magnet(uri) => Some(uri),
+                    _ => None,
+                })
+        })
+    };
     let download_url = media_content
         .as_ref()
         .map(|link| link.href.clone())
+        .or_else(magnet)
         .or_else(|| {
             entry
                 .links
                 .iter()
-                .find(|link| looks_like_direct_nzb_url(&link.href))
+                .find(|link| looks_like_direct_download_url(&link.href))
                 .map(|link| link.href.clone())
         });
     let display_url = entry.links.first().map(|link| link.href.clone());
@@ -293,13 +320,16 @@ fn feed_item_from_entry(entry: ParsedFeedEntry) -> FeedItem {
         fallback_item_id(&title, entry.published_at, None)
     };
 
-    let size_bytes = media_content.and_then(|link| link.length).or_else(|| {
-        entry
-            .links
-            .iter()
-            .find(|link| download_url.as_deref() == Some(link.href.as_str()))
-            .and_then(|link| link.length)
-    });
+    let size_bytes = media_content
+        .and_then(|link| link.length)
+        .or_else(|| {
+            entry
+                .links
+                .iter()
+                .find(|link| download_url.as_deref() == Some(link.href.as_str()))
+                .and_then(|link| link.length)
+        })
+        .or(entry.size);
 
     FeedItem {
         item_id,
@@ -347,6 +377,21 @@ fn apply_empty_feed_element<R: std::io::BufRead>(
                 && !term.is_empty()
             {
                 entry.categories.push(term);
+            }
+        }
+        "attr" => {
+            let name = attr_value_by_name(reader, element, "name")?;
+            let Some(value) =
+                attr_value_by_name(reader, element, "value")?.filter(|value| !value.is_empty())
+            else {
+                return Ok(());
+            };
+            match name.map(|name| name.to_ascii_lowercase()).as_deref() {
+                Some("size") => entry.size = value.parse().ok(),
+                Some("magneturl") => entry.magnet = Some(value),
+                Some("infohash") => entry.infohash = Some(value),
+                Some("category") => entry.categories.push(value),
+                _ => {}
             }
         }
         _ => {}
@@ -420,11 +465,13 @@ fn local_name(name: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
 
-pub(crate) fn looks_like_direct_nzb_url(url: &str) -> bool {
+// A link to an NZB or a torrent file, by its path or an indexer's `t=get`.
+pub(crate) fn looks_like_direct_download_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    if parsed.path().to_ascii_lowercase().ends_with(".nzb") {
+    let path = parsed.path().to_ascii_lowercase();
+    if path.ends_with(".nzb") || path.ends_with(".torrent") {
         return true;
     }
     parsed
