@@ -54,6 +54,7 @@ impl Room {
 
 // Where the held pieces are counted: the accountant every job shares, under
 // the namespace of the job's root.
+#[derive(Clone)]
 pub(crate) struct Holds {
     pub(crate) accountant: Arc<HoldsAccountant>,
     pub(crate) namespace: HoldsNamespace,

@@ -3248,7 +3248,7 @@ dependencies = [
 [[package]]
 name = "librqbit"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3311,7 +3311,7 @@ dependencies = [
 [[package]]
 name = "librqbit-bencode"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -3327,7 +3327,7 @@ dependencies = [
 [[package]]
 name = "librqbit-buffers"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "bytes",
  "librqbit-clone-to-owned",
@@ -3338,7 +3338,7 @@ dependencies = [
 [[package]]
 name = "librqbit-clone-to-owned"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "bytes",
 ]
@@ -3346,7 +3346,7 @@ dependencies = [
 [[package]]
 name = "librqbit-core"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3375,7 +3375,7 @@ dependencies = [
 [[package]]
 name = "librqbit-dht"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "anyhow",
  "backon",
@@ -3422,7 +3422,7 @@ dependencies = [
 [[package]]
 name = "librqbit-lsd"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "anyhow",
  "atoi 3.1.1",
@@ -3441,7 +3441,7 @@ dependencies = [
 [[package]]
 name = "librqbit-peer-protocol"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -3461,7 +3461,7 @@ dependencies = [
 [[package]]
 name = "librqbit-sha1-wrapper"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "assert_cfg",
  "aws-lc-rs",
@@ -3470,7 +3470,7 @@ dependencies = [
 [[package]]
 name = "librqbit-tracker-comms"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3498,7 +3498,7 @@ dependencies = [
 [[package]]
 name = "librqbit-upnp"
 version = "9.0.1"
-source = "git+https://github.com/scryer-media/rqbit.git?rev=11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf#11866f26e24e8f16bab4bcfb56b69b8cb8f3bbdf"
+source = "git+https://github.com/scryer-media/rqbit.git?rev=78baa6ebee97ca088a729da647aa42d166741460#78baa6ebee97ca088a729da647aa42d166741460"
 dependencies = [
  "anyhow",
  "bstr",
@@ -6329,6 +6329,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

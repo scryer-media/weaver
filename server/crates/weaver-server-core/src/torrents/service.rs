@@ -1366,16 +1366,22 @@ impl TorrentService {
         let intake = Arc::new(Intake::new(
             Arc::clone(&job) as Arc<dyn Pieces>,
             Room::new(Arc::clone(&env.limits), env.free_disk.clone()),
-            Holds {
-                accountant: Arc::clone(&env.accountant),
-                namespace: weaver_graph::holds::HoldsNamespace {
-                    scope: job_id.0,
-                    node: weaver_graph::NodeId::ROOT,
-                },
-            },
+            self.resident(job_id),
             Box::new(move |heard| signal.heard(job_id, heard)),
         ));
         (job, intake)
+    }
+
+    // Where a torrent's bytes in memory are counted: the accountant every
+    // job shares, under the namespace of the job's root.
+    fn resident(&self, job_id: JobId) -> Holds {
+        Holds {
+            accountant: Arc::clone(&self.inner.env.accountant),
+            namespace: weaver_graph::holds::HoldsNamespace {
+                scope: job_id.0,
+                node: weaver_graph::NodeId::ROOT,
+            },
+        }
     }
 
     // The torrent's job, over the metainfo. Whether it unpacks is fixed
@@ -1809,7 +1815,8 @@ impl TorrentService {
                 return;
             }
         };
-        let factory = PieceStorageFactory::new(layout, intake as Arc<dyn Pieces>);
+        let factory =
+            PieceStorageFactory::new(layout, intake as Arc<dyn Pieces>, self.resident(job_id));
         let mut options = AddTorrentOptions {
             paused,
             overwrite: true,

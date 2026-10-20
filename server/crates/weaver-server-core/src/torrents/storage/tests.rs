@@ -11,9 +11,9 @@ use librqbit::{
     SessionOptions, create_torrent, torrent_from_bytes,
 };
 use librqbit_core::lengths::{Lengths, ValidPieceIndex};
-use tokio::sync::watch;
-use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
-use weaver_graph::{ByteRange, VolumeIndex};
+use tokio::sync::{Notify, watch};
+use weaver_graph::holds::{HoldBudgets, HoldsAccountant, HoldsNamespace};
+use weaver_graph::{ByteRange, NodeId, VolumeIndex};
 
 use super::{PieceStorage, PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::operations::disk::CapacityReader;
@@ -23,17 +23,38 @@ use crate::pipeline::graph::limits::Caps;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::{PieceFile, PieceLayout, Verified};
 use crate::pipeline::graph::status::RepairSlots;
-use librqbit::storage::TorrentStorage;
+use crate::torrents::intake::Holds;
+use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
+
+fn accountant(resident_limit: u64) -> Arc<HoldsAccountant> {
+    Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    }))
+}
+
+const NAMESPACE: HoldsNamespace = HoldsNamespace {
+    scope: 1,
+    node: NodeId::ROOT,
+};
+
+fn holds(accountant: &Arc<HoldsAccountant>) -> Holds {
+    Holds {
+        accountant: Arc::clone(accountant),
+        namespace: NAMESPACE,
+    }
+}
+
+fn unbounded() -> Holds {
+    holds(&accountant(u64::MAX))
+}
 
 fn storage(dir: &Path, mail: &RunMail) -> Storage {
     Storage {
         working_dir: dir.to_path_buf(),
-        accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
-            resident_limit: u64::MAX,
-            scratch_total: u64::MAX,
-            scratch_ceiling: u64::MAX,
-            disk_reserve: 0,
-        })),
+        accountant: accountant(u64::MAX),
         free_disk: CapacityReader::unknown(),
         slots: 1,
         mail: mail.sender(),
@@ -65,6 +86,7 @@ struct Shim {
     layout: Arc<PieceLayout>,
     mail: RunMail,
     dir: tempfile::TempDir,
+    room: Arc<Notify>,
 }
 
 fn shim(piece_length: u64, files: Vec<PieceFile>) -> Shim {
@@ -77,13 +99,18 @@ fn shim(piece_length: u64, files: Vec<PieceFile>) -> Shim {
         Arc::default(),
         1,
     ));
-    let storage = PieceStorage::new(Arc::clone(&layout), Arc::clone(&job) as Arc<dyn Pieces>);
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        Arc::clone(&job) as Arc<dyn Pieces>,
+        unbounded(),
+    );
     Shim {
         job,
         storage,
         layout,
         mail,
         dir,
+        room: Arc::default(),
     }
 }
 
@@ -98,8 +125,10 @@ impl Shim {
         .unwrap()
     }
 
-    // The piece's bytes written as the session writes them: file by file.
+    // The piece's bytes written as the session writes them: granted room,
+    // then file by file.
     fn write(&self, piece: u32, torrent: &[u8]) {
+        assert!(self.storage.reserve_piece(self.index(piece), &self.room));
         let range = self.layout.piece_range(piece);
         for span in self.layout.spans(piece) {
             let at = (range.start + span.at) as usize;
@@ -288,11 +317,13 @@ impl Pieces for Watched {
     }
 }
 
-// A session on loopback alone: no DHT, no trackers, no discovery.
-async fn session(dir: &Path) -> Arc<Session> {
+// A session on loopback alone: no DHT, no trackers, no discovery, and
+// `blocking` threads for writing and checking pieces.
+async fn session(dir: &Path, blocking: Option<usize>) -> Arc<Session> {
     Session::new_with_opts(
         dir.to_path_buf(),
         SessionOptions {
+            runtime_worker_threads: blocking,
             dht: None,
             disable_trackers: true,
             disable_local_service_discovery: true,
@@ -310,12 +341,19 @@ async fn session(dir: &Path) -> Arc<Session> {
     .unwrap()
 }
 
-// One session seeds a torrent from its files; the other fetches it from
-// that peer alone into a graph job through the piece storage.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_it() {
-    let seeds = tempfile::tempdir().unwrap();
-    let set = seeds.path().join("set");
+// A torrent of three files, seeded by a session of its own.
+struct Seeded {
+    originals: [(&'static str, Vec<u8>); 3],
+    bytes: bytes::Bytes,
+    layout: Arc<PieceLayout>,
+    seeder: Arc<Session>,
+    peer: SocketAddr,
+    _dir: tempfile::TempDir,
+}
+
+async fn seeded() -> Seeded {
+    let dir = tempfile::tempdir().unwrap();
+    let set = dir.path().join("set");
     std::fs::create_dir(&set).unwrap();
     let originals = [
         ("a.bin", noise(1000, 1)),
@@ -342,7 +380,7 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_
     let layout = Arc::new(layout_of(&info).unwrap());
     assert!(layout.piece_count() > 3);
 
-    let seeder = session(&seeds.path().join("session")).await;
+    let seeder = session(&dir.path().join("session"), None).await;
     let seeding = seeder
         .add_torrent(
             AddTorrent::from_bytes(bytes.clone()),
@@ -358,35 +396,45 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_
         .unwrap();
     seeding.wait_until_completed().await.unwrap();
     let peer = seeder.listen_addr().unwrap();
+    Seeded {
+        originals,
+        bytes,
+        layout,
+        seeder,
+        peer,
+        _dir: dir,
+    }
+}
 
-    let fetch = tempfile::tempdir().unwrap();
+// A graph job over the layout, with the side the storage hands pieces to.
+fn watched_job(layout: &Arc<PieceLayout>, dir: &Path) -> (Arc<Watched>, watch::Receiver<bool>) {
     let mail = RunMail::default();
     let job = Arc::new(TorrentJob::new(
-        GraphJob::for_torrent(
-            1,
-            Arc::clone(&layout),
-            storage(&fetch.path().join("job"), &mail),
-        ),
+        GraphJob::for_torrent(1, Arc::clone(layout), storage(dir, &mail)),
         Arc::default(),
         Arc::default(),
         1,
     ));
-    let (whole, mut in_hand) = watch::channel(false);
-    let watched = Arc::new(Watched {
-        job: Arc::clone(&job),
-        whole,
-    });
-    let factory =
-        PieceStorageFactory::new(Arc::clone(&layout), Arc::clone(&watched) as Arc<dyn Pieces>);
-    let leecher = session(&fetch.path().join("session")).await;
+    let (whole, in_hand) = watch::channel(false);
+    (Arc::new(Watched { job, whole }), in_hand)
+}
+
+// The seeded torrent fetched from its seeder alone, into `factory`.
+async fn fetch(
+    seeded: &Seeded,
+    dir: &Path,
+    blocking: Option<usize>,
+    factory: BoxStorageFactory,
+) -> Arc<Session> {
+    let leecher = session(&dir.join("session"), blocking).await;
     let _fetching = leecher
         .add_torrent(
-            AddTorrent::from_bytes(bytes),
+            AddTorrent::from_bytes(seeded.bytes.clone()),
             Some(AddTorrentOptions {
-                output_folder: Some(fetch.path().join("unused").to_string_lossy().into_owned()),
+                output_folder: Some(dir.join("unused").to_string_lossy().into_owned()),
                 overwrite: true,
-                initial_peers: Some(vec![peer]),
-                storage_factory: Some(factory.boxed_factory()),
+                initial_peers: Some(vec![seeded.peer]),
+                storage_factory: Some(factory),
                 ..Default::default()
             }),
         )
@@ -394,11 +442,30 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_
         .unwrap()
         .into_handle()
         .unwrap();
+    leecher
+}
+
+// One session seeds a torrent from its files; the other fetches it from
+// that peer alone into a graph job through the piece storage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_it() {
+    let seeded = seeded().await;
+    let Seeded {
+        originals, layout, ..
+    } = &seeded;
+    let fetch_dir = tempfile::tempdir().unwrap();
+    let (watched, mut in_hand) = watched_job(layout, &fetch_dir.path().join("job"));
+    let factory = PieceStorageFactory::new(
+        Arc::clone(layout),
+        Arc::clone(&watched) as Arc<dyn Pieces>,
+        unbounded(),
+    );
+    let leecher = fetch(&seeded, fetch_dir.path(), None, factory.boxed_factory()).await;
     in_hand.wait_for(|whole| *whole).await.unwrap();
 
-    let dir = fetch.path().join("job");
+    let dir = fetch_dir.path().join("job");
     let mut torrent = Vec::new();
-    for (name, original) in &originals {
+    for (name, original) in originals {
         assert_eq!(&std::fs::read(dir.join(name)).unwrap(), original, "{name}");
     }
     for index in 0..layout.files().count() {
@@ -406,7 +473,7 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_
         let (_, original) = originals.iter().find(|(file, _)| file == name).unwrap();
         torrent.extend_from_slice(original);
     }
-    let posted = PieceStorage::new(Arc::clone(&layout), watched as Arc<dyn Pieces>);
+    let posted = PieceStorage::new(Arc::clone(&layout), watched as Arc<dyn Pieces>, unbounded());
     for piece in 0..layout.piece_count() {
         let range = layout.piece_range(piece);
         let mut read = Vec::new();
@@ -424,7 +491,168 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_
         );
     }
     leecher.stop().await;
-    seeder.stop().await;
+    seeded.seeder.stop().await;
+}
+
+// The piece storage as the session sees it, with the first verified piece
+// held back until the test lets it go, and every refusal of room counted.
+#[derive(Clone)]
+struct Gated {
+    storage: PieceStorage,
+    gate: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    refused: Arc<watch::Sender<usize>>,
+}
+
+impl TorrentStorage for Gated {
+    fn init(
+        &mut self,
+        shared: &librqbit::ManagedTorrentShared,
+        metadata: &librqbit::TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.storage.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.storage.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.storage.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+        self.storage.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
+        self.storage.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.storage.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(self.clone()))
+    }
+
+    fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        let gate = self.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.recv().unwrap();
+        }
+        self.storage.on_piece_completed(piece)
+    }
+
+    fn on_piece_hash_failed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.storage.on_piece_hash_failed(piece)
+    }
+
+    fn reserve_piece(&self, piece: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        let granted = self.storage.reserve_piece(piece, room);
+        if !granted {
+            self.refused.send_modify(|refused| *refused += 1);
+        }
+        granted
+    }
+}
+
+#[derive(Clone)]
+struct GatedFactory {
+    factory: PieceStorageFactory,
+    gate: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    refused: Arc<watch::Sender<usize>>,
+}
+
+impl StorageFactory for GatedFactory {
+    type Storage = Gated;
+
+    fn create(
+        &self,
+        shared: &librqbit::ManagedTorrentShared,
+        metadata: &librqbit::TorrentMetadata,
+    ) -> anyhow::Result<Gated> {
+        Ok(Gated {
+            storage: self.factory.create(shared, metadata)?,
+            gate: Arc::clone(&self.gate),
+            refused: Arc::clone(&self.refused),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+// With room for one piece and one thread for writing and checking, the
+// session is granted a piece, and while that piece is held at its handover
+// with the one thread, the next is refused: the session waits without a
+// thread of its own. Once the piece lets its room go the session is rung
+// and fetches the rest a piece at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_at_its_budget_waits_for_room_and_resumes_when_a_piece_lets_go() {
+    let seeded = seeded().await;
+    let layout = &seeded.layout;
+    let fetch_dir = tempfile::tempdir().unwrap();
+    let (watched, mut in_hand) = watched_job(layout, &fetch_dir.path().join("job"));
+    let budget = accountant(layout.piece_length());
+    let (go, gate) = std::sync::mpsc::channel();
+    let (refused, mut refusals) = watch::channel(0);
+    let factory = GatedFactory {
+        factory: PieceStorageFactory::new(
+            Arc::clone(layout),
+            Arc::clone(&watched) as Arc<dyn Pieces>,
+            holds(&budget),
+        ),
+        gate: Arc::new(std::sync::Mutex::new(Some(gate))),
+        refused: Arc::new(refused),
+    };
+    let leecher = fetch(&seeded, fetch_dir.path(), Some(1), factory.boxed()).await;
+
+    refusals.wait_for(|refused| *refused > 0).await.unwrap();
+    assert!(watched.job.with(|job| job.have().not_any()));
+    assert_eq!(
+        budget.namespace_usage(NAMESPACE).resident,
+        layout.piece_length()
+    );
+    go.send(()).unwrap();
+
+    in_hand.wait_for(|whole| *whole).await.unwrap();
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+    leecher.stop().await;
+    seeded.seeder.stop().await;
+}
+
+// A piece that fails its hash is dropped with the room it held, the session
+// waiting for that room is rung, and the storage going gives back the rest.
+#[tokio::test]
+async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
+    let layout = Arc::new(PieceLayout::new(8, vec![file("a", 16)]).unwrap());
+    let budget = accountant(8);
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        Arc::new(Kept::default()) as Arc<dyn Pieces>,
+        holds(&budget),
+    );
+    let lengths = Lengths::new(16, 8).unwrap();
+    let [first, second] = [0, 1].map(|piece| lengths.try_validate_piece_index(piece).unwrap());
+    let room = Arc::new(Notify::new());
+    assert!(storage.reserve_piece(first, &room));
+    storage.pwrite_all(0, 0, b"badbytes").unwrap();
+    // The budget holds one piece, and nothing is written without room.
+    assert!(!storage.reserve_piece(second, &room));
+    assert!(storage.pwrite_all(0, 8, b"x").is_err());
+
+    let rung = room.notified();
+    storage.on_piece_hash_failed(first).unwrap();
+    rung.await;
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
+    assert!(storage.pread_exact(0, 0, &mut [0; 8]).is_err());
+
+    assert!(storage.reserve_piece(second, &room));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 8);
+    drop(storage);
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
 }
 
 // The job's side that keeps what it is handed, and reads the piece back
@@ -460,14 +688,19 @@ impl Pieces for Kept {
 fn a_verified_piece_goes_to_the_job_without_a_copy() {
     let layout = Arc::new(PieceLayout::new(8, vec![file("a", 5), file("b", 3)]).unwrap());
     let kept = Arc::new(Kept::default());
-    let storage = PieceStorage::new(Arc::clone(&layout), Arc::clone(&kept) as Arc<dyn Pieces>);
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        Arc::clone(&kept) as Arc<dyn Pieces>,
+        unbounded(),
+    );
     kept.storage.set(storage.clone()).ok().unwrap();
-    storage.pwrite_all(0, 0, b"aaaaa").unwrap();
-    storage.pwrite_all(1, 0, b"bbb").unwrap();
     let index = Lengths::new(8, 8)
         .unwrap()
         .try_validate_piece_index(0)
         .unwrap();
+    assert!(storage.reserve_piece(index, &Arc::default()));
+    storage.pwrite_all(0, 0, b"aaaaa").unwrap();
+    storage.pwrite_all(1, 0, b"bbb").unwrap();
     storage.on_piece_completed(index).unwrap();
 
     assert_eq!(*kept.read_while_handed.lock().unwrap(), b"aaaaabbb");
@@ -482,4 +715,43 @@ fn a_verified_piece_goes_to_the_job_without_a_copy() {
     );
     // Once handed over, the piece is no longer in memory.
     assert!(storage.pread_exact(0, 0, &mut [0; 5]).is_err());
+}
+
+// A piece handed on to another peer is written into the room it already
+// holds: a steal is never asked for room, and a piece its peer gave back is
+// granted again without more. So no write the session makes after a grant
+// finds the piece without room.
+#[test]
+fn a_piece_handed_on_is_written_into_the_room_it_holds() {
+    let layout = Arc::new(PieceLayout::new(8, vec![file("a", 5), file("b", 3)]).unwrap());
+    let budget = accountant(8);
+    let kept = Arc::new(Kept::default());
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        Arc::clone(&kept) as Arc<dyn Pieces>,
+        holds(&budget),
+    );
+    kept.storage.set(storage.clone()).ok().unwrap();
+    let piece = Lengths::new(8, 8)
+        .unwrap()
+        .try_validate_piece_index(0)
+        .unwrap();
+    let room = Arc::new(Notify::new());
+    assert!(storage.reserve_piece(piece, &room));
+    // The first peer writes half, then the piece is stolen: the thief
+    // writes the rest with nothing asked.
+    storage.pwrite_all(0, 0, b"abcde").unwrap();
+    storage.pwrite_all(1, 0, b"fgh").unwrap();
+    // The thief leaves and the piece is queued again: the next peer is
+    // granted it with the budget already full, and rewrites it.
+    assert!(storage.reserve_piece(piece, &room));
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 8);
+    storage.pwrite_all(0, 0, b"ab").unwrap();
+    storage.on_piece_completed(piece).unwrap();
+    let shares = kept.shares.lock().unwrap();
+    assert_eq!(
+        (&shares[0].bytes[..], &shares[1].bytes[..]),
+        (&b"abcde"[..], &b"fgh"[..])
+    );
+    assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
 }

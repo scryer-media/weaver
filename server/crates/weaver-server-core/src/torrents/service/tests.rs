@@ -784,7 +784,11 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
         )
     };
     let mut retired = rig.service.retired();
-    let storage = PieceStorage::new(Arc::clone(&layout), intake as Arc<dyn Pieces>);
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        rig.service.resident(job_id),
+    );
     let lengths = Lengths::new(
         layout.files().map(|file| file.length).sum(),
         layout.piece_length() as u32,
@@ -792,6 +796,8 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
     .unwrap();
     for piece in 0..layout.piece_count() {
         let range = layout.piece_range(piece);
+        let index = lengths.try_validate_piece_index(piece).unwrap();
+        assert!(storage.reserve_piece(index, &Arc::default()));
         for span in layout.spans(piece) {
             let at = (range.start + span.at) as usize;
             storage
@@ -803,9 +809,7 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
                 .unwrap();
         }
         // A piece past the refusal is refused too.
-        if let Err(error) =
-            storage.on_piece_completed(lengths.try_validate_piece_index(piece).unwrap())
-        {
+        if let Err(error) = storage.on_piece_completed(index) {
             assert!(format!("{error:#}").contains("txt"), "{error:#}");
         }
     }

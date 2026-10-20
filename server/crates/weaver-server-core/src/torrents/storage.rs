@@ -10,6 +10,11 @@
 // its own file, a file an object reads through that object's inverse map,
 // which puts back what the object took off. So a piece seeds from the one
 // copy of its bytes the job keeps.
+//
+// A piece's buffer is held against the resident budget every job shares from
+// the moment the session is granted the piece until it verifies, fails its
+// hash, or the storage goes. A piece the budget has no room for is refused,
+// and the session waits for the room this storage rings when it lets bytes go.
 
 use std::collections::HashMap;
 use std::io::IoSlice;
@@ -23,9 +28,12 @@ use bytes::Bytes;
 use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
 use librqbit::{ManagedTorrentShared, TorrentMetadata, ValidatedTorrentMetaV1Info};
 use librqbit_core::lengths::ValidPieceIndex;
+use tokio::sync::Notify;
+use weaver_graph::holds::Reserve;
 use weaver_graph::slots::AskerId;
 use weaver_graph::{ByteRange, VolumeIndex};
 
+use super::intake::Holds;
 use super::service::Signal;
 use crate::jobs::ids::JobId;
 use crate::pipeline::graph::job::{GraphError, GraphJob};
@@ -165,7 +173,8 @@ pub(crate) fn layout_of<B: AsRef<[u8]>>(
 }
 
 // A piece in flight, the length of its piece: its chunks as they arrive,
-// then the whole piece while its shares go to the job.
+// then the whole piece while its shares go to the job. Only a piece still
+// being written holds room: a verified one's bytes are the job's.
 enum Flight {
     Writing(Vec<u8>),
     Verified(Bytes),
@@ -178,6 +187,13 @@ impl Flight {
             Self::Verified(bytes) => bytes,
         }
     }
+
+    fn held(&self) -> u64 {
+        match self {
+            Self::Writing(bytes) => bytes.len() as u64,
+            Self::Verified(_) => 0,
+        }
+    }
 }
 
 struct Inner {
@@ -185,6 +201,34 @@ struct Inner {
     pieces: Arc<dyn Pieces>,
     // The pieces in flight, by index.
     flight: Mutex<HashMap<u32, Flight>>,
+    holds: Holds,
+    // What the session waits on for room, as it last asked.
+    room: Mutex<Option<Arc<Notify>>>,
+}
+
+impl Inner {
+    // Room given back: the session waiting on it asks again.
+    fn release(&self, bytes: u64) {
+        self.holds
+            .accountant
+            .release_resident(self.holds.namespace, bytes);
+        if let Some(room) = &*self.room.lock().unwrap_or_else(PoisonError::into_inner) {
+            room.notify_waiters();
+        }
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let flight = self
+            .flight
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let held = flight.values().map(Flight::held).sum();
+        self.holds
+            .accountant
+            .release_resident(self.holds.namespace, held);
+    }
 }
 
 #[derive(Clone)]
@@ -193,12 +237,14 @@ pub(crate) struct PieceStorage {
 }
 
 impl PieceStorage {
-    pub(crate) fn new(layout: Arc<PieceLayout>, pieces: Arc<dyn Pieces>) -> Self {
+    pub(crate) fn new(layout: Arc<PieceLayout>, pieces: Arc<dyn Pieces>, holds: Holds) -> Self {
         Self {
             inner: Arc::new(Inner {
                 layout,
                 pieces,
                 flight: Mutex::new(HashMap::new()),
+                holds,
+                room: Mutex::new(None),
             }),
         }
     }
@@ -276,11 +322,8 @@ impl TorrentStorage for PieceStorage {
         let range = self.inner.layout.piece_range(piece);
         let at = (start - range.start) as usize;
         let mut flight = self.flight();
-        let held = flight
-            .entry(piece)
-            .or_insert_with(|| Flight::Writing(vec![0; range.len() as usize]));
-        let Flight::Writing(held) = held else {
-            bail!("piece {piece} is written after it verified");
+        let Some(Flight::Writing(held)) = flight.get_mut(&piece) else {
+            bail!("piece {piece} is written while the session holds no room for it");
         };
         held[at..at + buf.len()].copy_from_slice(buf);
         Ok(())
@@ -318,22 +361,50 @@ impl TorrentStorage for PieceStorage {
         Ok(Box::new(self.clone()))
     }
 
+    // Room for a piece the session is about to be handed. A piece given
+    // back by a peer that left keeps what was written and the room it holds.
+    fn reserve_piece(&self, piece: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        // Kept before the budget is asked, so a release after a refusal rings
+        // the session that was refused.
+        *self
+            .inner
+            .room
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(room));
+        let index = piece.get();
+        let mut flight = self.flight();
+        if flight.contains_key(&index) {
+            return true;
+        }
+        let length = self.inner.layout.piece_range(index).len();
+        let holds = &self.inner.holds;
+        if let Reserve::Breached(_) = holds.accountant.reserve_resident(holds.namespace, length) {
+            return false;
+        }
+        flight.insert(index, Flight::Writing(vec![0; length as usize]));
+        true
+    }
+
     // The piece's shares go to the job, and only then does the piece stop
-    // being read from memory, so no read finds it in neither place.
+    // being read from memory, so no read finds it in neither place. Its room
+    // is given back first: the job, or the intake holding it, counts the
+    // bytes from here.
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let index = piece.get();
-        let held = {
+        let (held, released) = {
             let mut flight = self.flight();
             let Some(entry) = flight.get_mut(&index) else {
                 bail!("piece {index} completed with nothing written");
             };
+            let released = entry.held();
             let held = match std::mem::replace(entry, Flight::Verified(Bytes::new())) {
                 Flight::Writing(bytes) => Bytes::from(bytes),
                 Flight::Verified(bytes) => bytes,
             };
             *entry = Flight::Verified(held.clone());
-            held
+            (held, released)
         };
+        self.inner.release(released);
         let shares = self
             .inner
             .layout
@@ -354,6 +425,14 @@ impl TorrentStorage for PieceStorage {
         self.flight().remove(&index);
         Ok(())
     }
+
+    // What failed is dropped, and the piece is fetched again into room
+    // granted afresh.
+    fn on_piece_hash_failed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        let failed = self.flight().remove(&piece.get());
+        self.inner.release(failed.as_ref().map_or(0, Flight::held));
+        Ok(())
+    }
 }
 
 // Makes the storage of one torrent's job.
@@ -361,11 +440,16 @@ impl TorrentStorage for PieceStorage {
 pub(crate) struct PieceStorageFactory {
     layout: Arc<PieceLayout>,
     pieces: Arc<dyn Pieces>,
+    holds: Holds,
 }
 
 impl PieceStorageFactory {
-    pub(crate) fn new(layout: Arc<PieceLayout>, pieces: Arc<dyn Pieces>) -> Self {
-        Self { layout, pieces }
+    pub(crate) fn new(layout: Arc<PieceLayout>, pieces: Arc<dyn Pieces>, holds: Holds) -> Self {
+        Self {
+            layout,
+            pieces,
+            holds,
+        }
     }
 
     pub(crate) fn boxed_factory(self) -> BoxStorageFactory {
@@ -384,6 +468,7 @@ impl StorageFactory for PieceStorageFactory {
         Ok(PieceStorage::new(
             Arc::clone(&self.layout),
             Arc::clone(&self.pieces),
+            self.holds.clone(),
         ))
     }
 
