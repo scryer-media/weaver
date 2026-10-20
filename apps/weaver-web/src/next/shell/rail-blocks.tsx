@@ -6,6 +6,7 @@ import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import type { JobProtocol } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
 import { RailBlock, RailMetric } from "./NextShell";
 import { Bar, Square } from "../components/chrome";
@@ -339,38 +340,101 @@ export function CategoryListBlock({
             ? UNCATEGORISED_COLOR
             : categoryColor(item.key);
         return (
-          <button
+          <FacetButton
             key={item.key ?? "*"}
-            type="button"
+            active={isActive}
+            color={color}
+            count={item.count}
             onClick={() => (item.key === null ? onClear() : onToggle(item.key))}
-            aria-pressed={isActive}
-            className={cn(
-              "flex items-center gap-[9px] text-left text-[12.5px]",
-              isActive ? "font-medium text-wv-strong" : "text-wv-fg hover:text-wv-secondary",
-            )}
           >
-            {/*
-              The swatch doubles as the checkbox: solid once the facet is on,
-              a ring of the same colour while it is off. One glyph, so a rail
-              of eight categories does not grow a column of empty boxes.
-            */}
-            <Square color={color} hollow={!isActive} />
-            <span className="min-w-0 truncate">
-              {item.key === null
-                ? t("next.categories.all")
-                : item.key === UNCATEGORISED
-                  ? t("next.categories.uncategorised")
-                  : item.label}
-            </span>
-            {item.count === undefined ? null : (
-              <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">
-                {item.count}
-              </span>
-            )}
-          </button>
+            {item.key === null
+              ? t("next.categories.all")
+              : item.key === UNCATEGORISED
+                ? t("next.categories.uncategorised")
+                : item.label}
+          </FacetButton>
         );
       })}
     </RailBlock>
+  );
+}
+
+/** Which kind of download the list shows; null shows both. */
+export type ProtocolFacet = JobProtocol | null;
+
+/**
+ * The rail's other facet block on Downloads: torrents, Usenet, or both.
+ *
+ * One pick at a time, since picking both is what All already means. A count is
+ * the rows that pick would show under the other filters.
+ */
+export function ProtocolFilterBlock({
+  counts,
+  selected,
+  onSelect,
+}: {
+  counts: Readonly<Record<JobProtocol | "ALL", number>>;
+  selected: ProtocolFacet;
+  onSelect: (facet: ProtocolFacet) => void;
+}) {
+  const t = useTranslate();
+  const items: { facet: ProtocolFacet; label: string; count: number }[] = [
+    { facet: null, label: t("history.filterAll"), count: counts.ALL },
+    { facet: "TORRENT", label: t("next.protocol.torrent"), count: counts.TORRENT },
+    { facet: "NZB", label: t("next.protocol.usenet"), count: counts.NZB },
+  ];
+  return (
+    <RailBlock eyebrow={t("next.protocol.type")} position="middle" className="gap-[9px]">
+      {items.map((item) => (
+        <FacetButton
+          key={item.facet ?? "*"}
+          active={item.facet === selected}
+          color={UNCATEGORISED_COLOR}
+          count={item.count}
+          onClick={() => onSelect(item.facet)}
+        >
+          {item.label}
+        </FacetButton>
+      ))}
+    </RailBlock>
+  );
+}
+
+/** One facet in a rail block: its swatch, its name, its count. */
+function FacetButton({
+  active,
+  color,
+  count,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  color: string;
+  count: number | undefined;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "flex items-center gap-[9px] text-left text-[12.5px]",
+        active ? "font-medium text-wv-strong" : "text-wv-fg hover:text-wv-secondary",
+      )}
+    >
+      {/*
+        The swatch doubles as the checkbox: solid once the facet is on,
+        a ring of the same colour while it is off. One glyph, so a rail
+        of eight categories does not grow a column of empty boxes.
+      */}
+      <Square color={color} hollow={!active} />
+      <span className="min-w-0 truncate">{children}</span>
+      {count === undefined ? null : (
+        <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">{count}</span>
+      )}
+    </button>
   );
 }
 

@@ -103,15 +103,22 @@ function Remove() {
 
 const TORRENT_STATES = ["FETCHING_METADATA", "CHECKING_FILES", "SEEDING", "STALLED"] as const;
 
-/** The queue's rows for each torrent state, labelled by the one status renderer every row uses. */
+/**
+ * The queue's rows for each torrent state, labelled by the one status renderer every row uses, and
+ * an older job with no protocol. The list is a container, as on the page, so its width lays out the rows.
+ */
 function Queue() {
   const statusLabel = useStatusLabel();
+  const rows: [string, JobData][] = [
+    ...TORRENT_STATES.map((state, index): [string, JobData] => [state, job({ id: index + 1, status: state, protocol: "TORRENT" })]),
+    ["older", job({ id: 9, name: "older job", displayTitle: "older job", originalTitle: "older job" })],
+  ];
   return (
-    <ul>
-      {TORRENT_STATES.map((state, index) => (
-        <li key={state} aria-label={state}>
+    <ul className="@container">
+      {rows.map(([label, entry]) => (
+        <li key={label} aria-label={label}>
           <DownloadRow
-            job={job({ id: index + 1, status: state, protocol: "TORRENT" })}
+            job={entry}
             selected={false}
             onSelect={() => {}}
             picked={false}

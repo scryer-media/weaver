@@ -923,7 +923,6 @@ function JobDetailContent() {
               id="providers"
               title={t("next.job.providersUsed")}
               tone="panel"
-              note={providers.length === 0 ? undefined : t("next.job.providersNote")}
               bodyClassName="gap-[11px]"
             >
               {providers.length === 0 ? (

@@ -14,7 +14,7 @@ import {
   RESUME_TORRENTS_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
-import { formatJobReleaseName, type JobData } from "@/lib/job-types";
+import { formatJobReleaseName, type JobData, type JobProtocol } from "@/lib/job-types";
 import {
   formatEtaFromRemainingBytes,
   useStableEtaSpeed,
@@ -52,7 +52,13 @@ import {
 } from "../data/status";
 import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
-import { AttentionBlock, CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
+import {
+  AttentionBlock,
+  CategoryListBlock,
+  ProtocolFilterBlock,
+  ProvidersBlock,
+  type ProtocolFacet,
+} from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
 import { ScheduleSeedingNote } from "../features/torrents/ScheduleSeedingNote";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
@@ -133,6 +139,7 @@ export function DownloadsPage() {
   const t = useTranslate();
 
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
+  const [protocol, setProtocol] = useState<ProtocolFacet>(null);
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("priority");
   const [query, setQuery] = useState("");
@@ -205,22 +212,38 @@ export function DownloadsPage() {
     );
   }, [jobs, query]);
 
+  // Each rail block counts under the other's filter, so a count is always the
+  // rows that click would show.
+  const ofProtocol = useMemo(
+    () => (protocol === null ? searched : searched.filter((job) => protocolOf(job) === protocol)),
+    [protocol, searched],
+  );
+
   const categories = useSettled(
     useMemo<CategoryEntry[]>(
-      () => categoryFacets({ configured, rows: searched, extras: queue.categories }),
-      [configured, queue.categories, searched],
+      () => categoryFacets({ configured, rows: ofProtocol, extras: queue.categories }),
+      [configured, queue.categories, ofProtocol],
     ),
     sameItems,
   );
 
   // Facets union: two of them asks for both, which is the only reading that
   // lets a second click widen the view rather than empty it.
-  const inCategory = useMemo(() => {
-    if (facets.size === 0) {
-      return searched;
-    }
-    return searched.filter((job) => facets.has(facetKey(job)));
-  }, [facets, searched]);
+  const inFacets = useCallback(
+    (rows: readonly JobData[]) =>
+      facets.size === 0 ? rows : rows.filter((job) => facets.has(facetKey(job))),
+    [facets],
+  );
+  const inCategory = useMemo(() => inFacets(ofProtocol), [inFacets, ofProtocol]);
+
+  const protocolCounts = useSettled(
+    useMemo(() => {
+      const rows = inFacets(searched);
+      const torrents = rows.filter((job) => protocolOf(job) === "TORRENT").length;
+      return { ALL: rows.length, TORRENT: torrents, NZB: rows.length - torrents };
+    }, [inFacets, searched]),
+    shallowEqual,
+  );
 
   const grouped = useMemo(() => {
     const buckets = new Map<DownloadGroup, JobData[]>();
@@ -544,6 +567,7 @@ export function DownloadsPage() {
               looks stalled, so Downloads says so rather than leaving it to the
               diagnostic screens. The block draws nothing when all is well. */}
           <AttentionBlock />
+          <ProtocolFilterBlock counts={protocolCounts} selected={protocol} onSelect={setProtocol} />
           <CategoryListBlock
             items={categories}
             selected={facets}
@@ -680,7 +704,8 @@ export function DownloadsPage() {
           setUploadOpen(true);
         }}
       >
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
+        {/* The rows lay out by the list's own width, which the inspector beside it takes from. */}
+        <div className="@container flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
           {queue.isLoading ? (
             <EmptyState loading title={t("next.common.loading")} body={t("next.downloads.loadingBody")} />
           ) : jobs.length === 0 ? (
@@ -893,6 +918,11 @@ const QueueGroup = memo(function QueueGroup({
 /** A torrent's figures for the seeding column, while it seeds or has stopped. */
 function seedingOf(torrent: TorrentSummaryData | undefined): TorrentSummaryData | null {
   return torrent && showsSeeding(torrent.state) ? torrent : null;
+}
+
+/** A job without a protocol predates torrents, so it is a Usenet one. */
+function protocolOf(job: JobData): JobProtocol {
+  return job.protocol ?? "NZB";
 }
 
 /** Whether a drag is carrying files from the desktop, not text or a link from the page. */

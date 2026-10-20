@@ -7,7 +7,7 @@ import { formatJobReleaseName, type JobData } from "@/lib/job-types";
 import type { TorrentSummaryData } from "@/lib/torrents";
 import { statusToken } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
-import { ProtocolTag, Square } from "@/next/components/chrome";
+import { Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
 import { Icon, type IconName } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
@@ -87,24 +87,30 @@ export const DownloadRow = memo(function DownloadRow({
       title={name}
       lead={lead}
       left={
-        <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px]">
-          <span className="flex min-w-0 items-center gap-[7px]">
-            <ProtocolTag protocol={job.protocol} />
-            <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">{name}</span>
+        // Where the list is wide the block dissolves into the row, so the bars
+        // become a column of their own and the row a single line.
+        <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px] @6xl:contents">
+          <span className="min-w-0 truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg @6xl:flex-[1_1_0%]">
+            {name}
           </span>
           <PhaseBars
             job={job}
             view={progress}
             height={10}
-            // 49 whole cells of the 7px period a 10px bar takes; a cap off that
-            // multiple leaves dead track before the percentage.
+            // 49 whole cells of the 7px period a 10px bar takes, or 28 in a
+            // column that is not yet as wide as that; a cap off that multiple
+            // leaves dead track before the percentage.
             barClassName="max-w-[343px] min-w-[56px] flex-1"
             percentClassName="w-[34px] text-[11.5px] text-wv-muted"
+            className="@6xl:w-[242px] @6xl:flex-none @min-[100rem]:w-[389px]"
           />
         </div>
       }
       right={
         <>
+          <span className="min-w-[56px] truncate text-[12.5px] text-wv-secondary">
+            {job.protocol === "TORRENT" ? t("next.protocol.torrent") : t("next.protocol.usenet")}
+          </span>
           <div className="flex min-w-[96px] items-center gap-[9px]" title={statusTitle}>
             <Square color={statusColor(progress.status)} />
             <span className="flex min-w-0 flex-col">

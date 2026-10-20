@@ -135,6 +135,32 @@ test("each torrent state is labelled in the queue by the shared status renderer"
   await page.close();
 });
 
+test("each queue row names its type, and a wide list draws the bars as a column of the row", async () => {
+  const { page, errors } = await open("queue");
+  const older = page.getByLabel("older", { exact: true });
+  await older.getByText("Usenet", { exact: true }).waitFor();
+  assert.equal(await page.getByLabel("SEEDING", { exact: true }).getByText("Torrent", { exact: true }).count(), 1);
+  const name = older.getByText("older job", { exact: true });
+  const bar = older.getByRole("progressbar");
+  const middle = (box) => box.y + box.height / 2;
+  // The rows lay out by the list's width, not the window's.
+  const listWidth = (width) => page.locator("ul").evaluate((list, value) => { list.style.width = value; }, width);
+  // A 1300px list: the bars sit level with the name, between it and the status.
+  await listWidth("1300px");
+  const [wideName, wideBar] = [await name.boundingBox(), await bar.boundingBox()];
+  assert.ok(Math.abs(middle(wideName) - middle(wideBar)) < wideName.height, "the bars share the name's line");
+  assert.ok(wideBar.x > wideName.x + wideName.width, "the bars follow the name");
+  // A 1700px list: the column widens to the bars' full length.
+  await listWidth("1700px");
+  assert.ok((await bar.boundingBox()).width > wideBar.width, "an ultrawide list draws longer bars");
+  // A 900px list: the bars go back under the name.
+  await listWidth("900px");
+  const [narrowName, narrowBar] = [await name.boundingBox(), await bar.boundingBox()];
+  assert.ok(narrowBar.y >= narrowName.y + narrowName.height, "the bars sit under the name");
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
 test("a torrent's detail names where its seeding policy comes from, and its swarm and file progress", async () => {
   const { page, errors } = await open("seeding");
   const seeding = (source) => page.getByLabel(source, { exact: true }).getByRole("region", { name: "Seeding", exact: true });
