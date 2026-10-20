@@ -78,7 +78,9 @@ const LIFTED: &[(&str, usize)] = &[
         "server/crates/weaver-server-core/src/speed_test/torrent.rs",
         1,
     ),
-    ("server/crates/weaver-server-core/src/torrents/net.rs", 1),
+    // A leg's tracker client, and the host's lookup for a leg that hands
+    // names on, as the session's own lookup would be.
+    ("server/crates/weaver-server-core/src/torrents/net.rs", 2),
     ("xtask/src/main.rs", 1),
 ];
 

@@ -19,7 +19,7 @@ use librqbit::network::{
 use librqbit::{SocketFactory, StreamListener};
 use weaver_tunnel::bridge::Bridge;
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
-use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Target};
+use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Resolution, Target};
 
 use crate::proxies::{EgressBinding, LegPath};
 use crate::torrents::identity::ClientIdentity;
@@ -148,7 +148,10 @@ impl LegSockets {
 
     // The datagrams the session's UDP rides, when not the source address.
     fn carrier(&self) -> Option<Arc<dyn DatagramTransport>> {
-        self.source.is_none().then(|| carrier(&self.dialer)).flatten()
+        self.source
+            .is_none()
+            .then(|| carrier(&self.dialer))
+            .flatten()
     }
 }
 
@@ -242,11 +245,10 @@ impl SocketFactory for LegSockets {
         })
     }
 
-    // Names for DHT bootstrap and UDP trackers resolve where their
-    // datagrams go.
+    // Names for DHT bootstrap and UDP trackers resolve by the leg's naming
+    // rule, as its peers' names do.
     fn resolver(&self) -> Option<Arc<dyn Resolver>> {
-        self.carrier()
-            .map(|carrier| Arc::new(FarSide(carrier)) as Arc<dyn Resolver>)
+        Some(Arc::new(LegNames(Arc::clone(&self.dialer))))
     }
 }
 
@@ -268,7 +270,11 @@ impl DatagramSocket for Carried {
         shared(self.socket.recv_from(buf))
     }
 
-    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> BoxFuture<'a, io::Result<usize>> {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<usize>> {
         shared(async move {
             self.socket.send_to(buf, target).await?;
             Ok(buf.len())
@@ -290,13 +296,26 @@ impl DatagramSocket for Carried {
     }
 }
 
-// The resolver on the far side of the leg's tunnel.
-struct FarSide(Arc<dyn DatagramTransport>);
+// The names a leg's dialer resolves. A leg that hands names on leaves them
+// to the host's resolver, as the session's own lookup would.
+struct LegNames(Arc<dyn Dialer>);
 
-impl Resolver for FarSide {
-    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
+impl Resolver for LegNames {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the session's own lookup, for a leg that hands names on"
+    )]
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
         shared(async move {
-            let addresses = self.0.resolve(host).await.map_err(io::Error::other)?;
+            let resolved = self.0.resolve(host).await;
+            let addresses = match resolved.map_err(|error| io::Error::other(error.to_string()))? {
+                Resolution::Addresses(addresses) => addresses,
+                Resolution::Unresolved => weaver_tunnel::resolution::host_lookup(host).await?,
+            };
             Ok(addresses
                 .into_iter()
                 .map(|ip| SocketAddr::new(ip, port))
@@ -622,10 +641,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DatagramTransport for Tunnel {
-        async fn resolve(
-            &self,
-            host: &str,
-        ) -> Result<Vec<IpAddr>, weaver_tunnel::TunnelError> {
+        async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, weaver_tunnel::TunnelError> {
             Ok(match host {
                 "router.example" => vec!["192.0.2.7".parse().unwrap()],
                 _ => Vec::new(),
@@ -652,7 +668,13 @@ mod tests {
             &self,
             _: &Target,
         ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
-            Err(weaver_tunnel::pipe::DialError::Skipped("datagrams only".into()))
+            Err(weaver_tunnel::pipe::DialError::Skipped(
+                "datagrams only".into(),
+            ))
+        }
+        async fn resolve(&self, host: &str) -> Result<Resolution, weaver_tunnel::pipe::DialError> {
+            let addresses = self.0.resolve(host).await.unwrap();
+            Ok(Resolution::Addresses(addresses))
         }
         fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
             Some(self.0.clone())
@@ -693,7 +715,10 @@ mod tests {
         peer.send_to(b"pong", udp.bind_addr()).await.unwrap();
         let mut back = [0u8; 4];
         let (len, from) = udp.recv_from(&mut back).await.unwrap();
-        assert_eq!((&back[..len], from), (&b"pong"[..], peer.local_addr().unwrap()));
+        assert_eq!(
+            (&back[..len], from),
+            (&b"pong"[..], peer.local_addr().unwrap())
+        );
 
         let resolver = sockets.resolver().expect("a tunnel resolves its names");
         assert_eq!(
@@ -724,13 +749,62 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
-        assert!(sockets.resolver().is_none());
         let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (_read, _write) = sockets
             .connect_tcp(peer.local_addr().unwrap())
             .await
             .unwrap();
         peer.accept().await.unwrap();
+    }
+
+    // A dialer whose naming rule answers one address, or hands names on.
+    struct Naming(Option<IpAddr>);
+
+    #[async_trait::async_trait]
+    impl Dialer for Naming {
+        async fn dial(
+            &self,
+            _: &Target,
+        ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+            Err(weaver_tunnel::pipe::DialError::Skipped("names only".into()))
+        }
+        async fn resolve(&self, _: &str) -> Result<Resolution, weaver_tunnel::pipe::DialError> {
+            Ok(self
+                .0
+                .map_or(Resolution::Unresolved, |ip| Resolution::Addresses(vec![ip])))
+        }
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
+        }
+        fn describe(&self) -> String {
+            "naming".into()
+        }
+    }
+
+    // A leg that pins a source address resolves DHT bootstrap and UDP
+    // tracker names by its dialer's naming rule, not the host's.
+    #[tokio::test]
+    async fn a_source_address_leg_resolves_names_through_its_dialer() {
+        let answer: IpAddr = "192.0.2.9".parse().unwrap();
+        let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
+        let sockets = LegSockets::new(Arc::new(Naming(Some(answer))), &kind);
+        let resolver = sockets.resolver().expect("the leg resolves its names");
+        assert_eq!(
+            resolver
+                .resolve("router.bittorrent.com", 6881)
+                .await
+                .unwrap(),
+            [SocketAddr::new(answer, 6881)]
+        );
+
+        // A dialer that hands names on leaves them to the host's resolver.
+        let sockets = LegSockets::new(Arc::new(Naming(None)), &kind);
+        let resolver = sockets.resolver().expect("the leg resolves its names");
+        let found = resolver.resolve("localhost", 6881).await.unwrap();
+        assert!(
+            found.contains(&SocketAddr::from(([127, 0, 0, 1], 6881))),
+            "{found:?}"
+        );
     }
 
     #[test]
