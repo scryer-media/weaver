@@ -215,7 +215,6 @@ pub struct TorrentStateLive {
     session_stats: Arc<SessionStats>,
 
     pub(crate) streams: Arc<TorrentStreams>,
-    have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
@@ -265,8 +264,6 @@ impl TorrentStateLive {
             pri
         };
 
-        let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
-
         let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
@@ -303,7 +300,6 @@ impl TorrentStateLive {
             down_speed_estimator,
             up_speed_estimator,
             cancellation_token,
-            have_broadcast_tx,
             session_stats,
             streams: paused.streams,
             per_piece_locks: (0..lengths.total_pieces())
@@ -517,11 +513,7 @@ impl TorrentStateLive {
 
         let res = tokio::select! {
             r = requester => {r}
-            r = peer_connection.manage_peer_incoming(
-                rx,
-                checked_peer,
-                self.have_broadcast_tx.subscribe()
-            ) => {r}
+            r = peer_connection.manage_peer_incoming(rx, checked_peer) => {r}
         };
 
         match res {
@@ -585,7 +577,7 @@ impl TorrentStateLive {
         );
         let conn_manager = aframe!(
             peer_connection
-                .manage_peer_outgoing(rx, state.have_broadcast_tx.subscribe())
+                .manage_peer_outgoing(rx)
                 .instrument(debug_span!("peer_connection"))
         );
 
@@ -731,7 +723,10 @@ impl TorrentStateLive {
     }
 
     fn transmit_haves(&self, index: ValidPieceIndex) {
-        let _ = self.have_broadcast_tx.send(index);
+        if self.shared.options.disable_upload() {
+            return;
+        }
+        self.peers.announce_have(index);
     }
 
     pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
@@ -1263,20 +1258,6 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         }
 
         self.state.get_approx_have_bytes() > 0
-    }
-
-    fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
-        if self.state.shared.options.disable_upload() {
-            return false;
-        }
-        let have = self
-            .state
-            .peers
-            .with_live(self.addr, |l| {
-                l.bitfield.get(id.get_usize()).map(|p| *p).unwrap_or(true)
-            })
-            .unwrap_or(true);
-        !have
     }
 
     fn update_my_extended_handshake(

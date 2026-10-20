@@ -14,7 +14,7 @@ use std::{
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::core::{
     hash_id::Id20,
-    lengths::{ChunkInfo, ValidPieceIndex},
+    lengths::ChunkInfo,
     peer_id::try_decode_peer_id,
 };
 use crate::peer_protocol::{
@@ -30,7 +30,7 @@ use futures::TryFutureExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use tracing::{Instrument, debug, trace, trace_span};
+use tracing::{Instrument, trace, trace_span};
 
 use crate::{
     read_buf::ReadBuf,
@@ -49,7 +49,6 @@ pub trait PeerConnectionHandler {
         extended_handshake: &ExtendedHandshake<ByteBuf>,
     ) -> anyhow::Result<()>;
     async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()>;
-    fn should_transmit_have(&self, id: ValidPieceIndex) -> bool;
     fn on_uploaded_bytes(&self, bytes: u32);
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()>;
     fn update_my_extended_handshake(
@@ -144,7 +143,6 @@ struct ManagePeerArgs {
     read: BoxAsyncReadVectored,
     write: BoxAsyncWrite,
     outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
-    have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
 }
 
 impl<H: PeerConnectionHandler> PeerConnection<H> {
@@ -174,7 +172,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         &self,
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         mut incoming: CheckedIncomingConnection,
-        have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
     ) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
@@ -223,7 +220,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             read: incoming.reader,
             write: incoming.writer,
             outgoing_chan,
-            have_broadcast,
         })
         .await
     }
@@ -231,7 +227,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
     pub async fn manage_peer_outgoing(
         &self,
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
-        have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
     ) -> Result<()> {
         let rwtimeout = self
             .options
@@ -289,7 +284,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 read,
                 write,
                 outgoing_chan,
-                have_broadcast,
             })
             .await
         }
@@ -305,7 +299,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             mut read,
             mut write,
             mut outgoing_chan,
-            mut have_broadcast,
         } = args;
 
         use tokio::io::AsyncWriteExt;
@@ -366,34 +359,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .await?;
             trace!("sent unchoke");
 
-            let mut broadcast_closed = false;
-
             loop {
-                let req = loop {
-                    break tokio::select! {
-                        r = have_broadcast.recv(), if !broadcast_closed => match r {
-                            Ok(id) => {
-                                if self.handler.should_transmit_have(id) {
-                                     WriterRequest::Message(Message::Have(id.get()))
-                                } else {
-                                    continue
-                                }
-                            },
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                broadcast_closed = true;
-                                debug!("broadcast channel closed, will not poll it anymore");
-                                continue
-                            },
-                            _ => continue
-                        },
-                        r = timeout(keep_alive_interval, outgoing_chan.recv()) => match r {
-                            Ok(Some(msg)) => msg,
-                            Ok(None) => {
-                                return Err(Error::TorrentIsNotLive);
-                            }
-                            Err(_) => WriterRequest::Message(Message::KeepAlive),
-                        }
-                    };
+                let req = match timeout(keep_alive_interval, outgoing_chan.recv()).await {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        return Err(Error::TorrentIsNotLive);
+                    }
+                    Err(_) => WriterRequest::Message(Message::KeepAlive),
                 };
 
                 tokio::task::yield_now().await;

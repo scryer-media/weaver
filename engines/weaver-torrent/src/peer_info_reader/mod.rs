@@ -69,8 +69,7 @@ pub(crate) async fn read_metainfo_from_peer(
     );
 
     let result_reader = result_rx;
-    let (_, brx) = tokio::sync::broadcast::channel(1);
-    let connection_runner = async move { connection.manage_peer_outgoing(writer_rx, brx).await };
+    let connection_runner = async move { connection.manage_peer_outgoing(writer_rx).await };
 
     tokio::select! {
         result = result_reader => Ok(result??),
@@ -261,10 +260,6 @@ impl PeerConnectionHandler for Handler {
                 )))?;
         }
         Ok(())
-    }
-
-    fn should_transmit_have(&self, _id: crate::core::lengths::ValidPieceIndex) -> bool {
-        false
     }
 
     fn client_name_and_version(&self) -> &str {
