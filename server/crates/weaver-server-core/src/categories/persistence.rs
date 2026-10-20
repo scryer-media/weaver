@@ -15,7 +15,7 @@ impl Database {
             SqlRuntime::execute(
                 datastore.read_exec(),
                 &format!(
-                    "INSERT INTO categories ({CATEGORY_COLUMNS}) VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                    "INSERT INTO categories ({CATEGORY_COLUMNS}) VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                 ),
                 &args,
             )
@@ -33,7 +33,7 @@ impl Database {
             SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE categories
-                    SET name = {}, dest_dir = {}, aliases = {}, seeding = {}, torrent_route = {}
+                    SET name = {}, dest_dir = {}, aliases = {}, seeding = {}, torrent_route = {}, unpack = {}
                   WHERE id = {}",
                 &args,
             )

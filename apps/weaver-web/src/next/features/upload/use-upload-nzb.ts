@@ -261,6 +261,8 @@ async function submitOne(input: {
   category: string;
   paused: boolean;
   password: string;
+  /** Whether a torrent's archives are extracted; null inherits. */
+  unpack: boolean | null;
 }): Promise<string | null> {
   const operations = {
     query: SUBMIT_OPERATION,
@@ -272,6 +274,7 @@ async function submitOne(input: {
           input.category.trim() && input.category !== NO_CATEGORY_VALUE ? input.category : null,
         paused: input.paused,
         password: input.password.trim() || null,
+        unpack: input.unpack,
       },
     },
   };
@@ -349,6 +352,7 @@ export function useUploadNzb(options?: {
   const [category, setCategory] = useState(NO_CATEGORY_VALUE);
   const [priority, setPriority] = useState("NORMAL");
   const [paused, setPaused] = useState(false);
+  const [unpack, setUnpack] = useState<boolean | null>(null);
   // One NZB or torrent URL, magnet link or infohash, sent as it is on submit.
   const [text, setTextState] = useState("");
   const [textError, setTextError] = useState<string | null>(null);
@@ -538,6 +542,7 @@ export function useUploadNzb(options?: {
       setCategory(NO_CATEGORY_VALUE);
       setPriority("NORMAL");
       setPaused(false);
+      setUnpack(null);
       setTextState("");
       setTextError(null);
       setForce(false);
@@ -676,7 +681,7 @@ export function useUploadNzb(options?: {
     );
 
     // The text and each torrent go on their own; a refusal stays on its row for another try.
-    const shared = { category, paused, password };
+    const shared = { category, paused, password, unpack };
     let anyAccepted = false;
     const textOutcome: UploadNzbEntryStatus[] = [];
     if (sentText !== "") {
@@ -848,6 +853,7 @@ export function useUploadNzb(options?: {
     setEntriesState,
     t,
     text,
+    unpack,
   ]);
 
   const staging = entries.some((entry) => entry.status === "queued" || entry.status === "staging");
@@ -871,6 +877,7 @@ export function useUploadNzb(options?: {
     password,
     priority,
     paused,
+    unpack,
     text,
     textError,
     force,
@@ -883,6 +890,7 @@ export function useUploadNzb(options?: {
     setPassword,
     setPriority,
     setPaused,
+    setUnpack,
     setText,
     setForce,
     setDuplicateMode,

@@ -13,7 +13,7 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack";
 
 fn tracker_rule_from_row(row: &SqlRow) -> Result<TrackerRule, StateError> {
     let seeding = row
@@ -31,6 +31,7 @@ fn tracker_rule_from_row(row: &SqlRow) -> Result<TrackerRule, StateError> {
         host_pattern: row.text("host_pattern")?,
         seeding,
         never_pause: row.bool("never_pause")?,
+        unpack: row.opt_bool("unpack")?,
     })
 }
 
@@ -45,6 +46,7 @@ fn tracker_rule_args(rule: &TrackerRule) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::Text(rule.host_pattern.clone()),
         SqlArg::OptText(seeding),
         SqlArg::Bool(rule.never_pause),
+        SqlArg::OptBool(rule.unpack),
     ])
 }
 
@@ -92,7 +94,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO tracker_rules ({TRACKER_RULE_COLUMNS}, created_at_ms, updated_at_ms)
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &values,
                     )
@@ -113,7 +115,7 @@ impl Database {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE tracker_rules
-                    SET host_pattern = {}, seeding = {}, never_pause = {}, updated_at_ms = {}
+                    SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, updated_at_ms = {}
                   WHERE id = {}",
                 &args,
             )

@@ -12,6 +12,7 @@ import {
   UPDATE_CATEGORY_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Toggle } from "../../../components/controls";
@@ -39,6 +40,8 @@ interface Category {
   seeding?: SeedingPolicy | null;
   /** Whether the category's torrents take their own route rather than the default torrent one. */
   torrentRoute?: boolean;
+  /** Whether the category's torrents have their archives extracted; null inherits. */
+  unpack?: boolean | null;
 }
 
 interface CategoryForm {
@@ -48,9 +51,17 @@ interface CategoryForm {
   /** Null while the category takes the global policy whole. */
   seeding: SeedingPolicy | null;
   torrentRoute: boolean;
+  unpack: boolean | null;
 }
 
-const NEW_CATEGORY: CategoryForm = { name: "", destDir: "", aliases: "", seeding: null, torrentRoute: false };
+const NEW_CATEGORY: CategoryForm = {
+  name: "",
+  destDir: "",
+  aliases: "",
+  seeding: null,
+  torrentRoute: false,
+  unpack: null,
+};
 
 const formOf = (category: Category): CategoryForm => ({
   name: category.name,
@@ -58,6 +69,7 @@ const formOf = (category: Category): CategoryForm => ({
   aliases: category.aliases ?? "",
   seeding: category.seeding ? seedingFrom(category.seeding) : null,
   torrentRoute: category.torrentRoute ?? false,
+  unpack: category.unpack ?? null,
 });
 
 /** The policy as the input takes it, comparable with another. */
@@ -114,6 +126,7 @@ export function CategoriesPanel() {
       aliases: form.aliases.trim(),
       ...(JSON.stringify(seeding) !== JSON.stringify(seedingValue(opened.seeding)) ? { seeding } : {}),
       ...(form.torrentRoute !== opened.torrentRoute ? { torrentRoute: form.torrentRoute } : {}),
+      ...(form.unpack !== opened.unpack ? { unpack: form.unpack } : {}),
     };
     const result =
       editingId === "new"
@@ -266,6 +279,17 @@ export function CategoriesPanel() {
                       )}
                     </div>
                   ),
+                },
+              },
+              {
+                id: "unpack",
+                label: t("next.torrents.unpack"),
+                keywords: "unpack extract archive",
+                control: {
+                  kind: "segmented",
+                  value: unpackChoice(form.unpack),
+                  options: UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) })),
+                  onChange: (choice) => setForm((current) => ({ ...current, unpack: unpackOf(choice) })),
                 },
               },
               {

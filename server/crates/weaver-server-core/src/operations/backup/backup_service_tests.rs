@@ -189,6 +189,7 @@ fn sample_config() -> Config {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 1,
                 name: "tv".into(),
                 dest_dir: Some("/old/data/complete/tv".into()),
@@ -197,6 +198,7 @@ fn sample_config() -> Config {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 2,
                 name: "movies".into(),
                 dest_dir: Some("/mnt/media/movies".into()),

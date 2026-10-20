@@ -2642,6 +2642,7 @@ async fn postgres_runtime_smoke_when_configured() {
         categories: vec![CategoryConfig {
             seeding: None,
             torrent_route: false,
+            unpack: None,
             id: 3,
             name: "TV".to_string(),
             dest_dir: Some("/media/tv".to_string()),

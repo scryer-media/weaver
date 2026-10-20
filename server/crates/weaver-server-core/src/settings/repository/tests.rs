@@ -105,6 +105,7 @@ fn config_roundtrip() {
             max_active_downloads: 7,
             max_peers_total: 120,
             session_dir: Some("/data/session".into()),
+            unpack: false,
         },
         data_dir: "/tmp/weaver".to_string(),
         hardware_profile: None,
@@ -143,6 +144,7 @@ fn config_roundtrip() {
                 ..Default::default()
             }),
             torrent_route: true,
+            unpack: None,
             id: 1,
             name: "Movies".to_string(),
             dest_dir: Some("/media/movies".to_string()),
@@ -339,6 +341,7 @@ fn category_crud() {
     let cat = CategoryConfig {
         seeding: None,
         torrent_route: false,
+        unpack: None,
         id: 1,
         name: "TV".to_string(),
         dest_dir: None,
@@ -378,6 +381,7 @@ fn a_database_without_torrent_settings_loads_the_defaults() {
         aliases: String::new(),
         seeding: None,
         torrent_route: false,
+        unpack: None,
     })
     .unwrap();
 
@@ -431,6 +435,7 @@ fn tracker_rules_crud() {
                 host_pattern: "*.example.org".into(),
                 seeding: Some(seeding),
                 never_pause: true,
+                unpack: Some(false),
             },
             1,
         )
@@ -442,6 +447,7 @@ fn tracker_rules_crud() {
                 host_pattern: "tracker.invalid".into(),
                 seeding: None,
                 never_pause: false,
+                unpack: None,
             },
             2,
         )
@@ -467,6 +473,7 @@ fn tracker_rules_crud() {
     let changed = TrackerRule {
         seeding: None,
         never_pause: false,
+        unpack: Some(true),
         ..first.clone()
     };
     assert!(db.update_tracker_rule(&changed, 4).unwrap());

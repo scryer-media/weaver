@@ -64,6 +64,7 @@ fn sample_config() -> Config {
         categories: vec![CategoryConfig {
             seeding: None,
             torrent_route: false,
+            unpack: None,
             id: 1,
             name: "tv".into(),
             dest_dir: Some("/old/data/complete/tv".into()),

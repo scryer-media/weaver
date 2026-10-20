@@ -154,6 +154,7 @@ fn service_on(
             aliases: String::new(),
             seeding: None,
             torrent_route: true,
+            unpack: None,
         }],
         seeding: None,
         torrent: TorrentConfig {
@@ -175,6 +176,7 @@ fn request(source: AddSource) -> AddRequest {
         policy_override: None,
         paused: false,
         forced: false,
+        unpack: None,
     }
 }
 
@@ -444,6 +446,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         seeding_inherited: None,
         seeding_policy: SeedingPolicy::default(),
         seeding_source: SeedingSource::Global,
+        unpack: true,
     };
     let job_info =
         |view: TorrentView, now: i64| report(view.clone(), job_status(&view), now).job_info();
@@ -1629,6 +1632,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                     ..SeedingPolicy::default()
                 }),
                 never_pause: true,
+                unpack: None,
             },
             EPOCH_MS,
         )
@@ -1827,4 +1831,82 @@ async fn the_download_limit_counts_downloading_torrents_as_it_is_set() {
     assert_eq!(queued().await, [false, true, true, true]);
     set(3).await;
     assert_eq!(queued().await, [false, false, false, false]);
+}
+
+#[test]
+fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
+    let mut record = TorrentRecord {
+        job_id: JobId(1),
+        infohash_v1: Some([1; 20]),
+        infohash_v2: None,
+        name: "set".into(),
+        source: TorrentSource::Metainfo,
+        metainfo: None,
+        private: false,
+        category_id: Some(1),
+        added_at_ms: EPOCH_MS,
+        intent: TorrentIntent::Resumed,
+        forced: false,
+        completed_at_ms: None,
+        storage_dir: None,
+        policy_override: None,
+        tracker_rule_id: Some(1),
+        unpack: None,
+    };
+    let mut rules = vec![TrackerRule {
+        id: 1,
+        host_pattern: "tracker.test".into(),
+        seeding: None,
+        never_pause: false,
+        unpack: None,
+    }];
+    let mut settings = TorrentSettings {
+        complete_dir: PathBuf::from("/complete"),
+        categories: vec![CategoryConfig {
+            id: 1,
+            name: "tv".into(),
+            dest_dir: None,
+            aliases: String::new(),
+            seeding: None,
+            torrent_route: false,
+            unpack: None,
+        }],
+        seeding: None,
+        torrent: TorrentConfig::default(),
+    };
+
+    assert!(settings.unpack(&record, &rules));
+    settings.torrent.unpack = false;
+    assert!(!settings.unpack(&record, &rules));
+    settings.categories[0].unpack = Some(true);
+    assert!(settings.unpack(&record, &rules));
+    rules[0].unpack = Some(false);
+    assert!(!settings.unpack(&record, &rules));
+    record.unpack = Some(true);
+    assert!(settings.unpack(&record, &rules));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_keeps_the_unpack_in_force_once_its_job_is_built() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let inherits = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("inherits", 1))))
+        .await
+        .unwrap();
+    let off = rig
+        .service
+        .add(AddRequest {
+            unpack: Some(false),
+            ..request(AddSource::Metainfo(plain("off", 2)))
+        })
+        .await
+        .unwrap();
+
+    let kept = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().unpack;
+    assert_eq!(kept(inherits), Some(true));
+    assert_eq!(kept(off), Some(false));
+    assert!(rig.service.torrent(inherits).await.unwrap().unpack);
+    assert!(!rig.service.torrent(off).await.unwrap().unpack);
 }

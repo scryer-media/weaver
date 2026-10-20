@@ -415,6 +415,7 @@ mod tests {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 1,
                 name: "tv".into(),
                 dest_dir: Some(category.to_string_lossy().into_owned()),
@@ -423,6 +424,7 @@ mod tests {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 2,
                 name: "movies".into(),
                 dest_dir: None,
@@ -431,6 +433,7 @@ mod tests {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 3,
                 name: "future".into(),
                 dest_dir: Some(future_parent.join("tv").to_string_lossy().into_owned()),

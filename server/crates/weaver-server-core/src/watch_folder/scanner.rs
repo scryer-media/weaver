@@ -373,6 +373,7 @@ impl WatchFolderScanner {
             policy_override: None,
             paused: false,
             forced: false,
+            unpack: None,
         };
         match torrents.add(request).await {
             Ok(job_id) => Added::Queued(job_id.0),
@@ -1050,6 +1051,7 @@ mod tests {
         CategoryConfig {
             seeding: None,
             torrent_route: false,
+            unpack: None,
             id: 1,
             name: name.to_string(),
             dest_dir: None,
@@ -1325,6 +1327,7 @@ mod tests {
         fn tv() -> CategoryConfig {
             CategoryConfig {
                 torrent_route: true,
+                unpack: None,
                 ..category("tv")
             }
         }

@@ -118,7 +118,9 @@ impl JobsMutation {
                 }
                 match kind.torrent(bytes) {
                     Ok(source) => {
-                        let added = add_torrent(ctx, source, category.clone(), input.paused).await;
+                        let added =
+                            add_torrent(ctx, source, category.clone(), input.paused, input.unpack)
+                                .await;
                         if let Some(url) = source_url {
                             let status = if added.is_ok() {
                                 UrlStatus::Success
@@ -145,7 +147,10 @@ impl JobsMutation {
                 let filename =
                     (!upload.filename.trim().is_empty()).then_some(upload.filename.clone());
                 match torrent_upload(upload) {
-                    Ok(source) => return add_torrent(ctx, source, category, input.paused).await,
+                    Ok(source) => {
+                        return add_torrent(ctx, source, category, input.paused, input.unpack)
+                            .await;
+                    }
                     Err(upload) => (NzbSource::Upload(upload), filename, None),
                 }
             }
@@ -1402,6 +1407,7 @@ async fn add_torrent(
     source: AddSource,
     category: Option<String>,
     paused: bool,
+    unpack: Option<bool>,
 ) -> Result<SubmissionResult> {
     let job_id = TorrentsMutation::add(
         ctx,
@@ -1411,6 +1417,7 @@ async fn add_torrent(
             policy_override: None,
             paused,
             forced: false,
+            unpack,
         },
     )
     .await?;

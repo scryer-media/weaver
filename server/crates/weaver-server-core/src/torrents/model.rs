@@ -131,6 +131,9 @@ pub struct TorrentRecord {
     pub policy_override: Option<SeedingPolicy>,
     // The tracker rule its trackers matched, if any.
     pub tracker_rule_id: Option<u32>,
+    // Whether its archives are extracted: the torrent's own value until its
+    // job is built, then the value in force.
+    pub unpack: Option<bool>,
 }
 
 impl TorrentRecord {

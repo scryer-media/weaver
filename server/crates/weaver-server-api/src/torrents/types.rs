@@ -170,6 +170,8 @@ pub struct Torrent {
     /// The host pattern of the tracker rule the policy comes from, when it
     /// does.
     pub seeding_rule: Option<String>,
+    /// Whether its archives are extracted.
+    pub unpack: bool,
     pub route: Option<String>,
     pub files: Vec<TorrentFileGql>,
     pub trackers: Vec<TorrentTrackerGql>,
@@ -220,6 +222,7 @@ impl From<TorrentView> for Torrent {
                 SeedingSource::TrackerRule(pattern) => Some(pattern),
                 _ => None,
             },
+            unpack: view.unpack,
             route: view.route,
             files,
             trackers: view.trackers.into_iter().map(Into::into).collect(),
@@ -238,4 +241,6 @@ pub struct SubmitTorrentInput {
     #[graphql(default)]
     pub forced: bool,
     pub seeding: Option<SeedingPolicyInput>,
+    /// Whether its archives are extracted; absent inherits.
+    pub unpack: Option<bool>,
 }

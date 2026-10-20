@@ -272,6 +272,7 @@ const CATEGORY_FIELDS = `
       ...SeedingPolicyFields
     }
     torrentRoute
+    unpack
   }
   ${SEEDING_POLICY_FIELDS}
 `;
@@ -1413,6 +1414,7 @@ const TORRENT_SETTINGS_FIELDS = `
       encryption
       maxActiveDownloads
       maxPeersTotal
+      unpack
     }
   }
   ${SEEDING_POLICY_FIELDS}
@@ -1444,6 +1446,7 @@ const TRACKER_RULE_FIELDS = `
       ...SeedingPolicyFields
     }
     neverPause
+    unpack
   }
   ${SEEDING_POLICY_FIELDS}
 `;
@@ -1532,6 +1535,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       }
       seedingSource
       seedingRule
+      unpack
       route
       files {
         index

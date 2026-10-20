@@ -300,6 +300,7 @@ impl Database {
             Some(dir) => self.set_setting("torrent.session_dir", dir)?,
             None => self.delete_setting("torrent.session_dir")?,
         }
+        self.set_setting("torrent.unpack", &torrent.unpack.to_string())?;
         Ok(())
     }
 
@@ -527,6 +528,7 @@ fn torrent_config_from_settings(
         session_dir: settings
             .get("torrent.session_dir")
             .map(std::path::PathBuf::from),
+        unpack: parsed_setting(settings, "torrent.unpack").unwrap_or(defaults.unpack),
     }
 }
 

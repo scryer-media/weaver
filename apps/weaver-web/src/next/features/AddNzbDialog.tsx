@@ -14,6 +14,7 @@ import { PrimaryButton, SecondaryButton, Select, TextField, Toggle } from "@/nex
 import { formatSize } from "@/next/data/format";
 import { WV } from "@/next/data/palette";
 import { countLabel } from "@/next/i18n/labels";
+import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
 
 const NO_CATEGORY_VALUE = "__none__";
 
@@ -242,6 +243,14 @@ export function AddNzbDialog({
           </FormRow>
           <FormRow label={t("next.addNzb.paused")}>
             <Toggle label={t("next.addNzb.paused")} checked={upload.paused} onChange={upload.setPaused} />
+          </FormRow>
+          <FormRow label={t("next.addNzb.unpack")}>
+            <Select
+              label={t("next.addNzb.unpack")}
+              value={unpackChoice(upload.unpack)}
+              options={UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) }))}
+              onChange={(choice) => upload.setUnpack(unpackOf(choice))}
+            />
           </FormRow>
           <FormRow label={t("servers.password")}>
             <TextField

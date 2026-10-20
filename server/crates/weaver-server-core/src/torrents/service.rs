@@ -132,6 +132,19 @@ impl TorrentSettings {
         )
     }
 
+    // Whether the torrent's archives are extracted: its own value, else its
+    // tracker rule's, else its category's, else the global default.
+    fn unpack(&self, record: &TorrentRecord, rules: &[TrackerRule]) -> bool {
+        record
+            .unpack
+            .or_else(|| rule_of(record, rules).and_then(|rule| rule.unpack))
+            .or_else(|| {
+                self.category(record.category_id)
+                    .and_then(|category| category.unpack)
+            })
+            .unwrap_or(self.torrent.unpack)
+    }
+
     fn category_seeding(&self, record: &TorrentRecord) -> Option<&SeedingPolicy> {
         self.category(record.category_id)
             .and_then(|category| category.seeding.as_ref())
@@ -292,6 +305,8 @@ pub struct AddRequest {
     pub policy_override: Option<SeedingPolicy>,
     pub paused: bool,
     pub forced: bool,
+    // Whether its archives are extracted; `None` inherits.
+    pub unpack: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -361,6 +376,8 @@ pub struct TorrentView {
     /// The seeding policy in force, and the level it comes from.
     pub seeding_policy: SeedingPolicy,
     pub seeding_source: SeedingSource,
+    /// Whether its archives are extracted.
+    pub unpack: bool,
     pub route: Option<String>,
     pub files: Vec<TorrentFile>,
     /// Each file's bytes in hand, by its index in the torrent.
@@ -1159,7 +1176,7 @@ impl TorrentService {
         }
     }
 
-    fn storage(&self, dir: PathBuf, layout: &PieceLayout) -> Storage {
+    fn storage(&self, dir: PathBuf, layout: &PieceLayout, unpack: bool) -> Storage {
         let policy = self
             .inner
             .db
@@ -1180,6 +1197,7 @@ impl TorrentService {
             passwords: Vec::new(),
             caps: Caps::new(Arc::clone(&env.limits), policy, declared),
             nesting: limits::NESTING,
+            unpack,
         }
     }
 
@@ -1189,6 +1207,7 @@ impl TorrentService {
         job_id: JobId,
         dir: PathBuf,
         layout: &Arc<PieceLayout>,
+        unpack: bool,
     ) -> (Arc<TorrentJob>, Arc<Intake>) {
         let slots = self.inner.env.slots;
         let restored = self
@@ -1203,14 +1222,18 @@ impl TorrentService {
                     &snapshot,
                     Arc::clone(layout),
                     job_id.0,
-                    self.storage(dir.clone(), layout),
+                    self.storage(dir.clone(), layout, unpack),
                     slots,
                 )
                 .ok()
             });
         let job = match restored {
             Some(restored) => restored.job,
-            None => GraphJob::for_torrent(job_id.0, Arc::clone(layout), self.storage(dir, layout)),
+            None => GraphJob::for_torrent(
+                job_id.0,
+                Arc::clone(layout),
+                self.storage(dir, layout, unpack),
+            ),
         };
         let env = &self.inner.env;
         let job = Arc::new(TorrentJob::new(
@@ -1242,9 +1265,19 @@ impl TorrentService {
         (job, intake)
     }
 
+    // The torrent's job, over the metainfo. Whether it unpacks is fixed
+    // here and kept, so a restart builds the same tree.
     fn give_metainfo(&self, torrent: &mut Live, bytes: Vec<u8>, parsed: &Parsed) {
+        let job_id = torrent.record.job_id;
+        let unpack = self.settings().unpack(&torrent.record, &self.rules());
+        if torrent.record.unpack.is_none() {
+            if let Err(error) = self.inner.db.set_torrent_unpack(job_id, unpack) {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
+            }
+            torrent.record.unpack = Some(unpack);
+        }
         let dir = PathBuf::from(torrent.record.storage_dir.clone().unwrap_or_default());
-        let (job, intake) = self.job(torrent.record.job_id, dir, &parsed.layout);
+        let (job, intake) = self.job(job_id, dir, &parsed.layout, unpack);
         torrent.names = parsed.manifest.paths.clone();
         torrent.total = parsed.total;
         torrent.layout = Some(Arc::clone(&parsed.layout));
@@ -1456,6 +1489,7 @@ impl TorrentService {
             storage_dir,
             policy_override: request.policy_override.clone(),
             tracker_rule_id: None,
+            unpack: request.unpack,
         }
     }
 
@@ -2420,6 +2454,7 @@ impl TorrentService {
             seeding_inherited: settings.inherited(record, &rules),
             seeding_policy: policy.unwrap_or_default(),
             seeding_source: settings.seeding_source(record, &rules),
+            unpack: settings.unpack(record, &rules),
             route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
             file_have: reading.file_have,

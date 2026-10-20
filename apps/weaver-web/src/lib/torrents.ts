@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+/**
+ * Whether archives are extracted, where a level may inherit it: null
+ * inherits. Option labels are translation keys.
+ */
+export const UNPACK_CHOICES = [
+  { value: "inherit", label: "next.torrents.unpackInherit" },
+  { value: "on", label: "next.common.on" },
+  { value: "off", label: "next.common.off" },
+] as const;
+
+export const unpackChoice = (unpack: boolean | null): string =>
+  unpack === null ? "inherit" : unpack ? "on" : "off";
+
+export const unpackOf = (choice: string): boolean | null =>
+  choice === "on" ? true : choice === "off" ? false : null;
+
 /** A torrent's state as the daemon names it. */
 export type TorrentState =
   | "QUEUED"
@@ -78,6 +94,8 @@ export interface TorrentData extends TorrentSummaryData {
   seedingSource: SeedingSource;
   /** The host pattern of the tracker rule the policy comes from, when it does. */
   seedingRule: string | null;
+  /** Whether its archives are extracted. */
+  unpack: boolean;
   route: string | null;
   files: TorrentFileData[];
   trackers: TorrentTrackerData[];

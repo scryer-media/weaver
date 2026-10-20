@@ -15,6 +15,9 @@ pub struct Category {
     // global policy.
     pub seeding: Option<SeedingPolicySettings>,
     pub torrent_route: bool,
+    // Whether the category's torrents have their archives extracted; absent
+    // inherits.
+    pub unpack: Option<bool>,
 }
 
 impl From<&weaver_server_core::categories::CategoryConfig> for Category {
@@ -26,6 +29,7 @@ impl From<&weaver_server_core::categories::CategoryConfig> for Category {
             aliases: c.aliases.clone(),
             seeding: c.seeding.map(Into::into),
             torrent_route: c.torrent_route,
+            unpack: c.unpack,
         }
     }
 }
@@ -39,15 +43,21 @@ pub struct CategoryInput {
     // Left out keeps the category's policy; null removes it.
     pub seeding: MaybeUndefined<SeedingPolicyInput>,
     pub torrent_route: Option<bool>,
+    // Left out keeps the category's value; null makes it inherit.
+    pub unpack: MaybeUndefined<bool>,
 }
 
 impl CategoryInput {
-    // The seeding policy and torrent route this input leaves on a category
-    // that had `current`.
+    // The seeding policy, torrent route and unpack this input leaves on a
+    // category that had `current`.
     pub(crate) fn torrent_fields(
         &self,
         current: Option<&weaver_server_core::categories::CategoryConfig>,
-    ) -> async_graphql::Result<(Option<weaver_server_core::settings::SeedingPolicy>, bool)> {
+    ) -> async_graphql::Result<(
+        Option<weaver_server_core::settings::SeedingPolicy>,
+        bool,
+        Option<bool>,
+    )> {
         let seeding = match self.seeding {
             MaybeUndefined::Undefined => current.and_then(|category| category.seeding),
             MaybeUndefined::Null => None,
@@ -56,6 +66,11 @@ impl CategoryInput {
         let torrent_route = self
             .torrent_route
             .unwrap_or_else(|| current.is_some_and(|category| category.torrent_route));
-        Ok((seeding, torrent_route))
+        let unpack = match self.unpack {
+            MaybeUndefined::Undefined => current.and_then(|category| category.unpack),
+            MaybeUndefined::Null => None,
+            MaybeUndefined::Value(unpack) => Some(unpack),
+        };
+        Ok((seeding, torrent_route, unpack))
     }
 }

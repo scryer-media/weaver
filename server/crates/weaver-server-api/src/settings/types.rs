@@ -1231,6 +1231,8 @@ pub struct TrackerRule {
     /// global policy.
     pub seeding: Option<SeedingPolicySettings>,
     pub never_pause: bool,
+    /// Whether its torrents' archives are extracted; absent inherits.
+    pub unpack: Option<bool>,
 }
 
 impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
@@ -1240,6 +1242,7 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             host_pattern: rule.host_pattern,
             seeding: rule.seeding.map(Into::into),
             never_pause: rule.never_pause,
+            unpack: rule.unpack,
         }
     }
 }
@@ -1250,6 +1253,7 @@ pub struct TrackerRuleInput {
     pub seeding: Option<SeedingPolicyInput>,
     #[graphql(default)]
     pub never_pause: bool,
+    pub unpack: Option<bool>,
 }
 
 impl TrackerRuleInput {
@@ -1267,6 +1271,7 @@ impl TrackerRuleInput {
                 .map(SeedingPolicyInput::into_policy)
                 .transpose()?,
             never_pause: self.never_pause,
+            unpack: self.unpack,
         })
     }
 }
@@ -1308,6 +1313,7 @@ pub struct TorrentSettings {
     pub max_active_downloads: u32,
     pub max_peers_total: u32,
     pub session_dir: Option<String>,
+    pub unpack: bool,
 }
 
 impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
@@ -1324,6 +1330,7 @@ impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
                 .session_dir
                 .as_ref()
                 .map(|dir| dir.display().to_string()),
+            unpack: value.unpack,
         }
     }
 }
@@ -1338,6 +1345,7 @@ pub struct TorrentSettingsInput {
     pub max_active_downloads: Option<u32>,
     pub max_peers_total: Option<u32>,
     pub session_dir: MaybeUndefined<String>,
+    pub unpack: Option<bool>,
 }
 
 impl TorrentSettingsInput {
@@ -1370,6 +1378,9 @@ impl TorrentSettingsInput {
             MaybeUndefined::Null => torrent.session_dir = None,
             MaybeUndefined::Value(dir) if dir.trim().is_empty() => torrent.session_dir = None,
             MaybeUndefined::Value(dir) => torrent.session_dir = Some(dir.trim().into()),
+        }
+        if let Some(unpack) = self.unpack {
+            torrent.unpack = unpack;
         }
     }
 }
