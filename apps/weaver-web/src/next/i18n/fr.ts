@@ -1760,6 +1760,7 @@ export const nextFr: LocaleDictionary = {
   "next.torrents.trackerRuleHost": "Hôte",
   "next.torrents.trackerRuleGoals": "Objectifs",
   "next.torrents.trackerRuleNeverPause": "Jamais en pause",
+  "next.torrents.trackerRuleClient": "Client",
   "next.torrents.trackerRulesEmpty": "Aucune règle de tracker.",
   "next.seeding.ratioGoal": "Objectif de ratio",
   "next.seeding.seedTimeGoal": "Objectif de durée",

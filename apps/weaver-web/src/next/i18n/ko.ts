@@ -1760,6 +1760,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.trackerRuleHost": "호스트",
   "next.torrents.trackerRuleGoals": "목표",
   "next.torrents.trackerRuleNeverPause": "일시정지 안 함",
+  "next.torrents.trackerRuleClient": "클라이언트",
   "next.torrents.trackerRulesEmpty": "트래커 규칙이 없습니다.",
   "next.seeding.ratioGoal": "비율 목표",
   "next.seeding.seedTimeGoal": "시딩 시간 목표",

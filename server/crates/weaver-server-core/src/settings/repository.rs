@@ -4,7 +4,7 @@
 use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
-use crate::settings::model::TrackerRule;
+use crate::settings::model::{Client, TrackerRule};
 
 #[cfg(test)]
 use crate::categories::CategoryConfig;
@@ -13,7 +13,7 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client";
 
 fn tracker_rule_from_row(row: &SqlRow) -> Result<TrackerRule, StateError> {
     let seeding = row
@@ -32,6 +32,14 @@ fn tracker_rule_from_row(row: &SqlRow) -> Result<TrackerRule, StateError> {
         seeding,
         never_pause: row.bool("never_pause")?,
         unpack: row.opt_bool("unpack")?,
+        client: row
+            .opt_text("client")?
+            .map(|client| {
+                Client::parse(&client).ok_or_else(|| {
+                    StateError::Database(format!("tracker rule client {client} is not known"))
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -47,6 +55,7 @@ fn tracker_rule_args(rule: &TrackerRule) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptText(seeding),
         SqlArg::Bool(rule.never_pause),
         SqlArg::OptBool(rule.unpack),
+        SqlArg::OptText(rule.client.map(|client| client.as_str().to_owned())),
     ])
 }
 
@@ -94,7 +103,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO tracker_rules ({TRACKER_RULE_COLUMNS}, created_at_ms, updated_at_ms)
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &values,
                     )
@@ -115,7 +124,7 @@ impl Database {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE tracker_rules
-                    SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, updated_at_ms = {}
+                    SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, updated_at_ms = {}
                   WHERE id = {}",
                 &args,
             )

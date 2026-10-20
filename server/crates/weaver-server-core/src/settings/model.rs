@@ -442,6 +442,71 @@ pub struct TrackerRule {
     // Whether the archives of a torrent under this rule are extracted;
     // `None` inherits.
     pub unpack: Option<bool>,
+    // The client a torrent under this rule names itself as; `None` is
+    // Weaver.
+    pub client: Option<Client>,
+}
+
+// A client a torrent may name itself as, for the trackers that admit only
+// some clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Client {
+    Weaver,
+    QBittorrent,
+    Transmission,
+}
+
+// How a client names itself: the Azureus prefix of its peer id, the
+// User-Agent of its HTTP announces and the `v` of its extended handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientName {
+    pub prefix: [u8; 8],
+    pub user_agent: &'static str,
+    pub version: &'static str,
+}
+
+impl Client {
+    pub const ALL: [Self; 3] = [Self::Weaver, Self::QBittorrent, Self::Transmission];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Weaver => "weaver",
+            Self::QBittorrent => "qbittorrent",
+            Self::Transmission => "transmission",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|client| client.as_str() == value)
+    }
+
+    // Each client as its current stable release names itself.
+    pub const fn name(self) -> ClientName {
+        use crate::torrents::identity::IDENTITY;
+        match self {
+            Self::Weaver => ClientName {
+                prefix: *IDENTITY.prefix(),
+                user_agent: IDENTITY.user_agent(),
+                version: IDENTITY.user_agent(),
+            },
+            // libtorrent's fingerprint of `qB` 5.2.3.0; libtorrent sends the
+            // user agent as `v`.
+            Self::QBittorrent => ClientName {
+                prefix: *b"-qB5230-",
+                user_agent: "qBittorrent/5.2.3",
+                version: "qBittorrent/5.2.3",
+            },
+            // Major, minor and patch in base 62, then `0` for a stable
+            // release.
+            Self::Transmission => ClientName {
+                prefix: *b"-TR4100-",
+                user_agent: "Transmission/4.1.0",
+                version: "Transmission 4.1.0",
+            },
+        }
+    }
 }
 
 impl TrackerRule {
@@ -690,7 +755,73 @@ mod tests {
             seeding: None,
             never_pause: false,
             unpack: None,
+            client: None,
         }
+    }
+
+    // Each row's prefix, User-Agent and `v` name one version, encoded as
+    // that client encodes it.
+    #[test]
+    fn each_client_names_one_version_its_own_way() {
+        fn version(text: &str, separator: char) -> Vec<u32> {
+            let (_, version) = text.rsplit_once(separator).unwrap();
+            version
+                .split('.')
+                .map(|part| part.parse().unwrap())
+                .collect()
+        }
+        // libtorrent: a digit below ten, then `A` onwards.
+        fn libtorrent(code: &[u8; 2], parts: &[u32]) -> [u8; 8] {
+            let digit = |v: u32| {
+                if v < 10 {
+                    b'0' + v as u8
+                } else {
+                    b'A' + (v - 10) as u8
+                }
+            };
+            let mut parts = parts.to_vec();
+            parts.resize(4, 0);
+            [
+                b'-',
+                code[0],
+                code[1],
+                digit(parts[0]),
+                digit(parts[1]),
+                digit(parts[2]),
+                digit(parts[3]),
+                b'-',
+            ]
+        }
+        const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+        let qb = Client::QBittorrent.name();
+        assert_eq!(qb.prefix, libtorrent(b"qB", &version(qb.user_agent, '/')));
+        assert_eq!(&qb.prefix, b"-qB5230-");
+        assert_eq!(qb.version, qb.user_agent);
+        assert_eq!(&libtorrent(b"qB", &[5, 1, 2]), b"-qB5120-");
+        assert_eq!(&libtorrent(b"qB", &[5, 10, 0]), b"-qB5A00-");
+
+        let tr = Client::Transmission.name();
+        let parts = version(tr.user_agent, '/');
+        assert_eq!(parts, version(tr.version, ' '));
+        assert!(tr.version.starts_with("Transmission "));
+        let mut prefix = *b"-TR...0-";
+        for (at, part) in parts.iter().enumerate() {
+            prefix[3 + at] = BASE62[*part as usize];
+        }
+        assert_eq!(tr.prefix, prefix);
+        assert_eq!(&tr.prefix, b"-TR4100-");
+
+        let weaver = Client::Weaver.name();
+        let identity = crate::torrents::identity::IDENTITY;
+        assert_eq!(&weaver.prefix, identity.prefix());
+        assert_eq!(weaver.user_agent, identity.user_agent());
+        assert_eq!(weaver.version, identity.user_agent());
+
+        for client in Client::ALL {
+            assert_eq!(Client::parse(client.as_str()), Some(client));
+        }
+        assert_eq!(Client::parse("deluge"), None);
     }
 
     #[test]

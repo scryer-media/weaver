@@ -250,6 +250,7 @@ fn a_torrent_keeps_the_tracker_rule_it_matched_until_the_rule_goes() {
                 seeding: None,
                 never_pause: true,
                 unpack: None,
+                client: None,
             },
             1,
         )
