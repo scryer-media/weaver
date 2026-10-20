@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useState } from "react";
-import type { Translate } from "@/lib/context/translate-context";
-import { NumberField, Toggle } from "../../components/controls";
+import { useState, type ReactNode } from "react";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import { NumberField, Toggle, UnitStrip } from "../../components/controls";
 import { LimitControl } from "../../features/networking/limits";
 import type { FieldSpec } from "./framework";
+import { trimNumber } from "./quota";
 
 /**
  * A seeding policy in an editor. The global policy and a category's own one
@@ -111,6 +112,80 @@ export function GoalControl({
   );
 }
 
+/** The units a duration goal is typed in; it is kept in minutes. */
+export type DurationUnit = "min" | "h" | "d";
+
+const UNIT_MINUTES: Record<DurationUnit, number> = { min: 1, h: 60, d: 1440 };
+const UNIT_KEYS: Record<DurationUnit, string> = {
+  min: "next.seeding.minutes",
+  h: "next.seeding.hours",
+  d: "next.seeding.days",
+};
+const DURATION_UNITS: readonly DurationUnit[] = ["min", "h", "d"];
+
+/** The largest unit the minutes divide into whole. */
+export function durationUnit(minutes: number): DurationUnit {
+  if (minutes > 0 && minutes % UNIT_MINUTES.d === 0) return "d";
+  if (minutes > 0 && minutes % UNIT_MINUTES.h === 0) return "h";
+  return "min";
+}
+
+/** Minutes as they read best: `90 min`, `2 h`, `1 d`. */
+export function durationText(t: Translate, minutes: number): string {
+  const unit = durationUnit(minutes);
+  return `${trimNumber(minutes / UNIT_MINUTES[unit])} ${t(UNIT_KEYS[unit])}`;
+}
+
+/**
+ * A duration goal: the number in the unit beside it, then its switch. The
+ * unit starts as the one the goal divides into whole, and changing it
+ * changes only how the same goal reads.
+ */
+export function DurationGoalControl({
+  label,
+  value,
+  onChange,
+  fallback,
+  offLabel,
+}: {
+  label: string;
+  /** Minutes, or null while the goal is off. */
+  value: number | null;
+  onChange: (next: number | null) => void;
+  fallback: number;
+  offLabel?: string;
+}) {
+  const t = useTranslate();
+  const [last, setLast] = useState(value ?? fallback);
+  const [unit, setUnit] = useState<DurationUnit>(() => durationUnit(value ?? fallback));
+  return (
+    <div className="flex items-center gap-[10px]">
+      {value !== null ? (
+        <>
+          <NumberField
+            label={label}
+            value={value / UNIT_MINUTES[unit]}
+            min={0}
+            precision={2}
+            onChange={(next) => {
+              const minutes = Math.max(0, Math.round(next * UNIT_MINUTES[unit]));
+              setLast(minutes);
+              onChange(minutes);
+            }}
+          />
+          <UnitStrip
+            options={DURATION_UNITS.map((option) => ({ value: option, label: t(UNIT_KEYS[option]) }))}
+            value={unit}
+            onChange={setUnit}
+          />
+        </>
+      ) : null}
+      <Toggle checked={value !== null} label={label} onChange={(on) => onChange(on ? last : null)} />
+      {value === null && offLabel ? <span className="font-wv-mono text-[11.5px] text-wv-muted">{offLabel}</span> : null}
+    </div>
+  );
+}
+
 /** Labels are translation keys, resolved when the fields render. */
 const MODES: { value: SeedingMode; label: string }[] = [
   { value: "ANY", label: "next.seeding.modeAny" },
@@ -137,31 +212,51 @@ export function seedingFields(
   const prefix = options.idPrefix ?? "seeding";
   const offLabel = t(options.inherits ? "next.seeding.inherits" : "next.seeding.noGoal");
   const patch = (next: Partial<SeedingPolicy>) => onChange({ ...policy, ...next });
-  const goal = (
-    id: "ratioGoal" | "seedTimeGoalMinutes" | "inactiveGoalMinutes",
-    label: string,
-    extra: { fallback: number; suffix?: string; precision?: number; step?: number },
-  ): FieldSpec => ({
+  const goal = (id: "ratioGoal" | "seedTimeGoalMinutes" | "inactiveGoalMinutes", label: string, control: ReactNode): FieldSpec => ({
     id: `${prefix}-${id}`,
     label,
     keywords: "seed seeding goal",
-    control: {
-      kind: "custom",
-      control: (
-        <GoalControl
-          label={label}
-          value={policy[id]}
-          offLabel={offLabel}
-          onChange={(next) => patch({ [id]: next })}
-          {...extra}
-        />
-      ),
-    },
+    control: { kind: "custom", control },
   });
+  const ratioLabel = t("next.seeding.ratioGoal");
+  const seedTimeLabel = t("next.seeding.seedTimeGoal");
+  const inactiveLabel = t("next.seeding.inactiveGoal");
   return [
-    goal("ratioGoal", t("next.seeding.ratioGoal"), { fallback: 1, precision: 2, step: 0.1 }),
-    goal("seedTimeGoalMinutes", t("next.seeding.seedTimeGoal"), { fallback: 1440, suffix: t("next.seeding.minutes") }),
-    goal("inactiveGoalMinutes", t("next.seeding.inactiveGoal"), { fallback: 60, suffix: t("next.seeding.minutes") }),
+    goal(
+      "ratioGoal",
+      ratioLabel,
+      <GoalControl
+        label={ratioLabel}
+        value={policy.ratioGoal}
+        offLabel={offLabel}
+        onChange={(ratioGoal) => patch({ ratioGoal })}
+        fallback={1}
+        precision={2}
+        step={0.1}
+      />,
+    ),
+    goal(
+      "seedTimeGoalMinutes",
+      seedTimeLabel,
+      <DurationGoalControl
+        label={seedTimeLabel}
+        value={policy.seedTimeGoalMinutes}
+        offLabel={offLabel}
+        onChange={(seedTimeGoalMinutes) => patch({ seedTimeGoalMinutes })}
+        fallback={1440}
+      />,
+    ),
+    goal(
+      "inactiveGoalMinutes",
+      inactiveLabel,
+      <DurationGoalControl
+        label={inactiveLabel}
+        value={policy.inactiveGoalMinutes}
+        offLabel={offLabel}
+        onChange={(inactiveGoalMinutes) => patch({ inactiveGoalMinutes })}
+        fallback={60}
+      />,
+    ),
     {
       id: `${prefix}-mode`,
       label: t("next.seeding.mode"),

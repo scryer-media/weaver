@@ -13,7 +13,7 @@ import { GridRow } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
 import { countLabel } from "@/next/i18n/labels";
-import { EMPTY_SEEDING, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
+import { EMPTY_SEEDING, durationText, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
 const TRACKER_COLUMNS = { base: "minmax(0,1fr) 112px", sm: "minmax(0,1fr) 112px minmax(0,1fr)" };
 const FILE_COLUMNS = { base: "minmax(0,1fr) 56px 90px" };
@@ -42,8 +42,7 @@ const ACTION_KEYS = {
 } as const;
 
 function seedingRows(t: Translate, policy: SeedingPolicy): { label: string; value: string }[] {
-  const minutes = (value: number | null) =>
-    value === null ? t("next.seeding.noGoal") : `${value} ${t("next.seeding.minutes")}`;
+  const minutes = (value: number | null) => (value === null ? t("next.seeding.noGoal") : durationText(t, value));
   return [
     {
       label: t("next.seeding.ratioGoal"),

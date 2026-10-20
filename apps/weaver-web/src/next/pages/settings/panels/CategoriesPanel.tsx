@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useMemo, useState } from "react";
+import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   ADD_CATEGORY_MUTATION,
@@ -13,6 +14,7 @@ import {
 import { useTranslate } from "@/lib/context/translate-context";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
+import { Toggle } from "../../../components/controls";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { useNextData } from "../../../data/next-data";
@@ -240,9 +242,30 @@ export function CategoriesPanel() {
                 label: t("next.categories.torrentRoute"),
                 keywords: "torrent route networking",
                 control: {
-                  kind: "toggle",
-                  value: form.torrentRoute,
-                  onChange: (torrentRoute) => setForm((current) => ({ ...current, torrentRoute })),
+                  kind: "custom",
+                  // Off, the category's torrents ride the default torrent route; on,
+                  // the category owns a route, edited under Networking's routes.
+                  control: (
+                    <div className="flex items-center gap-[10px]">
+                      <Toggle
+                        checked={form.torrentRoute}
+                        label={t("next.categories.torrentRoute")}
+                        onChange={(torrentRoute) => setForm((current) => ({ ...current, torrentRoute }))}
+                      />
+                      {form.torrentRoute && typeof editingId === "number" ? (
+                        <Link
+                          to={`/settings/networking/routes?consumer=torrent:category:${editingId}`}
+                          className="font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
+                        >
+                          {t("next.categories.routeOwn")}
+                        </Link>
+                      ) : form.torrentRoute ? (
+                        <span className="font-wv-mono text-[11.5px] text-wv-muted">{t("next.categories.routeOwn")}</span>
+                      ) : (
+                        <span className="font-wv-mono text-[11.5px] text-wv-muted">{t("next.networking.defaultTorrent")}</span>
+                      )}
+                    </div>
+                  ),
                 },
               },
               {

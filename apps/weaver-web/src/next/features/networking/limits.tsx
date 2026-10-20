@@ -80,7 +80,6 @@ export function SplitControl({
             min={1}
             max={99}
             suffix="%"
-            disabled={needsDownloadLimit}
             onChange={(next) => {
               setLast(next);
               onChange({ usenetPct: next });
@@ -94,7 +93,6 @@ export function SplitControl({
       <Toggle
         checked={value !== null}
         label={label}
-        disabled={needsDownloadLimit}
         onChange={(on) => onChange(on ? { usenetPct: last } : null)}
       />
     </div>

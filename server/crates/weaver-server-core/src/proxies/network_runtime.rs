@@ -52,23 +52,7 @@ impl Configuration {
     fn load(db: &Database) -> Result<Self, String> {
         let mut configuration = Self {
             warnings: HashMap::new(),
-            consumer_labels: db
-                .list_servers()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|server| (Consumer::Server(server.id), server.host, server.connections))
-                .chain(
-                    db.list_rss_feeds()
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(|feed| (Consumer::Rss(feed.id), feed.name, 1)),
-                )
-                .chain(std::iter::once((
-                    Consumer::Outbound,
-                    "Default outbound".to_owned(),
-                    1,
-                )))
-                .collect(),
+            consumer_labels: ProxyRuntime::consumer_labels(db).map_err(|e| e.to_string())?,
             consumers: ProxyRuntime::load_consumers(db)
                 .map_err(|e| e.to_string())?
                 .into_iter()

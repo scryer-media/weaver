@@ -39,7 +39,7 @@ import {
   quotaSearchText,
 } from "./egress-quota";
 import { LimitControl, SplitControl } from "./limits";
-import { bindingLabel, formatLimit, Hint, stateLabel, StatusMark } from "./presentation";
+import { bindingLabel, formatLimit, stateLabel, StatusMark } from "./presentation";
 import { TestViaDialog } from "./TestViaDialog";
 
 const NEW_EGRESS: Egress = {
@@ -311,7 +311,6 @@ export const EgressPage = memo(function EgressPage({
 
   return (
     <>
-      {data.platformNetworking.sourceAddressHint ? <Hint>{data.platformNetworking.sourceAddressHint}</Hint> : null}
       <SettingsBlocks blocks={blocks} loading={ceiling.loading} />
       {editing ? (
         <EgressEditor

@@ -4,6 +4,7 @@
 import type { Translate } from "@/lib/context/translate-context";
 import { usePasswordManagerIgnore } from "@/lib/password-manager";
 import type { DownloadQuota, QuotaPeriod, Weekday } from "@/lib/networking";
+import { UnitStrip } from "../../components/controls";
 import { formatSize } from "../../data/format";
 import type { FieldSpec } from "./framework";
 
@@ -37,6 +38,11 @@ function AllowanceInput({
   );
 }
 
+const ALLOWANCE_UNITS = [
+  { value: "GB", label: "GB" },
+  { value: "TB", label: "TB" },
+] as const;
+
 /** An allowance as typed, and the unit it is typed in. */
 export function AllowanceControl({
   label,
@@ -52,25 +58,7 @@ export function AllowanceControl({
   return (
     <div className="flex items-center gap-[10px]">
       <AllowanceInput label={label} value={limit} onChange={(next) => onChange({ limit: next, unit })} />
-      <div className="flex border border-wv-control bg-wv-input">
-        {(["GB", "TB"] as const).map((option, index) => (
-          <button
-            key={option}
-            type="button"
-            aria-pressed={unit === option}
-            onClick={() => onChange({ limit, unit: option })}
-            className={`flex h-8 cursor-pointer items-center px-[13px] font-wv-mono text-[12px] ${
-              index > 0 ? "border-l border-wv-control " : ""
-            }${
-              unit === option
-                ? "bg-wv-segment-active font-medium text-wv-strong"
-                : "text-wv-muted hover:text-wv-strong"
-            }`}
-          >
-            {option}
-          </button>
-        ))}
-      </div>
+      <UnitStrip options={ALLOWANCE_UNITS} value={unit} onChange={(next) => onChange({ limit, unit: next })} />
     </div>
   );
 }

@@ -19,6 +19,7 @@ import { SettingsBlocks, useDraft, usePanelState, type FieldSpec, type SettingsB
 import {
   EMPTY_SEEDING,
   GoalControl,
+  durationText,
   seedingFields,
   seedingFrom,
   seedingInput,
@@ -56,11 +57,14 @@ function goalsText(t: Translate, policy: SeedingPolicy | null): string {
   if (!policy) {
     return EM_DASH;
   }
-  const minutes = t("next.seeding.minutes");
   const goals = [
     policy.ratioGoal === null ? null : `${t("next.seeding.ratioGoal")} ${policy.ratioGoal}`,
-    policy.seedTimeGoalMinutes === null ? null : `${t("next.seeding.seedTimeGoal")} ${policy.seedTimeGoalMinutes} ${minutes}`,
-    policy.inactiveGoalMinutes === null ? null : `${t("next.seeding.inactiveGoal")} ${policy.inactiveGoalMinutes} ${minutes}`,
+    policy.seedTimeGoalMinutes === null
+      ? null
+      : `${t("next.seeding.seedTimeGoal")} ${durationText(t, policy.seedTimeGoalMinutes)}`,
+    policy.inactiveGoalMinutes === null
+      ? null
+      : `${t("next.seeding.inactiveGoal")} ${durationText(t, policy.inactiveGoalMinutes)}`,
   ].filter((goal): goal is string => goal !== null);
   return goals.length > 0 ? goals.join(" · ") : EM_DASH;
 }
@@ -253,7 +257,7 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   upnp: false,
   encryption: "PREFER",
   maxActiveDownloads: 3,
-  maxPeersTotal: 200,
+  maxPeersTotal: 500,
 };
 
 /** Option labels are translation keys, resolved when the panel renders. */

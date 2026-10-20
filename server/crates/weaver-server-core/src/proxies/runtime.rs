@@ -481,25 +481,53 @@ impl ProxyRuntime {
             allow_private_network: AtomicBool::new(true),
         }))
     }
-    pub(super) fn load_consumers(
+    // Everyone who owns a route, each with its name and how many connections
+    // it holds: every server and feed, default outbound, the default torrent
+    // route, and each category that routes its torrents itself. A category
+    // without its own route rides the default torrent route and is no
+    // consumer.
+    pub(super) fn consumer_labels(
         db: &Database,
-    ) -> Result<std::collections::HashSet<Consumer>, crate::StateError> {
+    ) -> Result<Vec<(Consumer, String, u16)>, crate::StateError> {
         Ok(db
             .list_servers()?
             .into_iter()
-            .map(|s| Consumer::Server(s.id))
+            .map(|server| (Consumer::Server(server.id), server.host, server.connections))
             .chain(
                 db.list_rss_feeds()?
                     .into_iter()
-                    .map(|f| Consumer::Rss(f.id)),
+                    .map(|feed| (Consumer::Rss(feed.id), feed.name, 1)),
             )
-            .chain(std::iter::once(Consumer::Outbound))
-            .chain(std::iter::once(Consumer::Torrent(TorrentScope::Default)))
+            .chain(std::iter::once((
+                Consumer::Outbound,
+                "Default outbound".to_owned(),
+                1,
+            )))
+            .chain(std::iter::once((
+                Consumer::Torrent(TorrentScope::Default),
+                "Default torrent".to_owned(),
+                1,
+            )))
             .chain(
                 db.list_categories()?
                     .into_iter()
-                    .map(|c| Consumer::Torrent(TorrentScope::Category(c.id))),
+                    .filter(|category| category.torrent_route)
+                    .map(|category| {
+                        (
+                            Consumer::Torrent(TorrentScope::Category(category.id)),
+                            category.name,
+                            1,
+                        )
+                    }),
             )
+            .collect())
+    }
+    pub(super) fn load_consumers(
+        db: &Database,
+    ) -> Result<std::collections::HashSet<Consumer>, crate::StateError> {
+        Ok(Self::consumer_labels(db)?
+            .into_iter()
+            .map(|(consumer, _, _)| consumer)
             .collect())
     }
     // Whether the runtime knows this consumer, so a route for it can be
