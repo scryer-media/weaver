@@ -18,8 +18,8 @@ use tokio::{
 };
 
 use crate::{
-    AddTorrent, AddTorrentOptions, AnnounceOk, BF, CreateTorrentOptions, Session,
-    SessionOptions, TrackerAnnounce, create_torrent,
+    AddTorrent, AddTorrentOptions, AnnounceOk, BF, CreateTorrentOptions, ListenerMode,
+    ListenerOptions, Session, SessionOptions, TrackerAnnounce, create_torrent,
     spawn_utils::BlockingSpawner,
     storage::StorageFactory,
     tests::{
@@ -152,6 +152,56 @@ async fn test_resumed_torrent_announces_only_this_runs_bytes() -> anyhow::Result
     assert_eq!(param(&query, "downloaded"), Some(missing.as_str()));
     assert_eq!(param(&query, "left"), Some("0"));
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}
+
+/// The `port` of the `started` announce a session makes for a new torrent.
+async fn started_port(opts: SessionOptions) -> anyhow::Result<(String, Option<u16>)> {
+    let t = TestTorrent::new("test_announced_port", 2048, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_announced_port_out")?;
+    let session = Session::new_with_opts(out.path().into(), opts).await?;
+    session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    let port = param(&query, "port").context("no port")?.to_owned();
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok((port, session.listen_addr().map(|a| a.port())))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_announced_port_is_the_one_the_session_listens_on() -> anyhow::Result<()> {
+    setup_test_logging();
+
+    // No listener: port 1, which no peer is listening on, never a made-up one.
+    let (port, listening) = started_port(tracker_session_opts()?).await?;
+    assert_eq!(listening, None);
+    assert_eq!(port, "1");
+
+    // A listener: its port.
+    let (port, listening) = started_port(SessionOptions {
+        listen: Some(ListenerOptions {
+            mode: ListenerMode::TcpOnly,
+            listen_addr: (Ipv4Addr::UNSPECIFIED, 0).into(),
+            ..Default::default()
+        }),
+        ..tracker_session_opts()?
+    })
+    .await?;
+    let listening = listening.context("the session listens")?;
+    assert_eq!(port, listening.to_string());
     Ok(())
 }
 

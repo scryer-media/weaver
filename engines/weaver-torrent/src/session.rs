@@ -1814,7 +1814,7 @@ impl Session {
             self.announce_tiers(tracker_tiers, is_private),
             Box::new(tracker_rx_stats),
             force_tracker_interval,
-            self.announce_port().unwrap_or(4240),
+            self.announce_port,
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),

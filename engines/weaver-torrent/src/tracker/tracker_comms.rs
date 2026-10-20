@@ -43,7 +43,7 @@ pub struct TrackerComms {
     stats: Box<dyn TorrentStatsProvider>,
     force_tracker_interval: Option<Duration>,
     tx: Sender,
-    // This MUST be set as trackers don't work with 0 port.
+    /// The `port` every announce carries (see [`announced_port`]).
     announce_port: u16,
     reqwest_client: reqwest::Client,
     udp_client: UdpTrackerClient,
@@ -551,6 +551,14 @@ async fn udp_tracker_to_socket_addrs(
     Ok(res)
 }
 
+/// The `port` of an announce: the port peers reach this session on, or 1
+/// when it accepts no connections. An announce has no way to say "not
+/// reachable", and some trackers refuse port 0, so a session without a
+/// listener names port 1, which no peer is listening on.
+fn announced_port(listen_port: Option<u16>) -> u16 {
+    listen_port.unwrap_or(1)
+}
+
 fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -577,7 +585,7 @@ impl TrackerComms {
         trackers: HashSet<Url>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        announce_port: u16,
+        listen_port: Option<u16>,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
     ) -> Option<TrackerTask> {
@@ -587,7 +595,7 @@ impl TrackerComms {
             trackers.into_iter().map(|t| vec![t]).collect(),
             stats,
             force_interval,
-            announce_port,
+            listen_port,
             reqwest_client,
             udp_client,
             StoppedAnnounces::default(),
@@ -602,7 +610,8 @@ impl TrackerComms {
     /// finishes during this run (see [`TrackerCommsStats::finished_during_run`]),
     /// and `stopped` when the returned stream is dropped. `stopped` is bounded
     /// and tracked by `stopped`. Each regular announce is recorded in the
-    /// returned [`TrackerStatus`].
+    /// returned [`TrackerStatus`]. `listen_port` is the port peers reach this
+    /// session on, None when it accepts no connections.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_tiers(
         info_hash: Id20,
@@ -610,7 +619,7 @@ impl TrackerComms {
         tiers: Vec<Vec<Url>>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        announce_port: u16,
+        listen_port: Option<u16>,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
@@ -650,7 +659,7 @@ impl TrackerComms {
             stats,
             force_tracker_interval: force_interval,
             tx,
-            announce_port,
+            announce_port: announced_port(listen_port),
             reqwest_client,
             udp_client,
             key: rand::random(),
@@ -1199,7 +1208,7 @@ mod tests {
             vec![vec![tracker]],
             Box::new(stats.clone()),
             None,
-            6881,
+            Some(6881),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -1261,7 +1270,7 @@ mod tests {
             vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]],
             Box::new(()),
             None,
-            6881,
+            Some(6881),
             reqwest::Client::new(),
             udp_client,
             stopped.clone(),
@@ -1301,7 +1310,7 @@ mod tests {
             tiers,
             Box::new(()),
             None,
-            6881,
+            Some(6881),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
