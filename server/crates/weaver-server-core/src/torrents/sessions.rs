@@ -455,7 +455,7 @@ impl Sessions {
         let mut slots = self.slots.lock().await;
         self.on.store(on, Ordering::Release);
         if !on {
-            close_all(std::mem::take(&mut *slots));
+            close_all(std::mem::take(&mut *slots)).await;
         }
     }
 
@@ -565,7 +565,7 @@ impl Sessions {
             Slot::Open {
                 session, leg, kind, ..
             } => {
-                close(session, leg);
+                close(session, leg).await;
                 kind
             }
             Slot::Held { kind, .. } => kind,
@@ -575,9 +575,9 @@ impl Sessions {
 
     /// Drop `key`'s session, open or held. The route keeps its port slot.
     pub async fn drop_route(&self, key: &RouteKey) {
-        let slot = self.slots.lock().await.remove(key);
-        if let Some(Slot::Open { session, leg, .. }) = slot {
-            close(session, leg);
+        let mut slots = self.slots.lock().await;
+        if let Some(Slot::Open { session, leg, .. }) = slots.remove(key) {
+            close(session, leg).await;
         }
     }
 
@@ -592,16 +592,19 @@ impl Sessions {
     }
 
     pub async fn stop_all(&self) {
-        close_all(std::mem::take(&mut *self.slots.lock().await));
+        let mut slots = self.slots.lock().await;
+        close_all(std::mem::take(&mut *slots)).await;
     }
 }
 
-fn close_all(slots: BTreeMap<RouteKey, Slot>) {
+async fn close_all(slots: BTreeMap<RouteKey, Slot>) {
+    let mut closing = tokio::task::JoinSet::new();
     for slot in slots.into_values() {
         if let Slot::Open { session, leg, .. } = slot {
-            close(session, leg);
+            closing.spawn(close(session, leg));
         }
     }
+    closing.join_all().await;
 }
 
 fn view(key: &RouteKey, slot: &Slot) -> SessionView {
@@ -622,9 +625,10 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
 }
 
 // Stop a session; its leg's bridge stops with the leg. The leg's stage is
-// the route's, and stays.
-fn close(session: Arc<Session>, leg: Option<Arc<TorrentLeg>>) {
-    session.cancellation_token().cancel();
+// the route's, and stays. Held under the slots' lock until the session holds
+// no sockets, so the route's next session finds its port free.
+async fn close(session: Arc<Session>, leg: Option<Arc<TorrentLeg>>) {
+    session.stop().await;
     drop(session);
     drop(leg);
 }

@@ -568,6 +568,148 @@ async fn every_session_gets_the_whole_peer_limit() {
     assert_eq!(*routes.peers.lock().unwrap(), [400, 400]);
 }
 
+// A leg whose DHT socket, the one bound on the route's port, logs when it is
+// bound and when it goes. It listens on nothing that accepts and resolves no
+// name, so the session reaches no one.
+struct LoggedDht {
+    port: u16,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+struct Logged {
+    inner: tokio::net::UdpSocket,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Drop for Logged {
+    fn drop(&mut self) {
+        self.log.lock().unwrap().push("dropped");
+    }
+}
+
+impl DatagramSocket for Logged {
+    fn bind_addr(&self) -> SocketAddr {
+        self.inner.bind_addr()
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        DatagramSocket::recv_from(&self.inner, buf)
+    }
+
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        DatagramSocket::send_to(&self.inner, buf, target)
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> std::task::Poll<io::Result<usize>> {
+        DatagramSocket::poll_send_to(&self.inner, cx, buf, target)
+    }
+}
+
+struct Quiet(SocketAddr);
+
+impl StreamListener for Quiet {
+    fn local_addr(&self) -> SocketAddr {
+        self.0
+    }
+
+    fn accept<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+struct NoNames;
+
+impl librqbit::network::Resolver for NoNames {
+    fn resolve<'a>(&'a self, _: &'a str, _: u16) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
+        Box::pin(async { Err(io::Error::from(io::ErrorKind::NotFound)) })
+    }
+}
+
+impl SocketFactory for LoggedDht {
+    fn connect_tcp<'a>(
+        &'a self,
+        _: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        Box::pin(async { Err(io::Error::from(io::ErrorKind::Unsupported)) })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        Box::pin(async move { Ok(Box::new(Quiet(addr)) as Box<dyn StreamListener>) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move {
+            if addr.port() != self.port {
+                return Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>);
+            }
+            let inner = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+            self.log.lock().unwrap().push("bound");
+            Ok(Arc::new(Logged {
+                inner,
+                log: Arc::clone(&self.log),
+            }) as Arc<dyn DatagramSocket>)
+        })
+    }
+
+    fn resolver(&self) -> Option<Arc<dyn librqbit::network::Resolver>> {
+        Some(Arc::new(NoNames))
+    }
+}
+
+// A route closed and opened again binds its DHT socket only once the closed
+// session's is gone, so the new one can take the same port.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_route_lets_go_of_its_dht_socket_before_it_opens_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let mut env = env(dir.path());
+    env.base_port = 40_000;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
+    routes.set_leg(
+        kind,
+        Arc::new(LoggedDht {
+            port: env.base_port,
+            log: Arc::clone(&log),
+        }),
+    );
+    let sessions = Sessions::new(routes.clone(), env, Database::open_in_memory().unwrap());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+
+    let before = sessions.session(&plan).await.unwrap();
+    assert!(before.get_dht().is_some());
+    drop(before);
+    sessions.drop_route(&plan.key).await;
+    let after = sessions.session(&plan).await.unwrap();
+    assert!(after.get_dht().is_some());
+    assert_eq!(*log.lock().unwrap(), ["bound", "dropped", "bound"]);
+    sessions.stop_all().await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["bound", "dropped", "bound", "dropped"]
+    );
+}
+
 fn vpn_legs() -> Vec<RouteLeg> {
     [1, 2]
         .map(|proxy| RouteLeg {
