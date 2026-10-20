@@ -227,7 +227,7 @@ const fn fallback(admission: Admission, direct_store: Expect) -> Expectation {
 }
 
 impl Container {
-    fn is_sevenz(self) -> bool {
+    pub(super) fn is_sevenz(self) -> bool {
         matches!(self, Self::SevenZip | Self::SevenZipSolid)
     }
 
@@ -552,7 +552,7 @@ impl Expectation {
 impl Naming {
     // Volumes the archive is written as, and the indices of those posted,
     // in posted order.
-    fn layout(self) -> (usize, &'static [usize]) {
+    pub(super) fn layout(self) -> (usize, &'static [usize]) {
         match self {
             Self::Single | Self::HexSingle => (1, &[0]),
             Self::ConventionalFour | Self::HexScattered => (4, &[0, 1, 2, 3]),
@@ -639,18 +639,21 @@ impl Naming {
 const PASSWORD: &str = "moonlit-harbour";
 
 // One cell's posted job.
-struct Fixture {
-    volumes: Vec<(String, Vec<u8>)>,
+#[derive(Clone)]
+pub(super) struct Fixture {
+    pub volumes: Vec<(String, Vec<u8>)>,
+    // The length of each volume the archive is written as.
+    pub lengths: Vec<usize>,
     // What each posted volume is really called, in posted order.
-    real: Vec<String>,
-    spec: JobSpec,
-    expected: Vec<(&'static str, Vec<u8>)>,
+    pub real: Vec<String>,
+    pub spec: JobSpec,
+    pub expected: Vec<(&'static str, Vec<u8>)>,
     // Loss masks that leave a 7z set without its map.
     unmapped: fn(u8) -> bool,
 }
 
 impl Fixture {
-    fn build(cell: Cell) -> Self {
+    pub(super) fn build(cell: Cell) -> Self {
         let (count, posted) = cell.naming.layout();
         let payload = unrepeated_payload(13, 70_001);
         let (written, expected, unmapped) = if cell.container.is_sevenz() {
@@ -761,6 +764,7 @@ impl Fixture {
         .then(|| PASSWORD.to_string());
         Self {
             volumes,
+            lengths: written.iter().map(|(_, bytes)| bytes.len()).collect(),
             real,
             spec,
             expected,
@@ -786,8 +790,36 @@ impl Fixture {
         }
     }
 
-    fn wanted(&self) -> Vec<&'static str> {
+    pub(super) fn wanted(&self) -> Vec<&'static str> {
         self.expected.iter().map(|(name, _)| *name).collect()
+    }
+
+    // Whether `mask` loses an article no other posted copy of its volume
+    // still carries: the bytes are then gone from the post.
+    pub(super) fn uncovered_loss(&self, mask: u8) -> bool {
+        let articles = 4 / self.volumes.len();
+        (0..4).any(|slot| {
+            mask & (1 << slot) != 0
+                && !self.volumes.iter().enumerate().any(|(copy, (_, bytes))| {
+                    bytes == &self.volumes[slot / articles].1
+                        && mask & (1 << (copy * articles + slot % articles)) == 0
+                })
+        })
+    }
+
+    // `interruption` as the post delivers it: a volume the post never
+    // carried is that volume posted and lost whole.
+    pub(super) fn posted_loss(&self, interruption: Interruption) -> Interruption {
+        match interruption.withheld() {
+            Some((volume, index_first)) => {
+                let articles = 4 / self.volumes.len() as u32;
+                Interruption::Loss {
+                    mask: (((1u32 << articles) - 1) << (volume * articles)) as u8,
+                    index_first,
+                }
+            }
+            None => interruption,
+        }
     }
 
     fn identity_prefix_slots(&self) -> u8 {
@@ -807,7 +839,7 @@ impl Fixture {
 
 impl Binding {
     // How the schedule is driven, and the names any listing carries.
-    fn drive(self, fixture: &Fixture) -> (ScheduleOptions, Option<Vec<String>>) {
+    pub(super) fn drive(self, fixture: &Fixture) -> (ScheduleOptions, Option<Vec<String>>) {
         let matrix = ScheduleOptions::MATRIX;
         let real = Some(fixture.real.clone());
         match self {
@@ -854,6 +886,33 @@ impl Binding {
             Self::LegacyReal => (matrix, real),
         }
     }
+}
+
+impl Cell {
+    // Whether the cell's post can be driven through `interruption`: a
+    // withheld volume has to be one the post carries and leaving it out has
+    // to withhold something.
+    pub(super) fn presents(self, interruption: Interruption) -> bool {
+        interruption.fits(self.naming.layout().1.len())
+            && (interruption.withheld().is_none() || self.naming.withholds())
+    }
+}
+
+// The recovery layouts a schedule is posted under: the binding's own, and
+// for a repair a PAR2 set as posters lay it out too, so the volumes it needs
+// are promoted one by one.
+pub(super) fn recovery_layouts(
+    options: ScheduleOptions,
+    interruption: Interruption,
+) -> Vec<ScheduleOptions> {
+    let ladder = options.recovery == RecoveryFormat::Par2
+        && (interruption.loss().is_some() || interruption.withheld().is_some());
+    std::iter::once(options)
+        .chain(ladder.then_some(ScheduleOptions {
+            recovery: RecoveryFormat::Par2Ladder,
+            ..options
+        }))
+        .collect()
 }
 
 // The direct-store route a cell's expectation allows, with `unmapped` the
@@ -962,21 +1021,10 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
         published.push("silver.horizon.sfv");
     }
     for (case, (order, interruption)) in cases {
-        if !profile.includes(interruption)
-            || !interruption.fits(fixture.volumes.len())
-            || (interruption.withheld().is_some() && !cell.naming.withholds())
-        {
+        if !profile.includes(interruption) || !cell.presents(interruption) {
             continue;
         }
-        // A repair also runs against the recovery set as posters lay it out,
-        // so the volumes it needs are promoted one by one.
-        let ladder = options.recovery == RecoveryFormat::Par2
-            && (interruption.loss().is_some() || interruption.withheld().is_some());
-        let ladder = ladder.then_some(ScheduleOptions {
-            recovery: RecoveryFormat::Par2Ladder,
-            ..options
-        });
-        for options in std::iter::once(options).chain(ladder) {
+        for options in recovery_layouts(options, interruption) {
             let context = format!(
                 "{cell:?} profile={profile:?} case={case} order={order:?} interruption={interruption:?} recovery={:?}",
                 options.recovery
@@ -996,32 +1044,20 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
             let check = || {
                 // An available article from a byte-identical repost supplies the
                 // same bytes. Otherwise a listing cannot repair missing data.
-                let unrepairable =
-                    (options.recovery == RecoveryFormat::Absent || interruption.fails())
-                        && interruption.loss().is_some_and(|(mask, _)| {
-                            // Names or posted PAR2 descriptions can identify the
-                            // absent copy. Parity is unnecessary when identical
-                            // source bytes remain available in another posting.
-                            let identifiable_copy = cell.naming == Naming::Reposted
-                                || (cell.naming == Naming::HexReposted
-                                    && cell.binding == Binding::Par2Posted);
-                            if !identifiable_copy {
-                                return mask != 0;
-                            }
-                            let articles_per_file = 4 / fixture.volumes.len();
-                            (0..4).any(|slot| {
-                                mask & (1 << slot) != 0
-                                    && !fixture.volumes.iter().enumerate().any(
-                                        |(copy, (_, bytes))| {
-                                            bytes == &fixture.volumes[slot / articles_per_file].1
-                                                && mask
-                                                    & (1 << (copy * articles_per_file
-                                                        + slot % articles_per_file))
-                                                    == 0
-                                        },
-                                    )
-                            })
-                        });
+                let unrepairable = (options.recovery == RecoveryFormat::Absent
+                    || interruption.fails())
+                    && interruption.loss().is_some_and(|(mask, _)| {
+                        // Names or posted PAR2 descriptions can identify the
+                        // absent copy. Parity is unnecessary when identical
+                        // source bytes remain available in another posting.
+                        let identifiable_copy = cell.naming == Naming::Reposted
+                            || (cell.naming == Naming::HexReposted
+                                && cell.binding == Binding::Par2Posted);
+                        if !identifiable_copy {
+                            return mask != 0;
+                        }
+                        fixture.uncovered_loss(mask)
+                    });
                 if unrepairable {
                     profile.assert_rejected(&outcome, &wanted);
                     return;
@@ -1232,16 +1268,7 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 // place, except where losing every article of that volume
                 // already leaves the set without its map or a volume without
                 // a name, and those exceptions are the loss's own.
-                let delivered = match interruption.withheld() {
-                    Some((volume, index_first)) => {
-                        let articles = 4 / fixture.volumes.len() as u32;
-                        Interruption::Loss {
-                            mask: (((1u32 << articles) - 1) << (volume * articles)) as u8,
-                            index_first,
-                        }
-                    }
-                    None => interruption,
-                };
+                let delivered = fixture.posted_loss(interruption);
                 profile.assert_delivery(&outcome, route, &published, delivered);
                 if matches!(interruption, Interruption::None) {
                     expect.assert_clean(&outcome, order.len() == 4, &context);

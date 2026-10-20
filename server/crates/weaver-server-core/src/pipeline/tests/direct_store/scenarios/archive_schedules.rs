@@ -49,6 +49,7 @@ fn enable_schedule_trace() {
 }
 
 mod extended;
+pub(super) mod graph;
 mod grouping;
 
 pub(super) fn arrival_orders() -> Vec<Vec<(u32, u32)>> {
@@ -1125,36 +1126,31 @@ pub(super) async fn run_schedule_with(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn drive_schedule(
-    options: ScheduleOptions,
-    profile: ExtractionProfile,
-    mut spec: JobSpec,
-    volumes: &[(String, Vec<u8>)],
-    described: Option<&[String]>,
+// What a schedule posts of an archive written as `written`: the volumes the
+// NZB carries, each one's article count, and the arrivals as articles of
+// those volumes. A withheld volume leaves the spec, and its slots name
+// nothing.
+fn posted_schedule(
+    spec: &mut JobSpec,
+    written: &[(String, Vec<u8>)],
     order: &[(u32, u32)],
-    wanted: &[&str],
     interruption: Interruption,
-) -> Outcome {
-    enable_schedule_trace();
-    let layout: Vec<usize> = spec.files[..volumes.len()]
+) -> (Vec<(String, Vec<u8>)>, Vec<usize>, Vec<(u32, u32)>) {
+    let layout: Vec<usize> = spec.files[..written.len()]
         .iter()
         .map(|file| file.segments.len())
         .collect();
     assert_eq!(
         layout,
-        slot_layout(volumes.len(), layout.iter().sum()),
+        slot_layout(written.len(), layout.iter().sum()),
         "four or five scheduled article slots"
     );
     let order: Vec<_> = order
         .iter()
         .map(|&(file, article)| slot_article(&layout, file * 2 + article))
         .collect();
-    // Every volume the set is written as: what a recovery set or a listing
-    // describes. `volumes` is rebound below to the ones the post carries.
-    let written = volumes;
     let withheld = interruption.withheld();
-    let (posted, layout, order) = match withheld {
+    match withheld {
         Some((volume, _)) => {
             assert!(interruption.fits(written.len()), "{interruption:?}");
             let at = volume as usize;
@@ -1178,24 +1174,22 @@ async fn drive_schedule(
             (posted, layout, order)
         }
         None => (written.to_vec(), layout, order),
-    };
-    let volumes = posted.as_slice();
-    let articles = |file: u32| layout[file as usize];
-    let root = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
-    profile.configure(&mut pipeline);
-    let mut chase_armed = 0;
-    let mut chase_consumed = 0;
-    let mut finalized = 0;
-    let mut demotions = Vec::new();
-    let mut schedule_demoted = None;
-    let mut retired = None;
-    let mut delivered = BTreeSet::new();
-    let mut rerequested = BTreeSet::new();
-    let mut durable = None;
-    let job = JobId(42200);
-    let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
+    }
+}
+
+// The recovery a schedule posts over every volume `written`, appended to
+// `spec` with the index first: a set with blocks enough to mend what the
+// schedule loses, none when it starves, and the listing when asked. And
+// whether the index arrives ahead of the volumes.
+fn schedule_recovery(
+    options: ScheduleOptions,
+    spec: &mut JobSpec,
+    written: &[(String, Vec<u8>)],
+    described: Option<&[String]>,
+    interruption: Interruption,
+) -> (Vec<ScheduleRecovery>, bool) {
     let loss = interruption.loss();
+    let withheld = interruption.withheld();
     let index_first = options.index_first
         || (!options.index_last
             && loss
@@ -1239,7 +1233,7 @@ async fn drive_schedule(
         match options.recovery {
             RecoveryFormat::Par2 => {
                 let bytes = build_test_par2_with_recovery(&described, slice as u64, blocks);
-                let index = append_par2_index(&mut spec, &bytes);
+                let index = append_par2_index(spec, &bytes);
                 vec![ScheduleRecovery {
                     index,
                     name: "silver.horizon.par2".to_string(),
@@ -1250,7 +1244,7 @@ async fn drive_schedule(
             RecoveryFormat::Par2Ladder => {
                 let carriers =
                     build_test_par2_ladder(&described, slice as u64, blocks, "silver.horizon");
-                let indices = append_single_article_files(&mut spec, &carriers);
+                let indices = append_single_article_files(spec, &carriers);
                 indices
                     .into_iter()
                     .zip(carriers)
@@ -1270,7 +1264,7 @@ async fn drive_schedule(
                 let mut carriers = par3_carriers_over(&described, slice as u64, blocks);
                 // The index leads: it is what arrives where a PAR2 file would.
                 carriers.sort_by_key(|(name, _)| name.contains(".vol"));
-                let indices = append_single_article_files(&mut spec, &carriers);
+                let indices = append_single_article_files(spec, &carriers);
                 indices
                     .into_iter()
                     .zip(carriers)
@@ -1299,7 +1293,7 @@ async fn drive_schedule(
             })
             .collect();
         let carrier = ("silver.horizon.sfv".to_string(), listing.into_bytes());
-        let index = append_single_article_files(&mut spec, std::slice::from_ref(&carrier))[0];
+        let index = append_single_article_files(spec, std::slice::from_ref(&carrier))[0];
         recovery.push(ScheduleRecovery {
             index,
             name: carrier.0,
@@ -1308,6 +1302,44 @@ async fn drive_schedule(
             format: RecoveryFormat::Par2,
         });
     }
+    (recovery, index_first)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_schedule(
+    options: ScheduleOptions,
+    profile: ExtractionProfile,
+    mut spec: JobSpec,
+    volumes: &[(String, Vec<u8>)],
+    described: Option<&[String]>,
+    order: &[(u32, u32)],
+    wanted: &[&str],
+    interruption: Interruption,
+) -> Outcome {
+    enable_schedule_trace();
+    // Every volume the set is written as: what a recovery set or a listing
+    // describes. `volumes` is rebound below to the ones the post carries.
+    let written = volumes;
+    let (posted, layout, order) = posted_schedule(&mut spec, written, order, interruption);
+    let volumes = posted.as_slice();
+    let articles = |file: u32| layout[file as usize];
+    let root = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
+    profile.configure(&mut pipeline);
+    let mut chase_armed = 0;
+    let mut chase_consumed = 0;
+    let mut finalized = 0;
+    let mut demotions = Vec::new();
+    let mut schedule_demoted = None;
+    let mut retired = None;
+    let mut delivered = BTreeSet::new();
+    let mut rerequested = BTreeSet::new();
+    let mut durable = None;
+    let job = JobId(42200);
+    let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
+    let loss = interruption.loss();
+    let (recovery, index_first) =
+        schedule_recovery(options, &mut spec, written, described, interruption);
     insert_active_job(&mut pipeline, job, spec.clone()).await;
     let mut trace = vec![];
     if let Some(index) = recovery.first()
@@ -1738,7 +1770,7 @@ async fn encrypted_restart_repair_preserves_direct_finalization() {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Format {
+pub(super) enum Format {
     Rar4,
     Rar5,
     Rar4Encrypted,
@@ -2148,162 +2180,172 @@ fn grouping_generator_covers_every_possible_cell() {
     grouping::assert_generated(GENERATED_CELLS);
 }
 
-grouping::grouping_cells! {
-    smoke rar4 Rar4 {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-    }
-    smoke rar5 Rar5 {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-    }
-    smoke rar5_encrypted Rar5Encrypted {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-    }
-    smoke rar5_encrypted_headers Rar5EncryptedHeaders {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-    }
-    smoke seven_zip SevenZip {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-        bare_first_part BareFirstPart [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-    }
-    smoke seven_zip_solid SevenZipSolid {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-        bare_first_part BareFirstPart [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-    }
-    smoke rar4_solid Rar4Solid {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-    }
-    smoke rar4_solid_encrypted Rar4SolidEncrypted {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-    }
-    smoke rar5_solid Rar5Solid {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-    }
-    smoke rar5_solid_encrypted Rar5SolidEncrypted {
-        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
-        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
-        reposted Reposted [par2_posted Par2Posted nothing Nothing]
-        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
-    }
+// The possible cells of the grouping cross, in the generator's form, handed to
+// `$emit`: the macro that writes one consumer's tests for them.
+macro_rules! grouping_listing {
+    ($emit:ident) => {
+        $emit! {
+            smoke rar4 Rar4 {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+            }
+            smoke rar5 Rar5 {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+            }
+            smoke rar5_encrypted Rar5Encrypted {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+            }
+            smoke rar5_encrypted_headers Rar5EncryptedHeaders {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+            }
+            smoke seven_zip SevenZip {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+                bare_first_part BareFirstPart [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+            }
+            smoke seven_zip_solid SevenZipSolid {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+                bare_first_part BareFirstPart [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+            }
+            smoke rar4_solid Rar4Solid {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+            }
+            smoke rar4_solid_encrypted Rar4SolidEncrypted {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+            }
+            smoke rar5_solid Rar5Solid {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+            }
+            smoke rar5_solid_encrypted Rar5SolidEncrypted {
+                conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+                hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+                reposted Reposted [par2_posted Par2Posted nothing Nothing]
+                hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+            }
+        }
+    };
 }
+pub(super) use grouping_listing;
+
+use grouping::grouping_cells;
+grouping_listing!(grouping_cells);
 
 fn late_index_direct_route(
     order: &[(u32, u32)],
@@ -2361,17 +2403,20 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
 // its rules apply.
 type KnownDefect = fn(Format, &[(u32, u32)], Interruption, &mut Outcome) -> bool;
 
-// A format's campaign over `slots` article slots (see [`slot_layout`]): the
-// given wrong-password schedules, then each case held to the same rules.
-async fn slot_campaign(
-    format: Format,
-    selection: Selection,
-    profile: ExtractionProfile,
-    slots: usize,
-    wrong_password: Vec<Schedule>,
-    cases: Vec<(usize, Schedule)>,
-    known_defect: KnownDefect,
-) {
+// A layout over `slots` article slots (see [`slot_layout`]): its one member
+// and that member's bytes, the volumes as posted, the names its recovery set
+// describes them by, and the job, with the password when the archive needs
+// one.
+struct SlotFixture {
+    name: &'static str,
+    payload: Vec<u8>,
+    volumes: Vec<(String, Vec<u8>)>,
+    described: Option<Vec<String>>,
+    encrypted: bool,
+    spec: JobSpec,
+}
+
+fn slot_fixture(format: Format, slots: usize) -> SlotFixture {
     let name = "nested/feature.mkv";
     let password = "moonlit-harbour";
     let length = match format {
@@ -2502,6 +2547,35 @@ async fn slot_campaign(
         }
     }
     spec.password = encrypted.then(|| password.to_string());
+    SlotFixture {
+        name,
+        payload,
+        volumes,
+        described,
+        encrypted,
+        spec,
+    }
+}
+
+// A format's campaign over `slots` article slots (see [`slot_layout`]): the
+// given wrong-password schedules, then each case held to the same rules.
+async fn slot_campaign(
+    format: Format,
+    selection: Selection,
+    profile: ExtractionProfile,
+    slots: usize,
+    wrong_password: Vec<Schedule>,
+    cases: Vec<(usize, Schedule)>,
+    known_defect: KnownDefect,
+) {
+    let SlotFixture {
+        name,
+        payload,
+        volumes,
+        described,
+        encrypted,
+        spec,
+    } = slot_fixture(format, slots);
     let baseline = run_schedule_with(
         format.options(),
         ExtractionProfile::Conventional,
@@ -2760,12 +2834,9 @@ async fn rar4_hex_single_arrival_schedules() {
     campaign(Format::Rar4HexSingle, Selection::Smoke).await;
 }
 
-// Two single-volume stored sets in one job, two articles each. A demotion,
-// a restart or a loss in one set is not a reason for the other to leave
-// direct store.
-async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
-    let members = ["alpha.mkv", "nested/beta.mkv"];
-    let payloads: Vec<Vec<u8>> = [(6001, 7), (4093, 11)]
+// The members of every two-set fixture, one a set, and their payloads.
+pub(super) fn two_set_members() -> ([&'static str; 2], Vec<Vec<u8>>) {
+    let payloads = [(6001, 7), (4093, 11)]
         .into_iter()
         .map(|(len, step)| {
             (0..len)
@@ -2773,6 +2844,13 @@ async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
                 .collect()
         })
         .collect();
+    (["alpha.mkv", "nested/beta.mkv"], payloads)
+}
+
+// Two single-volume stored sets in one job, two articles each: the first
+// set in slots 0 and 1, the second in slots 2 and 3.
+pub(super) fn two_set_fixture() -> TwoSetFixture {
+    let (members, payloads) = two_set_members();
     let volumes: Vec<_> = ["alpha", "beta"]
         .into_iter()
         .zip(members.iter().zip(&payloads))
@@ -2782,6 +2860,13 @@ async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
         })
         .collect();
     let spec = direct_store_job_spec("Two set schedules", &volumes);
+    (members, payloads, volumes, spec)
+}
+
+// The two-set fixture's schedules. A demotion, a restart or a loss in one
+// set is not a reason for the other to leave direct store.
+async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
+    let (members, payloads, volumes, spec) = two_set_fixture();
     let route = Route {
         sets: 2,
         ..Route::DIRECT
@@ -2878,7 +2963,7 @@ async fn two_set_arrival_schedules() {
 // No name says which set a volume belongs to or where in it, so only the
 // volumes' own headers can keep the sets apart; merged, neither extracts.
 #[derive(Clone, Copy, Debug)]
-enum HexTwoSets {
+pub(super) enum HexTwoSets {
     Rar5,
     Rar4,
 }
@@ -2958,25 +3043,17 @@ async fn hex_two_set_conventional_campaign(format: HexTwoSets, selection: Select
     hex_two_set_profile(format, selection, ExtractionProfile::Conventional).await;
 }
 
-// The members, their payloads, the posted volumes and the job of the
-// two-set fixture.
-type HexTwoSetFixture = (
+// The members, their payloads, the posted volumes and the job of a two-set
+// fixture.
+pub(super) type TwoSetFixture = (
     [&'static str; 2],
     Vec<Vec<u8>>,
     Vec<(String, Vec<u8>)>,
     JobSpec,
 );
 
-fn hex_two_set_fixture(format: HexTwoSets) -> HexTwoSetFixture {
-    let members = ["alpha.mkv", "nested/beta.mkv"];
-    let payloads: Vec<Vec<u8>> = [(6001, 7), (4093, 11)]
-        .into_iter()
-        .map(|(len, step)| {
-            (0..len)
-                .map(|n| ((n * step + n / 251) % 253) as u8)
-                .collect()
-        })
-        .collect();
+pub(super) fn hex_two_set_fixture(format: HexTwoSets) -> TwoSetFixture {
+    let (members, payloads) = two_set_members();
     let sets: Vec<Vec<Vec<u8>>> = members
         .iter()
         .zip(&payloads)
@@ -3197,7 +3274,7 @@ async fn rar4_hex_two_set_arrival_schedules() {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum CompressedFormat {
+pub(super) enum CompressedFormat {
     Rar4Mixed,
     Rar4Lz,
     Rar4Solid,
@@ -3549,15 +3626,11 @@ fn compressed_members(format: CompressedFormat) -> BTreeMap<String, Vec<u8>> {
     expected
 }
 
-async fn compressed_campaign(
-    format: CompressedFormat,
-    selection: Selection,
-    profile: ExtractionProfile,
-) {
+// A format's posted volumes and its job, with the password when the
+// archive needs one.
+fn compressed_job(format: CompressedFormat) -> (Vec<(String, Vec<u8>)>, JobSpec) {
     let (_, bytes, password) = format.fixture();
-    let expected = compressed_members(format);
     let posted = format.volumes();
-    let wanted = expected.keys().map(String::as_str).collect::<Vec<_>>();
     let volumes: Vec<(String, Vec<u8>)> = match posted {
         Some((_, parts)) => parts
             .into_iter()
@@ -3577,6 +3650,18 @@ async fn compressed_campaign(
         4 / volumes.len(),
     );
     spec.password = password.map(str::to_owned);
+    (volumes, spec)
+}
+
+async fn compressed_campaign(
+    format: CompressedFormat,
+    selection: Selection,
+    profile: ExtractionProfile,
+) {
+    let expected = compressed_members(format);
+    let wanted = expected.keys().map(String::as_str).collect::<Vec<_>>();
+    let (volumes, spec) = compressed_job(format);
+    let password = spec.password.clone();
     for (order, interruption) in wrong_password_schedules(selection) {
         if !profile.includes(interruption) {
             continue;

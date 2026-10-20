@@ -684,6 +684,20 @@ async fn run_move_to_claimed_destination(
         );
     }
 
+    // The chunk workspace is the job's scratch: everything it backed has been
+    // published, so it goes with the working directory it lives in.
+    let chunks = working_dir.join(".weaver-chunks");
+    if let Err(error) = tokio::fs::remove_dir_all(&chunks).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            job_id = job_id.0,
+            path = %chunks.display(),
+            error = %error,
+            "failed to remove chunk workspace during final move"
+        );
+    }
+
     let marker_path = working_dir.join(WORKING_DIR_MARKER);
     if let Err(error) = tokio::fs::remove_file(&marker_path).await
         && error.kind() != std::io::ErrorKind::NotFound

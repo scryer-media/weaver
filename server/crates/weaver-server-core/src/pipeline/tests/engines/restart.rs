@@ -511,7 +511,7 @@ async fn a_graph_job_with_no_checkpoint_is_refused_at_restore() {
 
 // The row stamped graph as an admission stamps it, with no checkpoint
 // written beside it.
-fn stamp_graph(db: &crate::Database) {
+pub(in crate::pipeline::tests) fn stamp_graph(db: &crate::Database) {
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
     let datastore = db.datastore();
     db.run_sql_blocking(async move {

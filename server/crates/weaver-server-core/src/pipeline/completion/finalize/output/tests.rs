@@ -534,6 +534,35 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
     assert!(dest.join("Yb5drZSkNi20UCMkb.mkv").is_file());
 }
 
+// The chunk workspace is scratch the job wrote beside its output; once the
+// output is published, the working directory goes, the workspace with it.
+#[tokio::test]
+async fn final_move_removes_the_working_directory_with_its_chunk_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let dest = temp.path().join("complete");
+    std::fs::create_dir_all(working.join(".weaver-chunks")).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(working.join("payload.bin"), b"payload").unwrap();
+    std::fs::write(working.join(".weaver-chunks/scratch-0"), b"scratch").unwrap();
+
+    run_move_to_complete(
+        JobId(1),
+        working.clone(),
+        None,
+        dest.clone(),
+        Arc::new(PhaseCounters::default()),
+        None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read(dest.join("payload.bin")).unwrap(), b"payload");
+    assert!(!dest.join(".weaver-chunks").exists());
+    assert!(!working.exists());
+}
+
 #[test]
 fn prepublication_scan_checks_both_delivery_roots() {
     let temp = tempfile::tempdir().unwrap();

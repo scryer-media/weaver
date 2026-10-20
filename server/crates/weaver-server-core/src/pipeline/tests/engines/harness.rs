@@ -36,7 +36,7 @@ use crate::pipeline::{
 pub(super) const ARTICLE: usize = 64;
 
 // Every run is its own pipeline, so one id serves every scenario.
-pub(super) const JOB: JobId = JobId(93_001);
+pub(in crate::pipeline::tests) const JOB: JobId = JobId(93_001);
 const JOB_NAME: &str = "lantern beacon";
 
 pub(super) struct Post {
@@ -1051,7 +1051,7 @@ async fn serve_from(
     settle_direct_demotion_work(pipeline).await;
 }
 
-pub(super) fn finished(pipeline: &Pipeline) -> bool {
+pub(in crate::pipeline::tests) fn finished(pipeline: &Pipeline) -> bool {
     matches!(
         job_status_for_assert(pipeline, JOB),
         Some(JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }) | None
