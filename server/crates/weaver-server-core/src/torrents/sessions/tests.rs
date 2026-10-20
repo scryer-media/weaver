@@ -56,6 +56,8 @@ pub(crate) struct FakeRoutes {
     pub(crate) down: Mutex<Option<String>>,
     pub(crate) refuse: Mutex<Option<String>>,
     pub(crate) leg: Mutex<Option<(LegKind, Arc<dyn SocketFactory>)>>,
+    // The peer limit each leg was opened for, in order.
+    pub(crate) peers: Mutex<Vec<usize>>,
     pub(crate) opened: AtomicUsize,
 }
 
@@ -111,8 +113,9 @@ impl Routes for FakeRoutes {
         })
     }
 
-    async fn open(&self, plan: &RoutePlan, _peers: usize) -> Result<OpenLeg, String> {
+    async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
         self.opened.fetch_add(1, Ordering::SeqCst);
+        self.peers.lock().unwrap().push(peers);
         if let Some(error) = self.refuse.lock().unwrap().clone() {
             return Err(error);
         }
@@ -543,6 +546,28 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
 }
 
 // Two VPN legs, each its own proxy on the system egress.
+// The peer limit is each torrent's: a route opened beside others gets all
+// of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_session_gets_the_whole_peer_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.route(TorrentScope::Default, 1);
+    routes.route(TorrentScope::Category(5), 2);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    for scope in [TorrentScope::Default, TorrentScope::Category(5)] {
+        sessions
+            .session(&routes.plan(scope).unwrap())
+            .await
+            .unwrap();
+    }
+    assert_eq!(*routes.peers.lock().unwrap(), [400, 400]);
+}
+
 fn vpn_legs() -> Vec<RouteLeg> {
     [1, 2]
         .map(|proxy| RouteLeg {

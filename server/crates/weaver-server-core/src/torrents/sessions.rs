@@ -499,11 +499,8 @@ impl Sessions {
             );
             return Err(SessionError::RouteDown(reason.clone()));
         }
-        let open = slots
-            .values()
-            .filter(|slot| matches!(slot, Slot::Open { .. }))
-            .count();
-        let peers = self.env.max_peers_total as usize / (open + 1);
+        // The peer limit is each torrent's, whatever else is open.
+        let peers = self.env.max_peers_total as usize;
         match self.build(plan, port_slot, peers).await {
             Ok((session, leg, port)) => {
                 self.rates.add(&session);
