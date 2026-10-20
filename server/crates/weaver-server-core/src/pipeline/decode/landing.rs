@@ -202,20 +202,24 @@ impl Pipeline {
 
     // Lands every batch of the job's files now, waiting on the owner's
     // answers. For anything that must not run beside the files' writes: a
-    // demotion taking a file's image, the shutdown drain.
+    // demotion taking a file's image, the shutdown drain. The last landing's
+    // latch relief can send the job's files more, so it runs until none is
+    // out.
     pub(crate) async fn settle_segment_writes_for_job(&mut self, job_id: JobId) {
         loop {
-            let Some((file_id, ticket)) = self
+            while let Some((file_id, ticket)) = self
                 .segment_writes
                 .iter_mut()
                 .find(|(file_id, tickets)| file_id.job_id == job_id && !tickets.is_empty())
                 .and_then(|(file_id, tickets)| Some((*file_id, tickets.pop_front()?)))
-            else {
+            {
+                self.land_segment_write(file_id, ticket).await;
+            }
+            self.after_segment_writes_landed(job_id).await;
+            if !self.has_pending_segment_writes(job_id) {
                 break;
-            };
-            self.land_segment_write(file_id, ticket).await;
+            }
         }
-        self.after_segment_writes_landed(job_id).await;
     }
 
     // [`Self::settle_segment_writes_for_job`] for every job with a batch
