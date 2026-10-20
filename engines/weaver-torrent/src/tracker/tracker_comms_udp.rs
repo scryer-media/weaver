@@ -65,6 +65,8 @@ pub struct AnnounceFields {
     pub uploaded: u64,
     pub event: u32,
     pub key: u32,
+    /// How many peers to ask for.
+    pub num_want: u32,
     pub port: u16,
 }
 
@@ -115,7 +117,7 @@ impl Request {
                 w.extend_from_slice(&fields.event.to_be_bytes())?;
                 w.extend_from_slice(&0u32.to_be_bytes())?; // ip address 0
                 w.extend_from_slice(&fields.key.to_be_bytes())?;
-                w.extend_from_slice(&(-1i32).to_be_bytes())?; // num want -1
+                w.extend_from_slice(&fields.num_want.to_be_bytes())?;
                 w.extend_from_slice(&fields.port.to_be_bytes())?;
             }
         }
@@ -567,6 +569,7 @@ mod tests {
                     uploaded: 0,
                     event: super::udp_event(event),
                     key: 0,
+                    num_want: 7,
                     port: 6881,
                 },
             );
@@ -576,6 +579,8 @@ mod tests {
             // connection id, action, transaction id, info hash, peer id,
             // downloaded, left, uploaded, then the event (BEP 15).
             assert_eq!(buf[80..84], wire.to_be_bytes());
+            // Then ip, key, num_want and port.
+            assert_eq!(buf[92..96], 7u32.to_be_bytes());
         }
     }
 
@@ -646,6 +651,7 @@ mod tests {
                 uploaded: 0,
                 event: EVENT_NONE,
                 key: 0, // whatever that is?
+                num_want: 50,
                 port: 24563,
             },
         );

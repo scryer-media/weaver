@@ -5,6 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
@@ -50,6 +51,9 @@ pub struct TrackerComms {
     key: u32,
     // Per tier, the tracker that accepted `started` and so is owed `stopped`.
     started: Mutex<Vec<Option<SupportedTracker>>>,
+    // The `tracker id` each HTTP tracker last gave, sent back on every later
+    // announce to it.
+    tracker_ids: Mutex<HashMap<Url, Vec<u8>>>,
     status: TrackerStatus,
 }
 
@@ -559,6 +563,15 @@ fn announced_port(listen_port: Option<u16>) -> u16 {
     listen_port.unwrap_or(1)
 }
 
+/// How many peers an announce asks for: none with `stopped`, since the run
+/// is over, otherwise libtorrent's default.
+fn numwant(event: Option<TrackerRequestEvent>) -> u32 {
+    match event {
+        Some(TrackerRequestEvent::Stopped) => 0,
+        _ => 200,
+    }
+}
+
 fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -664,6 +677,7 @@ impl TrackerComms {
             udp_client,
             key: rand::random(),
             started: Mutex::new(vec![None; tiers.len()]),
+            tracker_ids: Default::default(),
             status: status.clone(),
         });
         let stop_on_drop = StopOnDrop {
@@ -790,6 +804,7 @@ impl TrackerComms {
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
+        let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.peer_id,
@@ -801,9 +816,9 @@ impl TrackerComms {
             no_peer_id: false,
             event,
             ip: None,
-            numwant: None,
+            numwant: numwant(event),
             key: Some(self.key),
-            trackerid: None,
+            trackerid: trackerid.as_deref(),
         };
 
         let mut url = tracker_url.clone();
@@ -834,6 +849,11 @@ impl TrackerComms {
                     e.into_kind()
                 })?
                 .0;
+        if let Some(id) = &response.tracker_id {
+            self.tracker_ids
+                .lock()
+                .insert(tracker_url.clone(), id.as_ref().to_vec());
+        }
 
         Ok(Announced {
             peers: response.iter_peers().collect(),
@@ -899,6 +919,7 @@ impl TrackerComms {
             uploaded: stats.uploaded_bytes,
             event: udp_event(event),
             key: self.key,
+            num_want: numwant(event),
             port: self.announce_port,
         };
 
@@ -1251,6 +1272,71 @@ mod tests {
         assert_eq!(query_param(&q, "uploaded"), Some("42"));
         assert_eq!(query_param(&q, "downloaded"), Some("90"));
         assert_eq!(query_param(&q, "left"), Some("0"));
+
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_tracker_id_is_sent_back_and_stopped_wants_no_peers() {
+        let (listener, url) = http_listener().await;
+        let stats = Arc::new(ManualStats {
+            stats: Mutex::new(live(0, 90, false)),
+            completed: tokio::sync::watch::channel(false).0,
+        });
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let stopped = StoppedAnnounces::default();
+        let mut peers = TrackerComms::start_with_tiers(
+            Id20::new([1; 20]),
+            Id20::new([2; 20]),
+            vec![vec![url]],
+            Box::new(stats.clone()),
+            None,
+            Some(6881),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap()
+        .peers;
+
+        // Drive the peer stream while the tracker answers with `body`.
+        macro_rules! announce {
+            ($body:expr) => {
+                tokio::select! {
+                    _ = peers.next() => panic!("the tracker sent no peers"),
+                    q = async {
+                        let (conn, q) = read_announce(&listener).await;
+                        respond(conn, $body).await;
+                        q
+                    } => q,
+                }
+            };
+        }
+
+        let q = announce!("d8:intervali1800e5:peers0:10:tracker id3:t-1e");
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        assert_eq!(query_param(&q, "numwant"), Some("200"));
+        assert_eq!(query_param(&q, "trackerid"), None);
+
+        // The next announce carries the id back; an answer without one keeps it.
+        *stats.stats.lock() = live(90, 0, true);
+        stats.completed.send_replace(true);
+        let q = announce!("d8:intervali1800e5:peers0:e");
+        assert_eq!(query_param(&q, "event"), Some("completed"));
+        assert_eq!(query_param(&q, "numwant"), Some("200"));
+        assert_eq!(query_param(&q, "trackerid"), Some("t-1"));
+
+        // `stopped` asks for no peers, and still names the id.
+        drop(peers);
+        let q = next_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        assert_eq!(query_param(&q, "numwant"), Some("0"));
+        assert_eq!(query_param(&q, "trackerid"), Some("t-1"));
 
         stopped.wait_idle().await;
         token.cancel();
