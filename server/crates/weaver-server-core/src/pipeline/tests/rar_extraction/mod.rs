@@ -320,7 +320,7 @@ async fn stage_old_numbering_rar4_set_with_a_recovery_volume(
         .filter(|(volume, _)| *volume != 2)
         .map(|(_, file)| file.clone())
         .collect();
-    files.push(("silver.horizon.rev".to_string(), rev));
+    files.push(("silver.horizon1.rev".to_string(), rev));
     insert_active_job(pipeline, job_id, rar_job_spec(job_name, &files)).await;
     for (index, (filename, bytes)) in files.iter().enumerate() {
         write_and_complete_rar_volume(pipeline, job_id, index as u32, filename, bytes).await;

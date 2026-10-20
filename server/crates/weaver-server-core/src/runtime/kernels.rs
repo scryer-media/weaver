@@ -52,7 +52,7 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             KernelComponent::YencCrc32,
             "weaver-yenc",
             crc_ladder(),
-            yenc_crc_kernel,
+            crc_kernel,
             &[],
         ),
         selection(
@@ -78,8 +78,8 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             KernelComponent::Par2Crc32,
             "par2-rs",
             crc_ladder(),
-            rarpar_crc_kernel,
-            &[RARPAR_CRC_ENV],
+            crc_kernel,
+            &[],
         ),
         selection(
             KernelComponent::RarRecovery,
@@ -92,8 +92,8 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             KernelComponent::RarCrc32,
             "unrar-rs",
             crc_ladder(),
-            rarpar_crc_kernel,
-            &[RARPAR_CRC_ENV],
+            crc_kernel,
+            &[],
         ),
         selection(
             KernelComponent::RarSha1,
@@ -194,10 +194,6 @@ const CRC_PMULL_SHA3: &str = "PMULL + SHA3";
 const CRC_PMULL: &str = "PMULL";
 const CRC_TABLES: &str = "Lookup tables";
 
-// `RARPAR_CRC32_VPCLMUL`: `0` stands the 256-bit fold down, `1` engages it
-// alongside AVX-512VL too. It never enables the fold on a CPU without it.
-const RARPAR_CRC_ENV: &str = "RARPAR_CRC32_VPCLMUL";
-
 fn crc_ladder() -> Vec<&'static str> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -232,34 +228,9 @@ fn crc_turbo_kernel() -> &'static str {
     }
 }
 
-fn yenc_crc_kernel(_read_env: bool) -> &'static str {
+// weaver-yenc, par2-rs and unrar-rs all hash through crc-turbo.
+fn crc_kernel(_read_env: bool) -> &'static str {
     crc_turbo_kernel()
-}
-
-// par2-rs and unrar-rs carry the same fold behind the same gate.
-fn rarpar_crc_kernel(read_env: bool) -> &'static str {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let capable = is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("pclmulqdq")
-            && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("vpclmulqdq");
-        let fold = if env_is(read_env, RARPAR_CRC_ENV, "0") || !capable {
-            false
-        } else {
-            env_is(read_env, RARPAR_CRC_ENV, "1") || !is_x86_feature_detected!("avx512vl")
-        };
-        if fold {
-            return CRC_VPCLMUL_256;
-        }
-    }
-    let _ = read_env;
-    // The rest is crc-fast's pick, which has no 256-bit tier: where crc-turbo
-    // folds 256 wide, crc-fast drops to SSE.
-    match crc_turbo_kernel() {
-        CRC_VPCLMUL_256 => CRC_PCLMUL_128,
-        kernel => kernel,
-    }
 }
 
 // --- GF(2^16) --------------------------------------------------------------

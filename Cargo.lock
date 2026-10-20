@@ -1304,16 +1304,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
-name = "crc-fast"
-version = "1.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
-dependencies = [
- "digest 0.10.7",
- "spin 0.10.1",
-]
-
-[[package]]
 name = "crc-turbo"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2965,12 +2955,12 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53fb40ce177d0fd92480e8a17b469ee3688cc9f64c615b6457635a661398bde6"
+checksum = "3af35044209c991b5cafb0821392f36b3b3eb3bdd5411c21562716705139a621"
 dependencies = [
  "aws-lc-rs",
- "crc-fast",
+ "crc-turbo",
 ]
 
 [[package]]
@@ -3402,13 +3392,13 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.11"
+version = "0.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d01a571c77652bdf9675ec44917467bc311d1da12a3c6a644d166657170aaa7d"
+checksum = "5f79a1a5151a773c595f156d322236c3689404d622e5a85dc3188a06503529fc"
 dependencies = [
  "bytes",
  "cap-std",
- "crc-fast",
+ "crc-turbo",
  "libc",
  "md-5",
  "memmap2",
@@ -3420,13 +3410,13 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.7.1"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfd8139dda96647351865190d2722f0977cee9b96c409b4b67fb52093981a314"
+checksum = "65be08f04a17afc247c1fed6c5eee3ce0c20411792f244ce2d1dd13dde4c1ba4"
 dependencies = [
  "blake3",
  "cap-std",
- "crc-fast",
+ "crc-turbo",
  "libc",
  "rayon",
  "reedsolomon-rs",
@@ -4604,9 +4594,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.1"
+version = "0.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dd107b58f5db033006234ef50d51eb99a9b7ef0f4a90a463a911023bda06436"
+checksum = "110c472f8f3db3fb0f3a41d9e288e36bb754f3dc0475a6c549d7754cdca62bed"
 dependencies = [
  "aws-lc-rs",
  "brotli 9.0.0",
@@ -5187,7 +5177,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5774,13 +5764,13 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.12.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96deecfdf76128669eb50516caf4956f3b0a246e463e8732c9dccdcf4142b17"
+checksum = "f2821acdbd624de10b9d9fed6a959dfe7e911087f01e4b20449ecc6ee8ddfb47"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
- "crc-fast",
+ "crc-turbo",
  "filetime",
  "libc",
  "memchr",
