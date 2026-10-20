@@ -12,7 +12,12 @@ use bytes::Bytes;
 use either::Either;
 use encoding_rs::Encoding;
 use serde_derive::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::HashSet, iter::once, path::PathBuf};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, hash_map::Entry},
+    iter::once,
+    path::PathBuf,
+};
 use tracing::debug;
 
 use crate::core::{Error, hash_id::Id20, lengths::Lengths};
@@ -182,6 +187,14 @@ where
             .map(move |part| encoding.decode(part).0)
     }
 
+    /// Whether the name is a BitComet padding file, which carries no `attr`
+    /// and is known by its name alone.
+    fn is_bitcomet_padding(&self) -> bool {
+        self.iter_components_bytes()
+            .last()
+            .is_some_and(|name| memchr::memmem::find(name, b"_____padding_file_").is_some())
+    }
+
     /// Iterate path components as bytes.
     pub fn iter_components_bytes(&self) -> impl Iterator<Item = &'a [u8]> + use<'a, BufType> {
         let it = match self.data {
@@ -217,12 +230,18 @@ impl<BufType> FileDetails<'_, BufType>
 where
     BufType: AsRef<[u8]>,
 {
+    /// The file's BEP 47 attributes. A file is padding when its `attr` holds
+    /// `p`, or when its name is BitComet's `_____padding_file_` form: either
+    /// way it is all zeroes and never written. A `.pad/` path alone marks
+    /// nothing.
     pub fn attrs(&self) -> FileDetailsAttrs {
-        let attrs = match self.attr {
-            Some(attrs) => attrs,
-            None => return FileDetailsAttrs::default(),
+        let mut result = FileDetailsAttrs {
+            padding: self.filename.is_bitcomet_padding(),
+            ..Default::default()
         };
-        let mut result = FileDetailsAttrs::default();
+        let Some(attrs) = self.attr else {
+            return result;
+        };
         for byte in attrs.as_ref().iter().copied() {
             match byte {
                 b'l' => result.symlink = true,
@@ -346,16 +365,23 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
             return Err(Error::BadTorrentNoFiles);
         }
 
-        let mut unique_filenames = HashSet::<PathBuf>::new();
+        // Every file has a name of its own, except that a padding file, which
+        // is never written, may share its name with another padding file of
+        // the same length. Hybrid v1+v2 torrents repeat `.pad/N` that way.
+        let mut filenames = HashMap::<PathBuf, (u64, bool)>::new();
         for fd in validated.iter_file_details() {
             let pb = fd.filename.to_pathbuf();
             if pb.as_os_str().is_empty() {
                 return Err(Error::BadTorrentFileNoName);
             }
-            unique_filenames.insert(pb);
-        }
-        if unique_filenames.len() != seen_files {
-            return Err(Error::BadTorrentDuplicateFilenames);
+            let this = (fd.len, fd.attrs().padding);
+            match filenames.entry(pb) {
+                Entry::Vacant(name) => {
+                    name.insert(this);
+                }
+                Entry::Occupied(name) if *name.get() == this && this.1 => {}
+                Entry::Occupied(_) => return Err(Error::BadTorrentDuplicateFilenames),
+            }
         }
 
         Ok(validated)
@@ -580,5 +606,83 @@ mod tests {
         let buf = include_bytes!("../../resources/test/private.torrent");
         let torrent: TorrentMetaV1Borrowed = from_bytes(buf).unwrap();
         assert!(torrent.info.data.private);
+    }
+
+    fn file(path: &[&str], length: u64, attr: Option<&str>) -> TorrentMetaV1File<ByteBufOwned> {
+        TorrentMetaV1File {
+            length,
+            path: path.iter().map(|c| c.as_bytes().into()).collect(),
+            attr: attr.map(|a| a.as_bytes().into()),
+            sha1: None,
+            symlink_path: None,
+        }
+    }
+
+    fn multi_file_info(
+        files: Vec<TorrentMetaV1File<ByteBufOwned>>,
+    ) -> TorrentMetaV1Info<ByteBufOwned> {
+        TorrentMetaV1Info {
+            name: Some(b"hybrid"[..].into()),
+            piece_length: 16384,
+            files: Some(files),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn repeated_pad_file_names_are_not_duplicates() {
+        // A hybrid v1+v2 layout: every file but the last is padded to a piece
+        // boundary, and the pads repeat their `.pad/N` name.
+        let info = multi_file_info(vec![
+            file(&["a.bin"], 100, None),
+            file(&[".pad", "123"], 123, Some("p")),
+            file(&["b.bin"], 100, None),
+            file(&[".pad", "123"], 123, Some("p")),
+            file(&["c.bin"], 100, None),
+        ]);
+        let validated = info.validate().unwrap();
+        let padding = validated
+            .iter_file_details()
+            .map(|d| d.attrs().padding)
+            .collect::<Vec<_>>();
+        assert_eq!(padding, vec![false, true, false, true, false]);
+
+        // A BitComet pad is known by its name alone.
+        let validated = multi_file_info(vec![
+            file(&["a.bin"], 100, None),
+            file(&["_____padding_file_0_if you see this file, please update to BitComet 0.85 or above____"], 123, None),
+            file(&["b.bin"], 100, None),
+        ])
+        .validate()
+        .unwrap();
+        let padding = validated
+            .iter_file_details()
+            .map(|d| d.attrs().padding)
+            .collect::<Vec<_>>();
+        assert_eq!(padding, vec![false, true, false]);
+    }
+
+    #[test]
+    fn a_real_duplicate_name_is_refused() {
+        for files in [
+            vec![file(&["a.bin"], 100, None), file(&["a.bin"], 100, None)],
+            // A `.pad/` path without the attribute is an ordinary file.
+            vec![
+                file(&[".pad", "123"], 123, None),
+                file(&[".pad", "123"], 123, None),
+            ],
+            // A pad file never shares a name with a file that is written.
+            vec![file(&["x"], 7, Some("p")), file(&["x"], 7, None)],
+            // Nor with a pad file of another length.
+            vec![
+                file(&[".pad", "7"], 7, Some("p")),
+                file(&[".pad", "7"], 8, Some("p")),
+            ],
+        ] {
+            assert!(matches!(
+                multi_file_info(files).validate(),
+                Err(Error::BadTorrentDuplicateFilenames)
+            ));
+        }
     }
 }
