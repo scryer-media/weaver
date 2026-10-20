@@ -12,6 +12,7 @@ import { RecordEditor } from "@/next/components/RecordEditor";
 import { GridRow } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
+import { informationFields, transferFields, type TorrentField } from "@/next/features/torrents/general";
 import { countLabel } from "@/next/i18n/labels";
 import { EMPTY_SEEDING, durationText, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
@@ -73,7 +74,20 @@ function seedingSourceText(t: Translate, torrent: TorrentData): string {
   }
 }
 
-/** A torrent job's own blocks on the job's screen: the swarm, its trackers, its files and how it seeds. */
+/** A general section's rows in qBittorrent's three columns; a wide row spans them. */
+function GeneralGrid({ fields }: { fields: TorrentField[] }) {
+  return (
+    <div className="grid grid-cols-2 gap-x-4 gap-y-[13px] sm:grid-cols-3">
+      {fields.map((field) => (
+        <div key={field.label} className={field.wide ? "col-span-full min-w-0" : "min-w-0"}>
+          <Field label={field.label} value={field.value} title={field.value} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** A torrent job's own blocks on the job's screen: its transfer, its information, how it seeds, its trackers and its files. */
 export function TorrentDetail({
   torrent,
   onChanged,
@@ -100,28 +114,14 @@ export function TorrentDetail({
     );
   };
 
-  const percent = torrent.totalBytes > 0 ? (torrent.haveBytes / torrent.totalBytes) * 100 : 0;
-  const swarm = [
-    { label: t("next.torrent.infoHash"), value: torrent.infohash },
-    { label: t("next.inspector.totalSize"), value: formatSize(torrent.totalBytes) },
-    { label: t("next.torrent.progress"), value: `${percent.toFixed(1)}%` },
-    { label: t("next.torrent.seedsLeechers"), value: `${torrent.seeds} / ${torrent.leechers}` },
-    { label: t("next.torrent.peers"), value: String(torrent.peers) },
-    { label: t("next.torrent.ratio"), value: torrent.ratio.toFixed(2) },
-    { label: t("next.torrent.uploaded"), value: formatSize(torrent.uploadedBytes) },
-    { label: t("next.job.downloaded"), value: formatSize(torrent.downloadedBytes) },
-    { label: t("next.torrent.route"), value: torrent.route ?? EM_DASH },
-    { label: t("next.torrents.unpack"), value: t(torrent.unpack ? "next.common.on" : "next.common.off") },
-  ];
-
   return (
     <>
-      <DetailBlock id="torrent" title={t("next.protocol.torrent")} note={torrent.detail ?? undefined}>
-        <div className="grid gap-x-4 gap-y-[13px]" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))" }}>
-          {swarm.map((field) => (
-            <Field key={field.label} label={field.label} value={field.value} title={field.value} />
-          ))}
-        </div>
+      <DetailBlock id="transfer" title={t("next.torrent.transfer")} note={torrent.detail ?? undefined}>
+        <GeneralGrid fields={transferFields(t, torrent)} />
+      </DetailBlock>
+
+      <DetailBlock id="information" title={t("next.torrent.information")}>
+        <GeneralGrid fields={informationFields(t, torrent)} />
       </DetailBlock>
 
       <DetailBlock

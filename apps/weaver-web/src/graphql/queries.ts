@@ -1523,9 +1523,28 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       ratio
       downloadBps
       uploadBps
+      etaSeconds
       peers
       seeds
       leechers
+      maxPeers
+      swarmSeeds
+      swarmLeechers
+      reannounceSeconds
+      activeSeconds
+      downloadAvgBps
+      uploadAvgBps
+      wastedBytes
+      lastSeenCompleteMs
+      pieceCount
+      pieceSize
+      piecesHave
+      createdBy
+      createdAtMs
+      comment
+      addedAtMs
+      completedAtMs
+      savePath
       seedingLeft
       seedingOverride {
         ...SeedingPolicyFields

@@ -83,9 +83,31 @@ export interface TorrentData extends TorrentSummaryData {
   uploadedBytes: number;
   downloadedBytes: number;
   downloadBps: number;
+  etaSeconds: number | null;
   peers: number;
   seeds: number;
   leechers: number;
+  /** The most peers a torrent connects to. */
+  maxPeers: number;
+  /** The swarm as its trackers last counted it. */
+  swarmSeeds: number | null;
+  swarmLeechers: number | null;
+  reannounceSeconds: number | null;
+  /** Seconds spent running in a session. */
+  activeSeconds: number;
+  downloadAvgBps: number;
+  uploadAvgBps: number;
+  wastedBytes: number;
+  lastSeenCompleteMs: number | null;
+  pieceCount: number | null;
+  pieceSize: number | null;
+  piecesHave: number | null;
+  createdBy: string | null;
+  createdAtMs: number | null;
+  comment: string | null;
+  addedAtMs: number;
+  completedAtMs: number | null;
+  savePath: string | null;
   seedingLeft: string | null;
   /** The torrent's own policy; null when it inherits one. */
   seedingOverride: SeedingPolicyData | null;
