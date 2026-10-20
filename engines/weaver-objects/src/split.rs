@@ -7,7 +7,8 @@
 // number, whatever that is: `.001`, `.10` and `.100` alike, so a set renamed
 // to numbers of its own chains as a plain one does. Only the first piece
 // says what the set is; the others carry no signature, so their names are
-// all that places them. Case never matters.
+// all that places them. A set known by names alone counts from the number
+// its format gives the first piece. Case never matters.
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Piece {
@@ -22,6 +23,14 @@ impl Piece {
         (self.stem == first.stem)
             .then(|| self.number.checked_sub(first.number))
             .flatten()
+    }
+
+    // The piece of my set that carries `number`.
+    pub(crate) fn numbered(&self, number: u32) -> Piece {
+        Piece {
+            stem: self.stem.clone(),
+            number,
+        }
     }
 
     pub(crate) fn same_set(&self, other: &Piece) -> bool {

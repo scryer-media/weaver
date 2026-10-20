@@ -20,7 +20,7 @@ use crate::names::{Moved, NameLedger, Position};
 use crate::object::{Carried, Extent, Kind, Object, ObjectId, Placement, Posting};
 use crate::recovery::Recovery;
 use crate::seek::{Pull, Seek, SeekUp};
-use crate::sniff::{Sniff, sniff};
+use crate::sniff::{Sniff, signed, sniff};
 use crate::volume::{ByteRange, VolumeIndex};
 
 mod lent;
@@ -1514,6 +1514,9 @@ impl Tree {
                     Ok(Some(child)) => {
                         self.bound(node, member, kind, child, effects);
                         self.offer_unowned(node, child, effects);
+                        if matches!(signed(prefix, length), Sniff::Object(_)) {
+                            self.take_named(node, child, effects);
+                        }
                     }
                     Ok(None) => {}
                     Err(why) => effects.push(Effect::Refused { node, member, why }),
@@ -1531,6 +1534,96 @@ impl Tree {
                 && !found.undecided.contains(&member)
                 && !self.retired.contains_key(&(node, member))
         })
+    }
+
+    // An object founded on nothing but names: none of its volumes' fronts
+    // signs anything, so its hold on each is its name's.
+    fn founded_by_name(&self, node: NodeId) -> bool {
+        let Some(found) = self.nodes.get(&node) else {
+            return false;
+        };
+        let Some(binding) = found.binding.as_ref() else {
+            return false;
+        };
+        let Some(namespace) = self.namespace(binding.parent) else {
+            return false;
+        };
+        binding.volumes.values().all(|member| {
+            let length = namespace.get(*member).and_then(|record| record.length);
+            !matches!(
+                signed(namespace.first_bytes(*member), length),
+                Sniff::Object(_)
+            )
+        })
+    }
+
+    // An object its bytes founded takes, from each sibling founded by name
+    // alone, every volume its own claim places: a name is all that held
+    // them there, and bytes outrank names. The volume goes as one given
+    // back does, its file the member's own and nothing copied, straight to
+    // its new owner, never offered to the sibling again. A sibling left
+    // with no volume goes.
+    fn take_named(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
+        let named: Vec<NodeId> = self
+            .bound_below(node)
+            .into_iter()
+            .filter(|sibling| *sibling != child && self.founded_by_name(*sibling))
+            .collect();
+        for sibling in named {
+            let held: Vec<(VolumeIndex, MemberId)> = self
+                .nodes
+                .get(&sibling)
+                .and_then(|found| found.binding.as_ref())
+                .map(|binding| binding.volumes.iter().map(|(v, m)| (*v, *m)).collect())
+                .unwrap_or_default();
+            for (volume, member) in held {
+                let Some((name, length, front)) = self.namespace(node).and_then(|namespace| {
+                    namespace.get(member).map(|record| {
+                        (
+                            record.name.clone(),
+                            record.length,
+                            namespace.first_bytes(member).to_vec(),
+                        )
+                    })
+                }) else {
+                    continue;
+                };
+                let Some(place) = self
+                    .nodes
+                    .get_mut(&child)
+                    .and_then(|found| found.object.as_mut())
+                    .and_then(|object| object.claim(&name, &front, length))
+                else {
+                    continue;
+                };
+                if let Some(found) = self.nodes.get_mut(&sibling) {
+                    if let Some(binding) = found.binding.as_mut() {
+                        binding.volumes.remove(&volume);
+                        binding.awaiting.remove(&volume);
+                    }
+                    if let Some(object) = found.object.as_mut() {
+                        object.taken(volume);
+                    }
+                }
+                if let Some(found) = self.nodes.get_mut(&node) {
+                    found.children.remove(&member);
+                    found.namespace.unbind(member);
+                }
+                effects.push(Effect::GivenBack {
+                    node,
+                    member,
+                    from: sibling,
+                    volume,
+                });
+                self.join(node, member, (child, place), (&name, &front), effects);
+            }
+            let empty = self
+                .nodes
+                .get(&sibling)
+                .and_then(|found| found.binding.as_ref())
+                .is_some_and(|binding| binding.volumes.is_empty());
+            self.forget_empty(sibling, empty);
+        }
     }
 
     // Offer every member of `node`'s namespace that has no owner to the
@@ -2419,9 +2512,9 @@ mod tests {
             None
         }
         fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
-            match name.rsplit_once(".r") {
-                Some((_, "00")) => Some(VolumeIndex(1)),
-                Some((_, "01")) => Some(VolumeIndex(2)),
+            match name.rsplit_once('.') {
+                Some((_, "r00" | "002")) => Some(VolumeIndex(1)),
+                Some((_, "r01" | "003")) => Some(VolumeIndex(2)),
                 _ => None,
             }
         }
@@ -2471,12 +2564,55 @@ mod tests {
         }
     }
 
+    // A pretend set of pieces, founded by name alone: any `.NNN` piece is
+    // its volume, counted from `.001`.
+    struct Named(Vec<VolumeIndex>);
+
+    impl Object for Named {
+        fn kind(&self) -> Kind {
+            Kind::Split
+        }
+        fn deliver(
+            &mut self,
+            _: Delivery<'_>,
+            _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+            _: &mut Vec<Emit>,
+        ) {
+        }
+        fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+        fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+        fn wants(&mut self, _: &mut Vec<Seek>) {}
+        fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+        fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+            out.push(Placement::Envelope {
+                envelope: volume.0,
+                range,
+            });
+        }
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
+            None
+        }
+        fn bound(&mut self, volume: VolumeIndex, _: &str, _: &[u8], _: Option<u64>) {
+            self.0.push(volume);
+        }
+        fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Option<VolumeIndex> {
+            let (_, digits) = name.rsplit_once('.')?;
+            let number: u32 = digits.parse().ok()?;
+            Some(VolumeIndex(number.checked_sub(1)?))
+        }
+        fn taken(&mut self, volume: VolumeIndex) {
+            self.0.retain(|held| *held != volume);
+        }
+    }
+
     struct Build;
     impl Builder for Build {
         fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
             match kind {
                 Kind::RarStore => Some(Box::new(Split { announced: false })),
                 Kind::RarEngine => Some(Box::new(Reader(Vec::new()))),
+                Kind::Split => Some(Box::new(Named(Vec::new()))),
                 _ => None,
             }
         }
@@ -2681,6 +2817,64 @@ mod tests {
             kind: Kind::RarStore,
             child
         }));
+    }
+
+    // A piece that comes before its first founds a set by its name alone;
+    // the first, signed, founds the store, which takes the piece from the
+    // set where its own claim places it, and the set, left empty, goes.
+    #[test]
+    fn a_piece_founded_by_name_goes_to_the_store_its_first_founds() {
+        let mut tree = Tree::new();
+        let mut effects = Vec::new();
+        let piece = tree.announce_root("show.002", Some(5), &mut Vec::new());
+        tree.deliver(
+            NodeId::ROOT,
+            piece,
+            0,
+            Bytes::from_static(b"world"),
+            Provenance::Fresh,
+            &mut Build,
+            &mut effects,
+        );
+        let (named, place) = tree.child_of(NodeId::ROOT, piece).expect("founded by name");
+        assert_eq!(place, VolumeIndex(1));
+        assert!(effects.contains(&Effect::Bound {
+            node: NodeId::ROOT,
+            member: piece,
+            kind: Kind::Split,
+            child: named
+        }));
+        let first = tree.announce_root("show.rar", None, &mut Vec::new());
+        let mut bytes = SIGNATURE.to_vec();
+        bytes.extend_from_slice(b"hello");
+        effects.clear();
+        tree.deliver(
+            NodeId::ROOT,
+            first,
+            0,
+            bytes.into(),
+            Provenance::Fresh,
+            &mut Build,
+            &mut effects,
+        );
+        let store = tree.child_of(NodeId::ROOT, first).expect("bound").0;
+        assert_eq!(
+            tree.child_of(NodeId::ROOT, piece),
+            Some((store, VolumeIndex(1)))
+        );
+        assert!(effects.contains(&Effect::GivenBack {
+            node: NodeId::ROOT,
+            member: piece,
+            from: named,
+            volume: VolumeIndex(1),
+        }));
+        assert!(effects.contains(&Effect::Bound {
+            node: NodeId::ROOT,
+            member: piece,
+            kind: Kind::RarStore,
+            child: store
+        }));
+        assert!(tree.namespace(named).is_none(), "an empty set goes");
     }
 
     // A member whose front stopped at a lost slice, 66 bytes in, cannot yet

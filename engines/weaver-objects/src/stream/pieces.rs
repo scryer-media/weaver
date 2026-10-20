@@ -4,7 +4,8 @@
 // A plain file posted in numbered pieces, `name.001`, `name.002`, …, whose
 // first piece opens no signature: the pieces are one member, `name`, their
 // bytes joined in order and nothing done to them. The pieces are its
-// volumes, never delivered themselves.
+// volumes, never delivered themselves, so a piece whose first never came is
+// no file of its own: the set counts from `.001`, and any piece founds it.
 
 use std::io::{self, Read};
 
@@ -20,6 +21,7 @@ const WINDOW: u64 = 64 << 10;
 
 impl Decoder for Pieces {
     const KIND: Kind = Kind::Split;
+    const FIRST_PIECE: Option<u32> = Some(1);
 
     fn window(_first: &[u8]) -> u64 {
         WINDOW

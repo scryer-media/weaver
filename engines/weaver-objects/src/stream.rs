@@ -50,6 +50,12 @@ use crate::split;
 pub trait Decoder: Send + Sync + 'static {
     const KIND: Kind;
 
+    // The number a set's first piece carries when names are all that
+    // place its pieces, so any piece founds the set and the first may come
+    // after it, or never. `None` where the first piece is the one that
+    // opens the signature, whatever its number.
+    const FIRST_PIECE: Option<u32> = None;
+
     // The bytes a run of this stream holds resident, as the stream's first
     // bytes declare them, or the format's largest while they do not say.
     fn window(first: &[u8]) -> u64;
@@ -89,22 +95,25 @@ pub type SplitStream = Stream<Pieces>;
 // header up to the field that sizes its window.
 const FIRST: usize = 64;
 
-// Its facts are its first volume's name, its front and the pieces after it. How far a run has read is the run's
-// live progress, kept on the owner's shelf and never here: a restored stream
-// is one whose run has not started, and it replays from the stream's start
-// over the partial.
+// Its facts are a volume's name, the first volume's front and the volumes
+// it holds. How far a run has read is the run's live progress, kept on the
+// owner's shelf and never here: a restored stream is one whose run has not
+// started, and it replays from the stream's start over the partial.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Stream<D> {
     #[serde(skip)]
     decoder: PhantomData<fn() -> D>,
+    // The first volume's name, or the name of whichever piece founded the
+    // stream until the first is bound: the member's name and the set's stem
+    // read the same from either.
     name: String,
     first: Vec<u8>,
     // The first volume grows no further, so a front shorter than FIRST is
     // the whole of it.
     #[serde(default)]
     closed: bool,
-    // The volumes after the first, by index.
+    // The volumes bound, by index.
     #[serde(default)]
     pieces: BTreeSet<u32>,
 }
@@ -128,7 +137,7 @@ impl<D: Decoder> Stream<D> {
 }
 
 impl<D: Decoder> Durable for Stream<D> {
-    const VERSION: u16 = 2;
+    const VERSION: u16 = 3;
 
     fn impossible(&self) -> Option<&'static str> {
         (self.first.len() > FIRST).then_some("a front longer than a stream keeps")
@@ -191,11 +200,10 @@ impl<D: Decoder> Object for Stream<D> {
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
-        if volume == VolumeIndex(0) {
+        if volume == VolumeIndex(0) || self.name.is_empty() {
             name.clone_into(&mut self.name);
-        } else {
-            self.pieces.insert(volume.0);
         }
+        self.pieces.insert(volume.0);
     }
 
     fn renamed(&mut self, volume: VolumeIndex, name: &str) {
@@ -204,9 +212,10 @@ impl<D: Decoder> Object for Stream<D> {
         }
     }
 
-    // A piece numbered after the first volume's own, when the first is a
-    // piece: its place is its number counted from the first's. A name is
-    // all that places a piece here, so it never outvotes a front a format
+    // A piece of the set, when the volumes are pieces: its place is its
+    // number counted from the first piece's, the format's number for a set
+    // known by names alone and else the first volume's own. A name is all
+    // that places a piece here, so it never outvotes a front a format
     // names: that piece is the format's, wherever its name numbers it.
     fn claim(
         &mut self,
@@ -217,9 +226,23 @@ impl<D: Decoder> Object for Stream<D> {
         if matches!(signed(first_bytes, length), Sniff::Object(_)) {
             return None;
         }
-        let first = split::parse(&self.name)?;
-        let index = split::parse(name)?.index_from(&first)?;
-        (index != 0 && !self.pieces.contains(&index)).then_some(VolumeIndex(index))
+        let piece = split::parse(name)?;
+        let first = match D::FIRST_PIECE {
+            Some(number) => piece.numbered(number),
+            None => split::parse(&self.name)?,
+        };
+        let index = piece.index_from(&first)?;
+        (!self.pieces.contains(&index)).then_some(VolumeIndex(index))
+    }
+
+    // The object its bytes founded holds it now; the front it carried was
+    // the first volume's only if it was that volume.
+    fn taken(&mut self, volume: VolumeIndex) {
+        self.pieces.remove(&volume.0);
+        if volume == VolumeIndex(0) {
+            self.first.clear();
+            self.closed = false;
+        }
     }
 
     fn reads_in_order(&self) -> bool {

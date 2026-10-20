@@ -9,7 +9,8 @@
 // under an obfuscated name. A name decides only once the bytes have ruled
 // out every signature: tar, bzip2 and zip by their extensions too, and raw
 // deflate, brotli and SFV, which have no signature, by theirs alone, as is
-// the first numbered piece of a plain file split into pieces.
+// any numbered piece of a file split into pieces, whichever piece it is: a
+// piece whose first never came is no file of its own.
 //
 // Bytes read before a verdict, per kind:
 //
@@ -240,7 +241,6 @@ const NAMED: &[(Kind, &[&str])] = &[
     (Kind::Brotli, &[".br"]),
     (Kind::Sfv, &[".sfv"]),
     (Kind::Zip, &[".zip"]),
-    (Kind::Split, &[".001"]),
     (Kind::RarRecovery, &[".rev"]),
 ];
 
@@ -257,6 +257,15 @@ fn named(name: &str) -> Option<Kind> {
                 .any(|extension| has_extension(name, extension))
         })
         .map(|(kind, _)| *kind)
+        .or_else(|| numbered_piece(name).then_some(Kind::Split))
+}
+
+// A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
+// its last extension is all digits. Which piece it is, the object says.
+fn numbered_piece(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(stem, digits)| {
+        !stem.is_empty() && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn has_extension(name: &str, extension: &str) -> bool {
@@ -555,16 +564,28 @@ mod tests {
     }
 
     #[test]
-    fn sevenz_continuation_is_pending_then_leaf() {
+    fn sevenz_continuation_is_pending_then_a_piece() {
         // Bytes that agree with the 7z signature so far keep it pending.
         assert_eq!(sniff("a.7z.002", &[0x37, 0x7A], None), Sniff::Pending);
         let mut continuation = vec![0x37, 0x7A, 0x00, 0x00, 0x00, 0x00];
         continuation.extend(plain(600));
-        assert_eq!(sniff("a.7z.002", &continuation, None), Sniff::Leaf);
+        assert_eq!(sniff("a.7z.002", &continuation, None), object(Kind::Split));
         assert_eq!(
             sniff("a.7z.001", &seven_z(), None),
             object(Kind::SevenZipStore)
         );
+    }
+
+    // Whichever piece comes, and whatever its number: its first may never
+    // come, and a piece alone is no file. Its bytes still speak first.
+    #[test]
+    fn any_numbered_piece_is_a_split_by_name() {
+        let bytes = plain(600);
+        assert_eq!(sniff("a.001", &bytes, None), object(Kind::Split));
+        assert_eq!(sniff("a.mkv.003", &bytes, None), object(Kind::Split));
+        assert_eq!(sniff("a.7z.002", &[], Some(4)), Sniff::Pending);
+        assert_eq!(sniff("a.7z.0a2", &bytes, None), Sniff::Leaf);
+        assert_eq!(sniff(".001", &bytes, None), Sniff::Leaf);
     }
 
     #[test]

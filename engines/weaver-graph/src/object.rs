@@ -363,6 +363,11 @@ pub trait Object: Send + Sync {
         None
     }
 
+    // A volume of mine is now a volume of an object its bytes founded: my
+    // claim on it was its name's, which bytes outrank. I hold nothing of it
+    // from here.
+    fn taken(&mut self, _volume: VolumeIndex) {}
+
     // A member a sibling gave back, offered with what that sibling parsed
     // of it: is it one of my volumes? Answered from what was parsed, never
     // by reading the member again; `None` from an object that cannot read
