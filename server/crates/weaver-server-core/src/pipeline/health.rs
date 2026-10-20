@@ -469,7 +469,7 @@ impl Pipeline {
                 file_spec
                     .segments
                     .iter()
-                    .map(|segment| segment.message_id.clone())
+                    .map(|segment| segment.message_ids.in_use().to_string())
             })
             .collect()
     }

@@ -435,7 +435,9 @@ impl Scenario {
                             ordinal: ordinal as u32,
                             article_number: ordinal as u32,
                             bytes: article.len() as u32,
-                            message_id: format!("lantern-{index}-{ordinal}@example.com"),
+                            message_ids: crate::jobs::MessageIds::new(vec![format!(
+                                "lantern-{index}-{ordinal}@example.com"
+                            )]),
                         })
                         .collect(),
                 })

@@ -9,7 +9,7 @@ use tracing::info;
 use crate::ingest::{append_original_title_metadata, derive_release_name};
 use crate::jobs::ids::JobId;
 use crate::jobs::{
-    ArchivePasswordCandidate, ArchivePasswordSource, FileSpec, JobSpec, SegmentSpec,
+    ArchivePasswordCandidate, ArchivePasswordSource, FileSpec, JobSpec, MessageIds, SegmentSpec,
 };
 use crate::settings::archive_passwords;
 use weaver_model::files::{FileRole, unique_download_filenames};
@@ -122,7 +122,7 @@ pub(super) fn nzb_file_specs(
                 ordinal: ordinal as u32,
                 article_number: segment.number,
                 bytes: segment.bytes,
-                message_id: segment.message_id.clone(),
+                message_ids: MessageIds::new(segment.message_ids.clone()),
             })
             .collect();
 
@@ -295,3 +295,50 @@ impl std::fmt::Display for ImportError {
 }
 
 impl std::error::Error for ImportError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_of(segments: &str) -> JobSpec {
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="&quot;slot.bin&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>{segments}</segments>
+  </file>
+</nzb>"#
+        );
+        import_nzb(xml.as_bytes(), Path::new("slot.nzb")).unwrap().1
+    }
+
+    // A part listed twice is one article holding both ids in NZB order; the
+    // first is the one it is fetched by.
+    #[test]
+    fn a_part_listed_twice_is_one_article_with_both_ids() {
+        let spec = spec_of(
+            r#"<segment bytes="10" number="1">first@example.invalid</segment>
+               <segment bytes="10" number="2">two@example.invalid</segment>
+               <segment bytes="10" number="1">again@example.invalid</segment>"#,
+        );
+        let segments = &spec.files[0].segments;
+        assert_eq!(segments.len(), 2);
+        assert_eq!(
+            segments[0].message_ids.all(),
+            ["first@example.invalid", "again@example.invalid"]
+        );
+        assert_eq!(segments[0].message_ids.in_use(), "first@example.invalid");
+        assert_eq!(segments[0].article_number, 1);
+        assert_eq!(spec.total_bytes, 20);
+    }
+
+    #[test]
+    fn a_part_listed_once_holds_one_id() {
+        let spec = spec_of(r#"<segment bytes="10" number="1">only@example.invalid</segment>"#);
+        let ids = &spec.files[0].segments[0].message_ids;
+        assert_eq!(ids.all(), ["only@example.invalid"]);
+        assert_eq!(ids.in_use(), "only@example.invalid");
+        assert!(!ids.has_next());
+    }
+}

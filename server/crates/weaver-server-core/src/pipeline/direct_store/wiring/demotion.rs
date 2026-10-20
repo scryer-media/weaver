@@ -1354,7 +1354,7 @@ impl Pipeline {
                     }
                     work.push(DownloadWork {
                         segment_id,
-                        message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
+                        message_id: crate::jobs::ids::MessageId::new(segment.message_ids.in_use()),
                         groups: std::sync::Arc::from(file.groups.as_slice()),
                         priority: file.role.download_priority(),
                         byte_estimate: segment.bytes,
@@ -1461,7 +1461,7 @@ impl Pipeline {
                     }
                     work.push(DownloadWork {
                         segment_id,
-                        message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
+                        message_id: crate::jobs::ids::MessageId::new(segment.message_ids.in_use()),
                         groups: std::sync::Arc::from(file.groups.as_slice()),
                         priority: file.role.download_priority(),
                         byte_estimate: segment.bytes,

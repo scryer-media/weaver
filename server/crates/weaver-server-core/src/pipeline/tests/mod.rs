@@ -32,7 +32,7 @@ macro_rules! segment_spec {
             ordinal: $number,
             article_number: $number,
             bytes: $bytes,
-            message_id: $message_id,
+            message_ids: crate::jobs::MessageIds::new(vec![$message_id]),
         }
     };
     (ordinal: $ordinal:expr, article_number: $article_number:expr, bytes: $bytes:expr, message_id: $message_id:expr $(,)?) => {
@@ -40,7 +40,7 @@ macro_rules! segment_spec {
             ordinal: $ordinal,
             article_number: $article_number,
             bytes: $bytes,
-            message_id: $message_id,
+            message_ids: crate::jobs::MessageIds::new(vec![$message_id]),
         }
     };
 }

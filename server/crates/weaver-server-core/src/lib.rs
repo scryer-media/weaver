@@ -52,7 +52,7 @@ pub use jobs::{
     DuplicateMode, DuplicatePolicy, EgressQuotaBlock, ExtractionChunk, FieldUpdate, FileSpec,
     FingerprintEvidence, FingerprintKind, HardwareProfileInForce, HistoryDeleteOutcome,
     JobFingerprint, JobId, JobInfo, JobPhase, JobPhaseProgress, JobSpec, JobState, JobStatus,
-    JobUpdate, MessageId, NntpRuntimeActivation, NzbFileId, PhaseCounters, PostState,
+    JobUpdate, MessageId, MessageIds, NntpRuntimeActivation, NzbFileId, PhaseCounters, PostState,
     QueueMoveTarget, RecoveredJob, RestoreJobRequest, RunState, SchedulerCommand, SchedulerError,
     SchedulerHandle, SegmentId, SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource,
     SemanticCandidateState, SemanticDuplicate, SemanticDuplicateLifecycleEvent,

@@ -976,7 +976,7 @@ impl Pipeline {
                 retry_count + 1,
                 DownloadWork {
                     segment_id,
-                    message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+                    message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
                     groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                     priority: file_spec.role.download_priority(),
                     byte_estimate: seg_spec.bytes,
@@ -1286,10 +1286,10 @@ impl Pipeline {
         }
     }
 
-    // Whether a body that failed to decode goes to another server: the job
-    // still downloads, the article has decode retries left, and a server
-    // that has not served it remains. With no such server, none configured
-    // among them, the damage stands as it came.
+    // Whether a body that failed to decode is fetched again: the job still
+    // downloads, and the article holds another message-id, or has decode
+    // retries left and a server that has not served it. With neither, none
+    // configured among them, the damage stands as it came.
     pub(crate) fn decode_retry_left(&mut self, segment_id: SegmentId, exclude: &[usize]) -> bool {
         let job_id = segment_id.file_id.job_id;
         if self
@@ -1301,8 +1301,9 @@ impl Pipeline {
             return false;
         }
         let retries = self.decode_retries.get(&segment_id).copied().unwrap_or(0);
-        retries < MAX_SEGMENT_RETRIES
-            && self.unavailable_server_count(job_id, exclude) < self.nntp.pool().server_count()
+        self.message_id_left(segment_id)
+            || retries < MAX_SEGMENT_RETRIES
+                && self.unavailable_server_count(job_id, exclude) < self.nntp.pool().server_count()
     }
 
     // Handle a decode failure by re-queuing the segment for re-download.
@@ -1340,6 +1341,14 @@ impl Pipeline {
             // A later metadata probe still needs its unavailable marker, while
             // the existing terminal booking and metrics remain unchanged.
             self.book_terminal_segment(segment_id, SegmentTerminalState::DecodeExhausted);
+            return;
+        }
+
+        // A body that arrived and did not decode spends its message-id while
+        // the article holds another: the next id is fetched, not this one
+        // from another server.
+        if self.spend_message_id(segment_id) {
+            warn!(segment = %segment_id, error, "decode failed; fetching the part's next message-id");
             return;
         }
 
@@ -1426,7 +1435,7 @@ impl Pipeline {
             {
                 let work = DownloadWork {
                     segment_id,
-                    message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+                    message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
                     groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                     priority: file_spec.role.download_priority(),
                     byte_estimate: seg_spec.bytes,
@@ -3036,7 +3045,7 @@ impl Pipeline {
 
         let work = DownloadWork {
             segment_id,
-            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+            message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
             groups: std::sync::Arc::from(file_spec.groups.as_slice()),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,

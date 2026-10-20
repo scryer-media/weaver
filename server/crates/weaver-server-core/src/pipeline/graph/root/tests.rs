@@ -224,7 +224,9 @@ fn spec(name: &str, files: Vec<(String, FileRole, u32)>) -> JobSpec {
                         ordinal,
                         article_number: ordinal,
                         bytes: 64,
-                        message_id: format!("lantern-{index}-{ordinal}@example.com"),
+                        message_ids: crate::jobs::MessageIds::new(vec![format!(
+                            "lantern-{index}-{ordinal}@example.com"
+                        )]),
                     })
                     .collect(),
             })

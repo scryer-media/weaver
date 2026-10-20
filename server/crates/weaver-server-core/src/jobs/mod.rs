@@ -47,8 +47,9 @@ pub use handle::{
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{
     ArchivePasswordCandidate, ArchivePasswordSource, DownloadState, FieldUpdate, FileSpec, JobSpec,
-    JobState, JobStatus, JobUpdate, PostState, RunState, SegmentSpec, derive_legacy_job_status,
-    epoch_ms_now, job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
+    JobState, JobStatus, JobUpdate, MessageIds, PostState, RunState, SegmentSpec,
+    derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
+    runtime_lanes_from_status_snapshot,
 };
 pub use phase_progress::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
 pub use record::{

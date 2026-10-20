@@ -1705,7 +1705,7 @@ async fn repeated_article_case(uuencode: bool) {
             .collect::<Vec<_>>(),
     );
     for file in &mut spec.files {
-        file.segments[0].message_id = "shared@example.com".to_string();
+        file.segments[0].message_ids = "shared@example.com".into();
     }
     harness
         .handle

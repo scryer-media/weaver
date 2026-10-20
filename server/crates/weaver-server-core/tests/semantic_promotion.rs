@@ -187,7 +187,7 @@ fn score_spec(name: &str, message_id: &str) -> JobSpec {
                 ordinal: 0,
                 article_number: 1,
                 bytes: 10,
-                message_id: message_id.to_string(),
+                message_ids: weaver_server_core::MessageIds::new(vec![message_id.to_string()]),
             }],
         }],
     }

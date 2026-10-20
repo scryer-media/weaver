@@ -1072,7 +1072,7 @@ impl Pipeline {
                     };
                     target_queue.push(DownloadWork {
                         segment_id,
-                        message_id: MessageId::new(&seg.message_id),
+                        message_id: MessageId::new(seg.message_ids.in_use()),
                         groups: std::sync::Arc::clone(&groups),
                         priority,
                         byte_estimate: seg.bytes,
@@ -2424,19 +2424,25 @@ mod tests {
                         ordinal: 0,
                         article_number: 1,
                         bytes: 10,
-                        message_id: "one@example.com".to_string(),
+                        message_ids: crate::jobs::MessageIds::new(vec![
+                            "one@example.com".to_string(),
+                        ]),
                     },
                     SegmentSpec {
                         ordinal: 1,
                         article_number: 4,
                         bytes: 20,
-                        message_id: "four@example.com".to_string(),
+                        message_ids: crate::jobs::MessageIds::new(vec![
+                            "four@example.com".to_string(),
+                        ]),
                     },
                     SegmentSpec {
                         ordinal: 2,
                         article_number: 6,
                         bytes: 30,
-                        message_id: "six@example.com".to_string(),
+                        message_ids: crate::jobs::MessageIds::new(vec![
+                            "six@example.com".to_string(),
+                        ]),
                     },
                 ],
             }],
