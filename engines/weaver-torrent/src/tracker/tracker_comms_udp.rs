@@ -180,6 +180,23 @@ parse_impl!(i32, 4);
 parse_impl!(i64, 8);
 parse_impl!(i16, 2);
 
+/// The transaction id every reply carries in its second word.
+fn reply_transaction_id(buf: &[u8]) -> anyhow::Result<TransactionId> {
+    let (_action, buf) = u32::parse_num(buf).context("can't parse action")?;
+    let (tid, _) = u32::parse_num(buf).context("can't parse transaction id")?;
+    Ok(tid)
+}
+
+/// Whether an announce reply from `tracker` lists IPv6 peers (18 bytes each)
+/// rather than IPv4 ones (6 bytes each). BEP 15 ties the format to the
+/// family of the tracker's address, so it is read from the address the
+/// request went to, an IPv4-mapped IPv6 address counting as IPv4; never from
+/// the address the reply arrived from, which a dual-stack socket reports
+/// mapped.
+fn lists_ipv6_peers(tracker: SocketAddr) -> bool {
+    tracker.ip().to_canonical().is_ipv6()
+}
+
 impl Response {
     pub fn parse(buf: &[u8], is_ipv6: bool) -> anyhow::Result<(TransactionId, Self)> {
         let (action, buf) = u32::parse_num(buf).context("can't parse action")?;
@@ -262,7 +279,9 @@ struct ConnectionIdMeta {
 #[derive(Default)]
 struct ClientLocked {
     connections: HashMap<SocketAddr, ConnectionIdMeta>,
-    transactions: HashMap<TransactionId, tokio::sync::oneshot::Sender<Response>>,
+    // Each request's raw reply goes back to it to parse, as only the request
+    // knows the tracker address that fixes the reply's peer format.
+    transactions: HashMap<TransactionId, tokio::sync::oneshot::Sender<Vec<u8>>>,
 }
 
 /// The socket the UDP tracker client talks through.
@@ -381,19 +400,19 @@ impl UdpTrackerClient {
                 }
             };
 
-            let (tid, response) = match Response::parse(&buf[..len], addr.is_ipv6()) {
-                Ok(r) => r,
+            let tid = match reply_transaction_id(&buf[..len]) {
+                Ok(tid) => tid,
                 Err(e) => {
                     debug!(?addr, "error parsing UDP response: {e:#}");
                     continue;
                 }
             };
 
-            trace!(?tid, ?response, ?addr, "received");
+            trace!(?tid, len, ?addr, "received");
 
             let t = self.state.locked.write().transactions.remove(&tid);
             match t {
-                Some(tx) => match tx.send(response) {
+                Some(tx) => match tx.send(buf[..len].to_vec()) {
                     Ok(_) => {}
                     Err(_) => {
                         debug!(tid, "reader dead");
@@ -441,10 +460,12 @@ impl UdpTrackerClient {
             .await
             .with_context(|| format!("error sending to {addr:?}"))?;
 
-        let response = tokio::time::timeout(Duration::from_secs(10), rx)
+        let reply = tokio::time::timeout(Duration::from_secs(10), rx)
             .await
             .context("timeout connecting")?
             .context("sender dead")?;
+        let (_, response) = Response::parse(&reply, lists_ipv6_peers(addr))?;
+        trace!(tid = tid_g.tid, ?response, ?addr, "parsed");
         match &response {
             Response::Error(e) => {
                 anyhow::bail!("remote errored: {e}")
@@ -459,7 +480,7 @@ impl UdpTrackerClient {
 
     fn reserve_transaction_id(
         &self,
-        tx: tokio::sync::oneshot::Sender<Response>,
+        tx: tokio::sync::oneshot::Sender<Vec<u8>>,
     ) -> anyhow::Result<TransactionIdGuard<'_>> {
         let mut g = self.state.locked.write();
         for _ in 0..10 {
@@ -611,6 +632,151 @@ mod tests {
             }
             other => panic!("unexpected response {other:?}"),
         }
+    }
+
+    fn announce_reply(tid: &[u8], peers: &[SocketAddr]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&super::ACTION_ANNOUNCE.to_be_bytes());
+        b.extend_from_slice(tid);
+        b.extend_from_slice(&1800u32.to_be_bytes()); // interval
+        b.extend_from_slice(&0u32.to_be_bytes()); // leechers
+        b.extend_from_slice(&1u32.to_be_bytes()); // seeders
+        for peer in peers {
+            match peer {
+                SocketAddr::V4(a) => b.extend_from_slice(&a.ip().octets()),
+                SocketAddr::V6(a) => b.extend_from_slice(&a.ip().octets()),
+            }
+            b.extend_from_slice(&peer.port().to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn test_parse_ipv6_announce() {
+        let peers: Vec<SocketAddr> = vec![
+            "[2001:db8::2]:6881".parse().unwrap(),
+            "[2001:db8::3]:51413".parse().unwrap(),
+        ];
+        let b = announce_reply(&9u32.to_be_bytes(), &peers);
+        assert_eq!(b.len(), 20 + 2 * 18);
+        let (tid, response) = Response::parse(&b, true).unwrap();
+        assert_eq!(tid, 9);
+        match response {
+            Response::Announce(r) => assert_eq!(r.addrs, peers),
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+
+    /// An in-process socket: what the client sends comes out of `sent`, and
+    /// what is put into `replies` is what it receives.
+    struct FakeSocket {
+        sent: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+        replies: parking_lot::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+    }
+
+    impl DatagramSocket for FakeSocket {
+        fn bind_addr(&self) -> SocketAddr {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
+            Box::pin(async move {
+                let (reply, from) = std::future::poll_fn(|cx| self.replies.lock().poll_recv(cx))
+                    .await
+                    .ok_or_else(|| std::io::Error::other("no more replies"))?;
+                buf[..reply.len()].copy_from_slice(&reply);
+                Ok((reply.len(), from))
+            })
+        }
+
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            target: SocketAddr,
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<usize>> {
+            let sent = self.sent.send((buf.to_vec(), target));
+            Box::pin(async move {
+                sent.map_err(|_| std::io::Error::other("the tracker is gone"))?;
+                Ok(buf.len())
+            })
+        }
+
+        fn poll_send_to(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+            _target: SocketAddr,
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::Unsupported.into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_announce_reply_format_follows_the_tracker_address() {
+        let v4_tracker: SocketAddr = "192.0.2.1:6969".parse().unwrap();
+        let v6_tracker: SocketAddr = "[2001:db8::1]:6969".parse().unwrap();
+        let v4_peer: SocketAddr = "192.0.2.7:6881".parse().unwrap();
+        let v6_peer: SocketAddr = "[2001:db8::7]:6881".parse().unwrap();
+
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        let client = UdpTrackerClient::new_with_socket(
+            token.clone(),
+            Arc::new(FakeSocket {
+                sent: sent_tx,
+                replies: parking_lot::Mutex::new(reply_rx),
+            }),
+            None,
+        );
+
+        // Each tracker lists one peer of its own family. A dual-stack socket
+        // reports the IPv4 tracker's replies as from its IPv4-mapped address.
+        let tracker = async move {
+            while let Some((request, to)) = sent_rx.recv().await {
+                let tid = &request[12..16];
+                let action = u32::from_be_bytes(request[8..12].try_into().unwrap());
+                let reply = if action == ACTION_CONNECT {
+                    let mut b = ACTION_CONNECT.to_be_bytes().to_vec();
+                    b.extend_from_slice(tid);
+                    b.extend_from_slice(&7u64.to_be_bytes());
+                    b
+                } else if to == v4_tracker {
+                    announce_reply(tid, &[v4_peer])
+                } else {
+                    announce_reply(tid, &[v6_peer])
+                };
+                let from = match to {
+                    SocketAddr::V4(a) => SocketAddr::new(a.ip().to_ipv6_mapped().into(), a.port()),
+                    v6 => v6,
+                };
+                reply_tx.send((reply, from)).unwrap();
+            }
+        };
+        let tracker = tokio::spawn(tracker);
+
+        let fields = || AnnounceFields {
+            info_hash: Id20::new([1; 20]),
+            peer_id: Id20::new([2; 20]),
+            downloaded: 0,
+            left: 0,
+            uploaded: 0,
+            event: EVENT_NONE,
+            key: 0,
+            num_want: 200,
+            port: 6881,
+        };
+        let r = client.announce(v4_tracker, fields()).await.unwrap();
+        assert_eq!(r.addrs, vec![v4_peer]);
+        let r = client.announce(v6_tracker, fields()).await.unwrap();
+        assert_eq!(r.addrs, vec![v6_peer]);
+
+        token.cancel();
+        drop(client);
+        tracker.abort();
     }
 
     #[ignore]

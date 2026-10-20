@@ -169,8 +169,11 @@ pub struct TrackerResponse<'a> {
     #[serde(rename = "tracker id", borrow)]
     pub tracker_id: Option<ByteBuf<'a>>,
     pub incomplete: Option<u64>,
-    #[serde(borrow)]
+    /// IPv4 peers when compact (BEP 23), or peers of either family as
+    /// dictionaries. Absent when the tracker lists only IPv6 peers.
+    #[serde(default, borrow)]
     pub peers: Peers<'a, SocketAddrV4>,
+    /// IPv6 peers (BEP 7).
     #[serde(default, borrow)]
     pub peers6: Peers<'a, SocketAddrV6>,
 }
@@ -310,6 +313,24 @@ mod tests {
             ]
         );
         dbg!(response);
+    }
+
+    #[test]
+    fn every_listed_peer_of_either_family_is_read() {
+        let v4: SocketAddr = "105.105.105.105:28784".parse().unwrap();
+        let v6: SocketAddr = "[6969:6969:6969:6969:6969:6969:6969:6969]:28784"
+            .parse()
+            .unwrap();
+
+        // Only IPv6 peers: no `peers` key at all.
+        let data = b"d8:intervali1800e6:peers618:iiiiiiiiiiiiiiiippe";
+        let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
+        assert_eq!(response.iter_peers().collect::<Vec<_>>(), vec![v6]);
+
+        // Both lists in dictionary form.
+        let data = b"d8:intervali1800e5:peersld2:ip15:105.105.105.1054:porti28784eee6:peers6ld2:ip39:6969:6969:6969:6969:6969:6969:6969:69694:porti28784eeee";
+        let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
+        assert_eq!(response.iter_peers().collect::<Vec<_>>(), vec![v4, v6]);
     }
 
     #[test]
