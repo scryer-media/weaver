@@ -65,7 +65,6 @@ use std::{
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
-    constants::CHUNK_SIZE,
     hash_id::Id20,
     lengths::{ChunkInfo, Lengths, ValidPieceIndex},
     spawn_utils::spawn_with_cancel,
@@ -81,7 +80,7 @@ use crate::peer_protocol::{
         ut_pex::UtPex,
     },
 };
-use anyhow::{Context, bail};
+use anyhow::Context;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::{
     Notify, OwnedSemaphorePermit, Semaphore,
@@ -2056,31 +2055,9 @@ impl PeerHandler {
     }
 
     fn send_metadata_piece(&self, piece_id: u32) -> anyhow::Result<()> {
-        let data = &self.state.metadata.info_bytes;
-        let metadata_size = data.len();
-        if metadata_size == 0 {
-            anyhow::bail!("peer requested for info metadata but we don't have it")
-        }
-        let total_pieces: usize = (metadata_size as u64)
-            .div_ceil(CHUNK_SIZE as u64)
-            .try_into()?;
-
-        if piece_id as usize > total_pieces {
-            bail!("piece out of bounds")
-        }
-
-        let offset = piece_id * CHUNK_SIZE;
-        let end = (offset + CHUNK_SIZE).min(data.len().try_into()?);
-        let total_size: u32 = data
-            .len()
-            .try_into()
-            .context("can't send metadata: len doesn't fit into u32")?;
-        let data = data.slice(offset as usize..end as usize);
-
+        let data = UtMetadataData::piece_of(&self.state.metadata.info_bytes, piece_id)?;
         self.tx
-            .send(WriterRequest::UtMetadata(UtMetadata::Data(
-                UtMetadataData::from_bytes(piece_id, total_size, data.into()),
-            )))
+            .send(WriterRequest::UtMetadata(UtMetadata::Data(data)))
             .context("error sending UtMetadata: channel closed")?;
         Ok(())
     }

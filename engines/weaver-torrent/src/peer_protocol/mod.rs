@@ -116,7 +116,7 @@ pub enum MessageDeserializeError {
     UtMetadataMissingTotalSize,
     #[error("ut_metadata: unrecognized message type: {0}")]
     UtMetadataTypeUnknown(u32),
-    #[error("ut_metadata: received piece {received_piece} > total pieces {total_pieces}")]
+    #[error("ut_metadata: piece {received_piece} >= total pieces {total_pieces}")]
     UtMetadataPieceOutOfBounds {
         total_pieces: u32,
         received_piece: u32,
