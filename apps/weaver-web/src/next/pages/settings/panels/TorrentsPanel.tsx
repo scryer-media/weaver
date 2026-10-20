@@ -279,7 +279,7 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   upnp: false,
   encryption: "PREFER",
   maxActiveDownloads: 3,
-  maxPeersTotal: 500,
+  maxPeersTotal: 100,
   unpack: true,
 };
 

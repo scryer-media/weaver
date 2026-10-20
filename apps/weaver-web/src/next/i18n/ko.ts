@@ -1747,7 +1747,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.encryptionPrefer": "선호",
   "next.torrents.encryptionRequire": "필수",
   "next.torrents.maxActiveDownloads": "최대 활성 다운로드",
-  "next.torrents.maxPeers": "최대 피어",
+  "next.torrents.maxPeers": "토렌트당 피어",
   "next.torrents.unpack": "압축 해제",
   "next.torrents.unpackInherit": "상속",
   "next.torrents.portInvalid": "포트는 1~65535입니다.",

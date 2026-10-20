@@ -1747,7 +1747,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.encryptionPrefer": "优先",
   "next.torrents.encryptionRequire": "强制",
   "next.torrents.maxActiveDownloads": "最大活动下载数",
-  "next.torrents.maxPeers": "最大对等节点数",
+  "next.torrents.maxPeers": "每个种子的对等节点数",
   "next.torrents.unpack": "解压",
   "next.torrents.unpackInherit": "继承",
   "next.torrents.portInvalid": "端口范围为 1 到 65535。",

@@ -534,7 +534,7 @@ impl Default for TorrentConfig {
             upnp: true,
             encryption: TorrentEncryption::Prefer,
             max_active_downloads: 3,
-            max_peers_total: 500,
+            max_peers_total: 100,
             session_dir: None,
             unpack: true,
         }
@@ -784,6 +784,7 @@ name = "tv"
         assert_eq!(config.seeding, None);
         assert_eq!(config.torrent, TorrentConfig::default());
         assert!(!config.torrent.enabled);
+        assert_eq!(config.torrent.max_peers_total, 100);
         assert_eq!(config.categories[0].seeding, None);
         assert!(!config.categories[0].torrent_route);
 

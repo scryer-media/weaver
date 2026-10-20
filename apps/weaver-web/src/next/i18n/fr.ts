@@ -1747,7 +1747,7 @@ export const nextFr: LocaleDictionary = {
   "next.torrents.encryptionPrefer": "Préférer",
   "next.torrents.encryptionRequire": "Exiger",
   "next.torrents.maxActiveDownloads": "Téléchargements actifs max.",
-  "next.torrents.maxPeers": "Pairs max.",
+  "next.torrents.maxPeers": "Pairs par torrent",
   "next.torrents.unpack": "Décompresser",
   "next.torrents.unpackInherit": "Hériter",
   "next.torrents.portInvalid": "Un port va de 1 à 65535.",

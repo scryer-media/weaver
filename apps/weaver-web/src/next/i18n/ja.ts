@@ -1747,7 +1747,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.encryptionPrefer": "優先",
   "next.torrents.encryptionRequire": "必須",
   "next.torrents.maxActiveDownloads": "最大同時ダウンロード数",
-  "next.torrents.maxPeers": "最大ピア数",
+  "next.torrents.maxPeers": "トレントあたりのピア数",
   "next.torrents.unpack": "展開",
   "next.torrents.unpackInherit": "継承",
   "next.torrents.portInvalid": "ポートは 1〜65535 です。",
