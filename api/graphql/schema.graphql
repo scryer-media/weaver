@@ -372,6 +372,7 @@ type Category {
 	aliases: String!
 	seeding: SeedingPolicySettings
 	torrentRoute: Boolean!
+	unpack: Boolean
 }
 
 input CategoryInput {
@@ -380,6 +381,7 @@ input CategoryInput {
 	aliases: String! = ""
 	seeding: SeedingPolicyInput
 	torrentRoute: Boolean
+	unpack: Boolean
 }
 
 type ConfiguredStorage {
@@ -4551,6 +4553,11 @@ input SubmitInput {
 	category: String
 	paused: Boolean! = false
 	password: String
+	"""
+	Whether a torrent's archives are extracted; absent inherits. An NZB
+	ignores it.
+	"""
+	unpack: Boolean
 }
 
 input SubmitNzbInput {
@@ -4600,6 +4607,10 @@ input SubmitTorrentInput {
 	paused: Boolean! = false
 	forced: Boolean! = false
 	seeding: SeedingPolicyInput
+	"""
+	Whether its archives are extracted; absent inherits.
+	"""
+	unpack: Boolean
 }
 
 type SubscriptionRoot {
@@ -4859,6 +4870,10 @@ type Torrent {
 	does.
 	"""
 	seedingRule: String
+	"""
+	Whether its archives are extracted.
+	"""
+	unpack: Boolean!
 	route: String
 	files: [TorrentFile!]!
 	trackers: [TorrentTracker!]!
@@ -4889,6 +4904,7 @@ type TorrentSettings {
 	maxActiveDownloads: Int!
 	maxPeersTotal: Int!
 	sessionDir: String
+	unpack: Boolean!
 }
 
 input TorrentSettingsInput {
@@ -4900,6 +4916,7 @@ input TorrentSettingsInput {
 	maxActiveDownloads: Int
 	maxPeersTotal: Int
 	sessionDir: String
+	unpack: Boolean
 }
 
 enum TorrentState {
@@ -4948,12 +4965,17 @@ type TrackerRule {
 	"""
 	seeding: SeedingPolicySettings
 	neverPause: Boolean!
+	"""
+	Whether its torrents' archives are extracted; absent inherits.
+	"""
+	unpack: Boolean
 }
 
 input TrackerRuleInput {
 	hostPattern: String!
 	seeding: SeedingPolicyInput
 	neverPause: Boolean! = false
+	unpack: Boolean
 }
 
 enum TrackerStatus {
