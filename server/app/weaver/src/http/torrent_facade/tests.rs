@@ -1200,6 +1200,12 @@ async fn preferences_read_and_apply_the_mapped_keys() {
         before["max_active_downloads"],
         TorrentConfig::default().max_active_downloads
     );
+    // The peer limit is each torrent's; there is no global one.
+    assert_eq!(
+        before["max_connec_per_torrent"],
+        TorrentConfig::default().max_peers_total
+    );
+    assert!(before.get("max_connec").is_none());
 
     let json = r#"{"dl_limit":1048576,"up_limit":2048,"max_active_downloads":7,"listen_port":1}"#;
     let set = rig
