@@ -434,6 +434,19 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         peers: 1,
         seeds: 1,
         leechers: 0,
+        max_peers: 100,
+        swarm_seeds: None,
+        swarm_leechers: None,
+        reannounce_seconds: None,
+        active_seconds: 0,
+        download_avg_bps: 0,
+        upload_avg_bps: 0,
+        wasted_bytes: 0,
+        last_seen_complete_ms: None,
+        pieces: None,
+        created_by: None,
+        created_at_ms: None,
+        comment: None,
         added_at_ms: EPOCH_MS,
         completed_at_ms: None,
         storage_dir: None,
@@ -814,6 +827,35 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
         TorrentIntent::Resumed
     );
     assert_eq!(*retired.borrow(), 1);
+}
+
+// The metainfo's own word on who made it, when, and why stays with the
+// torrent; a torrent without it says nothing.
+#[test]
+fn a_metainfo_says_who_made_it_and_when() {
+    let bare = plain("set", 1);
+    let mut said = b"d".to_vec();
+    bstr(&mut said, b"comment");
+    bstr(&mut said, b"  a note ");
+    bstr(&mut said, b"created by");
+    bstr(&mut said, b"maker 1.0");
+    bstr(&mut said, b"creation date");
+    bint(&mut said, 1_600_000_000);
+    said.extend_from_slice(&bare[1..]);
+    let about = parse(&said).unwrap().about;
+    assert_eq!(
+        (about.created_by, about.created_at_ms, about.comment),
+        (
+            Some("maker 1.0".to_owned()),
+            Some(1_600_000_000_000),
+            Some("a note".to_owned()),
+        )
+    );
+    let about = parse(&bare).unwrap().about;
+    assert_eq!(
+        (about.created_by, about.created_at_ms, about.comment),
+        (None, None, None)
+    );
 }
 
 #[test]
@@ -1404,7 +1446,8 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     };
     let bytes = announcing(&private, &tracker(peer).await);
 
-    let rig = rig(set_clock());
+    let clock = set_clock();
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
     on_loopback(&rig.routes);
     let handle = queue();
     let mut changes = handle.state().subscribe_job_changes();
@@ -1428,8 +1471,31 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     );
     let sent = uploaded(&seeding);
     assert!(sent >= total, "the seeder sent {sent} of {total}");
-    // The ledger as the running tick keeps it.
+    // Every piece verified, so nothing fetched was wasted.
+    assert_eq!(view.wasted_bytes, 0);
+    assert_eq!(
+        view.pieces,
+        Some(TorrentPieces {
+            count: 4,
+            size: 16_384,
+            have: 4,
+        })
+    );
+    // The ledger as the running tick keeps it: the time between two ticks
+    // the torrent ran in its session is active, and it ran complete.
     rig.service.tick().await;
+    clock.0.fetch_add(30_000, Ordering::SeqCst);
+    rig.service.tick().await;
+    let ledger = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+    assert_eq!(
+        (
+            ledger.downloaded_bytes,
+            ledger.checked_bytes,
+            ledger.active_duration_s,
+            ledger.last_seen_complete_ms,
+        ),
+        (total, total, 30, Some(EPOCH_MS + 30_000))
+    );
     rig.service.stop().await;
     // What the server's recovery clears before anything starts.
     rig.db.prune_orphan_active_state().unwrap();
@@ -1450,6 +1516,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
         (total, total, 1.0)
     );
     assert_eq!(view.file_have, [total]);
+    assert_eq!((view.active_seconds, view.wasted_bytes), (30, 0));
     assert_eq!(uploaded(&seeding), sent);
     again.stop().await;
     seeding.stop().await;

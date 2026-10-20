@@ -365,6 +365,27 @@ pub struct TorrentView {
     pub peers: u32,
     pub seeds: u32,
     pub leechers: u32,
+    /// The most peers a torrent connects to.
+    pub max_peers: u32,
+    /// The swarm's seeds and leechers as its trackers last counted them.
+    pub swarm_seeds: Option<u32>,
+    pub swarm_leechers: Option<u32>,
+    /// Seconds until the next tracker announce.
+    pub reannounce_seconds: Option<u64>,
+    /// Seconds spent running in a session.
+    pub active_seconds: u64,
+    /// The bytes moved over the time active.
+    pub download_avg_bps: u64,
+    pub upload_avg_bps: u64,
+    /// Fetched bytes whose pieces did not verify.
+    pub wasted_bytes: u64,
+    /// The last time a complete copy was in reach.
+    pub last_seen_complete_ms: Option<i64>,
+    /// The torrent's pieces, once its metainfo is in hand.
+    pub pieces: Option<TorrentPieces>,
+    pub created_by: Option<String>,
+    pub created_at_ms: Option<i64>,
+    pub comment: Option<String>,
     pub added_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,
@@ -385,7 +406,40 @@ pub struct TorrentView {
     pub trackers: Vec<TorrentTracker>,
 }
 
+/// A torrent's pieces: how many, how long each is, and how many verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TorrentPieces {
+    pub count: u32,
+    pub size: u64,
+    pub have: u32,
+}
+
 impl TorrentView {
+    /// Where the torrent's output is: the folder that holds it, and the
+    /// output itself, its file when it is one file named as the torrent is,
+    /// else its folder. Both are empty until weaver has placed the torrent.
+    pub fn paths(&self) -> (String, String) {
+        let Some(dir) = &self.storage_dir else {
+            return (String::new(), String::new());
+        };
+        let dir = PathBuf::from(dir);
+        let single = match self.files.as_slice() {
+            [file] if file.path == self.name => Path::new(&file.path).file_name(),
+            _ => None,
+        };
+        let content = match single {
+            Some(name) => dir.join(name),
+            None => dir,
+        };
+        let save = content
+            .parent()
+            .map_or_else(|| content.clone(), Path::to_path_buf);
+        (
+            save.to_string_lossy().into_owned(),
+            content.to_string_lossy().into_owned(),
+        )
+    }
+
     /// How much of `file` is in hand, from 0 to 1.
     pub fn file_progress(&self, file: &TorrentFile) -> f64 {
         let have = self
@@ -410,6 +464,20 @@ struct Parsed {
     files: Vec<TorrentFile>,
     trackers: Vec<TrackerEntry>,
     total: u64,
+    about: About,
+}
+
+// What a torrent's metainfo says of where it came from.
+#[derive(Debug, Clone, Default)]
+struct About {
+    created_by: Option<String>,
+    created_at_ms: Option<i64>,
+    comment: Option<String>,
+}
+
+fn text(bytes: Option<&[u8]>) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes?).trim().to_owned();
+    (!text.is_empty()).then_some(text)
 }
 
 fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
@@ -481,6 +549,14 @@ fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
         layout,
         files,
         trackers,
+        about: About {
+            created_by: text(metainfo.created_by.as_ref().map(|by| by.as_ref())),
+            created_at_ms: metainfo
+                .creation_date
+                .and_then(|secs| i64::try_from(secs).ok())
+                .and_then(|secs| secs.checked_mul(1000)),
+            comment: text(metainfo.comment.as_ref().map(|comment| comment.as_ref())),
+        },
     })
 }
 
@@ -502,9 +578,10 @@ struct Live {
     attached: Option<Attached>,
     route: Option<RouteKey>,
     held: Option<Held>,
+    about: About,
     counters: TorrentCounters,
     // What the session reported at the last tick, for the ledger's deltas.
-    seen: (u64, u64),
+    seen: Seen,
     engine: Engine,
     // Why the session last refused to pause or resume the torrent, until it
     // takes the next change.
@@ -559,8 +636,9 @@ impl Live {
             attached: None,
             route: None,
             held: None,
+            about: About::default(),
             counters,
-            seen: (0, 0),
+            seen: Seen::default(),
             engine: Engine::Absent,
             run_error: None,
             queued: false,
@@ -601,6 +679,16 @@ impl Live {
         self.intake.as_ref().is_some_and(|intake| intake.holding())
     }
 
+    // The pieces, and how many of them the job holds verified.
+    fn pieces(&self) -> Option<TorrentPieces> {
+        let (layout, job) = (self.layout.as_ref()?, self.job.as_ref()?);
+        Some(TorrentPieces {
+            count: layout.piece_count(),
+            size: layout.piece_length(),
+            have: job.with(|job| job.have().count_ones()) as u32,
+        })
+    }
+
     // How announcing to each tracker of the session's latest run went.
     fn announces(&self) -> Vec<TrackerAnnounce> {
         self.attached
@@ -627,22 +715,35 @@ impl Live {
         let mut file_have = self.file_have.clone();
         take_file_have(&mut file_have, &engine, &stats.file_progress);
         let live = stats.live.as_ref();
-        let fetched = live.map_or(0, |live| live.snapshot.fetched_bytes);
-        let uploaded = stats.uploaded_bytes;
+        let seen = Seen {
+            uploaded: stats.uploaded_bytes,
+            fetched: live.map_or(0, |live| live.snapshot.fetched_bytes),
+            checked: live.map_or(0, |live| live.snapshot.downloaded_and_checked_bytes),
+        };
         // The session counts from zero each time it takes the torrent.
         let delta = |now: u64, then: u64| if now >= then { now - then } else { now };
-        let (up, down) = (delta(uploaded, self.seen.0), delta(fetched, self.seen.1));
+        let (up, down) = (
+            delta(seen.uploaded, self.seen.uploaded),
+            delta(seen.fetched, self.seen.fetched),
+        );
         let mut counters = self.counters;
         counters.uploaded_bytes += up;
         counters.downloaded_bytes += down;
+        counters.checked_bytes += delta(seen.checked, self.seen.checked);
         if up + down > 0 {
             counters.last_activity_ms = Some(now);
+        }
+        // A complete copy is in reach while the torrent runs complete, or
+        // while a seed is connected.
+        let seeds = live.map_or(0, |live| live.snapshot.peer_stats.live_seeders);
+        if matches!(engine, Engine::Live { finished: true, .. }) || seeds > 0 {
+            counters.last_seen_complete_ms = Some(now);
         }
         Reading {
             engine,
             file_have,
             counters,
-            seen: (uploaded, fetched),
+            seen,
             speeds: live.map_or((0, 0), |live| {
                 (live.download_speed.as_bytes(), live.upload_speed.as_bytes())
             }),
@@ -680,9 +781,17 @@ struct Reading {
     // The ledger with what the session moved since it was last kept.
     counters: TorrentCounters,
     // The session's own totals, which the ledger's deltas are taken from.
-    seen: (u64, u64),
+    seen: Seen,
     speeds: (u64, u64),
     peers: (u32, u32),
+}
+
+// The session's own totals for a torrent, since it last took it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Seen {
+    uploaded: u64,
+    fetched: u64,
+    checked: u64,
 }
 
 // What the job side asks the service to look at: the jobs that changed,
@@ -1285,6 +1394,7 @@ impl TorrentService {
         torrent.job = Some(job);
         torrent.intake = Some(intake);
         torrent.metainfo = Some(bytes);
+        torrent.about = parsed.about.clone();
     }
 
     // Add a torrent. A metainfo becomes a job at once; a magnet needs its
@@ -1730,7 +1840,7 @@ impl TorrentService {
                 torrent.attached = Some(Attached { session, handle });
                 torrent.route = Some(plan.key);
                 torrent.held = None;
-                torrent.seen = (0, 0);
+                torrent.seen = Seen::default();
                 torrent.applied = None;
                 torrent.run_error = None;
             }
@@ -2258,6 +2368,10 @@ impl TorrentService {
                 if state == TorrentState::Seeding {
                     torrent.counters.finished_duration_s += elapsed_s;
                 }
+                // Active is running in a session: not paused, held or queued.
+                if matches!(torrent.engine, Engine::Live { .. }) {
+                    torrent.counters.active_duration_s += elapsed_s;
+                }
                 if torrent.counters != before
                     || now - torrent.counters.updated_at_ms >= LEDGER_EVERY_MS
                 {
@@ -2418,6 +2532,9 @@ impl TorrentService {
         let have: u64 = reading.file_have.iter().sum();
         let rules = self.rules();
         let policy = settings.policy(record, &rules);
+        let swarm = status::swarm(&torrent.announces(), now);
+        let active = counters.active_duration_s;
+        let average = |bytes: u64| bytes.checked_div(active).unwrap_or(0);
         TorrentView {
             job_id: record.job_id,
             name: record.name.clone(),
@@ -2446,6 +2563,19 @@ impl TorrentService {
             peers: reading.peers.0,
             seeds: reading.peers.1,
             leechers: reading.peers.0.saturating_sub(reading.peers.1),
+            max_peers: settings.torrent.max_peers_total,
+            swarm_seeds: swarm.seeds,
+            swarm_leechers: swarm.leechers,
+            reannounce_seconds: swarm.reannounce_seconds,
+            active_seconds: active,
+            download_avg_bps: average(counters.downloaded_bytes),
+            upload_avg_bps: average(counters.uploaded_bytes),
+            wasted_bytes: counters.wasted_bytes(),
+            last_seen_complete_ms: counters.last_seen_complete_ms,
+            pieces: torrent.pieces(),
+            created_by: torrent.about.created_by.clone(),
+            created_at_ms: torrent.about.created_at_ms,
+            comment: torrent.about.comment.clone(),
             added_at_ms: record.added_at_ms,
             completed_at_ms: record.completed_at_ms,
             storage_dir: record.storage_dir.clone(),

@@ -187,13 +187,28 @@ pub struct TorrentTracker {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TorrentCounters {
     pub uploaded_bytes: u64,
+    // Every byte fetched from peers, whether it verified or not.
     pub downloaded_bytes: u64,
+    // The fetched bytes whose pieces verified.
+    pub checked_bytes: u64,
+    // Time spent running in a session, in seconds.
+    pub active_duration_s: u64,
+    // The last time a complete copy was in reach: the torrent's own while it
+    // ran complete, or a connected seed's.
+    pub last_seen_complete_ms: Option<i64>,
     // Time spent complete and seeding, in seconds.
     pub finished_duration_s: u64,
     pub last_activity_ms: Option<i64>,
     // The upload total reported in the last announce.
     pub last_announce_uploaded_bytes: u64,
     pub updated_at_ms: i64,
+}
+
+impl TorrentCounters {
+    /// The fetched bytes that did not verify.
+    pub fn wasted_bytes(&self) -> u64 {
+        self.downloaded_bytes.saturating_sub(self.checked_bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

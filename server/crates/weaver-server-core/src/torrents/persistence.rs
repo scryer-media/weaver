@@ -161,6 +161,9 @@ impl Database {
         let args = vec![
             SqlArg::I64(stored(counters.uploaded_bytes)?),
             SqlArg::I64(stored(counters.downloaded_bytes)?),
+            SqlArg::I64(stored(counters.checked_bytes)?),
+            SqlArg::I64(stored(counters.active_duration_s)?),
+            SqlArg::OptI64(counters.last_seen_complete_ms),
             SqlArg::I64(stored(counters.finished_duration_s)?),
             SqlArg::OptI64(counters.last_activity_ms),
             SqlArg::I64(stored(counters.last_announce_uploaded_bytes)?),
@@ -172,7 +175,8 @@ impl Database {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE torrent_counters
-                    SET uploaded_bytes = {}, downloaded_bytes = {}, finished_duration_s = {},
+                    SET uploaded_bytes = {}, downloaded_bytes = {}, checked_bytes = {},
+                        active_duration_s = {}, last_seen_complete_ms = {}, finished_duration_s = {},
                         last_activity_ms = {}, last_announce_uploaded_bytes = {},
                         updated_at_ms = {}
                   WHERE job_id = {}",
