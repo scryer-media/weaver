@@ -52,6 +52,11 @@ export function AddNzbDialog({
   const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
   const { addFiles, fileInputRef } = upload;
   const blocked = upload.entries.filter(isBlocked);
+  // Unpack is a torrent's choice: the row stands once a file read as a torrent is in the list, or
+  // the link is a magnet or an infohash.
+  const torrent =
+    upload.entries.some((entry) => entry.kind === "TORRENT") ||
+    /^(magnet:|[0-9a-f]{40}$|[a-z2-7]{32}$)/i.test(upload.text.trim());
   // Set once a submit has answered, so its verdict is read from the entries it updated.
   const [awaitingVerdict, setAwaitingVerdict] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);
@@ -244,14 +249,16 @@ export function AddNzbDialog({
           <FormRow label={t("next.addNzb.paused")}>
             <Toggle label={t("next.addNzb.paused")} checked={upload.paused} onChange={upload.setPaused} />
           </FormRow>
-          <FormRow label={t("next.addNzb.unpack")}>
-            <Select
-              label={t("next.addNzb.unpack")}
-              value={unpackChoice(upload.unpack)}
-              options={UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) }))}
-              onChange={(choice) => upload.setUnpack(unpackOf(choice))}
-            />
-          </FormRow>
+          {torrent ? (
+            <FormRow label={t("next.torrents.unpack")}>
+              <Select
+                label={t("next.torrents.unpack")}
+                value={unpackChoice(upload.unpack)}
+                options={UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) }))}
+                onChange={(choice) => upload.setUnpack(unpackOf(choice))}
+              />
+            </FormRow>
+          ) : null}
           <FormRow label={t("servers.password")}>
             <TextField
               label={t("servers.password")}

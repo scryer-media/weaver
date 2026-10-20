@@ -1836,7 +1836,6 @@ export const nextDe: LocaleDictionary = {
   "next.torrent.tracker.DISABLED": "Deaktiviert",
   "next.addNzb.link": "Link",
   "next.addNzb.paused": "Pausiert hinzufügen",
-  "next.addNzb.unpack": "Torrent entpacken",
   "next.quota.remaining": "{{size}} verbleibend",
   "next.networking.egress.quota": "Kontingent",
   "next.networking.egress.enabled": "Aktiviert",

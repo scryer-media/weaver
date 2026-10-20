@@ -1836,7 +1836,6 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.tracker.DISABLED": "已禁用",
   "next.addNzb.link": "链接",
   "next.addNzb.paused": "添加时暂停",
-  "next.addNzb.unpack": "种子解压",
   "next.quota.remaining": "剩余 {{size}}",
   "next.networking.egress.quota": "配额",
   "next.networking.egress.enabled": "已启用",

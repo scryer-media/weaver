@@ -1836,7 +1836,6 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.tracker.DISABLED": "無効",
   "next.addNzb.link": "リンク",
   "next.addNzb.paused": "一時停止で追加",
-  "next.addNzb.unpack": "トレント展開",
   "next.quota.remaining": "残り {{size}}",
   "next.networking.egress.quota": "容量",
   "next.networking.egress.enabled": "有効",
