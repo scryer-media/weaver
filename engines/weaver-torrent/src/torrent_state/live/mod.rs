@@ -1739,7 +1739,16 @@ impl PeerHandler {
                 }
             };
 
-            for chunk in self.state.lengths.iter_chunk_infos(next) {
+            // Only the chunks not yet received: a stolen piece keeps the
+            // chunks its previous owner delivered.
+            let missing = self
+                .state
+                .lock_read("missing chunks")
+                .get_pieces()?
+                .missing_chunks(next)
+                .collect::<Vec<_>>();
+
+            for chunk in missing {
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -1768,10 +1777,21 @@ impl PeerHandler {
                     .state
                     .peers
                     .with_live_mut(handle, "add chunk request", |live| {
-                        live.add_inflight_request(chunk)
+                        // Only the piece's owner requests its chunks. The check
+                        // and the request are one step under this peer's lock,
+                        // so a steal either comes after and cancels the request,
+                        // or comes first and this peer stops requesting.
+                        let owned = self
+                            .state
+                            .lock_read("add chunk request")
+                            .get_pieces()
+                            .is_ok_and(|pieces| pieces.is_owned_by(next, self.addr));
+                        owned.then(|| live.add_inflight_request(chunk))
                     }) {
-                    Some(true) => {}
-                    Some(false) => {
+                    Some(Some(true)) => {}
+                    // Stolen or released: the piece is no longer ours to request.
+                    Some(None) => break,
+                    Some(Some(false)) => {
                         // This request was already in-flight for this peer for this chunk.
                         // This might happen in theory, but not very likely.
                         //

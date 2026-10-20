@@ -315,4 +315,53 @@ mod tests {
         peers.drop_peer(a).unwrap();
         assert_eq!(live_seeders(&peers), (1, 1));
     }
+
+    #[test]
+    fn a_steal_empties_the_victims_queue_of_the_stolen_piece() {
+        use crate::core::constants::CHUNK_SIZE;
+        use crate::core::lengths::Lengths;
+        use crate::peer_protocol::{Message, Request};
+        use crate::peer_connection::WriterRequest;
+
+        let lengths = Lengths::new(CHUNK_SIZE as u64 * 8, CHUNK_SIZE * 4).unwrap();
+        let stolen = lengths.validate_piece_index(0).unwrap();
+        let kept = lengths.validate_piece_index(1).unwrap();
+
+        let peers = make_peer_states();
+        let (victim, mut victim_rx) = add_live_peer(&peers, "127.0.0.1:1234");
+        let (thief, _thief_rx) = add_live_peer(&peers, "127.0.0.1:1235");
+
+        peers
+            .with_live_mut(victim, "test", |live| {
+                for chunk in lengths.iter_chunk_infos(stolen).take(2) {
+                    assert!(live.add_inflight_request(chunk));
+                }
+                for chunk in lengths.iter_chunk_infos(kept).take(1) {
+                    assert!(live.add_inflight_request(chunk));
+                }
+            })
+            .unwrap();
+
+        peers.on_steal(victim, thief, stolen);
+
+        let queued = peers
+            .with_live(victim, |live| {
+                live.inflight_requests().copied().collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert!(queued.iter().all(|req| req.piece_index == kept), "{queued:?}");
+        assert_eq!(queued.len(), 1);
+
+        let mut cancelled = Vec::new();
+        while let Ok(msg) = victim_rx.try_recv() {
+            match msg {
+                WriterRequest::Message(Message::Cancel(Request { index, begin, .. })) => {
+                    cancelled.push((index, begin))
+                }
+                _ => panic!("unexpected writer request"),
+            }
+        }
+        cancelled.sort();
+        assert_eq!(cancelled, vec![(0, 0), (0, CHUNK_SIZE)]);
+    }
 }

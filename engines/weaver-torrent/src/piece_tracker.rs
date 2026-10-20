@@ -22,7 +22,7 @@ use std::{
 };
 
 use crate::buffers::ByteBuf;
-use crate::core::lengths::ValidPieceIndex;
+use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
 use crate::peer_protocol::Piece;
 
 use crate::{
@@ -289,6 +289,18 @@ impl PieceTracker {
     /// Get the inflight info for a piece, if it's currently being downloaded.
     pub fn get_inflight(&self, piece: ValidPieceIndex) -> Option<&InflightPiece> {
         self.inflight.get(&piece)
+    }
+
+    /// Whether `peer` owns the in-flight `piece`. Only the owner requests a
+    /// piece's chunks, so a peer whose piece was stolen stops requesting it.
+    pub fn is_owned_by(&self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
+        self.inflight.get(&piece).is_some_and(|info| info.peer == peer)
+    }
+
+    /// The chunks of `piece` its owner still has to request: those not yet
+    /// received. A peer that steals a half-received piece requests only these.
+    pub fn missing_chunks(&self, piece: ValidPieceIndex) -> impl Iterator<Item = ChunkInfo> + '_ {
+        self.chunks.iter_missing_chunks(piece)
     }
 
     /// Check if a piece is currently in-flight.
@@ -984,5 +996,87 @@ mod tests {
         pri(&mut tracker, &[(1, PiecePriority::Low)]);
         assert_eq!(tracker.chunks().get_hns().needed_bytes, full);
         assert_eq!(drain_for_peer(&mut tracker, &file_infos, |_| true), vec![1]);
+    }
+
+    #[test]
+    fn a_stolen_half_received_piece_asks_only_for_its_missing_chunks() {
+        use crate::core::constants::CHUNK_SIZE;
+
+        // One piece of four chunks.
+        let piece_length = CHUNK_SIZE * 4;
+        let lengths = Lengths::new(piece_length as u64, piece_length).unwrap();
+        let file_infos = vec![crate::file_info::FileInfo {
+            relative_filename: "test.dat".into(),
+            offset_in_torrent: 0,
+            len: piece_length as u64,
+            piece_range: 0..1,
+            attrs: Default::default(),
+        }];
+        let bf_len = lengths.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.set(0, true);
+        let chunks = ChunkTracker::new(have.into_dyn(), selected, lengths, &file_infos).unwrap();
+        let mut tracker = PieceTracker::new(chunks);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let (slow, fast) = (peer(1), peer(2));
+
+        let acquire = |tracker: &mut PieceTracker, who, avg| {
+            tracker.acquire_piece(AcquireRequest {
+                peer: who,
+                peer_avg_time: avg,
+                priority_pieces: std::iter::empty(),
+                file_priorities: &file_priorities,
+                file_infos: &file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            })
+        };
+
+        let piece = match acquire(&mut tracker, slow, None) {
+            AcquireResult::Reserved(piece) => piece,
+            other => panic!("expected Reserved, got {other:?}"),
+        };
+        assert_eq!(
+            tracker
+                .missing_chunks(piece)
+                .map(|c| c.chunk_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+
+        // The slow peer delivers chunks 0 and 2.
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        for chunk in [0, 2] {
+            let delivered = Piece::from_data(piece.get(), chunk * CHUNK_SIZE, &block);
+            assert!(matches!(
+                tracker.mark_chunk_downloaded(&delivered),
+                Some(ChunkMarkingResult::NotCompleted)
+            ));
+        }
+
+        // A peer with a zero average piece time steals at once.
+        match acquire(&mut tracker, fast, Some(Duration::ZERO)) {
+            AcquireResult::Stolen {
+                piece: stolen,
+                from_peer,
+            } => {
+                assert_eq!(stolen, piece);
+                assert_eq!(from_peer, slow);
+            }
+            other => panic!("expected Stolen, got {other:?}"),
+        }
+
+        // The thief asks only for what has not arrived; the victim no longer
+        // owns the piece, so it requests none of it.
+        assert_eq!(
+            tracker
+                .missing_chunks(piece)
+                .map(|c| c.chunk_index)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(tracker.is_owned_by(piece, fast));
+        assert!(!tracker.is_owned_by(piece, slow));
     }
 }
