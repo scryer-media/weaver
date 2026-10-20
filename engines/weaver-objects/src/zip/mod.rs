@@ -491,7 +491,7 @@ impl Object for Zip {
         self.kept.read(range).map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
         let first = self.names.values().next();
         if let Some(parsed) = ZipFormat::parse(name)
             && first.is_none_or(|first| first.same_set(&parsed))
@@ -513,7 +513,12 @@ impl Object for Zip {
         }
     }
 
-    fn claim(&mut self, name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        name: &str,
+        _first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         let candidate = ZipFormat::parse(name)?;
         // The member that founds the store binds at its own name's index,
         // the `.zip` at the symbolic last.

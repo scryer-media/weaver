@@ -25,6 +25,13 @@ fn bind(job: &mut Job<Par3>) {
     job.object.bind(&mut job.namespace, &mut renamed);
 }
 
+// Recovery blocks the rulings so far found reachable.
+fn reachable(object: &Par3) -> u64 {
+    let mut sets = Vec::new();
+    object.sets(&mut sets);
+    sets.iter().map(|set| set.blocks_reachable).sum()
+}
+
 #[test]
 fn par3_verifies_a_clean_member() {
     let one = payload(1, 9000);
@@ -36,8 +43,8 @@ fn par3_verifies_a_clean_member() {
     let second = job.member("two.bin", &two);
     bind(&mut job);
     assert!(job.object.covers(first) && job.object.covers(second));
-    assert!(job.object.blocks_reachable() >= 3);
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert!(reachable(&job.object) >= 3);
     assert_eq!(job.store.writes, 0);
 }
 
@@ -168,11 +175,11 @@ fn a_hole_in_a_volume_costs_only_the_blocks_it_cuts() {
     wrong[5000] ^= 0x42;
     let first = job.member("one.bin", &wrong);
     bind(&mut job);
-    assert_eq!(job.object.blocks_reachable(), 2);
     assert_eq!(
         job.object.repair(&mut job.store),
         RepairOutcome::Repaired { slices: 1 }
     );
+    assert_eq!(reachable(&job.object), 2);
     assert!(job.store.members[&first] == one);
 }
 

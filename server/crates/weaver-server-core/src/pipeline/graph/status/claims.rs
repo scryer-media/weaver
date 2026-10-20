@@ -155,7 +155,8 @@ pub(crate) struct Delivered {
 
 impl Delivery {
     // `payload` picks the root members that are the post's files,
-    // `furniture` the names whose state never decides a job, and
+    // `furniture` the names of those files whose state never decides a
+    // job, such as a text file posted beside the payload, and
     // `unrepaired` the members a recovery set whose repair could not
     // rebuild what it found covers, as their namespace says. `refused` says
     // why a member is a leaf.
@@ -266,14 +267,15 @@ struct Walk<'t, F, R> {
 
 impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
     // `short` says a volume the member was unpacked from is short where a
-    // failed repair covers it.
+    // failed repair covers it. Furniture is a file of the post: a member an
+    // object unpacked is payload, whatever it is named.
     fn member(&mut self, node: NodeId, member: &Member, short: bool) {
         let tree = self.tree;
         match tree.child_of(node, member.id) {
             Some((child, _)) if tree.recovers(child) => {}
             Some((child, _)) => self.namespace(child, short),
             None => {
-                if !(self.furniture)(&member.output_name) {
+                if !(node == NodeId::ROOT && (self.furniture)(&member.output_name)) {
                     self.leaf(node, member, short);
                 }
                 for kept in tree.kept(node, member.id) {

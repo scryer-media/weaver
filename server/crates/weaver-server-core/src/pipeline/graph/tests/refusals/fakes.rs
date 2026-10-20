@@ -237,7 +237,7 @@ impl Object for Store {
         None
     }
 
-    fn claim(&mut self, name: &str, _: &[u8]) -> Option<VolumeIndex> {
+    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
         let (_, part) = name.rsplit_once(".part")?;
         let part: u32 = part.strip_suffix(".rar")?.parse().ok()?;
         (part >= 2).then(|| VolumeIndex(part - 1))

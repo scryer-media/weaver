@@ -4,14 +4,14 @@
 // Where a graph job stands once its articles are in, read from the root
 // namespace: whether its recovery objects have ruled, the repair that takes
 // a slot when they have not, what the job claims it delivered, and what the
-// status, health and scripts are told. The job's status is its root's phase;
+// status and scripts are told. The job's status is its root's phase;
 // deeper phases belong to member detail.
 //
-//   summary   what every recovery object can say, folded into numbers
+//   summary   what every recovery object last ruled
 //   claims    complete, damaged or missing, member by member
 //   slots     the repair slots the graph jobs share
 //   metrics   the `graph.*` family
-//   seams     the pipeline's hooks: completion, the census, health, scripts
+//   seams     the pipeline's hooks: completion, the census, scripts
 
 mod claims;
 mod metrics;
@@ -90,8 +90,6 @@ impl RootJob for GraphJob {
                     .writer()
                     .set_name(tree, object.node)
                     .map_or_else(|| object.kind.to_string(), str::to_owned),
-                blocks_reachable: object.blocks_reachable,
-                damaged_slices: object.damaged_slices,
                 outcome: object.outcome,
             })
             .collect();
@@ -102,11 +100,7 @@ impl RootJob for GraphJob {
             .filter_map(|(node, member)| tree.namespace(*node)?.get(*member))
             .map(|member| member.output_name.clone())
             .collect();
-        RecoverySummary {
-            sets,
-            unusable,
-            forming: self.recovery_may_form(),
-        }
+        RecoverySummary { sets, unusable }
     }
 
     fn repair(&mut self) -> Vec<RepairOutcome> {

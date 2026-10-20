@@ -139,11 +139,7 @@ impl GraphJob {
     // The node was offered this candidate last: it is offered again, so the
     // object derives its keys from it as it did before.
     fn offer_again(&mut self, node: NodeId, index: usize) -> Result<(), GraphError> {
-        let Some(secret) = self
-            .passwords
-            .offered_before(node, index)
-            .map(str::to_owned)
-        else {
+        let Some(secret) = self.passwords.resume_at(node, index).map(str::to_owned) else {
             return Ok(());
         };
         let mut effects = Vec::new();

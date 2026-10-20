@@ -311,7 +311,12 @@ impl Object for RarRecovery {
 
     // Every recovery volume of the set this one covers, numbered as it
     // comes. The first is the one the object was built for.
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         let rev = first_bytes.starts_with(REV5_SIGN) || naming::recovery_stem(name).is_some();
         (rev && !self.revs.is_empty()
             && self.stem.is_some()
@@ -319,7 +324,7 @@ impl Object for RarRecovery {
             .then(|| VolumeIndex(self.revs.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         if self.stem.is_none() {
             self.stem = naming::recovery_stem(name);
         }
@@ -448,9 +453,5 @@ impl Recovery for RarRecovery {
                 (self.usable() < needed && self.coming()).then_some(RepairOutcome::Waiting)
             }
         }
-    }
-
-    fn blocks_reachable(&self) -> u64 {
-        self.usable() + self.revs.iter().filter(|rev| !rev.closed).count() as u64
     }
 }

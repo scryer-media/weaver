@@ -30,7 +30,7 @@ fn twin(files: &[(String, Vec<u8>)], data: &[u8]) -> Twin {
     let mut job = Job::new(Par2::new(OWN), OWN);
     let (member, bad) = damaged_member(&mut job, "payload.bin", data, 2100);
     let mut volumes = Vec::new();
-    for (index, (name, bytes)) in files.iter().enumerate() {
+    for (name, bytes) in files {
         let file = job.namespace.announce(name, Some(bytes.len() as u64));
         job.arrive(file, 0, bytes, Provenance::Fresh);
         job.namespace.bind(file, OWN);

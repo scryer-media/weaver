@@ -32,7 +32,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, MemberId, Object,
-    Placement, Pull, Seek, Standing, VolumeIndex, Why,
+    Placement, Pull, Seek, Sniff, Standing, VolumeIndex, Why, signed,
 };
 
 pub use self::brotli::Brotli;
@@ -190,7 +190,7 @@ impl<D: Decoder> Object for Stream<D> {
         None
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
         if volume == VolumeIndex(0) {
             name.clone_into(&mut self.name);
         } else {
@@ -205,8 +205,18 @@ impl<D: Decoder> Object for Stream<D> {
     }
 
     // A piece numbered after the first volume's own, when the first is a
-    // piece: its place is its number counted from the first's.
-    fn claim(&mut self, name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
+    // piece: its place is its number counted from the first's. A name is
+    // all that places a piece here, so it never outvotes a front a format
+    // names: that piece is the format's, wherever its name numbers it.
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        length: Option<u64>,
+    ) -> Option<VolumeIndex> {
+        if matches!(signed(first_bytes, length), Sniff::Object(_)) {
+            return None;
+        }
         let first = split::parse(&self.name)?;
         let index = split::parse(name)?.index_from(&first)?;
         (index != 0 && !self.pieces.contains(&index)).then_some(VolumeIndex(index))

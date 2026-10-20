@@ -175,32 +175,38 @@ fn sevenz_job_spec_stating(
     articles: usize,
     stated: impl Fn(u32) -> u32,
 ) -> JobSpec {
+    let files: Vec<FileSpec> = volumes
+        .iter()
+        .enumerate()
+        .map(|(index, (filename, bytes))| FileSpec {
+            filename: filename.clone(),
+            role: FileRole::from_filename(filename),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: (0..articles as u32)
+                .map(|segment_number| {
+                    let (start, end) = article_extent(bytes.len(), segment_number, articles);
+                    segment_spec! {
+                        number: segment_number,
+                        bytes: stated((end - start) as u32),
+                        message_id: format!("sevenz-{index}-{segment_number}@example.com"),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
     JobSpec {
         name: "Silver Horizon".to_string(),
         password: None,
-        total_bytes: volumes.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+        // Ingest's rule: a job's total is its files' declared segment bytes.
+        total_bytes: files
+            .iter()
+            .flat_map(|file| &file.segments)
+            .map(|segment| u64::from(segment.bytes))
+            .sum(),
         category: None,
         metadata: vec![],
-        files: volumes
-            .iter()
-            .enumerate()
-            .map(|(index, (filename, bytes))| FileSpec {
-                filename: filename.clone(),
-                role: FileRole::from_filename(filename),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: (0..articles as u32)
-                    .map(|segment_number| {
-                        let (start, end) = article_extent(bytes.len(), segment_number, articles);
-                        segment_spec! {
-                            number: segment_number,
-                            bytes: stated((end - start) as u32),
-                            message_id: format!("sevenz-{index}-{segment_number}@example.com"),
-                        }
-                    })
-                    .collect(),
-            })
-            .collect(),
+        files,
     }
 }
 

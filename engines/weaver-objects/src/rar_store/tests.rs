@@ -245,11 +245,31 @@ fn nameless_volumes_are_grouped_by_their_headers() {
 fn a_nameless_volume_without_its_predecessor_is_placed_where_it_states() {
     let volumes = write(&items(), &split(Version::Rar5));
     let mut object = store();
-    object.bound(VolumeIndex(0), "c0ffee", &[]);
+    object.bound(VolumeIndex(0), "c0ffee", &[], None);
     // Volume 2 of the set states its number; volume 1, which nobody holds
     // yet, does not decide where it goes.
     let front = &volumes[2][..4096.min(volumes[2].len())];
-    assert_eq!(object.claim("d00d", front), Some(VolumeIndex(2)));
+    assert_eq!(object.claim("d00d", front, None), Some(VolumeIndex(2)));
+}
+
+// A store holding only a set's second volume takes the first volume that
+// carries on into it, never another set's first, which states the same
+// number but ends on a member the second volume does not open on.
+#[test]
+fn a_first_volume_joins_only_the_set_it_carries_on_into() {
+    let ours = write(&items(), &split(Version::Rar5));
+    let theirs = write(
+        &[Item::File("delta.bin", payload(4, 10_000))],
+        &split(Version::Rar5),
+    );
+    let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+    let mut object = store();
+    object.bound(VolumeIndex(1), "c0ffee", &front(&ours[1]), None);
+    assert_eq!(object.claim("d00d", &front(&theirs[0]), None), None);
+    assert_eq!(
+        object.claim("beef", &front(&ours[0]), None),
+        Some(VolumeIndex(0))
+    );
 }
 
 #[test]

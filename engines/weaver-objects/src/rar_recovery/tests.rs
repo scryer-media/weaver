@@ -55,7 +55,7 @@ fn rev(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeInd
 // A recovery volume every byte of which has arrived, not yet closed.
 fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeIndex> {
     let front = &bytes[..bytes.len().min(64)];
-    let volume = match job.object.claim(name, front) {
+    let volume = match job.object.claim(name, front, None) {
         Some(volume) => volume,
         None if job.store.volumes.is_empty() => VolumeIndex(0),
         None => return None,
@@ -63,7 +63,7 @@ fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<Volu
     let member = job.namespace.announce(name, Some(bytes.len() as u64));
     job.arrive(member, 0, bytes, Provenance::Fresh);
     job.namespace.bind(member, OWN);
-    job.object.bound(volume, name, front);
+    job.object.bound(volume, name, front, None);
     job.store.volumes.insert(volume, bytes.to_vec());
     let mut out = Vec::new();
     job.object.sized(volume, bytes.len() as u64, &mut out);
@@ -140,7 +140,7 @@ fn recovery_volumes_of_one_set_are_claimed_and_another_sets_are_not() {
     );
     assert_eq!(
         job.object
-            .claim("lantern.part2.rar", b"Rar!\x1a\x07\x01\x00"),
+            .claim("lantern.part2.rar", b"Rar!\x1a\x07\x01\x00", None),
         None
     );
 }

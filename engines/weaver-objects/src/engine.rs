@@ -49,6 +49,10 @@ pub trait Format: Send + Sync {
     fn states_place(_front: &Self::Front) -> bool {
         false
     }
+    // Whether the front says the volume is not at `index`.
+    fn misplaced(_front: &Self::Front, _index: u32) -> bool {
+        false
+    }
     // The index the fronts of the volumes bound give a volume whose front
     // is `front`: each bound volume by index, with its front when it states
     // one.
@@ -196,7 +200,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         None
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         let first = self.names.values().next();
         if let Some(parsed) = F::parse(name)
             && first.is_none_or(|first| first.same_set(&parsed))
@@ -221,12 +225,18 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     // A volume's place is what states it, as the RAR store places one: the
-    // number its front gives, beside what the fronts of the volumes bound
-    // state; else its name in the set's own numbering; and only a volume
-    // that states neither by the fronts it links to beside it, which guess
-    // wrong across a volume not yet bound. A posted name is a label, which
-    // a recovery set may change later, so a stated number outranks it.
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+    // position its front gives, beside what the fronts of the volumes bound
+    // state; else its name in the set's own numbering where the front does
+    // not say the volume is not there; and only a volume that places
+    // neither by the fronts it links to beside it, which guess wrong across
+    // a volume not yet bound. A posted name is a label, which a recovery set
+    // may change later, so the front outranks it.
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         let bound = self
             .bound
             .iter()
@@ -234,7 +244,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             .collect();
         let front = F::front(first_bytes);
         let stated = front.as_ref().is_some_and(F::states_place);
-        let placed = front.and_then(|front| F::place(&bound, &front));
+        let placed = front.as_ref().and_then(|front| F::place(&bound, front));
         let named = F::parse(name)
             .filter(|candidate| {
                 self.names
@@ -242,7 +252,12 @@ impl<F: Format + 'static> Object for EngineObject<F> {
                     .next()
                     .is_some_and(|first| first.same_set(candidate))
             })
-            .and_then(|candidate| candidate.slot(&self.names));
+            .and_then(|candidate| candidate.slot(&self.names))
+            .filter(|index| {
+                !front
+                    .as_ref()
+                    .is_some_and(|front| F::misplaced(front, *index))
+            });
         let index = match (placed, named) {
             (Some(index), _) if stated => index,
             (_, Some(named)) => named,

@@ -211,7 +211,7 @@ fn run(engine: &mut ZipEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
 fn named(names: &[&str]) -> ZipEngine {
     let mut engine = ZipEngine::new();
     for (volume, name) in names.iter().enumerate() {
-        engine.bound(VolumeIndex(volume as u32), name, &[]);
+        engine.bound(VolumeIndex(volume as u32), name, &[], None);
     }
     engine
 }
@@ -348,28 +348,28 @@ fn a_set_the_names_disagree_with_is_refused_as_unsupported() {
 #[test]
 fn claim_names_the_volumes_of_its_own_set_with_the_last_after_them() {
     let mut engine = named(&["Set.Z01"]);
-    assert_eq!(engine.claim("set.z02", b""), Some(VolumeIndex(1)));
-    assert_eq!(engine.claim("set.z100", b""), Some(VolumeIndex(99)));
+    assert_eq!(engine.claim("set.z02", b"", None), Some(VolumeIndex(1)));
+    assert_eq!(engine.claim("set.z100", b"", None), Some(VolumeIndex(99)));
     assert_eq!(
-        engine.claim("set.zip", b""),
+        engine.claim("set.zip", b"", None),
         Some(VolumeIndex(u32::MAX)),
         "the last is after every numbered volume, whatever their count"
     );
-    assert_eq!(engine.claim("set.z01", b""), None);
-    assert_eq!(engine.claim("set.z00", b""), None);
-    assert_eq!(engine.claim("other.z02", b""), None);
-    assert_eq!(engine.claim("set.7z.002", b""), None);
-    engine.bound(VolumeIndex(u32::MAX), "set.zip", &[]);
-    assert_eq!(engine.claim("set.zip", b""), None);
+    assert_eq!(engine.claim("set.z01", b"", None), None);
+    assert_eq!(engine.claim("set.z00", b"", None), None);
+    assert_eq!(engine.claim("other.z02", b"", None), None);
+    assert_eq!(engine.claim("set.7z.002", b"", None), None);
+    engine.bound(VolumeIndex(u32::MAX), "set.zip", &[], None);
+    assert_eq!(engine.claim("set.zip", b"", None), None);
     assert_eq!(
-        engine.claim("set.z02", b""),
+        engine.claim("set.z02", b"", None),
         Some(VolumeIndex(1)),
         "a numbered volume posted after the last still takes its number"
     );
 
     let mut lone = named(&["set.zip"]);
     assert_eq!(
-        lone.claim("set.z01", b""),
+        lone.claim("set.z01", b"", None),
         None,
         "a lone zip has no siblings"
     );

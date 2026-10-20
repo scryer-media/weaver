@@ -214,8 +214,7 @@ impl Pipeline {
     }
 
     // What the root's recovery objects can say of a graph job now, read
-    // off the tree whenever it is asked: health asks it between articles,
-    // and the tree is what changed since.
+    // off the tree whenever it is asked.
     pub(in crate::pipeline) fn graph_recovery_summary(
         &self,
         job_id: JobId,

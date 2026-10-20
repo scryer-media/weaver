@@ -429,13 +429,14 @@ impl NamespaceWriter {
     pub(crate) fn rename(
         &mut self,
         tree: &mut Tree,
+        builder: &mut dyn Builder,
         node: NodeId,
         member: MemberId,
         name: &str,
     ) -> Result<String, WriteError> {
         let mut effects = Vec::new();
         let output_name = tree
-            .rename(node, member, name, &mut effects)
+            .rename(node, member, name, &mut self.placing(builder), &mut effects)
             .ok_or(WriteError::UnknownMember { node, member })?;
         self.moved(&effects)?;
         Ok(output_name)
@@ -540,6 +541,14 @@ impl NamespaceWriter {
         let kept = self
             .envelopes
             .capture(child, &placements, &arrival.bytes, arrival.provenance);
+        // What arrives is the member's bytes now, whatever was held of them
+        // before: a repair rewrites what was held, and the held copy never
+        // goes down after it.
+        if let Some(files) = self.files.get_mut(&arrival.node) {
+            files
+                .holds
+                .take(held_volume(arrival.member), arrival.range());
+        }
         let mut breached = Vec::new();
         for placement in &placements {
             let Placement::Held { range } = placement else {

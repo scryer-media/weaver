@@ -14,7 +14,7 @@ use unrar_rs::{MemberKeying, PasswordCheck, RarVolumeHeaderEncryption, check_mem
 use weaver_graph::{Emit, Why};
 use zeroize::Zeroizing;
 
-use super::{Lock, RarStore};
+use super::{Candidate, Lock, RarStore};
 use crate::crypt::Cbc;
 use crate::keys::{self, Keys, Tuple};
 
@@ -108,6 +108,21 @@ impl RarStore {
             self.asked = true;
             out.push(Emit::NeedsPassword);
         }
+    }
+
+    // The candidate that is `secret`, added when the store has none.
+    pub(super) fn candidate(&mut self, secret: &str) -> usize {
+        let found = self
+            .candidates
+            .iter()
+            .position(|candidate| candidate.secret.as_str() == secret);
+        found.unwrap_or_else(|| {
+            self.candidates.push(Candidate {
+                secret: Zeroizing::new(secret.to_owned()),
+                headers_wrong: false,
+            });
+            self.candidates.len() - 1
+        })
     }
 
     // The password the archive's check proved, for every header walk.

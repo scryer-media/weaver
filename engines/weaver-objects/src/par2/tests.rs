@@ -29,6 +29,13 @@ fn bind(job: &mut Job<Par2>) -> Vec<MemberId> {
     renamed
 }
 
+// Recovery blocks reachable across the sets, as their rulings say.
+fn reachable(object: &Par2) -> u64 {
+    let mut sets = Vec::new();
+    object.sets(&mut sets);
+    sets.iter().map(|set| set.blocks_reachable).sum()
+}
+
 // What the namespace feeds: every piece verified unless it touches `bad`.
 fn feed(job: &mut Job<Par2>, member: MemberId, bytes: &[u8], bad: Option<ByteRange>) {
     let mut pieces = segments(0, bytes, ARTICLE, BLOCK, true);
@@ -261,7 +268,7 @@ fn a_shared_recovery_file_feeds_both_sets() {
     feed(&mut job, left, &wrong, Some(left_bad));
     let wrong = job.store.members[&right].clone();
     feed(&mut job, right, &wrong, Some(right_bad));
-    assert_eq!(job.object.blocks_reachable(), 4);
+    assert_eq!(reachable(&job.object), 4);
     assert!(matches!(
         job.object.repair(&mut job.store),
         RepairOutcome::Repaired { .. }
@@ -278,7 +285,7 @@ fn blocks_reachable_drops_when_a_volume_is_lost() {
     let mut job = job(&files);
     job.member("payload.bin", &data);
     bind(&mut job);
-    let before = job.object.blocks_reachable();
+    let before = reachable(&job.object);
     assert_eq!(before, 4);
     let lost = files[2].1.len() as u64;
     let mut out = Vec::new();
@@ -287,7 +294,7 @@ fn blocks_reachable_drops_when_a_volume_is_lost() {
         ByteRange::new(0, lost),
         &mut out,
     );
-    assert!(job.object.blocks_reachable() < before);
+    assert!(reachable(&job.object) < before);
 }
 
 #[test]
@@ -433,7 +440,10 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
     let mut job = job(&files[..1]);
     job.member("payload.bin", &data);
     let (name, bytes) = &files[1];
-    let volume = job.object.claim(name, &bytes[..64]).expect("a PAR2 volume");
+    let volume = job
+        .object
+        .claim(name, &bytes[..64], None)
+        .expect("a PAR2 volume");
     let lost = ByteRange::at(ARTICLE, ARTICLE);
     let mut out = Vec::new();
     for (index, piece) in bytes.chunks(ARTICLE as usize).enumerate() {
@@ -467,7 +477,7 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
         at += length as usize;
     }
     assert!(clear >= 2, "the fixture keeps packets past the loss");
-    assert_eq!(job.object.blocks_reachable(), clear);
+    assert_eq!(reachable(&job.object), clear);
 }
 
 // A set's volume named but not yet arrived: claimed from its front, so
@@ -610,6 +620,75 @@ fn a_described_file_no_member_carries_is_named_and_rebuilt_whole() {
     assert!(job.store.members[&member] == carried);
 }
 
+// A posted file under a name no description answers to, its first article
+// lost: its front names nothing, so its slices do. It is not announced
+// again beside itself; the repair knows it by a slice it reads back and
+// mends it in place, and the bind after names it what the set describes.
+#[test]
+fn a_member_whose_front_was_lost_is_known_by_its_slices_and_mended_in_place() {
+    let file = payload(33, 6 * BLOCK as usize - 40);
+    let files = par2_set("set", &[("described.bin", &file)], BLOCK, 4, 1);
+    let mut job = job(&files);
+    let posted = job.member("5f0c9e2ab1d74c6e", &file);
+    let lost = vec![0; ARTICLE as usize];
+    job.arrive(posted, 0, &lost, Provenance::Damaged);
+    job.store.members.get_mut(&posted).expect("posted")[..lost.len()].copy_from_slice(&lost);
+    assert!(bind(&mut job).is_empty());
+    assert!(!job.object.covers(posted));
+    let mut named = Vec::new();
+    job.object.absent(&mut named);
+    assert!(named.is_empty(), "{named:?}");
+
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 2 }
+    );
+    assert!(job.store.members[&posted] == file);
+    assert!(job.object.covers(posted));
+
+    // The namespace delivers the mended front as repaired bytes.
+    job.arrive(posted, 0, &file[..lost.len()], Provenance::Repaired);
+    assert_eq!(bind(&mut job), vec![posted]);
+    assert!(job.object.covers(posted));
+    assert_eq!(
+        job.namespace.get(posted).expect("posted").name,
+        "described.bin"
+    );
+}
+
+// A posted file under a name no description answers to, every byte of it
+// lost: no front and no slice can say what it is, and the post's encoded
+// size only bounds its length, so it is what is left, the one free file it
+// could be. The repair mends it in place and the bind after recognises it,
+// name and length.
+#[test]
+fn a_member_with_no_intact_byte_binds_by_elimination_and_is_mended_in_place() {
+    let file = payload(34, 3 * BLOCK as usize - 24);
+    let files = par2_set("set", &[("described.bin", &file)], BLOCK, 4, 1);
+    let mut job = job(&files);
+    let lost = vec![0; file.len() + 100];
+    let posted = job.member("5f0c9e2ab1d74c6e", &lost);
+    job.arrive(posted, 0, &lost, Provenance::Damaged);
+    assert!(bind(&mut job).is_empty());
+    let mut named = Vec::new();
+    job.object.absent(&mut named);
+    assert!(named.is_empty(), "{named:?}");
+
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 3 }
+    );
+    assert!(job.store.members[&posted][..file.len()] == file);
+    assert!(job.object.covers(posted));
+
+    job.arrive(posted, 0, &file, Provenance::Repaired);
+    assert_eq!(bind(&mut job), vec![posted]);
+    let record = job.namespace.get(posted).expect("posted");
+    assert_eq!(record.name, "described.bin");
+    assert_eq!(record.length, Some(file.len() as u64));
+    assert!(record.is_complete());
+}
+
 // A recovery packet whose payload fails its hash is dropped at the scan, so
 // it is never counted as a block in hand.
 #[test]
@@ -626,7 +705,7 @@ fn a_recovery_packet_failing_its_hash_is_dropped_at_the_scan() {
     let mut job = job(&files);
     job.member("payload.bin", &data);
     bind(&mut job);
-    assert_eq!(job.object.blocks_reachable(), 3);
+    assert_eq!(reachable(&job.object), 3);
 }
 
 // A set describing more than a job may hold is refused: it binds nothing

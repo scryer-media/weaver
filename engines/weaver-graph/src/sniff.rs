@@ -40,6 +40,17 @@ pub enum Sniff {
 }
 
 pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
+    // A name never outvotes bytes that might still turn out to be a signature.
+    match signed(first_bytes, length) {
+        Sniff::Leaf => named(name).map_or(Sniff::Leaf, Sniff::Object),
+        verdict => verdict,
+    }
+}
+
+// What the first bytes alone say a member is: the kind whose signature they
+// open, `Pending` while one still might, and `Leaf` once they rule out every
+// one.
+pub fn signed(first_bytes: &[u8], length: Option<u64>) -> Sniff {
     let mut waiting = false;
     for signature in SIGNATURES {
         match signature.test(first_bytes, length) {
@@ -48,11 +59,7 @@ pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
             Test::No => {}
         }
     }
-    // A name never outvotes bytes that might still turn out to be a signature.
-    if waiting {
-        return Sniff::Pending;
-    }
-    named(name).map_or(Sniff::Leaf, Sniff::Object)
+    if waiting { Sniff::Pending } else { Sniff::Leaf }
 }
 
 struct Signature {

@@ -331,13 +331,18 @@ impl Object for Par3 {
 
     // Every PAR3 file is a volume of the one object, numbered as it comes,
     // up to the carrier limit.
-    fn claim(&mut self, _name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        _name: &str,
+        first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
             && self.volumes.len() < MAX_CARRIERS)
             .then(|| VolumeIndex(self.volumes.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, _name: &str, _front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {
         self.volume(volume);
     }
 
@@ -403,7 +408,8 @@ impl Recovery for Par3 {
         self.identified
             .retain(|member, _| unnamed.contains_key(member));
         for (path, member) in self.by_content() {
-            if namespace.rename(member, &path).is_some() {
+            let length = self.unnamed[&member].length;
+            if namespace.recognise(member, &path, length).is_some() {
                 renamed.push(member);
             }
             bound.insert(path, member);
@@ -561,13 +567,5 @@ impl Recovery for Par3 {
             outcome: ruled.outcome.filter(|_| current),
             ..ruled.clone()
         }));
-    }
-
-    // What the kept fronts carry, past any hole in them.
-    fn blocks_reachable(&self) -> u64 {
-        self.front_sets()
-            .iter()
-            .map(|set| rebuild::usable_recovery(set).len() as u64)
-            .sum()
     }
 }

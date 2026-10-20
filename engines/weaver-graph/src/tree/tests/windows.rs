@@ -90,9 +90,6 @@ impl Recovery for Tape {
     fn outcome(&self) -> Option<RepairOutcome> {
         None
     }
-    fn blocks_reachable(&self) -> u64 {
-        0
-    }
 }
 
 // The store doubles of the parent module, and a tape for recovery data.

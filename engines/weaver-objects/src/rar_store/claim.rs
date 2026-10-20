@@ -5,10 +5,11 @@
 // one is: the position the set gives it, never the order it arrived in.
 // Every volume of a RAR set starts with the signature, so a member without
 // one is never claimed. A volume is placed by what states its position: the
-// number its own headers give, else its name in the set's numbering, as in
+// position its own headers give, else its name in the set's numbering, as in
 // a set numbered by its names alone. A posted name is a label a recovery set
-// may change later, so a stated number outranks it. A volume that neither
-// numbers goes after the held volume whose last member it continues. The
+// may change later, so the headers outrank it, and a name they contradict
+// places nothing. A volume that neither places goes after the held volume
+// whose last member it continues. The
 // store's first volume is placed the same way, with nothing held yet, and a
 // front that places it nowhere founds the store with it first. That claim is
 // provisional: a volume whose own headers, read to its close, say it is not
@@ -61,7 +62,7 @@ pub(super) const CARRIED: u64 = 4 * 1024 * 1024;
 // Whether a volume's headers say it is not at `index`: they state another
 // position, or it opens on a member begun before it, so it is no set's
 // first.
-pub(super) fn misplaced(index: VolumeIndex, facts: &RarVolumeFacts) -> bool {
+pub(crate) fn misplaced(index: VolumeIndex, facts: &RarVolumeFacts) -> bool {
     let this = Nameless { facts };
     this.position().is_some_and(|stated| stated != index.0)
         || (index.0 == 0 && this.continued_member().is_some())
@@ -75,12 +76,18 @@ struct Nameless<'a> {
 impl Nameless<'_> {
     // The position the headers state. A RAR5 volume numbers itself in its
     // main header, all but the first, which states no number; a RAR4
-    // volume numbers itself only in its end record.
+    // volume numbers itself only in its end record, and short of one is
+    // its set's first when it opens on a member it does not continue, as
+    // RAR reads it.
     fn position(&self) -> Option<u32> {
         match (self.facts.volume_number, self.facts.archive_format()) {
             (Some(stated), _) => Some(stated),
             (None, ArchiveFormat::Rar5) => self.facts.is_volume.then_some(0),
-            (None, _) => None,
+            (None, _) => self
+                .ordered_members()
+                .first()
+                .is_some_and(|member| !member.split_before)
+                .then_some(0),
         }
     }
 
@@ -120,19 +127,34 @@ impl Nameless<'_> {
             return false;
         }
         match (previous.continuing_member(), self.continued_member()) {
-            (Some(tail), Some(head)) => {
-                head.name == tail.name
-                    && match (head.unpacked_size, tail.unpacked_size) {
-                        (Some(head_size), Some(tail_size)) => head_size == tail_size,
-                        _ => true,
-                    }
-            }
+            (Some(tail), Some(head)) => continues(tail, head),
             // A boundary that falls between two members links only on a
             // stated number; nothing else in the headers ties the volumes.
             (None, None) => self.position() == Some(index),
             _ => false,
         }
     }
+
+    // Whether `next` can come straight after this volume by what this one's
+    // headers say of its end: a member this volume carries on is the one
+    // `next` opens on. A front that ends on no carried member may stop
+    // short of its last header, so it says nothing against `next`.
+    fn runs_into(&self, next: &Nameless<'_>) -> bool {
+        self.continuing_member().is_none_or(|tail| {
+            next.continued_member()
+                .is_some_and(|head| continues(tail, head))
+        })
+    }
+}
+
+// Whether `head`, the member a volume opens on, is `tail`, the member the
+// volume before it carries on.
+fn continues(tail: &RarVolumeMemberFacts, head: &RarVolumeMemberFacts) -> bool {
+    head.name == tail.name
+        && match (head.unpacked_size, tail.unpacked_size) {
+            (Some(head_size), Some(tail_size)) => head_size == tail_size,
+            _ => true,
+        }
 }
 
 impl RarStore {
@@ -181,15 +203,17 @@ impl RarStore {
                     .filter_map(|volume| volume.name.as_deref().and_then(naming::parse))
                     .any(|bound| bound.same_set(wanted))
         });
-        // A position is what states it: the number the headers give, else
-        // the name in the set's numbering. Only a volume that neither
-        // numbers is placed by the members that link it to those held,
-        // which never fix a position on their own: one member may span
-        // every volume, and then it links each to all the others.
+        // A position is what states it: the position the headers give,
+        // else the name in the set's numbering. Only a volume that neither
+        // places is placed by the members that link it to those held, which
+        // never fix a position on their own: one member may span every
+        // volume, and then it links each to all the others. Nothing places
+        // a volume where its own headers say it is not, a name least of all.
         let stated = facts.is_some_and(states_position);
         let named = wanted
             .filter(|_| named)
-            .map(|wanted| VolumeIndex(wanted.index()));
+            .map(|wanted| VolumeIndex(wanted.index()))
+            .filter(|index| !facts.is_some_and(|facts| misplaced(*index, facts)));
         let index = match (facts.and_then(|facts| self.claim_by_headers(facts)), named) {
             (Some(index), _) if stated => index,
             (_, Some(named)) => named,
@@ -245,10 +269,11 @@ pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
 // The position a volume's headers give it beside the volumes held, by
 // index. One that states its number is at that number, when the held
 // volumes beside it agree: the one before carries on into it, the one after
-// is of the same kind and states the next number. One that states none, a
-// nameless RAR4 front, goes in the one free place beside the held volumes
-// where both its neighbours link to it: after the one whose last member it
-// continues, before the one that continues its last member.
+// is of the same kind, states the next number and opens on the member it
+// carries on, so a volume never joins a set it does not continue. One that
+// states none, a nameless RAR4 front, goes in the one free place beside the
+// held volumes where both its neighbours link to it: after the one whose
+// last member it continues, before the one that continues its last member.
 pub(crate) fn place(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> Option<u32> {
     let this = Nameless { facts };
     let joins = |previous: &Held<'_>, index: u32| {
@@ -265,7 +290,9 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> O
         let after = held.get(&(stated + 1)).is_none_or(|next| {
             next.facts.is_none_or(|facts| {
                 let next = Nameless { facts };
-                next.kin(&this) && next.position() == Some(stated + 1)
+                next.kin(&this)
+                    && next.position().is_none_or(|next| next == stated + 1)
+                    && this.runs_into(&next)
             })
         });
         return (before && after).then_some(stated);

@@ -29,17 +29,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Object,
-    Placement, Posting, Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
+    Placement, Posting, Pull, Seek, Sniff, Standing, Take, VolumeIndex, Weight, Why, signed,
 };
 use zeroize::Zeroizing;
 
 use crate::RECOVERY;
 use crate::crypt::{Cbc, Chain, Padding};
-use crate::engine::Format;
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
 use crate::keys::Keys;
-use crate::sevenz_engine::SevenZip;
+use crate::split;
 use geometry::Geometry;
 use header::{SIGNATURE, Signature, Start};
 use map::Map;
@@ -130,6 +129,10 @@ pub struct SevenZipStore {
     lengths: BTreeMap<VolumeIndex, u64>,
     kept: Kept,
     start: Option<Start>,
+    // How long the container is, as the signature header in the front the
+    // first piece was bound with states it: with that piece's length, what
+    // places the pieces bound after it, before any byte is delivered.
+    measured: Option<u64>,
     geometry: Option<Geometry>,
     // The end header is known to be encrypted.
     encrypted: bool,
@@ -163,7 +166,8 @@ pub struct SevenZipStore {
 impl Durable for SevenZipStore {
     // 3: the grid shelved by chunk of blocks, kept apart from the bytes.
     // 4: a sealed value encodes as nothing, numbered by its owner's walk.
-    const VERSION: u16 = 4;
+    // 5: the container's length as the first piece's front states it.
+    const VERSION: u16 = 5;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.grid.parts(take)
@@ -214,6 +218,7 @@ impl SevenZipStore {
             lengths: BTreeMap::new(),
             kept,
             start: None,
+            measured: None,
             geometry: None,
             encrypted: false,
             header_ranges: Vec::new(),
@@ -362,14 +367,9 @@ impl SevenZipStore {
             if geometry.agrees(*volume, *length) || !self.lengths_said.insert(*volume) {
                 continue;
             }
-            let expected = if *volume == geometry.last() {
-                geometry.total().saturating_sub(geometry.base(*volume))
-            } else {
-                geometry.base(VolumeIndex(1))
-            };
             out.push(Emit::Damaged {
                 volume: *volume,
-                range: ByteRange::new(0, (*length).max(expected)),
+                range: ByteRange::new(0, (*length).max(geometry.holds(*volume))),
             });
         }
     }
@@ -718,26 +718,62 @@ impl Object for SevenZipStore {
         self.kept.read(range).map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
+    // The first volume is the piece with the signature header, whose front
+    // says how long the container is; its length is how long every piece
+    // but the last is. Both are what places the pieces bound after it.
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], length: Option<u64>) {
         self.names.insert(volume, name.to_owned());
+        if let Some(length) = length {
+            self.lengths.entry(volume).or_insert(length);
+            self.stale = true;
+        }
+        if volume.0 == 0
+            && let Signature::Start(start) = header::signature(front)
+        {
+            self.measured = Some(start.total());
+        }
     }
 
     fn renamed(&mut self, volume: VolumeIndex, name: &str) {
         self.names.insert(volume, name.to_owned());
     }
 
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        // A volume of a split set has no signature of its own; one that has
-        // is a container of its own.
-        if first_bytes.starts_with(&header::MAGIC) {
+    // Every piece but the last is as long as the first, and the last holds
+    // the rest of the container the first piece's signature header
+    // measures, so a piece's length says which free places it can take.
+    // Where it could take several, as a piece as long as the first can,
+    // only the number its name carries, counted from the first piece's own,
+    // can say which: a numbered piece takes that place whatever its length,
+    // which the store checks as it checks every volume's. A piece with no
+    // number takes the one free place its length fits exactly, and a piece
+    // no fact places is not claimed.
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        length: Option<u64>,
+    ) -> Option<VolumeIndex> {
+        // A piece of a split set has no signature of its own; one whose
+        // front a format names is that format's, a container of its own or
+        // a recovery volume, however long it is.
+        if matches!(signed(first_bytes, length), Sniff::Object(_)) {
             return None;
         }
-        // Its place is its number counted from the first volume's own, so a
-        // set renamed to numbers of its own chains as a plain one does.
-        let first = SevenZip::parse(self.names.get(&VolumeIndex(0))?)?;
-        let index = SevenZip::parse(name)?.index_from(&first)?;
-        let volume = VolumeIndex(index);
-        (index != 0 && !self.names.contains_key(&volume)).then_some(volume)
+        let first = self.lengths.get(&VolumeIndex(0)).copied()?;
+        let geometry = Geometry::new(first, self.measured?)?;
+        let (length, names) = (length?, &self.names);
+        let free = |volume: &VolumeIndex| !names.contains_key(volume);
+        let numbered = split::parse(names.get(&VolumeIndex(0))?)
+            .and_then(|first| split::parse(name)?.index_from(&first))
+            .map(VolumeIndex);
+        if let Some(volume) = numbered.filter(free) {
+            return Some(volume);
+        }
+        let mut places = (1..=geometry.last().0)
+            .map(VolumeIndex)
+            .filter(|at| free(at) && geometry.holds(*at) == length);
+        let place = places.next()?;
+        places.next().is_none().then_some(place)
     }
     fn facts(&self) -> Facts {
         Facts::of(Kind::SevenZipStore, self)

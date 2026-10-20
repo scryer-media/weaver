@@ -381,10 +381,6 @@ impl Recovery for Par {
     fn outcome(&self) -> Option<RepairOutcome> {
         None
     }
-
-    fn blocks_reachable(&self) -> u64 {
-        0
-    }
 }
 
 const PLENTY: HoldBudgets = HoldBudgets {
@@ -733,9 +729,16 @@ fn a_rename_moves_the_file_and_the_name_allocation() {
     let mut job = Job::new(PLENTY);
     let member = job.member("3f9a.bin", Some(4));
     job.send(member, 0, b"data", Provenance::Fresh);
+    let mut build = job.build();
     let renamed = job
         .writer
-        .rename(&mut job.tree, NodeId::ROOT, member, "show.part01.rar")
+        .rename(
+            &mut job.tree,
+            &mut build,
+            NodeId::ROOT,
+            member,
+            "show.part01.rar",
+        )
         .expect("rename");
     assert_eq!(renamed, "show.part01.rar");
     assert_eq!(job.file("show.part01.rar"), b"data");
@@ -949,9 +952,10 @@ fn a_shallower_member_that_claims_a_written_name_moves_the_deeper_file_aside() {
     assert_eq!(job.file("inner.bin"), b"hello");
     let member = job.member("3f9a.bin", Some(4));
     job.send(member, 0, b"data", Provenance::Fresh);
+    let mut build = job.build();
     let renamed = job
         .writer
-        .rename(&mut job.tree, NodeId::ROOT, member, "INNER.bin")
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, member, "INNER.bin")
         .expect("rename");
     assert_eq!(renamed, "INNER.bin");
     let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();

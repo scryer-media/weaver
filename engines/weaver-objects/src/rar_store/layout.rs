@@ -8,6 +8,8 @@
 // member or the envelope. Members are numbered in its order, which is the
 // order every run of the same set numbers them; when new facts disagree with
 // a member already announced, it and every member after it are retracted.
+// A layout the store gives the set up over never becomes its map: no byte
+// was placed by it, so the bytes go back from where the last one put them.
 
 use std::sync::Arc;
 
@@ -151,9 +153,9 @@ impl RarStore {
             self.extend(id, member, out);
         }
         self.say_recovery(&layout, out);
-        self.layout = Some(layout);
-        if let Some(emit) = refusal {
-            self.give_up(emit, out);
+        match refusal {
+            Some(emit) => self.give_up(emit, out),
+            None => self.layout = Some(layout),
         }
     }
 

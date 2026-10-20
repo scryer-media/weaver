@@ -27,7 +27,7 @@ fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
             engine.reached(VolumeIndex(1), 0);
         }
     }
-    let claim = |object: &mut Box<dyn Object>| object.claim(names[1], &[]);
+    let claim = |object: &mut Box<dyn Object>| object.claim(names[1], &[], None);
     assert_eq!(claim(&mut live), claim(&mut again));
     assert_eq!(claim(&mut live), Some(VolumeIndex(1)));
     let wants = |object: &mut Box<dyn Object>| {

@@ -12,7 +12,7 @@
 // what, is decided here, by the same rules at every depth.
 
 use bytes::Bytes;
-use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling, SliceVerdict};
+use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
 use weaver_graph::{
     Builder, ByteRange, Effect, Kind, MemberId, NodeId, Provenance, RecoveryKind, Restore, Segment,
     Tree, VolumeIndex,
@@ -39,11 +39,6 @@ pub(crate) struct SetState {
     // The namespace it lives in, where the members it covers are.
     pub(crate) namespace: NodeId,
     pub(crate) kind: Kind,
-    // Recovery blocks in hand or still on their way.
-    pub(crate) blocks_reachable: u64,
-    // Slices the evidence in hand says are damaged, over every member the
-    // set covers.
-    pub(crate) damaged_slices: u64,
     // What its last repair came to; `None` before it ran one.
     pub(crate) outcome: Option<RepairOutcome>,
 }
@@ -111,10 +106,9 @@ impl NamespaceWriter {
             .collect()
     }
 
-    // Each set of every namespace, parents first, with the blocks it can
-    // reach and the slices it knows are damaged. A set whose repair is out
-    // is one whose ruling is pending; what it said when it left is its
-    // lender's to tell.
+    // Each set of every namespace, parents first, with what it last ruled.
+    // A set whose repair is out is one whose ruling is pending; what it said
+    // when it left is its lender's to tell.
     pub(crate) fn states(&self, tree: &Tree) -> Vec<SetState> {
         self.sets(tree)
             .into_iter()
@@ -129,27 +123,13 @@ impl NamespaceWriter {
                 node,
                 namespace,
                 kind,
-                blocks_reachable: 0,
-                damaged_slices: 0,
                 outcome: None,
             });
         };
-        let mut verdicts = Vec::new();
-        for member in tree.namespace(namespace)?.members() {
-            if recovery.covers(member.id) {
-                recovery.verdicts(member.id, &mut verdicts);
-            }
-        }
-        let damaged_slices = verdicts
-            .iter()
-            .filter(|verdict| **verdict == SliceVerdict::Damaged)
-            .count() as u64;
         Some(SetState {
             node,
             namespace,
             kind,
-            blocks_reachable: recovery.blocks_reachable(),
-            damaged_slices,
             outcome: recovery.outcome(),
         })
     }
@@ -762,14 +742,36 @@ impl NamespaceWriter {
                 .and_then(|namespace| namespace.get(*member))
                 .map(|record| record.name.clone());
             if let Some(wanted) = wanted {
-                tree.rename(node, *member, &wanted, &mut effects);
+                tree.rename(
+                    node,
+                    *member,
+                    &wanted,
+                    &mut self.placing(builder),
+                    &mut effects,
+                );
             }
         }
-        self.renamed = renamed;
         let (moves, claims): (Vec<Effect>, Vec<Effect>) = effects
             .into_iter()
             .partition(|effect| matches!(effect, Effect::Renamed { .. }));
         self.moved(&moves)?;
+        // A recognised member's length is the description's: its file, if
+        // it has one, takes it.
+        for member in &renamed {
+            let length = tree
+                .namespace(node)
+                .and_then(|namespace| namespace.get(*member))
+                .and_then(|record| record.length.filter(|_| record.is_complete()));
+            if let Some(length) = length
+                && let Some(leaf) = self
+                    .files
+                    .get_mut(&node)
+                    .and_then(|files| files.leaves.get_mut(member))
+            {
+                leaf.close(length)?;
+            }
+        }
+        self.renamed = renamed;
         self.apply_each(tree, builder, segments, claims, out)
     }
 

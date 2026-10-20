@@ -289,12 +289,17 @@ impl Object for Par2 {
     }
 
     // Every PAR2 file is a volume of the one object, numbered as it comes.
-    fn claim(&mut self, _name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        _name: &str,
+        first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice()))
             .then(|| VolumeIndex(self.volumes.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
         self.volume(volume).name(name);
         for state in self.sets.values_mut() {
             state.reopen();
@@ -317,19 +322,35 @@ impl Recovery for Par2 {
             .into_iter()
             .filter_map(|key| Some((key, self.sets[&key].usable()?)))
             .unzip();
-        let (bound, names) = bind_sets(&indexes, namespace, self.id);
+        let (bound, unnamed) = bind_sets(&indexes, namespace, self.id);
         let mut bound: BTreeMap<_, _> = keys.into_iter().zip(bound).collect();
-        for (member, described) in names {
-            let current = namespace.get(member).map(|record| record.name.as_str());
-            if current != Some(described.as_str()) && namespace.rename(member, &described).is_some()
-            {
-                renamed.push(member);
-            }
-        }
         let mut moved = BTreeSet::new();
         for (key, state) in &mut self.sets {
-            if state.bind(bound.remove(key).unwrap_or_default()) {
+            if state.bind(bound.remove(key).unwrap_or_default(), &unnamed) {
                 moved.insert(*key);
+            }
+        }
+        // A member a set bound under a name that does not answer to the
+        // description, even folded, is recognised: it takes the description's
+        // name and length.
+        for state in self.sets.values() {
+            let Some(index) = state.usable() else {
+                continue;
+            };
+            for (file, member) in state.members() {
+                let Some(description) = index.file_description(file) else {
+                    continue;
+                };
+                let answers = namespace
+                    .get(*member)
+                    .is_some_and(|record| record.name.eq_ignore_ascii_case(&description.filename));
+                if !answers
+                    && namespace
+                        .recognise(*member, &description.filename, description.length)
+                        .is_some()
+                {
+                    renamed.push(*member);
+                }
             }
         }
         let lengths: BTreeMap<MemberId, u64> = self
@@ -359,8 +380,9 @@ impl Recovery for Par2 {
         }
     }
 
-    // Every file a usable set can rebuild that no member is bound to, once
-    // each, in set order.
+    // Every file a usable set can rebuild that no member is bound to or may
+    // be, once each, in set order: the repair reads an unnamed member's
+    // slices before any second copy is announced.
     fn absent(&self, out: &mut Vec<(String, u64)>) {
         for key in self.ordered() {
             let state = &self.sets[&key];
@@ -372,7 +394,10 @@ impl Recovery for Par2 {
                     continue;
                 };
                 let named = (description.filename.clone(), description.length);
-                if !state.members().contains_key(file) && !out.contains(&named) {
+                if !state.members().contains_key(file)
+                    && !state.may_be(description.length)
+                    && !out.contains(&named)
+                {
                     out.push(named);
                 }
             }
@@ -511,21 +536,6 @@ impl Recovery for Par2 {
                 read: last.is_some_and(|last| last.read),
             });
         }
-    }
-
-    fn blocks_reachable(&self) -> u64 {
-        let packet = self.smallest_packet();
-        let present: u64 = self
-            .sets
-            .values()
-            .map(|state| state.recovery.len() as u64)
-            .sum();
-        let coming: u64 = self
-            .volumes
-            .iter()
-            .map(|volume| volume.coming(packet))
-            .sum();
-        present + coming
     }
 }
 

@@ -1114,7 +1114,11 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
         })
         .collect();
     let summary = job.recovery_summary();
-    view.blocks_reachable = summary.iter().map(|set| set.blocks_reachable).sum();
+    view.blocks_reachable = summary
+        .iter()
+        .filter_map(|set| tree.recovery(set.node))
+        .map(|recovery| recovery.blocks_reachable())
+        .sum();
     view.outcomes = summary.iter().map(|set| set.outcome).collect();
     *reads = job.writer().read_backs();
 }

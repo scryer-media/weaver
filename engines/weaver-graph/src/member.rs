@@ -288,6 +288,21 @@ impl Namespace {
         Some(found)
     }
 
+    // A recovery object recognised the member as a file it describes: it
+    // takes the description's name and length. A member none of whose bytes
+    // decoded reached only the post's encoded bound, and what it reached
+    // past the length is not it.
+    pub fn recognise(&mut self, member: MemberId, name: &str, length: u64) -> Option<&Member> {
+        let found = self.members.get_mut(&member)?;
+        found.name = name.to_owned();
+        let reached = found.coverage.runs().last().map_or(0, |run| run.range.end);
+        if reached > length {
+            found.coverage.erase(ByteRange::new(length, reached));
+        }
+        found.length = Some(length);
+        Some(found)
+    }
+
     // The member starts over: its bytes are forgotten and it is unbound. Its
     // output name is kept, so what comes back lands where it was.
     pub fn retract(&mut self, member: MemberId) {

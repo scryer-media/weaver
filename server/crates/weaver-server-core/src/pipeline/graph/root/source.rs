@@ -298,12 +298,6 @@ impl ArticleMap {
         Some(found.articles[found.index(ordinal)?].class)
     }
 
-    // Whether some volume's opening article can still arrive: until it
-    // does, nothing is known of what the volume is.
-    pub(crate) fn any_head_waiting(&self) -> bool {
-        (0..self.volumes.len()).any(|index| self.head_waiting(VolumeIndex(index as u32)))
-    }
-
     // Whether the volume's opening article can still arrive.
     pub(crate) fn head_waiting(&self, volume: VolumeIndex) -> bool {
         self.volumes

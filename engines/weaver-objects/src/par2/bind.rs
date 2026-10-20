@@ -17,14 +17,17 @@ use par2_rs::checksum::md5;
 use par2_rs::{FileDescription, FileId, Par2FileSet};
 use weaver_graph::{Member, MemberId, Namespace, ObjectId};
 
+use super::sets::Length;
+
 // PAR2 identifies a file by the MD5 of at most this much of its front.
 const HASH_WINDOW: u64 = 16 * 1024;
 
 // One member as the rules see it.
 struct Candidate<'a> {
     name: &'a str,
-    // The length, once every byte of it has arrived.
-    complete: Option<u64>,
+    // The length, once every byte of it has arrived: exact when any byte of
+    // it decoded, else only what the post's encoded size bounds it to.
+    complete: Option<Length>,
     // The furthest byte seen so far.
     seen: u64,
     first_bytes: &'a [u8],
@@ -34,7 +37,20 @@ impl<'a> Candidate<'a> {
     fn of(member: &'a Member, first_bytes: &'a [u8]) -> Self {
         Self {
             name: &member.name,
-            complete: member.length.filter(|_| member.is_complete()),
+            complete: member
+                .length
+                .filter(|_| member.is_complete())
+                .map(|length| {
+                    if member
+                        .coverage
+                        .runs()
+                        .any(|run| run.provenance.is_verified())
+                    {
+                        Length::Exact(length)
+                    } else {
+                        Length::AtMost(length)
+                    }
+                }),
             seen: member
                 .coverage
                 .runs()
@@ -48,7 +64,7 @@ impl<'a> Candidate<'a> {
     // A description whose length this member already contradicts is not it.
     fn contradicts(&self, length: u64) -> bool {
         match self.complete {
-            Some(complete) => complete != length,
+            Some(complete) => !complete.fits(length),
             None => self.seen > length,
         }
     }
@@ -60,15 +76,16 @@ impl<'a> Candidate<'a> {
     }
 }
 
-// The bindings of each set over the namespace, and the described name of
-// each member bound by its content alone.
+// The bindings of each set over the namespace, and each complete member no
+// set matched, with the length it has of its own: one whose front could not
+// name it, which a repair may still know by its slices or by elimination.
 pub(super) fn bind_sets(
     indexes: &[&Par2FileSet],
     namespace: &Namespace,
     own: ObjectId,
-) -> (Vec<BTreeMap<FileId, MemberId>>, Vec<(MemberId, String)>) {
-    let mut claims: Vec<BTreeMap<FileId, Vec<(MemberId, bool)>>> =
-        vec![BTreeMap::new(); indexes.len()];
+) -> (Vec<BTreeMap<FileId, MemberId>>, Vec<(MemberId, Length)>) {
+    let mut claims: Vec<BTreeMap<FileId, Vec<MemberId>>> = vec![BTreeMap::new(); indexes.len()];
+    let mut unnamed = Vec::new();
     for member in namespace.members() {
         if member.bound_to == Some(own) {
             continue;
@@ -78,43 +95,30 @@ pub(super) fn bind_sets(
             .iter()
             .enumerate()
             .find_map(|(at, index)| Some((at, match_member(index, &candidate)?)));
-        if let Some((at, (file, by_content))) = first {
-            claims[at]
-                .entry(file)
-                .or_default()
-                .push((member.id, by_content));
+        match first {
+            Some((at, file)) => claims[at].entry(file).or_default().push(member.id),
+            None => unnamed.extend(candidate.complete.map(|length| (member.id, length))),
         }
     }
-    let mut names = Vec::new();
     let bound = claims
         .into_iter()
-        .zip(indexes)
-        .map(|(claims, index)| {
+        .map(|claims| {
             claims
                 .into_iter()
-                .filter_map(|(file, claimants)| {
-                    let [(member, by_content)] = claimants.as_slice() else {
-                        return None;
-                    };
-                    if *by_content && let Some(description) = index.file_description(&file) {
-                        names.push((*member, description.filename.clone()));
-                    }
-                    Some((file, *member))
+                .filter_map(|(file, claimants)| match claimants.as_slice() {
+                    [member] => Some((file, *member)),
+                    _ => None,
                 })
                 .collect()
         })
         .collect();
-    (bound, names)
+    (bound, unnamed)
 }
 
-// A file and whether the member matched it by content alone, under a name
-// that does not answer to it even folded.
-fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<(FileId, bool)> {
+// The file the member is, by its content first and its name after.
+fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId> {
     if let Some(file) = by_content(index, candidate) {
-        let named = index
-            .file_description(&file)
-            .is_some_and(|description| description.filename.eq_ignore_ascii_case(candidate.name));
-        return Some((file, !named));
+        return Some(file);
     }
     let mut matches = described(index, |description| description.filename == candidate.name);
     if matches.is_empty() {
@@ -144,7 +148,7 @@ fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<(FileI
         }
     }
     match matches.as_slice() {
-        [(file, _)] => Some((*file, false)),
+        [(file, _)] => Some(*file),
         _ => None,
     }
 }

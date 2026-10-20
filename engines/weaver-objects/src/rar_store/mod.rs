@@ -59,6 +59,14 @@ pub(crate) struct Volume {
     front: Option<unrar_rs::RarVolumeFacts>,
 }
 
+// A volume given back, as it travels: what was read of it, and the password
+// that opened the headers it was read under, without which that parse
+// places nothing beside it.
+struct Given {
+    volume: Volume,
+    opened: Option<Zeroizing<String>>,
+}
+
 impl Volume {
     fn new() -> Self {
         Self {
@@ -573,16 +581,7 @@ impl Object for RarStore {
         // The offer answers the question the store asked: a candidate that
         // opens nothing leaves it free to ask for the next one.
         self.asked = false;
-        if !self
-            .candidates
-            .iter()
-            .any(|candidate| candidate.secret.as_str() == secret)
-        {
-            self.candidates.push(Candidate {
-                secret: Zeroizing::new(secret.to_owned()),
-                headers_wrong: false,
-            });
-        }
+        self.candidate(secret);
         for volume in self.volumes.values_mut() {
             volume.walk.touch();
         }
@@ -598,7 +597,7 @@ impl Object for RarStore {
             .map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         let facts = self.front_facts(front);
         let bound = self.volume(volume);
         bound.name = Some(name.to_owned());
@@ -608,7 +607,12 @@ impl Object for RarStore {
 
     // A store that gave its set up still claims the rest of it, so the rest
     // goes where the set went.
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         self.claim_volume(name, first_bytes)
     }
 
@@ -616,26 +620,34 @@ impl Object for RarStore {
     // volume's headers can need: then the member is refused, never read
     // again.
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        let opened = self.header_password();
         self.giving
             .remove(&volume)
             .filter(|given| given.kept.len() <= claim::CARRIED)
-            .map(|given| Box::new(given) as weaver_graph::Carried)
+            .map(|volume| Box::new(Given { volume, opened }) as weaver_graph::Carried)
     }
 
     fn reclaim(&mut self, name: &str, carried: &weaver_graph::Carried) -> Option<VolumeIndex> {
-        self.reclaim_volume(name, carried.downcast_ref::<Volume>()?)
+        self.reclaim_volume(name, &carried.downcast_ref::<Given>()?.volume)
     }
 
     // The volume as its giver read it: its headers walked, its bytes kept,
     // its length and close. Nothing of it is read or walked again, and no
     // key is derived again: derivations live in the process's shared cache,
-    // and a volume's walk holds no key of its own.
+    // and a volume's walk holds no key of its own. The password its headers
+    // were read under opens this store's, as one the job offered would.
     fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
-        let Ok(mut given) = carried.downcast::<Volume>() else {
-            return self.bound(volume, name, &[]);
+        let Ok(given) = carried.downcast::<Given>() else {
+            return self.bound(volume, name, &[], None);
         };
-        given.name = Some(name.to_owned());
-        self.volumes.insert(volume, *given);
+        let Given {
+            volume: mut held,
+            opened,
+        } = *given;
+        held.name = Some(name.to_owned());
+        self.volumes.insert(volume, held);
+        let opened = opened.map(|secret| self.candidate(&secret));
+        self.headers_open = self.headers_open.or(opened);
         self.stale = true;
     }
 

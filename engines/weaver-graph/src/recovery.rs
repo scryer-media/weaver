@@ -149,8 +149,4 @@ pub trait Recovery {
     // Each set the object holds, in the order it repairs them. An object
     // with no sets of its own to name says nothing.
     fn sets(&self, _out: &mut Vec<SetRuling>) {}
-
-    // Recovery blocks reachable right now, for health and for the
-    // impossible verdict. A lost recovery article lowers it.
-    fn blocks_reachable(&self) -> u64;
 }

@@ -318,12 +318,6 @@ impl Pipeline {
     // Neither is the NZB's static PAR2 byte count, which is what a posting
     // whose every recovery volume is already dead still reports in full.
     fn obtainable_recovery(&self, job_id: JobId) -> ObtainableRecovery {
-        if let Some(summary) = self.graph_recovery_summary(job_id) {
-            return ObtainableRecovery {
-                obtainable: summary.obtainable(),
-                ceiling: None,
-            };
-        }
         let sets = self.par2_set_recovery_capacities(job_id);
         let served = (!sets.is_empty()).then(|| {
             sets.iter()
@@ -388,9 +382,6 @@ impl Pipeline {
     // enough of them. This asks the parsed set instead — the shortfall in
     // blocks against what the posting's recovery volumes can actually supply.
     fn par2_recovery_covers_health_damage(&self, job_id: JobId, failed_bytes: u64) -> bool {
-        if let Some(summary) = self.graph_recovery_summary(job_id) {
-            return summary.repairs_all();
-        }
         let Some(set_id) = self.par2_served_set_id(job_id) else {
             return false;
         };

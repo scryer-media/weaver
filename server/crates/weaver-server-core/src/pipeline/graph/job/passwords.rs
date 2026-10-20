@@ -55,7 +55,7 @@ impl Passwords {
     // A restore takes up where the checkpoint left the node: the cursor is
     // past the candidate it was offered last, and that candidate is offered
     // again. `None` when the job no longer has it.
-    pub(super) fn offered_before(&mut self, node: NodeId, index: usize) -> Option<&str> {
+    pub(super) fn resume_at(&mut self, node: NodeId, index: usize) -> Option<&str> {
         let candidate = self.candidates.get(index)?;
         self.offered.insert(node, index + 1);
         Some(candidate)
@@ -79,16 +79,18 @@ impl GraphJob {
 
     // The object at `node` asked for a password: it gets the next candidate,
     // and an engine's run starts over under it, by the transition a repair
-    // behind the run takes. With none left, the node is left asking.
-    pub(super) fn offer_password(&mut self, node: NodeId, effects: &mut Vec<Effect>) {
+    // behind the run takes. With none left, the node is left asking. True
+    // when a candidate was offered.
+    pub(super) fn offer_password(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> bool {
         let builder: &mut dyn Builder = &mut *self.builder;
         let Some(secret) = self.passwords.next(node) else {
-            return;
+            return false;
         };
         self.tree
             .offer_password(node, secret, &mut self.writer.placing(builder), effects);
         if self.tree.engine(node).is_some() {
             self.writer.shelf(node).restart();
         }
+        true
     }
 }

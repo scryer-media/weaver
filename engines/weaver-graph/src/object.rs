@@ -330,23 +330,29 @@ pub trait Object: Send + Sync {
     // Bytes of my envelope, for the inverse map's remainder.
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes>;
 
-    // A member of my parent's namespace, by its name there and the first
-    // bytes it has so far, is now this volume of mine. They are how an
-    // object that chains its volumes, by name or by what their headers
-    // state, knows its own set when a sibling asks to be claimed: the same
-    // name and front a claim reads.
-    fn bound(&mut self, _volume: VolumeIndex, _name: &str, _front: &[u8]) {}
+    // A member of my parent's namespace, by its name there, the first bytes
+    // it has so far and its length once known, is now this volume of mine.
+    // They are how an object that chains its volumes, by name, by what their
+    // headers state or by how long they are, knows its own set when a
+    // sibling asks to be claimed: the same name, front and length a claim
+    // reads.
+    fn bound(&mut self, _volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {}
 
     // A new member appeared beside the one I am bound to. Is it one of my
     // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z
-    // store claims `.7z.002`, which has no signature of its own. Only an
+    // store a piece with no signature of its own by its length. Only an
     // object can say, because only it knows how its volumes chain. Answer
     // with the volume index the member becomes, its position in the set and
     // never the order it arrived in, or `None` to let the sniffer decide. A
     // freshly built object is asked first about the member it was built
     // for, and `None` makes that member its first volume. The answer only
     // reads: the volume exists once `bound` says so.
-    fn claim(&mut self, _name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        _name: &str,
+        _first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         None
     }
 
@@ -368,7 +374,7 @@ pub trait Object: Send + Sync {
     // A member I reclaimed is now this volume of mine, and what was parsed
     // of it is mine to keep: `bound`, for a member that brings its parse.
     fn adopt(&mut self, volume: VolumeIndex, name: &str, _carried: Carried) {
-        self.bound(volume, name, &[]);
+        self.bound(volume, name, &[], None);
     }
 
     // My volume's member has another name now: a recovery set named it.

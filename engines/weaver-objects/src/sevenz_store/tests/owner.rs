@@ -53,8 +53,9 @@ impl Owner {
             bound: vec![false; count],
             next: 0,
         };
-        let name = owner.volumes[0].0.clone();
-        owner.object.bound(VolumeIndex(0), &name, &[]);
+        let (name, bytes) = &owner.volumes[0];
+        let (front, length) = (&bytes[..bytes.len().min(32)], Some(bytes.len() as u64));
+        owner.object.bound(VolumeIndex(0), name, front, length);
         owner.bound[0] = true;
         owner.size(0);
         owner
@@ -72,20 +73,17 @@ impl Owner {
         self.apply(out);
     }
 
-    // A later volume is claimed by its name and first bytes, as the tree
-    // binds it when they arrive.
+    // A later volume is claimed by its name, first bytes and length, as the
+    // tree binds it when they arrive.
     fn bind(&mut self, volume: usize) {
         if self.bound[volume] {
             return;
         }
         let (name, bytes) = &self.volumes[volume];
-        let first = &bytes[..bytes.len().min(32)];
-        assert_eq!(
-            self.object.claim(name, first),
-            Some(VolumeIndex(volume as u32))
-        );
-        let name = name.clone();
-        self.object.bound(VolumeIndex(volume as u32), &name, &[]);
+        let (first, length) = (&bytes[..bytes.len().min(32)], Some(bytes.len() as u64));
+        let index = VolumeIndex(volume as u32);
+        assert_eq!(self.object.claim(name, first, length), Some(index));
+        self.object.bound(index, name, first, length);
         self.bound[volume] = true;
         self.size(volume);
     }

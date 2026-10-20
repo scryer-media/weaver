@@ -138,9 +138,6 @@ impl Pipeline {
                 slot.insert(terminal_state);
             }
         }
-        // A graph job's root marks the article's range damaged; a classic job
-        // has no root and this finds nothing.
-        self.graph_article_lost(seg_id);
         // A container set whose map this article closed cannot read it now.
         self.note_direct_article_terminal(seg_id);
         self.note_gap_support_fact(seg_id, terminal_state);
@@ -176,11 +173,14 @@ impl Pipeline {
                 self.give_up_unanchored(dependent);
             }
         }
-        // The first-article sample is read before the health arithmetic: when
-        // it can answer, it answers about the whole post rather than about a
-        // byte count, and it needs no probe of its own to do it.
-        self.note_first_article_settled(seg_id);
-        self.check_health(job_id);
+        // A graph job's root marks the article's range damaged, and its objects
+        // rule on the loss. A classic job has no root: its first-article sample
+        // is read, then its health arithmetic, the sample first because it
+        // answers about the whole post rather than about a byte count.
+        if !self.graph_article_lost(seg_id) {
+            self.note_first_article_settled(seg_id);
+            self.check_health(job_id);
+        }
         true
     }
 

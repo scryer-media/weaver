@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// What a namespace's recovery objects can say about its members, folded into
-// numbers: per object, the blocks it can still reach, the slices it knows
-// are damaged, and what its last repair came to. Health, the repair decision
-// and the script-facing PAR status all read this one record, so they cannot
-// disagree.
+// What a namespace's recovery objects can say about its members: per object,
+// what its last repair came to. The repair decision and the script-facing PAR
+// status both read this one record, so they cannot disagree.
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{Kind, NodeId};
@@ -16,9 +14,6 @@ pub(crate) struct RecoverySummary {
     // Members that carry recovery data nothing here reads, by name: it is
     // there, and no repair counts on it.
     pub(crate) unusable: Vec<String>,
-    // A member's opening bytes can still arrive, so it may yet turn out to
-    // be a recovery object no set here counts.
-    pub(crate) forming: bool,
 }
 
 // One recovery object of the namespace.
@@ -31,8 +26,6 @@ pub(crate) struct SetSummary {
     pub(crate) namespace: NodeId,
     // What the object is called where it lives, for the operator.
     pub(crate) name: String,
-    pub(crate) blocks_reachable: u64,
-    pub(crate) damaged_slices: u64,
     // `None` before it ran a repair.
     pub(crate) outcome: Option<RepairOutcome>,
 }
@@ -41,11 +34,6 @@ impl SetSummary {
     // Its last repair found the members whole or made them so.
     pub(crate) fn vouched(&self) -> bool {
         vouches(self.outcome)
-    }
-
-    // More is damaged than it can reach blocks to rebuild.
-    pub(crate) fn short(&self) -> bool {
-        self.damaged_slices > self.blocks_reachable
     }
 }
 
@@ -66,28 +54,10 @@ impl RecoverySummary {
             .collect()
     }
 
-    pub(crate) fn blocks_reachable(&self) -> u64 {
-        self.sets.iter().map(|set| set.blocks_reachable).sum()
-    }
-
     // Nothing is left for a repair pass to say: every object vouched, or
     // there is no object to ask.
     pub(crate) fn settled(&self) -> bool {
         self.sets.iter().all(SetSummary::vouched)
-    }
-
-    // Recovery exists and every object could rebuild what it has found
-    // damaged. Spare blocks in one object never repair another's members,
-    // so each is judged alone.
-    pub(crate) fn repairs_all(&self) -> bool {
-        !self.sets.is_empty() && !self.sets.iter().any(SetSummary::short)
-    }
-
-    // Health's question: whether recovery can still arrive. Blocks an
-    // object can still reach, or an object that can still form; with
-    // neither, waiting for recovery cannot change the verdict.
-    pub(crate) fn obtainable(&self) -> bool {
-        self.forming || self.blocks_reachable() > 0
     }
 
     // A recovery object rebuilt something.

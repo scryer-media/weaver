@@ -38,10 +38,6 @@ impl Geometry {
         })
     }
 
-    pub(super) fn total(&self) -> u64 {
-        self.total
-    }
-
     pub(super) fn last(&self) -> VolumeIndex {
         VolumeIndex(self.parts - 1)
     }
@@ -50,16 +46,21 @@ impl Geometry {
         u64::from(volume.0) * self.part
     }
 
+    // How much of the container a volume holds: as much as the first for
+    // every volume but the last, the rest of the container for the last.
+    pub(super) fn holds(&self, volume: VolumeIndex) -> u64 {
+        if volume == self.last() {
+            return self.total - self.base(volume);
+        }
+        self.part
+    }
+
     // The length a volume must have: exact for every volume but the last,
     // a floor for the last, which may carry bytes after the container.
     pub(super) fn agrees(&self, volume: VolumeIndex, length: u64) -> bool {
-        if volume.0 >= self.parts {
-            return false;
-        }
-        if volume == self.last() {
-            return length >= self.total - self.base(volume);
-        }
-        length == self.part
+        volume.0 < self.parts
+            && (length == self.holds(volume)
+                || volume == self.last() && length > self.holds(volume))
     }
 
     // A volume range in container coordinates, clipped to what the geometry

@@ -106,14 +106,12 @@ fn namespace(members: &[(&str, u64, &[(u64, u64, Provenance)])]) -> Namespace {
     namespace
 }
 
-fn set(kind: Kind, name: &str, reachable: u64, damaged: u64) -> SetSummary {
+fn set(kind: Kind, name: &str) -> SetSummary {
     SetSummary {
         node: NodeId(1),
         kind,
         namespace: NodeId::ROOT,
         name: name.to_string(),
-        blocks_reachable: reachable,
-        damaged_slices: damaged,
         outcome: None,
     }
 }
@@ -127,7 +125,6 @@ fn summary(sets: Vec<SetSummary>) -> RecoverySummary {
     RecoverySummary {
         sets,
         unusable: Vec::new(),
-        forming: false,
     }
 }
 
@@ -246,7 +243,7 @@ fn each_phase_shows_as_its_status_and_lanes() {
 #[test]
 fn the_drive_walks_the_phases_the_root_reports() {
     let names = || namespace(&[("ember.bin", 100, &[(0, 100, Provenance::Damaged)])]);
-    let damaged = || summary(vec![set(Kind::Par2, "ember.par2", 4, 1)]);
+    let damaged = || summary(vec![set(Kind::Par2, "ember.par2")]);
     let mut slots = RepairSlots::default();
 
     // Repaired: delivered, and the root is done.
@@ -275,7 +272,7 @@ fn the_drive_walks_the_phases_the_root_reports() {
 #[test]
 fn a_repair_waiting_on_recovery_yields_its_slot_to_the_next_job() {
     let names = || namespace(&[("ember.bin", 100, &[(0, 100, Provenance::Damaged)])]);
-    let damaged = || summary(vec![set(Kind::Par2, "ember.par2", 4, 1)]);
+    let damaged = || summary(vec![set(Kind::Par2, "ember.par2")]);
     let mut slots = RepairSlots::default();
     let mut first = Prepared::new(names(), damaged())
         .repairing_to(vec![RepairOutcome::Waiting])
@@ -368,46 +365,11 @@ fn only_a_payload_that_delivered_nothing_is_refused() {
 }
 
 #[test]
-fn health_reads_capacity_from_every_recovery_object() {
-    let none = RecoverySummary::default();
-    assert!(!none.repairs_all(), "no recovery covers nothing");
-    assert!(!none.obtainable(), "no recovery and none to come");
-    let forming = RecoverySummary {
-        forming: true,
-        ..RecoverySummary::default()
-    };
-    assert!(forming.obtainable(), "a member yet to open may be recovery");
-    assert!(!forming.repairs_all());
-
-    let fits = summary(vec![set(Kind::Par2, "a", 4, 3), set(Kind::Par3, "b", 2, 2)]);
-    assert!(fits.repairs_all());
-    assert_eq!(fits.blocks_reachable(), 6);
-
-    // Spare blocks in one object never repair another's members.
-    let short = summary(vec![
-        set(Kind::Par2, "a", 10, 1),
-        set(Kind::Par2, "b", 1, 2),
-    ]);
-    assert!(!short.repairs_all());
-    assert!(short.obtainable());
-
-    let dead = summary(vec![set(Kind::Par2, "a", 0, 1)]);
-    assert!(!dead.obtainable());
-    assert!(!dead.verified());
-    assert!(
-        summary(vec![ruled(
-            set(Kind::Par2, "a", 0, 0),
-            RepairOutcome::Clean
-        )])
-        .verified()
-    );
-    assert!(
-        !summary(vec![ruled(
-            set(Kind::Par2, "a", 0, 1),
-            RepairOutcome::Waiting
-        )])
-        .verified()
-    );
+fn the_scripts_are_told_verified_only_when_every_object_vouched() {
+    assert!(!RecoverySummary::default().verified());
+    assert!(!summary(vec![set(Kind::Par2, "a")]).verified());
+    assert!(summary(vec![ruled(set(Kind::Par2, "a"), RepairOutcome::Clean)]).verified());
+    assert!(!summary(vec![ruled(set(Kind::Par2, "a"), RepairOutcome::Waiting)]).verified());
 }
 
 #[test]
@@ -416,11 +378,13 @@ fn an_impossible_repair_fails_in_the_recovery_failure_shape() {
         ("ember.bin", 100, &[(0, 100, Provenance::Damaged)]),
         ("ember.dat", 100, &[(0, 100, Provenance::Fresh)]),
     ]);
-    let mut job = Prepared::new(names, summary(vec![set(Kind::Par2, "ember.par2", 1, 3)]))
-        .repairing_to(vec![RepairOutcome::Impossible {
-            damaged: 3,
-            reachable: 1,
-        }]);
+    let mut job =
+        Prepared::new(names, summary(vec![set(Kind::Par2, "ember.par2")])).repairing_to(vec![
+            RepairOutcome::Impossible {
+                damaged: 3,
+                reachable: 1,
+            },
+        ]);
     let mut slots = RepairSlots::default();
     // The job delivers; what it ends as is read off its claims.
     assert_eq!(drive(&mut job, &mut slots, AskerId(1), 1), Step::Deliver);
@@ -443,10 +407,10 @@ fn a_checking_object_never_overrules_one_that_repaired() {
     let mut job = Prepared::new(
         names,
         summary(vec![
-            set(Kind::Sfv, "ember.sfv", 0, 1),
-            set(Kind::Par2, "ember.par2", 4, 1),
+            set(Kind::Sfv, "ember.sfv"),
+            set(Kind::Par2, "ember.par2"),
             // Nor does a second listing, whatever it named.
-            set(Kind::Sfv, "stray.sfv", 0, 0),
+            set(Kind::Sfv, "stray.sfv"),
         ]),
     )
     .repairing_to(vec![
@@ -477,8 +441,8 @@ fn a_repair_of_one_set_never_excuses_another() {
     let mut job = Prepared::new(
         names,
         summary(vec![
-            set(Kind::Par2, "ember.par2", 4, 1),
-            set(Kind::Par2, "ember.dat.par2", 0, 2),
+            set(Kind::Par2, "ember.par2"),
+            set(Kind::Par2, "ember.dat.par2"),
         ]),
     )
     .repairing_to(vec![

@@ -188,10 +188,6 @@ impl Recovery for Trail {
     fn outcome(&self) -> Option<RepairOutcome> {
         None
     }
-
-    fn blocks_reachable(&self) -> u64 {
-        0
-    }
 }
 
 struct Carrying {

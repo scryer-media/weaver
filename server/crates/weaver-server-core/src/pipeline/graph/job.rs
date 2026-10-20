@@ -282,12 +282,6 @@ impl GraphJob {
         self.root.map.arrived_before(queued);
     }
 
-    // A recovery object may still form: an object is known by its opening
-    // bytes, and some member's have yet to arrive.
-    pub(crate) fn recovery_may_form(&self) -> bool {
-        self.root.map.any_head_waiting()
-    }
-
     // The class the root fetches an article under now.
     pub(crate) fn article_class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
         self.root.map.class(volume, ordinal)
@@ -473,16 +467,19 @@ impl GraphJob {
 
     // What the writer passed on that is the job's to answer: an object that
     // asks for a password is offered one, and what it says back is applied
-    // and answered the same way.
+    // and answered the same way. An offer goes through the writer even when
+    // the object says nothing back: what it can place under the password
+    // changed, and the writer is where held bytes go down.
     fn heard(&mut self, mut out: Vec<Effect>) -> Result<(), GraphError> {
         loop {
             let mut effects = Vec::new();
+            let mut offered = false;
             for effect in out.drain(..) {
                 if let Effect::NeedsPassword { node } = effect {
-                    self.offer_password(node, &mut effects);
+                    offered |= self.offer_password(node, &mut effects);
                 }
             }
-            if effects.is_empty() {
+            if !offered {
                 return Ok(());
             }
             self.writer.apply_all(

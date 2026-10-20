@@ -419,35 +419,38 @@ fn direct_store_job_spec_with_articles(
     volumes: &[(String, Vec<u8>)],
     articles: usize,
 ) -> JobSpec {
+    let files: Vec<FileSpec> = volumes
+        .iter()
+        .enumerate()
+        .map(|(index, (filename, bytes))| FileSpec {
+            filename: filename.clone(),
+            role: FileRole::from_filename(filename),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: (0..articles as u32)
+                .map(|segment_number| {
+                    let (start, end) = article_extent(bytes.len(), segment_number, articles);
+                    segment_spec! {
+                        number: segment_number,
+                        bytes: yenc_declared_bytes((end - start) as u32),
+                        message_id: format!("direct-{index}-{segment_number}@example.com"),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
     JobSpec {
         name: name.to_string(),
         password: None,
-        total_bytes: volumes
+        // Ingest's rule: a job's total is its files' declared segment bytes.
+        total_bytes: files
             .iter()
-            .map(|(_, bytes)| u64::from(yenc_declared_bytes(bytes.len() as u32)))
+            .flat_map(|file| &file.segments)
+            .map(|segment| u64::from(segment.bytes))
             .sum(),
         category: None,
         metadata: vec![],
-        files: volumes
-            .iter()
-            .enumerate()
-            .map(|(index, (filename, bytes))| FileSpec {
-                filename: filename.clone(),
-                role: FileRole::from_filename(filename),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: (0..articles as u32)
-                    .map(|segment_number| {
-                        let (start, end) = article_extent(bytes.len(), segment_number, articles);
-                        segment_spec! {
-                            number: segment_number,
-                            bytes: yenc_declared_bytes((end - start) as u32),
-                            message_id: format!("direct-{index}-{segment_number}@example.com"),
-                        }
-                    })
-                    .collect(),
-            })
-            .collect(),
+        files,
     }
 }
 

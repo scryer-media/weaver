@@ -9,6 +9,7 @@
 // byte goes through the namespace's access.
 
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io;
 
@@ -22,7 +23,7 @@ use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{ByteRange, MemberId, SliceVerdict};
 
 use super::evidence::Evidence;
-use super::sets::SetState;
+use super::sets::{Length, SetState};
 use crate::grid::Grid;
 
 // What one set's repair came to.
@@ -51,9 +52,12 @@ impl SetRepair {
     }
 }
 
-// A described file no post carries is announced by the namespace before the
-// repair, so it is a member here with every slice missing, and the rebuild
-// writes it whole.
+// A described file no member is bound to may be an unnamed member its
+// front could not name: the first whose slice reads back as the file's is
+// it, and the repair mends it in place, front and all, so the bind after
+// names it. A described file no post carries is announced by the namespace
+// before the repair, so it is a member here with every slice missing, and
+// the rebuild writes it whole.
 pub(super) fn repair_set(
     state: &mut SetState,
     grid: &Grid,
@@ -61,11 +65,14 @@ pub(super) fn repair_set(
     memory_limit: usize,
     access: &mut dyn MemberAccess,
 ) -> SetRepair {
+    let mut read = false;
+    for (file, member) in known_by_slices(state, access, &mut read) {
+        state.know(file, member);
+    }
     let Some(index) = state.usable() else {
-        return SetRepair::clean(false);
+        return SetRepair::clean(read);
     };
     let slice_size = index.slice_size;
-    let mut read = false;
     // The slices the bytes proved bad, which a repair that cannot rebuild
     // them reports to the namespace, so the members' coverage says what the
     // set found: damage only the set's checksums can see arrived marked
@@ -198,6 +205,73 @@ fn slice_validity(
             good == Some(true)
         })
         .collect()
+}
+
+// Each described file no member is bound to that an unnamed member holds a
+// slice of, to the first that does: the repair knows it by its content. What
+// no slice named has no intact byte to say what it is, so it is what is
+// left: longest file first, each takes the unnamed member it fits most
+// tightly, and the repair makes every byte of it over.
+fn known_by_slices(
+    state: &SetState,
+    access: &mut dyn MemberAccess,
+    read: &mut bool,
+) -> Vec<(FileId, MemberId)> {
+    let Some(index) = state.usable() else {
+        return Vec::new();
+    };
+    let mut unnamed = state.unnamed().to_vec();
+    let mut known = Vec::new();
+    for file in &index.recovery_file_ids {
+        if !state.members().contains_key(file)
+            && let Some(at) = unnamed
+                .iter()
+                .position(|&candidate| holds_slice_of(index, *file, candidate, access, read))
+        {
+            known.push((*file, unnamed.swap_remove(at).0));
+        }
+    }
+    let mut free: Vec<(FileId, u64)> = index
+        .recovery_file_ids
+        .iter()
+        .filter(|file| {
+            !state.members().contains_key(file) && !known.iter().any(|(k, _)| k == *file)
+        })
+        .filter_map(|file| Some((*file, index.file_description(file)?.length)))
+        .collect();
+    free.sort_by_key(|(_, long)| Reverse(*long));
+    for (file, long) in free {
+        let fitting = unnamed
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, length))| length.fits(long))
+            .min_by_key(|(_, (_, length))| length.bound());
+        if let Some((at, _)) = fitting {
+            known.push((file, unnamed.swap_remove(at).0));
+        }
+    }
+    known
+}
+
+// Whether the member, as long as the described file, holds one of its
+// slices: read back in order until one checks, so `read` says one was.
+fn holds_slice_of(
+    index: &Par2FileSet,
+    file: FileId,
+    (member, length): (MemberId, Length),
+    access: &mut dyn MemberAccess,
+    read: &mut bool,
+) -> bool {
+    let mut buffer = Vec::new();
+    index
+        .file_description(&file)
+        .filter(|description| length == Length::Exact(description.length))
+        .is_some_and(|description| {
+            (0..index.slice_count_for_file(description.length) as usize).any(|slice| {
+                *read = true;
+                read_slice(index, file, member, slice, access, &mut buffer) == Some(true)
+            })
+        })
 }
 
 // The member range of one slice: its share of the described file, as far

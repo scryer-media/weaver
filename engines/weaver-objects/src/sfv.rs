@@ -346,10 +346,6 @@ impl Recovery for Sfv {
     fn outcome(&self) -> Option<RepairOutcome> {
         self.outcome
     }
-
-    fn blocks_reachable(&self) -> u64 {
-        0
-    }
 }
 
 #[cfg(test)]

@@ -73,10 +73,13 @@ impl Owner {
         };
         let (name, bytes) = &owner.volumes[first];
         let front = &bytes[..bytes.len().min(FRONT)];
-        let volume = owner.object.claim(name, front).unwrap_or(VolumeIndex(0));
+        let volume = owner
+            .object
+            .claim(name, front, None)
+            .unwrap_or(VolumeIndex(0));
         assert_eq!(volume, VolumeIndex(first as u32), "founds on {name}");
         let name = name.clone();
-        owner.object.bound(volume, &name, &[]);
+        owner.object.bound(volume, &name, &[], None);
         owner.bound[first] = true;
         owner.size(first);
         owner
@@ -116,12 +119,13 @@ impl Owner {
         let (name, bytes) = &self.volumes[volume];
         let first = &bytes[..bytes.len().min(FRONT)];
         assert_eq!(
-            self.object.claim(name, first),
+            self.object.claim(name, first, None),
             Some(VolumeIndex(volume as u32)),
             "claims {name}"
         );
         let name = name.clone();
-        self.object.bound(VolumeIndex(volume as u32), &name, &[]);
+        self.object
+            .bound(VolumeIndex(volume as u32), &name, &[], None);
         self.bound[volume] = true;
         self.size(volume);
         self.settle();

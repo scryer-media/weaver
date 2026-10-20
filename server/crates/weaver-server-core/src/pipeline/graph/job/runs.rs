@@ -206,9 +206,10 @@ impl GraphJob {
         // its owner, and while anything more can come: a recovery object yet
         // to rule may rebuild a volume never posted.
         let ended = self.ended(parent);
-        let deciding = namespace
-            .members()
-            .any(|member| self.tree.is_undecided(parent, member.id));
+        let deciding = !ended
+            || namespace
+                .members()
+                .any(|member| self.tree.is_undecided(parent, member.id));
         let complete = ended && !deciding;
         let ends: Vec<(u32, Option<u64>, bool)> = volumes
             .iter()

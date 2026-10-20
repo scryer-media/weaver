@@ -99,7 +99,10 @@ impl SevenZipStore {
             if self.candidates[index].header_wrong {
                 continue;
             }
-            if self.header_wrong(index, start, false) {
+            if self
+                .header_tuple(index, start)
+                .is_some_and(|tuple| self.keys.is_wrong(&tuple))
+            {
                 self.candidates[index].header_wrong = true;
                 continue;
             }
@@ -113,7 +116,9 @@ impl SevenZipStore {
                 header::Parsed::Missing(range) => return self.want_header(range),
                 header::Parsed::Unverified => return,
                 header::Parsed::Locked | header::Parsed::Broken => {
-                    self.header_wrong(index, start, true);
+                    if let Some(tuple) = self.header_tuple(index, start) {
+                        self.keys.mark_wrong(&tuple);
+                    }
                     self.candidates[index].header_wrong = true;
                 }
                 header::Parsed::Archive { archive, read } => {
@@ -125,23 +130,16 @@ impl SevenZipStore {
         self.ask(out);
     }
 
-    // Whether the cache knows this candidate is wrong for this header, or,
-    // with `mark`, tell it so. The header's own bytes stand for its salt:
+    // The key the cache files this candidate under for this header, once
+    // the header is in hand. The header's own bytes stand for its salt:
     // sevenz-turbo derives the header's key inside its parse.
-    fn header_wrong(&self, index: usize, start: Start, mark: bool) -> bool {
-        let Some(params) = self.kept.read(start.end_header) else {
-            return false;
-        };
-        let tuple = Tuple {
+    fn header_tuple(&self, index: usize, start: Start) -> Option<Tuple<'_>> {
+        Some(Tuple {
             format: HEADER_TAG,
             password: &self.candidates[index].secret,
             salt: &[],
-            params,
-        };
-        if mark {
-            self.keys.mark_wrong(&tuple);
-        }
-        self.keys.is_wrong(&tuple)
+            params: self.kept.read(start.end_header)?,
+        })
     }
 
     pub(super) fn open_folders(&mut self, out: &mut Vec<Emit>) {
@@ -247,13 +245,14 @@ impl SevenZipStore {
         }
         let entry = &map.entries[proof.entry];
         let from = (entry.offset % BLOCK) as usize;
+        // A checksum that fails rules the candidate wrong for these bytes,
+        // not for its key: the cache keeps the key, and another job proves
+        // it again on bytes of its own.
         if crc32(&plain[from..from + entry.length as usize]) == expected {
-            return Verdict::Right;
+            Verdict::Right
+        } else {
+            Verdict::Wrong
         }
-        let params = [properties.cycles_power()];
-        self.keys
-            .mark_wrong(&self.folder_tuple(index, &properties, &params));
-        Verdict::Wrong
     }
 
     fn open_all(&mut self, index: usize, out: &mut Vec<Emit>) {

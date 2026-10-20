@@ -178,12 +178,14 @@ impl Pipeline {
         )
     }
 
-    // Every server failed an article of a graph job.
-    pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) {
+    // Every server failed an article of a graph job. True when the job is a
+    // graph job: its objects rule on the loss, so the caller's health
+    // arithmetic is not asked.
+    pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let limit = self.graph_slot_limit();
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
-            return;
+            return false;
         };
         let result = graph.lost(
             VolumeIndex(segment_id.file_id.file_index),
@@ -192,6 +194,7 @@ impl Pipeline {
             limit,
         );
         self.after_graph_result(job_id, result);
+        true
     }
 
     // What an engine's run said, or what a repair came back with. A run

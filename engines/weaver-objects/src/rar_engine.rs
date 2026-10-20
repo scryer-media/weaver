@@ -12,10 +12,10 @@ mod run;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(test)]
-use weaver_graph::{ByteRange, Emit, Engine, Object, Placement, VolumeIndex};
+use weaver_graph::{ByteRange, Emit, Engine, Object, Placement};
 
 use unrar_rs::{KdfCache, RarVolumeFacts};
-use weaver_graph::{Extraction, Kind};
+use weaver_graph::{Extraction, Kind, VolumeIndex};
 
 use crate::engine::{EngineObject, Format};
 use crate::rar_store::claim::{self, Held};
@@ -39,6 +39,10 @@ impl Format for Rar {
 
     fn states_place(front: &RarVolumeFacts) -> bool {
         claim::states_position(front)
+    }
+
+    fn misplaced(front: &RarVolumeFacts, index: u32) -> bool {
+        claim::misplaced(VolumeIndex(index), front)
     }
 
     // A front states nothing of whether a volume follows it: that is in the
