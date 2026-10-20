@@ -1117,7 +1117,11 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
     view.blocks_reachable = summary
         .iter()
         .filter_map(|set| tree.recovery(set.node))
-        .map(|recovery| recovery.blocks_reachable())
+        .map(|recovery| {
+            let mut sets = Vec::new();
+            recovery.sets(&mut sets);
+            sets.iter().map(|set| set.blocks_reachable).sum::<u64>()
+        })
         .sum();
     view.outcomes = summary.iter().map(|set| set.outcome).collect();
     *reads = job.writer().read_backs();

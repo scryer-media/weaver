@@ -68,6 +68,9 @@ fn assert_delivers(outcome: &Outcome, files: &[(&str, &[u8])]) {
     assert!(got == expected, "{}: {:?}", outcome.engine, got.keys());
 }
 
+// `blocks` is what the set had reached when it ruled, as its ruling says:
+// the repair runs in the stream as soon as a block per damaged slice is in
+// hand, so a one-slice repair rules on one block whatever the set posted.
 fn assert_repaired_once(graph: &Outcome, blocks: u64) {
     let view = graph.graph();
     assert_eq!(
@@ -118,7 +121,7 @@ async fn one_damaged_article_under_par3_is_repaired_under_both_engines() {
     assert_delivers(&classic, &[("lantern.bin", &data)]);
     assert_delivers(&graph, &[("lantern.bin", &data)]);
     assert!(claims_all(&graph.graph().claims, Claim::Complete));
-    assert_repaired_once(&graph, 2);
+    assert_repaired_once(&graph, 1);
 }
 
 #[tokio::test]
@@ -130,7 +133,7 @@ async fn a_lost_article_under_par3_is_repaired_with_its_blocks_reported() {
     assert_delivers(&classic, &[("lantern.bin", &data)]);
     assert_delivers(&graph, &[("lantern.bin", &data)]);
     assert!(claims_all(&graph.graph().claims, Claim::Complete));
-    assert_repaired_once(&graph, 2);
+    assert_repaired_once(&graph, 1);
 }
 
 // Two damaged slices and one recovery block. The graph fails the repair
@@ -360,7 +363,7 @@ async fn a_two_volume_rar5_set_beside_par3_with_a_damaged_article_is_repaired_in
     assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
     let graph = run(&scenario, Engine::Graph).await;
     assert_delivers(&graph, &[("beacon.bin", &body)]);
-    assert_repaired_once(&graph, 2);
+    assert_repaired_once(&graph, 1);
     assert!(claims_all(&graph.graph().claims, Claim::Complete));
 }
 
@@ -400,7 +403,7 @@ async fn a_damaged_stored_7z_beside_par3_is_repaired_under_both_engines_and_only
     assert_delivers(&classic, &expected);
     assert_delivers(&graph, &expected);
     assert_eq!(classic.refetched(), vec![(0, 0)]);
-    assert_repaired_once(&graph, 2);
+    assert_repaired_once(&graph, 1);
     assert_eq!(graph.graph().claims["lantern.7z"], Claim::Complete);
 }
 
