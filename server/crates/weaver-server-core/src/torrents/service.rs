@@ -350,6 +350,8 @@ pub struct TorrentView {
     pub source: TorrentSource,
     pub state: TorrentState,
     pub detail: Option<String>,
+    /// Who holds it stopped, while a hold does.
+    pub paused_by: Option<HoldOrigin>,
     pub category: Option<String>,
     pub private: bool,
     pub forced: bool,
@@ -2541,6 +2543,7 @@ impl TorrentService {
             source: record.source,
             state,
             detail,
+            paused_by: torrent.paused_by,
             category: settings
                 .category(record.category_id)
                 .map(|category| category.name.clone()),

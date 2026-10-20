@@ -379,12 +379,12 @@ async fn the_queue_events_carry_a_torrent() {
         ))
         .data(CallerScope::Read),
     );
-    // The next event for `id`, as (kind, state).
+    // The next event for `id` other than a progress tick, as (kind, state).
     let mut next = async |id: u64| loop {
         let response = events.next().await.expect("the queue's events stay open");
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         let event = response.data.into_json().unwrap()["queueEvents"].clone();
-        if event["itemId"].as_u64() == Some(id) {
+        if event["itemId"].as_u64() == Some(id) && event["kind"] != "ITEM_PROGRESS" {
             return (
                 event["kind"].as_str().unwrap().to_owned(),
                 event["state"].as_str().unwrap_or_default().to_owned(),

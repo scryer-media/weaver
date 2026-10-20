@@ -571,6 +571,8 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
         if complete { upload } else { download }
     };
     match view.state {
+        // The client has no hold on its queue: a held torrent is stopped.
+        TorrentState::Queued if view.paused_by.is_some() => side("stoppedDL", "stoppedUP"),
         TorrentState::Queued => side("queuedDL", "queuedUP"),
         TorrentState::FetchingMetadata => "metaDL",
         TorrentState::CheckingFiles => side("checkingDL", "checkingUP"),

@@ -357,6 +357,7 @@ fn view(state: TorrentState) -> TorrentView {
         state,
         detail: None,
         category: None,
+        paused_by: None,
         private: false,
         forced: false,
         progress: 0.5,
