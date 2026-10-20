@@ -111,6 +111,7 @@ export function TorrentDetail({
     { label: t("next.torrent.uploaded"), value: formatSize(torrent.uploadedBytes) },
     { label: t("next.job.downloaded"), value: formatSize(torrent.downloadedBytes) },
     { label: t("next.torrent.route"), value: torrent.route ?? EM_DASH },
+    { label: t("next.torrents.unpack"), value: t(torrent.unpack ? "next.common.on" : "next.common.off") },
   ];
 
   return (

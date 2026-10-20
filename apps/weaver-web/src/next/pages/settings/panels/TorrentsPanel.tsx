@@ -11,6 +11,7 @@ import {
   UPDATE_TORRENT_SETTINGS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
@@ -42,15 +43,18 @@ interface TrackerRule {
   /** Null while the rule leaves the goals to the category and the global policy. */
   seeding: SeedingPolicy | null;
   neverPause: boolean;
+  /** Null while the rule leaves it to the category and the global setting. */
+  unpack: boolean | null;
 }
 
 interface TrackerRuleForm {
   hostPattern: string;
   seeding: SeedingPolicy | null;
   neverPause: boolean;
+  unpack: boolean | null;
 }
 
-const NEW_TRACKER_RULE: TrackerRuleForm = { hostPattern: "", seeding: null, neverPause: false };
+const NEW_TRACKER_RULE: TrackerRuleForm = { hostPattern: "", seeding: null, neverPause: false, unpack: null };
 
 /** A rule's goals in one line, as its row shows them. */
 function goalsText(t: Translate, policy: SeedingPolicy | null): string {
@@ -87,7 +91,12 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
   const open = (rule: TrackerRule | null) => {
     setError(null);
     const start = rule
-      ? { hostPattern: rule.hostPattern, seeding: rule.seeding ? seedingFrom(rule.seeding) : null, neverPause: rule.neverPause }
+      ? {
+          hostPattern: rule.hostPattern,
+          seeding: rule.seeding ? seedingFrom(rule.seeding) : null,
+          neverPause: rule.neverPause,
+          unpack: rule.unpack,
+        }
       : NEW_TRACKER_RULE;
     setForm(start);
     setOpened(start);
@@ -102,6 +111,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         hostPattern: form.hostPattern.trim(),
         seeding: form.seeding ? seedingInput(form.seeding) : null,
         neverPause: form.neverPause,
+        unpack: form.unpack,
       },
     });
     setBusy(false);
@@ -196,6 +206,17 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                 },
               },
               {
+                id: "unpack",
+                label: t("next.torrents.unpack"),
+                keywords: "unpack extract archive",
+                control: {
+                  kind: "segmented",
+                  value: unpackChoice(form.unpack),
+                  options: UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) })),
+                  onChange: (choice) => setForm((current) => ({ ...current, unpack: unpackOf(choice) })),
+                },
+              },
+              {
                 id: "ownSeeding",
                 label: t("next.categories.ownSeeding"),
                 keywords: "seed seeding policy",
@@ -243,6 +264,7 @@ interface TorrentConnection {
   encryption: TorrentEncryption;
   maxActiveDownloads: number;
   maxPeersTotal: number;
+  unpack: boolean;
 }
 
 interface TorrentForm {
@@ -258,6 +280,7 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   encryption: "PREFER",
   maxActiveDownloads: 3,
   maxPeersTotal: 500,
+  unpack: true,
 };
 
 /** Option labels are translation keys, resolved when the panel renders. */
@@ -429,6 +452,12 @@ export function TorrentsPanel() {
                 min: 0,
                 onChange: (next) => patchTorrent({ maxPeersTotal: Math.max(0, Math.round(next)) }),
               },
+            },
+            {
+              id: "unpack",
+              label: t("next.torrents.unpack"),
+              keywords: "unpack extract archive",
+              control: { kind: "toggle", value: values.torrent.unpack, onChange: (unpack) => patchTorrent({ unpack }) },
             },
           ],
         },
