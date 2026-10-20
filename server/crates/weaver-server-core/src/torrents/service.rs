@@ -1130,12 +1130,15 @@ impl TorrentService {
         }
     }
 
+    // A task the service ends at stop. Only the running ones are kept.
     fn keep(&self, task: tokio::task::JoinHandle<()>) {
-        self.inner
+        let mut tasks = self
+            .inner
             .tasks
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(task);
+            .unwrap_or_else(PoisonError::into_inner);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
     }
 
     /// Counts the ticks run so far.
