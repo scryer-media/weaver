@@ -274,6 +274,46 @@ function endpointCards(consumers: FlowConsumer[], legs: LegFlow[]): Map<string, 
   return cards;
 }
 
+/**
+ * The legs and the endpoints in the order that crosses the fewest lines. A leg stands with the
+ * others leaving through its egress, under that egress's card, in its endpoint's order; an endpoint
+ * stands where the legs reaching it lie, at their mean row. Each order is swept against the other
+ * until neither moves. A consumer no shown leg reaches keeps its place after the ones one does.
+ */
+function uncrossed(
+  consumers: FlowConsumer[],
+  legs: LegFlow[],
+  egressRank: Map<number, number>,
+): { consumers: FlowConsumer[]; legs: LegFlow[] } {
+  const under = (order: FlowConsumer[]) => {
+    const rank = new Map(order.map((consumer, index) => [consumer.key, index]));
+    return [...legs].sort(
+      (a, b) =>
+        (egressRank.get(a.egressId) ?? 0) - (egressRank.get(b.egressId) ?? 0) ||
+        (rank.get(a.consumer) ?? 0) - (rank.get(b.consumer) ?? 0) ||
+        a.position - b.position,
+    );
+  };
+  let order = consumers;
+  for (let sweep = 0; sweep < 4; sweep += 1) {
+    const rows = under(order);
+    const reached = new Map<string, number[]>();
+    for (const [index, leg] of rows.entries()) {
+      reached.set(leg.consumer, [...(reached.get(leg.consumer) ?? []), index]);
+    }
+    const middle = (consumer: FlowConsumer) => {
+      const at = reached.get(consumer.key);
+      return at ? at.reduce((sum, index) => sum + index, 0) / at.length : rows.length;
+    };
+    const next = [...order].sort((a, b) => middle(a) - middle(b));
+    if (next.every((consumer, index) => consumer === order[index])) {
+      break;
+    }
+    order = next;
+  }
+  return { consumers: order, legs: under(order) };
+}
+
 /** A linear map from [0, domain] onto [0, range], clamped at both ends. */
 function scale(domain: number, range: number) {
   return (value: number) => Math.max(0, Math.min(range, (value / Math.max(1, domain)) * range));
@@ -708,16 +748,22 @@ export const NetworkFlow = memo(function NetworkFlow({
   }, [used]);
   const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
   const grouped = !single && (used.length > 6 || shownLegs.length > 40);
-  const cards = useMemo(() => endpointCards(shown, flow.legs), [shown, flow.legs]);
+  const order = useMemo(
+    () =>
+      uncrossed(
+        shown,
+        shownLegs.filter((leg) => !grouped || group === leg.egressId),
+        new Map(used.map((egress, index) => [egress.id, index])),
+      ),
+    [shown, shownLegs, grouped, group, used],
+  );
+  const cards = useMemo(() => endpointCards(order.consumers, flow.legs), [order.consumers, flow.legs]);
   const cardsBottom = [...cards.values()].reduce((bottom, card) => Math.max(bottom, card.y + card.height), 0);
 
   const layout = useMemo(() => {
-    const legs = shownLegs
-      .filter((leg) => !grouped || group === leg.egressId)
-      .sort((a, b) => a.egressId - b.egressId || a.consumer.localeCompare(b.consumer) || a.position - b.position);
     let offset = 58;
     const rows: Row[] = [];
-    for (const leg of legs) {
+    for (const leg of order.legs) {
       let bottom = 0;
       const blocks: Block[] = [];
       const rungs: Rung[] = leg.path.kind === "DIRECT" ? [] : leg.path.rungs;
@@ -806,7 +852,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       single ? endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom,
     );
     return { rows, endpointY, height: single ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t]);
+  }, [order.legs, flow.pools, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t]);
 
   // A flow no leg tunnels through has no proxy lane: the endpoints stand where it would start, and
   // a leg's line runs straight to its endpoint with nothing written on it.
