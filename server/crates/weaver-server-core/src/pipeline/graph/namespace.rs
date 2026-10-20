@@ -255,7 +255,7 @@ impl NamespaceWriter {
         self.caps.admit_name(&output_name)?;
         self.caps.admit_entry(tree, node)?;
         if Leaf::is_directory(&output_name) {
-            tree.settle_leaf(node, member);
+            self.settle(tree, builder, segments, node, member, out)?;
             Leaf::at(&self.working_dir, &output_name)?.create_directory()?;
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
@@ -610,7 +610,7 @@ impl NamespaceWriter {
                     bytes: bytes.clone(),
                     provenance: *provenance,
                 };
-                return self.write_leaf(tree, arrival, out);
+                return self.write_leaf(tree, builder, segments, arrival, out);
             }
             Effect::Reached {
                 node,
@@ -646,8 +646,7 @@ impl NamespaceWriter {
                 // is a leaf, whoever closed it: the root's source or an
                 // object's emit.
                 if tree.is_undecided(*node, *member) {
-                    tree.settle_leaf(*node, *member);
-                    self.release_to_leaf(tree, *node, *member)?;
+                    self.settle(tree, builder, segments, *node, *member, out)?;
                 }
                 // A leaf and a recovery volume live in their own files; a
                 // member another object owns has no file to close.
@@ -715,8 +714,7 @@ impl NamespaceWriter {
                 // cannot say what it is from them: it is a leaf, as one that
                 // ended first is. A repair there lets it say again.
                 if tree.is_undecided(*node, *member) && tree.front_lost(*node, *member, *range) {
-                    tree.settle_leaf(*node, *member);
-                    self.release_to_leaf(tree, *node, *member)?;
+                    self.settle(tree, builder, segments, *node, *member, out)?;
                 }
                 let mut effects = Vec::new();
                 tree.damaged_under_windows(
@@ -767,30 +765,38 @@ impl NamespaceWriter {
     fn write_leaf(
         &mut self,
         tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
         if tree.is_undecided(node, member) {
-            return self.hold(tree, arrival, out);
+            return self.hold(tree, builder, segments, arrival, out);
         }
         self.release_to_leaf(tree, node, member)?;
         self.write_file(tree, node, member, arrival.offset, &arrival.bytes)
     }
 
-    // Hold bytes whose member is not yet decided. A breach decides it a
-    // leaf: everything held and the new bytes go to its file.
+    // Hold bytes whose member is not yet decided. A breach settles it: the
+    // object that takes it is handed everything held and the new bytes; a
+    // leaf has them go to its file.
     fn hold(
         &mut self,
         tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
         if self.keep_held(node, member, arrival.offset, arrival.bytes.clone())? {
-            tree.settle_leaf(node, member);
+            if let Some(owner) = self.settle(tree, builder, segments, node, member, out)? {
+                let mut effects = Vec::new();
+                self.capture(tree, builder, owner, &arrival, &mut effects)?;
+                return self.apply_each(tree, builder, segments, effects, out);
+            }
             self.refuse(tree, node, member, Why::HoldsBreached);
-            self.release_to_leaf(tree, node, member)?;
             self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
             out.push(Effect::Refused {
                 node,
@@ -825,6 +831,29 @@ impl NamespaceWriter {
                 .write(page_out.scratch_offset, &page_out.bytes, None)?;
         }
         Ok(matches!(outcome.placed, Placed::Breached(_)))
+    }
+
+    // A member whose front will say no more is settled by the tree: an
+    // object beside it may take it, and is handed what was held of it;
+    // unclaimed, it is a leaf, and what was held goes to its file. The
+    // object that took it, as its volume.
+    fn settle(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        node: NodeId,
+        member: MemberId,
+        out: &mut Vec<Effect>,
+    ) -> Result<Option<(NodeId, VolumeIndex)>, WriteError> {
+        let mut effects = Vec::new();
+        tree.settle_leaf(node, member, &mut effects);
+        self.apply_each(tree, builder, segments, effects, out)?;
+        let owner = tree.child_of(node, member);
+        if owner.is_none() {
+            self.release_to_leaf(tree, node, member)?;
+        }
+        Ok(owner)
     }
 
     // The member was decided as a leaf: what was held is written first, so

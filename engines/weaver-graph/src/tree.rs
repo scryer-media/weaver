@@ -950,13 +950,23 @@ impl Tree {
             .flat_map(|found| found.undecided.iter().copied())
     }
 
-    // Decide an undecided member as a leaf without waiting for its bytes: the
-    // owner could not hold them any longer, or the member ended before its
-    // front could say what it is.
-    pub fn settle_leaf(&mut self, node: NodeId, member: MemberId) {
-        if let Some(found) = self.nodes.get_mut(&node) {
-            found.undecided.remove(&member);
+    // Decide an undecided member whose front will say no more: the owner
+    // could not hold its bytes any longer, or it ended, or lost its front
+    // for good, before the front could say what it is. The objects beside
+    // it are offered it with what it has, as a volume of theirs, as a
+    // member that has said what it is would be; unclaimed, it is a leaf.
+    pub fn settle_leaf(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
+        let Some(found) = self.nodes.get_mut(&node) else {
+            return;
+        };
+        if !found.undecided.remove(&member) {
+            return;
         }
+        let front = found.namespace.first_bytes(member).to_vec();
+        let mut siblings = self.bound_below(node);
+        siblings.extend(self.refused_below(node));
+        siblings.retain(|sibling| !self.lent(*sibling));
+        self.offer(node, member, &front, &siblings, effects);
     }
 
     // The inverse map of the object at `node`: where this range of its volume
