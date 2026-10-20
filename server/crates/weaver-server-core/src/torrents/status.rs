@@ -858,10 +858,7 @@ mod tests {
             }
         );
         // An announce already due is due now.
-        assert_eq!(
-            swarm(&announces, 1_100_000).reannounce_seconds,
-            Some(0)
-        );
+        assert_eq!(swarm(&announces, 1_100_000).reannounce_seconds, Some(0));
         assert_eq!(swarm(&[], 0), Swarm::default());
     }
 

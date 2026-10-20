@@ -569,7 +569,11 @@ fn a_route_runs_on_its_first_leg_that_is_up() {
         }
     };
     let key = |position: usize| {
-        RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &legs[position].path)
+        RouteKey::of(
+            SYSTEM_EGRESS_ID,
+            &EgressBinding::System,
+            &legs[position].path,
+        )
     };
 
     assert_eq!(first_up(&legs, down(&[])), Some((0, None)));

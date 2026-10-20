@@ -178,9 +178,9 @@ impl Routes for NetworkRoutes {
             scope,
             leg: position,
             egress_id: egress.as_ref().map_or(leg.egress_id, |egress| egress.id),
-            kind: egress
-                .as_ref()
-                .map_or(LegKind::System, |egress| LegKind::of(&egress.binding, &leg.path)),
+            kind: egress.as_ref().map_or(LegKind::System, |egress| {
+                LegKind::of(&egress.binding, &leg.path)
+            }),
             key: leg_key(&self.network, leg.egress_id, &leg.path),
             policy,
             down,
