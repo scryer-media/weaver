@@ -187,14 +187,15 @@ async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, engine: Engi
 
 #[test]
 fn each_phase_shows_as_its_status_and_lanes() {
-    let lanes = |phase| {
-        shown_status(phase, &JobStatus::Queued).map(|status| {
+    let lanes = |phase, current: &JobStatus| {
+        shown_status(phase, current).map(|status| {
             let (download, post, run) = runtime_lanes_from_status_snapshot(&status);
             (status, download, post, run)
         })
     };
+    // A repair that wants more bytes takes the job back to downloading.
     assert_eq!(
-        lanes(RootPhase::Downloading),
+        lanes(RootPhase::Downloading, &JobStatus::Repairing),
         Some((
             JobStatus::Downloading,
             DownloadState::Downloading,
@@ -202,6 +203,7 @@ fn each_phase_shows_as_its_status_and_lanes() {
             RunState::Active
         ))
     );
+    let lanes = |phase| lanes(phase, &JobStatus::Queued);
     assert_eq!(
         lanes(RootPhase::Verifying),
         Some((
@@ -236,6 +238,11 @@ fn each_phase_shows_as_its_status_and_lanes() {
     // No change is no report.
     assert_eq!(
         shown_status(RootPhase::Verifying, &JobStatus::Verifying),
+        None
+    );
+    // A queued job starts downloading at its first dispatch, not here.
+    assert_eq!(
+        shown_status(RootPhase::Downloading, &JobStatus::Queued),
         None
     );
 }

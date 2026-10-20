@@ -1997,11 +1997,12 @@ impl Pipeline {
             *slot = (*slot).max(*floor);
         }
         // The engine the row was stamped with at admission, never the switch's
-        // answer now: a job resumes on the engine it started on.
+        // answer now: a job resumes on the engine it started on. One with no
+        // stamp is from before the stamp, and every job before it ran classic.
         let engine = self
             .db_blocking(move |db| db.load_active_job_engine(job_id))
             .await?
-            .unwrap_or_default();
+            .unwrap_or(crate::pipeline::graph::Engine::Classic);
         // A graph job resumes from its checkpoint, which alone says which of
         // its articles are on disk, so the queue skips exactly those.
         let graph_restore = match engine {

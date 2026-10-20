@@ -287,9 +287,13 @@ fn damaged_names(namespace: Option<&Namespace>, set: NodeId) -> String {
 }
 
 // The status a phase shows over the one the job has, when it may replace
-// it. Done shows nothing: finalisation owns the status from there.
+// it. Done shows nothing: finalisation owns the status from there. Nor does
+// downloading show over queued: the tree says only that bytes are wanted,
+// and a queued job starts downloading when the dispatcher sends its first
+// article, whichever engine runs it.
 pub(crate) fn shown_status(phase: RootPhase, current: &JobStatus) -> Option<JobStatus> {
     phase
         .job_status()
         .filter(|status| RootPhase::may_replace(current) && status != current)
+        .filter(|status| !(*current == JobStatus::Queued && *status == JobStatus::Downloading))
 }
