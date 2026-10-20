@@ -51,6 +51,11 @@ impl Pipeline {
             .map(|(_, segment)| segment.len_bytes())
             .sum::<usize>();
         let count = segments.len();
+        let clean_ranges = segments
+            .iter()
+            .filter(|(_, segment)| segment.damaged_source.is_none())
+            .map(|(offset, segment)| (*offset, offset.saturating_add(segment.len_bytes() as u64)))
+            .collect();
         let started = Instant::now();
         let answer = submit_segments_to_disk(&file_path, segments);
         let (outcome_tx, outcome) = oneshot::channel();
@@ -83,6 +88,7 @@ impl Pipeline {
                 context,
                 bytes,
                 count,
+                clean_ranges,
                 started,
                 outcome,
                 answered: false,

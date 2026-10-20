@@ -3158,8 +3158,9 @@ impl Pipeline {
         }
     }
 
-    // Reconcile damage at handoff, after any demotion reset. Protect both
-    // durable ownership and accepted writes still waiting in this batch/buffer.
+    // Reconcile damage at handoff, after any demotion reset. Protect durable
+    // ownership, accepted writes still waiting in this batch/buffer, and
+    // accepted writes out to the disk owner.
     fn prepare_damaged_writes(
         &self,
         file_id: NzbFileId,
@@ -3177,6 +3178,13 @@ impl Pipeline {
             .and_then(|state| state.assembly.file(file_id))
             .into_iter()
             .flat_map(|file| file.protected_write_ranges())
+            .chain(
+                self.segment_writes
+                    .get(&file_id)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|ticket| ticket.clean_ranges.iter().copied()),
+            )
             .collect();
         let accepted = batch
             .iter()

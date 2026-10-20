@@ -1507,6 +1507,9 @@ pub(super) struct SegmentWriteTicket {
     pub(super) context: &'static str,
     pub(super) bytes: usize,
     pub(super) count: usize,
+    // The batch's clean ranges: accepted bytes a damaged write must not
+    // cover while they are neither buffered nor committed.
+    pub(super) clean_ranges: Vec<(u64, u64)>,
     pub(super) started: Instant,
     // The owner's answer. It is sent before the done message, so a landing
     // never waits on it.
