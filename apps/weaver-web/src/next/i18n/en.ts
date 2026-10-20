@@ -127,7 +127,6 @@ export const nextEn: LocaleDictionary = {
   "next.group.active": "In progress",
   "next.group.attention": "Needs attention",
   "next.group.note.paused": "resume to continue",
-  "next.group.note.queued": "starts when a slot frees",
   "next.group.note.attention": "cancelled or failed",
   "next.status.percentOf.DOWNLOADING": "{{percent}} of downloading",
   "next.status.percentOf.REPAIRING": "{{percent}} of repairing",

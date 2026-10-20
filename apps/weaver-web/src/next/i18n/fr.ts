@@ -120,7 +120,6 @@ export const nextFr: LocaleDictionary = {
   "next.group.active": "En cours",
   "next.group.attention": "À vérifier",
   "next.group.note.paused": "reprenez pour continuer",
-  "next.group.note.queued": "démarre dès qu’un emplacement se libère",
   "next.group.note.attention": "annulés ou échoués",
   "next.status.percentOf.DOWNLOADING": "{{percent}} du téléchargement",
   "next.status.percentOf.REPAIRING": "{{percent}} de la réparation",

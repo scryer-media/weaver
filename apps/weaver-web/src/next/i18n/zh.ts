@@ -120,7 +120,6 @@ export const nextZh: LocaleDictionary = {
   "next.group.active": "进行中",
   "next.group.attention": "需要处理",
   "next.group.note.paused": "恢复后继续",
-  "next.group.note.queued": "有空位时开始",
   "next.group.note.attention": "已取消或失败",
   "next.status.percentOf.DOWNLOADING": "下载已完成 {{percent}}",
   "next.status.percentOf.REPAIRING": "修复已完成 {{percent}}",

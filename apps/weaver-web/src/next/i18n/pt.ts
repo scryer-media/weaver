@@ -120,7 +120,6 @@ export const nextPt: LocaleDictionary = {
   "next.group.active": "Em andamento",
   "next.group.attention": "Requer atenção",
   "next.group.note.paused": "retome para continuar",
-  "next.group.note.queued": "começa quando uma vaga liberar",
   "next.group.note.attention": "cancelados ou com falha",
   "next.status.percentOf.DOWNLOADING": "{{percent}} do download",
   "next.status.percentOf.REPAIRING": "{{percent}} do reparo",

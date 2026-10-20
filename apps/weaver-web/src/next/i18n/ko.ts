@@ -120,7 +120,6 @@ export const nextKo: LocaleDictionary = {
   "next.group.active": "진행 중",
   "next.group.attention": "확인 필요",
   "next.group.note.paused": "재개하면 계속됩니다",
-  "next.group.note.queued": "자리가 나면 시작됩니다",
   "next.group.note.attention": "취소됨 또는 실패",
   "next.status.percentOf.DOWNLOADING": "다운로드 {{percent}}",
   "next.status.percentOf.REPAIRING": "복구 {{percent}}",

@@ -31,11 +31,11 @@ export const DOWNLOAD_GROUP_LABEL: Record<DownloadGroup, string> = {
   attention: "next.group.attention",
 };
 
-/** Translation keys for each group's section note; the in-progress group has none. */
+/** Translation keys for each group's section note; the in-progress and queued groups have none. */
 export const DOWNLOAD_GROUP_NOTE: Record<DownloadGroup, string | null> = {
   active: null,
   paused: "next.group.note.paused",
-  queued: "next.group.note.queued",
+  queued: null,
   attention: "next.group.note.attention",
 };
 

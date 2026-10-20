@@ -277,7 +277,7 @@ export function DownloadInspector({
       </div>
 
       <div className="flex flex-none flex-col gap-[10px] border-t border-wv-hairline px-5 py-[18px]">
-        <div className="flex gap-[10px]">
+        <div className="flex flex-wrap gap-[10px]">
           <SupportReportActions
             jobId={job.id}
             onReport={setNotice}
@@ -285,7 +285,7 @@ export function DownloadInspector({
           />
         </div>
         {notice === null ? null : <div className="text-[12px] text-wv-muted">{notice}</div>}
-        <div className="flex gap-[10px]">
+        <div className="flex flex-wrap gap-[10px]">
           <SecondaryButton
             icon={isPaused ? "resume" : "pause"}
             className="flex-1 justify-center"

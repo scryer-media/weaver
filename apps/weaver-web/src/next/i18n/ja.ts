@@ -120,7 +120,6 @@ export const nextJa: LocaleDictionary = {
   "next.group.active": "進行中",
   "next.group.attention": "要確認",
   "next.group.note.paused": "再開すると続行します",
-  "next.group.note.queued": "空きが出ると開始します",
   "next.group.note.attention": "キャンセルまたは失敗",
   "next.status.percentOf.DOWNLOADING": "ダウンロードの {{percent}}",
   "next.status.percentOf.REPAIRING": "修復の {{percent}}",

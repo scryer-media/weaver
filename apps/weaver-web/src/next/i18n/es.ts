@@ -120,7 +120,6 @@ export const nextEs: LocaleDictionary = {
   "next.group.active": "En curso",
   "next.group.attention": "Requiere atención",
   "next.group.note.paused": "reanuda para continuar",
-  "next.group.note.queued": "empieza cuando quede un hueco libre",
   "next.group.note.attention": "cancelada o fallida",
   "next.status.percentOf.DOWNLOADING": "{{percent}} de la descarga",
   "next.status.percentOf.REPAIRING": "{{percent}} de la reparación",
