@@ -45,16 +45,33 @@ interface TrackerRule {
   neverPause: boolean;
   /** Null while the rule leaves it to the category and the global setting. */
   unpack: boolean | null;
+  /** Null names the torrents as Weaver. */
+  client: TorrentClient | null;
 }
+
+type TorrentClient = "WEAVER" | "QBITTORRENT" | "TRANSMISSION";
+
+const TORRENT_CLIENTS: readonly { value: TorrentClient; label: string }[] = [
+  { value: "WEAVER", label: "Weaver" },
+  { value: "QBITTORRENT", label: "qBittorrent" },
+  { value: "TRANSMISSION", label: "Transmission" },
+];
 
 interface TrackerRuleForm {
   hostPattern: string;
   seeding: SeedingPolicy | null;
   neverPause: boolean;
   unpack: boolean | null;
+  client: TorrentClient | null;
 }
 
-const NEW_TRACKER_RULE: TrackerRuleForm = { hostPattern: "", seeding: null, neverPause: false, unpack: null };
+const NEW_TRACKER_RULE: TrackerRuleForm = {
+  hostPattern: "",
+  seeding: null,
+  neverPause: false,
+  unpack: null,
+  client: null,
+};
 
 /** A rule's goals in one line, as its row shows them. */
 function goalsText(t: Translate, policy: SeedingPolicy | null): string {
@@ -96,6 +113,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           seeding: rule.seeding ? seedingFrom(rule.seeding) : null,
           neverPause: rule.neverPause,
           unpack: rule.unpack,
+          client: rule.client,
         }
       : NEW_TRACKER_RULE;
     setForm(start);
@@ -112,6 +130,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         seeding: form.seeding ? seedingInput(form.seeding) : null,
         neverPause: form.neverPause,
         unpack: form.unpack,
+        client: form.client,
       },
     });
     setBusy(false);
@@ -214,6 +233,21 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                   value: unpackChoice(form.unpack),
                   options: UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) })),
                   onChange: (choice) => setForm((current) => ({ ...current, unpack: unpackOf(choice) })),
+                },
+              },
+              {
+                id: "client",
+                label: t("next.torrents.trackerRuleClient"),
+                keywords: "client peer id user agent",
+                control: {
+                  kind: "select",
+                  value: form.client ?? "WEAVER",
+                  options: TORRENT_CLIENTS,
+                  onChange: (client) =>
+                    setForm((current) => ({
+                      ...current,
+                      client: client === "WEAVER" ? null : (client as TorrentClient),
+                    })),
                 },
               },
               {

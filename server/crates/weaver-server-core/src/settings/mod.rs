@@ -12,7 +12,7 @@ mod schedules;
 pub mod service;
 
 pub use model::{
-    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
+    BufferPoolOverrides, Client, ClientName, Config, DeliveryNamingOverrides, DirectStoreOverrides,
     DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SeedingAction,
     SeedingGoalMode, SeedingPolicy, SharedConfig, TorrentConfig, TorrentEncryption,
     resolve_seeding_policy,

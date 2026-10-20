@@ -1447,6 +1447,7 @@ const TRACKER_RULE_FIELDS = `
     }
     neverPause
     unpack
+    client
   }
   ${SEEDING_POLICY_FIELDS}
 `;

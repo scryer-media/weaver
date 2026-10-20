@@ -1760,6 +1760,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.trackerRuleHost": "主机",
   "next.torrents.trackerRuleGoals": "目标",
   "next.torrents.trackerRuleNeverPause": "从不暂停",
+  "next.torrents.trackerRuleClient": "客户端",
   "next.torrents.trackerRulesEmpty": "没有 Tracker 规则。",
   "next.seeding.ratioGoal": "分享率目标",
   "next.seeding.seedTimeGoal": "做种时长目标",

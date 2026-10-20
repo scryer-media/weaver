@@ -4919,6 +4919,15 @@ type Torrent {
 	trackers: [TorrentTracker!]!
 }
 
+"""
+A client a torrent may name itself as to its peers and trackers.
+"""
+enum TorrentClient {
+	WEAVER
+	QBITTORRENT
+	TRANSMISSION
+}
+
 enum TorrentEncryption {
 	PREFER
 	REQUIRE
@@ -5009,6 +5018,10 @@ type TrackerRule {
 	Whether its torrents' archives are extracted; absent inherits.
 	"""
 	unpack: Boolean
+	"""
+	The client its torrents name themselves as; absent is Weaver.
+	"""
+	client: TorrentClient
 }
 
 input TrackerRuleInput {
@@ -5016,6 +5029,7 @@ input TrackerRuleInput {
 	seeding: SeedingPolicyInput
 	neverPause: Boolean! = false
 	unpack: Boolean
+	client: TorrentClient
 }
 
 enum TrackerStatus {

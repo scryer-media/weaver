@@ -919,3 +919,20 @@ kind = "sql"
 file = "migrations/0075_torrent_ledger_transfer/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 76
+description = "a tracker rule may name the client its torrents name themselves as"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0076_tracker_rule_client/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0076_tracker_rule_client/postgres.sql"
+engine = "postgres"
+scope = "all"

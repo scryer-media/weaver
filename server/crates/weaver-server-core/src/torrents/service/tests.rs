@@ -1716,6 +1716,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                 }),
                 never_pause: true,
                 unpack: None,
+                client: None,
             },
             EPOCH_MS,
         )
@@ -1942,6 +1943,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         seeding: None,
         never_pause: false,
         unpack: None,
+        client: None,
     }];
     let mut settings = TorrentSettings {
         complete_dir: PathBuf::from("/complete"),

@@ -12,7 +12,7 @@ use tracing::warn;
 #[cfg(test)]
 use crate::RssRuleAction;
 use crate::SchedulerHandle;
-use crate::ingest::{SubmissionOptions, submit_nzb_bytes_with_options};
+use crate::ingest::{Kind, SubmissionOptions, classify, submit_nzb_bytes_with_options};
 use crate::jobs::{CallerScopedIdempotency, SubmissionOrigin};
 use crate::proxies::{Consumer, FetchOptions, read_body, routed_fetch};
 use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata, unix_now_secs};
@@ -20,6 +20,7 @@ use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata, u
 use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items};
 use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
+use crate::torrents::service::{AddError, AddRequest, AddSource, TorrentService};
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};
 
 const MAX_RSS_REDIRECTS: usize = 10;
@@ -66,6 +67,19 @@ pub enum RssServiceError {
     Http(String),
 }
 
+// Why an accepted item made no job: one already holds it, or it failed.
+#[derive(Debug)]
+pub(super) enum NotAdded {
+    Ignored(String),
+    Failed(String),
+}
+
+impl From<String> for NotAdded {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
 #[derive(Clone)]
 pub struct RssService {
     pub(super) inner: Arc<RssServiceInner>,
@@ -78,6 +92,8 @@ pub(super) struct RssServiceInner {
     pub(super) security: RuntimeSecurityConfig,
     pub(super) sync_lock: Mutex<()>,
     pub(super) scheduled_paused: tokio::sync::watch::Sender<bool>,
+    // The torrent client the feeds' torrents go to, once it runs.
+    torrents: std::sync::OnceLock<TorrentService>,
     #[cfg(test)]
     clock_origin: tokio::time::Instant,
     #[cfg(test)]
@@ -96,6 +112,11 @@ impl RssService {
             *value = paused;
             true
         });
+    }
+
+    /// Send the torrents the feeds accept from now on to `torrents`.
+    pub fn use_torrents(&self, torrents: TorrentService) {
+        let _ = self.inner.torrents.set(torrents);
     }
 
     pub fn is_scheduled_paused(&self) -> bool {
@@ -144,6 +165,7 @@ impl RssService {
                 security,
                 sync_lock: Mutex::new(()),
                 scheduled_paused: tokio::sync::watch::channel(false).0,
+                torrents: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 clock_origin: tokio::time::Instant::now(),
                 #[cfg(test)]
@@ -154,90 +176,128 @@ impl RssService {
         }
     }
 
+    // An accepted item's job. A magnet goes to the torrent client as it is;
+    // anything else is fetched on the feed's route, and its bytes say whether
+    // it is a torrent or an NZB.
     pub(super) async fn accept_item_cancellable(
         &self,
         feed: &RssFeedRow,
         rule: &RssRuleRow,
         item: &FeedItem,
         cancellation: &crate::bandwidth::schedule::ScheduleCancellation,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, NotAdded> {
         let Some(download_url) = item.download_url.clone() else {
-            return Err("accepted item has no direct NZB URL".to_string());
+            return Err("accepted item has no download URL".to_string().into());
         };
+        let category = self.category(feed, rule).await;
+        let metadata = build_submission_metadata(feed, rule, item);
 
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".into()),
-            result = self.send_rss_request(feed, &download_url, false) => result.map_err(|e| format!("failed to fetch NZB: {e}"))?,
+        let fetched = match classify(download_url.as_bytes()) {
+            Kind::Magnet(uri) => Ok(AddSource::Magnet(uri)),
+            _ => {
+                let response = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".to_string().into()),
+                    result = self.send_rss_request(feed, &download_url, false) => result.map_err(|e| format!("failed to fetch item: {e}"))?,
+                };
+                if !response.status().is_success() {
+                    return Err(format!("failed to fetch item: HTTP {}", response.status()).into());
+                }
+                let supplied_password_candidates =
+                    crate::ingest::header_archive_password_candidates(
+                        crate::ingest::dnzb_header_passwords(response.headers())
+                            .iter()
+                            .map(String::as_str),
+                    );
+                let body = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".to_string().into()),
+                    result = read_body(response, self.inner.security.nzb_decompressed_limit_bytes) => result.map_err(|e| format!("failed to read item body: {e}"))?,
+                };
+                classify(&body)
+                    .torrent(body)
+                    .map_err(|nzb| (nzb, supplied_password_candidates))
+            }
         };
-        if !response.status().is_success() {
-            return Err(format!("failed to fetch NZB: HTTP {}", response.status()));
+        if cancellation.is_cancelled() {
+            return Err("scheduled RSS sync cancelled".to_string().into());
         }
-        let supplied_password_candidates = crate::ingest::header_archive_password_candidates(
-            crate::ingest::dnzb_header_passwords(response.headers())
-                .iter()
-                .map(String::as_str),
-        );
+        match fetched {
+            Ok(source) => self.add_torrent(source, category).await,
+            Err((nzb, supplied_password_candidates)) => {
+                weaver_nzb::parse_nzb(&nzb).map_err(|e| format!("invalid NZB: {e}"))?;
+                // Submission owns durable writes. Once started it must finish before shutdown.
+                let idempotency = CallerScopedIdempotency::new(
+                    format!("rss:feed:{}", feed.id),
+                    item.item_id.clone(),
+                );
+                let submitted = submit_nzb_bytes_with_options(
+                    &self.inner.db,
+                    &self.inner.handle,
+                    &self.inner.config,
+                    &nzb,
+                    Some(format!("{}.nzb", item.title)),
+                    None,
+                    category,
+                    metadata,
+                    SubmissionOptions {
+                        origin: SubmissionOrigin::Rss,
+                        idempotency,
+                        supplied_password_candidates,
+                        ..SubmissionOptions::default()
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(submitted.job_id.0)
+            }
+        }
+    }
 
-        let nzb_bytes = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".into()),
-            result = read_body(response, self.inner.security.nzb_decompressed_limit_bytes) => result.map_err(|e| format!("failed to read NZB body: {e}"))?,
-        };
-        weaver_nzb::parse_nzb(&nzb_bytes).map_err(|e| format!("invalid NZB: {e}"))?;
-
+    // The rule's category, else the feed's, as a configured category names it.
+    async fn category(&self, feed: &RssFeedRow, rule: &RssRuleRow) -> Option<String> {
         let raw_category = rule
             .category_override
             .clone()
-            .or_else(|| feed.default_category.clone());
-
-        let category = if let Some(ref cat) = raw_category {
-            let cfg = self.inner.config.read().await;
-            if cfg.categories.is_empty() {
-                raw_category
-            } else {
-                match crate::categories::resolve_category(&cfg.categories, cat) {
-                    Some(canonical) => Some(canonical),
-                    None => {
-                        warn!(
-                            feed = %feed.name,
-                            category = %cat,
-                            "RSS category not found, submitting without category"
-                        );
-                        None
-                    }
-                }
-            }
-        } else {
-            None
-        };
-
-        let metadata = build_submission_metadata(feed, rule, item);
-        if cancellation.is_cancelled() {
-            return Err("scheduled RSS sync cancelled".into());
+            .or_else(|| feed.default_category.clone())?;
+        let cfg = self.inner.config.read().await;
+        if cfg.categories.is_empty() {
+            return Some(raw_category);
         }
-        // Submission owns durable writes. Once started it must finish before shutdown.
-        let idempotency =
-            CallerScopedIdempotency::new(format!("rss:feed:{}", feed.id), item.item_id.clone());
-        let submitted = submit_nzb_bytes_with_options(
-            &self.inner.db,
-            &self.inner.handle,
-            &self.inner.config,
-            &nzb_bytes,
-            Some(format!("{}.nzb", item.title)),
-            None,
+        let canonical = crate::categories::resolve_category(&cfg.categories, &raw_category);
+        if canonical.is_none() {
+            warn!(
+                feed = %feed.name,
+                category = %raw_category,
+                "RSS category not found, submitting without category"
+            );
+        }
+        canonical
+    }
+
+    // A torrent goes to the torrent client with the item's category, whose
+    // route it takes. One the client already holds is left to it.
+    async fn add_torrent(
+        &self,
+        source: AddSource,
+        category: Option<String>,
+    ) -> Result<u64, NotAdded> {
+        let Some(torrents) = self.inner.torrents.get() else {
+            return Err("the torrent client is not running".to_string().into());
+        };
+        let request = AddRequest {
+            source,
             category,
-            metadata,
-            SubmissionOptions {
-                origin: SubmissionOrigin::Rss,
-                idempotency,
-                supplied_password_candidates,
-                ..SubmissionOptions::default()
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        Ok(submitted.job_id.0)
+            policy_override: None,
+            paused: false,
+            forced: false,
+            unpack: None,
+        };
+        match torrents.add(request).await {
+            Ok(job_id) => Ok(job_id.0),
+            Err(AddError::Duplicate(_)) => Err(NotAdded::Ignored("already added".into())),
+            Err(error) => Err(error.to_string().into()),
+        }
     }
 
     pub(super) async fn fetch_feed_response(

@@ -1233,6 +1233,8 @@ pub struct TrackerRule {
     pub never_pause: bool,
     /// Whether its torrents' archives are extracted; absent inherits.
     pub unpack: Option<bool>,
+    /// The client its torrents name themselves as; absent is Weaver.
+    pub client: Option<TorrentClientGql>,
 }
 
 impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
@@ -1243,6 +1245,7 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             seeding: rule.seeding.map(Into::into),
             never_pause: rule.never_pause,
             unpack: rule.unpack,
+            client: rule.client.map(Into::into),
         }
     }
 }
@@ -1254,6 +1257,7 @@ pub struct TrackerRuleInput {
     #[graphql(default)]
     pub never_pause: bool,
     pub unpack: Option<bool>,
+    pub client: Option<TorrentClientGql>,
 }
 
 impl TrackerRuleInput {
@@ -1272,7 +1276,39 @@ impl TrackerRuleInput {
                 .transpose()?,
             never_pause: self.never_pause,
             unpack: self.unpack,
+            client: self.client.map(Into::into),
         })
+    }
+}
+
+/// A client a torrent may name itself as to its peers and trackers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentClient")]
+pub enum TorrentClientGql {
+    Weaver,
+    #[graphql(name = "QBITTORRENT")]
+    QBittorrent,
+    Transmission,
+}
+
+impl From<weaver_server_core::settings::Client> for TorrentClientGql {
+    fn from(value: weaver_server_core::settings::Client) -> Self {
+        use weaver_server_core::settings::Client;
+        match value {
+            Client::Weaver => Self::Weaver,
+            Client::QBittorrent => Self::QBittorrent,
+            Client::Transmission => Self::Transmission,
+        }
+    }
+}
+
+impl From<TorrentClientGql> for weaver_server_core::settings::Client {
+    fn from(value: TorrentClientGql) -> Self {
+        match value {
+            TorrentClientGql::Weaver => Self::Weaver,
+            TorrentClientGql::QBittorrent => Self::QBittorrent,
+            TorrentClientGql::Transmission => Self::Transmission,
+        }
     }
 }
 

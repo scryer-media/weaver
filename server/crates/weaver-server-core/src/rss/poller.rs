@@ -9,8 +9,8 @@ use crate::rss::model::{
     parse_feed_items,
 };
 use crate::rss::service::{
-    DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, RssFeedSyncReport, RssService, RssServiceError,
-    RssSyncReport,
+    DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, NotAdded, RssFeedSyncReport, RssService,
+    RssServiceError, RssSyncReport,
 };
 use crate::{RssFeedRow, RssRuleAction};
 
@@ -473,7 +473,11 @@ impl RssService {
                             report.items_submitted += 1;
                             self.record_seen(feed.id, &item, "submitted", Some(job_id), None)?;
                         }
-                        Err(error) => {
+                        Err(NotAdded::Ignored(reason)) => {
+                            report.items_ignored += 1;
+                            self.record_seen(feed.id, &item, "ignored", None, Some(&reason))?;
+                        }
+                        Err(NotAdded::Failed(error)) => {
                             if cancellation.is_cancelled() {
                                 return Ok(report);
                             }
