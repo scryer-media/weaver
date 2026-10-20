@@ -53,7 +53,7 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             "weaver-yenc",
             crc_ladder(),
             crc_kernel,
-            &[],
+            &[crc_turbo::TIER_ENV],
         ),
         selection(
             KernelComponent::Par2Repair,
@@ -79,7 +79,7 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             "par2-rs",
             crc_ladder(),
             crc_kernel,
-            &[],
+            &[crc_turbo::TIER_ENV],
         ),
         selection(
             KernelComponent::RarRecovery,
@@ -93,7 +93,7 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             "unrar-rs",
             crc_ladder(),
             crc_kernel,
-            &[],
+            &[crc_turbo::TIER_ENV],
         ),
         selection(
             KernelComponent::RarSha1,
@@ -228,9 +228,44 @@ fn crc_turbo_kernel() -> &'static str {
     }
 }
 
-// weaver-yenc, par2-rs and unrar-rs all hash through crc-turbo.
-fn crc_kernel(_read_env: bool) -> &'static str {
-    crc_turbo_kernel()
+// weaver-yenc, par2-rs and unrar-rs all hash through crc-turbo. Its tier
+// gate is private, so the CPU's own pick mirrors its probes; the live tier is
+// the one `crc_turbo::TIER_ENV` may have narrowed it to.
+fn crc_kernel(read_env: bool) -> &'static str {
+    if read_env {
+        return crc_turbo_kernel();
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let pclmul = is_x86_feature_detected!("sse4.1") && is_x86_feature_detected!("pclmulqdq");
+        let avx512 =
+            pclmul && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx512bw");
+        let vpclmul = pclmul && is_x86_feature_detected!("vpclmulqdq");
+        if avx512 && vpclmul {
+            return CRC_VPCLMUL_512;
+        }
+        if avx512 {
+            return CRC_PCLMUL_512;
+        }
+        if vpclmul && is_x86_feature_detected!("avx2") {
+            return CRC_VPCLMUL_256;
+        }
+        if pclmul {
+            return CRC_PCLMUL_128;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("aes") {
+            return if is_aarch64_feature_detected!("sha3") {
+                CRC_PMULL_SHA3
+            } else {
+                CRC_PMULL
+            };
+        }
+    }
+    CRC_TABLES
 }
 
 // --- GF(2^16) --------------------------------------------------------------
