@@ -808,6 +808,11 @@ export const NetworkFlow = memo(function NetworkFlow({
     return { rows, endpointY, height: single ? bottom + 12 : Math.max(bottom + 52, 260) };
   }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t]);
 
+  // A flow no leg tunnels through has no proxy lane: the endpoints stand where it would start, and
+  // a leg's line runs straight to its endpoint with nothing written on it.
+  const tunnelled = layout.rows.some(({ blocks, closed }) => blocks.length > 0 || closed);
+  const endpoints = tunnelled ? ENDPOINTS : lane(PROXY.x, ENDPOINTS.width);
+  const span = tunnelled ? WIDTH : endpoints.end + 16;
   const width = scale(Math.max(RIBBON_FULL, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
   const name = (id: number) => profile(id)?.name ?? t("next.networking.proxyNumber", { id });
@@ -1104,17 +1109,17 @@ export const NetworkFlow = memo(function NetworkFlow({
       <div className="min-w-0 overflow-x-auto bg-wv-app">
         <svg
           xmlns="http://www.w3.org/2000/svg"
-          viewBox={`0 0 ${WIDTH} ${layout.height}`}
+          viewBox={`0 0 ${span} ${layout.height}`}
           role="group"
           aria-label={t("next.networking.flow.diagram")}
-          className="block w-full min-w-[1160px]"
-          style={{ background: INK.ground, fontFamily: FONT }}
+          className="block"
+          style={{ background: INK.ground, fontFamily: FONT, width: `${(100 * span) / WIDTH}%`, minWidth: (1160 * span) / WIDTH }}
         >
           {[
             [EGRESS.x, t("next.networking.flow.egressColumn")],
             [LEGS.x, t("next.networking.flow.legsColumn")],
-            [PROXY.x, t("next.networking.flow.proxyColumn")],
-            [ENDPOINTS.x, t(single ? "next.networking.flow.endpointColumn" : "next.networking.flow.consumersColumn")],
+            ...(tunnelled ? [[PROXY.x, t("next.networking.flow.proxyColumn")]] : []),
+            [endpoints.x, t(single ? "next.networking.flow.endpointColumn" : "next.networking.flow.consumersColumn")],
           ].map(([x, label]) => (
             <text key={String(x)} x={Number(x) + 4} y="30" fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
               {String(label).toUpperCase()}
@@ -1238,18 +1243,23 @@ export const NetworkFlow = memo(function NetworkFlow({
                   moves: passable && stateTone(way.status) !== "bad" && (way === taken || focus?.kind === "way"),
                 };
                 const enter = way.branches.map(({ at, share }) => ({
-                  points: [
-                    [LEGS.end, legY],
-                    [PROXY.x, at],
-                    ...(way.stop > PROXY.x ? [[way.stop, at] satisfies Point] : []),
-                  ] satisfies Point[],
+                  points: tunnelled
+                    ? ([
+                        [LEGS.end, legY],
+                        [PROXY.x, at],
+                        ...(way.stop > PROXY.x ? [[way.stop, at] satisfies Point] : []),
+                      ] satisfies Point[])
+                    : ([
+                        [LEGS.end, legY],
+                        [endpoints.x, consumerY],
+                      ] satisfies Point[]),
                   share,
                 }));
                 const leave = way.branches.map(({ at, share }) => ({
                   points: [
                     ...(way.resume < PROXY.end ? [[way.resume, at] satisfies Point] : []),
                     [PROXY.end, at],
-                    [ENDPOINTS.x, consumerY],
+                    [endpoints.x, consumerY],
                   ] satisfies Point[],
                   share,
                 }));
@@ -1267,7 +1277,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                 return [
                   { ...line, branches: enter, fan: "start" as const },
                   ...across,
-                  { ...line, branches: leave, fan: "end" as const },
+                  ...(tunnelled ? [{ ...line, branches: leave, fan: "end" as const }] : []),
                 ];
               }),
             ];
@@ -1495,7 +1505,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                     )}
                   </g>
                 ) : null}
-                {bypass == null ? null : (
+                {bypass == null || !tunnelled ? null : (
                   <g opacity={onWay(leg, blocks.length) ? undefined : FADE}>
                     {/* Written on the line, in the break the line leaves for it. */}
                     <StateText
@@ -1517,19 +1527,19 @@ export const NetworkFlow = memo(function NetworkFlow({
               {...(consumers[0] ? point({ kind: "endpoint", key: consumers[0].key }) : {})}
             >
               <title>{`${endpoint.title} · ${endpoint.detail}`}</title>
-              <rect x={ENDPOINTS.x} y={layout.endpointY} width={ENDPOINTS.width} height={ENDPOINT_BOX_HEIGHT} fill={INK.card} stroke={INK.line} />
-              <StateBar x={ENDPOINTS.x} y={layout.endpointY} height={ENDPOINT_BOX_HEIGHT} state={endpoint.state} />
-              <text x={ENDPOINTS.x + 14} y={layout.endpointY + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
-                {fit(endpoint.title, ENDPOINTS.width - 28, 12.5)}
+              <rect x={endpoints.x} y={layout.endpointY} width={endpoints.width} height={ENDPOINT_BOX_HEIGHT} fill={INK.card} stroke={INK.line} />
+              <StateBar x={endpoints.x} y={layout.endpointY} height={ENDPOINT_BOX_HEIGHT} state={endpoint.state} />
+              <text x={endpoints.x + 14} y={layout.endpointY + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
+                {fit(endpoint.title, endpoints.width - 28, 12.5)}
               </text>
-              <text x={ENDPOINTS.x + 14} y={layout.endpointY + 41} fill={INK.muted} fontSize="9.5">
-                {fit(endpoint.detail, ENDPOINTS.width - 28, 9.5)}
+              <text x={endpoints.x + 14} y={layout.endpointY + 41} fill={INK.muted} fontSize="9.5">
+                {fit(endpoint.detail, endpoints.width - 28, 9.5)}
               </text>
               <StateText
-                x={ENDPOINTS.x + 14}
+                x={endpoints.x + 14}
                 y={layout.endpointY + 61}
                 state={endpoint.state}
-                label={fit(endpoint.label, ENDPOINTS.width - 41, 10.5)}
+                label={fit(endpoint.label, endpoints.width - 41, 10.5)}
               />
             </g>
           ) : (
@@ -1547,7 +1557,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                 const outbound = consumer.key === OUTBOUND_CONSUMER;
                 // Only a server's card counts its connections.
                 const server = !rss && !outbound;
-                const x = ENDPOINTS.x + 14;
+                const x = endpoints.x + 14;
                 return (
                   <g
                     key={consumer.key}
@@ -1558,13 +1568,13 @@ export const NetworkFlow = memo(function NetworkFlow({
                       { kind: "route", consumer: consumer.key },
                       routePage(consumer.key),
                       <>
-                        <rect x={ENDPOINTS.x} y={y} width={ENDPOINTS.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
-                        <StateBar x={ENDPOINTS.x} y={y} height={height} state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"} />
+                        <rect x={endpoints.x} y={y} width={endpoints.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
+                        <StateBar x={endpoints.x} y={y} height={height} state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"} />
                         <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
-                          {rss ? fit(consumer.name, ENDPOINTS.width - 50, 12.5) : consumer.name.slice(0, 24)}
+                          {rss ? fit(consumer.name, endpoints.width - 50, 12.5) : consumer.name.slice(0, 24)}
                         </text>
                         {rss ? (
-                          <g transform={`translate(${ENDPOINTS.end - 26} ${y + 12})`} color={INK.muted}>
+                          <g transform={`translate(${endpoints.end - 26} ${y + 12})`} color={INK.muted}>
                             <Icon name="rss" size={12} />
                           </g>
                         ) : null}
