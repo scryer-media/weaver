@@ -1,39 +1,61 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { SAVE_ROUTE } from "@/graphql/networking";
-import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { routeInput, routeProblem, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
+import { useTranslate } from "@/lib/context/translate-context";
+import { routeInput, routeProblem, type ConsumerKind, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
+import { cn } from "@/lib/utils";
 import { Dialog } from "../../components/Dialog";
 import { PrimaryButton, SecondaryButton } from "../../components/controls";
+import { Icon } from "../../components/icons";
 import { Cell } from "../../components/rows";
-import { countLabel } from "../../i18n/labels";
 import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
 import { defaultRoute, speedPage, type Consumer, type NetworkingAction, type NetworkingData } from "./data";
 import { RouteEditor } from "./RouteEditor";
 import { stateLabel, StatusMark } from "./presentation";
 import { TestViaDialog } from "./TestViaDialog";
 
-/**
- * "20 NNTP connections · 2 legs": what a consumer is, and how its route splits
- * it. A route of one leg splits nothing, so says nothing about legs, and
- * Default outbound's and the torrent routes' names already say what they are.
- */
-export function consumerSummary(t: Translate, consumer: Consumer): string {
-  const count = consumer.route?.legs.length ?? 1;
-  const legs = count > 1 ? [countLabel(t, "next.networking.legCount", count)] : [];
-  switch (consumer.kind) {
+/** What a consumer carries: HTTP (Default outbound, the feeds), Usenet (the servers) or torrents. */
+export type ConsumerType = "HTTP" | "USENET" | "TORRENT";
+
+export function consumerType(kind: ConsumerKind): ConsumerType {
+  switch (kind) {
     case "SERVER":
-      return [countLabel(t, "next.networking.routes.connections", consumer.cap), ...legs].join(" · ");
+      return "USENET";
     case "RSS":
-      return [t("next.networking.routes.rssFeed"), ...legs].join(" · ");
     case "OUTBOUND":
+      return "HTTP";
     case "TORRENT_DEFAULT":
     case "TORRENT_CATEGORY":
-      return legs.join(" · ");
+      return "TORRENT";
   }
+}
+
+const TYPE_KEYS: Record<ConsumerType, string> = {
+  HTTP: "next.networking.routes.typeHttp",
+  USENET: "next.networking.routes.typeUsenet",
+  TORRENT: "next.networking.routes.typeTorrent",
+};
+
+type SortColumn = "name" | "type";
+type Sort = { column: SortColumn; descending: boolean };
+
+/** A header the table sorts by: a click sorts by it, a second click turns it around. */
+function SortHeader({ label, column, sort, onSort }: { label: string; column: SortColumn; sort: Sort; onSort: (column: SortColumn) => void }) {
+  const active = sort.column === column;
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={() => onSort(column)}
+      className={cn("flex cursor-pointer items-center gap-1 uppercase hover:text-wv-strong", active && "text-wv-strong")}
+    >
+      {label}
+      <Icon name={active ? (sort.descending ? "moveDown" : "moveUp") : "priority"} size={11} className={cn("flex-none", !active && "opacity-50")} />
+    </button>
+  );
 }
 
 /** The state a consumer's legs add up to: carrying, broken, or waiting. */
@@ -67,6 +89,17 @@ export function RoutesPage({
   const requested = new URLSearchParams(location.search).get("consumer");
   const preselected = consumers.find((consumer) => consumer.key === requested) ?? null;
   const [editing, setEditing] = useState<Consumer | null>(preselected);
+  const [sort, setSort] = useState<Sort>({ column: "name", descending: false });
+  const typeLabel = (consumer: Pick<Consumer, "kind">) => t(TYPE_KEYS[consumerType(consumer.kind)]);
+  const sorted = useMemo(() => {
+    const byName = (a: Consumer, b: Consumer) => a.name.localeCompare(b.name);
+    const byType = (a: Consumer, b: Consumer) =>
+      t(TYPE_KEYS[consumerType(a.kind)]).localeCompare(t(TYPE_KEYS[consumerType(b.kind)])) || byName(a, b);
+    const order = [...consumers].sort(sort.column === "name" ? byName : byType);
+    return sort.descending ? order.reverse() : order;
+  }, [consumers, sort, t]);
+  const onSort = (column: SortColumn) =>
+    setSort((current) => ({ column, descending: current.column === column && !current.descending }));
 
   const blocks: SettingsBlock[] = [
     {
@@ -74,10 +107,10 @@ export function RoutesPage({
       id: "routes",
       title: t("next.networking.routes.title"),
       note: t("next.networking.routes.note"),
-      columns: "minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1fr) 208px",
+      columns: "minmax(0, 1.6fr) minmax(0, 0.8fr) minmax(0, 1fr) 208px",
       headers: [
-        t("next.networking.routes.consumer"),
-        t("next.networking.routes.route"),
+        <SortHeader key="name" label={t("next.networking.routes.consumer")} column="name" sort={sort} onSort={onSort} />,
+        <SortHeader key="type" label={t("next.networking.routes.type")} column="type" sort={sort} onSort={onSort} />,
         t("next.networking.routes.live"),
         "",
       ],
@@ -88,19 +121,19 @@ export function RoutesPage({
           setEditing(consumer);
         }
       },
-      rows: consumers.map((consumer) => {
+      rows: sorted.map((consumer) => {
         const legs = flow.legs.filter((leg) => leg.consumer === consumer.key);
         const openCount = legs.reduce((sum, leg) => sum + leg.open, 0);
         const state = consumerState(flow, consumer);
         return {
           id: consumer.key,
-          searchText: `${consumer.name} ${consumerSummary(t, consumer)}`,
+          searchText: `${consumer.name} ${typeLabel(consumer)}`,
           cells: [
             <Cell key="name" title={consumer.name}>
               {consumer.name}
             </Cell>,
-            <Cell key="route" mono className="text-wv-secondary">
-              {consumerSummary(t, consumer)}
+            <Cell key="type" mono className="text-wv-secondary">
+              {typeLabel(consumer)}
             </Cell>,
             <StatusMark
               key="live"
@@ -184,7 +217,7 @@ export function RouteDialog({
     <Dialog
       open
       title={t("next.networking.routes.editorTitle", { name: consumer.name })}
-      note={consumerSummary(t, { ...consumer, route }) || undefined}
+      note={t(TYPE_KEYS[consumerType(consumer.kind)])}
       width={720}
       onDismiss={onClose}
       footer={
