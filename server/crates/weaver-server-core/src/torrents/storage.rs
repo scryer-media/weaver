@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, bail};
 use bitvec::boxed::BitBox;
 use bitvec::order::Msb0;
+use bytes::Bytes;
 use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
 use librqbit::{ManagedTorrentShared, TorrentMetadata, ValidatedTorrentMetaV1Info};
 use librqbit_core::lengths::ValidPieceIndex;
@@ -163,11 +164,27 @@ pub(crate) fn layout_of<B: AsRef<[u8]>>(
     PieceLayout::new(u64::from(info.lengths().default_piece_length()), files)
 }
 
+// A piece in flight, the length of its piece: its chunks as they arrive,
+// then the whole piece while its shares go to the job.
+enum Flight {
+    Writing(Vec<u8>),
+    Verified(Bytes),
+}
+
+impl Flight {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Writing(bytes) => bytes,
+            Self::Verified(bytes) => bytes,
+        }
+    }
+}
+
 struct Inner {
     layout: Arc<PieceLayout>,
     pieces: Arc<dyn Pieces>,
-    // The pieces in flight, by index, each the length of its piece.
-    flight: Mutex<HashMap<u32, Vec<u8>>>,
+    // The pieces in flight, by index.
+    flight: Mutex<HashMap<u32, Flight>>,
 }
 
 #[derive(Clone)]
@@ -186,7 +203,7 @@ impl PieceStorage {
         }
     }
 
-    fn flight(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Vec<u8>>> {
+    fn flight(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Flight>> {
         self.inner
             .flight
             .lock()
@@ -231,7 +248,7 @@ impl TorrentStorage for PieceStorage {
             && let Some(held) = self.flight().get(&piece)
         {
             let at = (start - self.inner.layout.piece_range(piece).start) as usize;
-            buf.copy_from_slice(&held[at..at + buf.len()]);
+            buf.copy_from_slice(&held.bytes()[at..at + buf.len()]);
             return Ok(());
         }
         let Some(volume) = self.inner.layout.file_volume(file_id) else {
@@ -261,7 +278,10 @@ impl TorrentStorage for PieceStorage {
         let mut flight = self.flight();
         let held = flight
             .entry(piece)
-            .or_insert_with(|| vec![0; range.len() as usize]);
+            .or_insert_with(|| Flight::Writing(vec![0; range.len() as usize]));
+        let Flight::Writing(held) = held else {
+            bail!("piece {piece} is written after it verified");
+        };
         held[at..at + buf.len()].copy_from_slice(buf);
         Ok(())
     }
@@ -302,8 +322,17 @@ impl TorrentStorage for PieceStorage {
     // being read from memory, so no read finds it in neither place.
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let index = piece.get();
-        let Some(held) = self.flight().get(&index).cloned() else {
-            bail!("piece {index} completed with nothing written");
+        let held = {
+            let mut flight = self.flight();
+            let Some(entry) = flight.get_mut(&index) else {
+                bail!("piece {index} completed with nothing written");
+            };
+            let held = match std::mem::replace(entry, Flight::Verified(Bytes::new())) {
+                Flight::Writing(bytes) => Bytes::from(bytes),
+                Flight::Verified(bytes) => bytes,
+            };
+            *entry = Flight::Verified(held.clone());
+            held
         };
         let shares = self
             .inner
@@ -317,7 +346,7 @@ impl TorrentStorage for PieceStorage {
                     volume,
                     piece: index,
                     offset: span.range.start,
-                    bytes: bytes::Bytes::copy_from_slice(&held[at..at + span.range.len() as usize]),
+                    bytes: held.slice(at..at + span.range.len() as usize),
                 })
             })
             .collect();

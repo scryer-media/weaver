@@ -426,3 +426,60 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_
     leecher.stop().await;
     seeder.stop().await;
 }
+
+// The job's side that keeps what it is handed, and reads the piece back
+// through the storage while it is being handed over.
+#[derive(Default)]
+struct Kept {
+    storage: std::sync::OnceLock<PieceStorage>,
+    shares: std::sync::Mutex<Vec<Verified>>,
+    read_while_handed: std::sync::Mutex<Vec<u8>>,
+}
+
+impl Pieces for Kept {
+    fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
+        let storage = self.storage.get().unwrap();
+        let mut read = self.read_while_handed.lock().unwrap();
+        for (file, length) in [(0, 5), (1, 3)] {
+            let mut buf = vec![0; length];
+            storage.pread_exact(file, 0, &mut buf)?;
+            read.extend(buf);
+        }
+        self.shares.lock().unwrap().extend(shares);
+        Ok(())
+    }
+
+    fn posted(&self, _: VolumeIndex, _: ByteRange, _: &mut Vec<u8>) -> bool {
+        false
+    }
+}
+
+// A verified piece's shares are views of the one buffer it was written
+// into, and the piece reads from memory until the job has them.
+#[test]
+fn a_verified_piece_goes_to_the_job_without_a_copy() {
+    let layout = Arc::new(PieceLayout::new(8, vec![file("a", 5), file("b", 3)]).unwrap());
+    let kept = Arc::new(Kept::default());
+    let storage = PieceStorage::new(Arc::clone(&layout), Arc::clone(&kept) as Arc<dyn Pieces>);
+    kept.storage.set(storage.clone()).ok().unwrap();
+    storage.pwrite_all(0, 0, b"aaaaa").unwrap();
+    storage.pwrite_all(1, 0, b"bbb").unwrap();
+    let index = Lengths::new(8, 8)
+        .unwrap()
+        .try_validate_piece_index(0)
+        .unwrap();
+    storage.on_piece_completed(index).unwrap();
+
+    assert_eq!(*kept.read_while_handed.lock().unwrap(), b"aaaaabbb");
+    let shares = kept.shares.lock().unwrap();
+    assert_eq!(
+        (&shares[0].bytes[..], &shares[1].bytes[..]),
+        (&b"aaaaa"[..], &b"bbb"[..])
+    );
+    assert_eq!(
+        shares[0].bytes.as_ptr().wrapping_add(5),
+        shares[1].bytes.as_ptr()
+    );
+    // Once handed over, the piece is no longer in memory.
+    assert!(storage.pread_exact(0, 0, &mut [0; 5]).is_err());
+}
