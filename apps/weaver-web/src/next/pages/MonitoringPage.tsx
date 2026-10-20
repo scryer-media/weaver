@@ -41,8 +41,8 @@ import {
   directionCap,
   directionPercent,
   metered,
-  QuotaStateChip,
   quotaHolding,
+  quotaStateLabel,
   usageColor,
   usageOf,
   useEgressQuotas,
@@ -577,7 +577,7 @@ function EgressQuotaSection() {
               <div key={direction} className="flex flex-col gap-[6px]">
                 <div className="flex items-baseline justify-between gap-3 font-wv-mono text-[11.5px] text-wv-muted">
                   <span>{label}</span>
-                  {quotaHolding(state) ? <QuotaStateChip t={t} state={state} /> : null}
+                  {quotaHolding(state) ? <span className="text-wv-warn">{quotaStateLabel(t, state)}</span> : null}
                 </div>
                 <Bar
                   percent={percent}

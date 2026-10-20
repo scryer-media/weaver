@@ -211,7 +211,7 @@ export function AddNzbDialog({
 
         <div className="mt-2 flex flex-col">
           <FormRow label={t("next.addNzb.link")}>
-            <div className="flex w-full min-w-0 flex-col gap-1">
+            <div className="flex w-[268px] max-w-full min-w-0 flex-col gap-1">
               <TextField
                 label={t("next.addNzb.link")}
                 value={upload.text}

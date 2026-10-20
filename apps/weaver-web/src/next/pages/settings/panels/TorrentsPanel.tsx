@@ -147,7 +147,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           {goalsText(t, rule.seeding)}
         </Cell>,
         <Cell key="neverPause" mono className="text-wv-muted">
-          {rule.neverPause ? "✓" : EM_DASH}
+          {t(rule.neverPause ? "next.common.on" : "next.common.off")}
         </Cell>,
       ],
     })),
@@ -158,13 +158,13 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
       <RecordEditor
         open={editingId !== null}
         title={editingId === "new" ? t("next.torrents.trackerRuleAdd") : (editing?.hostPattern ?? t("next.torrents.trackerRule"))}
-        note={editingId === "new" ? undefined : `#${editing?.id ?? ""}`}
+        note={editingId === "new" ? t("next.torrents.trackerRuleNewNote") : `#${editing?.id ?? ""}`}
         error={error}
         busy={busy}
         onSave={() => void save()}
         onDismiss={() => setEditingId(null)}
         onDelete={editing ? () => setConfirmDelete(editing) : undefined}
-        deleteLabel={t("next.torrents.trackerRuleDelete")}
+        deleteLabel={t("next.rss.removeRule")}
         sections={[
           {
             id: "trackerRule",
@@ -215,10 +215,11 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
 
       <ConfirmDialog
         open={confirmDelete !== null}
-        title={t("next.torrents.trackerRuleDelete")}
+        title={t("next.rss.removeRule")}
+        note={confirmDelete?.hostPattern}
         busy={busy}
-        confirmLabel={t("next.torrents.trackerRuleDelete")}
-        body={confirmDelete?.hostPattern}
+        confirmLabel={t("next.rss.removeRule")}
+        body={t("next.torrents.trackerRuleRemoveBody")}
         onConfirm={() => void remove()}
         onDismiss={() => setConfirmDelete(null)}
       />

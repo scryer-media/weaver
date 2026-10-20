@@ -729,7 +729,7 @@ function UploadResult({ upload }: { upload: SpeedTestUpload }) {
   const rate = (bps: number | null) => splitSpeed(bps ?? 0);
   const { http, peers } = upload;
   return (
-    <MetricStrip min={200}>
+    <MetricStrip min={140}>
       {http.outcome === "MEASURED" ? (
         <MetricCell variant="stat" eyebrow={t("next.networking.speed.upload")} {...rate(http.bps)} note={splitBytesLabel(http.bytes)} />
       ) : (

@@ -7,12 +7,12 @@ import { SET_TORRENT_SEEDING_MUTATION, TORRENT_UPDATES_SUBSCRIPTION } from "@/gr
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { torrentErrorText, type TorrentData } from "@/lib/torrents";
 import { DetailBlock, Field } from "@/next/components/chrome";
-import { Dialog } from "@/next/components/Dialog";
-import { PrimaryButton, SecondaryButton } from "@/next/components/controls";
+import { SecondaryButton } from "@/next/components/controls";
+import { RecordEditor } from "@/next/components/RecordEditor";
 import { GridRow } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
-import { FieldRows } from "@/next/pages/settings/framework";
+import { countLabel } from "@/next/i18n/labels";
 import { EMPTY_SEEDING, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
 const TRACKER_COLUMNS = { base: "minmax(0,1fr) 112px", sm: "minmax(0,1fr) 112px minmax(0,1fr)" };
@@ -149,7 +149,11 @@ export function TorrentDetail({
         </div>
       </DetailBlock>
 
-      <DetailBlock id="trackers" title={t("next.torrent.trackers")} note={String(torrent.trackers.length)}>
+      <DetailBlock
+        id="trackers"
+        title={t("next.torrent.trackers")}
+        note={countLabel(t, "next.torrent.trackerCount", torrent.trackers.length)}
+      >
         {torrent.trackers.length === 0 ? (
           <span className="text-[12.5px] text-wv-muted">{EM_DASH}</span>
         ) : (
@@ -158,7 +162,7 @@ export function TorrentDetail({
               key={`${tracker.tier}-${tracker.url}`}
               columns={TRACKER_COLUMNS}
               gap={14}
-              className="min-h-[34px] items-center border-t border-wv-hairline py-[6px]"
+              className="h-[38px] border-t border-wv-hairline"
               title={tracker.url}
             >
               <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{tracker.url}</span>
@@ -173,48 +177,57 @@ export function TorrentDetail({
         )}
       </DetailBlock>
 
-      <DetailBlock id="torrent-files" title={t("next.common.files")} note={String(torrent.files.length)}>
-        {torrent.files.map((file) => (
-          <GridRow
-            key={file.index}
-            columns={FILE_COLUMNS}
-            gap={14}
-            className="h-[34px] border-t border-wv-hairline"
-            title={file.path}
-          >
-            <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{file.path}</span>
-            <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(file.progress * 100).toFixed(1)}%`}</span>
-            <span className="text-right font-wv-mono text-[12px] text-wv-muted">{formatSize(file.length)}</span>
-          </GridRow>
-        ))}
+      <DetailBlock
+        id="torrent-files"
+        title={t("next.common.files")}
+        note={countLabel(t, "next.job.fileCount", torrent.files.length)}
+      >
+        {torrent.files.length === 0 ? (
+          <span className="text-[12.5px] text-wv-muted">{EM_DASH}</span>
+        ) : (
+          torrent.files.map((file) => (
+            <GridRow
+              key={file.index}
+              columns={FILE_COLUMNS}
+              gap={14}
+              className="h-[38px] border-t border-wv-hairline"
+              title={file.path}
+            >
+              <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{file.path}</span>
+              <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(file.progress * 100).toFixed(1)}%`}</span>
+              <span className="text-right font-wv-mono text-[12px] text-wv-muted">{formatSize(file.length)}</span>
+            </GridRow>
+          ))
+        )}
       </DetailBlock>
 
-      <Dialog
+      <RecordEditor
         open={editing !== null}
         title={t("next.torrent.overrideSeeding")}
         note={torrent.name}
+        busy={seedingState.fetching}
+        onSave={() => saveSeeding(editing ?? EMPTY_SEEDING)}
         onDismiss={() => setEditing(null)}
-        footer={
-          <>
-            <SecondaryButton
-              disabled={seedingState.fetching || torrent.seedingOverride === null}
-              onClick={() => saveSeeding(null)}
-            >
-              {t("next.torrent.useInherited")}
-            </SecondaryButton>
-            <SecondaryButton onClick={() => setEditing(null)}>{t("action.cancel")}</SecondaryButton>
-            <PrimaryButton disabled={seedingState.fetching} onClick={() => saveSeeding(editing ?? EMPTY_SEEDING)}>
-              {t("action.save")}
-            </PrimaryButton>
-          </>
+        extraActions={
+          <SecondaryButton
+            disabled={seedingState.fetching || torrent.seedingOverride === null}
+            onClick={() => saveSeeding(null)}
+          >
+            {t("next.torrent.useInherited")}
+          </SecondaryButton>
         }
-      >
-        {editing === null ? null : (
-          <div className="flex flex-col py-2">
-            <FieldRows fields={seedingFields(t, editing, setEditing, { inherits: true, idPrefix: "torrent-seeding" })} />
-          </div>
-        )}
-      </Dialog>
+        sections={
+          editing === null
+            ? []
+            : [
+                {
+                  id: "seeding",
+                  title: t("next.torrents.seeding"),
+                  fields: seedingFields(t, editing, setEditing, { inherits: true, idPrefix: "torrent-seeding" }),
+                },
+              ]
+        }
+      />
     </>
   );
 }
