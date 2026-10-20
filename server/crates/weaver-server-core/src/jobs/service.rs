@@ -1259,6 +1259,12 @@ impl Pipeline {
             // A reprocessed job is a new admission, so it takes the engine
             // the switch names now, like any other.
             let engine = crate::pipeline::graph::Engine::from_environment();
+            let skip = Self::reprocess_skip(job_id, &spec, engine);
+            let (assembly, download_queue, recovery_queue) =
+                Self::build_job_assembly(job_id, &spec, &skip);
+            let status = Self::reprocess_status(&download_queue);
+            let (download_state, _, _) =
+                crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
             self.db
                 .create_active_job(&crate::ActiveJob {
                     engine,
@@ -1270,8 +1276,8 @@ impl Pipeline {
                     created_at: (crate::jobs::model::epoch_ms_now() / 1000.0) as u64,
                     category: spec.category.clone(),
                     metadata: spec.metadata.clone(),
-                    status: "downloading",
-                    download_state: "downloading",
+                    status: status.persisted_status(),
+                    download_state: download_state.as_str(),
                     post_state: "idle",
                     run_state: "active",
                     paused_resume_status: None,
@@ -1282,9 +1288,6 @@ impl Pipeline {
                 })
                 .map_err(crate::SchedulerError::State)?;
 
-            let all_segments = Self::all_segment_ids(job_id, &spec);
-            let (assembly, download_queue, recovery_queue) =
-                Self::build_job_assembly(job_id, &spec, &all_segments);
             let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
 
             // Resolve the category's shared decoded-byte counter once, here, so the
@@ -1299,8 +1302,8 @@ impl Pipeline {
                 job_id,
                 job_hash: nzb_hash,
                 spec,
-                status: JobStatus::Downloading,
-                download_state: crate::jobs::model::DownloadState::Downloading,
+                status,
+                download_state,
                 post_state: crate::jobs::model::PostState::Idle,
                 run_state: crate::jobs::model::RunState::Active,
                 assembly,
@@ -1356,11 +1359,18 @@ impl Pipeline {
         }
 
         if in_jobs {
+            // A job still in memory runs on the engine whose runtime it has.
+            let engine = if self.graph_jobs.contains_key(&job_id) {
+                crate::pipeline::graph::Engine::Graph
+            } else {
+                crate::pipeline::graph::Engine::Classic
+            };
             let state = self.jobs.get(&job_id).unwrap();
-            let all_segments = Self::all_segment_ids(job_id, &state.spec);
+            let skip = Self::reprocess_skip(job_id, &state.spec, engine);
             let spec_clone = state.spec.clone();
             let (assembly, download_queue, recovery_queue) =
-                Self::build_job_assembly(job_id, &spec_clone, &all_segments);
+                Self::build_job_assembly(job_id, &spec_clone, &skip);
+            let status = Self::reprocess_status(&download_queue);
             let file_identities;
             {
                 let state = self.jobs.get_mut(&job_id).unwrap();
@@ -1374,11 +1384,12 @@ impl Pipeline {
                 state.failed_bytes = 0;
                 file_identities = state.file_identities.clone();
             }
-            self.transition_postprocessing_status(
-                job_id,
-                JobStatus::Downloading,
-                Some("downloading"),
-            );
+            let persisted = status.persisted_status();
+            self.transition_postprocessing_status(job_id, status, Some(persisted));
+            // The old tree ruled on the old attempt; the fresh one reads the
+            // queues just rebuilt.
+            self.graph_jobs.remove(&job_id);
+            self.admit_graph_job(job_id, engine);
             self.note_download_activity(job_id);
             self.persist_file_identities(job_id, &file_identities).await;
         }
@@ -1656,6 +1667,31 @@ impl Pipeline {
         for file_id in files {
             self.refresh_archive_state_for_completed_file(job_id, file_id, false)
                 .await;
+        }
+    }
+
+    // What a reprocess does not fetch again. The classic engine trusts the
+    // working directory and skips every article. The graph fetches again
+    // every article whose placement this run never saw, as its restore
+    // does, and a reprocess has no checkpoint to say where any was placed.
+    fn reprocess_skip(
+        job_id: JobId,
+        spec: &JobSpec,
+        engine: crate::pipeline::graph::Engine,
+    ) -> HashSet<SegmentId> {
+        match engine {
+            crate::pipeline::graph::Engine::Classic => Self::all_segment_ids(job_id, spec),
+            crate::pipeline::graph::Engine::Graph => HashSet::new(),
+        }
+    }
+
+    // A reprocess with nothing to fetch is downloading, so the completion
+    // check moves it on; one with work is queued until its first dispatch.
+    fn reprocess_status(download_queue: &DownloadQueue) -> JobStatus {
+        if download_queue.is_empty() {
+            JobStatus::Downloading
+        } else {
+            JobStatus::Queued
         }
     }
 
