@@ -18,12 +18,12 @@ use std::time::Duration;
 
 use bitvec::boxed::BitBox;
 use bitvec::order::Msb0;
-use librqbit::{
+use tokio::sync::watch;
+use weaver_torrent::core::lengths::Lengths;
+use weaver_torrent::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerMode, ListenerOptions,
     ManagedTorrent, PiecePriority, Session, SessionOptions, TrackerAnnounce,
 };
-use librqbit_core::lengths::Lengths;
-use tokio::sync::watch;
 use weaver_tunnel::pipe::Dialer;
 
 use super::natpmp;
@@ -286,7 +286,7 @@ impl TestTorrent {
             .join(&name)
             .map_err(|error| error.to_string())?;
         let bytes = get_capped(&client, &url).await?;
-        let lengths = librqbit::torrent_from_bytes(&bytes)
+        let lengths = weaver_torrent::torrent_from_bytes(&bytes)
             .map_err(|error| error.to_string())
             .and_then(|torrent| {
                 torrent
@@ -352,7 +352,6 @@ impl Joined {
                 ..ListenerOptions::default()
             }),
             connect: Some(ConnectionOptions {
-                proxy_url: None,
                 enable_tcp: true,
                 peer_opts: None,
             }),
@@ -612,7 +611,7 @@ async fn wait_pieces(
     }
 }
 
-fn announced(table: &[TrackerAnnounce]) -> Option<&librqbit::AnnounceOk> {
+fn announced(table: &[TrackerAnnounce]) -> Option<&weaver_torrent::AnnounceOk> {
     table
         .iter()
         .filter_map(|tracker| tracker.last.as_ref())

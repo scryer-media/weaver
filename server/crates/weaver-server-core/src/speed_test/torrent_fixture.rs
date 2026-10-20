@@ -10,14 +10,14 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use librqbit::spawn_utils::BlockingSpawner;
-use librqbit::{
-    AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerMode, ListenerOptions, Session,
-    SessionOptions, create_torrent,
-};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use weaver_torrent::spawn_utils::BlockingSpawner;
+use weaver_torrent::{
+    AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerMode, ListenerOptions, Session,
+    SessionOptions, create_torrent,
+};
 
 use super::TestTorrentSource;
 

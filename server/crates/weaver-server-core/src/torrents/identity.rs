@@ -3,7 +3,7 @@
 
 //! How Weaver names itself to peers and trackers. Fixed by the build.
 
-use librqbit_core::Id20;
+use weaver_torrent::core::Id20;
 
 /// The Azureus-style peer-id prefix and user agent of this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +97,6 @@ mod tests {
         assert_eq!(&first.0[..8], IDENTITY.prefix());
         assert_eq!(&second.0[..8], IDENTITY.prefix());
         assert_ne!(first, second);
-        assert!(librqbit_core::peer_id::try_decode_peer_id(first).is_some());
+        assert!(weaver_torrent::core::peer_id::try_decode_peer_id(first).is_some());
     }
 }

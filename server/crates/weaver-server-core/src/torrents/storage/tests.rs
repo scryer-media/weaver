@@ -5,15 +5,15 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
-use librqbit::spawn_utils::BlockingSpawner;
-use librqbit::{
-    AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerMode, ListenerOptions, Session,
-    SessionOptions, create_torrent, torrent_from_bytes,
-};
-use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 use tokio::sync::{Notify, watch};
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant, HoldsNamespace};
 use weaver_graph::{ByteRange, NodeId, VolumeIndex};
+use weaver_torrent::core::lengths::{Lengths, ValidPieceIndex};
+use weaver_torrent::spawn_utils::BlockingSpawner;
+use weaver_torrent::{
+    AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerMode, ListenerOptions, Session,
+    SessionOptions, create_torrent, torrent_from_bytes,
+};
 
 use super::{PieceStorage, PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::operations::disk::CapacityReader;
@@ -24,7 +24,9 @@ use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::{PieceFile, PieceLayout, Verified};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::torrents::intake::Holds;
-use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
+use weaver_torrent::storage::{
+    BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
+};
 
 fn accountant(resident_limit: u64) -> Arc<HoldsAccountant> {
     Arc::new(HoldsAccountant::new(HoldBudgets {
@@ -506,8 +508,8 @@ struct Gated {
 impl TorrentStorage for Gated {
     fn init(
         &mut self,
-        shared: &librqbit::ManagedTorrentShared,
-        metadata: &librqbit::TorrentMetadata,
+        shared: &weaver_torrent::ManagedTorrentShared,
+        metadata: &weaver_torrent::TorrentMetadata,
     ) -> anyhow::Result<()> {
         self.storage.init(shared, metadata)
     }
@@ -569,8 +571,8 @@ impl StorageFactory for GatedFactory {
 
     fn create(
         &self,
-        shared: &librqbit::ManagedTorrentShared,
-        metadata: &librqbit::TorrentMetadata,
+        shared: &weaver_torrent::ManagedTorrentShared,
+        metadata: &weaver_torrent::TorrentMetadata,
     ) -> anyhow::Result<Gated> {
         Ok(Gated {
             storage: self.factory.create(shared, metadata)?,

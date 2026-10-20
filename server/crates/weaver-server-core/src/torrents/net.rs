@@ -12,11 +12,11 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use librqbit::network::{
+use weaver_torrent::network::{
     AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket,
     Resolver,
 };
-use librqbit::{SocketFactory, StreamListener};
+use weaver_torrent::{SocketFactory, StreamListener};
 use weaver_tunnel::bridge::Bridge;
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
 use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Resolution, Target};

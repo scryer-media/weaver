@@ -92,16 +92,14 @@ const CLIENT_CRATES: &[(&str, &[&str])] = &[
         &[
             "application-updater",
             "artifact-trust",
+            "weaver",
+            "weaver-server-api",
+            "weaver-server-core",
             // The torrent session takes its tracker client from
             // `torrents::net`, built on the route; its own fallback client is
             // never built. UPnP keeps its own client and runs only on System
             // egress.
-            "librqbit",
-            "librqbit-tracker-comms",
-            "librqbit-upnp",
-            "weaver",
-            "weaver-server-api",
-            "weaver-server-core",
+            "weaver-torrent",
         ],
     ),
     ("hyper", &["axum", "hyper-rustls", "hyper-util", "reqwest"]),
@@ -112,9 +110,6 @@ const CLIENT_CRATES: &[(&str, &[&str])] = &[
     ),
     ("h3", &["h3-quinn", "proxy-tunnels", "weaver-tunnel"]),
     ("tokio-tungstenite", &["axum", "weaver"]),
-    // Dials only for a session given a SOCKS URL. Torrent sessions never set
-    // one: every peer socket goes through the route's `SocketFactory`.
-    ("tokio-socks", &["librqbit"]),
 ];
 
 // Crates that connect or resolve names their own way, none of which may enter

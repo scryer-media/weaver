@@ -12,13 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use librqbit::dht::DhtPersistenceConfig;
-use librqbit::{
+use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
+use weaver_torrent::dht::DhtPersistenceConfig;
+use weaver_torrent::{
     ConnectionOptions, DhtSessionConfig, ListenerMode, ListenerOptions, PeerConnectionOptions,
     Session, SessionOptions, SocketFactory,
 };
-use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 
 use crate::StateError;
 use crate::persistence::Database;
@@ -266,8 +266,8 @@ fn binds(ip: IpAddr) -> bool {
 /// How the session treats peer encryption.
 fn apply_encryption(options: &mut SessionOptions, policy: TorrentEncryption) {
     options.encryption = match policy {
-        TorrentEncryption::Prefer => librqbit::EncryptionPolicy::Prefer,
-        TorrentEncryption::Require => librqbit::EncryptionPolicy::Require,
+        TorrentEncryption::Prefer => weaver_torrent::EncryptionPolicy::Prefer,
+        TorrentEncryption::Require => weaver_torrent::EncryptionPolicy::Require,
     };
 }
 
@@ -288,7 +288,7 @@ pub fn session_options(
             port: Some(port),
             persistence: Some(DhtPersistenceConfig {
                 dump_interval: None,
-                config_filename: Some(dir.join("dht.json")),
+                config_filename: dir.join("dht.json"),
             }),
         }),
         bind_device_name: leg.kind.bind_device().map(str::to_owned),
@@ -306,7 +306,6 @@ pub fn session_options(
         // Peers are dialed by the session's own sockets or by the leg's
         // factory, never by a proxy URL of the session's.
         connect: Some(ConnectionOptions {
-            proxy_url: None,
             enable_tcp: true,
             peer_opts: Some(PeerConnectionOptions {
                 read_write_timeout: Some(PEER_TIMEOUT),

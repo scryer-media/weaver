@@ -3,9 +3,9 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use librqbit::storage::TorrentStorage;
-use librqbit_core::lengths::Lengths;
 use sha1::{Digest, Sha1};
+use weaver_torrent::core::lengths::Lengths;
+use weaver_torrent::storage::TorrentStorage;
 
 use super::*;
 use crate::jobs::{Hold, HoldOwner, HoldScope};
@@ -918,7 +918,9 @@ async fn tracker(peer: std::net::SocketAddrV4) -> String {
 // A session on loopback seeding `metainfo` from `files` under `dir`, with
 // no DHT, trackers or discovery.
 async fn seeder(dir: &std::path::Path, metainfo: &[u8], files: &[(&str, &[u8])]) -> Arc<Session> {
-    use librqbit::{AddTorrent, AddTorrentOptions, ListenerMode, ListenerOptions, SessionOptions};
+    use weaver_torrent::{
+        AddTorrent, AddTorrentOptions, ListenerMode, ListenerOptions, SessionOptions,
+    };
 
     for (path, bytes) in files {
         let path = dir.join(path);

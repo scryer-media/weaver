@@ -6,8 +6,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use librqbit::StreamListener;
-use librqbit::network::{BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket};
+use weaver_torrent::StreamListener;
+use weaver_torrent::network::{BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket};
 
 use super::*;
 use crate::proxies::{Rung, TorrentScope};
@@ -335,7 +335,6 @@ fn session_options_follow_the_leg() {
         Some(IDENTITY.user_agent())
     );
     assert!(system.http_client.is_some());
-    assert_eq!(system.connect.as_ref().unwrap().proxy_url, None);
 
     let interface = session_options(
         &env,
@@ -496,7 +495,7 @@ async fn a_route_that_goes_down_holds_closed_until_it_is_back() {
 // that opens later takes its share at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_torrent_rate_is_shared_across_the_open_sessions() {
-    use librqbit::limits::LimitKind;
+    use weaver_torrent::limits::LimitKind;
 
     let dir = tempfile::tempdir().unwrap();
     let routes = Arc::new(FakeRoutes::default());
@@ -633,7 +632,7 @@ impl StreamListener for Quiet {
 
 struct NoNames;
 
-impl librqbit::network::Resolver for NoNames {
+impl weaver_torrent::network::Resolver for NoNames {
     fn resolve<'a>(&'a self, _: &'a str, _: u16) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
         Box::pin(async { Err(io::Error::from(io::ErrorKind::NotFound)) })
     }
@@ -671,7 +670,7 @@ impl SocketFactory for LoggedDht {
         })
     }
 
-    fn resolver(&self) -> Option<Arc<dyn librqbit::network::Resolver>> {
+    fn resolver(&self) -> Option<Arc<dyn weaver_torrent::network::Resolver>> {
         Some(Arc::new(NoNames))
     }
 }

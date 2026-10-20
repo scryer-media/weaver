@@ -55,10 +55,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 crossbeam-queue = { workspace = true }
 bitvec = { workspace = true }
-librqbit = { workspace = true }
-# Named for its `sha1-ring` feature (aws-lc-rs SHA-1) and the piece lengths.
-librqbit-core = { workspace = true }
-# The storage trait librqbit calls returns `anyhow::Result`.
+weaver-torrent = { workspace = true }
+# The storage trait weaver-torrent calls returns `anyhow::Result`.
 anyhow = { version = "1", default-features = false, features = ["std"] }
 sha1 = { workspace = true }
 tokio = { workspace = true }

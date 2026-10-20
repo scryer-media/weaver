@@ -11,9 +11,9 @@ use std::future::{Future, poll_fn};
 use std::task::Poll;
 use std::time::Duration;
 
-use librqbit::TrackerAnnounce;
 use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior};
+use weaver_torrent::TrackerAnnounce;
 
 use super::{TorrentService, TorrentView};
 use crate::jobs::JobId;

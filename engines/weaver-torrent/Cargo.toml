@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "weaver-torrent"
+description = "BitTorrent session: peers, trackers, DHT, piece tracking"
+publish = false
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+arrayvec = { workspace = true }
+async-compression = { workspace = true, features = ["tokio", "gzip"] }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+atoi = { workspace = true }
+aws-lc-rs = { workspace = true }
+backon = { workspace = true, features = ["tokio-sleep"] }
+base64 = { workspace = true }
+bitvec = { workspace = true }
+bstr = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+chardetng = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true, features = ["serde"] }
+data-encoding = { workspace = true }
+either = { workspace = true }
+encoding_rs = { workspace = true }
+futures = { workspace = true }
+governor = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+httparse = { workspace = true }
+indexmap = { workspace = true }
+librqbit-dualstack-sockets = { workspace = true }
+librqbit-utp = { workspace = true }
+memchr = { workspace = true }
+memmap2 = { workspace = true }
+percent-encoding = { workspace = true }
+mime_guess = { workspace = true }
+network-interface = { workspace = true }
+nix = { workspace = true, features = ["uio"] }
+parking_lot = { workspace = true }
+quick-xml = { workspace = true, features = ["serialize"] }
+rand = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde = { workspace = true, features = ["rc"] }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true, features = ["io", "rt"] }
+tracing = { workspace = true, features = ["attributes"] }
+url = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4"] }
+walkdir = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }
+
+[dev-dependencies]
+# The e2e tests lift the open-file limit.
+nix = { workspace = true, features = ["resource", "uio"] }
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

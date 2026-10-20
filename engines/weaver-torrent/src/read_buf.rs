@@ -1,0 +1,489 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+//
+// Derived from rqbit (https://github.com/ikatson/rqbit), Copyright 2021 Igor Katson,
+// licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
+// Weaver authors from 2026-10-20 onward.
+
+use std::{io::IoSliceMut, time::Duration};
+
+use crate::peer_protocol::{Handshake, Message, MessageDeserializeError};
+use crate::{Error, Result};
+use crate::{
+    peer_connection::with_timeout, type_aliases::BoxAsyncReadVectored,
+    vectored_traits::AsyncReadVectoredExt,
+};
+use futures::TryFutureExt;
+use tokio::io::AsyncReadExt;
+
+// This should be greater than MAX_MSG_LEN
+const BUFLEN: usize = 0x8000; // 32kb
+
+/// A ringbuffer for reading bittorrent messages from socket.
+/// Messages may thus span 2 slices (notably, Piece message and UtMetadata messages), which is reflected in their contents.
+pub struct ReadBuf {
+    buf: Box<[u8; BUFLEN]>,
+    start: usize,
+    len: usize,
+}
+
+/// Advance by N bytes. A macro so that existing field-level
+/// borrows are understood by the borrow checker.
+macro_rules! advance {
+    ($self:expr, $len:expr) => {
+        $self.len = $self.len.saturating_sub($len);
+        $self.start = ($self.start + $len) % BUFLEN;
+    };
+}
+
+/// Convert readbuf into 2 slices. A macro so that field-level
+/// borrows are understood by the borrow checker.
+macro_rules! as_slices {
+    ($self:expr) => {{
+        let (first, second) = $self.as_slice_ranges();
+        (&$self.buf[first], &$self.buf[second])
+    }};
+}
+
+impl ReadBuf {
+    pub fn new() -> Self {
+        Self {
+            buf: Box::new([0u8; BUFLEN]),
+            start: 0,
+            len: 0,
+        }
+    }
+
+    // Read the BT handshake.
+    // This MUST be run as the first operation on the buffer.
+    //
+    // The 68-byte handshake may arrive split across several reads (e.g. when the
+    // peer, or a proxy in between, writes it in more than one chunk), so keep
+    // reading until it is complete. The timeout covers the whole handshake.
+    pub async fn read_handshake(
+        &mut self,
+        conn: &mut BoxAsyncReadVectored,
+        timeout: Duration,
+    ) -> Result<Handshake> {
+        self.start = 0;
+        self.len = 0;
+        with_timeout("reading", timeout, async {
+            loop {
+                let n = conn
+                    .read(&mut self.buf[self.len..])
+                    .await
+                    .map_err(Error::ReadHandshake)?;
+                if n == 0 {
+                    return Err(Error::PeerDisconnectedReadingHandshake);
+                }
+                self.len += n;
+                match Handshake::deserialize(&self.buf[..self.len]) {
+                    Ok((h, size)) => {
+                        self.advance(size);
+                        return Ok(h);
+                    }
+                    Err(MessageDeserializeError::NotEnoughData(..)) => continue,
+                    Err(e) => return Err(Error::DeserializeHandshake(e)),
+                }
+            }
+        })
+        .await
+    }
+
+    fn is_contiguous(&self) -> bool {
+        self.start + self.len == (self.start + self.len) % BUFLEN
+    }
+
+    // In rare cases, we might need to make the buffer contiguous, as the message
+    // parsing code won't work with a split ringbuffer. Only "bitfield" and "extended" messages
+    // need contiguous buffers.
+    // "Bitfield" however is always sent early, so in practice it won't ever happen. For "extended"
+    // in practice, it would rarely happen with UtMetadata::Data messages if the split happens to land
+    // in the middle of bencoded data (as we only can deserialize bencode from a single slice).
+    fn make_contiguous(&mut self) -> Result<()> {
+        if self.is_contiguous() {
+            #[allow(clippy::cast_possible_truncation)]
+            return Err(Error::BugReadBufMakeContiguous {
+                start: self.start as u16,
+                len: self.len as u16,
+            });
+        }
+
+        // This should be so rare that it's not worth writing complex in-place code.
+        // See the source in VecDequeue::make_contiguous to see how involved it would be
+        // otherwise.
+        let mut new = [0u8; BUFLEN];
+        let (first, second) = as_slices!(self);
+        new[..first.len()].copy_from_slice(first);
+        new[first.len()..first.len() + second.len()].copy_from_slice(second);
+        *self.buf = new;
+        self.start = 0;
+        Ok(())
+    }
+
+    /// Convert into 2 slices (as ranges).
+    fn as_slice_ranges(&self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        // These .min() calls are for asm to be branchless and the code panicless.
+        let len = self.len.min(BUFLEN);
+        let start = self.start.min(BUFLEN);
+
+        let first_len = len.min(BUFLEN - start);
+        let first = start..start + first_len;
+        let second = 0..len.saturating_sub(first_len);
+        (first, second)
+    }
+
+    fn advance(&mut self, len: usize) {
+        advance!(self, len);
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == BUFLEN
+    }
+
+    /// Get a part of the buffer for reading into.
+    fn unfilled_ioslices(&mut self) -> [IoSliceMut<'_>; 2] {
+        let write_start = (self.start.saturating_add(self.len)) % BUFLEN;
+        let available_len = BUFLEN.saturating_sub(self.len);
+        let first_len = (BUFLEN.saturating_sub(write_start)).min(available_len);
+        let second_len = available_len.saturating_sub(first_len);
+
+        let (second, first) = self.buf.split_at_mut(write_start);
+
+        let first_len = first_len.min(first.len());
+        let second_len = second_len.min(second.len());
+        [
+            IoSliceMut::new(&mut first[..first_len]),
+            IoSliceMut::new(&mut second[..second_len]),
+        ]
+    }
+
+    /// Read a message into the buffer, try to deserialize it and call the callback on it.
+    pub async fn read_message(
+        &mut self,
+        conn: &mut BoxAsyncReadVectored,
+        timeout: Duration,
+    ) -> Result<Message<'_>> {
+        loop {
+            let err = {
+                // A workaround for borrow-checker not understanding early returns.
+                //
+                // A stacked reborrow of self. After this block we either return from
+                // the function, or the block returns an owned error.
+                //
+                // Safety: there's nothing inherently unsafe here, this is just a
+                // borrow checker workaround. However to ensure we respect aliasing
+                // rules (&mut references are exclusive), there's a miri test below.
+                //
+                // In this case, 2 &mut references DO exist lexically, but in reality the
+                // latter one is a reborrow that ends with the block.
+                //
+                // Run with `cargo +nightly miri test -p librqbit --features miri test_read_buf_miri -- --nocapture --ignore`
+                let this = unsafe { &mut *(self as *mut Self) };
+                let (first, second) = as_slices!(this);
+                match Message::deserialize(first, second) {
+                    Ok((msg, size)) => {
+                        advance!(this, size);
+                        return Ok(msg);
+                    }
+                    Err(e) => e,
+                }
+            };
+
+            match err {
+                MessageDeserializeError::NotEnoughData(mut need_additional_bytes, ..) => {
+                    while need_additional_bytes > 0 {
+                        if self.is_full() {
+                            return Err(Error::ReadBufFull {
+                                #[allow(clippy::cast_possible_truncation)]
+                                need_additional_bytes: need_additional_bytes as u16,
+                            });
+                        }
+                        let size = with_timeout(
+                            "reading",
+                            timeout,
+                            conn.read_vectored(&mut self.unfilled_ioslices())
+                                .map_err(Error::Write),
+                        )
+                        .await?;
+                        if size == 0 {
+                            return Err(Error::PeerDisconnected);
+                        }
+                        self.len += size;
+                        need_additional_bytes = need_additional_bytes.saturating_sub(size)
+                    }
+                }
+                MessageDeserializeError::NeedContiguous => {
+                    self.make_contiguous()?;
+                    continue;
+                }
+                e => return Err(Error::Deserialize(e)),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::core::constants::CHUNK_SIZE;
+    use crate::peer_protocol::{
+        Handshake, MAX_MSG_LEN, Message,
+        extended::{
+            ExtendedMessage, PeerExtendedMessageIds,
+            ut_metadata::{UtMetadata, UtMetadataData},
+        },
+    };
+    use std::{net::Ipv4Addr, time::Duration};
+    use tokio::io::AsyncWriteExt;
+
+    use crate::{tests::test_util::setup_test_logging, type_aliases::BoxAsyncReadVectored};
+
+    use super::{BUFLEN, ReadBuf};
+
+    #[test]
+    fn test_ringbuf_ranges() {
+        let mut b = ReadBuf::new();
+        assert_eq!(b.as_slice_ranges(), (0..0, 0..0));
+
+        b.start = 10;
+        b.len = 10;
+        assert_eq!(b.as_slice_ranges(), (10..20, 0..0));
+
+        b.start = BUFLEN - 100;
+        b.len = 100;
+        assert_eq!(b.as_slice_ranges(), (BUFLEN - 100..BUFLEN, 0..0));
+
+        b.start = BUFLEN - 100;
+        b.len = 120;
+        assert_eq!(b.as_slice_ranges(), (BUFLEN - 100..BUFLEN, 0..20));
+
+        b.start = BUFLEN - 100;
+        b.len = BUFLEN;
+        assert_eq!(b.as_slice_ranges(), (BUFLEN - 100..BUFLEN, 0..BUFLEN - 100));
+    }
+
+    #[test]
+    fn test_ringbuf_advance() {
+        let mut b = ReadBuf::new();
+
+        b.start = 10;
+        b.len = 10;
+        assert_eq!(b.as_slice_ranges(), (10..20, 0..0));
+        b.advance(5);
+        assert_eq!(b.as_slice_ranges(), (15..20, 0..0));
+
+        b.start = BUFLEN - 5;
+        b.len = 10;
+        assert_eq!(b.as_slice_ranges(), (BUFLEN - 5..BUFLEN, 0..5));
+        b.advance(5);
+        assert_eq!(b.as_slice_ranges(), (0..5, 0..0));
+    }
+
+    #[test]
+    fn test_ringbuf_make_contiguous() {
+        let mut b = ReadBuf::new();
+        assert!(b.is_contiguous());
+        assert!(b.make_contiguous().is_err());
+
+        fn fill(buf: &mut [u8], value: u8) {
+            for b in buf.iter_mut() {
+                *b = value;
+            }
+        }
+
+        fill(&mut b.buf[BUFLEN - 100..], 42);
+        fill(&mut b.buf[..200], 43);
+        b.start = BUFLEN - 100;
+        b.len = 300;
+        assert!(!b.is_contiguous());
+        assert!(b.make_contiguous().is_ok());
+        assert_eq!(b.len, 300);
+        assert_eq!(b.start, 0);
+        assert_eq!(&b.buf[..100], &[42u8; 100]);
+        assert_eq!(&b.buf[100..300], &[43u8; 200]);
+        assert_eq!(&b.buf[300..], &[0u8; BUFLEN - 300]);
+    }
+
+    #[test]
+    fn test_unfilled_ioslices() {
+        ReadBuf::new();
+
+        fn offset(buf: &ReadBuf, s: *const u8, len: usize) -> std::ops::Range<usize> {
+            if len == 0 {
+                return 0..0;
+            }
+            let offset = unsafe { s.byte_offset_from(buf.buf.as_ptr()) } as usize;
+            offset..offset + len
+        }
+
+        fn offsets(
+            buf: &ReadBuf,
+            ioslices: [(*const u8, usize); 2],
+        ) -> [std::ops::Range<usize>; 2] {
+            [
+                offset(buf, ioslices[0].0, ioslices[0].1),
+                offset(buf, ioslices[1].0, ioslices[1].1),
+            ]
+        }
+
+        #[track_caller]
+        fn assert_one(start: usize, len: usize, ranges: [std::ops::Range<usize>; 2]) {
+            let mut b = ReadBuf::new();
+            b.start = start;
+            b.len = len;
+            let [f, s] = b.unfilled_ioslices();
+            let slices = [(f.as_ptr(), f.len()), (s.as_ptr(), s.len())];
+            assert_eq!(offsets(&b, slices), ranges)
+        }
+
+        // full
+        assert_one(0, BUFLEN, [0..0, 0..0]);
+        assert_one(100, BUFLEN, [0..0, 0..0]);
+        assert_one(BUFLEN, BUFLEN, [0..0, 0..0]);
+
+        // start=0
+        assert_one(0, 100, [100..BUFLEN, 0..0]);
+        assert_one(0, BUFLEN - 100, [BUFLEN - 100..BUFLEN, 0..0]);
+        assert_one(0, BUFLEN - 1, [BUFLEN - 1..BUFLEN, 0..0]);
+
+        // start=N
+        assert_one(100, 100, [200..BUFLEN, 0..100]);
+        assert_one(100, BUFLEN - 100, [0..100, 0..0]);
+        assert_one(100, BUFLEN - 101, [BUFLEN - 1..BUFLEN, 0..100]);
+
+        // start=BUFLEN-1
+        assert_one(BUFLEN - 1, 100, [99..BUFLEN - 1, 0..0]);
+    }
+
+    fn test_handshake() -> Vec<u8> {
+        let mut hs = Vec::new();
+        hs.push(19u8);
+        hs.extend_from_slice(b"BitTorrent protocol");
+        hs.extend_from_slice(&[0u8; 8]);
+        hs.extend_from_slice(&[0xaa; 20]); // info hash
+        hs.extend_from_slice(&[0xbb; 20]); // peer id
+        hs
+    }
+
+    async fn read_handshake_written_as(chunks: Vec<Vec<u8>>) -> crate::Result<Handshake> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = async move {
+            let mut w = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap();
+            w.set_nodelay(true).unwrap();
+            for c in chunks {
+                w.write_all(&c).await.unwrap();
+                w.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Keep the connection open until the reader is done.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let reader = async {
+            let reader = listener.accept().await.unwrap().0.into_split().0;
+            let mut reader: BoxAsyncReadVectored = Box::new(reader);
+            let mut rb = ReadBuf::new();
+            rb.read_handshake(&mut reader, Duration::from_secs(5)).await
+        };
+        let (h, ()) = tokio::join!(reader, writer);
+        h
+    }
+
+    #[tokio::test]
+    async fn handshake_split_across_reads_is_reassembled() {
+        setup_test_logging();
+        let hs = test_handshake();
+        // Split in the middle of the info hash, and byte by byte for the first few.
+        let mut chunks: Vec<Vec<u8>> = hs[..3].iter().map(|b| vec![*b]).collect();
+        chunks.push(hs[3..40].to_vec());
+        chunks.push(hs[40..].to_vec());
+        let h = read_handshake_written_as(chunks).await.unwrap();
+        assert_eq!(h.info_hash.0, [0xaa; 20]);
+        assert_eq!(h.peer_id.0, [0xbb; 20]);
+    }
+
+    #[tokio::test]
+    async fn handshake_cut_short_is_an_error() {
+        setup_test_logging();
+        let hs = test_handshake();
+        let err = read_handshake_written_as(vec![hs[..40].to_vec()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::PeerDisconnectedReadingHandshake),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn can_read_long_metainfo_correctly() {
+        setup_test_logging();
+        let reader = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = reader.local_addr().unwrap().port();
+        let mut writer = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap()
+            .into_split()
+            .1;
+
+        const ITERATIONS: u32 = 4096;
+
+        let reader = async {
+            let reader = reader.accept().await.unwrap().0.into_split().0;
+            let mut reader: BoxAsyncReadVectored = Box::new(reader);
+            let mut rb = ReadBuf::new();
+
+            for piece in 0..ITERATIONS {
+                let msg = rb
+                    .read_message(&mut reader, Duration::from_millis(1000))
+                    .await
+                    .unwrap();
+                let utdata = match msg {
+                    Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(utdata))) => {
+                        utdata
+                    }
+                    other => panic!("expected utdata, got {other:?}"),
+                };
+                assert_eq!(utdata.len(), CHUNK_SIZE as usize);
+                assert_eq!(utdata.piece(), piece);
+                #[allow(clippy::cast_possible_truncation)]
+                let expected_byte = { piece as u8 };
+                let all_good = utdata
+                    .as_double_buf()
+                    .get()
+                    .into_iter()
+                    .flatten()
+                    .all(|b| *b == expected_byte);
+                if !all_good {
+                    panic!("broken data");
+                }
+            }
+        };
+
+        let pext = PeerExtendedMessageIds::my();
+        let writer = async {
+            let mut sbuf = [0u8; MAX_MSG_LEN];
+            let mut pbuf = [0u8; CHUNK_SIZE as usize];
+            for piece in 0..ITERATIONS {
+                #[allow(clippy::cast_possible_truncation)]
+                for b in pbuf.iter_mut() {
+                    *b = piece as u8;
+                }
+                let len = Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(
+                    UtMetadataData::from_bytes(piece, CHUNK_SIZE * ITERATIONS, pbuf[..].into()),
+                )))
+                .serialize(&mut sbuf, &|| pext)
+                .unwrap();
+                writer.write_all(&sbuf[..len]).await.unwrap();
+            }
+        };
+
+        tokio::join!(reader, writer);
+    }
+}

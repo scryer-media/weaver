@@ -15,14 +15,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use anyhow::bail;
-use librqbit::network::{
-    AsyncReadVectored, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket,
-};
-use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
-use librqbit::{ManagedTorrentShared, SocketFactory, StreamListener, TorrentMetadata};
-use librqbit_core::lengths::ValidPieceIndex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
+use weaver_torrent::core::lengths::ValidPieceIndex;
+use weaver_torrent::network::{
+    AsyncReadVectored, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket,
+};
+use weaver_torrent::storage::{
+    BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
+};
+use weaver_torrent::{ManagedTorrentShared, SocketFactory, StreamListener, TorrentMetadata};
 
 use crate::torrents::net::{LegKind, LegSockets};
 

@@ -25,13 +25,15 @@ use anyhow::{Context, bail};
 use bitvec::boxed::BitBox;
 use bitvec::order::Msb0;
 use bytes::Bytes;
-use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
-use librqbit::{ManagedTorrentShared, TorrentMetadata, ValidatedTorrentMetaV1Info};
-use librqbit_core::lengths::ValidPieceIndex;
 use tokio::sync::Notify;
 use weaver_graph::holds::Reserve;
 use weaver_graph::slots::AskerId;
 use weaver_graph::{ByteRange, VolumeIndex};
+use weaver_torrent::core::lengths::ValidPieceIndex;
+use weaver_torrent::storage::{
+    BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
+};
+use weaver_torrent::{ManagedTorrentShared, TorrentMetadata, ValidatedTorrentMetaV1Info};
 
 use super::intake::Holds;
 use super::service::Signal;

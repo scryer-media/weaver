@@ -10,15 +10,15 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
-use librqbit::api::TorrentIdOrHash;
-use librqbit::limits::{LimitKind, LimitsConfig};
-use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent, Session,
-    TrackerAnnounce, torrent_from_bytes,
-};
 use tokio::sync::{Notify, mpsc, watch};
 use weaver_graph::VolumeIndex;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+use weaver_torrent::api::TorrentIdOrHash;
+use weaver_torrent::limits::{LimitKind, LimitsConfig};
+use weaver_torrent::{
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent, Session,
+    TrackerAnnounce, torrent_from_bytes,
+};
 
 use crate::SchedulerError;
 use crate::StateError;

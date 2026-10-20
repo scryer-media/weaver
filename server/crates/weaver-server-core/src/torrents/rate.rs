@@ -6,8 +6,8 @@
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use librqbit::Session;
-use librqbit::limits::LimitKind;
+use weaver_torrent::Session;
+use weaver_torrent::limits::LimitKind;
 
 use crate::bandwidth::TorrentRates;
 
@@ -165,7 +165,7 @@ mod tests {
     async fn session(dir: &std::path::Path) -> Arc<Session> {
         Session::new_with_opts(
             dir.to_path_buf(),
-            librqbit::SessionOptions {
+            weaver_torrent::SessionOptions {
                 dht: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,

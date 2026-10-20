@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use librqbit::{TorrentStats, TorrentStatsState, TrackerAnnounce};
+use weaver_torrent::{TorrentStats, TorrentStatsState, TrackerAnnounce};
 
 use crate::jobs::JobId;
 use crate::jobs::handle::HoldTarget;
@@ -386,7 +386,7 @@ pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use librqbit::{AnnounceOk, LastAnnounce};
+    use weaver_torrent::{AnnounceOk, LastAnnounce};
 
     use super::*;
     use crate::settings::SeedingAction;
