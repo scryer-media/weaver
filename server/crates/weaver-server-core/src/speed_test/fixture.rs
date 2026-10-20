@@ -213,7 +213,7 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
 
 // An HTTP/1.1 source: `/blob` answers `blob_len` bytes, each page its own
 // body, `/limited` answers HTTP 429 as a rate-limiting provider does, a POST
-// to `/upload` takes its body, and anything else 404. With `tls`, HTTPS.
+// to any path takes its body, and anything else 404. With `tls`, HTTPS.
 pub struct HttpFixture {
     pub addr: SocketAddr,
     requests: watch::Sender<usize>,
@@ -277,14 +277,15 @@ impl HttpFixture {
         self.requests.subscribe()
     }
 
-    // Body bytes posted to `/upload` so far.
+    // Body bytes posted so far.
     pub fn uploaded(&self) -> watch::Receiver<u64> {
         self.uploaded.subscribe()
     }
 }
 
 // A LibreSpeed server list naming each `(id, address, ping path)` server
-// over HTTPS, with `/blob` as its download endpoint.
+// over HTTPS, with `/blob` as its download endpoint and `/upload` as its
+// upload one.
 pub fn librespeed_list(servers: &[(&str, SocketAddr, Option<&str>)]) -> Vec<u8> {
     let entries: Vec<serde_json::Value> = servers
         .iter()
@@ -294,7 +295,7 @@ pub fn librespeed_list(servers: &[(&str, SocketAddr, Option<&str>)]) -> Vec<u8> 
                 "name": format!("fixture {id}"),
                 "server": format!("https://{addr}/"),
                 "dlURL": "blob",
-                "ulURL": "",
+                "ulURL": "upload",
                 "getIpURL": "",
                 "sponsorName": "",
             });
@@ -372,7 +373,7 @@ async fn serve_http(
     counter.send_modify(|count| *count += 1);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     let path = path.split('?').next().unwrap_or(path);
-    if request_line.starts_with("POST ") && path == "/upload" {
+    if request_line.starts_with("POST ") {
         let mut buffer = vec![0u8; 64 * 1024];
         let mut left = content_length;
         while left > 0 {

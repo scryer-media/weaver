@@ -2,9 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The test torrent: a public torrent fetched through the path under test,
-// announced to as a leecher, one piece downloaded and verified in memory,
-// and stopped. Nothing is kept. Each step is a rung that passes or fails on
-// what the path did, in the words of whatever stopped it.
+// announced to as a leecher, pieces downloaded and verified in memory, and
+// stopped. Nothing is kept on disk. The probe takes one piece, and each step
+// is a rung that passes or fails on what the path did, in the words of
+// whatever stopped it; a torrent speed test pulls for as long as it measures
+// and then serves what it held.
+
+use std::collections::HashSet;
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -13,10 +17,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bitvec::boxed::BitBox;
+use bitvec::order::Msb0;
 use librqbit::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerMode, ListenerOptions,
     ManagedTorrent, PiecePriority, Session, SessionOptions, TrackerAnnounce,
 };
+use librqbit_core::lengths::Lengths;
 use tokio::sync::watch;
 use weaver_tunnel::pipe::Dialer;
 
@@ -145,7 +151,7 @@ pub(crate) struct P2pPlan {
     pub upload_budget: Option<u64>,
 }
 
-// Why the wait for the piece ended.
+// Why the wait for pieces ended.
 enum Ended {
     Verified,
     AnnounceFailed,
@@ -160,16 +166,17 @@ pub(crate) async fn probe(
     plan: &P2pPlan,
     mut stop: Pin<&mut (dyn Future<Output = ()> + Send)>,
 ) -> P2pReport {
-    let provider = StreamProvider::new(path.stage.clone(), None);
-    let bridge = match start_bridge(provider as Arc<dyn FetchPath>) {
-        Ok(bridge) => bridge,
+    let fetched = tokio::select! {
+        biased;
+        () = stop.as_mut() => return failed_at(P2pStep::Torrent, "stopped".into()),
+        fetched = TestTorrent::fetch(path.stage.clone(), &plan.source) => fetched,
+    };
+    let torrent = match fetched {
+        Ok(torrent) => torrent,
         Err(error) => return failed_at(P2pStep::Torrent, error),
     };
-    let report = match http_client(&bridge) {
-        Ok(client) => run(path, plan, client, stop.as_mut()).await,
-        Err(error) => failed_at(P2pStep::Torrent, error),
-    };
-    bridge.revoke().await;
+    let report = run(&path, plan, &torrent, stop).await;
+    torrent.close().await;
     report
 }
 
@@ -252,131 +259,180 @@ async fn get_capped(client: &reqwest::Client, url: &reqwest::Url) -> Result<Vec<
     Ok(body)
 }
 
-// The test torrent's name and bytes.
-async fn fetch(
-    client: &reqwest::Client,
-    source: &TestTorrentSource,
-) -> Result<(String, Vec<u8>), String> {
-    let listing = get_capped(client, &source.directory).await?;
-    let name = pick_torrent(&String::from_utf8_lossy(&listing))
-        .ok_or_else(|| format!("{} lists no netinst torrent", source.directory))?;
-    let url = source
-        .directory
-        .join(&name)
-        .map_err(|error| error.to_string())?;
-    Ok((name, get_capped(client, &url).await?))
+// The test torrent, fetched through a path: its name and metainfo, and the
+// client its trackers are asked through, which rides the path's bridge. The
+// bridge is revoked as the torrent closes or drops.
+pub(crate) struct TestTorrent {
+    name: String,
+    bytes: Vec<u8>,
+    lengths: Lengths,
+    client: reqwest::Client,
+    bridge: Arc<weaver_tunnel::bridge::Bridge>,
+}
+
+impl TestTorrent {
+    pub(crate) async fn fetch(
+        stage: Arc<dyn Dialer>,
+        source: &TestTorrentSource,
+    ) -> Result<Self, String> {
+        let provider = StreamProvider::new(stage, None);
+        let bridge = start_bridge(provider as Arc<dyn FetchPath>)?;
+        let client = http_client(&bridge)?;
+        let listing = get_capped(&client, &source.directory).await?;
+        let name = pick_torrent(&String::from_utf8_lossy(&listing))
+            .ok_or_else(|| format!("{} lists no netinst torrent", source.directory))?;
+        let url = source
+            .directory
+            .join(&name)
+            .map_err(|error| error.to_string())?;
+        let bytes = get_capped(&client, &url).await?;
+        let lengths = librqbit::torrent_from_bytes(&bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|torrent| {
+                torrent
+                    .info
+                    .data
+                    .validate()
+                    .map(|info| *info.lengths())
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(|error| format!("{name} is not a torrent: {error}"))?;
+        Ok(Self {
+            name,
+            bytes,
+            lengths,
+            client,
+            bridge,
+        })
+    }
+
+    pub(crate) async fn close(self) {
+        self.bridge.revoke().await;
+    }
+
+    fn pieces(&self) -> u32 {
+        self.lengths.total_pieces()
+    }
+
+    fn piece_len(&self, piece: u32) -> u32 {
+        self.lengths
+            .validate_piece_index(piece)
+            .map_or(0, |valid| self.lengths.piece_length(valid))
+    }
+}
+
+// A session in the test torrent's swarm over a path. It has the pieces it
+// was given, fetches the rest of what its store wants, and skips the others.
+struct Joined {
+    session: Arc<Session>,
+    handle: Arc<ManagedTorrent>,
+    _dir: tempfile::TempDir,
+}
+
+impl Joined {
+    async fn open(
+        torrent: &TestTorrent,
+        path: &P2pPath,
+        store: &PieceStore,
+        have: &[u32],
+        watched: Arc<Watched>,
+    ) -> Result<Self, String> {
+        let dir = tempfile::TempDir::new().map_err(|error| error.to_string())?;
+        let listens = path.kind != LegKind::Ladder;
+        let options = SessionOptions {
+            dht: None,
+            disable_trackers: false,
+            fastresume: false,
+            persistence: None,
+            peer_id: Some(IDENTITY.peer_id()),
+            listen: listens.then(|| ListenerOptions {
+                mode: ListenerMode::TcpOnly,
+                listen_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+                enable_upnp_port_forwarding: false,
+                ..ListenerOptions::default()
+            }),
+            connect: Some(ConnectionOptions {
+                proxy_url: None,
+                enable_tcp: true,
+                peer_opts: None,
+            }),
+            peer_limit: Some(PEER_LIMIT),
+            disable_local_service_discovery: true,
+            client_name_and_version: Some(IDENTITY.user_agent().to_owned()),
+            socket_factory: Some(Arc::new(ProbeSockets::new(
+                path.stage.clone(),
+                path.kind.clone(),
+                watched,
+            ))),
+            http_client: Some(torrent.client.clone()),
+            ..SessionOptions::default()
+        };
+        let session = Session::new_with_opts(dir.path().join("output"), options)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let pieces = torrent.pieces();
+        let wanted: HashSet<u32> = store.wanted().iter().copied().collect();
+        let mut initial_have: BitBox<u8, Msb0> =
+            BitBox::from_boxed_slice(vec![0u8; (pieces as usize).div_ceil(8)].into_boxed_slice());
+        for piece in have {
+            initial_have.set(*piece as usize, true);
+        }
+        let added = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.bytes.clone()),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().join("output").display().to_string()),
+                    overwrite: true,
+                    peer_limit: Some(PEER_LIMIT),
+                    storage_factory: Some(store.factory()),
+                    initial_have: Some(initial_have),
+                    piece_priorities: Some(
+                        (0..pieces)
+                            .filter(|index| !wanted.contains(index))
+                            .map(|index| (index, PiecePriority::Skip))
+                            .collect(),
+                    ),
+                    ..AddTorrentOptions::default()
+                }),
+            )
+            .await;
+        match added.map(|added| added.into_handle()) {
+            Ok(Some(handle)) => Ok(Self {
+                session,
+                handle,
+                _dir: dir,
+            }),
+            Ok(None) => {
+                session.stop().await;
+                Err("the torrent was not added".into())
+            }
+            Err(error) => {
+                session.stop().await;
+                Err(format!("{error:#}"))
+            }
+        }
+    }
+
+    // Stopping sends `stopped` to every tracker that took `started`.
+    async fn leave(self) {
+        self.session.stop().await;
+    }
 }
 
 async fn run(
-    path: P2pPath,
+    path: &P2pPath,
     plan: &P2pPlan,
-    client: reqwest::Client,
+    torrent: &TestTorrent,
     mut stop: Pin<&mut (dyn Future<Output = ()> + Send)>,
 ) -> P2pReport {
-    let fetched = tokio::select! {
-        biased;
-        () = stop.as_mut() => return failed_at(P2pStep::Torrent, "stopped".into()),
-        fetched = fetch(&client, &plan.source) => fetched,
-    };
-    let (name, bytes) = match fetched {
-        Ok(fetched) => fetched,
-        Err(error) => return failed_at(P2pStep::Torrent, error),
-    };
-    let lengths = match librqbit::torrent_from_bytes(&bytes)
-        .map_err(|error| error.to_string())
-        .and_then(|torrent| {
-            torrent
-                .info
-                .data
-                .validate()
-                .map_err(|error| error.to_string())
-        }) {
-        Ok(info) => *info.lengths(),
-        Err(error) => {
-            return failed_at(
-                P2pStep::Torrent,
-                format!("{name} is not a torrent: {error}"),
-            );
-        }
-    };
-    let pieces = lengths.total_pieces();
     let piece = 0u32;
-    let piece_len = lengths
-        .validate_piece_index(piece)
-        .map_or(0, |valid| lengths.piece_length(valid));
-
-    let dir = match tempfile::TempDir::new() {
-        Ok(dir) => dir,
-        Err(error) => return failed_at(P2pStep::Torrent, error.to_string()),
-    };
     let watched = Arc::new(Watched::new());
-    let listens = path.kind != LegKind::Ladder;
-    let options = SessionOptions {
-        dht: None,
-        disable_trackers: false,
-        fastresume: false,
-        persistence: None,
-        peer_id: Some(IDENTITY.peer_id()),
-        listen: listens.then(|| ListenerOptions {
-            mode: ListenerMode::TcpOnly,
-            listen_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
-            enable_upnp_port_forwarding: false,
-            ..ListenerOptions::default()
-        }),
-        connect: Some(ConnectionOptions {
-            proxy_url: None,
-            enable_tcp: true,
-            peer_opts: None,
-        }),
-        peer_limit: Some(PEER_LIMIT),
-        disable_local_service_discovery: true,
-        client_name_and_version: Some(IDENTITY.user_agent().to_owned()),
-        socket_factory: Some(Arc::new(ProbeSockets::new(
-            path.stage.clone(),
-            path.kind.clone(),
-            watched.clone(),
-        ))),
-        http_client: Some(client),
-        ..SessionOptions::default()
-    };
-    let session = match Session::new_with_opts(dir.path().join("output"), options).await {
-        Ok(session) => session,
-        Err(error) => return failed_at(P2pStep::Announce, format!("{error:#}")),
-    };
     let store = PieceStore::new(vec![piece]);
-    let have_bytes = (pieces as usize).div_ceil(8);
-    let added = session
-        .add_torrent(
-            AddTorrent::from_bytes(bytes),
-            Some(AddTorrentOptions {
-                output_folder: Some(dir.path().join("output").display().to_string()),
-                overwrite: true,
-                peer_limit: Some(PEER_LIMIT),
-                storage_factory: Some(store.factory()),
-                initial_have: Some(BitBox::from_boxed_slice(
-                    vec![0u8; have_bytes].into_boxed_slice(),
-                )),
-                piece_priorities: Some(
-                    (0..pieces)
-                        .filter(|index| *index != piece)
-                        .map(|index| (index, PiecePriority::Skip))
-                        .collect(),
-                ),
-                ..AddTorrentOptions::default()
-            }),
-        )
-        .await;
-    let handle = match added.map(|added| added.into_handle()) {
-        Ok(Some(handle)) => handle,
-        Ok(None) => {
-            session.stop().await;
-            return failed_at(P2pStep::Announce, "the torrent was not added".into());
-        }
-        Err(error) => {
-            session.stop().await;
-            return failed_at(P2pStep::Announce, format!("{error:#}"));
-        }
+    let joined = match Joined::open(torrent, path, &store, &[], watched.clone()).await {
+        Ok(joined) => joined,
+        Err(error) => return failed_at(P2pStep::Announce, error),
     };
+    let handle = &joined.handle;
 
     let mut verified = store.verified();
     let deadline = tokio::time::Instant::now() + PIECE_WAIT;
@@ -384,7 +440,7 @@ async fn run(
         biased;
         () = stop.as_mut() => Ended::Stopped,
         () = tokio::time::sleep_until(deadline) => Ended::TimedOut,
-        ended = wait_piece(&handle, &watched, &mut verified) => ended,
+        ended = wait_pieces(handle, &watched, &mut verified, 1) => ended,
     };
     let announces = handle.tracker_announces();
     let upload = match (&ended, plan.upload_budget) {
@@ -392,34 +448,130 @@ async fn run(
             let started = store
                 .verified_at()
                 .unwrap_or_else(tokio::time::Instant::now);
-            Some(serve(&handle, &watched, budget, started, stop.as_mut()).await)
+            Some(serve(handle, &watched, budget, started, stop.as_mut()).await)
         }
         (_, Some(_)) => Some(PeerUpload::Failed("no piece arrived to serve".into())),
         (_, None) => None,
     };
-    let (inbound, mapped_port) = inbound(&path, &watched).await;
+    let (inbound, mapped_port) = inbound(path, &watched).await;
     let report = rungs(
-        name,
+        torrent.name.clone(),
         &announces,
         &watched,
         &ended,
         piece,
-        piece_len,
+        torrent.piece_len(piece),
         inbound,
         mapped_port,
         upload,
     );
-    // Stopping sends `stopped` to every tracker that took `started`.
-    session.stop().await;
-    drop(dir);
+    joined.leave().await;
     report
 }
 
-// Wait until the piece is verified or nothing more can bring it.
-async fn wait_piece(
+// What a pull held at its end, to serve, and why it moved nothing when it
+// did not.
+pub(crate) struct Pulled {
+    store: PieceStore,
+    pub failure: Option<String>,
+}
+
+// Pull the test torrent from its swarm over `path` as a leecher until every
+// piece is verified, nothing more can come, or `stop`. Each block's bytes go
+// to `received` as they are written; at most `keep` bytes of verified pieces
+// are held, and nothing else.
+pub(crate) async fn pull(
+    path: &P2pPath,
+    torrent: &TestTorrent,
+    keep: u64,
+    received: impl Fn(u64) + Send + Sync + 'static,
+    mut stop: Pin<&mut (dyn Future<Output = ()> + Send)>,
+) -> Pulled {
+    let pieces = torrent.pieces();
+    let watched = Arc::new(Watched::new());
+    let store = PieceStore::new((0..pieces).collect())
+        .keeping(keep)
+        .counting(received);
+    let joined = match Joined::open(torrent, path, &store, &[], watched.clone()).await {
+        Ok(joined) => joined,
+        Err(error) => {
+            return Pulled {
+                store,
+                failure: Some(error),
+            };
+        }
+    };
+    let mut verified = store.verified();
+    let ended = tokio::select! {
+        biased;
+        () = stop.as_mut() => Ended::Stopped,
+        ended = wait_pieces(&joined.handle, &watched, &mut verified, pieces as usize) => ended,
+    };
+    let announces = joined.handle.tracker_announces();
+    joined.leave().await;
+    let report = rungs(
+        torrent.name.clone(),
+        &announces,
+        &watched,
+        &ended,
+        0,
+        torrent.piece_len(0),
+        P2pOutcome::NotReached,
+        None,
+        None,
+    );
+    let failure = report
+        .rungs
+        .into_iter()
+        .find_map(|rung| match rung.outcome {
+            P2pOutcome::Failed(error) => Some(error),
+            _ => None,
+        });
+    Pulled { store, failure }
+}
+
+// Serve the pieces a pull held to the leechers the trackers send over
+// `path`, until `budget` bytes went to them or no peer wants them.
+pub(crate) async fn seed(
+    path: &P2pPath,
+    torrent: &TestTorrent,
+    pulled: &Pulled,
+    budget: u64,
+    stop: Pin<&mut (dyn Future<Output = ()> + Send)>,
+) -> PeerUpload {
+    let store = pulled.store.holding();
+    let held = store.held();
+    if held.is_empty() {
+        return PeerUpload::Failed("no piece arrived to serve".into());
+    }
+    let watched = Arc::new(Watched::new());
+    let joined = match Joined::open(torrent, path, &store, &held, watched.clone()).await {
+        Ok(joined) => joined,
+        Err(error) => return PeerUpload::Failed(error),
+    };
+    let upload = match joined.handle.wait_until_initialized().await {
+        Ok(()) => {
+            serve(
+                &joined.handle,
+                &watched,
+                budget,
+                tokio::time::Instant::now(),
+                stop,
+            )
+            .await
+        }
+        Err(error) => PeerUpload::Failed(format!("{error:#}")),
+    };
+    joined.leave().await;
+    upload
+}
+
+// Wait until `wanted` pieces are verified or nothing more can bring them.
+async fn wait_pieces(
     handle: &Arc<ManagedTorrent>,
     watched: &Watched,
     verified: &mut watch::Receiver<usize>,
+    wanted: usize,
 ) -> Ended {
     let mut wake = watched.subscribe();
     if handle.wait_until_initialized().await.is_err() {
@@ -427,7 +579,7 @@ async fn wait_piece(
     }
     let mut announces = handle.tracker_status().map(|status| status.subscribe());
     loop {
-        if *verified.borrow_and_update() > 0 {
+        if *verified.borrow_and_update() >= wanted {
             return Ended::Verified;
         }
         let table = handle.tracker_announces();

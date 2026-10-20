@@ -15,6 +15,7 @@ use crate::observability::refusal_error;
 pub enum SpeedTestKind {
     Bandwidth,
     Usenet,
+    Torrent,
 }
 
 impl From<core::SpeedTestKindLabel> for SpeedTestKind {
@@ -22,6 +23,7 @@ impl From<core::SpeedTestKindLabel> for SpeedTestKind {
         match value {
             core::SpeedTestKindLabel::Bandwidth => Self::Bandwidth,
             core::SpeedTestKindLabel::Usenet => Self::Usenet,
+            core::SpeedTestKindLabel::Torrent => Self::Torrent,
         }
     }
 }
@@ -135,10 +137,8 @@ pub struct BandwidthTestInput {
     pub provider_id: Option<String>,
     pub server: Option<String>,
     pub custom_url: Option<String>,
-    // An HTTPS endpoint the run posts to after it pulls, through the route.
-    // Without one, nothing is posted.
-    pub upload_url: Option<String>,
-    // How much is posted, in MiB; 32 when not given, at most 128.
+    // How much is posted to the provider after the run pulls, in MiB; 32
+    // when not given, at most 128.
     pub upload_mib: Option<u32>,
 }
 
@@ -157,6 +157,12 @@ pub struct UsenetTestInput {
 }
 
 #[derive(Clone, Debug, InputObject)]
+pub struct TorrentTestInput {
+    // How long the run pulls from the swarm; 20 when absent.
+    pub max_duration_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug, InputObject)]
 pub struct SpeedTestInput {
     pub kind: NetworkConsumerKind,
     pub id: u32,
@@ -164,6 +170,7 @@ pub struct SpeedTestInput {
     pub overrides: Option<PathOverrideInput>,
     pub bandwidth: Option<BandwidthTestInput>,
     pub usenet: Option<UsenetTestInput>,
+    pub torrent: Option<TorrentTestInput>,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -179,8 +186,8 @@ impl SpeedTestInput {
         service: &core::SpeedTestService,
     ) -> Result<core::SpeedTestRequest> {
         let consumer = self.kind.consumer(self.id);
-        let kind = match (self.bandwidth, self.usenet) {
-            (Some(bandwidth), None) => {
+        let kind = match (self.bandwidth, self.usenet, self.torrent) {
+            (Some(bandwidth), None, None) => {
                 let provider = match (bandwidth.provider_id, bandwidth.custom_url) {
                     (Some(id), None) => core::BandwidthProvider::Builtin {
                         id,
@@ -197,18 +204,11 @@ impl SpeedTestInput {
                     }
                 };
                 let upload = core::UploadRequest {
-                    url: bandwidth
-                        .upload_url
-                        .map(|url| {
-                            reqwest::Url::parse(&url)
-                                .map_err(|e| invalid(format!("uploadUrl: {e}")))
-                        })
-                        .transpose()?,
                     bytes: bandwidth.upload_mib.map(|mib| u64::from(mib) * MIB),
                 };
                 core::SpeedTestKind::Bandwidth { provider, upload }
             }
-            (None, Some(usenet)) => {
+            (None, Some(usenet), None) => {
                 let nzb = match (
                     usenet.sab_size,
                     usenet.nzb_url,
@@ -249,9 +249,17 @@ impl SpeedTestInput {
                     max_duration: Duration::from_secs(u64::from(usenet.max_duration_seconds)),
                 }
             }
+            (None, None, Some(torrent)) => core::SpeedTestKind::Torrent {
+                source: core::TestTorrentSource::debian(),
+                max_duration: torrent
+                    .max_duration_seconds
+                    .map_or(core::DEFAULT_TORRENT_DURATION, |seconds| {
+                        Duration::from_secs(u64::from(seconds))
+                    }),
+            },
             _ => {
                 return Err(invalid(
-                    "a speed test takes exactly one of bandwidth and usenet",
+                    "a speed test takes exactly one of bandwidth, usenet and torrent",
                 ));
             }
         };
@@ -385,8 +393,8 @@ pub struct SpeedTestResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
 pub enum UploadOutcome {
-    // The run named no upload endpoint.
-    NotConfigured,
+    // The provider takes no upload.
+    Unavailable,
     Measured,
     Failed,
     // No peer asked for anything.
@@ -397,6 +405,8 @@ pub enum UploadOutcome {
 #[derive(Clone, Debug, SimpleObject)]
 pub struct HttpUploadResult {
     pub outcome: UploadOutcome,
+    // The provider that takes no upload, for UNAVAILABLE.
+    pub provider: Option<String>,
     pub url: Option<String>,
     pub bytes: f64,
     pub elapsed_ms: u32,
@@ -418,16 +428,18 @@ pub struct PeerUploadResult {
 
 #[derive(Clone, Debug, SimpleObject)]
 pub struct UploadResult {
-    pub http: HttpUploadResult,
+    // Absent for a torrent run, which posts nothing.
+    pub http: Option<HttpUploadResult>,
     // Absent while torrents are off.
     pub peers: Option<PeerUploadResult>,
 }
 
 impl From<core::UploadResult> for UploadResult {
     fn from(upload: core::UploadResult) -> Self {
-        let http = match upload.http {
-            core::HttpUpload::NotConfigured => HttpUploadResult {
-                outcome: UploadOutcome::NotConfigured,
+        let http = upload.http.map(|http| match http {
+            core::HttpUpload::Unavailable { provider } => HttpUploadResult {
+                outcome: UploadOutcome::Unavailable,
+                provider: Some(provider),
                 url: None,
                 bytes: 0.0,
                 elapsed_ms: 0,
@@ -441,6 +453,7 @@ impl From<core::UploadResult> for UploadResult {
                 bps,
             } => HttpUploadResult {
                 outcome: UploadOutcome::Measured,
+                provider: None,
                 url: Some(url),
                 bytes: bytes as f64,
                 elapsed_ms: small(elapsed_ms),
@@ -449,13 +462,14 @@ impl From<core::UploadResult> for UploadResult {
             },
             core::HttpUpload::Failed { url, error } => HttpUploadResult {
                 outcome: UploadOutcome::Failed,
+                provider: None,
                 url: Some(url),
                 bytes: 0.0,
                 elapsed_ms: 0,
                 bps: 0.0,
                 failure: Some(error.into()),
             },
-        };
+        });
         let peers = upload.peers.map(|peers| match peers {
             core::PeerUpload::NoDemand => PeerUploadResult {
                 outcome: UploadOutcome::NoDemand,
@@ -496,7 +510,6 @@ pub struct BandwidthTestRequest {
     pub provider_id: Option<String>,
     pub server: Option<String>,
     pub custom_url: Option<String>,
-    pub upload_url: Option<String>,
     pub upload_mib: Option<u32>,
 }
 
@@ -513,17 +526,23 @@ pub struct UsenetTestRequest {
     pub max_duration_seconds: u32,
 }
 
-// Exactly one of `bandwidth` and `usenet` is set.
+#[derive(Clone, Debug, SimpleObject)]
+pub struct TorrentTestRequest {
+    pub max_duration_seconds: u32,
+}
+
+// Exactly one of `bandwidth`, `usenet` and `torrent` is set.
 #[derive(Clone, Debug, SimpleObject)]
 #[graphql(name = "SpeedTestRequest")]
 pub struct SpeedTestRequestGql {
     pub bandwidth: Option<BandwidthTestRequest>,
     pub usenet: Option<UsenetTestRequest>,
+    pub torrent: Option<TorrentTestRequest>,
 }
 
 impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
     fn from(request: &core::SpeedTestRequest) -> Self {
-        let (bandwidth, usenet) = match &request.kind {
+        let (bandwidth, usenet, torrent) = match &request.kind {
             core::SpeedTestKind::Bandwidth { provider, upload } => {
                 let (provider_id, server, custom_url) = match provider {
                     core::BandwidthProvider::Builtin { id, server } => {
@@ -536,9 +555,9 @@ impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
                         provider_id,
                         server,
                         custom_url,
-                        upload_url: upload.url.as_ref().map(ToString::to_string),
                         upload_mib: upload.bytes.map(|bytes| small(bytes.div_ceil(MIB))),
                     }),
+                    None,
                     None,
                 )
             }
@@ -566,10 +585,22 @@ impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
                         connections: connections.map(u32::from),
                         max_duration_seconds: small(max_duration.as_secs()),
                     }),
+                    None,
                 )
             }
+            core::SpeedTestKind::Torrent { max_duration, .. } => (
+                None,
+                None,
+                Some(TorrentTestRequest {
+                    max_duration_seconds: small(max_duration.as_secs()),
+                }),
+            ),
         };
-        Self { bandwidth, usenet }
+        Self {
+            bandwidth,
+            usenet,
+            torrent,
+        }
     }
 }
 
@@ -817,7 +848,7 @@ impl SpeedTestQuery {
                 id: p.id.into(),
                 name: p.name.into(),
                 host: p.host.map(Into::into),
-                needs_server: p.needs_server,
+                needs_server: p.needs_server(),
             })
             .collect()
     }

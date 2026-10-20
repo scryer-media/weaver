@@ -394,6 +394,16 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "a Usenet speed test runs on a server; a feed can run a bandwidth test only",
         ),
         (
+            R::SpeedTestTorrentNeedsTorrentRoute,
+            "SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE",
+            "a torrent speed test runs on a torrent route",
+        ),
+        (
+            R::SpeedTestTorrentsOff,
+            "SPEED_TEST_TORRENTS_OFF",
+            "torrents are off; turn them on to run a torrent speed test",
+        ),
+        (
             R::SpeedTestLegDownAll,
             "SPEED_TEST_LEG_DOWN_ALL",
             "every leg of the route would be down; leave at least one leg up",
@@ -529,9 +539,11 @@ fn slot(refusal: &R) -> usize {
         R::TorrentRoutePool => 83,
         R::BandwidthLimitTooLarge => 84,
         R::BandwidthSplitRange => 85,
+        R::SpeedTestTorrentNeedsTorrentRoute => 86,
+        R::SpeedTestTorrentsOff => 87,
     }
 }
-const SLOTS: usize = 86;
+const SLOTS: usize = 88;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {

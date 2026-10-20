@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::speed_test::torrent_fixture::{Answer, LISTED, PIECE_LEN, TorrentFixture};
+use crate::speed_test::torrent_fixture::{Answer, CONTENT_LEN, LISTED, PIECE_LEN, TorrentFixture};
 
 fn loopback() -> Arc<dyn Dialer> {
     Arc::new(weaver_tunnel::pipe::Egress::new(
@@ -216,5 +216,56 @@ async fn no_leechers_is_no_demand() {
 
     assert!(report.passed(P2pStep::Piece), "{report:?}");
     assert_eq!(report.upload, Some(PeerUpload::NoDemand));
+    fixture.stop().await;
+}
+
+// A pull counts every block it writes and holds no more verified bytes than
+// it may keep; it tells the tracker `stopped` as it leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_counts_every_block_and_holds_no_more_than_it_keeps() {
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder()],
+        seeders: 1,
+        ..Answer::default()
+    });
+    let path = P2pPath {
+        stage: loopback(),
+        kind: LegKind::Ladder,
+        gateway: None,
+        internal_port: 0,
+    };
+    let torrent = TestTorrent::fetch(path.stage.clone(), &fixture.source)
+        .await
+        .unwrap();
+    let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = received.clone();
+    let pulled = pull(
+        &path,
+        &torrent,
+        u64::from(PIECE_LEN),
+        move |bytes| {
+            counted.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        },
+        std::pin::pin!(std::future::pending::<()>()),
+    )
+    .await;
+    torrent.close().await;
+
+    assert_eq!(pulled.failure, None);
+    assert_eq!(
+        received.load(std::sync::atomic::Ordering::Relaxed),
+        CONTENT_LEN as u64
+    );
+    assert_eq!(pulled.store.held().len(), 1);
+    let mut announces = fixture.announces();
+    announces
+        .wait_for(|announces| {
+            announces
+                .iter()
+                .any(|announce| announce.event.as_deref() == Some("stopped"))
+        })
+        .await
+        .unwrap();
     fixture.stop().await;
 }

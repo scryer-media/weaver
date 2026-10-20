@@ -71,7 +71,7 @@ const MIB = 1024 * 1024;
 const runs: SpeedTestRun[] = [
   {
     id: 1, consumer: "server:1", consumerName: "news.fixture.invalid", kind: "BANDWIDTH",
-    request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null, uploadUrl: null, uploadMib: null }, usenet: null },
+    request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null, uploadMib: null }, usenet: null, torrent: null },
     status: "COMPLETED", phase: null, startedAt: 1790640000000, finishedAt: 1790640010000, failure: null,
     tested: { legs: [{ position: 0, egressId: 0, weight: 100, down: false, downReason: null, path: { kind: "DIRECT" }, target: 4 }], failover: "REDISTRIBUTE", overrides: noOverrides(), names: [{ kind: "egress", id: 0, name: "System" }] },
     result: {
@@ -191,16 +191,17 @@ function graphql(name: string, variables: Record<string, unknown>) {
     const overrides = input.overrides ?? noOverrides();
     const run: SpeedTestRun = {
       id: runs.reduce((top, entry) => Math.max(top, entry.id), 0) + 1,
-      consumer: owner.key, consumerName: owner.name, kind: input.usenet ? "USENET" : "BANDWIDTH",
+      consumer: owner.key, consumerName: owner.name, kind: input.usenet ? "USENET" : input.torrent ? "TORRENT" : "BANDWIDTH",
       // Kept as the daemon keeps it: every field present, absent ones null.
       request: {
-        bandwidth: input.bandwidth ? { providerId: input.bandwidth.providerId ?? null, server: input.bandwidth.server ?? null, customUrl: input.bandwidth.customUrl ?? null, uploadUrl: input.bandwidth.uploadUrl ?? null, uploadMib: input.bandwidth.uploadMib ?? null } : null,
+        bandwidth: input.bandwidth ? { providerId: input.bandwidth.providerId ?? null, server: input.bandwidth.server ?? null, customUrl: input.bandwidth.customUrl ?? null, uploadMib: input.bandwidth.uploadMib ?? null } : null,
         usenet: usenet
           ? {
               sabSize: usenet.sabSize ?? null, nzbUrl: usenet.nzbUrl ?? null, nzbFilename: uploaded?.upload ?? held,
               nzbRunId: usenet.nzbRunId ?? null, connections: usenet.connections ?? null, maxDurationSeconds: usenet.maxDurationSeconds,
             }
           : null,
+        torrent: input.torrent ? { maxDurationSeconds: input.torrent.maxDurationSeconds ?? 20 } : null,
       }, status: "RUNNING", phase: "draining 3",
       startedAt: 1790640100000, finishedAt: null, failure: null,
       tested: {

@@ -6,13 +6,15 @@ use std::time::Duration;
 
 use super::failure::SpeedTestFailure;
 use super::http::{NZB_LIMIT, TestArticle, parse_test_nzb};
+use super::torrent::TestTorrentSource;
 use crate::proxies::{Consumer, Failover, LegPath, Route};
 
 // What a run measures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeedTestKind {
     // Repeated HTTPS GETs of the provider's largest download through the
-    // route, over as many connections as the line takes.
+    // route, over as many connections as the line takes, then one post to
+    // the same provider.
     Bandwidth {
         provider: BandwidthProvider,
         upload: UploadRequest,
@@ -24,6 +26,13 @@ pub enum SpeedTestKind {
         connections: Option<u16>,
         max_duration: Duration,
     },
+    // The test torrent's pieces pulled from its swarm through a torrent
+    // route for `max_duration`, then served to the leechers its trackers
+    // send. Nothing is kept on disk.
+    Torrent {
+        source: TestTorrentSource,
+        max_duration: Duration,
+    },
 }
 
 impl SpeedTestKind {
@@ -31,6 +40,7 @@ impl SpeedTestKind {
         match self {
             Self::Bandwidth { .. } => SpeedTestKindLabel::Bandwidth,
             Self::Usenet { .. } => SpeedTestKindLabel::Usenet,
+            Self::Torrent { .. } => SpeedTestKindLabel::Torrent,
         }
     }
 }
@@ -39,15 +49,17 @@ impl SpeedTestKind {
 pub enum SpeedTestKindLabel {
     Bandwidth,
     Usenet,
+    Torrent,
 }
 
 impl SpeedTestKindLabel {
-    pub const ALL: [Self; 2] = [Self::Bandwidth, Self::Usenet];
+    pub const ALL: [Self; 3] = [Self::Bandwidth, Self::Usenet, Self::Torrent];
 
     pub fn index(self) -> usize {
         match self {
             Self::Bandwidth => 0,
             Self::Usenet => 1,
+            Self::Torrent => 2,
         }
     }
 
@@ -55,6 +67,7 @@ impl SpeedTestKindLabel {
         match self {
             Self::Bandwidth => "bandwidth",
             Self::Usenet => "usenet",
+            Self::Torrent => "torrent",
         }
     }
 }
@@ -65,16 +78,26 @@ pub enum BandwidthProvider {
     // provider's server list. Without one, a list provider run takes the
     // nearest: the first listed server to answer a ping through the route.
     Builtin { id: String, server: Option<String> },
-    // Any HTTPS URL. The egress block rules apply to it.
+    // Any HTTPS URL. The egress block rules apply to it. It is pulled from,
+    // never posted to.
     Custom { url: reqwest::Url },
 }
 
-// What a bandwidth run sends after it has pulled.
+impl BandwidthProvider {
+    // The name a run reports the provider by: a built-in's own, a custom
+    // URL's host.
+    pub fn name(&self) -> String {
+        match self {
+            Self::Builtin { id, .. } => super::providers::provider(id)
+                .map_or_else(|| id.clone(), |provider| provider.name.to_owned()),
+            Self::Custom { url } => url.host_str().unwrap_or(url.as_str()).to_owned(),
+        }
+    }
+}
+
+// What a bandwidth run posts to its provider after it has pulled.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UploadRequest {
-    // An HTTPS endpoint that takes a POST. The egress block rules apply to
-    // it. Without one, nothing is posted.
-    pub url: Option<reqwest::Url>,
     // How much is posted; `DEFAULT_UPLOAD_BYTES` when not given.
     pub bytes: Option<u64>,
 }
@@ -83,7 +106,8 @@ pub struct UploadRequest {
 pub const DEFAULT_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 // The most a post may send.
 pub const MAX_UPLOAD_BYTES: u64 = 128 * 1024 * 1024;
-// The most the test torrent serves to peers.
+// The most the test torrent serves to peers, and the most of its verified
+// pieces a torrent run holds in memory to serve.
 pub const PEER_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +211,7 @@ impl PathOverride {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeedTestRequest {
-    // Usenet runs need a server.
+    // Usenet runs need a server, torrent runs a torrent route.
     pub consumer: Consumer,
     // `None` tests the saved route; `Some` an unsaved draft.
     pub route: Option<Route>,
@@ -195,8 +219,10 @@ pub struct SpeedTestRequest {
     pub kind: SpeedTestKind,
 }
 
-// The longest a Usenet run may measure for.
+// The longest a Usenet or torrent run may measure for.
 pub const MAX_DURATION: Duration = Duration::from_secs(15 * 60);
+// How long a torrent run pulls for when the request names no duration.
+pub const DEFAULT_TORRENT_DURATION: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpeedTestStatus {
@@ -241,7 +267,7 @@ pub enum SpeedTestPhase {
     // Taking the server's connections from the live pool.
     Leasing,
     Measuring,
-    // Posting to the upload endpoint, then serving the test torrent.
+    // Posting to the provider, or serving the test torrent.
     Uploading,
     // Giving the connections, the queue and the draft back.
     Releasing,
@@ -336,11 +362,13 @@ pub struct BandwidthResult {
     pub connections: u32,
 }
 
-// A post to the upload endpoint, through the route.
+// A post to the provider the run pulled from, through the route.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HttpUpload {
-    // The request named no endpoint.
-    NotConfigured,
+    // The provider, named here, takes no upload.
+    Unavailable {
+        provider: String,
+    },
     Measured {
         url: String,
         bytes: u64,
@@ -353,12 +381,13 @@ pub enum HttpUpload {
     },
 }
 
-// What a bandwidth run sent. The post measures the route's upload; the
-// peers' figure is at least what the route can send, since it is only what
-// the peers asked for.
+// What a bandwidth or torrent run sent. The post measures the route's
+// upload; the peers' figure is at least what the route can send, since it
+// is only what the peers asked for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UploadResult {
-    pub http: HttpUpload,
+    // `None` for a torrent run, which posts nothing.
+    pub http: Option<HttpUpload>,
     // `None` while torrents are off.
     pub peers: Option<super::PeerUpload>,
 }

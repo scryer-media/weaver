@@ -124,9 +124,66 @@ async fn every_public_endpoint_answers() {
     let leg = direct_leg();
     let mut rows = Vec::new();
 
-    for info in PROVIDERS.iter().filter(|info| !info.needs_server) {
-        let url = provider_url(info).expect("provider URL");
-        rows.push(probe(&leg, info.id, &url, info.download_bytes, PREFIX).await);
+    for info in PROVIDERS.iter().filter(|info| !info.discovered()) {
+        let endpoints = fixed_endpoints(info).expect("provider endpoints");
+        let expected = endpoints.size.expect("a fixed provider's size");
+        rows.push(probe(&leg, info.id, &endpoints.download[0], expected, PREFIX).await);
+    }
+
+    let page = reqwest::Url::parse(FAST_COM_PAGE).unwrap();
+    let api = reqwest::Url::parse(FAST_COM_API).unwrap();
+    let started = Instant::now();
+    let found = discover_fast_com(&leg, &HttpOptions::default(), &page, &api).await;
+    rows.push(Row {
+        provider: "fast.com targets".into(),
+        url: page.to_string(),
+        status: "-".into(),
+        length: found.as_ref().map_or("-".into(), |found| {
+            format!("{} targets", found.download.len())
+        }),
+        elapsed: started.elapsed(),
+        error: found.as_ref().err().cloned(),
+    });
+    if let Ok(found) = &found {
+        let url = &found.download[0];
+        let started = Instant::now();
+        let mut routed = routed_get(&leg, url, &HttpOptions::default()).await;
+        let row = match &mut routed {
+            Ok(routed) => {
+                let mut observed = 0u64;
+                let mut error = None;
+                while observed < PREFIX {
+                    match routed.response.chunk().await {
+                        Ok(Some(chunk)) => observed += chunk.len() as u64,
+                        Ok(None) => break,
+                        Err(e) => {
+                            error = Some(format!("reading the body failed: {e}"));
+                            break;
+                        }
+                    }
+                }
+                Row {
+                    provider: "fast.com".into(),
+                    url: url.to_string(),
+                    status: routed.response.status().as_u16().to_string(),
+                    length: format!("read {observed}"),
+                    elapsed: started.elapsed(),
+                    error: error.or_else(|| (observed == 0).then(|| "the body is empty".into())),
+                }
+            }
+            Err(error) => Row {
+                provider: "fast.com".into(),
+                url: url.to_string(),
+                status: "-".into(),
+                length: "-".into(),
+                elapsed: started.elapsed(),
+                error: Some(error.clone()),
+            },
+        };
+        if let Ok(routed) = routed {
+            routed.close().await;
+        }
+        rows.push(row);
     }
 
     let list = reqwest::Url::parse(LIBRESPEED_SERVER_LIST).unwrap();

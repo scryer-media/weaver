@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Public endpoints a bandwidth run can pull bytes from. Every one serves
-// arbitrary bytes over a plain HTTPS GET with no token.
+// Public endpoints a bandwidth run can pull bytes from and post bytes to.
+// Every one serves arbitrary bytes over plain HTTPS; fast.com hands out a
+// token its own page carries.
+
+use super::http::{HttpLeg, HttpOptions, read_capped, routed_get};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -11,15 +14,26 @@ const GIB: u64 = 1024 * MIB;
 pub struct ProviderInfo {
     pub id: &'static str,
     pub name: &'static str,
-    // The host a run downloads from; `None` for a list provider, whose
+    // The host a run reaches first; `None` for a list provider, whose
     // servers each carry their own.
     pub host: Option<&'static str>,
-    // Where the provider's largest single download lives on `host`.
-    path: &'static str,
-    // Bytes one GET of that download moves.
-    pub download_bytes: u64,
-    // Whether the operator picks one server from the provider's list.
-    pub needs_server: bool,
+    source: Source,
+}
+
+// Where a provider's endpoints come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    // One download on `host`, of a known size, and the path on `host` that
+    // takes a post, if any.
+    Fixed {
+        download: &'static str,
+        bytes: u64,
+        upload: Option<&'static str>,
+    },
+    // A server the operator picks from the provider's list, or the nearest.
+    List,
+    // The targets fast.com hands out for a token read from its own page.
+    FastCom,
 }
 
 pub const PROVIDERS: &[ProviderInfo] = &[
@@ -27,42 +41,54 @@ pub const PROVIDERS: &[ProviderInfo] = &[
         id: "cloudflare",
         name: "Cloudflare",
         host: Some("speed.cloudflare.com"),
-        // A larger request is refused with HTTP 403.
-        path: "/__down?bytes=99999999",
-        download_bytes: 99_999_999,
-        needs_server: false,
+        source: Source::Fixed {
+            // A larger request is refused with HTTP 403.
+            download: "/__down?bytes=99999999",
+            bytes: 99_999_999,
+            upload: Some("/__up"),
+        },
     },
     ProviderInfo {
         id: "sabnzbd",
         name: "SABnzbd",
         host: Some("sabnzbd.org"),
-        path: "/tests/internetspeed/100MB.bin",
-        download_bytes: 100 * MIB,
-        needs_server: false,
+        source: Source::Fixed {
+            download: "/tests/internetspeed/100MB.bin",
+            bytes: 100 * MIB,
+            upload: None,
+        },
     },
     ProviderInfo {
         id: "ovh",
         name: "OVH",
         host: Some("proof.ovh.net"),
-        path: "/files/10Gb.dat",
-        download_bytes: 10 * GIB,
-        needs_server: false,
+        source: Source::Fixed {
+            download: "/files/10Gb.dat",
+            bytes: 10 * GIB,
+            upload: None,
+        },
     },
     ProviderInfo {
         id: "hetzner",
         name: "Hetzner",
         host: Some("nbg1-speed.hetzner.com"),
-        path: "/10GB.bin",
-        download_bytes: 10 * GIB,
-        needs_server: false,
+        source: Source::Fixed {
+            download: "/10GB.bin",
+            bytes: 10 * GIB,
+            upload: None,
+        },
     },
     ProviderInfo {
         id: "librespeed",
         name: "LibreSpeed",
         host: None,
-        path: "",
-        download_bytes: LIBRESPEED_MAX_CHUNKS * MIB,
-        needs_server: true,
+        source: Source::List,
+    },
+    ProviderInfo {
+        id: "fast",
+        name: "fast.com",
+        host: Some("fast.com"),
+        source: Source::FastCom,
     },
 ];
 
@@ -70,19 +96,94 @@ pub const PROVIDERS: &[ProviderInfo] = &[
 pub const LIBRESPEED_SERVER_LIST: &str = "https://librespeed.org/backend-servers/servers.php";
 // LibreSpeed serves its garbage in 1 MiB chunks, at most this many per GET.
 const LIBRESPEED_MAX_CHUNKS: u64 = 1024;
+// The fast.com page whose script carries the token.
+pub const FAST_COM_PAGE: &str = "https://fast.com/";
+// The fast.com endpoint that hands out targets for a token.
+pub const FAST_COM_API: &str = "https://api.fast.com/netflix/speedtest/v2";
+// Targets asked of fast.com.
+const FAST_COM_TARGETS: u32 = 5;
+// The most of a page, script or answer read while finding the endpoints.
+const DISCOVERY_LIMIT: usize = 4 * 1024 * 1024;
+
+impl ProviderInfo {
+    // Whether the operator picks one server from the provider's list.
+    pub fn needs_server(&self) -> bool {
+        self.source == Source::List
+    }
+
+    // Bytes one GET of the provider's download moves, when it is known
+    // before the GET.
+    pub fn download_bytes(&self) -> Option<u64> {
+        match self.source {
+            Source::Fixed { bytes, .. } => Some(bytes),
+            Source::List => Some(LIBRESPEED_MAX_CHUNKS * MIB),
+            Source::FastCom => None,
+        }
+    }
+
+    // Whether a run finds its endpoints through the route before it holds
+    // the queue.
+    pub(crate) fn discovered(&self) -> bool {
+        !matches!(self.source, Source::Fixed { .. })
+    }
+}
 
 pub fn provider(id: &str) -> Option<&'static ProviderInfo> {
     PROVIDERS.iter().find(|provider| provider.id == id)
 }
 
-// The URL every GET of a run on a fixed provider asks for. List providers
-// resolve through `list_server_url`.
-pub fn provider_url(provider: &ProviderInfo) -> Result<reqwest::Url, String> {
-    let Some(host) = provider.host else {
-        return Err(format!("{} takes its server from a list", provider.name));
+// Where a run pulls from and posts to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Endpoints {
+    // Each new connection takes the next, in turn.
+    pub download: Vec<reqwest::Url>,
+    // What one GET moves; `None` when only the response says.
+    pub size: Option<u64>,
+    // `None` for a provider that takes no post.
+    pub upload: Option<reqwest::Url>,
+}
+
+impl Endpoints {
+    // A custom URL: pulled from, never posted to.
+    pub(crate) fn custom(url: reqwest::Url) -> Self {
+        Self {
+            download: vec![url],
+            size: None,
+            upload: None,
+        }
+    }
+}
+
+// The endpoints of a fixed provider. List providers resolve through
+// `list_server_endpoints`, fast.com through `fast_com_endpoints`.
+pub(crate) fn fixed_endpoints(provider: &ProviderInfo) -> Result<Endpoints, String> {
+    let (
+        Some(host),
+        Source::Fixed {
+            download,
+            bytes,
+            upload,
+        },
+    ) = (provider.host, provider.source)
+    else {
+        return Err(format!(
+            "{} finds its endpoints through the route",
+            provider.name
+        ));
     };
-    reqwest::Url::parse(&format!("https://{host}{}", provider.path))
-        .map_err(|error| error.to_string())
+    let on_host = |path: &str| {
+        reqwest::Url::parse(&format!("https://{host}{path}")).map_err(|error| error.to_string())
+    };
+    Ok(Endpoints {
+        download: vec![on_host(download)?],
+        size: Some(bytes),
+        upload: upload.map(on_host).transpose()?,
+    })
+}
+
+// The URL every GET of a run on a fixed provider asks for.
+pub fn provider_url(provider: &ProviderInfo) -> Result<reqwest::Url, String> {
+    fixed_endpoints(provider).map(|endpoints| endpoints.download[0].clone())
 }
 
 // One server of a list provider.
@@ -94,6 +195,8 @@ pub struct ProviderServer {
     pub host: String,
     // Where the server's download endpoint lives.
     pub download_url: String,
+    // Where the server takes a post; `None` for a server that names none.
+    pub upload_url: Option<String>,
     // Where the server's ping endpoint lives; `None` for a server that names
     // none, which is never pinged.
     pub ping_url: Option<String>,
@@ -106,6 +209,8 @@ struct LibreSpeedEntry {
     server: String,
     #[serde(rename = "dlURL")]
     dl_url: String,
+    #[serde(default, rename = "ulURL")]
+    ul_url: Option<String>,
     #[serde(default, rename = "pingURL")]
     ping_url: Option<String>,
     #[serde(default, rename = "sponsorName")]
@@ -144,16 +249,17 @@ pub fn parse_librespeed_servers(body: &[u8]) -> Result<Vec<ProviderServer>, Stri
                     .filter(|url| url.origin() == base.origin())
             };
             let download = on_base(&entry.dl_url)?;
-            // The ping endpoint sits beside the download one, on the same
-            // base; a server that names none, or one that does not resolve
-            // there, is listed but never pinged.
-            let ping = entry
-                .ping_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|ping| !ping.is_empty())
-                .and_then(on_base)
-                .map(|ping| ping.to_string());
+            // The ping and upload endpoints sit beside the download one, on
+            // the same base; one a server names none of, or that does not
+            // resolve there, is never asked.
+            let beside = |path: Option<&str>| {
+                path.map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .and_then(on_base)
+                    .map(|url| url.to_string())
+            };
+            let ping = beside(entry.ping_url.as_deref());
+            let upload = beside(entry.ul_url.as_deref());
             let id = match entry.id {
                 serde_json::Value::String(id) => id,
                 other => other.to_string(),
@@ -164,6 +270,7 @@ pub fn parse_librespeed_servers(body: &[u8]) -> Result<Vec<ProviderServer>, Stri
                 location: entry.sponsor_name.filter(|name| !name.is_empty()),
                 host: base.host_str()?.to_owned(),
                 download_url: download.to_string(),
+                upload_url: upload,
                 ping_url: ping,
             })
         })
@@ -174,6 +281,120 @@ pub fn parse_librespeed_servers(body: &[u8]) -> Result<Vec<ProviderServer>, Stri
 // chunks the server serves at once.
 pub fn list_server_url(server: &ProviderServer) -> Result<reqwest::Url, String> {
     chunked_url(server, LIBRESPEED_MAX_CHUNKS)
+}
+
+// The endpoints of a run on a LibreSpeed server.
+pub(crate) fn list_server_endpoints(server: &ProviderServer) -> Result<Endpoints, String> {
+    Ok(Endpoints {
+        download: vec![list_server_url(server)?],
+        size: Some(LIBRESPEED_MAX_CHUNKS * MIB),
+        upload: server
+            .upload_url
+            .as_deref()
+            .map(reqwest::Url::parse)
+            .transpose()
+            .map_err(|error| error.to_string())?,
+    })
+}
+
+// The app script a fast.com page loads: the first script whose file is
+// named `app-<hash>.js`, on the page's own origin.
+pub(crate) fn fast_com_script(page: &reqwest::Url, html: &str) -> Result<reqwest::Url, String> {
+    html.split("src=")
+        .skip(1)
+        .filter_map(|rest| {
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let rest = &rest[1..];
+            Some(&rest[..rest.find(quote)?])
+        })
+        .filter_map(|src| page.join(src).ok())
+        .find(|url| {
+            url.origin() == page.origin()
+                && url
+                    .path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .is_some_and(|file| file.starts_with("app-") && file.ends_with(".js"))
+        })
+        .ok_or_else(|| "the fast.com page loads no app script".to_owned())
+}
+
+// The token a fast.com app script carries, as its `token:"..."` literal.
+pub(crate) fn fast_com_token(script: &str) -> Result<String, String> {
+    let rest = script
+        .split_once("token:\"")
+        .map(|(_, rest)| rest)
+        .ok_or("the fast.com script carries no token")?;
+    let token = &rest[..rest.find('"').ok_or("the fast.com token is not closed")?];
+    if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("the fast.com token is not readable".into());
+    }
+    Ok(token.to_owned())
+}
+
+// Where fast.com hands out targets for `token`.
+pub(crate) fn fast_com_api_url(api: &reqwest::Url, token: &str) -> reqwest::Url {
+    let mut url = api.clone();
+    url.query_pairs_mut()
+        .append_pair("https", "true")
+        .append_pair("token", token)
+        .append_pair("urlCount", &FAST_COM_TARGETS.to_string());
+    url
+}
+
+#[derive(serde::Deserialize)]
+struct FastComAnswer {
+    targets: Vec<FastComTarget>,
+}
+
+#[derive(serde::Deserialize)]
+struct FastComTarget {
+    url: String,
+}
+
+// The targets fast.com handed out. Each is pulled from and posted to; one
+// that is not HTTPS is left out.
+pub(crate) fn fast_com_endpoints(body: &[u8]) -> Result<Endpoints, String> {
+    let answer: FastComAnswer = serde_json::from_slice(body)
+        .map_err(|error| format!("the fast.com answer is not readable: {error}"))?;
+    let download: Vec<reqwest::Url> = answer
+        .targets
+        .into_iter()
+        .filter_map(|target| reqwest::Url::parse(&target.url).ok())
+        .filter(|url| url.scheme() == "https")
+        .collect();
+    let upload = download
+        .first()
+        .cloned()
+        .ok_or("fast.com handed out no HTTPS target")?;
+    Ok(Endpoints {
+        download,
+        size: None,
+        upload: Some(upload),
+    })
+}
+
+// Find fast.com's targets through one leg: its page, the app script the
+// page loads, then the targets for the token that script carries.
+pub(crate) async fn discover_fast_com(
+    leg: &HttpLeg,
+    options: &HttpOptions,
+    page: &reqwest::Url,
+    api: &reqwest::Url,
+) -> Result<Endpoints, String> {
+    let fetch = |url: reqwest::Url, what: &'static str| async move {
+        let routed = routed_get(leg, &url, options)
+            .await
+            .map_err(|error| format!("fetching the fast.com {what} failed: {error}"))?;
+        read_capped(routed, DISCOVERY_LIMIT)
+            .await
+            .map_err(|error| format!("fetching the fast.com {what} failed: {error}"))
+    };
+    let html = fetch(page.clone(), "page").await?;
+    let script = fast_com_script(page, &String::from_utf8_lossy(&html))?;
+    let script = fetch(script, "script").await?;
+    let token = fast_com_token(&String::from_utf8_lossy(&script))?;
+    let answer = fetch(fast_com_api_url(api, &token), "targets").await?;
+    fast_com_endpoints(&answer)
 }
 
 fn chunked_url(server: &ProviderServer, chunks: u64) -> Result<reqwest::Url, String> {
@@ -189,7 +410,7 @@ mod tests {
 
     #[test]
     fn every_fixed_provider_downloads_from_its_host() {
-        for info in PROVIDERS.iter().filter(|info| !info.needs_server) {
+        for info in PROVIDERS.iter().filter(|info| !info.discovered()) {
             let url = provider_url(info).unwrap();
             assert_eq!(url.scheme(), "https");
             assert_eq!(url.host_str(), info.host, "{}", info.id);
@@ -204,7 +425,7 @@ mod tests {
             .query_pairs()
             .find(|(name, _)| name == "bytes")
             .map(|(_, value)| value.parse::<u64>().unwrap());
-        assert_eq!(asked, Some(cloudflare.download_bytes));
+        assert_eq!(asked, cloudflare.download_bytes());
         assert_eq!(
             provider_url(provider("ovh").unwrap()).unwrap().as_str(),
             "https://proof.ovh.net/files/10Gb.dat"
@@ -212,6 +433,31 @@ mod tests {
         let librespeed = provider("librespeed").unwrap();
         assert_eq!(librespeed.host, None);
         assert!(provider_url(librespeed).is_err());
+        assert!(provider_url(provider("fast").unwrap()).is_err());
+    }
+
+    #[test]
+    fn each_fixed_provider_names_its_own_upload_endpoint() {
+        let uploads: Vec<(&str, Option<String>)> = PROVIDERS
+            .iter()
+            .filter(|info| !info.discovered())
+            .map(|info| {
+                let upload = fixed_endpoints(info).unwrap().upload;
+                (info.id, upload.map(|url| url.to_string()))
+            })
+            .collect();
+        assert_eq!(
+            uploads,
+            vec![
+                (
+                    "cloudflare",
+                    Some("https://speed.cloudflare.com/__up".into())
+                ),
+                ("sabnzbd", None),
+                ("ovh", None),
+                ("hetzner", None),
+            ]
+        );
     }
 
     #[test]
@@ -231,6 +477,7 @@ mod tests {
                     location: Some("Example".into()),
                     host: "speed.example.test".into(),
                     download_url: "https://speed.example.test/backend/garbage.php".into(),
+                    upload_url: None,
                     ping_url: None,
                 },
                 ProviderServer {
@@ -239,6 +486,7 @@ mod tests {
                     location: None,
                     host: "nested.example.test".into(),
                     download_url: "https://nested.example.test/backend/garbage.php".into(),
+                    upload_url: None,
                     ping_url: None,
                 }
             ]
@@ -327,6 +575,87 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_librespeed_server_posts_beside_its_download() {
+        let body = br#"[
+            {"id":1,"name":"Backend","server":"https://one.example.test/","dlURL":"backend/garbage.php","ulURL":"backend/empty.php"},
+            {"id":2,"name":"Elsewhere","server":"https://two.example.test/","dlURL":"garbage.php","ulURL":"https://other.example.test/empty.php"},
+            {"id":3,"name":"Blank","server":"https://three.example.test/","dlURL":"garbage.php","ulURL":""}
+        ]"#;
+        let servers = parse_librespeed_servers(body).unwrap();
+        let uploads: Vec<Option<String>> = servers
+            .iter()
+            .map(|server| {
+                list_server_endpoints(server)
+                    .unwrap()
+                    .upload
+                    .map(|url| url.to_string())
+            })
+            .collect();
+        assert_eq!(
+            uploads,
+            vec![
+                Some("https://one.example.test/backend/empty.php".into()),
+                None,
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn the_fast_com_page_names_its_app_script_on_its_own_origin() {
+        let page = reqwest::Url::parse("https://fast.com/").unwrap();
+        let html = r#"<html><head><script src="https://elsewhere.example.test/app-1.js"></script>
+            <link rel="stylesheet" href="/style.css"><script src="/vendor-2.js"></script>
+            <script src='/app-9f8e7d.js'></script></head></html>"#;
+        assert_eq!(
+            fast_com_script(&page, html).unwrap().as_str(),
+            "https://fast.com/app-9f8e7d.js"
+        );
+        assert!(fast_com_script(&page, "<script src=\"/main.js\"></script>").is_err());
+    }
+
+    #[test]
+    fn the_fast_com_token_is_read_from_its_literal() {
+        let script = r#"var a=1;e.exports={apiEndpoint:"api.fast.com/netflix/speedtest/v2",token:"YXNkZmFzZGxmbnNk",urlCount:5}"#;
+        assert_eq!(fast_com_token(script).unwrap(), "YXNkZmFzZGxmbnNk");
+        assert!(fast_com_token("token:\"\"").is_err());
+        assert!(fast_com_token("token:\"a b\"").is_err());
+        assert!(fast_com_token("nothing here").is_err());
+        assert_eq!(
+            fast_com_api_url(&reqwest::Url::parse(FAST_COM_API).unwrap(), "abc").as_str(),
+            "https://api.fast.com/netflix/speedtest/v2?https=true&token=abc&urlCount=5"
+        );
+    }
+
+    #[test]
+    fn fast_com_targets_are_pulled_from_and_posted_to() {
+        let body = br#"{"client":{"ip":"192.0.2.1"},"targets":[
+            {"name":"https://one.example.test/speedtest","url":"https://one.example.test/speedtest?c=a&e=1","location":{"city":"X"}},
+            {"name":"cleartext","url":"http://two.example.test/speedtest"},
+            {"name":"https://three.example.test/speedtest","url":"https://three.example.test/speedtest?c=b"}
+        ]}"#;
+        let endpoints = fast_com_endpoints(body).unwrap();
+        assert_eq!(
+            endpoints
+                .download
+                .iter()
+                .map(reqwest::Url::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "https://one.example.test/speedtest?c=a&e=1",
+                "https://three.example.test/speedtest?c=b"
+            ]
+        );
+        assert_eq!(endpoints.size, None);
+        assert_eq!(
+            endpoints.upload.as_ref().map(reqwest::Url::as_str),
+            Some("https://one.example.test/speedtest?c=a&e=1")
+        );
+        assert!(fast_com_endpoints(br#"{"targets":[]}"#).is_err());
+        assert!(fast_com_endpoints(b"not json").is_err());
     }
 }
 

@@ -53,7 +53,7 @@ export const TEST_VIA = gql`mutation TestVia($route:RouteInput!,$subject:TestSub
 const PATH_FIELDS = "kind directFallback rungs { kind proxyId poolId chainIds }";
 /** A speed test run as every speed test screen reads it: the route it took and what it measured. */
 const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase startedAt finishedAt failure { code message params }
-  request { bandwidth { providerId server customUrl uploadUrl uploadMib } usenet { sabSize nzbUrl nzbFilename nzbRunId connections maxDurationSeconds } }
+  request { bandwidth { providerId server customUrl uploadMib } usenet { sabSize nzbUrl nzbFilename nzbRunId connections maxDurationSeconds } torrent { maxDurationSeconds } }
   tested { legs { position egressId weight down downReason target path { ${PATH_FIELDS} } } failover
     overrides { downLegs downRungs { leg rung } downProxies downEgresses } names { kind id name } }
   result { bytes elapsedMs averageBps peakBps
@@ -61,7 +61,7 @@ const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase starte
     connections { leg connectMs path { egressId rung poolId memberId proxyIds } sourceAddress bytes bytesPerSecond error }
     usenet { articlesRequested delivered missing failed declaredBytes decodedBytes pipelining tls tlsCipherSuite }
     bandwidth { providerId server url connections }
-    upload { http { outcome url bytes elapsedMs bps failure { code message params } } peers { outcome bytes elapsedMs bps peers error } }
+    upload { http { outcome provider url bytes elapsedMs bps failure { code message params } } peers { outcome bytes elapsedMs bps peers error } }
     samples { atMs leg bytes decodedBytes } }`;
 export const SPEED_TEST_QUERY = gql`query SpeedTest { bandwidthProviders { id name host needsServer } speedTestRuns { ${SPEED_TEST_RUN_FIELDS} } }`;
 export const SPEED_TEST_RUN_QUERY = gql`query SpeedTestRun($id:Int!) { speedTestRun(id:$id) { ${SPEED_TEST_RUN_FIELDS} } }`;
