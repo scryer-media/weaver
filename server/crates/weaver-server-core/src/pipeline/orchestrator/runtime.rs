@@ -515,6 +515,7 @@ impl Pipeline {
             direct_placement_done_tx,
             direct_placement_done_rx,
             segment_writes: HashMap::new(),
+            orphaned_segment_writes: HashMap::new(),
             next_segment_write_id: 0,
             segment_write_done_tx,
             segment_write_done_rx,

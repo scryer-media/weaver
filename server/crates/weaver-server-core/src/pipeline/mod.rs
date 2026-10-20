@@ -3001,6 +3001,10 @@ pub struct Pipeline {
     // Decoded batches out to the disk owner, per file in submission order;
     // see [`SegmentWriteTicket`].
     pub(super) segment_writes: HashMap<NzbFileId, VecDeque<SegmentWriteTicket>>,
+    // A removed job's batches still out to the disk owner, by ticket: the
+    // owner holds their bytes until it answers, so they stay charged until
+    // then.
+    pub(super) orphaned_segment_writes: HashMap<u64, (usize, usize)>,
     // Monotonic; stamps each ticket and its done message.
     pub(super) next_segment_write_id: u64,
     pub(super) segment_write_done_tx: mpsc::Sender<SegmentWriteDone>,

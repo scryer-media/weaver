@@ -103,13 +103,16 @@ impl Pipeline {
             .get_mut(&done.file_id)
             .and_then(|tickets| tickets.iter_mut().find(|ticket| ticket.id == done.ticket))
         else {
-            // Its job let it go first (a removal, a settle), and accounted
-            // for it then.
+            // Its job let it go first (a removal, a settle). A removal's
+            // bytes were the owner's until now.
             debug!(
                 file_id = %done.file_id,
                 ticket = done.ticket,
                 "a decoded batch landed after its file let it go"
             );
+            if self.release_orphaned_segment_write(done.ticket) {
+                self.relieve_latched_write_backlog().await;
+            }
             return;
         };
         ticket.answered = true;
@@ -246,26 +249,46 @@ impl Pipeline {
                 self.settle_segment_writes_for_job(job_id).await;
             }
         }
-        // The done messages of what landed here have nothing left to apply.
-        while self.segment_write_done_rx.try_recv().is_ok() {}
+        // The done messages of what landed here have nothing left to apply,
+        // beyond a removed job's charge.
+        while let Ok(done) = self.segment_write_done_rx.try_recv() {
+            self.release_orphaned_segment_write(done.ticket);
+        }
     }
 
     // Forgets a removed job's batches. Their writes run to the end on their
-    // own, and a close of the job's roots queues behind them.
+    // own, and a close of the job's roots queues behind them. A batch the
+    // owner has answered is freed now; one it still holds stays charged
+    // until its answer.
     pub(crate) fn drop_segment_writes_for_job(&mut self, job_id: JobId) {
         let mut bytes = 0usize;
         let mut count = 0usize;
+        let orphaned = &mut self.orphaned_segment_writes;
         self.segment_writes.retain(|file_id, tickets| {
             if file_id.job_id != job_id {
                 return true;
             }
             for ticket in tickets.drain(..) {
-                bytes += ticket.bytes;
-                count += ticket.count;
+                if ticket.answered {
+                    bytes += ticket.bytes;
+                    count += ticket.count;
+                } else {
+                    orphaned.insert(ticket.id, (ticket.bytes, ticket.count));
+                }
             }
             false
         });
         self.write_inflight_bytes = self.write_inflight_bytes.saturating_sub(bytes);
         self.release_write_buffered(bytes, count);
+    }
+
+    // Frees a removed job's batch once its owner answers. Whether it was one.
+    fn release_orphaned_segment_write(&mut self, ticket: u64) -> bool {
+        let Some((bytes, count)) = self.orphaned_segment_writes.remove(&ticket) else {
+            return false;
+        };
+        self.write_inflight_bytes = self.write_inflight_bytes.saturating_sub(bytes);
+        self.release_write_buffered(bytes, count);
+        true
     }
 }

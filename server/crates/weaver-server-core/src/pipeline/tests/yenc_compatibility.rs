@@ -2034,3 +2034,70 @@ async fn decoded_segment_commits_when_its_write_lands() {
     assert_eq!(std::fs::read(&path).unwrap(), b"head");
     assert!(pipeline.job_decode_stage_drained(file_id.job_id));
 }
+
+// A removed job's batch is still the disk owner's until it answers; its
+// bytes count against the backlog until then.
+#[tokio::test]
+async fn a_removed_jobs_write_stays_charged_until_its_owner_answers() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _path) = setup(&temp, 40249, &[4, 4]).await;
+    let bytes = b"head";
+    pipeline
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number: 0,
+                },
+                raw_size: 4,
+                encoding: SegmentEncoding::Yenc,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 8,
+                    part: Some(1),
+                    total: Some(2),
+                    begin: Some(1),
+                    end: Some(4),
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: par2_rs::checksum::crc32(bytes),
+                truncation_suspected: false,
+                expected_file_crc: None,
+                data: DecodedChunk::from(bytes.to_vec()),
+                yenc_name: "sample.bin".to_owned(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                segments: vec![weaver_yenc::Segment {
+                    file_offset: 0,
+                    len: 4,
+                    crc32: par2_rs::checksum::crc32(bytes),
+                }],
+            },
+            SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        )
+        .await;
+
+    // The job goes while its write is out: the owner still holds the
+    // bytes, so they stay charged.
+    pipeline.drop_segment_writes_for_job(file_id.job_id);
+    assert!(pipeline.segment_writes.is_empty());
+    assert_eq!(pipeline.write_buffered_bytes, 4);
+    assert_eq!(pipeline.write_inflight_bytes, 4);
+
+    // The owner's answer frees them, and lands nothing.
+    let done = pipeline
+        .segment_write_done_rx
+        .recv()
+        .await
+        .expect("the segment write channel stays open");
+    pipeline.handle_segment_write_done(done).await;
+    assert!(pipeline.orphaned_segment_writes.is_empty());
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.write_inflight_bytes, 0);
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        0
+    );
+}
