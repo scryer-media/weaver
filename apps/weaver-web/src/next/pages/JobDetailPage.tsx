@@ -915,34 +915,37 @@ function JobDetailContent() {
             The prototype's last panel. It lists only the providers that served
             something: the ledger omits a provider that contributed nothing
             rather than carrying it at zero, so "this backup went untouched" is
-            read from its absence here, not from a row.
+            read from its absence here, not from a row. A torrent has no
+            providers.
           */}
-          <DetailBlock
-            id="providers"
-            title={t("next.job.providersUsed")}
-            tone="panel"
-            note={providers.length === 0 ? undefined : t("next.job.providersNote")}
-            bodyClassName="gap-[11px]"
-          >
-            {providers.length === 0 ? (
-              <div className="text-[12.5px] leading-[1.5] text-wv-muted">
-                {t("next.job.providersEmpty")}
-              </div>
-            ) : (
-              providers.map((provider, index) => (
-                <ShareRow
-                  key={provider.serverId}
-                  label={provider.serverHost ?? t("next.job.serverId", { id: provider.serverId })}
-                  title={countLabel(t, "next.job.articles", provider.articles, {
-                    count: provider.articles.toLocaleString(),
-                  })}
-                  note={`${formatSize(provider.wireBytes)} · ${Math.round(provider.share)}%`}
-                  percent={provider.share}
-                  color={PROVIDER_COLORS[index % PROVIDER_COLORS.length]}
-                />
-              ))
-            )}
-          </DetailBlock>
+          {isTorrent ? null : (
+            <DetailBlock
+              id="providers"
+              title={t("next.job.providersUsed")}
+              tone="panel"
+              note={providers.length === 0 ? undefined : t("next.job.providersNote")}
+              bodyClassName="gap-[11px]"
+            >
+              {providers.length === 0 ? (
+                <div className="text-[12.5px] leading-[1.5] text-wv-muted">
+                  {t("next.job.providersEmpty")}
+                </div>
+              ) : (
+                providers.map((provider, index) => (
+                  <ShareRow
+                    key={provider.serverId}
+                    label={provider.serverHost ?? t("next.job.serverId", { id: provider.serverId })}
+                    title={countLabel(t, "next.job.articles", provider.articles, {
+                      count: provider.articles.toLocaleString(),
+                    })}
+                    note={`${formatSize(provider.wireBytes)} · ${Math.round(provider.share)}%`}
+                    percent={provider.share}
+                    color={PROVIDER_COLORS[index % PROVIDER_COLORS.length]}
+                  />
+                ))
+              )}
+            </DetailBlock>
+          )}
 
           <DetailBlock id="recovery" title={t("next.job.bytes")} tone="panel" bodyClassName="gap-[11px]">
             <ShareRow

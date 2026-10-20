@@ -312,6 +312,34 @@ pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
     }
 }
 
+/// The swarm as the trackers last counted it, and when the next announce is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Swarm {
+    /// The most seeds any tracker counts: trackers count the same swarm, so
+    /// their counts overlap rather than add up.
+    pub seeds: Option<u32>,
+    pub leechers: Option<u32>,
+    /// Seconds until the soonest tracker announce.
+    pub reannounce_seconds: Option<u64>,
+}
+
+/// The swarm read off how announcing to each tracker went, at `now_ms`.
+pub fn swarm(announces: &[TrackerAnnounce], now_ms: i64) -> Swarm {
+    let trackers: Vec<TorrentTracker> = announces
+        .iter()
+        .map(|announce| tracker_view(0, announce))
+        .collect();
+    Swarm {
+        seeds: trackers.iter().filter_map(|tracker| tracker.seeders).max(),
+        leechers: trackers.iter().filter_map(|tracker| tracker.leechers).max(),
+        reannounce_seconds: trackers
+            .iter()
+            .filter_map(|tracker| tracker.next_announce_ms)
+            .min()
+            .map(|next| ((next - now_ms).max(0) as u64).div_ceil(1000)),
+    }
+}
+
 /// A torrent's trackers: the ones its run announces to, each in the tier
 /// the torrent lists it in, or, before it has run, the ones it lists. A
 /// tracker the torrent does not list came with its magnet, whose trackers
@@ -798,6 +826,40 @@ mod tests {
             (failed.seeders, failed.leechers, failed.next_announce_ms),
             (None, None, None)
         );
+    }
+
+    #[test]
+    fn the_swarm_is_the_largest_tracker_count_and_the_soonest_announce() {
+        let counted = |seeders, leechers, interval| {
+            announce(
+                false,
+                Some(Ok(AnnounceOk {
+                    seeders,
+                    leechers,
+                    ..accepted(interval, None)
+                })),
+            )
+        };
+        let announces = [
+            counted(Some(3), Some(9), 1800),
+            counted(Some(7), None, 60),
+            announce(false, Some(Err("refused".into()))),
+        ];
+        // The announce at 1,000 s is due again at 1,060 s.
+        assert_eq!(
+            swarm(&announces, 1_020_500),
+            Swarm {
+                seeds: Some(7),
+                leechers: Some(9),
+                reannounce_seconds: Some(40),
+            }
+        );
+        // An announce already due is due now.
+        assert_eq!(
+            swarm(&announces, 1_100_000).reannounce_seconds,
+            Some(0)
+        );
+        assert_eq!(swarm(&[], 0), Swarm::default());
     }
 
     // An answer whose interval has long passed with no announce in flight

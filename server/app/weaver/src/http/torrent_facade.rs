@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -585,35 +585,6 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
     }
 }
 
-// Where the torrent's output is (`content_path`): its file when it is one
-// file, else its folder; and the folder that holds it (`save_path`). Both
-// are empty until weaver has placed the torrent.
-fn paths(view: &TorrentView) -> (String, String) {
-    let Some(dir) = &view.storage_dir else {
-        return (String::new(), String::new());
-    };
-    let dir = PathBuf::from(dir);
-    let content = match single_file(view) {
-        Some(name) => dir.join(name),
-        None => dir,
-    };
-    let save = content
-        .parent()
-        .map_or_else(|| content.clone(), Path::to_path_buf);
-    (
-        save.to_string_lossy().into_owned(),
-        content.to_string_lossy().into_owned(),
-    )
-}
-
-// A one-file torrent's file name: its only file, named as the torrent is.
-fn single_file(view: &TorrentView) -> Option<&std::ffi::OsStr> {
-    match view.files.as_slice() {
-        [file] if file.path == view.name => Path::new(&file.path).file_name(),
-        _ => None,
-    }
-}
-
 fn category_dir(config: &Config, category: Option<&str>) -> PathBuf {
     let complete = PathBuf::from(config.complete_dir());
     completion_parent(&complete, &config.categories, category).unwrap_or(complete)
@@ -659,7 +630,7 @@ fn share_limits(view: &TorrentView) -> [(&'static str, Value); 6] {
 }
 
 pub(super) fn info(view: &TorrentView) -> Value {
-    let (save_path, content_path) = paths(view);
+    let (save_path, content_path) = view.paths();
     let mut fields = object([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
         ("infohash_v1", json!(view.infohash.to_ascii_lowercase())),
@@ -793,8 +764,7 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
         return not_found();
     };
-    let (save_path, content_path) = paths(&view);
-    let now = secs(chrono::Utc::now().timestamp_millis());
+    let (save_path, content_path) = view.paths();
     axum::Json(object([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
         ("infohash_v1", json!(view.infohash.to_ascii_lowercase())),
@@ -804,40 +774,40 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("content_path", json!(content_path)),
         ("download_path", json!("")),
         ("is_private", json!(view.private)),
-        ("comment", json!("")),
-        ("created_by", json!("")),
-        ("creation_date", json!(-1)),
-        ("piece_size", json!(-1)),
-        ("pieces_have", json!(-1)),
-        ("pieces_num", json!(-1)),
+        ("comment", json!(view.comment.clone().unwrap_or_default())),
+        ("created_by", json!(view.created_by.clone().unwrap_or_default())),
+        ("creation_date", json!(view.created_at_ms.map_or(-1, secs))),
+        ("piece_size", json!(view.pieces.map_or(-1, |pieces| pieces.size as i64))),
+        ("pieces_have", json!(view.pieces.map_or(-1, |pieces| i64::from(pieces.have)))),
+        ("pieces_num", json!(view.pieces.map_or(-1, |pieces| i64::from(pieces.count)))),
         ("total_size", json!(view.total_bytes)),
-        ("total_wasted", json!(0)),
+        ("total_wasted", json!(view.wasted_bytes)),
         ("total_uploaded", json!(view.uploaded_bytes)),
         ("total_uploaded_session", json!(view.uploaded_bytes)),
         ("total_downloaded", json!(view.downloaded_bytes)),
         ("total_downloaded_session", json!(view.downloaded_bytes)),
         ("up_limit", json!(-1)),
         ("dl_limit", json!(-1)),
-        ("time_elapsed", json!((now - secs(view.added_at_ms)).max(0))),
+        ("time_elapsed", json!(view.active_seconds)),
         ("nb_connections", json!(view.peers)),
-        ("nb_connections_limit", json!(-1)),
+        ("nb_connections_limit", json!(view.max_peers)),
         ("share_ratio", json!(view.ratio)),
         ("addition_date", json!(secs(view.added_at_ms))),
         (
             "completion_date",
             json!(view.completed_at_ms.map_or(-1, secs)),
         ),
-        ("last_seen", json!(-1)),
+        ("last_seen", json!(view.last_seen_complete_ms.map_or(-1, secs))),
         ("dl_speed", json!(view.download_bps)),
-        ("dl_speed_avg", json!(view.download_bps)),
+        ("dl_speed_avg", json!(view.download_avg_bps)),
         ("up_speed", json!(view.upload_bps)),
-        ("up_speed_avg", json!(view.upload_bps)),
+        ("up_speed_avg", json!(view.upload_avg_bps)),
         ("eta", json!(eta(&view))),
         ("peers", json!(view.leechers)),
-        ("peers_total", json!(view.leechers)),
+        ("peers_total", json!(view.swarm_leechers.unwrap_or(view.leechers))),
         ("seeds", json!(view.seeds)),
-        ("seeds_total", json!(view.seeds)),
-        ("reannounce", json!(0)),
+        ("seeds_total", json!(view.swarm_seeds.unwrap_or(view.seeds))),
+        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
     ]))
     .into_response()
 }
@@ -960,6 +930,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
             policy_override,
             paused,
             forced: false,
+            unpack: None,
         };
         match torrents.add(request).await {
             Ok(_) => added += 1,
@@ -1292,6 +1263,7 @@ async fn create_category(ctx: &TorrentFacadeContext, params: &Params) -> Respons
             aliases: String::new(),
             seeding: None,
             torrent_route: false,
+            unpack: None,
         };
         db.insert_category(&category).map(|()| category)
     })

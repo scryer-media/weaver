@@ -122,6 +122,9 @@ fn intent_and_counters_update_in_place() {
     let counters = TorrentCounters {
         uploaded_bytes: 7_000_000_000,
         downloaded_bytes: 3_500_000_000,
+        checked_bytes: 3_400_000_000,
+        active_duration_s: 900,
+        last_seen_complete_ms: Some(8_800),
         finished_duration_s: 600,
         last_activity_ms: Some(8_500),
         last_announce_uploaded_bytes: 6_000_000_000,
