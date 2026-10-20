@@ -219,12 +219,13 @@ fn crc_ladder() -> Vec<&'static str> {
     }
 }
 
-// The tier `crc-fast` runs for everything the 256-bit fold does not take.
-fn crc_fast_kernel() -> &'static str {
-    match crc_fast::get_calculator_target(crc_fast::CrcAlgorithm::Crc32IsoHdlc).as_str() {
+// The tier `crc-turbo` runs.
+fn crc_turbo_kernel() -> &'static str {
+    match crc_turbo::get_calculator_target(crc_turbo::CrcAlgorithm::Crc32IsoHdlc).as_str() {
         "x86_64-avx512-vpclmulqdq" => CRC_VPCLMUL_512,
         "x86_64-avx512-pclmulqdq" => CRC_PCLMUL_512,
-        "x86_64-sse-pclmulqdq" => CRC_PCLMUL_128,
+        "x86_64-avx2-vpclmulqdq" => CRC_VPCLMUL_256,
+        "x86_64-sse-pclmulqdq" | "x86-sse-pclmulqdq" => CRC_PCLMUL_128,
         "aarch64-neon-pmull-sha3" => CRC_PMULL_SHA3,
         "aarch64-neon-pmull" => CRC_PMULL,
         _ => CRC_TABLES,
@@ -232,11 +233,7 @@ fn crc_fast_kernel() -> &'static str {
 }
 
 fn yenc_crc_kernel(_read_env: bool) -> &'static str {
-    if weaver_yenc::crc::wide_fold_selected() {
-        CRC_VPCLMUL_256
-    } else {
-        crc_fast_kernel()
-    }
+    crc_turbo_kernel()
 }
 
 // par2-rs and unrar-rs carry the same fold behind the same gate.
@@ -257,7 +254,12 @@ fn rarpar_crc_kernel(read_env: bool) -> &'static str {
         }
     }
     let _ = read_env;
-    crc_fast_kernel()
+    // The rest is crc-fast's pick, which has no 256-bit tier: where crc-turbo
+    // folds 256 wide, crc-fast drops to SSE.
+    match crc_turbo_kernel() {
+        CRC_VPCLMUL_256 => CRC_PCLMUL_128,
+        kernel => kernel,
+    }
 }
 
 // --- GF(2^16) --------------------------------------------------------------

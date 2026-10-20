@@ -4337,7 +4337,7 @@ fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileCh
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
     let mut md5 = par2_rs::checksum::FileHashState::new();
-    let mut crc32 = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    let mut crc32 = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
     let mut buffer = [0u8; 256 * 1024];
     loop {
         let bytes_read = file.read(&mut buffer)?;

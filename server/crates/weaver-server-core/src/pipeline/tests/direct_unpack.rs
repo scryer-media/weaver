@@ -40,7 +40,7 @@ fn signature_header(next_header_offset: u64, next_header_size: u64) -> [u8; 32] 
     header[7] = 4;
     header[12..20].copy_from_slice(&next_header_offset.to_le_bytes());
     header[20..28].copy_from_slice(&next_header_size.to_le_bytes());
-    let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, &header[12..32]) as u32;
+    let crc = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &header[12..32]) as u32;
     header[8..12].copy_from_slice(&crc.to_le_bytes());
     header
 }

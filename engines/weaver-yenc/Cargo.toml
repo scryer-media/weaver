@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
-crc-fast = { workspace = true }
+crc-turbo = { workspace = true }
 memchr = { workspace = true }
 
 [build-dependencies]
@@ -36,8 +36,3 @@ name = "rapidyenc_parity"
 path = "benches/rapidyenc_parity.rs"
 harness = false
 
-
-[[bench]]
-name = "crc_combine"
-path = "benches/crc_combine.rs"
-harness = false

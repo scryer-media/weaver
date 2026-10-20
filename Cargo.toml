@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 bytes = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false }
 async-graphql = { version = "7.2", default-features = false, features = ["chrono"] }
-crc-fast = { version = "1.10", default-features = false, features = ["std"] }
+crc-turbo = { version = "1.11", default-features = false, features = ["std"] }
 md-5 = { version = "0.11", default-features = false, features = ["alloc"] }
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
 blake2s_simd = { version = "1.0", default-features = false, features = ["std"] }
@@ -181,6 +181,10 @@ overflow-checks = true
 [profile.test.package.weaver-yenc]
 opt-level = 3
 
+[profile.test.package.crc-turbo]
+opt-level = 3
+
+# rarpar still hashes through crc-fast.
 [profile.test.package.crc-fast]
 opt-level = 3
 

@@ -3884,7 +3884,7 @@ fn read_restart_seeded_runs(
             }
         };
         file.seek(SeekFrom::Start(run.logical_offset))?;
-        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        let mut hasher = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
         let mut remaining = run.len;
         while remaining > 0 {
             let want = (remaining.min(buffer.len() as u64)) as usize;

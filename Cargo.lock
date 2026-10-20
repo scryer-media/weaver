@@ -1314,6 +1314,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc-turbo"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe9845f8267cd17ae1edacec5cd2bc0f8b891d1946db64d929209170fcf7e9b8"
+dependencies = [
+ "digest 0.10.7",
+ "spin 0.10.1",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6137,7 +6147,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "chrono",
- "crc-fast",
+ "crc-turbo",
  "criterion",
  "crossbeam-queue",
  "filetime",
@@ -6220,7 +6230,7 @@ name = "weaver-yenc"
 version = "0.16.2"
 dependencies = [
  "cc",
- "crc-fast",
+ "crc-turbo",
  "criterion",
  "libloading",
  "memchr",

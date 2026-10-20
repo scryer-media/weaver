@@ -1161,9 +1161,10 @@ mod tests {
             .position(|part| part == [0x21, 0x21, 1, 8])
             .expect("one LZMA2 coder with a 64 KiB dictionary");
         bytes[header + coder + 3] = 40; // A valid 4 GiB advertised dictionary.
-        let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, &bytes[header..]) as u32;
+        let crc =
+            crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &bytes[header..]) as u32;
         bytes[28..32].copy_from_slice(&crc.to_le_bytes());
-        let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, &bytes[12..32]) as u32;
+        let crc = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &bytes[12..32]) as u32;
         bytes[8..12].copy_from_slice(&crc.to_le_bytes());
         let (paths, coverage, end_header) = source(temp.path(), &bytes);
         let context = test_context(temp.path(), bytes.len() as u64, end_header);
@@ -1321,7 +1322,7 @@ mod tests {
             }
         }
         fn crc(bytes: &[u8]) -> u32 {
-            crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
+            crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
         }
         let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
         writer.set_encrypt_header(false);
