@@ -281,14 +281,14 @@ export function DownloadInspector({
           <SupportReportActions
             jobId={job.id}
             onReport={setNotice}
-            className="min-w-0 flex-1 justify-center"
+            className="flex-auto justify-center"
           />
         </div>
         {notice === null ? null : <div className="text-[12px] text-wv-muted">{notice}</div>}
         <div className="flex flex-wrap gap-[10px]">
           <SecondaryButton
             icon={isPaused ? "resume" : "pause"}
-            className="flex-1 justify-center"
+            className="flex-auto justify-center"
             onClick={() => {
               setFailure(null);
               void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })).then(settle);
@@ -298,7 +298,7 @@ export function DownloadInspector({
           </SecondaryButton>
           <SecondaryButton
             icon="topOfQueue"
-            className="flex-1 justify-center"
+            className="flex-auto justify-center"
             onClick={() => {
               setFailure(null);
               void updateJobs({ ids: [job.id], priority: "HIGH" }).then(settle);
