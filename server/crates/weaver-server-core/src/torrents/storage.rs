@@ -58,7 +58,7 @@ pub(crate) struct TorrentJob {
 }
 
 impl TorrentJob {
-    pub(crate) fn new(
+    pub(super) fn new(
         job: GraphJob<PieceRoot>,
         repairs: Arc<Mutex<RepairSlots>>,
         signal: Arc<Signal>,
