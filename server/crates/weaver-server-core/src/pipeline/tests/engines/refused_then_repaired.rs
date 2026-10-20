@@ -18,13 +18,14 @@ use weaver_graph::{MemberId, NodeId, Why};
 
 use super::harness::{
     ARTICLE, JOB, Post, Scenario, admit, collect, finished, par2_volumes, par2_volumes_sliced,
-    serve,
+    par3_set, serve,
 };
 use super::rar::delivered;
 use super::sevenz;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::Pipeline;
 use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::tests::{
     debug_job_state, hear_graph_mail, job_status_for_assert, pump_pipeline_runtime_queues,
     rar5_fixture_bytes, retire_pipeline_database,
@@ -45,6 +46,10 @@ fn posts() -> Vec<Post> {
     let mut posts = vec![Post::plain("mixed.rar", posted)];
     posts.extend(par2_volumes("mixed", &[("mixed.rar", &original)], 2, 1));
     posts
+}
+
+fn articles_of(scenario: &Scenario, file: usize) -> u32 {
+    scenario.posts[file].bytes.len().div_ceil(scenario.article) as u32
 }
 
 fn articles(post: &Post) -> u32 {
@@ -190,6 +195,27 @@ pub(super) async fn serve_posts(
             pump_pipeline_runtime_queues(pipeline).await;
         }
     }
+}
+
+// Hear every run of the job while the repair that is out runs: what the
+// repair came back with is kept, unheard, until no run is live.
+async fn runs_before_the_repair(pipeline: &mut Pipeline) -> Said {
+    assert!(
+        job(pipeline).repair_out(),
+        "{}",
+        debug_job_state(pipeline, JOB)
+    );
+    let mut repaired = None;
+    while repaired.is_none() || job(pipeline).runs().live() {
+        let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+        if matches!(said.heard, Heard::Repaired(_)) {
+            repaired = Some(said);
+        } else {
+            pipeline.graph_run_said(said);
+            pump_pipeline_runtime_queues(pipeline).await;
+        }
+    }
+    repaired.expect("the repair came back")
 }
 
 // Hear the job's runs until none is out.
@@ -342,6 +368,73 @@ async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_re
     serve_posts(&mut pipeline, &scenario, 0..3).await;
     until_no_run(&mut pipeline).await;
     serve_posts(&mut pipeline, &scenario, 3..5).await;
+    hear_graph_mail(&mut pipeline, JOB).await;
+    assert_eq!(
+        outcomes(&pipeline),
+        [Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+
+    drive_to_finish(&mut pipeline, &scenario).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+
+    assert_eq!(status, Some(JobStatus::Complete), "{:?}", files.keys());
+    let expected = sevenz::members();
+    assert_eq!(
+        files.keys().cloned().collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(name, _)| delivered(name))
+            .collect::<Vec<_>>()
+    );
+    for (name, bytes) in expected {
+        assert!(files[&delivered(name)] == bytes, "{name} bytes");
+    }
+}
+
+// An LZMA2 7z with the last slice of its coded stream zeroed before
+// posting, and a PAR3 index and volumes made over it as it was. Everything
+// but the archive's second article is in before the set's repair goes out;
+// the engine writes the first member and refuses the archive on the zeroed
+// slice while the repair runs. The refusal moved what the repair read, so
+// the set is rebuilt from its facts, hears its volumes again from their
+// files, repairs the slice, the archive is read again whole, and the job
+// completes.
+#[tokio::test]
+async fn an_lzma2_7z_whose_engine_read_damage_before_its_par3_set_repaired_it_delivers_under_graph()
+{
+    let original = sevenz::container(Lzma2Options::from_level(1).into(), None);
+    let mut posted = original.clone();
+    let quill = sevenz::packed_end(&original) / ARTICLE - 1;
+    posted[quill * ARTICLE..(quill + 1) * ARTICLE].fill(0);
+    let mut posts = vec![Post::plain("lantern.7z", posted)];
+    posts.extend(par3_set("lantern", &[("lantern.7z", &original)], 4));
+    let count = posts.len() as u32;
+    let scenario = Scenario::new(posts);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
+    while pipeline
+        .jobs
+        .get_mut(&JOB)
+        .and_then(|state| state.download_queue.pop())
+        .is_some()
+    {}
+
+    serve_posts(&mut pipeline, &scenario, 1..count).await;
+    let last = articles_of(&scenario, 0);
+    for ordinal in std::iter::once(0).chain(2..last) {
+        serve(&mut pipeline, &scenario, (0, ordinal)).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    serve(&mut pipeline, &scenario, (0, 1)).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    let repaired = runs_before_the_repair(&mut pipeline).await;
+    assert_eq!(
+        job(&pipeline).writer().refused(NodeId::ROOT, MemberId(0)),
+        Some(Why::Unrepairable)
+    );
+    pipeline.graph_run_said(repaired);
     hear_graph_mail(&mut pipeline, JOB).await;
     assert_eq!(
         outcomes(&pipeline),

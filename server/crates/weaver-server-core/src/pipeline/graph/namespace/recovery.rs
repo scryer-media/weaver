@@ -391,14 +391,15 @@ impl NamespaceWriter {
     // A lent repair came back. The object takes its node again and hears
     // what reached it while it was out. When the loop moved something the
     // repair read, its ruling was made on bytes that are not there now: the
-    // object is rebuilt as it left, from the facts its node kept, and the
-    // set is due again. Otherwise what it came to is applied: the ranges it
-    // repaired come back through the one write path as repaired bytes, so a
-    // leaf is overwritten and a bound member's object takes them as any
-    // delivery. A member whose bytes it rewrote or proved is offered again
-    // once applied, so whatever refused it on the bytes it held before
-    // reads it as it is now. An object that keeps no facts cannot be
-    // rebuilt as it left, so its ruling is applied as it came.
+    // object is rebuilt as it left, from the facts its node kept and its
+    // volumes' files, and the set is due again. Otherwise what it came to
+    // is applied: the ranges it repaired come back through the one write
+    // path as repaired bytes, so a leaf is overwritten and a bound member's
+    // object takes them as any delivery. A member whose bytes it rewrote or
+    // proved is offered again once applied, so whatever refused it on the
+    // bytes it held before reads it as it is now. An object that keeps no
+    // facts cannot be rebuilt as it left, so its ruling is applied as it
+    // came.
     pub(crate) fn returned(
         &mut self,
         tree: &mut Tree,
@@ -431,7 +432,18 @@ impl NamespaceWriter {
         let mut effects = Vec::new();
         if let Some(rebuilt) = rebuilt {
             tree.take_back(set, rebuilt, &mut self.placing(builder), &mut effects);
-            return self.apply_all(tree, builder, segments, effects, out);
+            self.apply_all(tree, builder, segments, effects, out)?;
+            // Facts keep no bytes of the volumes: the object hears them
+            // again from their files, as a restored one hears them again
+            // from the articles.
+            let volumes: Vec<(NodeId, MemberId)> = tree
+                .volumes(set)
+                .map(|(parent, volumes)| volumes.values().map(|member| (parent, *member)).collect())
+                .unwrap_or_default();
+            for (parent, member) in volumes {
+                self.replay_file(tree, builder, segments, parent, member, out)?;
+            }
+            return Ok(());
         }
         tree.take_back(set, object, &mut self.placing(builder), &mut effects);
         self.apply_all(tree, builder, segments, effects, out)?;

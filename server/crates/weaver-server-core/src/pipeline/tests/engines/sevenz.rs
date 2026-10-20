@@ -37,7 +37,7 @@ pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
 
 // One container of `members()` coded by `method`, enciphered under
 // `password` when there is one.
-fn container(method: EncoderConfiguration, password: Option<&str>) -> Vec<u8> {
+pub(super) fn container(method: EncoderConfiguration, password: Option<&str>) -> Vec<u8> {
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
     let mut methods = vec![method];
     if let Some(password) = password {
@@ -609,7 +609,7 @@ async fn an_lzma2_7z_served_last_article_first_delivers_alike_in_every_frame_siz
 
 // The packed streams end where the end header starts, which the signature
 // header names.
-fn packed_end(archive: &[u8]) -> usize {
+pub(super) fn packed_end(archive: &[u8]) -> usize {
     32 + u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize
 }
 
