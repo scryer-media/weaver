@@ -1714,11 +1714,29 @@ impl Pipeline {
 
     pub(crate) async fn restore_job(
         &mut self,
-        request: RestoreJobRequest,
+        mut request: RestoreJobRequest,
     ) -> Result<(), crate::SchedulerError> {
         if self.jobs.contains_key(&request.job_id) {
             return Err(crate::SchedulerError::JobExists(request.job_id));
         }
+        // The status the job goes back to when unpaused: the stored one, else
+        // the one its stored download and post states name. Read here once,
+        // so the job installs with it whether its restore succeeds or blocks.
+        request.paused_resume_status = Self::normalize_paused_resume_status(
+            request.paused_resume_status.take().or_else(|| {
+                request
+                    .paused_resume_download_state
+                    .zip(request.paused_resume_post_state)
+                    .map(|(download_state, post_state)| {
+                        crate::jobs::model::derive_legacy_job_status(
+                            download_state,
+                            post_state,
+                            crate::jobs::model::RunState::Active,
+                            None,
+                        )
+                    })
+            }),
+        );
         let original = request.clone();
         match self.restore_job_inner(request).await {
             Ok(()) => {
@@ -2106,22 +2124,8 @@ impl Pipeline {
 
         let queue_depth = download_queue.len() + recovery_queue.len();
         let paused_resume_status = matches!(status, JobStatus::Paused)
-            .then(|| {
-                paused_resume_status.clone().or_else(|| {
-                    paused_resume_download_state
-                        .zip(paused_resume_post_state)
-                        .map(|(download_state, post_state)| {
-                            crate::jobs::model::derive_legacy_job_status(
-                                download_state,
-                                post_state,
-                                crate::jobs::model::RunState::Active,
-                                None,
-                            )
-                        })
-                })
-            })
+            .then_some(paused_resume_status)
             .flatten();
-        let paused_resume_status = Self::normalize_paused_resume_status(paused_resume_status);
         let restored_staging_dir = {
             let staging_dir = self.deterministic_extraction_staging_dir(job_id);
             tokio::fs::try_exists(&staging_dir)
