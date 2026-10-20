@@ -433,6 +433,7 @@ async fn a_placement_overtaken_by_a_demotion_is_dropped_and_its_article_handed_b
 
     settle_direct_demotion_work(&mut pipeline).await;
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
 
     // Handed back conventionally: written into the volume and committed there,
     // and not fetched a second time.
@@ -500,6 +501,7 @@ async fn a_placement_task_that_panics_fails_its_placement_and_hands_the_article_
     hold.add_permits(1);
     settle_direct_demotion_work(&mut pipeline).await;
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
 
     assert!(pipeline.direct_placement_lanes.is_empty());
     assert!(

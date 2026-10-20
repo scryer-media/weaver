@@ -98,8 +98,8 @@ async fn parked_damage_masks_accepted_and_reconstructed_ranges_after_reset() {
         assert_eq!(buffer.buffered_len(), 1, "clean tail remains parked");
         pipeline
             .persist_ready_segments(file_id, ready, contiguous_end)
-            .await
-            .unwrap();
+            .await;
+        pipeline.settle_all_segment_writes().await;
         assert_eq!(
             std::fs::read(&path).unwrap(),
             if reconstructed {
@@ -379,6 +379,7 @@ async fn deliver_declared(
             },
         )
         .await;
+    settle_segment_write_work(pipeline).await;
     settle_direct_demotion_work(pipeline).await;
 }
 
@@ -415,6 +416,7 @@ async fn sparse_segment_list_commits_every_listed_article_and_flags_the_hole() {
     // The hole keeps the tail articles out of the contiguous run, so they
     // settle through the quiescent drain rather than in stream.
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     assert!(
         pipeline.segment_terminal_states.is_empty(),
         "no listed article may be abandoned"
@@ -635,6 +637,7 @@ async fn exhausted_damage_keeps_bytes_but_never_success_or_restart_coverage() {
     deliver(&mut pipeline, file_id, 0, 0, b"bad!", false).await;
     deliver(&mut pipeline, file_id, 1, 4, b"tail", true).await;
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     pipeline.note_file_progress_floor(file_id, 8, false);
     assert_eq!(std::fs::read(path).unwrap(), b"bad!tail");
     let file = pipeline.jobs[&file_id.job_id]
@@ -804,6 +807,7 @@ async fn restart_refetches_retained_damage_and_overwrites_it() {
     deliver(&mut pipeline, file_id, 0, 0, b"bad!", false).await;
     deliver(&mut pipeline, file_id, 1, 4, b"tail", true).await;
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     pipeline
         .flush_file_progress_batch_awaited("test.restart")
         .await
@@ -982,6 +986,7 @@ async fn restart_partial(mut pipeline: Pipeline, temp: &TempDir, file_id: NzbFil
     let spec = pipeline.jobs[&job_id].spec.clone();
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     pipeline
         .flush_file_progress_batch_awaited("test.yenc_restart")
         .await
@@ -1101,6 +1106,7 @@ async fn restart_checkpoint_preserves_good_prefix_but_cannot_conceal_a_gap() {
         // The restore cursor is conservatively rounded in encoded units;
         // exercise the actor's quiescent drain before observing disk state.
         pipeline.flush_quiescent_write_backlog().await;
+        pipeline.settle_all_segment_writes().await;
         let file = pipeline.jobs[&file_id.job_id]
             .assembly
             .file(file_id)
@@ -1222,6 +1228,8 @@ async fn real_wire_crc32_only_retry_clears_damage_through_every_adapter() {
                 pipeline.handle_decode_done(done).await;
                 drop(held);
             }
+            // The damaged bytes reach the disk before the retry is asked for.
+            settle_segment_write_work(&mut pipeline).await;
             if !valid {
                 let retry = pipeline.retry_rx.recv().await.unwrap();
                 assert_eq!(retry.work.segment_id, segment_id);
@@ -1494,6 +1502,7 @@ async fn deliver_unanchored_status(
             },
         )
         .await;
+    settle_segment_write_work(pipeline).await;
     settle_direct_demotion_work(pipeline).await;
 }
 
@@ -1718,6 +1727,7 @@ async fn deliver_damaged_declaring(
             },
         )
         .await;
+    settle_segment_write_work(pipeline).await;
     settle_direct_demotion_work(pipeline).await;
 }
 
@@ -1745,6 +1755,7 @@ async fn a_held_article_anchors_on_the_range_a_given_up_predecessor_declared() {
     // Three bytes of a five-byte range: the header still knows the range.
     deliver_damaged_declaring(&mut pipeline, file_id, 0, 0, 5, 16, b"bad").await;
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
 
     assert_eq!(
         pipeline.segment_terminal_states.get(&head),
@@ -1784,6 +1795,7 @@ async fn a_clean_replacement_outranks_the_range_damaged_bytes_declared() {
 
     deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     assert!(pipeline.unanchored_parked.is_empty());
     assert_eq!(std::fs::read(&path).unwrap(), b"headtail");
     let file = pipeline.jobs[&file_id.job_id]
@@ -1843,6 +1855,7 @@ async fn a_run_held_behind_settled_damage_releases_in_order() {
     pipeline.decode_retries.insert(head, MAX_SEGMENT_RETRIES);
     deliver_damaged_declaring(&mut pipeline, file_id, 0, 0, 4, 36, b"aa").await;
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
 
     assert!(pipeline.unanchored_parked.is_empty());
     assert_eq!(std::fs::read(&path).unwrap(), b"aa\0\0bbbbcccc");
@@ -1936,4 +1949,88 @@ async fn a_body_cut_short_without_a_range_anchors_nothing() {
         .unwrap();
     assert_eq!(file.placement_of(1), None);
     assert!(file.segment_damage_is_truncation_only(0));
+}
+
+// A decode's landing hands its bytes to the disk owner and returns: the
+// commit runs when the owner's answer comes back as a message, never on a
+// wait of the pipeline task.
+#[tokio::test]
+async fn decoded_segment_commits_when_its_write_lands() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40230, &[4, 4]).await;
+    let bytes = b"head";
+    pipeline
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number: 0,
+                },
+                raw_size: 4,
+                encoding: SegmentEncoding::Yenc,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 8,
+                    part: Some(1),
+                    total: Some(2),
+                    begin: Some(1),
+                    end: Some(4),
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: par2_rs::checksum::crc32(bytes),
+                truncation_suspected: false,
+                expected_file_crc: None,
+                data: DecodedChunk::from(bytes.to_vec()),
+                yenc_name: "sample.bin".to_owned(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                segments: vec![weaver_yenc::Segment {
+                    file_offset: 0,
+                    len: 4,
+                    crc32: par2_rs::checksum::crc32(bytes),
+                }],
+            },
+            SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        )
+        .await;
+
+    // Back with the write out: one ticket, its bytes still counted, nothing
+    // committed, and the decode stage not drained.
+    assert_eq!(
+        pipeline
+            .segment_writes
+            .values()
+            .map(|tickets| tickets.len())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(pipeline.write_buffered_bytes, 4);
+    assert_eq!(pipeline.write_inflight_bytes, 4);
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        0
+    );
+    assert!(pipeline.has_pending_segment_writes(file_id.job_id));
+    assert!(!pipeline.job_decode_stage_drained(file_id.job_id));
+
+    // The owner's answer arrives as a message, and its landing commits.
+    let done = pipeline
+        .segment_write_done_rx
+        .recv()
+        .await
+        .expect("the segment write channel stays open");
+    assert!(done.file_id == file_id);
+    pipeline.handle_segment_write_done(done).await;
+
+    assert!(pipeline.segment_writes.is_empty());
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.write_inflight_bytes, 0);
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"head");
+    assert!(pipeline.job_decode_stage_drained(file_id.job_id));
 }
