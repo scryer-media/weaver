@@ -50,7 +50,7 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         infohash_v2: hash(row, "infohash_v2")?,
         name: row.text("name")?,
         source: TorrentSource::parse(&source).ok_or_else(|| corrupt("source", &source))?,
-        metainfo: row.opt_bytes("metainfo")?,
+        metainfo: row.opt_bytes("metainfo")?.map(bytes::Bytes::from),
         private: row.bool("private")?,
         category_id: opt_u32(row, "category_id")?,
         added_at_ms: row.i64("added_at_ms")?,

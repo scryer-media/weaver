@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
+use bytes::Bytes;
 use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::{LimitKind, LimitsConfig};
 use librqbit::{
@@ -573,7 +574,6 @@ struct Live {
     record: TorrentRecord,
     names: Vec<String>,
     total: u64,
-    metainfo: Option<Vec<u8>>,
     layout: Option<Arc<PieceLayout>>,
     job: Option<Arc<TorrentJob>>,
     intake: Option<Arc<Intake>>,
@@ -631,7 +631,6 @@ impl Live {
             record,
             names: Vec::new(),
             total: 0,
-            metainfo: None,
             layout: None,
             job: None,
             intake: None,
@@ -1381,7 +1380,7 @@ impl TorrentService {
 
     // The torrent's job, over the metainfo. Whether it unpacks is fixed
     // here and kept, so a restart builds the same tree.
-    fn give_metainfo(&self, torrent: &mut Live, bytes: Vec<u8>, parsed: &Parsed) {
+    fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) {
         let job_id = torrent.record.job_id;
         let unpack = self.settings().unpack(&torrent.record, &self.rules());
         if torrent.record.unpack.is_none() {
@@ -1398,7 +1397,6 @@ impl TorrentService {
         torrent.file_have = job.with(|job| job.file_have());
         torrent.job = Some(job);
         torrent.intake = Some(intake);
-        torrent.metainfo = Some(bytes);
         torrent.about = parsed.about.clone();
     }
 
@@ -1432,6 +1430,7 @@ impl TorrentService {
         };
         match request.source.clone() {
             AddSource::Metainfo(bytes) => {
+                let bytes = Bytes::from(bytes);
                 let parsed = parse(&bytes)?;
                 self.admit(&parsed.manifest)?;
                 self.duplicate(Infohash::V1(parsed.infohash))?;
@@ -1446,7 +1445,7 @@ impl TorrentService {
                     parsed.infohash,
                     parsed.manifest.name.clone(),
                     TorrentSource::Metainfo,
-                    Some(bytes.clone()),
+                    Some(bytes),
                     parsed.private,
                     Some(dir.clone()),
                 );
@@ -1455,7 +1454,7 @@ impl TorrentService {
                     return Err(error);
                 }
                 let mut torrent = Live::new(record, TorrentCounters::default());
-                self.give_metainfo(&mut torrent, bytes, &parsed);
+                self.give_metainfo(&mut torrent, &parsed);
                 self.inner.live.lock().await.insert(job_id, torrent);
                 self.apply_queue().await;
                 self.attach(job_id).await;
@@ -1579,7 +1578,7 @@ impl TorrentService {
         infohash: [u8; 20],
         name: String,
         source: TorrentSource,
-        metainfo: Option<Vec<u8>>,
+        metainfo: Option<Bytes>,
         private: bool,
         storage_dir: Option<String>,
     ) -> TorrentRecord {
@@ -1643,7 +1642,7 @@ impl TorrentService {
                 )
                 .await;
             let bytes = match listed {
-                Ok(AddTorrentResponse::ListOnly(listed)) => listed.torrent_bytes.to_vec(),
+                Ok(AddTorrentResponse::ListOnly(listed)) => listed.torrent_bytes,
                 Ok(_) => {
                     service
                         .fail(job_id, "the session did not return the metainfo".into())
@@ -1661,7 +1660,7 @@ impl TorrentService {
         }));
     }
 
-    async fn resolved(&self, job_id: JobId, bytes: Vec<u8>) -> Result<(), AddError> {
+    async fn resolved(&self, job_id: JobId, bytes: Bytes) -> Result<(), AddError> {
         let parsed = parse(&bytes)?;
         self.admit(&parsed.manifest)?;
         let settings = self.settings();
@@ -1707,7 +1706,7 @@ impl TorrentService {
                 &parsed.trackers,
             )
             .map_err(|error| AddError::State(state_error(error)))?;
-        self.give_metainfo(torrent, bytes, &parsed);
+        self.give_metainfo(torrent, &parsed);
         drop(live);
         self.attach(job_id).await;
         Ok(())
@@ -1769,7 +1768,7 @@ impl TorrentService {
                 return;
             }
             let (Some(bytes), Some(layout), Some(intake), Some(job)) = (
-                torrent.metainfo.clone(),
+                torrent.record.metainfo.clone(),
                 torrent.layout.clone(),
                 torrent.intake.clone(),
                 torrent.job.as_ref(),
@@ -2195,8 +2194,7 @@ impl TorrentService {
             let mut torrent = Live::new(record.clone(), counters);
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
-                    let bytes = record.metainfo.clone().unwrap_or_default();
-                    self.give_metainfo(&mut torrent, bytes, &parsed);
+                    self.give_metainfo(&mut torrent, &parsed);
                     self.inner.live.lock().await.insert(job_id, torrent);
                 }
                 Some(Err(error)) => {

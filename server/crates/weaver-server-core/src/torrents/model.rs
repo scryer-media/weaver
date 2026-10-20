@@ -120,7 +120,9 @@ pub struct TorrentRecord {
     pub infohash_v2: Option<[u8; 32]>,
     pub name: String,
     pub source: TorrentSource,
-    pub metainfo: Option<Vec<u8>>,
+    /// The one copy of the metainfo: the job's tree and the session's
+    /// torrent are made from views of it.
+    pub metainfo: Option<bytes::Bytes>,
     pub private: bool,
     pub category_id: Option<u32>,
     pub added_at_ms: i64,

@@ -65,7 +65,7 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
     let db = Database::open_in_memory().unwrap();
     let mut record = torrent(7, Some([1; 20]), Some([2; 32]));
     record.source = TorrentSource::Metainfo;
-    record.metainfo = Some(b"d4:infod4:name1:aee".to_vec());
+    record.metainfo = Some(bytes::Bytes::from_static(b"d4:infod4:name1:aee"));
     record.private = true;
     record.forced = true;
     record.category_id = Some(4);

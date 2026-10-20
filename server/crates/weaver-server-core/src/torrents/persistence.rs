@@ -32,7 +32,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptBytes(torrent.infohash_v2.map(|hash| hash.to_vec())),
         SqlArg::Text(torrent.name.clone()),
         SqlArg::Text(torrent.source.as_str().to_string()),
-        SqlArg::OptBytes(torrent.metainfo.clone()),
+        SqlArg::OptBytes(torrent.metainfo.as_deref().map(<[u8]>::to_vec)),
         SqlArg::Bool(torrent.private),
         SqlArg::OptI64(torrent.category_id.map(i64::from)),
         SqlArg::I64(torrent.added_at_ms),
