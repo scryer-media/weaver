@@ -25,17 +25,18 @@ const (
 // the harness reads the same value the product read.
 const weaverEngineEnv = "WEAVER_ENGINE"
 
-// engineUnderTest is the engine this harness process tests: `graph` when
-// WEAVER_ENGINE says so, the classic engine for anything else, unset included.
+// engineUnderTest is the engine this harness process tests: `classic` when
+// WEAVER_ENGINE says so, the graph engine for anything else, unset included,
+// as weaver itself reads the switch.
 func engineUnderTest() weaverEngine {
 	return parseWeaverEngine(os.Getenv(weaverEngineEnv))
 }
 
 func parseWeaverEngine(value string) weaverEngine {
-	if strings.EqualFold(strings.TrimSpace(value), string(engineGraph)) {
-		return engineGraph
+	if strings.EqualFold(strings.TrimSpace(value), string(engineClassic)) {
+		return engineClassic
 	}
-	return engineClassic
+	return engineGraph
 }
 
 // The graph engine's observability lines, one per fact, each carrying

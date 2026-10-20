@@ -761,11 +761,11 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
 }
 
 #[test]
-fn parse_defaults_to_classic_when_unset_or_blank() {
-    assert_eq!(Engine::parse(None), Engine::Classic);
-    assert_eq!(Engine::parse(Some("")), Engine::Classic);
-    assert_eq!(Engine::parse(Some("  ")), Engine::Classic);
-    assert_eq!(Engine::default(), Engine::Classic);
+fn parse_defaults_to_graph_when_unset_or_blank() {
+    assert_eq!(Engine::parse(None), Engine::Graph);
+    assert_eq!(Engine::parse(Some("")), Engine::Graph);
+    assert_eq!(Engine::parse(Some("  ")), Engine::Graph);
+    assert_eq!(Engine::default(), Engine::Graph);
 }
 
 #[test]
@@ -783,9 +783,9 @@ fn parse_ignores_case() {
 }
 
 #[test]
-fn parse_falls_back_to_classic_on_an_unknown_value() {
-    assert_eq!(Engine::parse(Some("turbo")), Engine::Classic);
-    assert_eq!(Engine::parse(Some("graph2")), Engine::Classic);
+fn parse_falls_back_to_graph_on_an_unknown_value() {
+    assert_eq!(Engine::parse(Some("turbo")), Engine::Graph);
+    assert_eq!(Engine::parse(Some("graph2")), Engine::Graph);
 }
 
 #[test]

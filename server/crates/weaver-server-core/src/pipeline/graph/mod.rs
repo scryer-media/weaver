@@ -29,8 +29,8 @@ const ENGINE_VARIABLE: &str = "WEAVER_ENGINE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Engine {
-    #[default]
     Classic,
+    #[default]
     Graph,
 }
 
@@ -64,20 +64,20 @@ impl Engine {
 
     // The decision behind `from_environment`, apart from the process
     // environment so tests can drive it without setting a global variable.
-    // Unset or blank is classic; an unknown value is classic too, with a
-    // warning, so a typo never stops the server from starting.
+    // Unset or blank is graph, the one engine; an unknown value is graph
+    // too, with a warning, so a typo never stops the server from starting.
     pub fn parse(value: Option<&str>) -> Self {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-            return Self::Classic;
+            return Self::Graph;
         };
         match value.parse() {
             Ok(engine) => engine,
             Err(UnknownEngine(value)) => {
                 tracing::warn!(
                     value = %value,
-                    "{ENGINE_VARIABLE} is not classic or graph; new jobs use the classic engine"
+                    "{ENGINE_VARIABLE} is not classic or graph; new jobs use the graph engine"
                 );
-                Self::Classic
+                Self::Graph
             }
         }
     }

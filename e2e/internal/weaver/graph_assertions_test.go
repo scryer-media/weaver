@@ -34,9 +34,10 @@ func TestEngineUnderTestReadsWeaverEngine(t *testing.T) {
 		value string
 		want  weaverEngine
 	}{
-		{value: "", want: engineClassic},
+		{value: "", want: engineGraph},
 		{value: "classic", want: engineClassic},
-		{value: "pipeline", want: engineClassic},
+		{value: " ClAsSiC ", want: engineClassic},
+		{value: "pipeline", want: engineGraph},
 		{value: "graph", want: engineGraph},
 		{value: " GRAPH ", want: engineGraph},
 	} {
@@ -46,8 +47,8 @@ func TestEngineUnderTestReadsWeaverEngine(t *testing.T) {
 		}
 	}
 	os.Unsetenv(weaverEngineEnv)
-	if got := engineUnderTest(); got != engineClassic {
-		t.Fatalf("unset WEAVER_ENGINE: engine = %q, want classic", got)
+	if got := engineUnderTest(); got != engineGraph {
+		t.Fatalf("unset WEAVER_ENGINE: engine = %q, want graph", got)
 	}
 }
 
@@ -650,8 +651,8 @@ func TestFileIdentityRewriteObserverReadsTheGraphLog(t *testing.T) {
 	}
 }
 
-// The engine-keyed fields take over only for the engine they name; with
-// WEAVER_ENGINE unset every scenario reads exactly as before.
+// The engine-keyed fields take over only for the engine they name; under
+// classic every scenario reads exactly as before.
 func TestScenarioExpectationsAreEngineKeyed(t *testing.T) {
 	scenario := &Scenario{
 		ExpectedOutcome:               "extraction_failure",
@@ -659,11 +660,11 @@ func TestScenarioExpectationsAreEngineKeyed(t *testing.T) {
 		ExpectedOutcomeByEngine:       map[string]string{"graph": "success"},
 		ExpectedErrorContainsByEngine: map[string]string{"graph": "graph wording"},
 	}
-	t.Setenv(weaverEngineEnv, "")
+	t.Setenv(weaverEngineEnv, "classic")
 	if scenario.expectedOutcome() != "extraction_failure" || scenario.expectedErrorContains() != "classic wording" {
 		t.Fatalf("classic expectations = %q / %q", scenario.expectedOutcome(), scenario.expectedErrorContains())
 	}
-	t.Setenv(weaverEngineEnv, "graph")
+	os.Unsetenv(weaverEngineEnv)
 	if scenario.expectedOutcome() != "success" || scenario.expectedErrorContains() != "graph wording" {
 		t.Fatalf("graph expectations = %q / %q", scenario.expectedOutcome(), scenario.expectedErrorContains())
 	}
@@ -704,9 +705,9 @@ func TestEngineKeyedScenarioFiles(t *testing.T) {
 	}
 }
 
-// With WEAVER_ENGINE unset the assertions read the classic lines and nothing
-// else: a log holding only graph lines fails them, the classic lines pass.
-// With it set to graph the same assertions read the graph lines, and the
+// Under classic the assertions read the classic lines and nothing else: a log
+// holding only graph lines fails them, the classic lines pass. With
+// WEAVER_ENGINE unset the same assertions read the graph lines, and the
 // direct-store one is judged without the classic gate.
 func TestRuntimeAssertionsFollowTheEngineUnderTest(t *testing.T) {
 	runDir := t.TempDir()
@@ -737,7 +738,7 @@ func TestRuntimeAssertionsFollowTheEngineUnderTest(t *testing.T) {
 	}
 	graphImpossible := graphLine("recovery set ruled", `job_id=70 node=1 kind=par2 set=a.par2 recovery_set_id=aa11 slice_size=65536 blocks_reachable=1 damaged_slices=9 outcome=impossible slices_repaired=0 verification=`)
 
-	os.Unsetenv(weaverEngineEnv)
+	t.Setenv(weaverEngineEnv, "classic")
 	writeLog(graphRuled)
 	wantVerdict(t, assertPar2CleanSettlement(70, settlement), "did not observe set(s): aa11")
 	writeLog(classicLines...)
@@ -749,7 +750,7 @@ func TestRuntimeAssertionsFollowTheEngineUnderTest(t *testing.T) {
 	wantVerdict(t, assertDirectStoreScenario(70, directStore), `did not demote with "par2_damaged"`)
 	t.Setenv("WEAVER_RAR_DIRECT_STORE", "")
 
-	t.Setenv(weaverEngineEnv, "graph")
+	os.Unsetenv(weaverEngineEnv)
 	writeLog(classicLines...)
 	wantVerdict(t, assertPar2CleanSettlement(70, settlement), "no recovery set ruled line for set(s): aa11")
 	writeLog(graphRuled)
