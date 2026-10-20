@@ -4849,9 +4849,49 @@ type Torrent {
 	peers: Int!
 	seeds: Int!
 	leechers: Int!
+	"""
+	The most peers a torrent connects to.
+	"""
+	maxPeers: Int!
+	"""
+	The swarm's seeds and leechers as its trackers last counted them.
+	"""
+	swarmSeeds: Int
+	swarmLeechers: Int
+	"""
+	Seconds until the next tracker announce.
+	"""
+	reannounceSeconds: Int
+	"""
+	Seconds spent running in a session.
+	"""
+	activeSeconds: Int!
+	downloadAvgBps: Int!
+	uploadAvgBps: Int!
+	"""
+	Fetched bytes whose pieces did not verify.
+	"""
+	wastedBytes: Int!
+	"""
+	The last time a complete copy was in reach.
+	"""
+	lastSeenCompleteMs: Int
+	pieceCount: Int
+	pieceSize: Int
+	"""
+	The pieces in hand, verified.
+	"""
+	piecesHave: Int
+	createdBy: String
+	createdAtMs: Int
+	comment: String
 	addedAtMs: Int!
 	completedAtMs: Int
 	storageDir: String
+	"""
+	The folder that holds the torrent's output.
+	"""
+	savePath: String
 	"""
 	The seeding goal still to meet; absent once it is met.
 	"""
