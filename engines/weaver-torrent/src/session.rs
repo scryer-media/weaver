@@ -59,7 +59,7 @@ use crate::{
     stream_connect::{ConnectionKind, ConnectionOptions, StreamConnector, StreamConnectorArgs},
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        TorrentMetadata, TorrentStateLive,
+        RunCounters, TorrentMetadata, TorrentStateLive,
         initializing::{TorrentStateInitializing, normalize_initial_have},
     },
     type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerStream},
@@ -1814,7 +1814,7 @@ impl Session {
             self.announce_tiers(tracker_tiers, is_private),
             Box::new(tracker_rx_stats),
             force_tracker_interval,
-            self.announce_port().unwrap_or(4240),
+            self.announce_port,
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
@@ -2052,35 +2052,34 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             }
         };
         let live = mt.live();
-        let stats = mt.stats();
 
         use crate::torrent_state::stats::TorrentStatsState as TS;
         use crate::tracker::TrackerCommsStatsState as S;
 
-        let torrent_state = match stats.state {
+        let torrent_state = match mt.stats().state {
             TS::Initializing { .. } => S::Initializing,
             TS::Live => S::Live,
             TS::Paused => S::Paused,
             TS::Error => S::None,
         };
-        let last_run = *mt.shared().last_run.lock();
-        match (live, last_run) {
-            // Once a run has ended its counters are gone from the torrent's
-            // state; report the ones recorded as it ended.
-            (None, Some(run)) => crate::tracker::TrackerCommsStats {
-                downloaded_bytes: run.progress_bytes,
-                total_bytes: run.total_bytes,
-                uploaded_bytes: run.uploaded_bytes,
-                torrent_state,
-                finished_during_run: false,
-            },
-            (live, _) => crate::tracker::TrackerCommsStats {
-                downloaded_bytes: stats.progress_bytes,
-                total_bytes: stats.total_bytes,
-                uploaded_bytes: stats.uploaded_bytes,
-                torrent_state,
-                finished_during_run: live.is_some_and(|l| l.finished_during_run()),
-            },
+        // The running run's counters; once it has ended (its pieces are gone
+        // from the live state) the ones recorded as it ended.
+        let run = live
+            .as_ref()
+            .and_then(|l| {
+                Some(RunCounters {
+                    uploaded_bytes: l.get_uploaded_bytes(),
+                    downloaded_bytes: l.get_downloaded_bytes(),
+                    left_bytes: l.get_hns()?.needed_bytes,
+                })
+            })
+            .or(*mt.shared().last_run.lock());
+        crate::tracker::TrackerCommsStats {
+            uploaded_bytes: run.map_or(0, |r| r.uploaded_bytes),
+            downloaded_bytes: run.map_or(0, |r| r.downloaded_bytes),
+            left_bytes: run.map(|r| r.left_bytes),
+            torrent_state,
+            finished_during_run: live.is_some_and(|l| l.finished_during_run()),
         }
     }
 

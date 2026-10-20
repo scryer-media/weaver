@@ -789,11 +789,10 @@ impl TorrentStateLive {
         // into_chunks() will requeue any in-flight pieces
         let chunk_tracker = piece_tracker.into_chunks();
 
-        let hns = chunk_tracker.get_hns();
         *self.shared.last_run.lock() = Some(RunCounters {
             uploaded_bytes: self.get_uploaded_bytes(),
-            progress_bytes: hns.progress(),
-            total_bytes: hns.total(),
+            downloaded_bytes: self.get_downloaded_bytes(),
+            left_bytes: chunk_tracker.get_hns().needed_bytes,
         });
 
         Ok(TorrentStatePaused {

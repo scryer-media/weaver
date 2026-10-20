@@ -40,9 +40,11 @@ pub struct TrackerRequest<'a> {
     pub no_peer_id: bool,
 
     pub ip: Option<IpAddr>,
-    pub numwant: Option<usize>,
+    /// How many peers to ask for.
+    pub numwant: u32,
     pub key: Option<u32>,
-    pub trackerid: Option<&'a str>,
+    /// The `tracker id` this tracker gave in an earlier answer.
+    pub trackerid: Option<&'a [u8]>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -163,11 +165,15 @@ pub struct TrackerResponse<'a> {
     pub interval: u64,
     #[serde(rename = "min interval")]
     pub min_interval: Option<u64>,
-    #[allow(dead_code)]
+    /// To be sent back as `trackerid` on every later announce to this tracker.
+    #[serde(rename = "tracker id", borrow)]
     pub tracker_id: Option<ByteBuf<'a>>,
     pub incomplete: Option<u64>,
-    #[serde(borrow)]
+    /// IPv4 peers when compact (BEP 23), or peers of either family as
+    /// dictionaries. Absent when the tracker lists only IPv6 peers.
+    #[serde(default, borrow)]
     pub peers: Peers<'a, SocketAddrV4>,
+    /// IPv6 peers (BEP 7).
     #[serde(default, borrow)]
     pub peers6: Peers<'a, SocketAddrV6>,
 }
@@ -214,14 +220,13 @@ impl TrackerRequest<'_> {
         if let Some(ip) = &self.ip {
             write!(s, "&ip={ip}").unwrap();
         }
-        if let Some(numwant) = &self.numwant {
-            write!(s, "&numwant={numwant}").unwrap();
-        }
+        write!(s, "&numwant={}", self.numwant).unwrap();
         if let Some(key) = &self.key {
             write!(s, "&key={key}").unwrap();
         }
-        if let Some(trackerid) = &self.trackerid {
-            write!(s, "&trackerid={trackerid}").unwrap();
+        if let Some(trackerid) = self.trackerid {
+            s.push_str("&trackerid=");
+            s.extend(percent_encode(trackerid, QUERY_VALUE));
         }
         s
     }
@@ -247,7 +252,7 @@ mod tests {
             no_peer_id: false,
             event: Some(TrackerRequestEvent::Started),
             ip: Some("127.0.0.1".parse().unwrap()),
-            numwant: None,
+            numwant: 50,
             key: None,
             trackerid: None,
         };
@@ -272,7 +277,7 @@ mod tests {
                 no_peer_id: false,
                 event: None,
                 ip: None,
-                numwant: None,
+                numwant: 50,
                 key: None,
                 trackerid: None,
             };
@@ -288,7 +293,7 @@ mod tests {
             assert_eq!(
                 request.as_querystring(),
                 format!(
-                    "info_hash={e}&peer_id={e}&port=1&uploaded=0&downloaded=0&left=0&compact=1&no_peer_id=0"
+                    "info_hash={e}&peer_id={e}&port=1&uploaded=0&downloaded=0&left=0&compact=1&no_peer_id=0&numwant=50"
                 )
             );
         }
@@ -311,6 +316,24 @@ mod tests {
     }
 
     #[test]
+    fn every_listed_peer_of_either_family_is_read() {
+        let v4: SocketAddr = "105.105.105.105:28784".parse().unwrap();
+        let v6: SocketAddr = "[6969:6969:6969:6969:6969:6969:6969:6969]:28784"
+            .parse()
+            .unwrap();
+
+        // Only IPv6 peers: no `peers` key at all.
+        let data = b"d8:intervali1800e6:peers618:iiiiiiiiiiiiiiiippe";
+        let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
+        assert_eq!(response.iter_peers().collect::<Vec<_>>(), vec![v6]);
+
+        // Both lists in dictionary form.
+        let data = b"d8:intervali1800e5:peersld2:ip15:105.105.105.1054:porti28784eee6:peers6ld2:ip39:6969:6969:6969:6969:6969:6969:6969:69694:porti28784eeee";
+        let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
+        assert_eq!(response.iter_peers().collect::<Vec<_>>(), vec![v4, v6]);
+    }
+
+    #[test]
     fn test_parse_tracker_response_counts() {
         let data = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
         let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
@@ -322,6 +345,38 @@ mod tests {
         let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
         assert_eq!(response.complete, None);
         assert_eq!(response.incomplete, None);
+    }
+
+    #[test]
+    fn tracker_id_is_read_and_sent_back_escaped() {
+        let data = b"d8:intervali1800e5:peers0:10:tracker id4:a b&e";
+        let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
+        let id = response.tracker_id.as_ref().map(|id| id.as_ref());
+        assert_eq!(id, Some(&b"a b&"[..]));
+
+        let hash = Id20::new([0x61; 20]);
+        let request = TrackerRequest {
+            info_hash: &hash,
+            peer_id: &hash,
+            port: 1,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            compact: true,
+            no_peer_id: false,
+            event: None,
+            ip: None,
+            numwant: 200,
+            key: None,
+            trackerid: id,
+        };
+        assert!(
+            request
+                .as_querystring()
+                .ends_with("&numwant=200&trackerid=a%20b%26"),
+            "{}",
+            request.as_querystring()
+        );
     }
 
     #[test]
