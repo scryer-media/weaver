@@ -12,7 +12,8 @@ use crate::proxies::{Consumer, Failover, LegPath, Route};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeedTestKind {
     // Repeated HTTPS GETs of the provider's largest download through the
-    // route, over as many connections as the line takes.
+    // route, over as many connections as the line takes, then one post to
+    // the same provider.
     Bandwidth {
         provider: BandwidthProvider,
         upload: UploadRequest,
@@ -65,16 +66,26 @@ pub enum BandwidthProvider {
     // provider's server list. Without one, a list provider run takes the
     // nearest: the first listed server to answer a ping through the route.
     Builtin { id: String, server: Option<String> },
-    // Any HTTPS URL. The egress block rules apply to it.
+    // Any HTTPS URL. The egress block rules apply to it. It is pulled from,
+    // never posted to.
     Custom { url: reqwest::Url },
 }
 
-// What a bandwidth run sends after it has pulled.
+impl BandwidthProvider {
+    // The name a run reports the provider by: a built-in's own, a custom
+    // URL's host.
+    pub fn name(&self) -> String {
+        match self {
+            Self::Builtin { id, .. } => super::providers::provider(id)
+                .map_or_else(|| id.clone(), |provider| provider.name.to_owned()),
+            Self::Custom { url } => url.host_str().unwrap_or(url.as_str()).to_owned(),
+        }
+    }
+}
+
+// What a bandwidth run posts to its provider after it has pulled.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UploadRequest {
-    // An HTTPS endpoint that takes a POST. The egress block rules apply to
-    // it. Without one, nothing is posted.
-    pub url: Option<reqwest::Url>,
     // How much is posted; `DEFAULT_UPLOAD_BYTES` when not given.
     pub bytes: Option<u64>,
 }
@@ -241,7 +252,7 @@ pub enum SpeedTestPhase {
     // Taking the server's connections from the live pool.
     Leasing,
     Measuring,
-    // Posting to the upload endpoint, then serving the test torrent.
+    // Posting to the provider, then serving the test torrent.
     Uploading,
     // Giving the connections, the queue and the draft back.
     Releasing,
@@ -336,11 +347,13 @@ pub struct BandwidthResult {
     pub connections: u32,
 }
 
-// A post to the upload endpoint, through the route.
+// A post to the provider the run pulled from, through the route.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HttpUpload {
-    // The request named no endpoint.
-    NotConfigured,
+    // The provider, named here, takes no upload.
+    Unavailable {
+        provider: String,
+    },
     Measured {
         url: String,
         bytes: u64,

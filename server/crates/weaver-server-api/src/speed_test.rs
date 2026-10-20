@@ -135,10 +135,8 @@ pub struct BandwidthTestInput {
     pub provider_id: Option<String>,
     pub server: Option<String>,
     pub custom_url: Option<String>,
-    // An HTTPS endpoint the run posts to after it pulls, through the route.
-    // Without one, nothing is posted.
-    pub upload_url: Option<String>,
-    // How much is posted, in MiB; 32 when not given, at most 128.
+    // How much is posted to the provider after the run pulls, in MiB; 32
+    // when not given, at most 128.
     pub upload_mib: Option<u32>,
 }
 
@@ -197,13 +195,6 @@ impl SpeedTestInput {
                     }
                 };
                 let upload = core::UploadRequest {
-                    url: bandwidth
-                        .upload_url
-                        .map(|url| {
-                            reqwest::Url::parse(&url)
-                                .map_err(|e| invalid(format!("uploadUrl: {e}")))
-                        })
-                        .transpose()?,
                     bytes: bandwidth.upload_mib.map(|mib| u64::from(mib) * MIB),
                 };
                 core::SpeedTestKind::Bandwidth { provider, upload }
@@ -385,8 +376,8 @@ pub struct SpeedTestResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
 pub enum UploadOutcome {
-    // The run named no upload endpoint.
-    NotConfigured,
+    // The provider takes no upload.
+    Unavailable,
     Measured,
     Failed,
     // No peer asked for anything.
@@ -397,6 +388,8 @@ pub enum UploadOutcome {
 #[derive(Clone, Debug, SimpleObject)]
 pub struct HttpUploadResult {
     pub outcome: UploadOutcome,
+    // The provider that takes no upload, for UNAVAILABLE.
+    pub provider: Option<String>,
     pub url: Option<String>,
     pub bytes: f64,
     pub elapsed_ms: u32,
@@ -426,8 +419,9 @@ pub struct UploadResult {
 impl From<core::UploadResult> for UploadResult {
     fn from(upload: core::UploadResult) -> Self {
         let http = match upload.http {
-            core::HttpUpload::NotConfigured => HttpUploadResult {
-                outcome: UploadOutcome::NotConfigured,
+            core::HttpUpload::Unavailable { provider } => HttpUploadResult {
+                outcome: UploadOutcome::Unavailable,
+                provider: Some(provider),
                 url: None,
                 bytes: 0.0,
                 elapsed_ms: 0,
@@ -441,6 +435,7 @@ impl From<core::UploadResult> for UploadResult {
                 bps,
             } => HttpUploadResult {
                 outcome: UploadOutcome::Measured,
+                provider: None,
                 url: Some(url),
                 bytes: bytes as f64,
                 elapsed_ms: small(elapsed_ms),
@@ -449,6 +444,7 @@ impl From<core::UploadResult> for UploadResult {
             },
             core::HttpUpload::Failed { url, error } => HttpUploadResult {
                 outcome: UploadOutcome::Failed,
+                provider: None,
                 url: Some(url),
                 bytes: 0.0,
                 elapsed_ms: 0,
@@ -496,7 +492,6 @@ pub struct BandwidthTestRequest {
     pub provider_id: Option<String>,
     pub server: Option<String>,
     pub custom_url: Option<String>,
-    pub upload_url: Option<String>,
     pub upload_mib: Option<u32>,
 }
 
@@ -536,7 +531,6 @@ impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
                         provider_id,
                         server,
                         custom_url,
-                        upload_url: upload.url.as_ref().map(ToString::to_string),
                         upload_mib: upload.bytes.map(|bytes| small(bytes.div_ceil(MIB))),
                     }),
                     None,
@@ -817,7 +811,7 @@ impl SpeedTestQuery {
                 id: p.id.into(),
                 name: p.name.into(),
                 host: p.host.map(Into::into),
-                needs_server: p.needs_server,
+                needs_server: p.needs_server(),
             })
             .collect()
     }

@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use weaver_server_api::auth::{CallerIdentity, CallerScope};
 use weaver_server_core::proxies::ProxyRuntime;
 use weaver_server_core::speed_test::fixture::{
-    FixtureArticle, HttpFixture, NntpFixture, loopback_tls, nzb,
+    FixtureArticle, HttpFixture, NntpFixture, librespeed_list, loopback_tls, nzb,
 };
 use weaver_server_core::speed_test::{SpeedTestService, SpeedTestStatus};
 
@@ -152,7 +152,14 @@ async fn providers_are_listed_with_their_hosts() {
         .collect();
     assert_eq!(
         ids,
-        ["cloudflare", "sabnzbd", "ovh", "hetzner", "librespeed"]
+        [
+            "cloudflare",
+            "sabnzbd",
+            "ovh",
+            "hetzner",
+            "librespeed",
+            "fast"
+        ]
     );
     let hosts: serde_json::Value = providers
         .as_array()
@@ -167,11 +174,13 @@ async fn providers_are_listed_with_their_hosts() {
             "sabnzbd.org",
             "proof.ovh.net",
             "nbg1-speed.hetzner.com",
-            null
+            null,
+            "fast.com"
         ])
     );
     assert_eq!(providers[4]["needsServer"], true);
     assert_eq!(providers[0]["needsServer"], false);
+    assert_eq!(providers[5]["needsServer"], false);
 }
 
 #[tokio::test]
@@ -747,43 +756,78 @@ async fn a_downed_rung_is_absent_from_every_connection_path() {
     );
 }
 
-#[tokio::test]
-async fn a_bandwidth_run_posts_to_its_upload_url_and_reports_the_upload() {
-    let h = harness().await;
+// Each GET of a provider of known size holds a 16 MiB slice of the quota
+// first, so a run ends once a little past one slice is used.
+const UPLOAD_RUN_QUOTA: u64 = 16 * 1024 * 1024 + 300_000;
+
+// Start a bandwidth run of `bandwidth`, an input naming its provider, on an
+// HTTPS fixture that serves `/blob`, and return the finished run's upload.
+async fn upload_run(
+    h: &TestHarness,
+    bandwidth: impl FnOnce(&HttpFixture) -> String,
+    shape: &str,
+) -> (serde_json::Value, serde_json::Value, HttpFixture) {
     let (acceptor, cert_der, _) = loopback_tls();
-    let http = HttpFixture::start(String::new(), 200_000, Some(acceptor)).await;
+    let http = HttpFixture::start(String::new(), 200_000, Some(acceptor.clone())).await;
+    let list = HttpFixture::serve(
+        vec![("/servers.php", librespeed_list(&[("1", http.addr, None)]))],
+        0,
+        Some(acceptor),
+    )
+    .await;
     let service = SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true);
     service.trust_roots_for_tests(vec![cert_der]);
+    service.server_list_url_for_tests(
+        format!("https://127.0.0.1:{}/servers.php", list.addr.port())
+            .parse()
+            .unwrap(),
+    );
     service.measure_until_stopped_for_tests();
-    egress_quota(&h, 300_000);
-    let url = format!("https://127.0.0.1:{}/blob", http.addr.port());
-    let upload = format!("https://127.0.0.1:{}/upload", http.addr.port());
+    egress_quota(h, UPLOAD_RUN_QUOTA);
 
     let response = h
         .execute(&format!(
-            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},bandwidth:{{customUrl:"{url}",uploadUrl:"{upload}",uploadMib:1}}}}){{id request{{bandwidth{{uploadUrl uploadMib}}}}}}}}"#
+            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},bandwidth:{}}}){{id request{{bandwidth{{providerId server customUrl uploadMib}}}}}}}}"#,
+            bandwidth(&http)
         ))
         .await;
     assert_no_errors(&response);
     let started = response_data(&response)["startSpeedTest"].clone();
-    assert_eq!(
-        started["request"]["bandwidth"],
-        serde_json::json!({"uploadUrl": upload, "uploadMib": 1})
-    );
     let id = started["id"].as_u64().unwrap();
-    wait_until(&h, id, |run| run.status != SpeedTestStatus::Running).await;
+    wait_until(h, id, |run| run.status != SpeedTestStatus::Running).await;
     let response = h
-        .execute(&format!(
-            "{{speedTestRun(id:{id}){{status result{{upload{{http{{outcome url bytes elapsedMs bps failure{{code}}}} peers{{outcome}}}}}}}}}}"
-        ))
+        .execute(&format!("{{speedTestRun(id:{id}){{{shape}}}}}"))
         .await;
     assert_no_errors(&response);
-    let done = response_data(&response)["speedTestRun"].clone();
+    (
+        started,
+        response_data(&response)["speedTestRun"].clone(),
+        http,
+    )
+}
 
+#[tokio::test]
+async fn a_bandwidth_run_posts_to_its_provider_and_reports_the_upload() {
+    let h = harness().await;
+    let (started, done, http) = upload_run(
+        &h,
+        |_| r#"{providerId:"librespeed",server:"1",uploadMib:1}"#.into(),
+        "status result{upload{http{outcome provider url bytes elapsedMs bps failure{code}} peers{outcome}}}",
+    )
+    .await;
+
+    assert_eq!(
+        started["request"]["bandwidth"],
+        serde_json::json!({"providerId": "librespeed", "server": "1", "customUrl": null, "uploadMib": 1})
+    );
     assert_eq!(done["status"], "COMPLETED", "{done}");
     let posted = &done["result"]["upload"]["http"];
     assert_eq!(posted["outcome"], "MEASURED", "{done}");
-    assert_eq!(posted["url"], upload);
+    assert_eq!(posted["provider"], serde_json::Value::Null);
+    assert_eq!(
+        posted["url"],
+        format!("https://127.0.0.1:{}/upload", http.addr.port())
+    );
     assert_eq!(posted["bytes"], 1_048_576.0);
     assert!(posted["bps"].as_f64().unwrap() > 0.0, "{done}");
     assert_eq!(posted["failure"], serde_json::Value::Null);
@@ -792,15 +836,38 @@ async fn a_bandwidth_run_posts_to_its_upload_url_and_reports_the_upload() {
 }
 
 #[tokio::test]
-async fn an_upload_url_must_use_https() {
+async fn a_provider_without_an_upload_path_reports_it_has_none() {
+    let h = harness().await;
+    let (_, done, http) = upload_run(
+        &h,
+        |http| {
+            format!(
+                r#"{{customUrl:"https://127.0.0.1:{}/blob"}}"#,
+                http.addr.port()
+            )
+        },
+        "status result{upload{http{outcome provider url bytes}}}",
+    )
+    .await;
+
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    assert_eq!(
+        done["result"]["upload"]["http"],
+        serde_json::json!({"outcome": "UNAVAILABLE", "provider": "127.0.0.1", "url": null, "bytes": 0.0})
+    );
+    assert_eq!(*http.uploaded().borrow(), 0);
+}
+
+#[tokio::test]
+async fn an_upload_must_send_at_least_one_mib() {
     let h = harness().await;
     let response = h
         .execute(&format!(
-            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},bandwidth:{{customUrl:"https://127.0.0.1:1/blob",uploadUrl:"http://127.0.0.1:1/upload"}}}}){{id}}}}"#
+            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},bandwidth:{{customUrl:"https://127.0.0.1:1/blob",uploadMib:0}}}}){{id}}}}"#
         ))
         .await;
     let (message, _) = refusal(&response);
-    assert_eq!(message, "an upload URL must use https");
+    assert_eq!(message, "an upload sends 1 to 134217728 bytes");
 }
 
 // A torrent route's Test via runs the test torrent over its path and

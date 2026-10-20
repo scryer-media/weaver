@@ -18,7 +18,7 @@ use super::model::*;
 use super::nearest::{Nearest, nearest};
 use super::overrides::{TestedLeg, TestedRoute};
 use super::progress::{LegRecorder, Progress, UsenetFacts};
-use super::providers::{self, ProviderServer};
+use super::providers::{self, Endpoints, ProviderServer};
 use super::runner::Stop;
 use super::torrent::{P2pOutcome, P2pPath, P2pPlan, PeerUpload, TestTorrentSource};
 use super::upload;
@@ -79,6 +79,9 @@ pub struct ServiceInner {
     // Where a list provider's server list is fetched from in place of its
     // own; only tests set it.
     server_list_url: Mutex<Option<reqwest::Url>>,
+    // Where fast.com's page and target endpoint are found in place of its
+    // own; only tests set them.
+    fast_com_urls: Mutex<Option<(reqwest::Url, reqwest::Url)>>,
     roots: Mutex<Vec<Vec<u8>>>,
     // Bandwidth runs measure until cancelled or until every connection has
     // ended; only tests set it.
@@ -154,6 +157,7 @@ impl SpeedTestService {
                 revision: watch::channel(0).0,
                 server_lists: tokio::sync::Mutex::new(HashMap::new()),
                 server_list_url: Mutex::new(None),
+                fast_com_urls: Mutex::new(None),
                 roots: Mutex::new(Vec::new()),
                 until_stopped: AtomicBool::new(false),
                 torrent_source: Mutex::new(None),
@@ -196,6 +200,17 @@ impl SpeedTestService {
             .server_list_url
             .lock()
             .expect("speed test server list") = Some(url);
+    }
+
+    // Find fast.com's page at `page` and its targets at `api`; for loopback
+    // fixtures.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fast_com_urls_for_tests(&self, page: reqwest::Url, api: reqwest::Url) {
+        *self
+            .inner
+            .fast_com_urls
+            .lock()
+            .expect("speed test fast.com") = Some((page, api));
     }
 
     // Bandwidth runs end only when cancelled or when every connection has
@@ -307,7 +322,7 @@ impl SpeedTestService {
         let provider = providers::provider(provider_id).ok_or_else(|| {
             SpeedTestError::Invalid(format!("no bandwidth provider is called {provider_id}"))
         })?;
-        if !provider.needs_server {
+        if !provider.needs_server() {
             return Ok(Vec::new());
         }
         let runtime = self.inner.runtime()?;
@@ -468,12 +483,12 @@ impl SpeedTestService {
             }
         }
 
-        // What the run pulls from.
-        let bandwidth_url = match &request.kind {
+        // What the run pulls from and posts to.
+        let endpoints = match &request.kind {
             SpeedTestKind::Bandwidth {
                 provider: BandwidthProvider::Custom { url },
                 ..
-            } => Some(url.clone()),
+            } => Some(Endpoints::custom(url.clone())),
             SpeedTestKind::Bandwidth {
                 provider: BandwidthProvider::Builtin { id, .. },
                 ..
@@ -481,10 +496,10 @@ impl SpeedTestService {
                 let provider = providers::provider(id).ok_or_else(|| {
                     SpeedTestError::Invalid(format!("no bandwidth provider is called {id}"))
                 })?;
-                if provider.needs_server {
+                if provider.discovered() {
                     None
                 } else {
-                    Some(providers::provider_url(provider).map_err(SpeedTestError::Invalid)?)
+                    Some(providers::fixed_endpoints(provider).map_err(SpeedTestError::Invalid)?)
                 }
             }
             SpeedTestKind::Usenet { .. } => None,
@@ -538,7 +553,7 @@ impl SpeedTestService {
             server,
             server_control,
             nzb_url,
-            bandwidth_url,
+            endpoints,
         };
 
         let cell = {
@@ -742,8 +757,9 @@ struct RunPlan {
     server_control: Option<Arc<ServerTransferControl>>,
     // `None` for an uploaded NZB, which the request itself holds.
     nzb_url: Option<reqwest::Url>,
-    // `None` for a list provider until its server is looked up.
-    bandwidth_url: Option<reqwest::Url>,
+    // `None` for a provider whose endpoints are found through the route
+    // once the run is under way.
+    endpoints: Option<Endpoints>,
 }
 
 enum Outcome {
@@ -831,6 +847,22 @@ impl ServiceInner {
         let servers = providers::parse_librespeed_servers(&body)?;
         lists.insert(provider_id.to_owned(), (Instant::now(), servers.clone()));
         Ok(servers)
+    }
+
+    async fn discover_fast_com(&self, leg: &HttpLeg) -> Result<Endpoints, String> {
+        let overridden = self
+            .fast_com_urls
+            .lock()
+            .expect("speed test fast.com")
+            .clone();
+        let (page, api) = match overridden {
+            Some(urls) => urls,
+            None => (
+                reqwest::Url::parse(providers::FAST_COM_PAGE).map_err(|e| e.to_string())?,
+                reqwest::Url::parse(providers::FAST_COM_API).map_err(|e| e.to_string())?,
+            ),
+        };
+        providers::discover_fast_com(leg, &self.options(), &page, &api).await
     }
 
     fn snapshot(&self, cell: &RunCell) -> SpeedTestRun {
@@ -1113,21 +1145,20 @@ async fn execute(
         },
         _ => None,
     };
-    let bandwidth = if let SpeedTestKind::Bandwidth { provider, .. } = &cell.request.kind {
+    let endpoints = if let SpeedTestKind::Bandwidth { provider, .. } = &cell.request.kind {
         let (provider_id, server) = match provider {
             BandwidthProvider::Builtin { id, server } => (Some(id.clone()), server.clone()),
             BandwidthProvider::Custom { .. } => (None, None),
         };
-        let size = provider_id
-            .as_deref()
-            .and_then(providers::provider)
-            .map(|provider| provider.download_bytes);
         // The list server the run pulls from: the one asked for, or the
         // nearest when none was.
         let mut chosen = server.clone();
-        let url = match (&plan.bandwidth_url, &provider_id) {
-            (Some(url), _) => url.clone(),
-            (None, Some(provider_id)) => {
+        let endpoints = match (
+            &plan.endpoints,
+            provider_id.as_deref().and_then(providers::provider),
+        ) {
+            (Some(endpoints), _) => endpoints.clone(),
+            (None, Some(info)) if info.needs_server() => {
                 let leg = match http_leg(first) {
                     Ok(leg) => leg,
                     Err(error) => return Outcome::Failed(error),
@@ -1135,7 +1166,7 @@ async fn execute(
                 let listed = tokio::select! {
                     biased;
                     _ = stop.stopped() => return Outcome::Cancelled,
-                    listed = inner.list_servers(provider_id, &leg) => listed,
+                    listed = inner.list_servers(info.id, &leg) => listed,
                 };
                 let servers = match listed {
                     Ok(servers) => servers,
@@ -1146,7 +1177,8 @@ async fn execute(
                         Some(found) => found,
                         None => {
                             return Outcome::Failed(format!(
-                                "{provider_id} lists no server {server}"
+                                "{} lists no server {server}",
+                                info.id
                             ));
                         }
                     },
@@ -1162,15 +1194,28 @@ async fn execute(
                         }
                         Nearest::Cancelled => return Outcome::Cancelled,
                         Nearest::NoneAnswered => {
-                            let name = providers::provider(provider_id)
-                                .map_or(provider_id.as_str(), |p| p.name);
-                            return Outcome::Failed(format!("no {name} server answered"));
+                            return Outcome::Failed(format!("no {} server answered", info.name));
                         }
                     },
                 };
                 chosen = Some(found.id.clone());
-                match providers::list_server_url(&found) {
-                    Ok(url) => url,
+                match providers::list_server_endpoints(&found) {
+                    Ok(endpoints) => endpoints,
+                    Err(error) => return Outcome::Failed(error),
+                }
+            }
+            (None, Some(_)) => {
+                let leg = match http_leg(first) {
+                    Ok(leg) => leg,
+                    Err(error) => return Outcome::Failed(error),
+                };
+                let found = tokio::select! {
+                    biased;
+                    _ = stop.stopped() => return Outcome::Cancelled,
+                    found = inner.discover_fast_com(&leg) => found,
+                };
+                match found {
+                    Ok(endpoints) => endpoints,
                     Err(error) => return Outcome::Failed(error),
                 }
             }
@@ -1179,11 +1224,11 @@ async fn execute(
         let result = BandwidthResult {
             provider_id,
             server: chosen,
-            url: url.to_string(),
+            url: endpoints.download[0].to_string(),
             connections: 0,
         };
         cell.life.lock().expect("speed test run").bandwidth = Some(result);
-        Some((url, size))
+        Some(endpoints)
     } else {
         None
     };
@@ -1211,7 +1256,7 @@ async fn execute(
         _ = metrics.wait_downloads_drained() => {}
     }
 
-    match (articles, &plan.server, bandwidth) {
+    match (articles, &plan.server, &endpoints) {
         (Some(articles), Some(server), _) => {
             let SpeedTestKind::Usenet { max_duration, .. } = cell.request.kind else {
                 return Outcome::Failed("the run has nothing to measure".into());
@@ -1325,7 +1370,7 @@ async fn execute(
             .await;
             drop(sampler);
         }
-        (None, _, Some((url, size))) => {
+        (None, _, Some(endpoints)) => {
             let runtime = match inner.runtime() {
                 Ok(runtime) => runtime,
                 Err(error) => return Outcome::Failed(error.to_string()),
@@ -1357,8 +1402,8 @@ async fn execute(
                 BandwidthPlan {
                     legs,
                     weights: cell.tested.legs.iter().map(|leg| leg.weight).collect(),
-                    url,
-                    size,
+                    urls: endpoints.download.clone(),
+                    size: endpoints.size,
                     options,
                     until_stopped: inner.until_stopped.load(Ordering::Acquire),
                 },
@@ -1386,7 +1431,9 @@ async fn execute(
             None => SpeedTestFailure::NoBytes,
         });
     }
-    if let SpeedTestKind::Bandwidth { upload, .. } = &cell.request.kind {
+    if let (SpeedTestKind::Bandwidth { provider, upload }, Some(endpoints)) =
+        (&cell.request.kind, &endpoints)
+    {
         // Uploading: the queue is still held, so the route sends nothing
         // else.
         inner.set_phase(&cell, SpeedTestPhase::Uploading);
@@ -1398,10 +1445,15 @@ async fn execute(
             stage: stage.clone(),
         };
         let options = inner.options();
-        let http = tokio::select! {
-            biased;
-            _ = stop.stopped() => return Outcome::Cancelled,
-            http = upload::run(&leg, upload, &options) => http,
+        let http = match &endpoints.upload {
+            Some(url) => tokio::select! {
+                biased;
+                _ = stop.stopped() => return Outcome::Cancelled,
+                http = upload::run(&leg, url, upload, &options) => http,
+            },
+            None => HttpUpload::Unavailable {
+                provider: provider.name(),
+            },
         };
         cell.life.lock().expect("speed test run").upload = Some(UploadResult { http, peers: None });
         inner.bump();

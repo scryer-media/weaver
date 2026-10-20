@@ -2,7 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The HTTP half of a bandwidth run's upload: one bounded POST through the
-// route, timed from the first byte sent to the answer.
+// route to the provider the run pulled from, timed from the first byte sent
+// to the answer.
 
 use std::time::Instant;
 
@@ -11,11 +12,6 @@ use super::model::{DEFAULT_UPLOAD_BYTES, HttpUpload, MAX_UPLOAD_BYTES, UploadReq
 
 // Why an upload request cannot be run, if it cannot.
 pub(crate) fn validate(upload: &UploadRequest) -> Result<(), String> {
-    if let Some(url) = &upload.url
-        && url.scheme() != "https"
-    {
-        return Err("an upload URL must use https".into());
-    }
     if let Some(bytes) = upload.bytes
         && (bytes == 0 || bytes > MAX_UPLOAD_BYTES)
     {
@@ -24,15 +20,14 @@ pub(crate) fn validate(upload: &UploadRequest) -> Result<(), String> {
     Ok(())
 }
 
-// Post the request's body through `leg`. Without an endpoint nothing is sent.
+// Post the request's body through `leg` to `url`, the provider's upload
+// endpoint.
 pub(crate) async fn run(
     leg: &HttpLeg,
+    url: &reqwest::Url,
     upload: &UploadRequest,
     options: &HttpOptions,
 ) -> HttpUpload {
-    let Some(url) = &upload.url else {
-        return HttpUpload::NotConfigured;
-    };
     let bytes = upload
         .bytes
         .unwrap_or(DEFAULT_UPLOAD_BYTES)

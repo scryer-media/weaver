@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::watch;
 use weaver_nntp::transfer::{BodyTransferPermit, ServerTransferControl};
@@ -26,8 +26,9 @@ pub(crate) struct BandwidthPlan {
     // By position; `None` for a leg that is down.
     pub legs: Vec<Option<Arc<BandwidthLeg>>>,
     pub weights: Vec<u8>,
-    pub url: reqwest::Url,
-    // What one GET of `url` moves; `None` when only the response says.
+    // Each new connection takes the next URL, in turn.
+    pub urls: Vec<reqwest::Url>,
+    // What one GET of a URL moves; `None` when only the response says.
     pub size: Option<u64>,
     pub options: HttpOptions,
     // Ignore the controller's stop and measure until cancelled or until
@@ -49,14 +50,17 @@ pub(crate) async fn run(plan: BandwidthPlan, progress: Arc<Progress>, mut stop: 
     let mut tasks = tokio::task::JoinSet::new();
     // The leg of every connection still open, and whether it moved a byte.
     let mut open: HashMap<tokio::task::Id, (usize, Arc<AtomicBool>)> = HashMap::new();
+    let opened = AtomicUsize::new(0);
     let spawn =
         |tasks: &mut tokio::task::JoinSet<Ended>, open: &mut HashMap<_, _>, position: usize| {
             let Some(Some(leg)) = plan.legs.get(position) else {
                 return;
             };
             let moved = Arc::new(AtomicBool::new(false));
+            let url = plan.urls[opened.fetch_add(1, Ordering::Relaxed) % plan.urls.len()].clone();
             let handle = tasks.spawn(connection(
                 leg.clone(),
+                url,
                 plan.clone(),
                 progress.clone(),
                 worker_stop.clone(),
@@ -182,18 +186,18 @@ enum Ended {
     Quota,
 }
 
-// One connection: GET the URL again each time a body ends, until stopped
-// or until a GET fails.
+// One connection: GET `url` again each time a body ends, until stopped or
+// until a GET fails.
 async fn connection(
     leg: Arc<BandwidthLeg>,
+    url: reqwest::Url,
     plan: Arc<BandwidthPlan>,
     progress: Arc<Progress>,
     mut stop: Stop,
     moved: Arc<AtomicBool>,
 ) -> Ended {
     let recorder = leg.recorder.clone();
-    let connect =
-        RoutedClient::connect(&leg.http, &plan.url, &plan.options, Some(recorder.clone()));
+    let connect = RoutedClient::connect(&leg.http, &url, &plan.options, Some(recorder.clone()));
     let client = tokio::select! {
         biased;
         _ = stop.stopped() => return Ended::Stopped,
@@ -227,7 +231,7 @@ async fn connection(
         let response = tokio::select! {
             biased;
             _ = stop.stopped() => break Ended::Stopped,
-            response = client.get(&plan.url) => response,
+            response = client.get(&url) => response,
         };
         let mut response = match response {
             Ok(response) => response,

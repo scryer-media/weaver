@@ -355,7 +355,6 @@ input BandwidthTestInput {
 	providerId: String
 	server: String
 	customUrl: String
-	uploadUrl: String
 	uploadMib: Int
 }
 
@@ -363,7 +362,6 @@ type BandwidthTestRequest {
 	providerId: String
 	server: String
 	customUrl: String
-	uploadUrl: String
 	uploadMib: Int
 }
 
@@ -1169,6 +1167,7 @@ type HttpBindAddressStatus {
 
 type HttpUploadResult {
 	outcome: UploadOutcome!
+	provider: String
 	url: String
 	bytes: Float!
 	elapsedMs: Int!
@@ -4975,7 +4974,7 @@ A multipart file upload
 scalar Upload
 
 enum UploadOutcome {
-	NOT_CONFIGURED
+	UNAVAILABLE
 	MEASURED
 	FAILED
 	NO_DEMAND
