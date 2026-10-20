@@ -1775,3 +1775,11 @@ fn a_revocable_leg_carries_its_stage_datagrams_until_revoked() {
     leg.revoke();
     assert!(leg.datagrams().is_none());
 }
+
+#[tokio::test]
+async fn a_ladder_carries_the_datagrams_of_the_rung_a_dial_would_try() {
+    let ladder = Arc::new(Fallback::new(vec![Arc::new(Carrying), bottom()]));
+    assert!(Arc::clone(&ladder).datagrams().is_some());
+    ladder.report_rung(0, Some(&DialError::Egress(io::Error::other("path down"))));
+    assert!(ladder.datagrams().is_none());
+}

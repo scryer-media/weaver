@@ -5,7 +5,7 @@ import { useQuery } from "urql";
 import { EGRESS_QUOTAS_QUERY } from "@/graphql/networking";
 import type { Translate } from "@/lib/context/translate-context";
 import type { Egress, EgressQuota, QuotaDirectionUsage, QuotaPeriod, QuotaState, Weekday } from "@/lib/networking";
-import { Bar } from "../../components/chrome";
+import { Pie } from "../../components/chrome";
 import { Toggle } from "../../components/controls";
 import { Cell } from "../../components/rows";
 import { formatDayClock, formatSize } from "../../data/format";
@@ -136,7 +136,7 @@ export function usageColor(state: QuotaState | undefined, percent: number): stri
 }
 
 /**
- * The egress table's quota cell: for each capped direction, a bar of the
+ * The egress table's quota cell: for each capped direction, a pie of the
  * spend against the cap, the figures, and whether the cap is holding that
  * direction back; then when the period resets. A dash for an egress with no cap.
  */
@@ -162,7 +162,7 @@ export function QuotaCell({ t, egress }: { t: Translate; egress: EgressQuotaRow 
             <span aria-hidden="true" className="flex-none font-wv-mono text-[11px] text-wv-muted">
               {ARROW[direction]}
             </span>
-            <Bar percent={percent} color={usageColor(state, percent)} height={10} className="w-[56px] flex-none" label={label} />
+            <Pie percent={percent} color={usageColor(state, percent)} size={16} />
             <Cell mono className={quotaHolding(state) ? "text-wv-warn" : undefined}>
               {directionSummary(egress, direction)}
             </Cell>

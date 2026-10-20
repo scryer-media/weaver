@@ -449,16 +449,20 @@ async fn handle(
         .into_response(),
         ("app", "preferences") => {
             let config = ctx.inner.config.read().await;
-            let dht = ctx.inner.torrents.as_ref().is_some_and(|torrents| {
-                std::iter::once(TorrentScope::Default)
-                    .chain(
-                        config
-                            .categories
-                            .iter()
-                            .map(|c| TorrentScope::Category(c.id)),
-                    )
-                    .any(|scope| torrents.carries_dht(scope))
-            });
+            let mut dht = false;
+            if let Some(torrents) = ctx.inner.torrents.as_ref() {
+                for scope in std::iter::once(TorrentScope::Default).chain(
+                    config
+                        .categories
+                        .iter()
+                        .map(|c| TorrentScope::Category(c.id)),
+                ) {
+                    if torrents.carries_dht(scope).await {
+                        dht = true;
+                        break;
+                    }
+                }
+            }
             axum::Json(preferences(&config, dht)).into_response()
         }
         ("app", "setPreferences") => set_preferences(&ctx, &params).await,

@@ -3,19 +3,22 @@
 
 //! The sockets a torrent session uses, for the one leg of its route.
 //!
-//! A leg's path decides everything: whether the session dials with its own
-//! kernel sockets or through the leg's dialer, whether it can listen, and
-//! whether it may use UDP at all (DHT, UDP trackers, uTP).
+//! A leg's path decides whether the session dials with its own kernel
+//! sockets or through the leg's dialer, and whether it can listen. Whether it
+//! may use UDP at all (DHT, UDP trackers, uTP) is the dialer's to say.
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use librqbit::network::{
     AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket,
+    Resolver,
 };
 use librqbit::{SocketFactory, StreamListener};
 use weaver_tunnel::bridge::Bridge;
+use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
 use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Target};
 
 use crate::proxies::{EgressBinding, LegPath};
@@ -30,7 +33,8 @@ pub enum LegKind {
     Interface(String),
     /// Kernel sockets bound to a source address.
     SourceAddress(IpAddr),
-    /// Through a proxy or tunnel rung: stream connections only.
+    /// Through a proxy or tunnel rung: stream connections, and datagrams
+    /// when the rung carries them.
     Ladder,
 }
 
@@ -46,8 +50,15 @@ impl LegKind {
         }
     }
 
-    /// What a session on this leg may do.
-    pub fn shape(&self) -> Shape {
+    /// Whether a session on this leg opens kernel sockets itself.
+    pub fn own_sockets(&self) -> bool {
+        matches!(self, Self::System | Self::Interface(_))
+    }
+
+    /// What a session on this leg may do over `dialer`, the leg's dialer
+    /// when its sockets come from one. A ladder leg carries datagrams, and so
+    /// DHT, exactly when its dialer does.
+    pub fn shape(&self, dialer: Option<&Arc<dyn Dialer>>) -> Shape {
         match self {
             Self::System => Shape {
                 own_sockets: true,
@@ -70,13 +81,16 @@ impl LegKind {
                 listen: true,
                 datagrams: true,
             },
-            Self::Ladder => Shape {
-                own_sockets: false,
-                dht: false,
-                upnp: false,
-                listen: false,
-                datagrams: false,
-            },
+            Self::Ladder => {
+                let datagrams = dialer.is_some_and(|dialer| carrier(dialer).is_some());
+                Shape {
+                    own_sockets: false,
+                    dht: datagrams,
+                    upnp: false,
+                    listen: false,
+                    datagrams,
+                }
+            }
         }
     }
 
@@ -111,8 +125,14 @@ pub struct Shape {
     pub datagrams: bool,
 }
 
+// The datagrams `dialer` carries for the session's UDP.
+fn carrier(dialer: &Arc<dyn Dialer>) -> Option<Arc<dyn DatagramTransport>> {
+    Arc::clone(dialer).datagrams()
+}
+
 /// Peer sockets through a leg's dialer; a leg that pins a source address
-/// also listens and carries UDP on it.
+/// also listens and carries UDP on it, and any other leg carries UDP through
+/// its dialer when the dialer carries datagrams.
 pub struct LegSockets {
     dialer: Arc<dyn Dialer>,
     source: Option<IpAddr>,
@@ -125,6 +145,25 @@ impl LegSockets {
             source: kind.listen_ip(),
         }
     }
+
+    // The datagrams the session's UDP rides, when not the source address.
+    fn carrier(&self) -> Option<Arc<dyn DatagramTransport>> {
+        self.source.is_none().then(|| carrier(&self.dialer)).flatten()
+    }
+}
+
+// A future the session can share between threads. The session's futures
+// must be Sync and a tunnel socket's are not; nothing reaches this one but
+// its poll, which holds it exclusively.
+fn shared<'a, T>(future: impl Future<Output = T> + Send + 'a) -> BoxFuture<'a, T> {
+    let mut future = Mutex::new(Box::pin(future));
+    Box::pin(std::future::poll_fn(move |cx| {
+        future
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .poll(cx)
+    }))
 }
 
 fn halves(stream: DialedStream) -> (BoxAsyncReadVectored, BoxAsyncWrite) {
@@ -181,14 +220,87 @@ impl SocketFactory for LegSockets {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        Box::pin(async move {
-            Ok(match self.source {
-                Some(ip) => {
+        if let Some(ip) = self.source {
+            return Box::pin(async move {
+                Ok(
                     Arc::new(tokio::net::UdpSocket::bind(SocketAddr::new(ip, addr.port())).await?)
-                        as Arc<dyn DatagramSocket>
-                }
-                None => Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>,
-            })
+                        as Arc<dyn DatagramSocket>,
+                )
+            });
+        }
+        let Some(carrier) = self.carrier() else {
+            return Box::pin(async move {
+                Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>)
+            });
+        };
+        shared(async move {
+            let socket = carrier.bind(addr).await.map_err(io::Error::other)?;
+            Ok(Arc::new(Carried {
+                bind_addr: socket.local_addr().unwrap_or(addr),
+                socket,
+            }) as Arc<dyn DatagramSocket>)
+        })
+    }
+
+    // Names for DHT bootstrap and UDP trackers resolve where their
+    // datagrams go.
+    fn resolver(&self) -> Option<Arc<dyn Resolver>> {
+        self.carrier()
+            .map(|carrier| Arc::new(FarSide(carrier)) as Arc<dyn Resolver>)
+    }
+}
+
+// A socket in the leg's tunnel, as the session's datagram socket.
+struct Carried {
+    socket: Arc<dyn TunnelSocket>,
+    bind_addr: SocketAddr,
+}
+
+impl DatagramSocket for Carried {
+    fn bind_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        shared(self.socket.recv_from(buf))
+    }
+
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> BoxFuture<'a, io::Result<usize>> {
+        shared(async move {
+            self.socket.send_to(buf, target).await?;
+            Ok(buf.len())
+        })
+    }
+
+    // Only uTP polls a send, and only on a leg that listens; a ladder leg
+    // never does.
+    fn poll_send_to(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+        _target: SocketAddr,
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::task::Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a tunnel's datagrams carry no uTP",
+        )))
+    }
+}
+
+// The resolver on the far side of the leg's tunnel.
+struct FarSide(Arc<dyn DatagramTransport>);
+
+impl Resolver for FarSide {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
+        shared(async move {
+            let addresses = self.0.resolve(host).await.map_err(io::Error::other)?;
+            Ok(addresses
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect())
         })
     }
 }
@@ -381,7 +493,7 @@ mod tests {
             ),
             (LegKind::Ladder, false, false),
         ] {
-            let shape = kind.shape();
+            let shape = kind.shape(None);
             assert_eq!(shape.own_sockets, own_sockets, "{kind:?}");
             assert_eq!(shape.datagrams, datagrams, "{kind:?}");
             assert_eq!(shape.dht, shape.datagrams, "{kind:?}");
@@ -390,28 +502,32 @@ mod tests {
 
     #[test]
     fn upnp_runs_only_on_system_egress() {
-        assert!(LegKind::System.shape().upnp);
-        assert!(!LegKind::Interface("en1".into()).shape().upnp);
+        assert!(LegKind::System.shape(None).upnp);
+        assert!(!LegKind::Interface("en1".into()).shape(None).upnp);
         assert!(
             !LegKind::SourceAddress("192.0.2.4".parse().unwrap())
-                .shape()
+                .shape(None)
                 .upnp
         );
-        assert!(!LegKind::Ladder.shape().upnp);
+        assert!(!LegKind::Ladder.shape(Some(&carrying())).upnp);
     }
 
     #[test]
-    fn a_ladder_leg_neither_listens_nor_carries_udp() {
-        let shape = LegKind::Ladder.shape();
-        assert!(!shape.listen && !shape.datagrams && !shape.own_sockets);
+    fn a_ladder_leg_carries_udp_only_when_its_dialer_does() {
+        let shape = LegKind::Ladder.shape(Some(&loopback_egress()));
+        assert!(!shape.listen && !shape.datagrams && !shape.dht && !shape.own_sockets);
         assert_eq!(LegKind::Ladder.listen_ip(), None);
+
+        let shape = LegKind::Ladder.shape(Some(&carrying()));
+        assert!(shape.datagrams && shape.dht);
+        assert!(!shape.listen && !shape.upnp && !shape.own_sockets);
     }
 
     #[test]
     fn a_source_address_leg_listens_on_its_address() {
         let address: IpAddr = "192.0.2.4".parse().unwrap();
         let kind = LegKind::SourceAddress(address);
-        assert!(kind.shape().listen);
+        assert!(kind.shape(None).listen);
         assert_eq!(kind.listen_ip(), Some(address));
         assert_eq!(kind.bind_device(), None);
         assert_eq!(LegKind::Interface("en1".into()).bind_device(), Some("en1"));
@@ -473,8 +589,121 @@ mod tests {
         assert_eq!((&got[..len], from), (&b"dht"[..], udp.bind_addr()));
     }
 
+    // A tunnel's datagrams, each socket a loopback socket that stands for
+    // one inside the tunnel.
+    #[derive(Default)]
+    struct Tunnel {
+        bound: Mutex<Vec<SocketAddr>>,
+    }
+
+    struct TunnelUdp(tokio::net::UdpSocket);
+
+    #[async_trait::async_trait]
+    impl TunnelSocket for TunnelUdp {
+        async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<()> {
+            self.0.send_to(data, target).await.map(drop)
+        }
+        async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            self.0.recv_from(buffer).await
+        }
+        fn local_addr(&self) -> Option<SocketAddr> {
+            self.0.local_addr().ok()
+        }
+        fn link_mtu(&self) -> Option<u16> {
+            None
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        async fn closed(&self) {
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DatagramTransport for Tunnel {
+        async fn resolve(
+            &self,
+            host: &str,
+        ) -> Result<Vec<IpAddr>, weaver_tunnel::TunnelError> {
+            Ok(match host {
+                "router.example" => vec!["192.0.2.7".parse().unwrap()],
+                _ => Vec::new(),
+            })
+        }
+        async fn bind(
+            &self,
+            peer: SocketAddr,
+        ) -> Result<Arc<dyn TunnelSocket>, weaver_tunnel::TunnelError> {
+            self.bound.lock().unwrap().push(peer);
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .map_err(|error| weaver_tunnel::TunnelError::Engine(error.to_string()))?;
+            Ok(Arc::new(TunnelUdp(socket)))
+        }
+    }
+
+    // A rung whose tunnel carries datagrams.
+    struct Carrying(Arc<Tunnel>);
+
+    #[async_trait::async_trait]
+    impl Dialer for Carrying {
+        async fn dial(
+            &self,
+            _: &Target,
+        ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+            Err(weaver_tunnel::pipe::DialError::Skipped("datagrams only".into()))
+        }
+        fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+            Some(self.0.clone())
+        }
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
+        }
+        fn describe(&self) -> String {
+            "carrying".into()
+        }
+    }
+
+    fn carrying() -> Arc<dyn Dialer> {
+        Arc::new(Carrying(Arc::default()))
+    }
+
+    // A ladder leg whose tunnel carries datagrams: the session's UDP binds
+    // inside the tunnel, and its names resolve there.
+    #[tokio::test]
+    async fn a_ladder_leg_carries_udp_through_its_tunnel() {
+        let tunnel = Arc::new(Tunnel::default());
+        let sockets = LegSockets::new(Arc::new(Carrying(tunnel.clone())), &LegKind::Ladder);
+        let asked = SocketAddr::from(([0, 0, 0, 0], 6881));
+        let udp = sockets.bind_udp(asked).await.unwrap();
+        assert_eq!(*tunnel.bound.lock().unwrap(), [asked]);
+        assert_eq!(udp.bind_addr().ip(), IpAddr::from([127, 0, 0, 1]));
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sent = udp
+            .send_to(b"dht", peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(sent, 3);
+        let mut got = [0u8; 3];
+        let (len, from) = peer.recv_from(&mut got).await.unwrap();
+        assert_eq!((&got[..len], from), (&b"dht"[..], udp.bind_addr()));
+
+        peer.send_to(b"pong", udp.bind_addr()).await.unwrap();
+        let mut back = [0u8; 4];
+        let (len, from) = udp.recv_from(&mut back).await.unwrap();
+        assert_eq!((&back[..len], from), (&b"pong"[..], peer.local_addr().unwrap()));
+
+        let resolver = sockets.resolver().expect("a tunnel resolves its names");
+        assert_eq!(
+            resolver.resolve("router.example", 6881).await.unwrap(),
+            [SocketAddr::from(([192, 0, 2, 7], 6881))]
+        );
+    }
+
     // A ladder leg's sockets: peers dialed through the leg, and neither a
-    // listener nor UDP.
+    // listener nor UDP when its dialer carries no datagrams.
     #[tokio::test]
     async fn a_ladder_leg_dials_only() {
         let sockets = LegSockets::new(loopback_egress(), &LegKind::Ladder);
@@ -495,6 +724,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
+        assert!(sockets.resolver().is_none());
         let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (_read, _write) = sockets
             .connect_tcp(peer.local_addr().unwrap())

@@ -133,8 +133,10 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         }
         TorrentIntent::Resumed => {}
     }
+    // A hold on the queue leaves the torrent as it was asked to be, and
+    // holds it in the queue, as it does any other job; the hold says whose.
     if let Some(origin) = seen.paused_by {
-        return (TorrentState::Paused, detail(origin.reason()));
+        return (TorrentState::Queued, detail(origin.reason()));
     }
     if let Some(held) = &seen.held {
         return (held.state(), Some(held.detail(seen.complete)));
@@ -446,7 +448,8 @@ mod tests {
             (TorrentState::Queued, None)
         );
         // A hold outranks what else holds a torrent, a complete torrent it
-        // stops is paused, not seeding, and the hold says whose it is.
+        // stops waits in the queue, not seeding, and the hold says whose it
+        // is.
         assert_eq!(
             project(&Observed {
                 paused_by: Some(HoldOrigin::SpeedTest),
@@ -454,7 +457,7 @@ mod tests {
                 held: Some(Held::RouteDown(String::new())),
                 ..seen(Engine::Paused { finished: true })
             }),
-            (TorrentState::Paused, Some("speed test".to_owned()))
+            (TorrentState::Queued, Some("speed test".to_owned()))
         );
         assert_eq!(
             project(&Observed {

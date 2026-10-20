@@ -1340,9 +1340,18 @@ async fn the_global_pause_reaches_the_torrents() {
     rig.service.pause(kept).await.unwrap();
 
     let mut published = queue.state().subscribe_job_changes();
-    let paused = |job_id| {
+    // A hold keeps a torrent in the queue and says whose it is; its own
+    // pause is a pause.
+    let state = |job_id| {
         let service = rig.service.clone();
-        async move { service.torrent(job_id).await.unwrap().state == TorrentState::Paused }
+        async move {
+            let view = service.torrent(job_id).await.unwrap();
+            (view.state, view.detail)
+        }
+    };
+    let held = |job_id| {
+        let state = state.clone();
+        async move { matches!(state(job_id).await, (TorrentState::Queued, Some(_))) }
     };
     let scheduled = |scope, owner| Hold {
         origin: HoldOrigin::Scheduled,
@@ -1368,10 +1377,10 @@ async fn the_global_pause_reaches_the_torrents() {
             set.hold(hold);
         }
         queue.state().restore_holds(set);
-        while (paused(downloading).await, paused(seeding).await) != stopped {
+        while (held(downloading).await, held(seeding).await) != stopped {
             published.changed().await.unwrap();
         }
-        assert!(paused(kept).await);
+        assert_eq!(state(kept).await, (TorrentState::Paused, None));
     }
     for (job_id, intent) in [
         (downloading, TorrentIntent::Resumed),

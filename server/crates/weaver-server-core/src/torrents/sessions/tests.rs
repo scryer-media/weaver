@@ -110,7 +110,7 @@ impl Routes for FakeRoutes {
         })
     }
 
-    async fn open(&self, plan: &RoutePlan) -> Result<OpenLeg, String> {
+    async fn open(&self, plan: &RoutePlan, _peers: usize) -> Result<OpenLeg, String> {
         self.opened.fetch_add(1, Ordering::SeqCst);
         if let Some(error) = self.refuse.lock().unwrap().clone() {
             return Err(error);
@@ -121,6 +121,7 @@ impl Routes for FakeRoutes {
         );
         Ok(OpenLeg {
             kind: plan.kind.clone(),
+            shape: plan.kind.shape(None),
             factory: Some(factory),
             http: tracker_client(&LegKind::System, None, &IDENTITY)?,
             leg: None,
@@ -295,6 +296,7 @@ async fn the_encryption_setting_reaches_the_sessions() {
 
 fn leg(kind: LegKind) -> OpenLeg {
     OpenLeg {
+        shape: kind.shape(None),
         kind,
         factory: None,
         http: tracker_client(&LegKind::System, None, &IDENTITY).unwrap(),
@@ -371,6 +373,29 @@ fn session_options_follow_the_leg() {
     assert!(ladder.listen.is_none());
     assert!(ladder.disable_local_service_discovery);
     assert_eq!(ladder.peer_limit, Some(100));
+
+    // A ladder whose tunnel carries datagrams runs DHT, and still neither
+    // listens nor maps a port.
+    let mut tunnel = leg(LegKind::Ladder);
+    tunnel.shape.dht = true;
+    tunnel.shape.datagrams = true;
+    let tunnel = session_options(&env, &tunnel, 6884, dir.path(), 100, Default::default());
+    assert_eq!(tunnel.dht.as_ref().and_then(|dht| dht.port), Some(6884));
+    assert!(tunnel.listen.is_none());
+    assert!(tunnel.disable_local_service_discovery);
+}
+
+#[test]
+fn a_peer_may_stay_quiet_for_two_minutes_on_any_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env(dir.path());
+    for kind in [LegKind::System, LegKind::Ladder] {
+        let options = session_options(&env, &leg(kind), 6881, dir.path(), 100, Default::default());
+        let peer = options.connect.unwrap().peer_opts.unwrap();
+        assert_eq!(peer.read_write_timeout, Some(Duration::from_secs(120)));
+        assert_eq!(peer.connect_timeout, None);
+        assert_eq!(peer.keep_alive_interval, None);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

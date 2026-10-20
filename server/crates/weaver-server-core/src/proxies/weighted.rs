@@ -132,6 +132,14 @@ impl Default for LegState {
     }
 }
 impl LegState {
+    // Take `dialed` among the leg's open connections, as the path and
+    // source the leg now runs on; its reads go to the counter returned.
+    fn carry(&mut self, dialed: &Dialed) -> Arc<AtomicU64> {
+        self.open += 1;
+        self.path = Some(dialed.path.clone());
+        self.source = dialed.source;
+        self.reads.clone()
+    }
     fn health(&self, now: Instant) -> LegHealthState {
         if let Some(reason) = &self.blocked {
             return LegHealthState::Blocked(reason.clone());
@@ -251,6 +259,37 @@ struct Shared {
     timer_snapshots: AtomicU64,
 }
 impl Shared {
+    // Count `dialed`'s reads into leg `position`'s throughput, and give back
+    // its place among the leg's open connections when it closes. A leg that
+    // changed since keeps its own count.
+    fn follow(
+        self: &Arc<Self>,
+        position: usize,
+        generation: u64,
+        reads: Arc<AtomicU64>,
+        dialed: &mut Dialed,
+    ) {
+        let wake = self.clone();
+        dialed.outcome.on_read(move |bytes| {
+            // Only the first read after the timer drained the counter can
+            // find it parked, so steady traffic pays one extra load at most.
+            if reads.fetch_add(bytes as u64, Ordering::SeqCst) == 0 {
+                wake.wake_timer();
+            }
+        });
+        let shared = self.clone();
+        dialed.outcome.on_close(move || {
+            let mut state = shared.state.lock().expect("leg allocation");
+            if let Some(leg) = state
+                .legs
+                .get_mut(position)
+                .filter(|l| l.generation == generation)
+            {
+                leg.open -= 1;
+            }
+            shared.publish(&state);
+        });
+    }
     // Wake a parked rate timer so it re-plans its next wake: a publish may
     // have set or cleared a leg's cooldown.
     fn wake_timer(&self) {
@@ -420,6 +459,21 @@ impl Weighted {
             }
         }));
         Ok(result)
+    }
+    /// Count `dialed`, made on leg `position` by a consumer that keeps its
+    /// own connection limit, among the leg's open connections until it
+    /// closes, with its reads in the leg's throughput.
+    pub fn carry(&self, position: usize, dialed: &mut Dialed) {
+        let mut state = self.shared.state.lock().expect("leg allocation");
+        let Some(leg) = state.legs.get_mut(position) else {
+            return;
+        };
+        dialed.path.leg = Some(position);
+        let generation = leg.generation;
+        let reads = leg.carry(dialed);
+        self.shared.publish(&state);
+        drop(state);
+        self.shared.follow(position, generation, reads, dialed);
     }
     pub fn allocations(&self) -> Vec<LegAllocation> {
         self.shared.state.lock().expect("leg allocation").snapshot()
@@ -613,12 +667,9 @@ impl Opening {
             ));
         };
         leg.opening -= 1;
-        leg.open += 1;
         dialed.path.leg = Some(self.position);
-        leg.path = Some(dialed.path.clone());
-        leg.source = dialed.source;
+        let reads = leg.carry(dialed);
         leg.succeeded();
-        let reads = leg.reads.clone();
         if let Some(egress_id) = egress_id {
             super::network_metrics::record_leg_dial(
                 egress_id,
@@ -628,29 +679,8 @@ impl Opening {
         self.completed = true;
         self.shared.publish(&state);
         drop(state);
-        dialed.path.leg = Some(self.position);
-        let shared = self.shared.clone();
-        let position = self.position;
-        let generation = self.generation;
-        let wake = self.shared.clone();
-        dialed.outcome.on_read(move |bytes| {
-            // Only the first read after the timer drained the counter can
-            // find it parked, so steady traffic pays one extra load at most.
-            if reads.fetch_add(bytes as u64, Ordering::SeqCst) == 0 {
-                wake.wake_timer();
-            }
-        });
-        dialed.outcome.on_close(move || {
-            let mut state = shared.state.lock().expect("leg allocation");
-            if let Some(leg) = state
-                .legs
-                .get_mut(position)
-                .filter(|l| l.generation == generation)
-            {
-                leg.open -= 1;
-            }
-            shared.publish(&state);
-        });
+        self.shared
+            .follow(self.position, self.generation, reads, dialed);
         Ok(())
     }
     fn failed(&self, error: &DialError) {

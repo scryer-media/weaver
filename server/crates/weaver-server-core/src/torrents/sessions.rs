@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use librqbit::dht::DhtPersistenceConfig;
 use librqbit::{
-    ConnectionOptions, DhtSessionConfig, ListenerMode, ListenerOptions, Session, SessionOptions,
-    SocketFactory,
+    ConnectionOptions, DhtSessionConfig, ListenerMode, ListenerOptions, PeerConnectionOptions,
+    Session, SessionOptions, SocketFactory,
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -28,11 +28,15 @@ use crate::proxies::{
 };
 use crate::settings::TorrentEncryption;
 use crate::torrents::identity::ClientIdentity;
-use crate::torrents::net::{LegKind, LegSockets, tracker_client};
+use crate::torrents::net::{LegKind, LegSockets, Shape, tracker_client};
 use crate::torrents::rate::SessionRates;
 
 /// The most sessions that run at once.
 pub const MAX_SESSIONS: usize = 8;
+
+/// How long a peer may send nothing before it is dropped. A seed that
+/// unchokes and then sends only the odd HAVE is still a seed.
+pub const PEER_TIMEOUT: Duration = Duration::from_secs(120);
 
 const SLOTS_KEY: &str = "torrent.session_slots";
 const MAPPED_KEY: &str = "torrent.mapped_ports";
@@ -84,6 +88,7 @@ pub struct RoutePlan {
 /// A leg made ready for a session.
 pub struct OpenLeg {
     pub kind: LegKind,
+    pub shape: Shape,
     pub factory: Option<Arc<dyn SocketFactory>>,
     pub http: reqwest::Client,
     /// The route's leg the factory dials through, kept while the session
@@ -95,7 +100,8 @@ pub struct OpenLeg {
 #[async_trait::async_trait]
 pub trait Routes: Send + Sync {
     fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String>;
-    async fn open(&self, plan: &RoutePlan) -> Result<OpenLeg, String>;
+    /// Open `plan`'s leg for a session of at most `peers` peers.
+    async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String>;
 }
 
 /// Routes as the network runtime resolves them.
@@ -163,23 +169,27 @@ impl Routes for NetworkRoutes {
         })
     }
 
-    async fn open(&self, plan: &RoutePlan) -> Result<OpenLeg, String> {
-        if plan.kind.shape().own_sockets {
+    async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
+        if plan.kind.own_sockets() {
             return Ok(OpenLeg {
                 kind: plan.kind.clone(),
+                shape: plan.kind.shape(None),
                 factory: None,
                 http: tracker_client(&plan.kind, None, &self.identity)?,
                 leg: None,
             });
         }
-        let leg = self.network.torrent_leg(plan.scope, self.timeout)?;
+        let peers = u16::try_from(peers).unwrap_or(u16::MAX);
+        let leg = self.network.torrent_leg(plan.scope, peers, self.timeout)?;
         let bridge = match plan.kind {
             LegKind::Ladder => Some(leg.bridge()?),
             _ => None,
         };
         let http = tracker_client(&plan.kind, bridge.as_deref(), &self.identity)?;
+        let dialer = leg.dialer();
         Ok(OpenLeg {
-            factory: Some(Arc::new(LegSockets::new(leg.stage.clone(), &plan.kind))),
+            shape: plan.kind.shape(Some(&dialer)),
+            factory: Some(Arc::new(LegSockets::new(dialer, &plan.kind))),
             kind: plan.kind.clone(),
             http,
             leg: Some(leg),
@@ -250,7 +260,7 @@ pub fn session_options(
     peers: usize,
     encryption: TorrentEncryption,
 ) -> SessionOptions {
-    let shape = leg.kind.shape();
+    let shape = leg.shape;
     let listen_ip = leg.kind.listen_ip().unwrap_or_else(|| unspecified(binds));
     let mut options = SessionOptions {
         dht: shape.dht.then(|| DhtSessionConfig {
@@ -278,7 +288,10 @@ pub fn session_options(
         connect: Some(ConnectionOptions {
             proxy_url: None,
             enable_tcp: true,
-            peer_opts: None,
+            peer_opts: Some(PeerConnectionOptions {
+                read_write_timeout: Some(PEER_TIMEOUT),
+                ..PeerConnectionOptions::default()
+            }),
         }),
         peer_limit: Some(peers.max(1)),
         disable_local_service_discovery: !shape.own_sockets,
@@ -430,6 +443,15 @@ impl Sessions {
         &self.routes
     }
 
+    /// Whether `plan`'s route carries DHT. Its open session says; a route
+    /// with none open yet has no dialer to ask, so a ladder leg says no.
+    pub async fn carries_dht(&self, plan: &RoutePlan) -> bool {
+        match self.slots.lock().await.get(&plan.key) {
+            Some(Slot::Open { session, .. }) => session.get_dht().is_some(),
+            _ => plan.kind.shape(None).dht,
+        }
+    }
+
     /// The open session of `plan`'s route, built when it is not open yet. A
     /// route that is down holds closed.
     pub async fn session(&self, plan: &RoutePlan) -> Result<Arc<Session>, SessionError> {
@@ -503,7 +525,7 @@ impl Sessions {
             .ok_or("no listen port is left for this route")?;
         let dir = self.env.root.join(plan.key.as_str());
         std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        let leg = self.routes.open(plan).await?;
+        let leg = self.routes.open(plan, peers).await?;
         // A port a gateway mapped to the route is the one it announces.
         let env = SessionEnv {
             announce_port: mapped.or(self.env.announce_port),

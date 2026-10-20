@@ -7,7 +7,8 @@ use super::*;
 use weaver_tunnel::{
     TunnelError, TunnelStream,
     bridge::{Bridge, ConnectionOutcome},
-    pipe::Purpose,
+    endpoint::DatagramTransport,
+    pipe::{Dialed, Purpose, Resolution},
 };
 
 /// A torrent session's leg: the first leg of its consumer's live route.
@@ -15,10 +16,18 @@ use weaver_tunnel::{
 /// the bridge an HTTP client rides belongs to this leg, and stops with it.
 pub struct TorrentLeg {
     pub stage: Arc<Revocable>,
+    route: Arc<super::weighted::Weighted>,
     handle: tokio::runtime::Handle,
     bridge: Mutex<Option<Arc<Bridge>>>,
 }
 impl TorrentLeg {
+    /// The leg's dialer, whose connections the route counts as its own.
+    pub fn dialer(&self) -> Arc<dyn Dialer> {
+        Arc::new(Carried {
+            stage: self.stage.clone(),
+            route: self.route.clone(),
+        })
+    }
     // The bridge onto the leg's stage, started the first time it is asked for.
     pub fn bridge(&self) -> Result<Arc<Bridge>, String> {
         // A panic while starting the bridge left it unstarted: start it.
@@ -30,7 +39,7 @@ impl TorrentLeg {
         getrandom::fill(&mut secret).map_err(|_| "could not generate bridge credentials")?;
         let started = Bridge::start(
             &self.handle,
-            Arc::new(TorrentProvider(self.stage.clone())),
+            Arc::new(TorrentProvider(self.dialer())),
             self.stage.budget(),
             ("weaver".into(), hex::encode(secret)),
         )
@@ -51,7 +60,34 @@ impl Drop for TorrentLeg {
         }
     }
 }
-struct TorrentProvider(Arc<Revocable>);
+// A session's connections on the first leg of its route. The session keeps
+// its own peer limit, so they pass the route's allocation by, but the route
+// counts them, and their bytes, as the leg's.
+struct Carried {
+    stage: Arc<Revocable>,
+    route: Arc<super::weighted::Weighted>,
+}
+#[async_trait::async_trait]
+impl Dialer for Carried {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        let mut dialed = self.stage.dial(target).await?;
+        self.route.carry(0, &mut dialed);
+        Ok(dialed)
+    }
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.stage.resolve(host).await
+    }
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        Arc::clone(&self.stage).datagrams()
+    }
+    fn budget(&self) -> Duration {
+        self.stage.budget()
+    }
+    fn describe(&self) -> String {
+        self.stage.describe()
+    }
+}
+struct TorrentProvider(Arc<dyn Dialer>);
 #[async_trait::async_trait]
 impl TunnelProvider for TorrentProvider {
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
@@ -88,13 +124,14 @@ impl TunnelProvider for TorrentProvider {
 }
 impl NetworkRuntime {
     /// The leg a torrent scope's session runs on: the first leg of the
-    /// scope's live route.
+    /// scope's live route, which allows it `peers` connections.
     pub fn torrent_leg(
         &self,
         scope: TorrentScope,
+        peers: u16,
         timeout: Duration,
     ) -> Result<Arc<TorrentLeg>, String> {
-        let route = self.route(Consumer::Torrent(scope), 1, timeout)?;
+        let route = self.route(Consumer::Torrent(scope), peers, timeout)?;
         let stage = route
             .legs
             .read()
@@ -105,6 +142,7 @@ impl NetworkRuntime {
             .clone();
         Ok(Arc::new(TorrentLeg {
             stage,
+            route: route.weighted.clone(),
             handle: self.handle.clone(),
             bridge: Mutex::new(None),
         }))

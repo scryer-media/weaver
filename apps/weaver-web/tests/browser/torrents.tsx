@@ -101,17 +101,21 @@ function Remove() {
   );
 }
 
+/** A release name longer than any row is wide. */
+const LONG_NAME = Array.from({ length: 24 }, (_, index) => `Segment${index}`).join(".");
+
 const TORRENT_STATES = ["FETCHING_METADATA", "CHECKING_FILES", "SEEDING", "STALLED"] as const;
 
 /**
  * The queue's rows for each torrent state, labelled by the one status renderer every row uses, and
- * an older job with no protocol. The list is a container, as on the page, so its width lays out the rows.
+ * an older job with no protocol, and one whose name is longer than the row. The list is a container, as on the page, so its width lays out the rows.
  */
 function Queue() {
   const statusLabel = useStatusLabel();
   const rows: [string, JobData][] = [
     ...TORRENT_STATES.map((state, index): [string, JobData] => [state, job({ id: index + 1, status: state, protocol: "TORRENT" })]),
     ["older", job({ id: 9, name: "older job", displayTitle: "older job", originalTitle: "older job" })],
+    ["long", job({ id: 10, name: LONG_NAME, displayTitle: LONG_NAME, originalTitle: LONG_NAME })],
   ];
   return (
     <ul className="@container">

@@ -150,6 +150,13 @@ test("each queue row names its type, and a wide list draws the bars as a column 
   const [wideName, wideBar] = [await name.boundingBox(), await bar.boundingBox()];
   assert.ok(Math.abs(middle(wideName) - middle(wideBar)) < wideName.height, "the bars share the name's line");
   assert.ok(wideBar.x > wideName.x + wideName.width, "the bars follow the name");
+  // A name that does not fit beside the column is never cut: the bars go under it, and it wraps.
+  const long = page.getByLabel("long", { exact: true });
+  const [longName, longBar] = [long.getByText(/Segment23$/), long.getByRole("progressbar")];
+  const longBox = await longName.boundingBox();
+  assert.ok((await longBar.boundingBox()).y >= longBox.y + longBox.height, "the bars sit under a long name");
+  assert.ok(longBox.height > 2 * wideName.height, "a long name wraps rather than being cut");
+  assert.ok(await longName.evaluate((text) => text.scrollWidth <= text.clientWidth), "no part of the name is hidden");
   // A 1700px list: the column widens to the bars' full length.
   await listWidth("1700px");
   assert.ok((await bar.boundingBox()).width > wideBar.width, "an ultrawide list draws longer bars");

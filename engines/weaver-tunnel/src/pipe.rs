@@ -1390,6 +1390,11 @@ impl Dialer for Fallback {
             None => Ok(Resolution::Unresolved),
         }
     }
+    // The datagrams of the first rung a dial would try.
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        let index = (0..self.rungs.len()).find(|index| self.allows_rung(*index, false))?;
+        Arc::clone(&self.rungs[index]).datagrams()
+    }
     fn budget(&self) -> Duration {
         self.rungs.iter().fold(Duration::ZERO, |sum, rung| {
             sum.saturating_add(rung.budget())

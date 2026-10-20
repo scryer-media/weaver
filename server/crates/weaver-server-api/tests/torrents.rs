@@ -43,6 +43,7 @@ impl Routes for Offline {
     fn open<'life0, 'life1, 'async_trait>(
         &'life0 self,
         _: &'life1 RoutePlan,
+        _: usize,
     ) -> Pin<Box<dyn Future<Output = Result<OpenLeg, String>> + Send + 'async_trait>>
     where
         'life0: 'async_trait,

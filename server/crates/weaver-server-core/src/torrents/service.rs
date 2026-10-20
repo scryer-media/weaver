@@ -1401,12 +1401,11 @@ impl TorrentService {
     // route's session to fetch the metainfo, and becomes one when it has.
     /// Whether the route a torrent in `scope` would take carries DHT, so a
     /// magnet with no trackers can find its peers there.
-    pub fn carries_dht(&self, scope: TorrentScope) -> bool {
-        self.inner
-            .sessions
-            .routes()
-            .plan(scope)
-            .is_ok_and(|plan| plan.kind.shape().dht)
+    pub async fn carries_dht(&self, scope: TorrentScope) -> bool {
+        let Ok(plan) = self.inner.sessions.routes().plan(scope) else {
+            return false;
+        };
+        self.inner.sessions.carries_dht(&plan).await
     }
 
     pub async fn add(&self, request: AddRequest) -> Result<JobId, AddError> {
@@ -1473,18 +1472,18 @@ impl TorrentService {
                     .routes()
                     .plan(scope)
                     .map_err(AddError::NoNetwork)?;
-                if magnet.trackers.is_empty() && !plan.kind.shape().dht {
-                    return Err(AddError::NoNetwork(
-                        "a magnet with no trackers needs DHT, which this route does not carry"
-                            .into(),
-                    ));
-                }
                 let session = self
                     .inner
                     .sessions
                     .session(&plan)
                     .await
                     .map_err(|error| AddError::NoNetwork(error.to_string()))?;
+                if magnet.trackers.is_empty() && session.get_dht().is_none() {
+                    return Err(AddError::NoNetwork(
+                        "a magnet with no trackers needs DHT, which this route does not carry"
+                            .into(),
+                    ));
+                }
                 let job_id = self.reserve()?;
                 let name = magnet.name.clone().unwrap_or_else(|| hex::encode(infohash));
                 let mut record = self.record(
@@ -2751,9 +2750,16 @@ fn job_status(view: &TorrentView) -> JobStatus {
     }
 }
 
-// A downloading torrent's speed and ETA, as the queue reads a job's.
+// A downloading torrent's progress, speed and ETA, as the queue reads a
+// job's. One that has stalled short of complete is still downloading, at no
+// speed, and keeps what it has.
 fn downloading(view: &TorrentView, now_ms: i64) -> Option<JobPhaseProgress> {
-    (view.state == TorrentState::Downloading).then(|| JobPhaseProgress {
+    let fetching = match view.state {
+        TorrentState::Downloading => true,
+        TorrentState::Stalled => view.completed_at_ms.is_none(),
+        _ => false,
+    };
+    fetching.then(|| JobPhaseProgress {
         phase: JobPhase::Downloading,
         completed_bytes: view.have_bytes,
         total_bytes: view.total_bytes,

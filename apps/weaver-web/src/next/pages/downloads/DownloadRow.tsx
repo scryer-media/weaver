@@ -87,10 +87,12 @@ export const DownloadRow = memo(function DownloadRow({
       title={name}
       lead={lead}
       left={
-        // Where the list is wide the block dissolves into the row, so the bars
-        // become a column of their own and the row a single line.
-        <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px] @6xl:contents">
-          <span className="min-w-0 truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg @6xl:flex-[1_1_0%]">
+        // The name is never cut short. Where the list is wide the bars are a
+        // column beside it, so the row is a single line, but only while the
+        // whole name fits there; one that does not sends the bars under it,
+        // and one longer than the row wraps.
+        <div className="flex min-w-0 flex-[1_1_240px] flex-wrap items-center gap-x-5 gap-y-[9px]">
+          <span className="max-w-full min-w-0 flex-[1_1_auto] text-[13.5px] font-medium tracking-[-0.005em] [overflow-wrap:anywhere] text-wv-fg">
             {name}
           </span>
           <PhaseBars
@@ -102,7 +104,7 @@ export const DownloadRow = memo(function DownloadRow({
             // leaves dead track before the percentage.
             barClassName="max-w-[343px] min-w-[56px] flex-1"
             percentClassName="w-[34px] text-[11.5px] text-wv-muted"
-            className="@6xl:w-[242px] @6xl:flex-none @min-[100rem]:w-[389px]"
+            className="basis-full @6xl:flex-[0_0_242px] @min-[100rem]:flex-[0_0_389px]"
           />
         </div>
       }
