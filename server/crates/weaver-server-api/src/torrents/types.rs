@@ -157,9 +157,33 @@ pub struct Torrent {
     pub peers: u32,
     pub seeds: u32,
     pub leechers: u32,
+    /// The most peers a torrent connects to.
+    pub max_peers: u32,
+    /// The swarm's seeds and leechers as its trackers last counted them.
+    pub swarm_seeds: Option<u32>,
+    pub swarm_leechers: Option<u32>,
+    /// Seconds until the next tracker announce.
+    pub reannounce_seconds: Option<u64>,
+    /// Seconds spent running in a session.
+    pub active_seconds: u64,
+    pub download_avg_bps: u64,
+    pub upload_avg_bps: u64,
+    /// Fetched bytes whose pieces did not verify.
+    pub wasted_bytes: u64,
+    /// The last time a complete copy was in reach.
+    pub last_seen_complete_ms: Option<i64>,
+    pub piece_count: Option<u32>,
+    pub piece_size: Option<u64>,
+    /// The pieces in hand, verified.
+    pub pieces_have: Option<u32>,
+    pub created_by: Option<String>,
+    pub created_at_ms: Option<i64>,
+    pub comment: Option<String>,
     pub added_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,
+    /// The folder that holds the torrent's output.
+    pub save_path: Option<String>,
     /// The seeding goal still to meet; absent once it is met.
     pub seeding_left: Option<String>,
     /// The torrent's own seeding policy; absent when it inherits one.
@@ -190,6 +214,7 @@ impl From<TorrentView> for Torrent {
                 progress: view.file_progress(file),
             })
             .collect();
+        let (save_path, _) = view.paths();
         Self {
             id: view.job_id.0,
             name: view.name,
@@ -211,9 +236,25 @@ impl From<TorrentView> for Torrent {
             peers: view.peers,
             seeds: view.seeds,
             leechers: view.leechers,
+            max_peers: view.max_peers,
+            swarm_seeds: view.swarm_seeds,
+            swarm_leechers: view.swarm_leechers,
+            reannounce_seconds: view.reannounce_seconds,
+            active_seconds: view.active_seconds,
+            download_avg_bps: view.download_avg_bps,
+            upload_avg_bps: view.upload_avg_bps,
+            wasted_bytes: view.wasted_bytes,
+            last_seen_complete_ms: view.last_seen_complete_ms,
+            piece_count: view.pieces.map(|pieces| pieces.count),
+            piece_size: view.pieces.map(|pieces| pieces.size),
+            pieces_have: view.pieces.map(|pieces| pieces.have),
+            created_by: view.created_by,
+            created_at_ms: view.created_at_ms,
+            comment: view.comment,
             added_at_ms: view.added_at_ms,
             completed_at_ms: view.completed_at_ms,
             storage_dir: view.storage_dir,
+            save_path: (!save_path.is_empty()).then_some(save_path),
             seeding_left: view.seeding_left,
             seeding_override: view.seeding_override.map(Into::into),
             seeding_policy: view.seeding_policy.into(),

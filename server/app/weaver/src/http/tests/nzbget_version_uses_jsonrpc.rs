@@ -795,6 +795,7 @@ fn tv_category_config() -> SharedConfig {
         .unwrap()
         .categories
         .push(weaver_server_core::categories::CategoryConfig {
+            unpack: None,
             seeding: None,
             torrent_route: false,
             id: 1,
@@ -1904,6 +1905,7 @@ async fn nzbget_config_exposes_real_categories_and_keep_history() {
         config_write
             .categories
             .push(weaver_server_core::categories::CategoryConfig {
+                unpack: None,
                 seeding: None,
                 torrent_route: false,
                 id: 1,
@@ -1968,6 +1970,7 @@ async fn nzbget_config_emits_virtual_literal_alias_categories_for_arr_test() {
         config_write
             .categories
             .push(weaver_server_core::categories::CategoryConfig {
+                unpack: None,
                 seeding: None,
                 torrent_route: false,
                 id: 1,

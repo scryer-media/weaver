@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -369,6 +370,19 @@ fn view(state: TorrentState) -> TorrentView {
         peers: 0,
         seeds: 0,
         leechers: 0,
+        max_peers: 100,
+        swarm_seeds: None,
+        swarm_leechers: None,
+        reannounce_seconds: None,
+        active_seconds: 0,
+        download_avg_bps: 0,
+        upload_avg_bps: 0,
+        wasted_bytes: 0,
+        last_seen_complete_ms: None,
+        pieces: None,
+        created_by: None,
+        created_at_ms: None,
+        comment: None,
         added_at_ms: 1_700_000_000_000,
         completed_at_ms: None,
         storage_dir: Some("/complete/tv/a".into()),
@@ -377,6 +391,7 @@ fn view(state: TorrentState) -> TorrentView {
         seeding_inherited: None,
         seeding_policy: SeedingPolicy::default(),
         seeding_source: SeedingSource::Global,
+        unpack: true,
         route: None,
         files: Vec::new(),
         file_have: Vec::new(),
@@ -799,6 +814,39 @@ async fn an_added_torrent_is_listed_with_its_paths_and_state() {
         .json();
     assert_eq!(properties["total_size"], 3000);
     assert_eq!(properties["save_path"], torrent["save_path"]);
+    // Three pieces of 1 KiB, none in hand; a route that is down runs
+    // nothing, wastes nothing and has seen no complete copy.
+    assert_eq!(
+        [
+            &properties["pieces_num"],
+            &properties["piece_size"],
+            &properties["pieces_have"],
+        ],
+        [&json!(3), &json!(1024), &json!(0)]
+    );
+    assert_eq!(
+        [
+            &properties["time_elapsed"],
+            &properties["total_wasted"],
+            &properties["last_seen"],
+            &properties["dl_speed_avg"],
+            &properties["up_speed_avg"],
+        ],
+        [&json!(0), &json!(0), &json!(-1), &json!(0), &json!(0)]
+    );
+    assert_eq!(
+        properties["nb_connections_limit"],
+        TorrentConfig::default().max_peers_total
+    );
+    // The metainfo names no maker, date or comment.
+    assert_eq!(
+        [
+            &properties["created_by"],
+            &properties["creation_date"],
+            &properties["comment"],
+        ],
+        [&json!(""), &json!(-1), &json!("")]
+    );
     let files = rig
         .get(&format!("/api/v2/torrents/files?hash={hash}"))
         .await
