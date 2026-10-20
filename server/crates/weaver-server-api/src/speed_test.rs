@@ -15,6 +15,7 @@ use crate::observability::refusal_error;
 pub enum SpeedTestKind {
     Bandwidth,
     Usenet,
+    Torrent,
 }
 
 impl From<core::SpeedTestKindLabel> for SpeedTestKind {
@@ -22,6 +23,7 @@ impl From<core::SpeedTestKindLabel> for SpeedTestKind {
         match value {
             core::SpeedTestKindLabel::Bandwidth => Self::Bandwidth,
             core::SpeedTestKindLabel::Usenet => Self::Usenet,
+            core::SpeedTestKindLabel::Torrent => Self::Torrent,
         }
     }
 }
@@ -155,6 +157,12 @@ pub struct UsenetTestInput {
 }
 
 #[derive(Clone, Debug, InputObject)]
+pub struct TorrentTestInput {
+    // How long the run pulls from the swarm; 20 when absent.
+    pub max_duration_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug, InputObject)]
 pub struct SpeedTestInput {
     pub kind: NetworkConsumerKind,
     pub id: u32,
@@ -162,6 +170,7 @@ pub struct SpeedTestInput {
     pub overrides: Option<PathOverrideInput>,
     pub bandwidth: Option<BandwidthTestInput>,
     pub usenet: Option<UsenetTestInput>,
+    pub torrent: Option<TorrentTestInput>,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -177,8 +186,8 @@ impl SpeedTestInput {
         service: &core::SpeedTestService,
     ) -> Result<core::SpeedTestRequest> {
         let consumer = self.kind.consumer(self.id);
-        let kind = match (self.bandwidth, self.usenet) {
-            (Some(bandwidth), None) => {
+        let kind = match (self.bandwidth, self.usenet, self.torrent) {
+            (Some(bandwidth), None, None) => {
                 let provider = match (bandwidth.provider_id, bandwidth.custom_url) {
                     (Some(id), None) => core::BandwidthProvider::Builtin {
                         id,
@@ -199,7 +208,7 @@ impl SpeedTestInput {
                 };
                 core::SpeedTestKind::Bandwidth { provider, upload }
             }
-            (None, Some(usenet)) => {
+            (None, Some(usenet), None) => {
                 let nzb = match (
                     usenet.sab_size,
                     usenet.nzb_url,
@@ -240,9 +249,17 @@ impl SpeedTestInput {
                     max_duration: Duration::from_secs(u64::from(usenet.max_duration_seconds)),
                 }
             }
+            (None, None, Some(torrent)) => core::SpeedTestKind::Torrent {
+                source: core::TestTorrentSource::debian(),
+                max_duration: torrent
+                    .max_duration_seconds
+                    .map_or(core::DEFAULT_TORRENT_DURATION, |seconds| {
+                        Duration::from_secs(u64::from(seconds))
+                    }),
+            },
             _ => {
                 return Err(invalid(
-                    "a speed test takes exactly one of bandwidth and usenet",
+                    "a speed test takes exactly one of bandwidth, usenet and torrent",
                 ));
             }
         };
@@ -411,14 +428,15 @@ pub struct PeerUploadResult {
 
 #[derive(Clone, Debug, SimpleObject)]
 pub struct UploadResult {
-    pub http: HttpUploadResult,
+    // Absent for a torrent run, which posts nothing.
+    pub http: Option<HttpUploadResult>,
     // Absent while torrents are off.
     pub peers: Option<PeerUploadResult>,
 }
 
 impl From<core::UploadResult> for UploadResult {
     fn from(upload: core::UploadResult) -> Self {
-        let http = match upload.http {
+        let http = upload.http.map(|http| match http {
             core::HttpUpload::Unavailable { provider } => HttpUploadResult {
                 outcome: UploadOutcome::Unavailable,
                 provider: Some(provider),
@@ -451,7 +469,7 @@ impl From<core::UploadResult> for UploadResult {
                 bps: 0.0,
                 failure: Some(error.into()),
             },
-        };
+        });
         let peers = upload.peers.map(|peers| match peers {
             core::PeerUpload::NoDemand => PeerUploadResult {
                 outcome: UploadOutcome::NoDemand,
@@ -508,17 +526,23 @@ pub struct UsenetTestRequest {
     pub max_duration_seconds: u32,
 }
 
-// Exactly one of `bandwidth` and `usenet` is set.
+#[derive(Clone, Debug, SimpleObject)]
+pub struct TorrentTestRequest {
+    pub max_duration_seconds: u32,
+}
+
+// Exactly one of `bandwidth`, `usenet` and `torrent` is set.
 #[derive(Clone, Debug, SimpleObject)]
 #[graphql(name = "SpeedTestRequest")]
 pub struct SpeedTestRequestGql {
     pub bandwidth: Option<BandwidthTestRequest>,
     pub usenet: Option<UsenetTestRequest>,
+    pub torrent: Option<TorrentTestRequest>,
 }
 
 impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
     fn from(request: &core::SpeedTestRequest) -> Self {
-        let (bandwidth, usenet) = match &request.kind {
+        let (bandwidth, usenet, torrent) = match &request.kind {
             core::SpeedTestKind::Bandwidth { provider, upload } => {
                 let (provider_id, server, custom_url) = match provider {
                     core::BandwidthProvider::Builtin { id, server } => {
@@ -533,6 +557,7 @@ impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
                         custom_url,
                         upload_mib: upload.bytes.map(|bytes| small(bytes.div_ceil(MIB))),
                     }),
+                    None,
                     None,
                 )
             }
@@ -560,10 +585,22 @@ impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
                         connections: connections.map(u32::from),
                         max_duration_seconds: small(max_duration.as_secs()),
                     }),
+                    None,
                 )
             }
+            core::SpeedTestKind::Torrent { max_duration, .. } => (
+                None,
+                None,
+                Some(TorrentTestRequest {
+                    max_duration_seconds: small(max_duration.as_secs()),
+                }),
+            ),
         };
-        Self { bandwidth, usenet }
+        Self {
+            bandwidth,
+            usenet,
+            torrent,
+        }
     }
 }
 

@@ -1195,7 +1195,7 @@ async fn the_upload_posts_the_bounded_body_to_the_provider_and_its_rate_is_measu
 
     assert_eq!(run.status, SpeedTestStatus::Completed, "{:?}", run.error);
     let upload = run.result.unwrap().upload.unwrap();
-    match upload.http {
+    match upload.http.expect("a bandwidth run posts") {
         HttpUpload::Measured { bytes, url, .. } => {
             assert_eq!(bytes, 65_536);
             assert_eq!(
@@ -1224,9 +1224,9 @@ async fn a_provider_without_an_upload_path_is_named_as_having_none() {
     let upload = run.result.unwrap().upload.unwrap();
     assert_eq!(
         upload.http,
-        HttpUpload::Unavailable {
+        Some(HttpUpload::Unavailable {
             provider: "127.0.0.1".into()
-        }
+        })
     );
     assert_eq!(*http.uploaded().borrow(), 0);
 }
@@ -1277,7 +1277,7 @@ async fn a_fast_com_run_pulls_from_and_posts_to_the_targets_its_token_finds() {
     let result = run.result.unwrap();
     assert!(result.bytes > 0);
     assert_eq!(result.bandwidth.unwrap().url, target);
-    match result.upload.unwrap().http {
+    match result.upload.unwrap().http.expect("a bandwidth run posts") {
         HttpUpload::Measured { bytes, url, .. } => {
             assert_eq!(bytes, 65_536);
             assert_eq!(url, target);
@@ -1333,10 +1333,159 @@ async fn with_torrents_on_a_swarm_without_leechers_is_no_demand() {
     let upload = run.result.unwrap().upload.unwrap();
     assert_eq!(
         upload.http,
-        HttpUpload::Unavailable {
+        Some(HttpUpload::Unavailable {
             provider: "127.0.0.1".into()
-        }
+        })
     );
+    assert_eq!(upload.peers, Some(PeerUpload::NoDemand));
+    fixture.stop().await;
+}
+
+fn torrent_request() -> SpeedTestRequest {
+    SpeedTestRequest {
+        consumer: Consumer::Torrent(crate::proxies::TorrentScope::Default),
+        route: Some(direct_route()),
+        overrides: PathOverride::default(),
+        kind: SpeedTestKind::Torrent {
+            source: TestTorrentSource::debian(),
+            max_duration: DEFAULT_TORRENT_DURATION,
+        },
+    }
+}
+
+// A torrent rig: torrents on, and the test torrent taken from `fixture`.
+async fn torrent_rig(fixture: &super::torrent_fixture::TorrentFixture) -> Rig {
+    let rig = rig().await;
+    rig.service
+        .test_torrent_source_for_tests(fixture.source.clone());
+    rig.config.write().await.torrent.enabled = true;
+    rig
+}
+
+#[tokio::test]
+async fn a_torrent_run_needs_a_torrent_route_and_torrents_on() {
+    let rig = rig().await;
+    let mut request = torrent_request();
+    request.consumer = Consumer::Rss(1);
+    assert_eq!(
+        rig.service.start(request).await.unwrap_err(),
+        SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestTorrentNeedsTorrentRoute)
+    );
+    assert_eq!(
+        rig.service.start(torrent_request()).await.unwrap_err(),
+        SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestTorrentsOff)
+    );
+    rig.config.write().await.torrent.enabled = true;
+    for max_duration in [Duration::ZERO, MAX_DURATION + Duration::from_secs(1)] {
+        let mut request = torrent_request();
+        request.kind = SpeedTestKind::Torrent {
+            source: TestTorrentSource::debian(),
+            max_duration,
+        };
+        assert!(
+            matches!(
+                rig.service.start(request).await,
+                Err(SpeedTestError::Invalid(_))
+            ),
+            "{max_duration:?} accepted"
+        );
+    }
+}
+
+// The whole torrent is pulled from the seeder, every block counted on the
+// leg, and the pieces it held then go to the leecher the tracker sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_run_pulls_from_the_swarm_and_serves_what_it_held() {
+    use super::torrent_fixture::{Answer, CONTENT_LEN, PIECE_LEN, TorrentFixture};
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder(), fixture.leecher()],
+        seeders: 1,
+        leechers: 1,
+        ..Answer::default()
+    });
+    let rig = torrent_rig(&fixture).await;
+    rig.service
+        .peer_upload_budget_for_tests(u64::from(PIECE_LEN));
+    let started = rig.service.start(torrent_request()).await.unwrap();
+    assert_eq!(started.kind, SpeedTestKindLabel::Torrent);
+    assert_eq!(
+        started
+            .tested
+            .legs
+            .iter()
+            .map(|leg| leg.target)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Completed, "{:?}", run.error);
+    let result = run.result.unwrap();
+    assert_eq!(result.bytes, CONTENT_LEN as u64);
+    assert_eq!(result.legs[0].bytes, CONTENT_LEN as u64);
+    let upload = result.upload.unwrap();
+    assert_eq!(upload.http, None);
+    match upload.peers {
+        Some(PeerUpload::Measured { bytes, peers, .. }) => {
+            assert_eq!(bytes, u64::from(PIECE_LEN));
+            assert_eq!(peers, 1);
+        }
+        other => panic!("not measured: {other:?}"),
+    }
+    // Both the pull and the serve leave the swarm.
+    let mut announces = fixture.announces();
+    announces
+        .wait_for(|announces| {
+            announces
+                .iter()
+                .filter(|announce| announce.event.as_deref() == Some("stopped"))
+                .count()
+                == 2
+        })
+        .await
+        .unwrap();
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_run_whose_tracker_fails_says_so() {
+    use super::torrent_fixture::{Answer, TorrentFixture};
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        failure: Some("torrent not registered".into()),
+        ..Answer::default()
+    });
+    let rig = torrent_rig(&fixture).await;
+    let started = rig.service.start(torrent_request()).await.unwrap();
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    match run.error {
+        Some(SpeedTestFailure::Other(error)) => {
+            assert!(error.contains("torrent not registered"), "{error}");
+        }
+        other => panic!("failed otherwise: {other:?}"),
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_run_without_leechers_has_no_demand() {
+    use super::torrent_fixture::{Answer, TorrentFixture};
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder()],
+        seeders: 1,
+        leechers: 0,
+        ..Answer::default()
+    });
+    let rig = torrent_rig(&fixture).await;
+    let started = rig.service.start(torrent_request()).await.unwrap();
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Completed, "{:?}", run.error);
+    let upload = run.result.unwrap().upload.unwrap();
     assert_eq!(upload.peers, Some(PeerUpload::NoDemand));
     fixture.stop().await;
 }

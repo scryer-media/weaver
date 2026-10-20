@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,9 @@ use super::overrides::{TestedLeg, TestedRoute};
 use super::progress::{LegRecorder, Progress, UsenetFacts};
 use super::providers::{self, Endpoints, ProviderServer};
 use super::runner::Stop;
-use super::torrent::{P2pOutcome, P2pPath, P2pPlan, PeerUpload, TestTorrentSource};
+use super::torrent::{
+    P2pOutcome, P2pPath, P2pPlan, PeerUpload, Pulled, TestTorrent, TestTorrentSource,
+};
 use super::upload;
 use super::usenet::{self, UsenetLeg, UsenetPlan};
 use crate::jobs::{Hold, HoldOrigin, HoldOwner, HoldScope};
@@ -88,6 +90,8 @@ pub struct ServiceInner {
     until_stopped: AtomicBool,
     // Where the test torrent is found; only tests set it.
     torrent_source: Mutex<Option<TestTorrentSource>>,
+    // The most the test torrent serves to peers; only tests lower it.
+    peer_budget: AtomicU64,
 }
 
 #[derive(Default)]
@@ -161,6 +165,7 @@ impl SpeedTestService {
                 roots: Mutex::new(Vec::new()),
                 until_stopped: AtomicBool::new(false),
                 torrent_source: Mutex::new(None),
+                peer_budget: AtomicU64::new(PEER_UPLOAD_BYTES),
             }),
         }
     }
@@ -228,6 +233,12 @@ impl SpeedTestService {
             .torrent_source
             .lock()
             .expect("speed test torrent source") = Some(source);
+    }
+
+    // Serve the test torrent until this many bytes went to peers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn peer_upload_budget_for_tests(&self, budget: u64) {
+        self.inner.peer_budget.store(budget, Ordering::Release);
     }
 
     // Abort the task driving run `id`, as a runtime shutting down would.
@@ -356,7 +367,13 @@ impl SpeedTestService {
         inner.check_idle()?;
         let runtime = inner.runtime()?;
         let consumer = request.consumer;
-        let servers = inner.config.read().await.servers.clone();
+        let (servers, torrents_on) = {
+            let config = inner.config.read().await;
+            (config.servers.clone(), config.torrent.enabled)
+        };
+        if request.kind.label() == SpeedTestKindLabel::Torrent && !torrents_on {
+            return Err(NetworkRefusal::SpeedTestTorrentsOff.into());
+        }
         let server = match consumer {
             Consumer::Server(id) => Some(
                 servers
@@ -434,6 +451,13 @@ impl SpeedTestService {
             (SpeedTestKind::Bandwidth { .. }, _) => {
                 tested.healthy().into_iter().map(u16::from).collect()
             }
+            // A torrent run joins the swarm on the first leg that is up.
+            (SpeedTestKind::Torrent { .. }, _) => {
+                let first = first_leg_up(&tested);
+                (0..tested.legs.len())
+                    .map(|position| u16::from(Some(position) == first))
+                    .collect()
+            }
         };
 
         // Quotas: a run books its bytes against every quota it crosses.
@@ -502,11 +526,11 @@ impl SpeedTestService {
                     Some(providers::fixed_endpoints(provider).map_err(SpeedTestError::Invalid)?)
                 }
             }
-            SpeedTestKind::Usenet { .. } => None,
+            SpeedTestKind::Usenet { .. } | SpeedTestKind::Torrent { .. } => None,
         };
         let nzb_url = match &request.kind {
             SpeedTestKind::Usenet { nzb, .. } => nzb.url().map_err(SpeedTestError::Invalid)?,
-            SpeedTestKind::Bandwidth { .. } => None,
+            SpeedTestKind::Bandwidth { .. } | SpeedTestKind::Torrent { .. } => None,
         };
 
         // The draft: the tested route with its downed pool members left out.
@@ -611,6 +635,19 @@ fn validate_request(request: &SpeedTestRequest) -> Result<(), SpeedTestError> {
             SpeedTestKind::Usenet { .. },
             Consumer::Rss(_) | Consumer::Outbound | Consumer::Torrent(_),
         ) => Err(NetworkRefusal::SpeedTestUsenetNeedsServer.into()),
+        (
+            SpeedTestKind::Torrent { .. },
+            Consumer::Server(_) | Consumer::Rss(_) | Consumer::Outbound,
+        ) => Err(NetworkRefusal::SpeedTestTorrentNeedsTorrentRoute.into()),
+        (SpeedTestKind::Torrent { max_duration, .. }, Consumer::Torrent(_)) => {
+            if max_duration.is_zero() || *max_duration > MAX_DURATION {
+                return Err(SpeedTestError::Invalid(format!(
+                    "a torrent run measures for 1 to {} seconds",
+                    MAX_DURATION.as_secs()
+                )));
+            }
+            Ok(())
+        }
         (SpeedTestKind::Bandwidth { provider, upload }, _) => {
             upload::validate(upload).map_err(SpeedTestError::Invalid)?;
             match provider {
@@ -924,7 +961,7 @@ impl ServiceInner {
             .unwrap_or_default();
         let plan = P2pPlan {
             source,
-            upload_budget: Some(PEER_UPLOAD_BYTES),
+            upload_budget: Some(self.peer_budget.load(Ordering::Acquire)),
         };
         let path = P2pPath {
             stage,
@@ -1233,6 +1270,39 @@ async fn execute(
         None
     };
 
+    let torrent = if let SpeedTestKind::Torrent { source, .. } = &cell.request.kind {
+        let stage = match plan.draft.leg_stage(first.position) {
+            Ok(stage) => stage,
+            Err(error) => return Outcome::Failed(error),
+        };
+        let source = inner
+            .torrent_source
+            .lock()
+            .expect("speed test torrent source")
+            .clone()
+            .unwrap_or_else(|| source.clone());
+        let fetched = tokio::select! {
+            biased;
+            _ = stop.stopped() => return Outcome::Cancelled,
+            fetched = TestTorrent::fetch(stage.clone(), &source) => fetched,
+        };
+        match fetched {
+            // Peers are dialled out, so any path can pull and serve.
+            Ok(torrent) => Some((
+                torrent,
+                P2pPath {
+                    stage,
+                    kind: LegKind::Ladder,
+                    gateway: None,
+                    internal_port: 0,
+                },
+            )),
+            Err(error) => return Outcome::Failed(error),
+        }
+    } else {
+        None
+    };
+
     // Hold the queue, seeding too, through the one pause every holder uses.
     inner.set_phase(&cell, SpeedTestPhase::Pausing);
     if let Err(error) = inner
@@ -1256,8 +1326,9 @@ async fn execute(
         _ = metrics.wait_downloads_drained() => {}
     }
 
-    match (articles, &plan.server, &endpoints) {
-        (Some(articles), Some(server), _) => {
+    let mut pulled: Option<Pulled> = None;
+    match (articles, &plan.server, &endpoints, &torrent) {
+        (Some(articles), Some(server), _, _) => {
             let SpeedTestKind::Usenet { max_duration, .. } = cell.request.kind else {
                 return Outcome::Failed("the run has nothing to measure".into());
             };
@@ -1370,7 +1441,7 @@ async fn execute(
             .await;
             drop(sampler);
         }
-        (None, _, Some(endpoints)) => {
+        (None, _, Some(endpoints), _) => {
             let runtime = match inner.runtime() {
                 Ok(runtime) => runtime,
                 Err(error) => return Outcome::Failed(error.to_string()),
@@ -1413,6 +1484,28 @@ async fn execute(
             .await;
             drop(sampler);
         }
+        (None, _, None, Some((torrent, path))) => {
+            let SpeedTestKind::Torrent { max_duration, .. } = cell.request.kind else {
+                return Outcome::Failed("the run has nothing to measure".into());
+            };
+            inner.set_phase(&cell, SpeedTestPhase::Measuring);
+            cell.progress.start();
+            let sampler = spawn_sampler(cell.progress.clone(), None);
+            let progress = cell.progress.clone();
+            let leg = first.position;
+            let mut measure = stop.with_duration(max_duration);
+            pulled = Some(
+                super::torrent::pull(
+                    path,
+                    torrent,
+                    PEER_UPLOAD_BYTES,
+                    move |bytes| progress.add_leg_bytes(leg, bytes),
+                    std::pin::pin!(measure.stopped()),
+                )
+                .await,
+            );
+            drop(sampler);
+        }
         _ => return Outcome::Failed("the run has nothing to measure".into()),
     }
     cell.progress.finish();
@@ -1421,6 +1514,15 @@ async fn execute(
         return Outcome::Cancelled;
     }
     if cell.progress.bytes() == 0 {
+        // A pull that moved nothing says why in the step that stopped it.
+        if let Some(pulled) = &pulled {
+            return Outcome::Failed(
+                pulled
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| "no peer sent a piece".into()),
+            );
+        }
         // What ended the first connection is why nothing came; a cause of its
         // own stands as the run's, any other is told as the empty run's.
         return Outcome::FailedWith(match cell.progress.first_failure() {
@@ -1455,7 +1557,10 @@ async fn execute(
                 provider: provider.name(),
             },
         };
-        cell.life.lock().expect("speed test run").upload = Some(UploadResult { http, peers: None });
+        cell.life.lock().expect("speed test run").upload = Some(UploadResult {
+            http: Some(http),
+            peers: None,
+        });
         inner.bump();
         if inner.config.read().await.torrent.enabled {
             let peers = inner.serve_test_torrent(stage, &mut stop).await;
@@ -1467,6 +1572,28 @@ async fn execute(
             }
             inner.bump();
         }
+    }
+    if let (Some((torrent, path)), Some(pulled)) = (torrent, &pulled) {
+        // Uploading: the pieces the pull held go to the swarm's leechers.
+        inner.set_phase(&cell, SpeedTestPhase::Uploading);
+        let budget = inner.peer_budget.load(Ordering::Acquire);
+        let peers = super::torrent::seed(
+            &path,
+            &torrent,
+            pulled,
+            budget,
+            std::pin::pin!(stop.stopped()),
+        )
+        .await;
+        torrent.close().await;
+        if stop.cancelled() {
+            return Outcome::Cancelled;
+        }
+        cell.life.lock().expect("speed test run").upload = Some(UploadResult {
+            http: None,
+            peers: Some(peers),
+        });
+        inner.bump();
     }
     Outcome::Completed
 }

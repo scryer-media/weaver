@@ -233,11 +233,12 @@ async fn the_removed_size_stream_and_duration_fields_are_refused_by_the_schema()
 }
 
 #[tokio::test]
-async fn a_run_takes_exactly_one_of_bandwidth_and_usenet() {
+async fn a_run_takes_exactly_one_of_bandwidth_usenet_and_torrent() {
     let h = harness().await;
     for body in [
         "",
         r#"bandwidth:{customUrl:"https://127.0.0.1/blob"},usenet:{sabSize:MB_100}"#,
+        "usenet:{sabSize:MB_100},torrent:{}",
     ] {
         let response = h
             .execute(&format!(
@@ -248,7 +249,7 @@ async fn a_run_takes_exactly_one_of_bandwidth_and_usenet() {
         let (message, _) = refusal(&response);
         assert_eq!(
             message,
-            "a speed test takes exactly one of bandwidth and usenet"
+            "a speed test takes exactly one of bandwidth, usenet and torrent"
         );
     }
 }
@@ -911,4 +912,80 @@ async fn test_via_a_torrent_route_reports_the_test_torrent_rungs() {
     );
     assert_eq!(p2p["mappedPort"], serde_json::Value::Null);
     fixture.stop().await;
+}
+
+// A torrent speed test on a torrent route pulls the test torrent from the
+// swarm and serves what it held to the peers that ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_run_pulls_and_serves_on_a_torrent_route() {
+    use weaver_server_core::speed_test::torrent_fixture::{
+        Answer, CONTENT_LEN, PIECE_LEN, TorrentFixture,
+    };
+
+    let h = harness().await;
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder(), fixture.leecher()],
+        seeders: 1,
+        leechers: 1,
+        ..Answer::default()
+    });
+    let service = SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true);
+    service.test_torrent_source_for_tests(fixture.source.clone());
+    service.peer_upload_budget_for_tests(u64::from(PIECE_LEN));
+    h.config.write().await.torrent.enabled = true;
+
+    let response = h
+        .execute(&format!(
+            "mutation{{startSpeedTest(input:{{kind:TORRENT_DEFAULT,id:0,route:{DIRECT},torrent:{{maxDurationSeconds:20}}}}){{id kind request{{torrent{{maxDurationSeconds}}}} tested{{legs{{target}}}}}}}}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    let started = response_data(&response)["startSpeedTest"].clone();
+    assert_eq!(started["kind"], "TORRENT");
+    assert_eq!(
+        started["request"]["torrent"],
+        serde_json::json!({"maxDurationSeconds": 20})
+    );
+    assert_eq!(started["tested"]["legs"][0]["target"], 1);
+    let id = started["id"].as_u64().unwrap();
+    wait_until(&h, id, |run| run.status != SpeedTestStatus::Running).await;
+    let response = h
+        .execute(&format!(
+            "{{speedTestRun(id:{id}){{status result{{bytes legs{{bytes}} upload{{http{{outcome}} peers{{outcome bytes peers}}}}}}}}}}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    let done = response_data(&response)["speedTestRun"].clone();
+
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    let result = &done["result"];
+    assert_eq!(result["bytes"], CONTENT_LEN as f64, "{done}");
+    assert_eq!(result["legs"][0]["bytes"], CONTENT_LEN as f64, "{done}");
+    assert_eq!(result["upload"]["http"], serde_json::Value::Null);
+    assert_eq!(
+        result["upload"]["peers"],
+        serde_json::json!({"outcome": "MEASURED", "bytes": f64::from(PIECE_LEN), "peers": 1})
+    );
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn a_torrent_run_on_a_feed_or_with_torrents_off_is_refused_by_code() {
+    let h = harness().await;
+    let response = h
+        .execute(&format!(
+            "mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},torrent:{{}}}}){{id}}}}"
+        ))
+        .await;
+    assert_eq!(
+        refusal(&response).1,
+        "SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE"
+    );
+    let response = h
+        .execute(&format!(
+            "mutation{{startSpeedTest(input:{{kind:TORRENT_DEFAULT,id:0,route:{DIRECT},torrent:{{}}}}){{id}}}}"
+        ))
+        .await;
+    assert_eq!(refusal(&response).1, "SPEED_TEST_TORRENTS_OFF");
 }

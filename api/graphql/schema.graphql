@@ -4422,16 +4422,19 @@ input SpeedTestInput {
 	overrides: PathOverrideInput
 	bandwidth: BandwidthTestInput
 	usenet: UsenetTestInput
+	torrent: TorrentTestInput
 }
 
 enum SpeedTestKind {
 	BANDWIDTH
 	USENET
+	TORRENT
 }
 
 type SpeedTestRequest {
 	bandwidth: BandwidthTestRequest
 	usenet: UsenetTestRequest
+	torrent: TorrentTestRequest
 }
 
 type SpeedTestResult {
@@ -4910,6 +4913,14 @@ enum TorrentState {
 	STOPPED
 }
 
+input TorrentTestInput {
+	maxDurationSeconds: Int
+}
+
+type TorrentTestRequest {
+	maxDurationSeconds: Int!
+}
+
 type TorrentTracker {
 	tier: Int!
 	url: String!
@@ -4981,7 +4992,7 @@ enum UploadOutcome {
 }
 
 type UploadResult {
-	http: HttpUploadResult!
+	http: HttpUploadResult
 	peers: PeerUploadResult
 }
 

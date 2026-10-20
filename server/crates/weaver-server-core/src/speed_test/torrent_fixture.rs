@@ -25,7 +25,7 @@ use super::TestTorrentSource;
 pub const LISTED: &str = "debian-13.1.0-amd64-netinst.iso.torrent";
 pub const PIECE_LEN: u32 = 16 * 1024;
 // Three pieces, the last one short.
-const CONTENT_LEN: usize = 2 * PIECE_LEN as usize + 7000;
+pub const CONTENT_LEN: usize = 2 * PIECE_LEN as usize + 7000;
 
 // One announce the tracker was sent.
 #[derive(Clone, Debug, PartialEq, Eq)]

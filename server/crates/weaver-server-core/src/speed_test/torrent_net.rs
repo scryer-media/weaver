@@ -2,10 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // What a test torrent's session rides and writes to: the path's sockets,
-// watched for how each peer answered, and a store that keeps only the piece
-// the test fetches, in memory.
+// watched for how each peer answered, and a store that keeps only the pieces
+// the test fetches, in memory and within a bound.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -451,10 +451,16 @@ impl AsyncWrite for WatchedWrite {
 }
 
 // The pieces a test fetches, held in memory and nothing else. A write to
-// any other piece is refused.
+// any other piece is refused. Verified pieces are held up to `keep` bytes;
+// one verified past that is let go, so a long pull stays bounded.
 #[derive(Clone)]
 pub(super) struct PieceStore {
     wanted: Arc<[u32]>,
+    keep: u64,
+    // The verified pieces held, and their bytes.
+    held: Arc<Mutex<(BTreeSet<u32>, u64)>>,
+    // Told the bytes of each block as it is written.
+    written: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     verified: watch::Sender<usize>,
     // When the first wanted piece was verified, before any peer heard of it.
     verified_at: Arc<Mutex<Option<tokio::time::Instant>>>,
@@ -465,9 +471,58 @@ impl PieceStore {
     pub(super) fn new(wanted: Vec<u32>) -> Self {
         Self {
             wanted: wanted.into(),
+            keep: u64::MAX,
+            held: Arc::default(),
+            written: None,
             verified: watch::channel(0).0,
             verified_at: Arc::default(),
             pieces: Arc::default(),
+        }
+    }
+
+    // Hold at most `keep` bytes of verified pieces.
+    pub(super) fn keeping(self, keep: u64) -> Self {
+        Self { keep, ..self }
+    }
+
+    // Tell `written` the bytes of each block as it is written.
+    pub(super) fn counting(self, written: impl Fn(u64) + Send + Sync + 'static) -> Self {
+        Self {
+            written: Some(Arc::new(written)),
+            ..self
+        }
+    }
+
+    pub(super) fn wanted(&self) -> &[u32] {
+        &self.wanted
+    }
+
+    // The verified pieces held.
+    pub(super) fn held(&self) -> Vec<u32> {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    // A store with the pieces this one holds, wanting nothing more.
+    pub(super) fn holding(&self) -> Self {
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        Self {
+            wanted: held.0.iter().copied().collect(),
+            keep: u64::MAX,
+            held: Arc::new(Mutex::new(held)),
+            written: None,
+            verified: watch::channel(0).0,
+            verified_at: Arc::default(),
+            pieces: self.pieces.clone(),
         }
     }
 
@@ -597,7 +652,12 @@ impl TorrentStorage for HeldPieces {
                 .or_insert_with(|| vec![0; *length].into_boxed_slice());
             held[within..within + range.len()].copy_from_slice(&buf[range]);
             Ok(())
-        })
+        })?;
+        drop(pieces);
+        if let Some(written) = &self.store.written {
+            written(buf.len() as u64);
+        }
+        Ok(())
     }
 
     fn remove_file(&self, _file_id: usize, _filename: &Path) -> anyhow::Result<()> {
@@ -622,14 +682,35 @@ impl TorrentStorage for HeldPieces {
     }
 
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
-        if self.lengths.contains_key(&piece.get()) {
-            self.store
-                .verified_at
+        let piece = piece.get();
+        let Some(length) = self.lengths.get(&piece) else {
+            return Ok(());
+        };
+        {
+            let mut held = self
+                .store
+                .held
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_or_insert_with(tokio::time::Instant::now);
-            self.store.verified.send_modify(|verified| *verified += 1);
+                .unwrap_or_else(PoisonError::into_inner);
+            let length = *length as u64;
+            if held.1 + length <= self.store.keep {
+                if held.0.insert(piece) {
+                    held.1 += length;
+                }
+            } else {
+                self.store
+                    .pieces
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&piece);
+            }
         }
+        self.store
+            .verified_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(tokio::time::Instant::now);
+        self.store.verified.send_modify(|verified| *verified += 1);
         Ok(())
     }
 }

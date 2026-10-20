@@ -108,6 +108,8 @@ pub enum NetworkRefusal {
     },
     SpeedTestQueueBusy,
     SpeedTestUsenetNeedsServer,
+    SpeedTestTorrentNeedsTorrentRoute,
+    SpeedTestTorrentsOff,
     SpeedTestLegDownAll,
     SpeedTestQuotaBlocked {
         holder: SpeedTestQuotaHolder,
@@ -221,6 +223,8 @@ impl NetworkRefusal {
             Self::SpeedTestAlreadyRunning { .. } => "SPEED_TEST_ALREADY_RUNNING",
             Self::SpeedTestQueueBusy => "SPEED_TEST_QUEUE_BUSY",
             Self::SpeedTestUsenetNeedsServer => "SPEED_TEST_USENET_NEEDS_SERVER",
+            Self::SpeedTestTorrentNeedsTorrentRoute => "SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE",
+            Self::SpeedTestTorrentsOff => "SPEED_TEST_TORRENTS_OFF",
             Self::SpeedTestLegDownAll => "SPEED_TEST_LEG_DOWN_ALL",
             Self::SpeedTestQuotaBlocked { .. } => "SPEED_TEST_QUOTA_BLOCKED",
             Self::SpeedTestLeaseRefused { .. } => "SPEED_TEST_LEASE_REFUSED",
@@ -405,6 +409,12 @@ impl std::fmt::Display for NetworkRefusal {
             }
             Self::SpeedTestUsenetNeedsServer => {
                 "a Usenet speed test runs on a server; a feed can run a bandwidth test only"
+            }
+            Self::SpeedTestTorrentNeedsTorrentRoute => {
+                "a torrent speed test runs on a torrent route"
+            }
+            Self::SpeedTestTorrentsOff => {
+                "torrents are off; turn them on to run a torrent speed test"
             }
             Self::SpeedTestLegDownAll => {
                 "every leg of the route would be down; leave at least one leg up"

@@ -74,7 +74,10 @@ const LIFTED: &[(&str, usize)] = &[
     ("server/crates/weaver-server-core/src/proxies/runtime.rs", 2),
     ("server/crates/weaver-server-core/src/speed_test/http.rs", 1),
     // The test torrent's upload client rides the path's bridge.
-    ("server/crates/weaver-server-core/src/speed_test/torrent.rs", 1),
+    (
+        "server/crates/weaver-server-core/src/speed_test/torrent.rs",
+        1,
+    ),
     ("server/crates/weaver-server-core/src/torrents/net.rs", 1),
     ("xtask/src/main.rs", 1),
 ];
