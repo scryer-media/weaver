@@ -18,7 +18,10 @@ use std::collections::BTreeMap;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use weaver_graph::{ByteRange, Part, Sealed, Shelf, VolumeIndex, decode_parts, encode_parts};
+use weaver_graph::{
+    ByteRange, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
+    encode_parts,
+};
 
 use super::phase::RootPhase;
 use super::{ArticleRoot, Root};
@@ -59,21 +62,30 @@ pub(crate) struct RootBlob {
 }
 
 impl RootBlob {
-    pub(crate) fn of<R: Root>(root: &R, kept: &mut R::Kept) -> Result<Self, RootFactsError> {
-        let (bytes, mut parts) = root.encode(kept)?;
+    // The root's facts as the checkpoint keeps them. Facts that do not
+    // encode are facts nothing could restore, so they say so as
+    // unsupported, which a restore refuses.
+    pub(crate) fn of<R: Root>(root: &R, kept: &mut R::Kept) -> Self {
+        let (version, bytes, mut parts) = match root.encode(kept) {
+            Ok((bytes, parts)) => (R::FACTS_VERSION, bytes, parts),
+            Err(_) => (Facts::UNSUPPORTED, Vec::new(), Vec::new()),
+        };
         parts.sort_by_key(|part| part.key);
-        Ok(Self {
+        Self {
             root: R::NAME.to_owned(),
-            version: R::FACTS_VERSION,
+            version,
             bytes,
             parts,
-        })
+        }
     }
 
     // The facts, for a root of the kind that wrote them.
     pub(crate) fn read<R: Root>(&self) -> Result<R::Facts, RootFactsError> {
         if self.root != R::NAME {
             return Err(RootFactsError::Mismatch("another kind of root"));
+        }
+        if self.version == Facts::UNSUPPORTED {
+            return Err(RootFactsError::Unsupported);
         }
         if self.version != R::FACTS_VERSION {
             return Err(RootFactsError::Version(self.version));
@@ -92,8 +104,9 @@ pub(crate) struct PostFacts {
 
 impl PostFacts {
     // 1: the whole post in the blob. 2: each volume's lists shelved a
-    // chunk of articles to a part.
-    pub(crate) const VERSION: u16 = 2;
+    // chunk of articles to a part. 3: a sealed value encodes as nothing,
+    // numbered by its owner's walk.
+    pub(crate) const VERSION: u16 = 3;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +148,8 @@ pub(crate) enum RootFactsError {
     Decode(String),
     #[error("the root's facts do not encode: {0}")]
     Encode(String),
+    #[error("the root's facts did not encode, so nothing restores them")]
+    Unsupported,
     #[error("the root's facts do not match the post: {0}")]
     Mismatch(&'static str),
 }
@@ -203,7 +218,7 @@ pub(crate) fn decode(
         posted: before.posted,
         volumes: before.volumes,
     };
-    let (bytes, parts) = encode_post(&mut Encoded::default(), &post);
+    let (bytes, parts) = encode_post(&mut Encoded::default(), &post)?;
     Ok(RootRow {
         next_node: before.next_node,
         job: JobFacts {
@@ -322,6 +337,32 @@ impl EncodedVolume {
     }
 }
 
+impl Durable for Encoded {
+    const VERSION: u16 = PostFacts::VERSION;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        take.sealed(&self.posted)?;
+        for volume in &self.volumes {
+            take.shelf(&volume.articles)?;
+            take.shelf(&volume.known)?;
+            take.shelf(&volume.segments)?;
+            take.shelf(&volume.raised)?;
+        }
+        Ok(())
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        give.sealed(&mut self.posted)?;
+        for volume in &mut self.volumes {
+            give.shelf(&mut volume.articles)?;
+            give.shelf(&mut volume.known)?;
+            give.shelf(&mut volume.segments)?;
+            give.shelf(&mut volume.raised)?;
+        }
+        Ok(())
+    }
+}
+
 impl Encoded {
     fn refresh(&mut self, facts: &PostFacts) {
         self.posted.set(facts.posted.clone());
@@ -341,11 +382,14 @@ impl Encoded {
 }
 
 // The post's facts' bytes and their parts, encoding again only the parts
-// that changed since `encoded` last encoded.
-pub(crate) fn encode_post(encoded: &mut Encoded, facts: &PostFacts) -> (Vec<u8>, Vec<Part>) {
+// that changed since `encoded` last encoded. A part that does not encode
+// fails the whole: the blob then says so as unsupported.
+pub(crate) fn encode_post(
+    encoded: &mut Encoded,
+    facts: &PostFacts,
+) -> Result<(Vec<u8>, Vec<Part>), RootFactsError> {
     encoded.refresh(facts);
-    // A plain struct of integers always encodes.
-    encode_parts(encoded).unwrap_or_default()
+    encode_parts(encoded).map_err(RootFactsError::Encode)
 }
 
 pub(crate) fn decode_post(bytes: &[u8], parts: &[Part]) -> Result<PostFacts, RootFactsError> {

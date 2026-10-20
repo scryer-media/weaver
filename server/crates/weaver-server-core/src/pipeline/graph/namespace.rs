@@ -29,7 +29,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed};
 use weaver_graph::member::FIRST_BYTES;
-use weaver_graph::recovery::MemberAccess;
 use weaver_graph::{
     Builder, ByteRange, Effect, Emit, Kind, MemberId, NodeId, Object, ObjectId, Placement,
     Provenance, Segment, Tree, VolumeIndex, Why,
@@ -474,18 +473,13 @@ impl NamespaceWriter {
         }
     }
 
-    // The namespace's face toward its recovery objects.
-    pub(crate) fn access<'a>(&'a self, tree: &'a Tree, node: NodeId) -> Access<'a> {
+    // The namespace's face toward its members, which reads them wherever
+    // their bytes are.
+    pub(crate) fn access<'a>(&'a self, tree: &'a Tree) -> Access<'a> {
         Access {
             writer: self,
             tree,
-            node,
-            recovery: None,
             held: true,
-            reads: 0,
-            repaired: Vec::new(),
-            found: Vec::new(),
-            scratch: None,
         }
     }
 
@@ -1201,9 +1195,9 @@ impl Builder for Placing<'_> {
         else {
             return false;
         };
-        let access = self.writer.access(tree, parent);
+        let access = self.writer.access(tree);
         let start = into.len();
-        let read = access.read_placement((parent, member), node, placement, into);
+        let read = read_placed(&access, (parent, member), node, placement, into);
         if !read {
             into.truncate(start);
         }
@@ -1211,27 +1205,126 @@ impl Builder for Placing<'_> {
     }
 }
 
-// A namespace's recovery objects read members and write repaired ranges
-// through this. A read follows the member to wherever its bytes are: its
-// leaf, or through the inverse map of the object that owns it, into that
-// object's members and envelopes, as deep as the tree goes. Repaired ranges
-// are collected and delivered when the repair returns, so they reach the
-// file and the owning object by the same path as any other bytes.
+// Where a read of a namespace's members finds their bytes. A read follows
+// the member to wherever they are: its leaf, the bytes still held for it,
+// or through the inverse map of the object that owns it, into that object's
+// members and envelopes, as deep as the tree goes. The live tree answers on
+// the loop; a repair lent off it answers from what it took along.
+pub(crate) trait Source {
+    // The data object the member is bound to, and the volume it is of it.
+    // A recovery volume is in its own file, so it is bound to none.
+    fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)>;
+    // The bytes posted for a range of the object's volume, rebuilt as the
+    // object says from what `read` hands back per placement.
+    fn posted(
+        &self,
+        child: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool;
+    fn envelope(&self, child: NodeId, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool;
+    // The member's own file, for a range its coverage says was written.
+    fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
+    // Bytes still held for the member, read where they are kept and left
+    // held, for a member whose object has not placed them yet.
+    fn held(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
+}
+
+pub(crate) fn read_member(
+    source: &dyn Source,
+    node: NodeId,
+    member: MemberId,
+    range: ByteRange,
+    into: &mut Vec<u8>,
+) -> bool {
+    let Some((child, volume)) = source.bound(node, member) else {
+        return read_own(source, node, member, range, into);
+    };
+    // The object rebuilds its volume's bytes from its placements: one that
+    // deciphers puts the cipher back.
+    let mut read = |placement: &Placement, into: &mut Vec<u8>| {
+        read_placed(source, (node, member), child, placement, into)
+    };
+    source.posted(child, volume, range, &mut read, into)
+}
+
+// What one placement of the object at `child`, bound to `member` of `node`,
+// holds.
+fn read_placed(
+    source: &dyn Source,
+    (node, member): (NodeId, MemberId),
+    child: NodeId,
+    placement: &Placement,
+    into: &mut Vec<u8>,
+) -> bool {
+    match placement {
+        Placement::Member { member, range } => read_member(source, child, *member, *range, into),
+        Placement::Envelope { envelope, range } => source.envelope(child, *envelope, *range, into),
+        // What the object could not place was held for the member, and once
+        // released it is in the member's own file.
+        Placement::Held { range } => read_own(source, node, member, *range, into),
+    }
+}
+
+// A member no object reads: its bytes are in its own file, or still held
+// while its front has not said what it is.
+fn read_own(
+    source: &dyn Source,
+    node: NodeId,
+    member: MemberId,
+    range: ByteRange,
+    into: &mut Vec<u8>,
+) -> bool {
+    let start = into.len();
+    if source.leaf(node, member, range, into) {
+        return true;
+    }
+    into.truncate(start);
+    source.held(node, member, range, into)
+}
+
+// The held pieces of a range from its start, as long as they run on, read
+// with `piece`; whole, or nothing and `false`.
+fn read_pieces<'p>(
+    pieces: impl IntoIterator<Item = (ByteRange, &'p Location)>,
+    range: ByteRange,
+    into: &mut Vec<u8>,
+    mut scratch: impl FnMut(u64, u64, &mut Vec<u8>) -> bool,
+) -> bool {
+    let start = into.len();
+    let mut at = range.start;
+    for (piece, location) in pieces {
+        if piece.start != at {
+            break;
+        }
+        let read = match location {
+            Location::Ram(bytes) => {
+                into.extend_from_slice(bytes);
+                true
+            }
+            Location::Scratch { offset, len } => scratch(*offset, *len, into),
+        };
+        if !read {
+            break;
+        }
+        at = piece.end;
+    }
+    let whole = at == range.end;
+    if !whole {
+        into.truncate(start);
+    }
+    whole
+}
+
+// The namespace's own face toward its members, on the loop.
 pub(crate) struct Access<'a> {
     writer: &'a NamespaceWriter,
     tree: &'a Tree,
-    node: NodeId,
-    // The recovery object this access was lent to, whose volumes it reads.
-    recovery: Option<NodeId>,
     // Whether bytes still held count as read. A repair reads them; what is
     // on disk, which a restart reads back, does not hold them.
     held: bool,
-    reads: u64,
-    repaired: Vec<(MemberId, u64, Bytes)>,
-    // Ranges the object proved bad and could not rebuild.
-    found: Vec<(MemberId, ByteRange)>,
-    // The directory lent for this one repair, removed when it returns.
-    scratch: Option<PathBuf>,
 }
 
 // A repair's scratch directory goes with the repair. One left behind by a
@@ -1246,53 +1339,8 @@ fn remove_scratch(dir: &Path) {
 }
 
 impl Access<'_> {
-    fn read_at(
-        &self,
-        node: NodeId,
-        member: MemberId,
-        range: ByteRange,
-        into: &mut Vec<u8>,
-    ) -> bool {
-        // A recovery volume is in its own file; the one lent this access is
-        // out of the tree, so the tree cannot say it recovers.
-        let Some((child, volume)) = self
-            .tree
-            .child_of(node, member)
-            .filter(|(child, _)| self.recovery != Some(*child) && !self.tree.recovers(*child))
-        else {
-            return self.read_own(node, member, range, into);
-        };
-        // The object rebuilds its volume's bytes from its placements: one
-        // that deciphers puts the cipher back.
-        let mut read = |placement: &Placement, into: &mut Vec<u8>| {
-            self.read_placement((node, member), child, placement, into)
-        };
-        self.tree.posted(child, volume, range, &mut read, into)
-    }
-
-    // What one placement of the object at `child`, bound to `member` of
-    // `node`, holds.
-    fn read_placement(
-        &self,
-        (node, member): (NodeId, MemberId),
-        child: NodeId,
-        placement: &Placement,
-        into: &mut Vec<u8>,
-    ) -> bool {
-        match placement {
-            Placement::Member { member, range } => self.read_at(child, *member, *range, into),
-            Placement::Envelope { envelope, range } => {
-                self.writer.envelopes.read(child, *envelope, *range, into)
-            }
-            // What the object could not place was held for the member, and
-            // once released it is in the member's own file.
-            Placement::Held { range } => self.read_own(node, member, *range, into),
-        }
-    }
-
-    // A member no object reads: its bytes are in its own file, or still
-    // held while its front has not said what it is.
-    fn read_own(
+    // The range of the member appended to `into`, or nothing and `false`.
+    pub(crate) fn read_at(
         &self,
         node: NodeId,
         member: MemberId,
@@ -1300,60 +1348,37 @@ impl Access<'_> {
         into: &mut Vec<u8>,
     ) -> bool {
         let start = into.len();
-        if self.read_leaf(node, member, range, into) {
-            return true;
-        }
-        into.truncate(start);
-        self.held && self.read_held(node, member, range, into)
-    }
-
-    // Bytes still held for the member, read where they are kept and left
-    // held, for a member whose object has not placed them yet.
-    fn read_held(
-        &self,
-        node: NodeId,
-        member: MemberId,
-        range: ByteRange,
-        into: &mut Vec<u8>,
-    ) -> bool {
-        let Some(files) = self.writer.files.get(&node) else {
-            return range.is_empty();
-        };
-        let start = into.len();
-        let mut at = range.start;
-        for piece in files.holds.peek(held_volume(member), range) {
-            if piece.range.start != at {
-                break;
-            }
-            let read = match piece.location {
-                Location::Ram(bytes) => {
-                    into.extend_from_slice(&bytes);
-                    true
-                }
-                Location::Scratch { offset, len } => files
-                    .scratch
-                    .as_ref()
-                    .is_some_and(|scratch| scratch.read(offset, index(len), into).is_ok()),
-            };
-            if !read {
-                break;
-            }
-            at = piece.range.end;
-        }
-        let whole = at == range.end;
-        if !whole {
+        let read = read_member(self, node, member, range, into);
+        if !read {
             into.truncate(start);
         }
-        whole
+        read
+    }
+}
+
+impl Source for Access<'_> {
+    fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
+        self.tree
+            .child_of(node, member)
+            .filter(|(child, _)| !self.tree.recovers(*child))
     }
 
-    fn read_leaf(
+    fn posted(
         &self,
-        node: NodeId,
-        member: MemberId,
+        child: NodeId,
+        volume: VolumeIndex,
         range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
     ) -> bool {
+        self.tree.posted(child, volume, range, read, into)
+    }
+
+    fn envelope(&self, child: NodeId, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        self.writer.envelopes.read(child, envelope, range, into)
+    }
+
+    fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
         let written = self
             .tree
             .namespace(node)
@@ -1369,67 +1394,26 @@ impl Access<'_> {
         };
         written && leaf.read(range.start, index(range.len()), into).is_ok()
     }
-}
 
-impl MemberAccess for Access<'_> {
-    fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.reads += 1;
-        let start = into.len();
-        let read = self.read_at(self.node, member, range, into);
-        if !read {
-            into.truncate(start);
-        }
-        read
-    }
-
-    fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
-        self.repaired
-            .push((member, offset, Bytes::copy_from_slice(bytes)));
-    }
-
-    fn found_damaged(&mut self, member: MemberId, range: ByteRange) {
-        self.found.push((member, range));
-    }
-
-    fn length(&self, member: MemberId) -> Option<u64> {
-        self.tree.namespace(self.node)?.get(member)?.length
-    }
-
-    // Under the directory finalize never delivers, one per recovery object
-    // and namespace, so two repairs never share one.
-    fn scratch(&mut self) -> Option<PathBuf> {
-        let recovery = self.recovery?;
-        let dir = self.writer.working_dir.join(format!(
-            ".weaver-chunks/graph-recovery-{}-{}",
-            self.node.0, recovery.0
-        ));
-        remove_scratch(&dir);
-        std::fs::create_dir_all(&dir).ok()?;
-        self.scratch = Some(dir.clone());
-        Some(dir)
-    }
-
-    // The recovery object's volume is a member of this namespace, or a
-    // window on one, read wherever the member's bytes are: its own file,
-    // or back through the inverse map of the object that owns it.
-    fn read_volume(&mut self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        // Posted beside the members it covers, or above them when it moved
-        // to where the member it names was founded.
-        let member = self.recovery.and_then(|recovery| {
-            let (parent, volumes) = self.tree.volumes(recovery)?;
-            let member = volumes.get(&volume).copied()?;
-            let within = self.tree.in_member(recovery, range)?;
-            (within.len() == range.len()).then_some((parent, member, within))
-        });
-        let Some((parent, member, range)) = member else {
+    fn held(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        if !self.held {
             return false;
-        };
-        let start = into.len();
-        let read = self.read_at(parent, member, range, into);
-        if !read {
-            into.truncate(start);
         }
-        read
+        let Some(files) = self.writer.files.get(&node) else {
+            return range.is_empty();
+        };
+        let pieces = files.holds.peek(held_volume(member), range);
+        read_pieces(
+            pieces.iter().map(|piece| (piece.range, &piece.location)),
+            range,
+            into,
+            |offset, len, into| {
+                files
+                    .scratch
+                    .as_ref()
+                    .is_some_and(|scratch| scratch.read(offset, index(len), into).is_ok())
+            },
+        )
     }
 }
 
@@ -1467,9 +1451,11 @@ fn index(offset: u64) -> usize {
 
 mod claimed;
 mod durable;
+mod loan;
 mod recovery;
 mod refusal;
 
-pub(crate) use recovery::SetState;
+pub(crate) use loan::{Loan, Returned};
+pub(crate) use recovery::{Lender, SetState};
 #[cfg(test)]
 mod tests;

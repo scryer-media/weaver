@@ -335,6 +335,94 @@ fn wants_asks_for_recovery_while_short() {
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
 }
 
+// A set short of recovery blocks waits while the pieces that bring none
+// arrive, and is due again in the step the block it needs is in hand: no
+// repair and no close between.
+#[test]
+fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
+    let data = payload(18, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    job.volume(&files[0].0, &files[0].1, ARTICLE as usize, false);
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    let (member, bad) = damaged_member(&mut job, "payload.bin", &data, 300);
+    bind(&mut job);
+    let wrong = job.store.members[&member].clone();
+    feed(&mut job, member, &wrong, Some(bad));
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    let held = |job: &Job<Par2>| -> usize {
+        job.object
+            .sets
+            .values()
+            .map(|state| state.recovery.len())
+            .sum()
+    };
+    let mut out = Vec::new();
+    for (index, piece) in bytes.chunks(ARTICLE as usize).enumerate() {
+        assert_eq!(job.object.outcome(), Some(RepairOutcome::Waiting));
+        job.object.deliver(
+            weaver_graph::Delivery {
+                volume,
+                offset: index as u64 * ARTICLE,
+                bytes: piece,
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut out,
+        );
+        assert_eq!(job.object.outcome().is_none(), held(&job) > 0);
+        if held(&job) > 0 {
+            break;
+        }
+    }
+    assert_eq!(held(&job), 1);
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Repaired { slices: 1 })
+    );
+    assert!(job.store.members[&member] == data);
+}
+
+// An object that has found no set has not ruled while its volume's bytes
+// may still hold one: the front of an index is only a packet header. Once
+// the volume is read through with no set in it, there is nothing to rule
+// on: it is Clean, not due again every step, and a set found later makes it
+// due once.
+#[test]
+fn an_object_with_no_sets_rules_clean_once_a_volume_is_read_through() {
+    let data = payload(18, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    assert_eq!(job.object.outcome(), None);
+    let (name, bytes) = &files[0];
+    let header = &bytes[..par2_rs::packet::HEADER_SIZE];
+    let volume = job.name(name, header);
+    let mut out = Vec::new();
+    job.object.deliver(
+        weaver_graph::Delivery {
+            volume,
+            offset: 0,
+            bytes: header,
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut out,
+    );
+    assert!(job.object.sets.is_empty());
+    assert_eq!(job.object.outcome(), None);
+    job.object.volume_closed(volume, &mut out);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+    job.volume(&files[1].0, &files[1].1, ARTICLE as usize, false);
+    assert_eq!(job.object.outcome(), None);
+}
+
 // The front of a volume walk steps over a lost article and resyncs on the
 // next packet, so every recovery packet clear of the loss is still found.
 #[test]

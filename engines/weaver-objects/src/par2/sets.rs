@@ -143,7 +143,7 @@ impl SetState {
     // volume bound since may bring more, so the set is tried again. Without
     // this the verdict would depend on whether a volume's front decided
     // before or after the damage arrived.
-    pub(super) fn reopen(&mut self) -> bool {
+    pub(super) fn reopen(&mut self) {
         let impossible = matches!(
             self.last.map(|last| last.outcome),
             Some(RepairOutcome::Impossible { .. })
@@ -151,14 +151,14 @@ impl SetState {
         if impossible {
             self.last = None;
         }
-        impossible
     }
 
-    // Damaged slices the last repair found while it waited for blocks.
-    pub(super) fn needed(&self) -> u64 {
+    // The recovery blocks the set must hold before it is tried again, when
+    // its last repair came up short of them.
+    pub(super) fn short_of(&self) -> Option<u64> {
         self.last
             .filter(|last| last.outcome == RepairOutcome::Waiting)
-            .map_or(0, |last| last.damaged)
+            .map(|last| last.needed)
     }
 
     // Whether the last repair settled the set: only a wait is tried again.

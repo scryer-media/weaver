@@ -12,6 +12,8 @@
 // over them, and the part or file is judged when their repair arrives, so
 // no mark is left on a part whose bytes were never bad.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Emit, MemberId, Placement, Provenance, SliceVerdict, VolumeIndex};
 
@@ -51,7 +53,7 @@ impl RarStore {
                 Lock::Locked | Lock::Sealed(_) => continue,
                 Lock::Plain => {}
                 Lock::Open(cbc) => {
-                    let said = &mut entry.out;
+                    let (cbc, said) = (Arc::make_mut(cbc), Arc::make_mut(&mut entry.out));
                     let member = MemberId(id as u32);
                     let mut plain = |range: ByteRange, buffer: &mut Vec<u8>| {
                         read(&Placement::Member { member, range }, buffer)
@@ -112,13 +114,15 @@ impl RarStore {
             provenance,
         });
         entry.plain_runs.feed(range, crc32(bytes), provenance);
-        entry.out.coverage.write(range, provenance);
-        let Some(length) = entry.plain_len() else {
+        let plain_len = entry.plain_len();
+        let said = Arc::make_mut(&mut entry.out);
+        said.coverage.write(range, provenance);
+        let Some(length) = plain_len else {
             return;
         };
         let whole = ByteRange::new(0, length);
-        if !entry.out.closed && entry.out.coverage.covered(whole) {
-            entry.out.closed = true;
+        if !said.closed && said.coverage.covered(whole) {
+            said.closed = true;
             out.push(Emit::MemberClosed(member));
         }
         let Some(expected) = entry.crc else {

@@ -16,6 +16,7 @@ use crate::pipeline::graph::checkpoint::Snapshot;
 use crate::pipeline::graph::engine::Runs;
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::pieces::{PieceLayout, PieceRoot, Verified};
+use crate::pipeline::graph::status::RepairSlots;
 
 impl GraphJob<PieceRoot> {
     // The runtime of a torrent's job. `scope` is the job's process-wide id.
@@ -80,14 +81,16 @@ impl GraphJob<PieceRoot> {
     // A piece that verified, as its files' shares. A piece is fetched
     // whole, so one fetched again for a share that did not read back also
     // carries shares already in hand: only the ones still to come go down.
+    // A repair a share makes due is lent under `slots`.
     pub(crate) fn verified(
         &mut self,
         shares: Vec<Verified>,
+        slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
         for share in shares {
             if self.root.waiting(share.volume, share.piece) {
-                self.intake(share, limit)?;
+                self.intake(share, slots, limit)?;
             }
         }
         Ok(())

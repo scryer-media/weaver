@@ -12,15 +12,41 @@
 // its own reason. The server tells; it chooses no reason.
 
 use weaver_graph::NodeId;
+use weaver_graph::slots::Ticket;
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::root::Root;
+use crate::pipeline::graph::status::RepairSlots;
 
 impl<R: Root> GraphJob<R> {
+    // Walk the namespaces without asking for a slot: a job just restored
+    // holds none, and lends what is due once the pipeline has it.
+    pub(super) fn repair(&mut self) -> Result<(), GraphError> {
+        self.walk(None)
+    }
+
+    // Walk the namespaces and lend what is due, asking `slots` for a slot
+    // when the job holds none. The slot goes back once nothing is out. A
+    // step lends after its runs are stepped, so `reading` counts the runs
+    // the step started: a namespace one of them is about to read may still
+    // announce members, and no set over it is due yet.
+    pub(crate) fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
+        let walked = self.walk(Some((&mut *slots, limit)));
+        if let Some(ticket) = self.loans.give_back() {
+            slots.release(ticket);
+        }
+        walked
+    }
+
+    // The repair slot the job holds, for a job going away.
+    pub(crate) fn forget_slot(&mut self) -> Option<Ticket> {
+        self.loans.forget()
+    }
+
     // Walk the namespaces in node order, which puts every parent before its
     // children, and ask each to rule its sets. A namespace the walk's own
     // repairs bring into being is walked too.
-    pub(super) fn repair(&mut self) -> Result<(), GraphError> {
+    fn walk(&mut self, mut slots: Option<(&mut RepairSlots, usize)>) -> Result<(), GraphError> {
         let mut walked = None;
         while let Some(node) = self
             .tree
@@ -30,12 +56,16 @@ impl<R: Root> GraphJob<R> {
         {
             walked = Some(node);
             let runs = &self.runs;
+            let mut lending = self
+                .loans
+                .lending(slots.as_mut().map(|(slots, limit)| (&mut **slots, *limit)));
             let mut out = Vec::new();
             self.writer.rule(
                 &mut self.tree,
                 &mut *self.builder,
                 &self.root,
                 (node, &|namespace| runs.reading(namespace)),
+                &mut lending,
                 &mut out,
             )?;
             self.heard(out)?;
@@ -79,10 +109,13 @@ impl<R: Root> GraphJob<R> {
         Ok(changed)
     }
 
-    // The payload is in, no run is reading, and every namespace's sets have
-    // ruled on something other than waiting.
+    // The payload is in, no run is reading, no repair is out, and every
+    // namespace's sets have ruled on something other than waiting.
     fn quiet(&self) -> bool {
-        !self.payload_waiting() && !self.runs.live() && self.writer.all_ruled(&self.tree)
+        !self.payload_waiting()
+            && !self.runs.live()
+            && !self.loans.out()
+            && self.writer.all_ruled(&self.tree)
     }
 
     // Ranges of lost articles go to the root namespace as soon as they can

@@ -17,8 +17,12 @@ fn restored<D: Decoder>(volume: &str, member: &str, encode: fn(&[u8]) -> Vec<u8>
     let (facts, live, again) = restores_alike(Box::new(Stream::<D>::new()), &steps, 2, &[]);
     let reserve = |object: &dyn Object| object.engine().map(Engine::reserve);
     assert_eq!(reserve(live.as_ref()), reserve(again.as_ref()));
-    let stream: Stream<D> = facts.read(D::KIND).expect("decodes");
-    assert_eq!(whole(&stream, bytes), decoded(member, plain), "{volume}");
+    let mut stream: Stream<D> = facts.read(D::KIND).expect("decodes");
+    assert_eq!(
+        whole(&mut stream, bytes),
+        decoded(member, plain),
+        "{volume}"
+    );
 }
 
 #[test]
@@ -70,11 +74,11 @@ fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
     ];
     for (steps, cut, frontier) in cuts {
         let (facts, live, again) = restores_alike(Box::new(XzStream::new()), steps, cut, &[]);
-        let kept: XzStream = facts.read(Kind::Xz).expect("decodes");
+        let mut kept: XzStream = facts.read(Kind::Xz).expect("decodes");
         assert_eq!(kept.first.len(), FIRST.min(frontier as usize), "cut {cut}");
         assert_eq!(reserve(live.as_ref()), reserve(again.as_ref()));
         assert_eq!(
-            whole(&kept, bytes.clone()),
+            whole(&mut kept, bytes.clone()),
             decoded("alpha.tar", joined.clone()),
             "cut {cut}"
         );

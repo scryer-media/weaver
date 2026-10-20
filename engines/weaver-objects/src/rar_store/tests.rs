@@ -400,13 +400,16 @@ fn encrypted_headers_open_with_the_password() {
 }
 
 #[test]
-fn encrypted_headers_without_the_password_are_refused_at_the_last_close() {
+fn encrypted_headers_without_the_password_are_refused_at_quiet() {
     let version = Version::Rar5;
     let volumes = write(&items(), &encrypted(version, true));
     let mut owner = Owner::named(store(), volumes);
     owner.frames(0, 4096);
     owner.offer("not-the-passphrase");
     owner.close(0);
+    // The question is still open: a candidate may yet answer it.
+    assert!(!owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)));
+    owner.quiet();
     assert!(
         owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
         "{version:?} {:?}",
@@ -427,12 +430,14 @@ fn rar4_encrypted_headers_go_to_an_engine() {
 }
 
 #[test]
-fn encrypted_files_without_the_password_are_refused_at_the_last_close() {
+fn encrypted_files_without_the_password_are_refused_at_quiet() {
     let volumes = write(&items(), &encrypted(Version::Rar5, false));
     let mut owner = Owner::named(store(), volumes);
     owner.frames(0, 4096);
     owner.offer("not-the-passphrase");
     owner.close(0);
+    assert!(!owner.said.contains(&Emit::Refuse(Why::Encrypted)));
+    owner.quiet();
     assert!(owner.said.contains(&Emit::Refuse(Why::Encrypted)));
 }
 

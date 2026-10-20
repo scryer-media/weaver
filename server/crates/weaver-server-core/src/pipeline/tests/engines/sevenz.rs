@@ -5,6 +5,7 @@
 // first, compressed, enciphered with and without the job's password, and
 // damaged under a PAR2 set.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
@@ -18,14 +19,16 @@ use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, par2_volumes_sliced,
-    payload, run, run_both, run_unprompted, try_run,
+    ARTICLE, Claim, JOB, Outcome, Post, Scenario, admit, assert_same, collect, kinds, par2_set,
+    par2_volumes_sliced, payload, run, run_both, run_unprompted, try_run,
 };
+use super::refused_then_repaired::{drive_to_finish, serve_posts};
+use crate::pipeline::tests::{job_status_for_assert, retire_pipeline_database};
 
-const SECRET: &str = "quill-ember-secret";
+pub(super) const SECRET: &str = "quill-ember-secret";
 
 // The members every fixture holds, by name.
-fn members() -> Vec<(&'static str, Vec<u8>)> {
+pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("ember.bin", payload(5 * ARTICLE + 11, 41)),
         ("quill.bin", payload(3 * ARTICLE - 3, 42)),
@@ -34,7 +37,7 @@ fn members() -> Vec<(&'static str, Vec<u8>)> {
 
 // One container of `members()` coded by `method`, enciphered under
 // `password` when there is one.
-fn container(method: EncoderConfiguration, password: Option<&str>) -> Vec<u8> {
+pub(super) fn container(method: EncoderConfiguration, password: Option<&str>) -> Vec<u8> {
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
     let mut methods = vec![method];
     if let Some(password) = password {
@@ -58,7 +61,7 @@ fn stored(password: Option<&str>) -> Vec<u8> {
 
 // A pure byte split at a fixed size into `.7z.001` onward, the last volume
 // the short tail.
-fn split(archive: &[u8], count: usize) -> Vec<Post> {
+pub(super) fn split(archive: &[u8], count: usize) -> Vec<Post> {
     let chunk = archive.len().div_ceil(count);
     archive
         .chunks(chunk)
@@ -68,7 +71,7 @@ fn split(archive: &[u8], count: usize) -> Vec<Post> {
 }
 
 // Every delivered file lands in the job's folder.
-fn delivered(name: &str) -> String {
+pub(super) fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
 }
 
@@ -350,6 +353,21 @@ async fn a_damaged_stored_7z_under_par2_is_repaired_and_delivered_under_both_eng
     assert_same_delivered_classic_refetching(&classic, &graph);
 }
 
+// The same under AES: the damaged article is cipher bytes, and the repair
+// reads the volume back through the store's keys and chain.
+#[tokio::test]
+async fn a_damaged_aes_stored_7z_under_par2_is_repaired_and_delivered_under_both_engines_and_only_classic_refetches()
+ {
+    let archive = stored(Some(SECRET));
+    let mut posts = vec![Post::plain("lantern.7z", archive.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.7z", &archive)], 2));
+    let scenario = Scenario::new(posts).damaged(0, 1).password(SECRET);
+    let (classic, graph) = run_both(&scenario).await;
+    assert_members(&graph);
+    assert_members(&classic);
+    assert_same_delivered_classic_refetching(&classic, &graph);
+}
+
 // The coded stream damaged beside a PAR2 set: the engine waits at the
 // damaged article for its repair, then decodes the members once, and the
 // job ends with nothing parked. Divergence: classic demotes and fetches the
@@ -417,12 +435,13 @@ async fn an_aes_stored_7z_tries_a_wrong_candidate_once_then_the_right_one_under_
     assert_same(&classic, &graph);
 }
 
-// AES over the members and the end header alike, as 7zz writes `-mhe=on`.
-fn sealed_header() -> Vec<u8> {
+// AES over the members, coded by `method`, and over the end header alike,
+// as 7zz writes `-mhe=on`.
+pub(super) fn sealed_header(method: EncoderConfiguration) -> Vec<u8> {
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
     writer.set_content_methods(vec![
         AesEncoderOptions::new(Password::new(SECRET)).into(),
-        EncoderConfiguration::new(EncoderMethod::COPY),
+        method,
     ]);
     writer.set_encrypt_header(true);
     for (name, bytes) in members() {
@@ -436,7 +455,10 @@ fn sealed_header() -> Vec<u8> {
 }
 
 fn sealed() -> Scenario {
-    Scenario::new(vec![Post::plain("lantern.7z", sealed_header())])
+    Scenario::new(vec![Post::plain(
+        "lantern.7z",
+        sealed_header(EncoderConfiguration::new(EncoderMethod::COPY)),
+    )])
 }
 
 // The job's own password is its first candidate: the store, which cannot
@@ -469,6 +491,49 @@ async fn an_aes_7z_with_encrypted_headers_opened_by_the_second_candidate_deliver
         "one try for each of the two candidates"
     );
     assert_same(&classic, &graph);
+}
+
+// The last volume and the first are whole before the second has come:
+// `.003` has no signature and is a leaf until `.001` binds the store, which
+// is handed it closed. The store asks for the header's password on the
+// bytes it is handed, and the job's password answers before the container
+// is ruled shut, though the volume that holds the header is already in.
+#[tokio::test]
+async fn a_split_7z_with_encrypted_headers_whose_last_volume_came_first_opens_on_the_job_password_under_graph()
+ {
+    let scenario = Scenario::new(split(
+        &sealed_header(EncoderConfiguration::new(EncoderMethod::COPY)),
+        3,
+    ))
+    .password(SECRET);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
+    while pipeline
+        .jobs
+        .get_mut(&JOB)
+        .and_then(|state| state.download_queue.pop())
+        .is_some()
+    {}
+    serve_posts(&mut pipeline, &scenario, 2..3).await;
+    serve_posts(&mut pipeline, &scenario, 0..1).await;
+    serve_posts(&mut pipeline, &scenario, 1..2).await;
+    drive_to_finish(&mut pipeline, &scenario).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+
+    assert_eq!(status, Some(JobStatus::Complete), "{:?}", files.keys());
+    let expected = members();
+    assert_eq!(
+        files.keys().cloned().collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(name, _)| delivered(name))
+            .collect::<Vec<_>>()
+    );
+    for (name, bytes) in expected {
+        assert!(files[&delivered(name)] == bytes, "{name} bytes");
+    }
 }
 
 fn lzma2() -> Scenario {
@@ -544,7 +609,7 @@ async fn an_lzma2_7z_served_last_article_first_delivers_alike_in_every_frame_siz
 
 // The packed streams end where the end header starts, which the signature
 // header names.
-fn packed_end(archive: &[u8]) -> usize {
+pub(super) fn packed_end(archive: &[u8]) -> usize {
     32 + u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize
 }
 

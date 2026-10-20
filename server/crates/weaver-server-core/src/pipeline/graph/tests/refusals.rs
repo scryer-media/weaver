@@ -23,6 +23,7 @@ use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::Delivery;
+use crate::pipeline::graph::status::RepairSlots;
 
 const CANDIDATES: [&str; 4] = ["lantern-one", "lantern-two", OPENS, "lantern-four"];
 const WRONG: [&str; 4] = ["lantern-one", "lantern-two", "lantern-four", "lantern-five"];
@@ -116,6 +117,7 @@ impl Refusing {
                     length: Some(bytes.len() as u64),
                     segments: Vec::new(),
                 },
+                &mut RepairSlots::default(),
                 1,
             )
             .unwrap();
@@ -133,7 +135,9 @@ impl Refusing {
             let said = self.mail.recv().await.unwrap();
             let ended = matches!(said.heard, Heard::Ended)
                 && self.job.runs().current(said.node, said.generation);
-            self.job.run_said(said, 1).unwrap();
+            self.job
+                .run_said(said, &mut RepairSlots::default(), 1)
+                .unwrap();
             if ended {
                 return;
             }
@@ -144,7 +148,9 @@ impl Refusing {
     async fn until_refused(&mut self, member: u32) {
         while self.refused(member).is_none() {
             let said = self.mail.recv().await.unwrap();
-            self.job.run_said(said, 1).unwrap();
+            self.job
+                .run_said(said, &mut RepairSlots::default(), 1)
+                .unwrap();
         }
     }
 

@@ -43,6 +43,12 @@ impl RepairSlots {
         }
     }
 
+    // Whether a slot was handed to the asker while it waited, and is kept
+    // here until it asks again.
+    pub(crate) fn handed(&self, asker: AskerId) -> bool {
+        self.tickets.contains_key(&asker)
+    }
+
     pub(crate) fn release(&mut self, ticket: Ticket) {
         let admissions = self.slots.release(ticket);
         self.note(admissions);

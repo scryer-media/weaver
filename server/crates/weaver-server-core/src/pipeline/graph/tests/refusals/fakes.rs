@@ -294,7 +294,7 @@ impl Object for LockedEngine {
 }
 
 impl Engine for LockedEngine {
-    fn start(&self) -> Box<dyn Extraction> {
+    fn start(&mut self) -> Box<dyn Extraction> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         Box::new(LockedRun {
             refuses: self.refuses,

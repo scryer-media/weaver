@@ -51,8 +51,9 @@ pub trait Extraction: Send {
 // The engine face of an object: what the owner runs.
 pub trait Engine {
     // A run from the object's present state: its password, if one opened
-    // it, and which volumes it has.
-    fn start(&self) -> Box<dyn Extraction>;
+    // it, and which volumes it has. A question an earlier run asked was
+    // asked of bytes this run reads again, so it is the new run's to ask.
+    fn start(&mut self) -> Box<dyn Extraction>;
 
     // How far the run has read: the furthest volume it reached and the
     // offset in it. The owner tells the object as the run goes, so the

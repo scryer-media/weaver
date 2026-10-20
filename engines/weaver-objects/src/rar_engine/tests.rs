@@ -276,7 +276,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
     out
 }
 
-fn run(engine: &RarEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
+fn run(engine: &mut RarEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
     let mut emits = Vec::new();
     let mut sink = |emit| {
         emits.push(emit);
@@ -296,7 +296,7 @@ fn named(names: &[&str]) -> RarEngine {
 
 #[test]
 fn a_store_archive_extracts_its_members_by_name_and_closes_them() {
-    let said = run(&RarEngine::new(), vec![one_volume()]);
+    let said = run(&mut RarEngine::new(), vec![one_volume()]);
     assert_eq!(
         said,
         vec![
@@ -312,7 +312,10 @@ fn a_store_archive_extracts_its_members_by_name_and_closes_them() {
 
 #[test]
 fn a_member_spanning_two_volumes_extracts_whole() {
-    let said = run(&named(&["set.part1.rar", "set.part2.rar"]), two_volumes());
+    let said = run(
+        &mut named(&["set.part1.rar", "set.part2.rar"]),
+        two_volumes(),
+    );
     assert_eq!(
         said,
         vec![
@@ -381,7 +384,7 @@ fn claim_places_a_nameless_volume_by_its_headers() {
     );
 
     engine.bound(VolumeIndex(1), "a1b2.102", &volumes[1]);
-    let said = run(&engine, volumes);
+    let said = run(&mut engine, volumes);
     assert_eq!(said[1], Said::Bytes(0, spanning()));
 }
 
@@ -477,21 +480,21 @@ fn a_run_waits_for_bytes_not_yet_there_and_continues_when_they_land() {
 fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
     let mut engine = named(&["locked.rar"]);
     assert_eq!(
-        run(&engine, vec![ENCRYPTED.to_vec()]),
+        run(&mut engine, vec![ENCRYPTED.to_vec()]),
         vec![Said::NeedsPassword],
         "an encrypted member with no password is never announced"
     );
 
     let mut out = Vec::new();
     engine.offer_password("not-the-password", &mut out);
-    let wrong = run(&engine, vec![ENCRYPTED.to_vec()]);
+    let wrong = run(&mut engine, vec![ENCRYPTED.to_vec()]);
     assert_eq!(wrong.last(), Some(&Said::NeedsPassword));
     assert!(!wrong.iter().any(|said| matches!(said, Said::Closed(_))));
 
     engine.offer_password("testpass123", &mut out);
     assert!(out.is_empty());
     assert_eq!(
-        run(&engine, vec![ENCRYPTED.to_vec()]),
+        run(&mut engine, vec![ENCRYPTED.to_vec()]),
         vec![
             Said::Member(0, "small.txt".into(), Some(ENCRYPTED_MEMBER.len() as u64)),
             Said::Bytes(0, ENCRYPTED_MEMBER.to_vec()),
@@ -509,7 +512,7 @@ fn a_member_whose_checksum_fails_is_retracted_and_its_volume_damaged() {
         .unwrap();
     volume[at + 3] ^= 0x20;
     let length = volume.len() as u64;
-    let said = run(&RarEngine::new(), vec![volume]);
+    let said = run(&mut RarEngine::new(), vec![volume]);
     // A checksum failure is damage a repair can mend, not a refusal.
     assert_eq!(
         said[said.len() - 2..],

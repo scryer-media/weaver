@@ -659,6 +659,19 @@ pub(in crate::pipeline) async fn retire_pipeline_database(pipeline: Pipeline) {
         .unwrap();
 }
 
+// Hear the run mail until the graph job has nothing out: a repair it lent
+// returns there, and is applied as it is heard.
+pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline
+        .graph_jobs
+        .get(&job_id)
+        .is_some_and(|job| job.awaits_mail())
+    {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+}
+
 // [`new_direct_pipeline`] whose direct-store gate comes from configuration.
 async fn new_config_gated_direct_pipeline(
     temp_dir: &TempDir,

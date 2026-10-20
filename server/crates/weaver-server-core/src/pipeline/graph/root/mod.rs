@@ -225,7 +225,7 @@ impl Root for ArticleRoot {
     }
 
     fn encode(&self, kept: &mut facts::Encoded) -> Result<(Vec<u8>, Vec<Part>), RootFactsError> {
-        Ok(facts::encode_post(kept, &self.post_facts()))
+        facts::encode_post(kept, &self.post_facts())
     }
 
     fn decode(bytes: &[u8], parts: &[Part]) -> Result<PostFacts, RootFactsError> {

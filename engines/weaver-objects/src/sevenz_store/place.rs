@@ -10,13 +10,15 @@
 // held: only the map can say whose it is. A locked AES folder stays held
 // until a password opens it.
 
-use weaver_graph::{ByteRange, Extent, MemberId, Placement, VolumeIndex};
+use std::sync::Arc;
+
+use weaver_graph::{ByteRange, Extent, MemberId, Placement, Placements, Posting, VolumeIndex};
 
 use super::header::SIGNATURE;
 use super::map::Map;
 use super::record::FolderPlaced;
-use super::{ENVELOPE, Lock, SevenZipStore};
-use crate::crypt::BLOCK;
+use super::{ENVELOPE, Lock, Out, SevenZipStore};
+use crate::crypt::{BLOCK, Cbc, Padding};
 
 // A piece of the container: the envelope and held bytes in container
 // coordinates, a member's at its own offsets.
@@ -221,63 +223,112 @@ impl SevenZipStore {
         );
     }
 
-    pub(super) fn rebuild_posted(
+    // The posted bytes of these ranges of the store's volumes, as it stands
+    // now: their inverse map, and every open folder's cipher with the map
+    // and what its members said, shared, so the cipher can be put back over
+    // the plaintext away from the store.
+    pub(super) fn posted_over(&self, ranges: &[(VolumeIndex, ByteRange)]) -> Posted {
+        let placed = Placements::take(ranges, |volume, range, out| self.place(volume, range, out));
+        let mut sealed = Vec::new();
+        for &(volume, range) in ranges {
+            let (Some(container), Some(map)) = (self.container(volume, range), &self.map) else {
+                continue;
+            };
+            for (index, folder) in map.folders_in(container) {
+                let (Lock::Open(cbc, padding), Some(part)) =
+                    (&self.folders[index], container.intersect(folder.pack))
+                else {
+                    continue;
+                };
+                sealed.push(Sealed {
+                    volume,
+                    part,
+                    base: self.base(volume),
+                    folder: index,
+                    pack: folder.pack.start,
+                    cbc: Arc::clone(cbc),
+                    padding: Arc::clone(padding),
+                });
+            }
+        }
+        Posted {
+            placed,
+            map: self.map.clone(),
+            members: Arc::clone(&self.members),
+            sealed,
+        }
+    }
+}
+
+// An open folder's part of a volume, in container coordinates, with where
+// the volume and the folder start there, and the folder's cipher and its
+// padding as they stood.
+struct Sealed {
+    volume: VolumeIndex,
+    part: ByteRange,
+    base: u64,
+    folder: usize,
+    pack: u64,
+    cbc: Arc<Cbc>,
+    padding: Arc<Padding>,
+}
+
+// The store's posted bytes, apart from the store: a plain stretch is read
+// through its placements, an open folder's part is sealed again from its
+// members' plaintext.
+pub(super) struct Posted {
+    placed: Placements,
+    map: Option<Arc<Map>>,
+    members: Arc<Vec<Out>>,
+    sealed: Vec<Sealed>,
+}
+
+impl Posting for Posted {
+    fn posted(
         &self,
         volume: VolumeIndex,
         range: ByteRange,
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
     ) -> bool {
-        let (Some(container), Some(map)) = (self.container(volume, range), &self.map) else {
-            return self.read_placed(volume, range, read, into);
-        };
-        let base = self.base(volume);
-        let mut cursor = container.start;
-        for (index, folder) in map.folders_in(container) {
-            let Lock::Open(cbc, padding) = &self.folders[index] else {
+        let mut cursor = range.start;
+        for sealed in self.sealed.iter().filter(|sealed| sealed.volume == volume) {
+            let Some(part) = sealed.part.intersect(range.shift(sealed.base as i64)) else {
                 continue;
             };
-            let Some(part) = container.intersect(folder.pack) else {
-                continue;
+            let Some(map) = &self.map else {
+                return false;
             };
-            if part.start > cursor
-                && !self.read_placed(
-                    volume,
-                    ByteRange::new(cursor - base, part.start - base),
-                    read,
-                    into,
-                )
+            let start = part.start - sealed.base;
+            if start > cursor
+                && !self
+                    .placed
+                    .posted(volume, ByteRange::new(cursor, start), read, into)
             {
                 return false;
             }
+            let folder = sealed.folder;
             let mut plain = |wanted: ByteRange, buffer: &mut Vec<u8>| {
-                read_folder(map, index, wanted, read, buffer)
+                read_folder(map, folder, wanted, read, buffer)
             };
             let placed = FolderPlaced {
                 map,
-                folder: index,
+                folder,
                 members: &self.members,
             };
-            let local = part.shift(-(folder.pack.start as i64));
-            if !cbc.seal(&placed, padding, local, &mut plain, into) {
+            let local = part.shift(-(sealed.pack as i64));
+            if !sealed
+                .cbc
+                .seal(&placed, &sealed.padding, local, &mut plain, into)
+            {
                 return false;
             }
-            cursor = part.end;
+            cursor = part.end - sealed.base;
         }
-        cursor - base >= range.end
-            || self.read_placed(volume, ByteRange::new(cursor - base, range.end), read, into)
-    }
-
-    fn read_placed(
-        &self,
-        volume: VolumeIndex,
-        range: ByteRange,
-        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
-        into: &mut Vec<u8>,
-    ) -> bool {
-        let mut placements = Vec::new();
-        self.place(volume, range, &mut placements);
-        placements.iter().all(|placement| read(placement, into))
+        cursor >= range.end
+            || self
+                .placed
+                .posted(volume, ByteRange::new(cursor, range.end), read, into)
     }
 }
 

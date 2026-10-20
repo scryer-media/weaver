@@ -69,7 +69,7 @@ fn article_blob(facts: PostFacts) -> RootBlob {
 // The post encoded by `kept`, so parts unchanged since it last encoded
 // keep their bytes.
 fn article_blob_kept(kept: &mut Encoded, facts: PostFacts) -> RootBlob {
-    let (bytes, parts) = encode_post(kept, &facts);
+    let (bytes, parts) = encode_post(kept, &facts).unwrap();
     RootBlob {
         root: "articles".to_owned(),
         version: PostFacts::VERSION,

@@ -34,6 +34,7 @@ use weaver_graph::{Emit, Extraction, NodeId, Why};
 
 use self::volumes::RunVolumes;
 use super::envelope::Shelf;
+use super::namespace::Returned;
 
 // How many things a run may have said before it waits for the pipeline to
 // hear them: a bound on the bytes in flight, not on the run.
@@ -62,6 +63,9 @@ pub(crate) enum Heard {
     Emit(Emit),
     // The run returned: nothing more will be said under its generation.
     Ended,
+    // A recovery set's repair, lent off the loop, came back: addressed to
+    // the set's node, under the loan's number for a generation.
+    Repaired(Box<Returned>),
 }
 
 // Where every graph job's runs speak.
@@ -198,6 +202,15 @@ impl Runs {
             accountant,
             runs: BTreeMap::new(),
         }
+    }
+
+    // The job's id and where its runs speak, which its repairs share.
+    pub(crate) fn scope(&self) -> u64 {
+        self.scope
+    }
+
+    pub(crate) fn mail(&self) -> mpsc::Sender<Said> {
+        self.mail.clone()
     }
 
     // A run is waiting for a slot, waiting for memory, or running.

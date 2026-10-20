@@ -83,9 +83,8 @@ struct Slot {
     // `None` until a checkpoint is written or read: what the database holds
     // of the job is not known, so the next change is the whole job.
     last: Option<GraphCheckpoint>,
+    // The change a queued write takes: `Some` exactly while one is queued.
     queued: Option<Delta>,
-    // A write is queued that has not taken the change yet.
-    scheduled: bool,
     tally: Tally,
 }
 
@@ -118,25 +117,23 @@ impl Pending {
             return false;
         }
         match &mut slot.queued {
-            Some(queued) => queued.absorb(delta),
-            None => slot.queued = Some(delta),
+            Some(queued) => {
+                queued.absorb(delta);
+                false
+            }
+            None => {
+                slot.queued = Some(delta);
+                true
+            }
         }
-        !std::mem::replace(&mut slot.scheduled, true)
     }
 
     fn take(&self) -> Option<Delta> {
-        let mut slot = self.slot();
-        slot.scheduled = false;
-        slot.queued.take()
+        self.slot().queued.take()
     }
 
-    // The write was not queued: the next checkpoint queues one.
-    fn unschedule(&self) {
-        self.slot().scheduled = false;
-    }
-
-    // A write failed, so what the database holds is not known: the next
-    // checkpoint writes the whole job.
+    // A write failed or was never queued, so what the database holds is not
+    // known: the next checkpoint writes the whole job, and queues it.
     fn forget(&self) {
         let mut slot = self.slot();
         slot.last = None;
@@ -160,15 +157,8 @@ impl Pipeline {
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return;
         };
-        let snapshot = match graph.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a graph job");
-                return;
-            }
-        };
         let pending = graph.pending().clone();
-        if !pending.put(&snapshot) {
+        if !pending.put(&graph.snapshot()) {
             return;
         }
         let writer = pending.clone();
@@ -194,7 +184,7 @@ impl Pipeline {
                 written
             });
         if let Err(error) = queued {
-            pending.unschedule();
+            pending.forget();
             warn!(job_id = job_id.0, error = %error, "could not queue the graph checkpoint");
         }
     }

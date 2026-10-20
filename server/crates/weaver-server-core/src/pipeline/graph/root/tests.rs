@@ -28,6 +28,7 @@ use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{RunMail, Runs};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
+use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::{
     insert_active_job, new_direct_pipeline, retire_pipeline_database, sample_nzb_zstd,
 };
@@ -319,18 +320,31 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
     assert_eq!(job.phase_change(), Some(RootPhase::Downloading));
     assert_eq!(job.phase_change(), None);
 
-    job.intake(decoded(1, 0, 0, &[7; 90], Some(90)), 1).unwrap();
+    job.intake(
+        decoded(1, 0, 0, &[7; 90], Some(90)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
     assert_eq!(job.phase(), RootPhase::Downloading);
 
-    job.intake(decoded(0, 0, 0, &zip_front(90), Some(180)), 1)
-        .unwrap();
+    job.intake(
+        decoded(0, 0, 0, &zip_front(90), Some(180)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
     assert_eq!(job.phase(), RootPhase::Downloading);
 
     // Every volume in and the probe never closes the member it announced:
     // the object refuses itself as unmapped once the job is quiet, in the
     // settle that closes the last volume, and the job is done.
-    job.intake(decoded(0, 1, 90, &[0; 90], Some(180)), 1)
-        .unwrap();
+    job.intake(
+        decoded(0, 1, 90, &[0; 90], Some(180)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
     assert_eq!(job.phase(), RootPhase::Done);
     assert_eq!(
         job.writer().refused(NodeId::ROOT, MemberId(0)),
@@ -339,7 +353,11 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
 
     let (mut plain, _plain_dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
     plain
-        .intake(decoded(0, 0, 0, &[7; 90], Some(90)), 1)
+        .intake(
+            decoded(0, 0, 0, &[7; 90], Some(90)),
+            &mut RepairSlots::default(),
+            1,
+        )
         .unwrap();
     assert_eq!(plain.phase(), RootPhase::Done);
 }
@@ -354,8 +372,12 @@ fn a_data_seek_moves_the_articles_that_cover_it_into_the_window() {
     let (mut job, _dir, answers) = job_with(&[file("inner.zip", &[100, 100, 100])], wants);
     // The first article binds the zip object and says how long the file is,
     // which pins where the second article's bytes can lie.
-    job.intake(decoded(0, 0, 0, &zip_front(90), Some(270)), 1)
-        .unwrap();
+    job.intake(
+        decoded(0, 0, 0, &zip_front(90), Some(270)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
 
     let moves = job.seek_round(|_| true).unwrap();
 
@@ -455,8 +477,12 @@ async fn a_recovery_seek_lands_in_the_promoted_class() {
         &[file("inner.zip", &[64, 64]), file("blocks.par2", &[64])],
         wants,
     );
-    job.intake(decoded(0, 0, 0, &zip_front(60), Some(120)), 1)
-        .unwrap();
+    job.intake(
+        decoded(0, 0, 0, &zip_front(60), Some(120)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
     let moves = job.seek_round(|_| true).unwrap();
     assert_eq!(*answers.lock().unwrap(), vec![Pull::Moved(1)]);
     assert!(!moves.is_empty());
@@ -572,17 +598,32 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
 async fn a_lost_article_marks_its_range_damaged() {
     // Both edges known: the range is exact.
     let (mut job, _dir, _) = job_with(&[file("plain.bin", &[100, 100, 100])], Vec::new());
-    job.intake(decoded(0, 0, 0, &[7; 90], Some(270)), 1)
+    job.intake(
+        decoded(0, 0, 0, &[7; 90], Some(270)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    job.intake(
+        decoded(0, 2, 180, &[7; 90], Some(270)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    job.lost(VolumeIndex(0), 1, &mut RepairSlots::default(), 1)
         .unwrap();
-    job.intake(decoded(0, 2, 180, &[7; 90], Some(270)), 1)
-        .unwrap();
-    job.lost(VolumeIndex(0), 1, 1).unwrap();
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 180)]);
 
     // An unknown end: once nothing else can arrive, the widest bound.
     let (mut job, _dir, _) = job_with(&[file("plain.bin", &[100, 100])], Vec::new());
-    job.intake(decoded(0, 0, 0, &[7; 90], None), 1).unwrap();
-    job.lost(VolumeIndex(0), 1, 1).unwrap();
+    job.intake(
+        decoded(0, 0, 0, &[7; 90], None),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    job.lost(VolumeIndex(0), 1, &mut RepairSlots::default(), 1)
+        .unwrap();
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 190)]);
 
     // A seek into a lost range is answered Lost.
@@ -625,7 +666,7 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
     let (mut job, dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
     let mut article = decoded(0, 0, 0, &[7; 90], Some(90));
     article.intact = false;
-    job.intake(article, 1).unwrap();
+    job.intake(article, &mut RepairSlots::default(), 1).unwrap();
     assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(0, 90)]);
     assert_eq!(
         std::fs::read(dir.path().join("plain.bin")).unwrap(),
@@ -743,7 +784,7 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
                 restored_id,
                 Arc::new(crate::jobs::graph_checkpoint::Delta::between(
                     None,
-                    &checkpoint::rows(&admitted.snapshot().unwrap()),
+                    &checkpoint::rows(&admitted.snapshot()),
                 )),
             )
             .unwrap();
@@ -798,8 +839,13 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
 fn an_article_job_checkpointed_before_roots_had_kinds_restores() {
     let files = [file("lantern.bin", &[100]), file("later.bin", &[100])];
     let (mut job, dir, _) = job_with(&files, Vec::new());
-    job.intake(decoded(0, 0, 0, &[7; 90], Some(90)), 1).unwrap();
-    let taken = job.snapshot().unwrap();
+    job.intake(
+        decoded(0, 0, 0, &[7; 90], Some(90)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    let taken = job.snapshot();
     let mut rows = checkpoint::rows(&taken);
     checkpoint::tests::as_version_2(&mut rows);
     let snapshot = checkpoint::snapshot(&rows).unwrap();
@@ -822,7 +868,7 @@ fn an_article_job_checkpointed_before_roots_had_kinds_restores() {
     let mut restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
     assert!(restored.refetched.is_empty());
     assert!(restored.settled.contains(&(VolumeIndex(0), 0)));
-    let again = restored.job.snapshot().unwrap();
+    let again = restored.job.snapshot();
     assert_eq!(again.root, taken.root);
     assert_eq!(again.job.read_backs, taken.job.read_backs);
 }

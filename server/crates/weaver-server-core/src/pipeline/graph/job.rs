@@ -7,6 +7,7 @@
 // what the download and decode paths learn; nothing else of the pipeline
 // reaches into the tree, and nothing else writes the job's files.
 
+mod loans;
 mod passwords;
 mod pieces;
 mod repair;
@@ -24,6 +25,7 @@ use weaver_graph::{
     Builder, Effect, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
 };
 
+use self::loans::Loans;
 use self::passwords::Passwords;
 use super::Engine;
 use super::checkpoint::Pending;
@@ -32,6 +34,7 @@ use super::limits::Caps;
 use super::namespace::{NamespaceWriter, SetState, WriteError};
 use super::root::phase::{self, RootPhase};
 use super::root::{ArticleRoot, Ask, Root};
+use super::status::RepairSlots;
 use crate::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +69,7 @@ pub(crate) struct GraphJob<R: Root = ArticleRoot> {
     builder: Box<dyn Builder + Send + Sync>,
     writer: NamespaceWriter,
     runs: Runs,
+    loans: Loans,
     passwords: Passwords,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
@@ -178,6 +182,7 @@ impl<R: Root> GraphJob<R> {
             kept: R::Kept::default(),
             builder,
             writer,
+            loans: Loans::new(runs.scope(), runs.mail()),
             runs,
             passwords: Passwords::default(),
             reported: None,
@@ -194,6 +199,24 @@ impl<R: Root> GraphJob<R> {
     #[cfg(test)]
     pub(crate) fn runs(&self) -> &Runs {
         &self.runs
+    }
+
+    // The job's process-wide id, which its runs and its repairs ask under.
+    pub(crate) fn scope(&self) -> u64 {
+        self.runs.scope()
+    }
+
+    // Whether something of the job is out on a thread and will speak
+    // through the run mail: a run, or a repair.
+    #[cfg(test)]
+    pub(crate) fn awaits_mail(&self) -> bool {
+        self.runs.live() || self.loans.out()
+    }
+
+    // Whether a repair of the job is out on a thread.
+    #[cfg(test)]
+    pub(crate) fn repair_out(&self) -> bool {
+        self.loans.out()
     }
 
     #[cfg(test)]
@@ -235,7 +258,11 @@ impl<R: Root> GraphJob<R> {
     // namespace in the tree, parents first, as its namespace reads it.
     // Stable.
     pub(crate) fn recovery_summary(&self) -> Vec<SetState> {
-        self.writer.states(&self.tree)
+        self.writer
+            .states(&self.tree)
+            .into_iter()
+            .map(|state| self.loans.state(state.node).unwrap_or(state))
+            .collect()
     }
 
     // Seam for the article decoder: the block sizes the root namespace's
@@ -302,8 +329,15 @@ impl<R: Root> GraphJob<R> {
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step
-    // that asks or frees a run follows.
-    pub(crate) fn intake(&mut self, decoded: R::Intake, limit: usize) -> Result<(), GraphError> {
+    // that asks or frees a run follows, and a repair the step lends asks
+    // `slots` under it. The runs step before the lend, so a run the step
+    // starts counts as reading when the walk asks whether a set is due.
+    pub(crate) fn intake(
+        &mut self,
+        decoded: R::Intake,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         let (arrival, length) = self.root.receive(decoded);
         let member = arrival.member;
         let volume = VolumeIndex(member.0);
@@ -327,7 +361,8 @@ impl<R: Root> GraphJob<R> {
         self.heard(out)?;
         self.mark_damage()?;
         self.after_member(volume)?;
-        self.step_runs(Vec::new(), limit)
+        self.step_runs(Vec::new(), limit)?;
+        self.lend(slots, limit)
     }
 
     // Every server failed the article; nothing will fetch it again.
@@ -335,17 +370,19 @@ impl<R: Root> GraphJob<R> {
         &mut self,
         volume: VolumeIndex,
         ordinal: u32,
+        slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
         self.root.lost(volume, ordinal);
         self.mark_damage()?;
         self.after_member(volume)?;
-        self.step_runs(Vec::new(), limit)
+        self.step_runs(Vec::new(), limit)?;
+        self.lend(slots, limit)
     }
 
     // After an article of `volume` was settled: a member with nothing left
-    // to fetch is closed, and the recovery objects of every namespace
-    // repair when what they cover is in or what they waited for arrived.
+    // to fetch is closed. The walk after the step's runs rules what that
+    // completed.
     fn after_member(&mut self, volume: VolumeIndex) -> Result<(), GraphError> {
         let member = MemberId(volume.0);
         if !self.root.volume_waiting(volume) && !self.closed(member) {
@@ -360,7 +397,7 @@ impl<R: Root> GraphJob<R> {
             )?;
             self.heard(out)?;
         }
-        self.repair()
+        Ok(())
     }
 
     fn closed(&self, member: MemberId) -> bool {

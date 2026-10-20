@@ -10,6 +10,8 @@
 // file the first candidate is admitted unproven, and a checksum that fails
 // later is damage like any other.
 
+use std::sync::Arc;
+
 use sevenz_turbo::{AesProperties, ArchiveLimits};
 use weaver_graph::{ByteRange, Emit, Why};
 use zeroize::Zeroizing;
@@ -280,7 +282,9 @@ impl SevenZipStore {
                 (Ok(None) | Err(_), _) => None,
             };
             match opened {
-                Some((cbc, padding)) => self.folders[at] = Lock::Open(Box::new(cbc), padding),
+                Some((cbc, padding)) => {
+                    self.folders[at] = Lock::Open(Arc::new(cbc), Arc::new(padding));
+                }
                 None => failed = true,
             }
         }

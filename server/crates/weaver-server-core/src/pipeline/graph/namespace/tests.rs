@@ -4,7 +4,7 @@
 use std::sync::Mutex;
 
 use weaver_graph::holds::HoldBudgets;
-use weaver_graph::recovery::{Recovery, RepairOutcome, SliceVerdict};
+use weaver_graph::recovery::{MemberAccess, Recovery, RepairOutcome, SliceVerdict};
 use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, RecoveryKind, Seek};
 
 use super::*;
@@ -515,6 +515,53 @@ impl Job {
     fn is_open(&self, node: NodeId, member: MemberId) -> bool {
         self.writer.files[&node].leaves[&member].is_open()
     }
+
+    // Run each repair that went out, here, and hand it back as its return
+    // through the mail would. What each set came to, in the order lent.
+    fn run_lent(&mut self, build: &mut dyn Builder, lent: Inline) -> Vec<(NodeId, RepairOutcome)> {
+        let mut ruled = Vec::new();
+        for loan in lent.0 {
+            let returned = loan.run();
+            ruled.extend(returned.outcome.map(|outcome| (returned.set, outcome)));
+            self.writer
+                .returned(
+                    &mut self.tree,
+                    build,
+                    &Source,
+                    &weaver_objects::Objects,
+                    returned,
+                    &mut self.out,
+                )
+                .expect("returned");
+        }
+        ruled
+    }
+
+    // Repair the sets now, due or not.
+    fn repair(
+        &mut self,
+        build: &mut dyn Builder,
+        node: NodeId,
+        due: &[NodeId],
+    ) -> Vec<(NodeId, RepairOutcome)> {
+        let mut lent = Inline::default();
+        self.writer.repair(&mut self.tree, node, due, &mut lent);
+        self.run_lent(build, lent)
+    }
+}
+
+// What goes out, kept for the test to run: every due set at once.
+#[derive(Default)]
+struct Inline(Vec<Loan>);
+
+impl Lender for Inline {
+    fn admit(&mut self) -> bool {
+        true
+    }
+
+    fn lend(&mut self, loan: Loan) {
+        self.0.push(loan);
+    }
 }
 
 #[test]
@@ -656,7 +703,7 @@ fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
     assert_eq!(job.file("inner.bin"), b"hello");
 
     // The volume reads back whole through the object's placements.
-    let access = job.writer.access(&job.tree, NodeId::ROOT);
+    let access = job.writer.access(&job.tree);
     let mut posted = Vec::new();
     assert!(access.read_at(
         NodeId::ROOT,
@@ -717,17 +764,7 @@ fn damaged_bytes_are_written_and_marked_and_a_repair_overwrites_them() {
 
     let mut build = job.build();
     let due = job.tree.recovery_nodes(NodeId::ROOT);
-    let outcomes = job
-        .writer
-        .repair(
-            &mut job.tree,
-            &mut build,
-            &Source,
-            NodeId::ROOT,
-            &due,
-            &mut job.out,
-        )
-        .expect("repair");
+    let outcomes = job.repair(&mut build, NodeId::ROOT, &due);
     let outcomes: Vec<RepairOutcome> = outcomes.into_iter().map(|(_, outcome)| outcome).collect();
     assert_eq!(outcomes, vec![RepairOutcome::Repaired { slices: 1 }]);
     let seen = job.par.lock().unwrap();
@@ -804,18 +841,17 @@ fn a_bound_member_reads_back_through_its_envelope_and_its_child() {
     assert_eq!(job.file("inner.bin"), b"hello");
     assert!(!job.dir.path().join("pack.bin").exists());
 
-    let mut access = job.writer.access(&job.tree, NodeId::ROOT);
+    let access = job.writer.access(&job.tree);
     let mut posted = Vec::new();
-    assert!(access.read(member, ByteRange::new(0, 12), &mut posted));
+    assert!(access.read_at(NodeId::ROOT, member, ByteRange::new(0, 12), &mut posted));
     assert_eq!(posted, [SIGNATURE, b"hello"].concat());
 
     let mut inner = Vec::new();
-    let mut child_access = job.writer.access(&job.tree, child);
-    assert!(child_access.read(MemberId(0), ByteRange::new(1, 4), &mut inner));
+    assert!(access.read_at(child, MemberId(0), ByteRange::new(1, 4), &mut inner));
     assert_eq!(inner, b"ell");
 
     let mut beyond = vec![1u8];
-    assert!(!access.read(member, ByteRange::new(10, 20), &mut beyond));
+    assert!(!access.read_at(NodeId::ROOT, member, ByteRange::new(10, 20), &mut beyond));
     assert_eq!(
         beyond,
         vec![1u8],
@@ -1019,9 +1055,10 @@ fn bytes_held_below_the_root_reach_their_member_once_its_store_knows_its_map() {
     job.send(member, HEADER + map_at().start, MAP, Provenance::Fresh);
     assert_eq!(job.writer.held_bytes(store), 0);
     assert_eq!(job.accountant.usage().resident, 0);
-    let mut access = job.writer.access(&job.tree, late);
+    let access = job.writer.access(&job.tree);
     let mut inner = Vec::new();
-    assert!(access.read(
+    assert!(access.read_at(
+        late,
         MemberId(0),
         body().shift(-(body().start as i64)),
         &mut inner

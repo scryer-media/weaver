@@ -9,13 +9,15 @@
 // order every run of the same set numbers them; when new facts disagree with
 // a member already announced, it and every member after it are retracted.
 
+use std::sync::Arc;
+
 use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, StoredLayoutBuilder,
     StoredMember,
 };
 use weaver_graph::{ByteRange, Emit, MemberId, RecoveryKind, VolumeIndex, Why};
 
-use super::{Entry, Lock, Out, Piece, RarStore, claim};
+use super::{Entry, Lock, Piece, RarStore, claim};
 use crate::runs::CrcRuns;
 
 // A name as the namespace numbers it: forward slashes, a directory with a
@@ -181,12 +183,12 @@ impl RarStore {
             pieces: Vec::new(),
             complete: dir,
             hash_key: None,
-            out: Out::default(),
+            out: Arc::default(),
             plain_runs: CrcRuns::default(),
             parts: Default::default(),
         });
         if dir {
-            self.entries[id.0 as usize].out.closed = true;
+            Arc::make_mut(&mut self.entries[id.0 as usize].out).closed = true;
             out.push(Emit::MemberClosed(id));
         }
     }
@@ -215,7 +217,7 @@ impl RarStore {
         entry.crc = member.data_crc32;
         entry.uses_mac = member.data_hash_uses_mac;
         if entry.plain_len() == Some(0) && !entry.out.closed {
-            entry.out.closed = true;
+            Arc::make_mut(&mut entry.out).closed = true;
             out.push(Emit::MemberClosed(MemberId(id as u32)));
         }
     }

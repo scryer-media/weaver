@@ -44,6 +44,7 @@ use crate::pipeline::graph::job::{GraphJob, Storage};
 use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::PieceLayout;
+use crate::pipeline::graph::status::RepairSlots;
 use crate::proxies::TorrentScope;
 use crate::settings::model::{TrackerRule, tracker_rule_for};
 use crate::settings::{
@@ -185,6 +186,9 @@ pub struct JobEnv {
     // Where the jobs' runs speak, and where a job joins to hear them.
     pub(crate) mail: mpsc::Sender<Said>,
     pub(crate) outside: Arc<Outside>,
+    // The repair slots every torrent job shares, as the pipeline's jobs
+    // share theirs.
+    pub(crate) repairs: Arc<Mutex<RepairSlots>>,
     // With no pipeline to hear the mail, the mail itself, until the service
     // hears it in the pipeline's stead.
     alone: Arc<Mutex<Option<RunMail>>>,
@@ -202,6 +206,7 @@ impl JobEnv {
             limits: budget.limits,
             mail: budget.mail,
             outside: budget.outside,
+            repairs: Arc::default(),
             alone: Arc::default(),
         }
     }
@@ -221,6 +226,7 @@ impl JobEnv {
             limits: Arc::new(ExtractionLimits::unbounded()),
             mail: mail.sender(),
             outside: Arc::default(),
+            repairs: Arc::default(),
             alone: Arc::new(Mutex::new(Some(mail))),
         }
     }
@@ -666,7 +672,7 @@ struct Reading {
 // the ones whose checkpoint is behind them, and the writes a job's intake
 // could not make.
 #[derive(Default)]
-struct Signal {
+pub(super) struct Signal {
     dirty: Mutex<BTreeSet<JobId>>,
     unsaved: Mutex<BTreeSet<JobId>>,
     refused: Mutex<BTreeMap<JobId, String>>,
@@ -678,7 +684,7 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Signal {
-    fn mark(&self, job_id: JobId) {
+    pub(super) fn mark(&self, job_id: JobId) {
         locked(&self.dirty).insert(job_id);
         locked(&self.unsaved).insert(job_id);
         self.wake.notify_one();
@@ -717,7 +723,9 @@ struct Hearer {
 impl Hears for Hearer {
     fn said(&self, said: Said, slots: usize) {
         let job_id = JobId(said.scope);
-        if let Err(error) = self.job.with(|job| job.run_said(said, slots)) {
+        if let Err(error) = self.job.step(slots, |job, repairs, limit| {
+            job.run_said(said, repairs, limit)
+        }) {
             tracing::warn!(job_id = job_id.0, error = %error, "a torrent job's run failed");
         }
         self.signal.mark(job_id);
@@ -1078,6 +1086,9 @@ impl TorrentService {
                 live.get(&job_id).and_then(|torrent| torrent.job.clone())
             };
             let Some(job) = job else { continue };
+            if let Err(error) = job.lend_handed() {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent job's repair lending failed");
+            }
             let (refusal, done) = job.with(|job| {
                 (
                     job.writer()
@@ -1112,13 +1123,7 @@ impl TorrentService {
     }
 
     async fn save_checkpoint(&self, job_id: JobId, job: &TorrentJob) {
-        let snapshot = match job.with(|job| job.snapshot()) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent job");
-                return;
-            }
-        };
+        let snapshot = job.with(|job| job.snapshot());
         // A torrent job's checkpoint is written whole: its rows change little
         // and seldom.
         let rows = Arc::new(Delta::between(None, &checkpoint::rows(&snapshot)));
@@ -1207,8 +1212,13 @@ impl TorrentService {
             Some(restored) => restored.job,
             None => GraphJob::for_torrent(job_id.0, Arc::clone(layout), self.storage(dir, layout)),
         };
-        let job = Arc::new(TorrentJob::new(job, slots));
         let env = &self.inner.env;
+        let job = Arc::new(TorrentJob::new(
+            job,
+            Arc::clone(&env.repairs),
+            Arc::clone(&self.inner.signal),
+            slots,
+        ));
         env.outside.join(
             job_id.0,
             Arc::new(Hearer {
@@ -1775,6 +1785,9 @@ impl TorrentService {
     async fn retire(&self, torrent: Live, status: &str, error: Option<String>) {
         let job_id = torrent.record.job_id;
         self.inner.env.outside.leave(job_id.0);
+        if let Some(job) = &torrent.job {
+            job.forget();
+        }
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
         let report = report(

@@ -323,17 +323,7 @@ fn recovery_data_inside_a_volume_gets_a_window_fed_what_passed_and_what_passes()
 
     let job = &mut carried.job;
     let due = job.tree.recovery_nodes(NodeId::ROOT);
-    let outcomes = job
-        .writer
-        .repair(
-            &mut job.tree,
-            &mut carried.build,
-            &Source,
-            NodeId::ROOT,
-            &due,
-            &mut job.out,
-        )
-        .expect("repair");
+    let outcomes = job.repair(&mut carried.build, NodeId::ROOT, &due);
     assert_eq!(outcomes, vec![(windows[0], RepairOutcome::Clean)]);
     assert_eq!(carried.tape().volume.as_deref(), Some(&b"PAR3tail"[..]));
 }

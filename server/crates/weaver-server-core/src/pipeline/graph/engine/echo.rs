@@ -119,7 +119,7 @@ impl Object for Echo {
 }
 
 impl Engine for Echo {
-    fn start(&self) -> Box<dyn Extraction> {
+    fn start(&mut self) -> Box<dyn Extraction> {
         Box::new(EchoRun {
             volumes: self.volumes,
         })

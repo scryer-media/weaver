@@ -64,6 +64,16 @@ impl ByteRange {
         (start < end).then(|| Self::new(start, end))
     }
 
+    // Where this range of a window's own bytes lies in the member the
+    // window is on: moved to the window's start and clipped at its end,
+    // since nothing past the window is the window's. `None` when it starts
+    // past the window.
+    pub fn in_window(&self, window: ByteRange) -> Option<ByteRange> {
+        let start = window.start.saturating_add(self.start);
+        let end = window.start.saturating_add(self.end).min(window.end);
+        (start <= end).then(|| ByteRange::new(start, end))
+    }
+
     // Whether two ranges touch or overlap, which is what makes them one run.
     pub fn abuts(&self, other: ByteRange) -> bool {
         self.start <= other.end && other.start <= self.end

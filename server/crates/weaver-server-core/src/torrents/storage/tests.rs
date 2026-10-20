@@ -22,6 +22,7 @@ use crate::pipeline::graph::job::{GraphJob, Storage};
 use crate::pipeline::graph::limits::Caps;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::{PieceFile, PieceLayout, Verified};
+use crate::pipeline::graph::status::RepairSlots;
 use librqbit::storage::TorrentStorage;
 
 fn storage(dir: &Path, mail: &RunMail) -> Storage {
@@ -71,6 +72,8 @@ fn shim(piece_length: u64, files: Vec<PieceFile>) -> Shim {
     let mail = RunMail::default();
     let job = Arc::new(TorrentJob::new(
         GraphJob::for_torrent(1, Arc::clone(&layout), storage(dir.path(), &mail)),
+        Arc::default(),
+        Arc::default(),
         1,
     ));
     let storage = PieceStorage::new(Arc::clone(&layout), Arc::clone(&job) as Arc<dyn Pieces>);
@@ -131,7 +134,9 @@ impl Shim {
     async fn settle(&mut self) {
         while self.job.with(|job| job.phase()) != RootPhase::Done {
             let said = self.mail.recv().await.unwrap();
-            self.job.with(|job| job.run_said(said, 1)).unwrap();
+            self.job
+                .with(|job| job.run_said(said, &mut RepairSlots::default(), 1))
+                .unwrap();
         }
     }
 }
@@ -192,8 +197,7 @@ fn a_restored_job_gives_the_session_the_pieces_it_has() {
     for piece in [0, 1, 2, 4] {
         shim.complete(piece, &torrent);
     }
-    let rows =
-        crate::pipeline::graph::checkpoint::rows(&shim.job.with(|job| job.snapshot().unwrap()));
+    let rows = crate::pipeline::graph::checkpoint::rows(&shim.job.with(|job| job.snapshot()));
     let snapshot = crate::pipeline::graph::checkpoint::snapshot(&rows).unwrap();
     let restored = GraphJob::restore_torrent(
         &snapshot,
@@ -362,6 +366,8 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_
             Arc::clone(&layout),
             storage(&fetch.path().join("job"), &mail),
         ),
+        Arc::default(),
+        Arc::default(),
         1,
     ));
     let (whole, mut in_hand) = watch::channel(false);

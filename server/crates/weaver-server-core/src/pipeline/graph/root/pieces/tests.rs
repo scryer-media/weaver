@@ -17,6 +17,7 @@ use crate::pipeline::graph::limits::Caps;
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::facts::RootFactsError;
 use crate::pipeline::graph::root::{Ask, Root};
+use crate::pipeline::graph::status::RepairSlots;
 
 const PIECE: u64 = 1024;
 
@@ -408,10 +409,12 @@ fn a_torrent_job_writes_its_files_and_restores_its_pieces() {
     let dir = tempfile::tempdir().unwrap();
     let mut job = torrent_job(&layout, dir.path());
     for piece in 0..4 {
-        job.verified(shares(&layout, piece), 1).unwrap();
+        job.verified(shares(&layout, piece), &mut RepairSlots::default(), 1)
+            .unwrap();
     }
     // Piece 3 again: b's share and c's are both in hand already.
-    job.verified(shares(&layout, 3), 1).unwrap();
+    job.verified(shares(&layout, 3), &mut RepairSlots::default(), 1)
+        .unwrap();
     let bytes = torrent_bytes(&layout);
     assert_eq!(
         std::fs::read(dir.path().join("a.bin")).unwrap(),
@@ -426,7 +429,7 @@ fn a_torrent_job_writes_its_files_and_restores_its_pieces() {
     // c's share of piece 3 is in hand; its share of piece 4 is not.
     assert_eq!(job.file_have(), vec![1000, 2500, 4096 - 3500]);
 
-    let rows = checkpoint::rows(&job.snapshot().unwrap());
+    let rows = checkpoint::rows(&job.snapshot());
     let snapshot = checkpoint::snapshot(&rows).unwrap();
     let restored =
         GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
@@ -438,7 +441,8 @@ fn a_torrent_job_writes_its_files_and_restores_its_pieces() {
 
     // The last piece completes c.
     let mut job = restored.job;
-    job.verified(shares(&layout, 4), 1).unwrap();
+    job.verified(shares(&layout, 4), &mut RepairSlots::default(), 1)
+        .unwrap();
     assert!(job.have().all());
     assert_eq!(
         std::fs::read(dir.path().join("c.bin")).unwrap(),
@@ -454,7 +458,7 @@ fn a_torrent_checkpoint_is_read_only_by_a_torrent_job() {
     let layout = layout();
     let dir = tempfile::tempdir().unwrap();
     let mut job = torrent_job(&layout, dir.path());
-    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot().unwrap())).unwrap();
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
     assert!(matches!(
         GraphJob::restore(&snapshot, &[], 1, storage(dir.path()), 1),
         Err(crate::pipeline::graph::job::restore::RestoreFailure::Root(

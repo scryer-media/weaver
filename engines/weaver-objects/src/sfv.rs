@@ -13,8 +13,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Namespace, Object, ObjectId,
-    Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
+    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Namespace, Object,
+    ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, Take, VolumeIndex,
 };
 
 use crate::grid::{self, Grid, WHOLE};
@@ -42,7 +42,16 @@ pub struct Sfv {
 
 impl Durable for Sfv {
     // 2: the grid shelved by chunk of blocks, kept apart from the bytes.
-    const VERSION: u16 = 2;
+    // 3: a sealed value encodes as nothing, numbered by its owner's walk.
+    const VERSION: u16 = 3;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        self.grid.parts(take)
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        self.grid.restore_parts(give)
+    }
 
     fn impossible(&self) -> Option<&'static str> {
         let sized = self

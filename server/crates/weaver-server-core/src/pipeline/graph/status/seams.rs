@@ -41,6 +41,12 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     {
         return;
     }
+    // A slot handed to the job while it waited goes to the repair it could
+    // not lend for want of one, so the verdict below waits on that repair
+    // rather than taking its slot. Every step lends what it made due.
+    if pipeline.graph_status.repairs.handed(asker(job_id)) {
+        pipeline.lend_graph_repairs(job_id);
+    }
     let (_, limit) = limits::budgets(&pipeline.direct_store.settings(), &pipeline.tuner);
     let Some(job) = pipeline.graph_jobs.get_mut(&job_id) else {
         return;
@@ -228,7 +234,16 @@ impl Pipeline {
         self.graph_jobs.get(&job_id).is_some_and(RootJob::unpacked)
     }
 
+    // A job going away gives back the repair slot it holds, a repair still
+    // out among them, and its place in the queue for one.
     pub(in crate::pipeline) fn forget_graph_repair(&mut self, job_id: JobId) {
+        if let Some(ticket) = self
+            .graph_jobs
+            .get_mut(&job_id)
+            .and_then(GraphJob::forget_slot)
+        {
+            self.graph_status.repairs.release(ticket);
+        }
         self.graph_status.repairs.forget(asker(job_id));
     }
 

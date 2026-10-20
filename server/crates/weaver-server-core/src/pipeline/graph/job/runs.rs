@@ -13,18 +13,25 @@ use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
-use crate::pipeline::graph::namespace::WriteError;
+use crate::pipeline::graph::namespace::{Returned, WriteError};
 use crate::pipeline::graph::root::Root;
+use crate::pipeline::graph::status::RepairSlots;
 
 impl<R: Root> GraphJob<R> {
-    // What a run said. A stopped run's words carry an old generation and
-    // are not heard.
-    pub(crate) fn run_said(&mut self, said: Said, limit: usize) -> Result<(), GraphError> {
+    // What a run said, or a repair lent off the loop came back with. A
+    // stopped run's words carry an old generation and are not heard.
+    pub(crate) fn run_said(
+        &mut self,
+        said: Said,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         let node = said.node;
-        if !self.runs.current(node, said.generation) {
-            return Ok(());
-        }
         let admitted = match said.heard {
+            Heard::Repaired(returned) => {
+                return self.repaired(node, said.generation, *returned, slots, limit);
+            }
+            _ if !self.runs.current(node, said.generation) => return Ok(()),
             Heard::Emit(emit) => {
                 // The object is told its run is asking, as it is told how
                 // far the run read: it rules on it when the job is quiet.
@@ -52,9 +59,39 @@ impl<R: Root> GraphJob<R> {
                 self.runs.ended(node, said.generation, limit)
             }
         };
-        // What the run said may have closed what a recovery object covers.
-        self.repair()?;
-        self.step_runs(admitted, limit)
+        // What the run said may have closed what a recovery object covers:
+        // the walk rules on it once the runs the step starts are reading.
+        self.step_runs(admitted, limit)?;
+        self.lend(slots, limit)
+    }
+
+    // The set's repair came back. Its ruling is applied, what the ruling
+    // closed is stepped, and the next repair due goes out under the slot
+    // the job holds or one `slots` gives it. A set the loop moved under is
+    // rebuilt from its facts as `weaver_objects` restores them.
+    fn repaired(
+        &mut self,
+        set: NodeId,
+        serial: u64,
+        returned: Returned,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        if !self.loans.returned(set, serial) {
+            return Ok(());
+        }
+        let mut out = Vec::new();
+        self.writer.returned(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            &weaver_objects::Objects,
+            returned,
+            &mut out,
+        )?;
+        self.heard(out)?;
+        self.step_runs(Vec::new(), limit)?;
+        self.lend(slots, limit)
     }
 
     // Bring every engine's run up to the tree, under the slot limit the
@@ -127,7 +164,7 @@ impl<R: Root> GraphJob<R> {
                 return Ok(Vec::new());
             }
         }
-        if let Some(extraction) = self.tree.engine(node).map(Engine::start) {
+        if let Some(extraction) = self.tree.engine_mut(node).map(Engine::start) {
             let shelf = self.writer.shelf(node);
             self.runs.start(node, extraction, shelf);
         }

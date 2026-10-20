@@ -129,9 +129,9 @@ fn a_store_a_stream_feeds_reads_its_volume_back_through_its_envelope() {
     assert!(job.tree.child_of(node, MemberId(0)).is_some(), "a store");
     assert_eq!(job.file("inner.bin"), b"hello");
 
-    let mut access = job.writer.access(&job.tree, node);
+    let access = job.writer.access(&job.tree);
     let mut posted = Vec::new();
-    assert!(access.read(MemberId(0), ByteRange::new(0, 12), &mut posted));
+    assert!(access.read_at(node, MemberId(0), ByteRange::new(0, 12), &mut posted));
     assert_eq!(posted, [SIGNATURE, b"hello"].concat());
 }
 
@@ -149,9 +149,7 @@ fn a_set_a_stream_feeds_reads_its_volume_back_from_its_file() {
 
     let mut build = job.build();
     let due = job.tree.recovery_nodes(node);
-    job.writer
-        .repair(&mut job.tree, &mut build, &Source, node, &due, &mut job.out)
-        .expect("repair");
+    job.repair(&mut build, node, &due);
     assert_eq!(
         job.par.lock().unwrap().volume.as_deref(),
         Some(PAR2_SIGNATURE),

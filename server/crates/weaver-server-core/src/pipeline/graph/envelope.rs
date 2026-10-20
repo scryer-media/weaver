@@ -159,15 +159,15 @@ impl Envelopes {
         range: ByteRange,
         into: &mut Vec<u8>,
     ) -> bool {
-        let Some(shelf) = self.shelves.get(&node) else {
-            return range.is_empty();
-        };
-        let state = shelf.lock();
-        let Some(kept) = state.kept.get(&envelope) else {
-            return range.is_empty();
-        };
-        let len = usize::try_from(range.len()).expect("an envelope range fits the address space");
-        kept.coverage.covered(range) && kept.leaf.read(range.start, len, into).is_ok()
+        match self.shelves.get(&node) {
+            Some(shelf) => shelf.read(envelope, range, into),
+            None => range.is_empty(),
+        }
+    }
+
+    // The node's shelf, if anything was ever kept on it.
+    pub(crate) fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
+        self.shelves.get(&node).map(Arc::clone)
     }
 
     // An envelope the object at `node` gave back with its volume leaves the
@@ -248,6 +248,17 @@ impl Shelf {
             );
         }
         Ok(state.kept.get_mut(&envelope).expect("inserted above"))
+    }
+
+    // Append the bytes of `range` of an envelope to `into`, or nothing and
+    // `false` when any of them were never kept.
+    pub(crate) fn read(&self, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        let state = self.lock();
+        let Some(kept) = state.kept.get(&envelope) else {
+            return range.is_empty();
+        };
+        let len = usize::try_from(range.len()).expect("an envelope range fits the address space");
+        kept.coverage.covered(range) && kept.leaf.read(range.start, len, into).is_ok()
     }
 
     // Whether any byte of any volume is in.

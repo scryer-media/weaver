@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 use super::GraphJob;
 use crate::pipeline::graph::checkpoint::{FileState, Snapshot};
 use crate::pipeline::graph::root::Root;
-use crate::pipeline::graph::root::facts::{JobFacts, RootBlob, RootFactsError};
+use crate::pipeline::graph::root::facts::{JobFacts, RootBlob};
 
 impl<R: Root> GraphJob<R> {
-    pub(crate) fn snapshot(&mut self) -> Result<Snapshot, RootFactsError> {
+    pub(crate) fn snapshot(&mut self) -> Snapshot {
         let tree = self.tree.records();
         let mut files = BTreeMap::new();
         for node in &tree.nodes {
@@ -25,16 +25,16 @@ impl<R: Root> GraphJob<R> {
                 }
             }
         }
-        Ok(Snapshot {
+        Snapshot {
             job: JobFacts {
                 read_backs: self.writer.read_backs(),
                 reported: self.reported,
             },
-            root: RootBlob::of(&self.root, &mut self.kept)?,
+            root: RootBlob::of(&self.root, &mut self.kept),
             tree,
             files,
             kept: self.writer.kept_records(),
             passwords: self.passwords.last_offered().collect(),
-        })
+        }
     }
 }

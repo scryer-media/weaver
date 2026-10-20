@@ -7,6 +7,8 @@
 // covered, and its CRC32 is folded as its bytes pass, so a checksum that
 // fails marks the member's extent damaged for the recovery beside it.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Emit, MemberId, Placement, Provenance, Segment, SliceVerdict};
 
@@ -69,6 +71,7 @@ impl SevenZipStore {
                 Lock::Plain => {}
                 Lock::Locked | Lock::Sealed(..) => continue,
                 Lock::Open(cbc, padding) => {
+                    let (cbc, padding) = (Arc::make_mut(cbc), Arc::make_mut(padding));
                     let placed = FolderPlaced {
                         map: &map,
                         folder: index,
@@ -145,7 +148,7 @@ impl SevenZipStore {
             let folded = self.grid.fold(member, WHOLE, 0, whole);
             grid::verdict(folded, entry.length, 0, expected)
         });
-        let Some(said) = self.members.get_mut(member.0 as usize) else {
+        let Some(said) = Arc::make_mut(&mut self.members).get_mut(member.0 as usize) else {
             return;
         };
         said.coverage.write(range, provenance);

@@ -22,12 +22,16 @@ use bitvec::order::Msb0;
 use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
 use librqbit::{ManagedTorrentShared, TorrentMetadata, ValidatedTorrentMetaV1Info};
 use librqbit_core::lengths::ValidPieceIndex;
+use weaver_graph::slots::AskerId;
 use weaver_graph::{ByteRange, VolumeIndex};
 
-use crate::pipeline::graph::job::GraphJob;
+use super::service::Signal;
+use crate::jobs::ids::JobId;
+use crate::pipeline::graph::job::{GraphError, GraphJob};
 use crate::pipeline::graph::root::pieces::{
     LayoutError, PieceFile, PieceLayout, PieceRoot, Verified,
 };
+use crate::pipeline::graph::status::RepairSlots;
 
 #[cfg(test)]
 mod tests;
@@ -42,16 +46,28 @@ pub(crate) trait Pieces: Send + Sync {
 }
 
 // A graph job over a piece root as the storage's other side. `limit` is the
-// slot limit every step the job takes follows.
+// slot limit every step the job takes follows; `repairs` the repair slots
+// every torrent job shares, under which a step lends the repairs it made
+// due; and `signal` where a job those slots woke is marked, so the service
+// lends for it.
 pub(crate) struct TorrentJob {
     job: Mutex<GraphJob<PieceRoot>>,
+    repairs: Arc<Mutex<RepairSlots>>,
+    signal: Arc<Signal>,
     limit: usize,
 }
 
 impl TorrentJob {
-    pub(crate) fn new(job: GraphJob<PieceRoot>, limit: usize) -> Self {
+    pub(crate) fn new(
+        job: GraphJob<PieceRoot>,
+        repairs: Arc<Mutex<RepairSlots>>,
+        signal: Arc<Signal>,
+        limit: usize,
+    ) -> Self {
         Self {
             job: Mutex::new(job),
+            repairs,
+            signal,
             limit,
         }
     }
@@ -59,12 +75,63 @@ impl TorrentJob {
     pub(crate) fn with<T>(&self, read: impl FnOnce(&mut GraphJob<PieceRoot>) -> T) -> T {
         read(&mut self.job.lock().unwrap_or_else(PoisonError::into_inner))
     }
+
+    // One step of the job under the shared repair slots, at `limit`. A slot
+    // the step gave back may go to a job that waited for it: that job is
+    // marked, and the service lends for it.
+    pub(crate) fn step(
+        &self,
+        limit: usize,
+        step: impl FnOnce(&mut GraphJob<PieceRoot>, &mut RepairSlots, usize) -> Result<(), GraphError>,
+    ) -> Result<(), GraphError> {
+        let mut repairs = self.repairs.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = self.with(|job| step(job, &mut repairs, limit));
+        for woken in repairs.take_woken() {
+            self.signal.mark(JobId(woken.0));
+        }
+        result
+    }
+
+    // A slot handed to the job while it waited goes to the repair it could
+    // not lend for want of one. Every step lends what it made due, so a
+    // job no slot was handed to has nothing to lend here.
+    pub(crate) fn lend_handed(&self) -> Result<(), GraphError> {
+        let handed = self
+            .repairs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .handed(self.asker());
+        if !handed {
+            return Ok(());
+        }
+        self.step(self.limit, |job, repairs, limit| job.lend(repairs, limit))
+    }
+
+    // The job's repair slot, or its place in the queue, for a torrent
+    // going away.
+    pub(crate) fn forget(&self) {
+        let asker = self.asker();
+        let ticket = self.with(GraphJob::forget_slot);
+        let mut repairs = self.repairs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(ticket) = ticket {
+            repairs.release(ticket);
+        }
+        repairs.forget(asker);
+        for woken in repairs.take_woken() {
+            self.signal.mark(JobId(woken.0));
+        }
+    }
+
+    fn asker(&self) -> AskerId {
+        AskerId(self.with(|job| job.scope()))
+    }
 }
 
 impl Pieces for TorrentJob {
     fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        let limit = self.limit;
-        Ok(self.with(|job| job.verified(shares, limit))?)
+        Ok(self.step(self.limit, |job, repairs, limit| {
+            job.verified(shares, repairs, limit)
+        })?)
     }
 
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {

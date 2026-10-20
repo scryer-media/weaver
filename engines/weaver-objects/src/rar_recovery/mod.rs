@@ -118,11 +118,21 @@ pub struct RarRecovery {
     reference: Option<String>,
     // The bound volumes that were whole at the last bind.
     whole: BTreeSet<u32>,
-    outcome: Option<RepairOutcome>,
+    // What the last repair came to, for the members bound then.
+    last: Option<Ruling>,
+}
+
+// The verdict a repair reached, or that it came up short of recovery
+// volumes: it needs as many in hand as it found data volumes missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Ruling {
+    Reached(RepairOutcome),
+    Short { needed: u64 },
 }
 
 impl Durable for RarRecovery {
-    const VERSION: u16 = 1;
+    // 2: a repair that came up short kept with the volumes it needs.
+    const VERSION: u16 = 2;
 }
 
 impl RarRecovery {
@@ -135,7 +145,7 @@ impl RarRecovery {
             names: BTreeMap::new(),
             reference: None,
             whole: BTreeSet::new(),
-            outcome: None,
+            last: None,
         }
     }
 
@@ -273,13 +283,8 @@ impl Object for RarRecovery {
         self.rev(volume).length = Some(length);
     }
 
-    // A recovery volume is spent whole, so a wait ends as one closes: it
-    // is in hand, or the last one is and no more can come.
     fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.rev(volume).closed = true;
-        if self.outcome == Some(RepairOutcome::Waiting) {
-            self.outcome = None;
-        }
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {
@@ -374,7 +379,7 @@ impl Recovery for RarRecovery {
         // A ruling is on the members bound, not on how whole they were: a
         // volume its own repair made whole leaves it standing.
         if bound != self.bound {
-            self.outcome = None;
+            self.last = None;
         }
         self.reference = names.values().next().cloned();
         self.bound = bound;
@@ -412,7 +417,7 @@ impl Recovery for RarRecovery {
         let Some((index, _)) = self.bound.iter().find(|(_, bound)| **bound == member) else {
             return;
         };
-        out.push(match self.outcome {
+        out.push(match self.outcome() {
             _ if self.whole.contains(index) => SliceVerdict::Intact,
             Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. }) => SliceVerdict::Intact,
             Some(RepairOutcome::Impossible { .. }) => SliceVerdict::Damaged,
@@ -424,12 +429,25 @@ impl Recovery for RarRecovery {
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
         let outcome = self.rule(access);
-        self.outcome = Some(outcome);
+        self.last = Some(match outcome {
+            RepairOutcome::Waiting => Ruling::Short {
+                needed: self.missing(),
+            },
+            reached => Ruling::Reached(reached),
+        });
         outcome
     }
 
+    // A recovery volume is spent whole, so one is in hand once it closes
+    // unlost; a wait is over once as many are as it needs, or none more
+    // can come.
     fn outcome(&self) -> Option<RepairOutcome> {
-        self.outcome
+        match self.last? {
+            Ruling::Reached(outcome) => Some(outcome),
+            Ruling::Short { needed } => {
+                (self.usable() < needed && self.coming()).then_some(RepairOutcome::Waiting)
+            }
+        }
     }
 
     fn blocks_reachable(&self) -> u64 {

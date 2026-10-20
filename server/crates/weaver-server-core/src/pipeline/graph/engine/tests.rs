@@ -21,6 +21,7 @@ use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
+use crate::pipeline::graph::status::RepairSlots;
 
 const NODE: NodeId = NodeId(7);
 const FIRST: VolumeIndex = VolumeIndex(0);
@@ -469,6 +470,7 @@ impl Echoing {
                     length: Some(bytes.len() as u64),
                     segments: Vec::new(),
                 },
+                &mut RepairSlots::default(),
                 1,
             )
             .unwrap();
@@ -494,7 +496,9 @@ impl Echoing {
         let said = self.mail.recv().await.unwrap();
         let ended = matches!(said.heard, Heard::Ended)
             && self.job.runs().current(said.node, said.generation);
-        self.job.run_said(said, 1).unwrap();
+        self.job
+            .run_said(said, &mut RepairSlots::default(), 1)
+            .unwrap();
         ended
     }
 
@@ -532,7 +536,10 @@ async fn the_job_reports_extracting_while_a_run_is_live_and_done_after() {
         let said = echoing.mail.recv().await.unwrap();
         let ended = matches!(said.heard, Heard::Ended);
         assert_eq!(echoing.job.phase(), RootPhase::Extracting);
-        echoing.job.run_said(said, 1).unwrap();
+        echoing
+            .job
+            .run_said(said, &mut RepairSlots::default(), 1)
+            .unwrap();
         if ended {
             break;
         }

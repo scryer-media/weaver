@@ -112,6 +112,7 @@ impl Pipeline {
         state.recovery_queue.extend_segment_ids(&mut parked);
         graph.parked(|volume, ordinal| parked.contains(&segment(job_id, volume, ordinal)));
         self.graph_jobs.insert(job_id, graph);
+        self.lend_graph_repairs(job_id);
         self.after_graph_step(job_id);
         self.checkpoint_graph_job(job_id);
     }
@@ -152,7 +153,7 @@ impl Pipeline {
                 })
                 .collect(),
         };
-        let result = graph.intake(decoded, limit);
+        let result = graph.intake(decoded, &mut self.graph_status.repairs, limit);
         self.after_graph_result(job_id, result);
         true
     }
@@ -187,13 +188,15 @@ impl Pipeline {
         let result = graph.lost(
             VolumeIndex(segment_id.file_id.file_index),
             segment_id.segment_number,
+            &mut self.graph_status.repairs,
             limit,
         );
         self.after_graph_result(job_id, result);
     }
 
-    // What an engine's run said. A run that ended may have been the last
-    // thing the job waited on, so the completion gate looks again.
+    // What an engine's run said, or what a repair came back with. A run
+    // that ended or a repair that ruled may have been the last thing the job
+    // waited on, so the completion gate looks again.
     pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
         let job_id = JobId(said.scope);
         let limit = self.graph_slot_limit();
@@ -201,8 +204,8 @@ impl Pipeline {
             self.graph_outside.deliver(said, limit);
             return;
         };
-        let ended = matches!(said.heard, Heard::Ended);
-        let result = graph.run_said(said, limit);
+        let ended = matches!(said.heard, Heard::Ended | Heard::Repaired(_));
+        let result = graph.run_said(said, &mut self.graph_status.repairs, limit);
         self.after_graph_result(job_id, result);
         if ended {
             self.schedule_job_completion_check(job_id);
@@ -236,9 +239,30 @@ impl Pipeline {
         if self.fail_graph_job_on_breach(job_id) {
             return;
         }
+        self.wake_repair_waiters();
         self.after_graph_step(job_id);
         // The step's bytes are written: the checkpoint can say so.
         self.checkpoint_graph_job(job_id);
+    }
+
+    // Lend the job's due repairs under the repair slots every graph job
+    // shares.
+    pub(in crate::pipeline::graph) fn lend_graph_repairs(&mut self, job_id: JobId) {
+        let limit = self.graph_slot_limit();
+        if let Some(graph) = self.graph_jobs.get_mut(&job_id)
+            && let Err(error) = graph.lend(&mut self.graph_status.repairs, limit)
+        {
+            warn!(job_id = job_id.0, error = %error, "graph repair lending failed");
+        }
+        self.wake_repair_waiters();
+    }
+
+    // A slot a step gave back, or one that went to a job waiting for it,
+    // wakes that job's completion gate, which lends for it in turn.
+    fn wake_repair_waiters(&mut self) {
+        for woken in self.graph_status.repairs.take_woken() {
+            self.schedule_job_completion_check(JobId(woken.0));
+        }
     }
 
     // After anything reached the tree: answer the objects' seeks, move the
