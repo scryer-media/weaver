@@ -88,6 +88,7 @@ impl Pipeline {
             passwords,
             caps,
             nesting: limits::NESTING,
+            unpack: true,
         };
         let Some(mut graph) = GraphJob::for_engine(engine, job_id.0, &files, storage) else {
             return;

@@ -439,6 +439,9 @@ pub struct TrackerRule {
     pub host_pattern: String,
     pub seeding: Option<SeedingPolicy>,
     pub never_pause: bool,
+    // Whether the archives of a torrent under this rule are extracted;
+    // `None` inherits.
+    pub unpack: Option<bool>,
 }
 
 impl TrackerRule {
@@ -517,6 +520,9 @@ pub struct TorrentConfig {
     // Where each route's session keeps its DHT state. Absent means under
     // the data directory.
     pub session_dir: Option<PathBuf>,
+    // Whether a torrent's archives are extracted, unless its category, its
+    // tracker rule or the torrent itself says otherwise.
+    pub unpack: bool,
 }
 
 impl Default for TorrentConfig {
@@ -530,6 +536,7 @@ impl Default for TorrentConfig {
             max_active_downloads: 3,
             max_peers_total: 500,
             session_dir: None,
+            unpack: true,
         }
     }
 }
@@ -682,6 +689,7 @@ mod tests {
             host_pattern: TrackerRule::pattern(host_pattern).unwrap(),
             seeding: None,
             never_pause: false,
+            unpack: None,
         }
     }
 
@@ -805,6 +813,7 @@ name = "tv"
             max_active_downloads: 5,
             max_peers_total: 200,
             session_dir: Some(PathBuf::from("/var/lib/weaver/torrents")),
+            unpack: false,
         };
 
         let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();

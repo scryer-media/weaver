@@ -885,3 +885,20 @@ kind = "sql"
 file = "migrations/0073_torrent_trackers_listing/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 74
+description = "a category, a tracker rule or a torrent may say whether its archives are extracted"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0074_unpack_overrides/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0074_unpack_overrides/postgres.sql"
+engine = "postgres"
+scope = "all"

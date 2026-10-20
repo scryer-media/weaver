@@ -119,6 +119,7 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 1,
                 name: "Movies".to_string(),
                 dest_dir: Some(complete_dir.display().to_string()),
@@ -127,6 +128,7 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 2,
                 name: "TV".to_string(),
                 dest_dir: None,
@@ -135,6 +137,7 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 3,
                 name: "Unavailable".to_string(),
                 dest_dir: Some(missing_dir.display().to_string()),

@@ -867,6 +867,9 @@ pub struct SubmitInput {
     #[graphql(default)]
     pub paused: bool,
     pub password: Option<String>,
+    /// Whether a torrent's archives are extracted; absent inherits. An NZB
+    /// ignores it.
+    pub unpack: Option<bool>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]

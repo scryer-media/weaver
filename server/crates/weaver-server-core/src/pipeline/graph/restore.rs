@@ -74,6 +74,7 @@ impl Pipeline {
             passwords: self.restore_passwords(job_id, spec),
             caps: self.graph_caps(&files),
             nesting: super::limits::NESTING,
+            unpack: true,
         };
         let limit = storage.slots;
         let Restored {

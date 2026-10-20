@@ -306,6 +306,7 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
             aliases: String::new(),
             seeding: Some(policy(3.0)),
             torrent_route: false,
+            unpack: None,
         }],
         seeding: Some(policy(1.5)),
         torrent: TorrentConfig::default(),

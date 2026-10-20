@@ -79,6 +79,7 @@ impl TorrentsMutation {
                 policy_override,
                 paused: input.paused,
                 forced: input.forced,
+                unpack: input.unpack,
             },
         )
         .await?;

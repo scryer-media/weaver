@@ -772,6 +772,7 @@ mod category_destination_tests {
         crate::categories::CategoryConfig {
             seeding: None,
             torrent_route: false,
+            unpack: None,
             id: 1,
             name: name.to_string(),
             dest_dir: dest_dir.map(str::to_string),

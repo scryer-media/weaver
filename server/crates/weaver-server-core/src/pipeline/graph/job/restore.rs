@@ -125,7 +125,7 @@ impl<R: Root> GraphJob<R> {
         let mut job = Self {
             tree,
             root,
-            builder: Box::new(weaver_objects::Objects),
+            builder: super::builder(storage.unpack),
             kept: R::Kept::default(),
             writer,
             loans: Loans::new(runs.scope(), runs.mail()),

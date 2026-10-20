@@ -59,6 +59,43 @@ pub(crate) struct Storage {
     pub(crate) caps: Caps,
     // How deep the job's namespaces may nest, the root's being 0.
     pub(crate) nesting: u32,
+    // Whether members are opened as archives; off leaves every member a
+    // leaf.
+    pub(crate) unpack: bool,
+}
+
+// The builder of a job that opens no member: every member stays a leaf.
+struct Leaves;
+
+impl Builder for Leaves {
+    fn build(
+        &mut self,
+        _: weaver_graph::Kind,
+        _: weaver_graph::ObjectId,
+    ) -> Option<Box<dyn weaver_graph::Object>> {
+        None
+    }
+
+    fn read(
+        &self,
+        _: &Tree,
+        _: NodeId,
+        _: VolumeIndex,
+        _: &weaver_graph::Placement,
+        _: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
+}
+
+// The builder a job's objects come from: the real objects, or none when the
+// job does not unpack.
+pub(crate) fn builder(unpack: bool) -> Box<dyn Builder + Send + Sync> {
+    if unpack {
+        Box::new(weaver_objects::Objects)
+    } else {
+        Box::new(Leaves)
+    }
 }
 
 pub(crate) struct GraphJob<R: Root = ArticleRoot> {
@@ -110,7 +147,7 @@ impl GraphJob {
             .capped(storage.caps);
             Self::new(
                 files,
-                Box::new(weaver_objects::Objects),
+                builder(storage.unpack),
                 writer,
                 runs,
                 storage.nesting,

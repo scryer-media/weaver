@@ -864,6 +864,7 @@ fn an_article_job_checkpointed_before_roots_had_kinds_restores() {
         passwords: Vec::new(),
         caps: crate::pipeline::graph::limits::Caps::unbounded(),
         nesting: u32::MAX,
+        unpack: true,
     };
     let mut restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
     assert!(restored.refetched.is_empty());

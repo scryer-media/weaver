@@ -25,7 +25,7 @@ impl Database {
                                     .into_args()?;
                             tx.execute(
                                 &format!(
-                                    "INSERT INTO categories ({}) VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}})",
+                                    "INSERT INTO categories ({}) VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})",
                                     crate::categories::record::CATEGORY_COLUMNS
                                 ),
                                 &args,

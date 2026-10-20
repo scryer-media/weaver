@@ -42,6 +42,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptText(torrent.storage_dir.clone()),
         SqlArg::OptText(policy_override),
         SqlArg::OptI64(torrent.tracker_rule_id.map(i64::from)),
+        SqlArg::OptBool(torrent.unpack),
     ])
 }
 
@@ -95,7 +96,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO torrents ({TORRENT_COLUMNS})
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &torrent_args,
                     )
@@ -254,6 +255,22 @@ impl Database {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE torrents SET tracker_rule_id = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // Whether the torrent's archives are extracted, fixed when its job is
+    // built. Returns whether the torrent exists.
+    pub fn set_torrent_unpack(&self, job_id: JobId, unpack: bool) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(unpack), SqlArg::I64(stored(job_id.0)?)];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET unpack = {} WHERE job_id = {}",
                 &args,
             )
             .await?;

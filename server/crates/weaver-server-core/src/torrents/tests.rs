@@ -26,6 +26,7 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         storage_dir: None,
         policy_override: None,
         tracker_rule_id: None,
+        unpack: None,
     }
 }
 
@@ -245,6 +246,7 @@ fn a_torrent_keeps_the_tracker_rule_it_matched_until_the_rule_goes() {
                 host_pattern: "*.invalid".into(),
                 seeding: None,
                 never_pause: true,
+                unpack: None,
             },
             1,
         )

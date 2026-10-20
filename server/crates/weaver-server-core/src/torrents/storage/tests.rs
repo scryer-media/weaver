@@ -40,6 +40,7 @@ fn storage(dir: &Path, mail: &RunMail) -> Storage {
         passwords: Vec::new(),
         caps: Caps::unbounded(),
         nesting: u32::MAX,
+        unpack: true,
     }
 }
 

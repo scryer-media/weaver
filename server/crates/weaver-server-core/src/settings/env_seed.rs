@@ -1152,6 +1152,7 @@ mod tests {
             categories: vec![CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 1,
                 name: "Movies".to_string(),
                 dest_dir: None,

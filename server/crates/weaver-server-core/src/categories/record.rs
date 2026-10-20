@@ -6,7 +6,8 @@ use crate::categories::CategoryConfig;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow};
 use crate::settings::SeedingPolicy;
 
-pub(crate) const CATEGORY_COLUMNS: &str = "id, name, dest_dir, aliases, seeding, torrent_route";
+pub(crate) const CATEGORY_COLUMNS: &str =
+    "id, name, dest_dir, aliases, seeding, torrent_route, unpack";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CategoryRecord {
@@ -16,6 +17,7 @@ pub(crate) struct CategoryRecord {
     pub aliases: String,
     pub seeding: Option<SeedingPolicy>,
     pub torrent_route: bool,
+    pub unpack: Option<bool>,
 }
 
 impl CategoryRecord {
@@ -27,6 +29,7 @@ impl CategoryRecord {
             aliases: self.aliases,
             seeding: self.seeding,
             torrent_route: self.torrent_route,
+            unpack: self.unpack,
         }
     }
 
@@ -38,6 +41,7 @@ impl CategoryRecord {
             aliases: category.aliases.clone(),
             seeding: category.seeding,
             torrent_route: category.torrent_route,
+            unpack: category.unpack,
         }
     }
 
@@ -57,6 +61,7 @@ impl CategoryRecord {
             aliases: row.text("aliases")?,
             seeding,
             torrent_route: row.bool("torrent_route")?,
+            unpack: row.opt_bool("unpack")?,
         })
     }
 
@@ -74,6 +79,7 @@ impl CategoryRecord {
             SqlArg::Text(self.aliases),
             SqlArg::OptText(seeding),
             SqlArg::Bool(self.torrent_route),
+            SqlArg::OptBool(self.unpack),
         ])
     }
 }

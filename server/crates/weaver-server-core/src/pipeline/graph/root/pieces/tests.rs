@@ -57,7 +57,11 @@ fn torrent_bytes(layout: &PieceLayout) -> Vec<u8> {
 
 // Each volume's share of the piece, as the storage hands it over.
 fn shares(layout: &PieceLayout, piece: u32) -> Vec<Verified> {
-    let bytes = torrent_bytes(layout);
+    shares_of(layout, &torrent_bytes(layout), piece)
+}
+
+// Each volume's share of the piece of `bytes`, the torrent's whole content.
+fn shares_of(layout: &PieceLayout, bytes: &[u8], piece: u32) -> Vec<Verified> {
     let range = layout.piece_range(piece);
     layout
         .spans(piece)
@@ -379,6 +383,7 @@ pub(crate) fn storage(dir: &std::path::Path) -> Storage {
         passwords: Vec::new(),
         caps: Caps::unbounded(),
         nesting: u32::MAX,
+        unpack: true,
     }
 }
 
@@ -466,4 +471,49 @@ fn a_torrent_checkpoint_is_read_only_by_a_torrent_job() {
         ))
     ));
     let _ = Unit::Waiting;
+}
+
+// A job that does not unpack opens no member: an archive's volume stays a
+// leaf and lands as it is, where the real objects would open it.
+#[test]
+fn a_job_that_does_not_unpack_leaves_an_archive_a_leaf() {
+    let layout = Arc::new(PieceLayout::new(PIECE, vec![file("set.rar", 2000)]).unwrap());
+    let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+    bytes.extend((bytes.len()..2000).map(|at| (at % 251) as u8));
+    let job = |unpack: bool, dir: &std::path::Path| {
+        let accountant = accountant();
+        let writer = NamespaceWriter::new(
+            1,
+            dir.to_path_buf(),
+            Arc::clone(&accountant),
+            CapacityReader::unknown(),
+        );
+        let runs = Runs::new(1, 1, RunMail::default().sender(), accountant);
+        let mut job = GraphJob::torrent(
+            Arc::clone(&layout),
+            crate::pipeline::graph::job::builder(unpack),
+            writer,
+            runs,
+            u32::MAX,
+        );
+        // No run slot: an object is built, but no engine starts.
+        for piece in 0..2 {
+            job.verified(
+                shares_of(&layout, &bytes, piece),
+                &mut RepairSlots::default(),
+                0,
+            )
+            .unwrap();
+        }
+        job
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let leaves = job(false, dir.path());
+    assert!(leaves.tree().child_of(NodeId::ROOT, MemberId(0)).is_none());
+    assert_eq!(std::fs::read(dir.path().join("set.rar")).unwrap(), bytes);
+
+    let dir = tempfile::tempdir().unwrap();
+    let opened = job(true, dir.path());
+    assert!(opened.tree().child_of(NodeId::ROOT, MemberId(0)).is_some());
 }

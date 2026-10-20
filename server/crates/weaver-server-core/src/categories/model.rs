@@ -26,6 +26,10 @@ pub struct CategoryConfig {
     // of `torrent:default`.
     #[serde(default)]
     pub torrent_route: bool,
+    // Whether the category's torrents have their archives extracted;
+    // `None` inherits.
+    #[serde(default)]
+    pub unpack: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -186,6 +190,7 @@ mod tests {
         let categories = vec![CategoryConfig {
             seeding: None,
             torrent_route: false,
+            unpack: None,
             id: 1,
             name: "Movies".to_string(),
             dest_dir: None,
@@ -213,6 +218,7 @@ mod tests {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 1,
                 name: "Movies".to_string(),
                 dest_dir: None,
@@ -221,6 +227,7 @@ mod tests {
             CategoryConfig {
                 seeding: None,
                 torrent_route: false,
+                unpack: None,
                 id: 2,
                 name: "custom/name".to_string(),
                 dest_dir: Some("/trusted/output".to_string()),
@@ -255,6 +262,7 @@ mod tests {
         let unsafe_without_override = vec![CategoryConfig {
             seeding: None,
             torrent_route: false,
+            unpack: None,
             id: 3,
             name: "unsafe/name".to_string(),
             dest_dir: None,

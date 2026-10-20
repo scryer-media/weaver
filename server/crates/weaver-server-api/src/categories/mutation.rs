@@ -43,7 +43,7 @@ impl CategoriesMutation {
         }
         let dest_dir = input.dest_dir.clone().filter(|value| !value.is_empty());
         validate_category_name(&name, dest_dir.as_deref())?;
-        let (seeding, torrent_route) = input.torrent_fields(None)?;
+        let (seeding, torrent_route, unpack) = input.torrent_fields(None)?;
 
         with_timed_config_read(config, "categories.mutation.add_category.validate", |cfg| {
             if cfg
@@ -75,6 +75,7 @@ impl CategoriesMutation {
             aliases: input.aliases,
             seeding,
             torrent_route,
+            unpack,
         };
 
         let added = {
@@ -154,7 +155,7 @@ impl CategoriesMutation {
                     )));
                 }
 
-                let (seeding, torrent_route) = input.torrent_fields(Some(current))?;
+                let (seeding, torrent_route, unpack) = input.torrent_fields(Some(current))?;
                 Ok(weaver_server_core::categories::CategoryConfig {
                     id,
                     name: name.clone(),
@@ -162,6 +163,7 @@ impl CategoriesMutation {
                     aliases: input.aliases.clone(),
                     seeding,
                     torrent_route,
+                    unpack,
                 })
             },
         )
@@ -316,6 +318,7 @@ mod tests {
                             .push(weaver_server_core::categories::CategoryConfig {
                                 seeding: None,
                                 torrent_route: false,
+                                unpack: None,
                                 id: 1,
                                 name: "tv".to_string(),
                                 dest_dir: None,

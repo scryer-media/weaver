@@ -30,17 +30,11 @@ impl GraphJob<PieceRoot> {
             passwords,
             caps,
             nesting,
+            unpack,
         } = storage;
         let runs = Runs::new(scope, slots, mail, Arc::clone(&accountant));
         let writer = NamespaceWriter::new(scope, working_dir, accountant, free_disk).capped(caps);
-        Self::torrent(
-            layout,
-            Box::new(weaver_objects::Objects),
-            writer,
-            runs,
-            nesting,
-        )
-        .offering(passwords)
+        Self::torrent(layout, super::builder(unpack), writer, runs, nesting).offering(passwords)
     }
 
     pub(crate) fn torrent(
