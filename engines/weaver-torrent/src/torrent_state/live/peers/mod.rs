@@ -13,6 +13,8 @@ use parking_lot::RwLock;
 
 use crate::{
     Error,
+    peer_connection::WriterRequest,
+    peer_protocol::Message,
     torrent_state::utils::{TimedExistence, atomic_inc},
     type_aliases::{BF, PeerHandle},
 };
@@ -185,6 +187,26 @@ impl PeerStates {
             live.cancel_inflight_requests_for_piece(stolen_idx);
         });
     }
+
+    /// Tells every live peer that lacks `piece` that we have it now. A peer
+    /// that sent no bitfield has nothing, so it lacks every piece. The HAVE
+    /// goes on the peer's own unbounded writer queue, so a slow connection
+    /// receives it late but never loses it. A peer that goes live after this
+    /// walk reads our have-bitfield afterwards, which holds the piece.
+    pub(crate) fn announce_have(&self, piece: ValidPieceIndex) {
+        for peer in self.states.iter() {
+            if let PeerState::Live(live) = peer.value().get_state()
+                && !live
+                    .bitfield
+                    .get(piece.get_usize())
+                    .is_some_and(|has| *has)
+            {
+                let _ = live
+                    .tx
+                    .send(WriterRequest::Message(Message::Have(piece.get())));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +336,107 @@ mod tests {
 
         peers.drop_peer(a).unwrap();
         assert_eq!(live_seeders(&peers), (1, 1));
+    }
+
+    #[test]
+    fn a_steal_empties_the_victims_queue_of_the_stolen_piece() {
+        use crate::core::constants::CHUNK_SIZE;
+        use crate::core::lengths::Lengths;
+        use crate::peer_protocol::Request;
+
+        let lengths = Lengths::new(CHUNK_SIZE as u64 * 8, CHUNK_SIZE * 4).unwrap();
+        let stolen = lengths.validate_piece_index(0).unwrap();
+        let kept = lengths.validate_piece_index(1).unwrap();
+
+        let peers = make_peer_states();
+        let (victim, mut victim_rx) = add_live_peer(&peers, "127.0.0.1:1234");
+        let (thief, _thief_rx) = add_live_peer(&peers, "127.0.0.1:1235");
+
+        peers
+            .with_live_mut(victim, "test", |live| {
+                for chunk in lengths.iter_chunk_infos(stolen).take(2) {
+                    assert!(live.add_inflight_request(chunk));
+                }
+                for chunk in lengths.iter_chunk_infos(kept).take(1) {
+                    assert!(live.add_inflight_request(chunk));
+                }
+            })
+            .unwrap();
+
+        peers.on_steal(victim, thief, stolen);
+
+        let queued = peers
+            .with_live(victim, |live| {
+                live.inflight_requests().copied().collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert!(queued.iter().all(|req| req.piece_index == kept), "{queued:?}");
+        assert_eq!(queued.len(), 1);
+
+        let mut cancelled = Vec::new();
+        while let Ok(msg) = victim_rx.try_recv() {
+            match msg {
+                WriterRequest::Message(Message::Cancel(Request { index, begin, .. })) => {
+                    cancelled.push((index, begin))
+                }
+                _ => panic!("unexpected writer request"),
+            }
+        }
+        cancelled.sort();
+        assert_eq!(cancelled, vec![(0, 0), (0, CHUNK_SIZE)]);
+    }
+
+    fn haves_queued(rx: &mut PeerRx) -> Vec<u32> {
+        let mut haves = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                WriterRequest::Message(Message::Have(piece)) => haves.push(piece),
+                _ => panic!("unexpected writer request"),
+            }
+        }
+        haves
+    }
+
+    fn piece(total_pieces: u32, index: u32) -> ValidPieceIndex {
+        crate::core::lengths::Lengths::new(total_pieces as u64, 1)
+            .unwrap()
+            .validate_piece_index(index)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_completed_piece_is_announced_to_every_live_peer_that_lacks_it() {
+        let peers = make_peer_states();
+        let (_silent, mut silent_rx) = add_live_peer(&peers, "127.0.0.1:1234");
+        let (seeder, mut seeder_rx) = add_live_peer(&peers, "127.0.0.1:1235");
+        let (leecher, mut leecher_rx) = add_live_peer(&peers, "127.0.0.1:1236");
+        peers
+            .update_bitfield(seeder, full_bitfield(), TOTAL_PIECES)
+            .unwrap();
+        peers
+            .update_bitfield(leecher, empty_bitfield(), TOTAL_PIECES)
+            .unwrap();
+
+        peers.announce_have(piece(TOTAL_PIECES as u32, 3));
+
+        // The peer that sent no bitfield has nothing, so it is told.
+        assert_eq!(haves_queued(&mut silent_rx), vec![3]);
+        assert_eq!(haves_queued(&mut leecher_rx), vec![3]);
+        assert_eq!(haves_queued(&mut seeder_rx), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_peer_that_falls_behind_still_learns_every_completed_piece() {
+        // Far more pieces than a 128-entry bounded channel holds, all completed
+        // before the peer's writer reads a single one.
+        const PIECES: u32 = 1000;
+        let peers = make_peer_states();
+        let (_slow, mut slow_rx) = add_live_peer(&peers, "127.0.0.1:1234");
+
+        for index in 0..PIECES {
+            peers.announce_have(piece(PIECES, index));
+        }
+
+        assert_eq!(haves_queued(&mut slow_rx), (0..PIECES).collect::<Vec<_>>());
     }
 }

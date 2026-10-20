@@ -65,7 +65,6 @@ use std::{
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
-    constants::CHUNK_SIZE,
     hash_id::Id20,
     lengths::{ChunkInfo, Lengths, ValidPieceIndex},
     spawn_utils::spawn_with_cancel,
@@ -81,7 +80,7 @@ use crate::peer_protocol::{
         ut_pex::UtPex,
     },
 };
-use anyhow::{Context, bail};
+use anyhow::Context;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::{
     Notify, OwnedSemaphorePermit, Semaphore,
@@ -216,7 +215,6 @@ pub struct TorrentStateLive {
     session_stats: Arc<SessionStats>,
 
     pub(crate) streams: Arc<TorrentStreams>,
-    have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
@@ -266,8 +264,6 @@ impl TorrentStateLive {
             pri
         };
 
-        let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
-
         let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
@@ -304,7 +300,6 @@ impl TorrentStateLive {
             down_speed_estimator,
             up_speed_estimator,
             cancellation_token,
-            have_broadcast_tx,
             session_stats,
             streams: paused.streams,
             per_piece_locks: (0..lengths.total_pieces())
@@ -518,11 +513,7 @@ impl TorrentStateLive {
 
         let res = tokio::select! {
             r = requester => {r}
-            r = peer_connection.manage_peer_incoming(
-                rx,
-                checked_peer,
-                self.have_broadcast_tx.subscribe()
-            ) => {r}
+            r = peer_connection.manage_peer_incoming(rx, checked_peer) => {r}
         };
 
         match res {
@@ -586,7 +577,7 @@ impl TorrentStateLive {
         );
         let conn_manager = aframe!(
             peer_connection
-                .manage_peer_outgoing(rx, state.have_broadcast_tx.subscribe())
+                .manage_peer_outgoing(rx)
                 .instrument(debug_span!("peer_connection"))
         );
 
@@ -732,7 +723,10 @@ impl TorrentStateLive {
     }
 
     fn transmit_haves(&self, index: ValidPieceIndex) {
-        let _ = self.have_broadcast_tx.send(index);
+        if self.shared.options.disable_upload() {
+            return;
+        }
+        self.peers.announce_have(index);
     }
 
     pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
@@ -1266,20 +1260,6 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.get_approx_have_bytes() > 0
     }
 
-    fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
-        if self.state.shared.options.disable_upload() {
-            return false;
-        }
-        let have = self
-            .state
-            .peers
-            .with_live(self.addr, |l| {
-                l.bitfield.get(id.get_usize()).map(|p| *p).unwrap_or(true)
-            })
-            .unwrap_or(true);
-        !have
-    }
-
     fn update_my_extended_handshake(
         &self,
         handshake: &mut ExtendedHandshake<ByteBuf>,
@@ -1740,7 +1720,16 @@ impl PeerHandler {
                 }
             };
 
-            for chunk in self.state.lengths.iter_chunk_infos(next) {
+            // Only the chunks not yet received: a stolen piece keeps the
+            // chunks its previous owner delivered.
+            let missing = self
+                .state
+                .lock_read("missing chunks")
+                .get_pieces()?
+                .missing_chunks(next)
+                .collect::<Vec<_>>();
+
+            for chunk in missing {
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -1769,10 +1758,21 @@ impl PeerHandler {
                     .state
                     .peers
                     .with_live_mut(handle, "add chunk request", |live| {
-                        live.add_inflight_request(chunk)
+                        // Only the piece's owner requests its chunks. The check
+                        // and the request are one step under this peer's lock,
+                        // so a steal either comes after and cancels the request,
+                        // or comes first and this peer stops requesting.
+                        let owned = self
+                            .state
+                            .lock_read("add chunk request")
+                            .get_pieces()
+                            .is_ok_and(|pieces| pieces.is_owned_by(next, self.addr));
+                        owned.then(|| live.add_inflight_request(chunk))
                     }) {
-                    Some(true) => {}
-                    Some(false) => {
+                    Some(Some(true)) => {}
+                    // Stolen or released: the piece is no longer ours to request.
+                    Some(None) => break,
+                    Some(Some(false)) => {
                         // This request was already in-flight for this peer for this chunk.
                         // This might happen in theory, but not very likely.
                         //
@@ -2056,31 +2056,9 @@ impl PeerHandler {
     }
 
     fn send_metadata_piece(&self, piece_id: u32) -> anyhow::Result<()> {
-        let data = &self.state.metadata.info_bytes;
-        let metadata_size = data.len();
-        if metadata_size == 0 {
-            anyhow::bail!("peer requested for info metadata but we don't have it")
-        }
-        let total_pieces: usize = (metadata_size as u64)
-            .div_ceil(CHUNK_SIZE as u64)
-            .try_into()?;
-
-        if piece_id as usize > total_pieces {
-            bail!("piece out of bounds")
-        }
-
-        let offset = piece_id * CHUNK_SIZE;
-        let end = (offset + CHUNK_SIZE).min(data.len().try_into()?);
-        let total_size: u32 = data
-            .len()
-            .try_into()
-            .context("can't send metadata: len doesn't fit into u32")?;
-        let data = data.slice(offset as usize..end as usize);
-
+        let data = UtMetadataData::piece_of(&self.state.metadata.info_bytes, piece_id)?;
         self.tx
-            .send(WriterRequest::UtMetadata(UtMetadata::Data(
-                UtMetadataData::from_bytes(piece_id, total_size, data.into()),
-            )))
+            .send(WriterRequest::UtMetadata(UtMetadata::Data(data)))
             .context("error sending UtMetadata: channel closed")?;
         Ok(())
     }
