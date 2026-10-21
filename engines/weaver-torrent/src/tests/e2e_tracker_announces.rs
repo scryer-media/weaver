@@ -123,7 +123,7 @@ async fn test_resumed_torrent_announces_only_this_runs_bytes() -> anyhow::Result
             Some(AddTorrentOptions {
                 storage_factory: Some(MemoryStorageFactory::default().clone_box()),
                 trackers: Some(vec![url]),
-                initial_have: Some(have),
+                checkpoint: Some(crate::Checkpoint::pieces(have)),
                 ..Default::default()
             }),
         )

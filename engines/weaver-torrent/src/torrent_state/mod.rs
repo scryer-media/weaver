@@ -580,6 +580,13 @@ impl ManagedTorrent {
         }
     }
 
+    /// What the torrent has written of its data, for a later run to start
+    /// from (libtorrent `torrent::write_resume_data`); None while it is
+    /// checked or stopped by an error.
+    pub fn checkpoint(&self) -> Option<initializing::Checkpoint> {
+        self.with_chunk_tracker(ChunkTracker::checkpoint).ok()
+    }
+
     /// Get the live state if the torrent is live.
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();

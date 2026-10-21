@@ -48,7 +48,7 @@ async fn test_full_initial_have_goes_live_without_reading_storage() -> anyhow::R
             AddTorrent::from_bytes(t.torrent.clone()),
             Some(AddTorrentOptions {
                 storage_factory: Some(storage.clone_box()),
-                initial_have: Some(have_all_but(&[])),
+                checkpoint: Some(crate::Checkpoint::pieces(have_all_but(&[]))),
                 ..Default::default()
             }),
         )
@@ -94,7 +94,7 @@ async fn test_partial_initial_have_fetches_exactly_the_missing_pieces() -> anyho
             AddTorrent::from_bytes(t.torrent.clone()),
             Some(AddTorrentOptions {
                 storage_factory: Some(storage.clone_box()),
-                initial_have: Some(have_all_but(&missing)),
+                checkpoint: Some(crate::Checkpoint::pieces(have_all_but(&missing))),
                 initial_peers: Some(vec![seeder_addr]),
                 ..Default::default()
             }),
@@ -141,7 +141,7 @@ async fn test_initial_have_of_the_wrong_length_is_refused() -> anyhow::Result<()
                 AddTorrent::from_bytes(t.torrent.clone()),
                 Some(AddTorrentOptions {
                     storage_factory: Some(storage.clone_box()),
-                    initial_have: Some(have),
+                    checkpoint: Some(crate::Checkpoint::pieces(have)),
                     ..Default::default()
                 }),
             )
@@ -150,7 +150,7 @@ async fn test_initial_have_of_the_wrong_length_is_refused() -> anyhow::Result<()
             Ok(_) => anyhow::bail!("a have-bitfield of the wrong length was accepted"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(err.contains("initial_have"), "unclear error: {err}");
+        assert!(err.contains("checkpoint"), "unclear error: {err}");
         assert_eq!(storage.log.preads(), 0);
     }
     assert!(

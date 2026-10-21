@@ -132,11 +132,23 @@ impl Harness {
             .await
             .unwrap();
         let have = BF::from_boxed_slice(have.into());
+        Self::adding(session, out, torrent, crate::Checkpoint::pieces(have), add).await
+    }
+
+    /// `torrent`, live, started from `checkpoint`, added to `session` with
+    /// `add`.
+    async fn adding(
+        session: Arc<Session>,
+        out: TempDir,
+        torrent: TestTorrent,
+        checkpoint: crate::Checkpoint,
+        add: AddTorrentOptions,
+    ) -> Self {
         let handle = session
             .add_torrent(
                 AddTorrent::from_bytes(torrent.torrent.clone()),
                 Some(AddTorrentOptions {
-                    initial_have: Some(have),
+                    checkpoint: Some(checkpoint),
                     ..add
                 }),
             )
@@ -152,6 +164,32 @@ impl Harness {
             _torrent: Some(torrent),
             _out: out,
         }
+    }
+
+    /// The torrent's handle in its session.
+    fn handle(&self) -> crate::torrent_state::ManagedTorrentHandle {
+        self._session
+            .get(crate::api::TorrentIdOrHash::Id(self.live.shared.id))
+            .unwrap()
+    }
+
+    /// The torrent taken out of its session, its files left, and added
+    /// again with `add`, started from `checkpoint`, as a restart does.
+    async fn restarted(self, checkpoint: crate::Checkpoint, add: AddTorrentOptions) -> Self {
+        let Self {
+            live,
+            _session: session,
+            _torrent: torrent,
+            _out: out,
+            ..
+        } = self;
+        let id = live.shared.id;
+        drop(live);
+        session
+            .delete(crate::api::TorrentIdOrHash::Id(id), false)
+            .await
+            .unwrap();
+        Self::adding(session, out, torrent.unwrap(), checkpoint, add).await
     }
 
     /// A live peer at `addr` with every piece, and the queue of what we send it.
@@ -2317,7 +2355,7 @@ mod v2 {
                     AddTorrent::from_bytes(torrent.torrent_bytes()),
                     Some(AddTorrentOptions {
                         storage_factory: Some(MemoryStorageFactory::default().clone_box()),
-                        initial_have: Some(have),
+                        checkpoint: Some(crate::Checkpoint::pieces(have)),
                         ..Default::default()
                     }),
                 )
@@ -5236,7 +5274,7 @@ impl Harness {
                 AddTorrent::from_bytes(torrent.torrent_bytes()),
                 Some(AddTorrentOptions {
                     storage_factory: Some(MemoryStorageFactory::default().clone_box()),
-                    initial_have: Some(have),
+                    checkpoint: Some(crate::Checkpoint::pieces(have)),
                     ..Default::default()
                 }),
             )
@@ -5378,4 +5416,75 @@ async fn the_web_seed_of_a_single_file_torrent_that_fails_a_piece_is_banned() {
         |lacks| h.web_layout.bitfield(lacks).any(),
     );
     assert!(due.is_empty());
+}
+
+// libtorrent `torrent::write_resume_data` records the finished blocks of each
+// downloading piece (`unfinished_pieces`), and `torrent::read_resume_data`
+// marks them finished again (`piece_picker::mark_as_finished`): a restarted
+// torrent asks for none of them, and the piece's hash is checked once the
+// rest arrive.
+#[tokio::test]
+async fn a_checkpoint_keeps_the_written_blocks_of_a_piece_across_a_restart() {
+    let storage = MemoryStorageFactory::default();
+    let add = || AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        ..Default::default()
+    };
+    // Piece 1 had: piece 0 is the one fetched.
+    let h = Harness::build_added(
+        "checkpoint_keeps_written_blocks",
+        PIECES,
+        0x40,
+        isolated_session_opts(false),
+        add(),
+    )
+    .await;
+    tokio::time::pause();
+    {
+        let (peer, mut rx) = h.peer("127.0.0.1:6881");
+        let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+        peer.on_i_am_unchoked();
+        assert_eq!(
+            next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+            chunks(0, 0..CHUNKS_PER_PIECE)
+        );
+        h.deliver(&peer, (0, 0)).await;
+        h.deliver(&peer, (0, CHUNK_SIZE)).await;
+    }
+
+    let checkpoint = h.handle().checkpoint().unwrap();
+    assert_eq!(checkpoint.have.as_raw_slice(), &[0x40]);
+    let blocks = checkpoint.blocks.as_ref().unwrap();
+    assert_eq!(
+        blocks.iter_ones().collect::<Vec<_>>(),
+        [0, 1, 4, 5, 6, 7],
+        "the two blocks written of piece 0, and every block of piece 1"
+    );
+    assert_eq!(storage.log.written_pieces(), [0, 0]);
+
+    let h = h.restarted(checkpoint, add()).await;
+    assert_eq!(h.missing_chunks(0), [2, 3]);
+    let (peer, mut rx) = h.peer("127.0.0.2:6881");
+    let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+    peer.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, 2).await,
+        chunks(0, 2..CHUNKS_PER_PIECE)
+    );
+    assert_eq!(h.inflight_count(&peer), 2);
+    h.deliver(&peer, (0, 2 * CHUNK_SIZE)).await;
+    h.deliver(&peer, (0, 3 * CHUNK_SIZE)).await;
+
+    assert!(
+        h.lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .is_piece_have(h.piece(0))
+    );
+    assert_eq!(storage.log.completed_pieces(), [0]);
+    assert_eq!(
+        storage.log.written_pieces(),
+        [0, 0, 0, 0],
+        "no block was fetched twice"
+    );
 }

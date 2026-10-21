@@ -79,11 +79,9 @@ use crate::{
     torrent_state::{
         AddIncomingPeerResult, ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions,
         ManagedTorrentState, TorrentMetadata, TorrentStateLive,
-        initializing::{TorrentStateInitializing, normalize_initial_have},
+        initializing::{Checkpoint, TorrentStateInitializing, normalize_checkpoint},
     },
-    type_aliases::{
-        BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream,
-    },
+    type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream},
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -533,17 +531,16 @@ pub struct AddTorrentOptions {
     // Custom trackers
     pub trackers: Option<Vec<String>>,
 
-    /// The pieces the storage already holds and that the caller has already
-    /// verified, as a BEP 3 bitfield: bit 0 (the high bit of the first byte)
-    /// is piece 0. When set, the initial hash check does not run: these pieces
-    /// are taken as have and every other piece as missing, and none of them is
-    /// read back from the storage. It also takes precedence over any fastresume
-    /// bitfield.
-    ///
-    /// Its length is either the piece count, or the piece count rounded up to
-    /// whole bytes with the spare bits clear; anything else is refused.
+    /// What the storage already holds, as a checkpoint of an earlier run
+    /// recorded it (see [`Checkpoint`]). When set, the initial hash check
+    /// does not run: its pieces are taken as have and its blocks as
+    /// written, every other piece and block as missing, and none is read
+    /// back from the storage but a piece every block of which was written
+    /// and that is not had, whose hash is checked. It also takes precedence
+    /// over any fastresume bitfield. A bitfield of the wrong length is
+    /// refused.
     #[serde(skip)]
-    pub initial_have: Option<BF>,
+    pub checkpoint: Option<Checkpoint>,
 
     /// The initial fetch priority of the given pieces, by piece index; every
     /// other piece is Normal. See [`PiecePriority`] and
@@ -594,7 +591,7 @@ impl Default for AddTorrentOptions {
             preferred_id: None,
             storage_factory: None,
             trackers: None,
-            initial_have: None,
+            checkpoint: None,
             piece_priorities: None,
             identity: None,
             disable_v1_hashes: v1_hashes_disabled_by_default(),
@@ -2083,10 +2080,10 @@ impl Session {
             opts.list_only,
         )?;
 
-        let initial_have = opts
-            .initial_have
+        let checkpoint = opts
+            .checkpoint
             .take()
-            .map(|have| normalize_initial_have(have, metadata.info.lengths()))
+            .map(|checkpoint| normalize_checkpoint(checkpoint, metadata.info.lengths()))
             .transpose()?;
 
         let piece_priorities = match opts.piece_priorities.take() {
@@ -2193,7 +2190,7 @@ impl Session {
                 self.spawner
                     .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
                 false,
-                initial_have,
+                checkpoint,
                 piece_priorities.clone(),
             ));
             let handle = Arc::new(ManagedTorrent {

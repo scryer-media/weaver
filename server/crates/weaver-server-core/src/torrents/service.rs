@@ -16,8 +16,8 @@ use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::limits::{LimitKind, LimitsConfig};
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Identity, Magnet, ManagedTorrent, Session,
-    TrackerAnnounce, torrent_from_bytes,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
+    ManagedTorrent, Session, TrackerAnnounce, torrent_from_bytes,
 };
 
 use crate::SchedulerError;
@@ -2709,12 +2709,15 @@ fn top_priority(value: &str) -> bool {
     numeric_priority(value) >= numeric_priority("HIGH")
 }
 
-// The pieces the session starts from, so it does not check the files.
+// The checkpoint the session starts from, so it does not check the files:
+// the pieces the job has, and no block of any other. The storage keeps a
+// piece's blocks in memory until the piece verifies, so no block of a piece
+// not had is ever written to the job's files.
 fn apply_initial_have(
     options: &mut AddTorrentOptions,
     have: bitvec::boxed::BitBox<u8, bitvec::order::Msb0>,
 ) {
-    options.initial_have = Some(have);
+    options.checkpoint = Some(Checkpoint::pieces(have));
 }
 
 // Why a session refusal leaves a torrent without one.

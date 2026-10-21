@@ -25,7 +25,7 @@ use crate::{
     bitv::BitV,
     bitv_factory::BitVFactory,
     chunk_tracker::{ChunkTracker, compute_selected_bytes},
-    file_ops::FileOps,
+    file_ops::{FileOps, Verdict, inconsistent_hashes},
     piece_priority::PiecePriority,
     type_aliases::{BF, FileStorage},
 };
@@ -43,35 +43,73 @@ pub struct TorrentStateInitializing {
     pause_requested: AtomicBool,
     check_running: AtomicBool,
     previously_errored: bool,
-    // Pieces the embedder says are present and verified: when set, they are
-    // the have set and no piece is read back to check it.
-    initial_have: Option<BF>,
+    // What the embedder recorded of the data: when set, it is taken as
+    // what the storage holds and no piece is read back to check it.
+    checkpoint: Option<Checkpoint>,
     // The fetch priority of every piece; None while all are Normal.
     piece_priorities: Option<Vec<PiecePriority>>,
 }
 
-/// Bring a caller-supplied have-bitfield to the torrent's BEP 3 bitfield
-/// layout: one bit per piece, rounded up to whole bytes, spare bits clear.
-///
-/// It accepts exactly the piece count in bits, or the byte-rounded length with
+/// What a torrent had written of its data when it was last saved, for the
+/// next run to start from instead of reading every piece back (libtorrent
+/// `add_torrent_params::have_pieces` and `unfinished_pieces`, which
+/// `torrent::write_resume_data` writes and `torrent::read_resume_data`
+/// takes). [`crate::ManagedTorrent::checkpoint`] makes one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// The pieces had and verified, as a BEP 3 bitfield: bit 0 (the high bit
+    /// of the first byte) is piece 0. Its length is the piece count, or the
+    /// piece count rounded up to whole bytes with the spare bits clear.
+    pub have: BF,
+    /// Every block written to the storage, one bit per block, piece `i`'s
+    /// blocks from bit `i` times the blocks of a whole piece on; the blocks
+    /// of a had piece may be set or not. Its length is the block count, or
+    /// the block count rounded up to whole bytes with the spare bits clear.
+    /// None records no block of a piece not had.
+    pub blocks: Option<BF>,
+}
+
+impl Checkpoint {
+    /// A checkpoint of the pieces in `have`, no block of any other written.
+    pub fn pieces(have: BF) -> Self {
+        Self { have, blocks: None }
+    }
+}
+
+/// Bring a bitfield of `units` bits to whole bytes with the spare bits
+/// clear. It accepts exactly `units` bits, or the byte-rounded length with
 /// its spare bits clear, as a peer's BITFIELD message must be (BEP 3).
-pub(crate) fn normalize_initial_have(have: BF, lengths: &Lengths) -> anyhow::Result<BF> {
-    let pieces = lengths.total_pieces() as usize;
-    let bytes = lengths.piece_bitfield_bytes();
-    let bits = have.len();
-    if bits != pieces && bits != bytes * 8 {
+fn normalize_bits(bits: BF, units: usize, what: &str) -> anyhow::Result<BF> {
+    let bytes = units.div_ceil(8);
+    let len = bits.len();
+    if len != units && len != bytes * 8 {
         anyhow::bail!(
-            "initial_have has {bits} bits, but the torrent has {pieces} pieces: expected {pieces} bits, or {bytes} bytes with the spare bits clear"
+            "the checkpoint's {what} bitfield has {len} bits, but the torrent has {units} {what}: expected {units} bits, or {bytes} bytes with the spare bits clear"
         );
     }
-    if have[pieces..].any() {
+    if bits[units..].any() {
         anyhow::bail!(
-            "initial_have marks pieces past the last one ({pieces} pieces): the spare bits must be clear"
+            "the checkpoint's {what} bitfield marks {what} past the last one ({units} {what}): the spare bits must be clear"
         );
     }
     let mut normalized = BF::from_boxed_slice(vec![0u8; bytes].into_boxed_slice());
-    normalized[..pieces].copy_from_bitslice(&have[..pieces]);
+    normalized[..units].copy_from_bitslice(&bits[..units]);
     Ok(normalized)
+}
+
+/// Bring a caller-supplied checkpoint to the torrent's layouts: one bit per
+/// piece and one per block, each rounded up to whole bytes, spare bits clear.
+pub(crate) fn normalize_checkpoint(
+    checkpoint: Checkpoint,
+    lengths: &Lengths,
+) -> anyhow::Result<Checkpoint> {
+    Ok(Checkpoint {
+        have: normalize_bits(checkpoint.have, lengths.total_pieces() as usize, "pieces")?,
+        blocks: checkpoint
+            .blocks
+            .map(|blocks| normalize_bits(blocks, lengths.total_chunks() as usize, "blocks"))
+            .transpose()?,
+    })
 }
 
 impl TorrentStateInitializing {
@@ -81,7 +119,7 @@ impl TorrentStateInitializing {
         only_files: Option<Vec<usize>>,
         files: FileStorage,
         previously_errored: bool,
-        initial_have: Option<BF>,
+        checkpoint: Option<Checkpoint>,
         piece_priorities: Option<Vec<PiecePriority>>,
     ) -> Self {
         Self {
@@ -93,7 +131,7 @@ impl TorrentStateInitializing {
             pause_requested: AtomicBool::new(false),
             check_running: AtomicBool::new(false),
             previously_errored,
-            initial_have,
+            checkpoint,
             piece_priorities,
         }
     }
@@ -228,6 +266,50 @@ impl TorrentStateInitializing {
         Some(hp)
     }
 
+    /// The pieces of a checkpoint every block of which was written but that
+    /// are not had, their hash not checked before the checkpoint was made,
+    /// have it checked now: one that passes is had, one that does not has
+    /// its blocks dropped, to be fetched again (libtorrent
+    /// `torrent::on_resume_data_checked`: `verify_piece` on each unfinished
+    /// piece `is_piece_finished`, then `piece_passed` or `piece_failed`).
+    /// Returns the blocks left.
+    async fn verify_finished(&self, have: &mut BF, mut blocks: BF) -> anyhow::Result<BF> {
+        let lengths = *self.metadata.lengths();
+        let finished: Vec<_> = lengths
+            .iter_piece_infos()
+            .map(|piece| piece.piece_index)
+            .filter(|piece| !have[piece.get_usize()] && blocks[lengths.chunk_range(*piece)].all())
+            .collect();
+        if finished.is_empty() {
+            return Ok(blocks);
+        }
+        let verdicts = self
+            .shared
+            .spawner
+            .block_in_place_with_semaphore(|| {
+                let fo = FileOps::new(
+                    &self.metadata,
+                    &self.files,
+                    self.shared.options.disable_v1_hashes,
+                );
+                finished
+                    .iter()
+                    .map(|piece| (*piece, fo.check_piece(*piece)))
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        for (piece, verdict) in verdicts {
+            match verdict {
+                Ok(Verdict::Passed) => have.set(piece.get_usize(), true),
+                Ok(Verdict::Inconsistent) => return Err(inconsistent_hashes(piece)),
+                Ok(Verdict::Failed | Verdict::Unknown) | Err(_) => {
+                    blocks[lengths.chunk_range(piece)].fill(false)
+                }
+            }
+        }
+        Ok(blocks)
+    }
+
     // The have set from fastresume data when it holds up, else from hashing every piece.
     async fn resume_or_check(
         &self,
@@ -286,20 +368,28 @@ impl TorrentStateInitializing {
             .bitv_factory
             .clone();
 
-        let have_pieces = match self.initial_have.as_ref() {
-            Some(have) => {
-                // The embedder vouches for these pieces, so none is read back. Storing
-                // them makes them the fastresume state too, replacing whatever was there.
+        let (have_pieces, blocks) = match self.checkpoint.as_ref() {
+            Some(checkpoint) => {
+                // The embedder vouches for this data, so none is read back
+                // but the pieces it holds every block of. Storing the pieces
+                // makes them the fastresume state too, replacing whatever was
+                // there.
                 info!(
                     torrent=?self.shared.id,
-                    "using the supplied have-bitfield, skipping the initial check"
+                    "starting from the supplied checkpoint, skipping the initial check"
                 );
-                bitv_factory
-                    .store_initial_check(id, have.clone())
+                let mut have = checkpoint.have.clone();
+                let blocks = match checkpoint.blocks.clone() {
+                    Some(blocks) => Some(self.verify_finished(&mut have, blocks).await?),
+                    None => None,
+                };
+                let have = bitv_factory
+                    .store_initial_check(id, have)
                     .await
-                    .context("error storing the supplied have-bitfield")?
+                    .context("error storing the supplied have-bitfield")?;
+                (have, blocks)
             }
-            None => self.resume_or_check(&*bitv_factory, id).await?,
+            None => (self.resume_or_check(&*bitv_factory, id).await?, None),
         };
 
         let selected_bytes = compute_selected_bytes(
@@ -320,6 +410,9 @@ impl TorrentStateInitializing {
             &self.metadata.file_infos,
         )
         .context("error creating chunk tracker")?;
+        if let Some(blocks) = blocks.as_deref() {
+            chunk_tracker.restore_blocks(blocks);
+        }
         if let Some(priorities) = self.piece_priorities.as_ref() {
             let lengths = self.metadata.lengths();
             chunk_tracker.set_piece_priorities(
@@ -394,8 +487,12 @@ impl TorrentStateInitializing {
 mod tests {
     use crate::core::lengths::Lengths;
 
-    use super::normalize_initial_have;
+    use super::{Checkpoint, normalize_checkpoint};
     use crate::type_aliases::BF;
+
+    fn normalize_initial_have(have: BF, lengths: &Lengths) -> anyhow::Result<BF> {
+        normalize_checkpoint(Checkpoint::pieces(have), lengths).map(|c| c.have)
+    }
 
     fn bf(bits: &[bool]) -> BF {
         bits.iter()
@@ -405,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_initial_have() {
+    fn test_normalize_checkpoint_have() {
         // 10 pieces: two bytes on the wire, six spare bits.
         let l = Lengths::new(10 * 1024, 1024).unwrap();
         let mut ten = [false; 10];
@@ -432,6 +529,58 @@ mod tests {
         for bits in [0usize, 9, 11, 15, 24] {
             assert!(
                 normalize_initial_have(bf(&vec![false; bits]), &l).is_err(),
+                "{bits} bits"
+            );
+        }
+    }
+
+    // The blocks are held to their layout as the pieces are to theirs.
+    #[test]
+    fn test_normalize_checkpoint_blocks() {
+        // 10 pieces of two blocks, the last of one: 19 blocks, three bytes.
+        let l = Lengths::new(9 * 2 * 16384 + 16384, 2 * 16384).unwrap();
+        assert_eq!(l.total_chunks(), 19);
+        let have = BF::from_boxed_slice(vec![0, 0].into_boxed_slice());
+        let blocks = |bits: usize, set: &[usize]| {
+            let mut b = bf(&vec![false; bits]);
+            for i in set {
+                b.set(*i, true);
+            }
+            b
+        };
+        let n = normalize_checkpoint(
+            Checkpoint {
+                have: have.clone(),
+                blocks: Some(blocks(19, &[0, 18])),
+            },
+            &l,
+        )
+        .unwrap();
+        assert_eq!(
+            n.blocks.unwrap().as_raw_slice(),
+            &[0b1000_0000, 0, 0b0010_0000]
+        );
+        // A spare bit set names a block that does not exist.
+        assert!(
+            normalize_checkpoint(
+                Checkpoint {
+                    have: have.clone(),
+                    blocks: Some(blocks(24, &[19])),
+                },
+                &l,
+            )
+            .is_err()
+        );
+        for bits in [0usize, 18, 20, 16, 32] {
+            assert!(
+                normalize_checkpoint(
+                    Checkpoint {
+                        have: have.clone(),
+                        blocks: Some(blocks(bits, &[])),
+                    },
+                    &l,
+                )
+                .is_err(),
                 "{bits} bits"
             );
         }

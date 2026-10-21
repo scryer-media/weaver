@@ -21,8 +21,8 @@ use bitvec::order::Msb0;
 use tokio::sync::watch;
 use weaver_torrent::core::lengths::Lengths;
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, ConnectionOptions, HttpClients, ListenerMode, ListenerOptions,
-    ManagedTorrent, PiecePriority, Session, SessionOptions, TrackerAnnounce,
+    AddTorrent, AddTorrentOptions, Checkpoint, ConnectionOptions, HttpClients, ListenerMode,
+    ListenerOptions, ManagedTorrent, PiecePriority, Session, SessionOptions, TrackerAnnounce,
 };
 use weaver_tunnel::pipe::Dialer;
 
@@ -385,7 +385,7 @@ impl Joined {
                     overwrite: true,
                     peer_limit: Some(PEER_LIMIT),
                     storage_factory: Some(store.factory()),
-                    initial_have: Some(initial_have),
+                    checkpoint: Some(Checkpoint::pieces(initial_have)),
                     piece_priorities: Some(
                         (0..pieces)
                             .filter(|index| !wanted.contains(index))

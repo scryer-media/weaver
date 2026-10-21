@@ -18,6 +18,7 @@ use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
     piece_priority::PiecePriority,
+    torrent_state::initializing::Checkpoint,
     type_aliases::{BF, BS, FileInfos},
 };
 
@@ -502,6 +503,30 @@ impl ChunkTracker {
         ct.hns = ct.calc_hns();
         ct.recount_queue();
         Ok(ct)
+    }
+
+    /// Takes back the blocks a checkpoint recorded as written: each is
+    /// received, so no peer is asked for it, and a piece not had keeps
+    /// waiting for the rest before its hash is checked (libtorrent
+    /// `torrent::read_resume_data` and `piece_picker::mark_as_finished` for
+    /// each block of an unfinished piece). `blocks` is in the tracker's own
+    /// layout, as [`Self::checkpoint`] gives it.
+    pub(crate) fn restore_blocks(&mut self, blocks: &BS) {
+        for chunk in blocks.iter_ones() {
+            self.chunk_status.set(chunk, true);
+        }
+        self.recount_queue();
+    }
+
+    /// What a checkpoint records of the torrent: the pieces had, and every
+    /// block written, those of the pieces not had among them (libtorrent
+    /// `torrent::write_resume_data`: `have_pieces`, and `unfinished_pieces`
+    /// with the blocks of each downloading piece that are finished).
+    pub(crate) fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            have: self.have.as_slice().to_bitvec().into_boxed_bitslice(),
+            blocks: Some(self.chunk_status.clone()),
+        }
     }
 
     fn recalculate_per_file_bytes(&mut self, file_infos: &FileInfos) {
