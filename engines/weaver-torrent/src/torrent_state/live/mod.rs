@@ -1466,7 +1466,11 @@ impl PeerHandler {
                 let result = pieces.acquire_admitted_piece(
                     AcquireRequest {
                         peer: self.addr,
-                        peer_avg_time: self.counters.average_piece_download_time(),
+                        peer_avg_time: if live.is_snubbed() {
+                            None
+                        } else {
+                            self.counters.average_piece_download_time()
+                        },
                         priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                         file_priorities,
                         file_infos: &self.state.metadata.file_infos,
@@ -1686,6 +1690,9 @@ impl PeerHandler {
     }
 
     fn on_requests_timed_out(&self) -> crate::Result<()> {
+        self.state
+            .peers
+            .with_live_mut(self.addr, "snub", |live| live.snub());
         let timed_out = self.return_requests()?;
         debug!(requests = timed_out.len(), "requests timed out");
         for request in timed_out {
@@ -2172,12 +2179,6 @@ impl PeerHandler {
         self.lock_flow_control("is_choked").i_am_choked
     }
 
-    fn requested_inflight_count(&self) -> Option<usize> {
-        self.state
-            .peers
-            .with_live(self.addr, |live| live.requested_inflight_count())
-    }
-
     fn can_send_request(&self) -> bool {
         let (i_am_choked, request_window) = {
             let flow = self.lock_flow_control("can_send_request");
@@ -2188,8 +2189,12 @@ impl PeerHandler {
             return false;
         }
 
-        self.requested_inflight_count()
-            .is_some_and(|requested| requested < request_window)
+        self.state
+            .peers
+            .with_live(self.addr, |live| {
+                live.can_hold_another_request(request_window)
+            })
+            .unwrap_or(false)
     }
 
     fn lock_flow_control(

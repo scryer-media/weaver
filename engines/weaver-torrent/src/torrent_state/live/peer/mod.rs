@@ -291,6 +291,11 @@ pub(crate) struct LivePeerState {
     // How long the peer takes to deliver a block, which sets its request timeout.
     block_time: BlockTime,
 
+    // The peer went its request timeout without delivering a block. Until a
+    // block it was asked for arrives, it may hold one request and takes no
+    // piece from another peer.
+    snubbed: bool,
+
     request_slots_changed: Arc<Notify>,
 
     // The main channel to send requests to peer.
@@ -316,6 +321,7 @@ impl LivePeerState {
             late_cancelled_request_tolerance: 0,
             waiting_since: Instant::now(),
             block_time: BlockTime::default(),
+            snubbed: false,
             request_slots_changed: Default::default(),
             tx,
             connection_kind,
@@ -332,6 +338,22 @@ impl LivePeerState {
 
     pub fn requested_inflight_count(&self) -> usize {
         self.inflight_requests.len()
+    }
+
+    pub fn is_snubbed(&self) -> bool {
+        self.snubbed
+    }
+
+    /// The peer went its request timeout without delivering a block.
+    pub fn snub(&mut self) {
+        self.snubbed = true;
+    }
+
+    /// Whether the peer may hold another request: one while it is snubbed,
+    /// `window` otherwise.
+    pub fn can_hold_another_request(&self, window: usize) -> bool {
+        let budget = if self.snubbed { 1 } else { window };
+        self.requested_inflight_count() < budget
     }
 
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
@@ -358,6 +380,7 @@ impl LivePeerState {
             let now = Instant::now();
             self.block_time.add(now - self.waiting_since);
             self.waiting_since = now;
+            self.snubbed = false;
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
         }

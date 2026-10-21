@@ -18,8 +18,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use tokio::time::Instant;
 
 use crate::buffers::ByteBuf;
 use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
@@ -61,7 +63,9 @@ where
 {
     /// The peer requesting a piece.
     pub peer: PeerHandle,
-    /// The peer's average piece download time (for steal calculations).
+    /// The peer's average piece download time (for steal calculations). None
+    /// for a peer that steals from no one: one with no piece downloaded yet,
+    /// or one that is snubbed.
     pub peer_avg_time: Option<Duration>,
     /// Priority pieces to check first (e.g., for streaming).
     pub priority_pieces: I,

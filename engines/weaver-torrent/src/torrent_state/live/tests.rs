@@ -281,3 +281,75 @@ async fn an_undelivered_request_is_free_again_after_the_timeout_and_a_delivered_
     assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
     assert_eq!(h.missing_chunks(1), vec![0, 1, 2, 3]);
 }
+
+impl Harness {
+    /// Whether the peer stats snapshot shows the peer at `peer` snubbed.
+    fn snubbed(&self, peer: &PeerHandler) -> bool {
+        self.per_peer_stats_snapshot(Default::default()).peers[&peer.addr.to_string()].snubbed
+    }
+}
+
+#[tokio::test]
+async fn a_timed_out_peer_holds_one_request_until_a_block_arrives() {
+    let h = Harness::new("a_timed_out_peer_is_snubbed").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
+    let mut task: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+    peer.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut task, &mut rx, every_chunk().len()).await,
+        every_chunk()
+    );
+    assert!(!h.snubbed(&peer));
+
+    // No block arrives: every request times out and the peer is snubbed.
+    assert_eq!(
+        next_cancels(&mut task, &mut rx, every_chunk().len()).await,
+        every_chunk()
+    );
+    assert!(h.snubbed(&peer));
+
+    // Snubbed, the peer is asked for one chunk and may hold no more.
+    let asked = next_requests(&mut task, &mut rx, 1).await;
+    assert_eq!(h.inflight_count(&peer), 1);
+    assert!(!peer.can_send_request());
+
+    // The block it was asked for arrives: the snub is lifted and the
+    // requester fills the window with the rest.
+    let delivered = *asked.first().unwrap();
+    h.deliver(&peer, delivered).await;
+    assert!(!h.snubbed(&peer));
+    assert!(peer.can_send_request());
+    let mut rest = every_chunk();
+    rest.remove(&delivered);
+    assert_eq!(next_requests(&mut task, &mut rx, rest.len()).await, rest);
+}
+
+#[tokio::test]
+async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
+    let h = Harness::new("a_snubbed_peer_does_not_steal").await;
+    tokio::time::pause();
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    owner.on_i_am_unchoked();
+    assert!(owner.acquire_next_piece().unwrap().is_some());
+    assert!(owner.acquire_next_piece().unwrap().is_some());
+    assert_eq!(h.queued_pieces(), Vec::<u32>::new());
+
+    // Two peers that take a second a piece; the owner has held both pieces
+    // far longer than that.
+    let (snubbed, _snubbed_rx) = h.peer("127.0.0.2:6881");
+    let (fast, _fast_rx) = h.peer("127.0.0.3:6881");
+    for peer in [&snubbed, &fast] {
+        peer.counters
+            .on_piece_completed(PIECE_LENGTH.into(), Duration::from_secs(1));
+        peer.on_i_am_unchoked();
+    }
+    h.peers
+        .with_live_mut(snubbed.addr, "test", |live| live.snub())
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(100)).await;
+
+    assert_eq!(snubbed.acquire_next_piece().unwrap(), None);
+    assert!(fast.acquire_next_piece().unwrap().is_some());
+}
