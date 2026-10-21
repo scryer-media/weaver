@@ -124,6 +124,8 @@ pub(crate) struct ManagedTorrentLocked {
     // The announce table of the trackers of the latest live run. It outlives
     // the run, so the last outcomes stay readable while paused.
     pub(crate) trackers: Option<crate::tracker::TrackerStatus>,
+    // While paused, ends the scraping of those trackers when dropped.
+    pub(crate) auto_scrape: Option<tokio_util::sync::DropGuard>,
 }
 
 #[derive(Default)]
@@ -582,6 +584,7 @@ impl ManagedTorrent {
 
         self.state_change_notify.notify_waiters();
 
+        g.auto_scrape = None;
         g.state = ManagedTorrentState::Error(error)
     }
 
@@ -666,8 +669,10 @@ impl ManagedTorrent {
                 }
                 ManagedTorrentState::Paused(_) => {
                     if start_paused {
+                        g.auto_scrape = t.spawn_auto_scrape(g.trackers.clone());
                         return Ok(());
                     }
+                    g.auto_scrape = None;
                     let paused = g.state.take().assert_paused();
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let live = TorrentStateLive::new(paused, tx, token.clone())?;
@@ -744,6 +749,39 @@ impl ManagedTorrent {
         self.locked.read().trackers.clone()
     }
 
+    /// Asks a tracker of the latest live run for the swarm's counts now; see
+    /// [`crate::tracker::TrackerStatus::scrape`]. Fails when the torrent has
+    /// not run with trackers yet.
+    pub async fn scrape(&self) -> anyhow::Result<crate::tracker::ScrapeOk> {
+        let trackers = self
+            .tracker_status()
+            .context("the torrent has not run with trackers")?;
+        trackers.scrape().await
+    }
+
+    /// While the torrent rests paused, its trackers are scraped on the
+    /// session's auto-scrape cadence (libtorrent `torrent::update_want_scrape`
+    /// lists paused torrents). Dropping the returned guard ends it.
+    fn spawn_auto_scrape(
+        &self,
+        trackers: Option<crate::tracker::TrackerStatus>,
+    ) -> Option<tokio_util::sync::DropGuard> {
+        let trackers = trackers?;
+        let session = self.shared.session.upgrade()?;
+        let schedule = session.auto_scrape().clone();
+        let token = session.cancellation_token().child_token();
+        spawn_with_cancel(
+            debug_span!(parent: self.shared.span.clone(), "auto_scrape"),
+            "auto_scrape",
+            token.clone(),
+            async move {
+                trackers.auto_scrape(&schedule).await;
+                anyhow::Ok(())
+            },
+        );
+        Some(token.drop_guard())
+    }
+
     /// Pause the torrent if it's live.
     pub(crate) fn pause(&self) -> anyhow::Result<()> {
         let mut g = self.locked.write();
@@ -752,6 +790,7 @@ impl ManagedTorrent {
                 let paused = live.pause()?;
                 g.state = ManagedTorrentState::Paused(paused);
                 g.paused = true;
+                g.auto_scrape = self.spawn_auto_scrape(g.trackers.clone());
                 self.state_change_notify.notify_waiters();
                 Ok(())
             }

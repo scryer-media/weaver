@@ -5,7 +5,9 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
+use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
+use crate::tracker::ScrapeOk;
 use either::Either;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 use serde::Deserializer;
@@ -232,6 +234,57 @@ impl TrackerRequest<'_> {
     }
 }
 
+/// The scrape URL of an announce URL (BEP 48): the last path component's
+/// leading `announce` becomes `scrape`. None when it does not start with
+/// `announce`, as the tracker then offers no scrape.
+pub(crate) fn scrape_url(announce: &url::Url) -> Option<url::Url> {
+    let path = announce.path();
+    let (dir, last) = path.rsplit_once('/')?;
+    let rest = last.strip_prefix("announce")?;
+    let mut url = announce.clone();
+    url.set_path(&format!("{dir}/scrape{rest}"));
+    Some(url)
+}
+
+/// The query of a scrape for `info_hash`, escaped as an announce's is.
+pub(crate) fn scrape_querystring(info_hash: &Id20) -> String {
+    let mut s = String::from("info_hash=");
+    s.extend(percent_encode(&info_hash.0, QUERY_VALUE));
+    s
+}
+
+/// The counts a scrape reply gives for `info_hash`: the `files` entry keyed
+/// by the raw hash (libtorrent `parse_tracker_response` with
+/// `scrape_request`). A count the entry leaves out, or gives below zero, is
+/// None.
+pub(crate) fn parse_scrape(body: &[u8], info_hash: &Id20) -> anyhow::Result<ScrapeOk> {
+    if let Ok((error, _)) = crate::bencode::from_bytes_with_rest::<TrackerError>(body) {
+        anyhow::bail!(
+            "tracker returned failure. Failure reason: {}",
+            error.failure_reason
+        )
+    }
+    let reply = crate::bencode::dyn_from_bytes::<ByteBuf>(body).map_err(|e| e.into_kind())?;
+    let BencodeValue::Dict(reply) = reply else {
+        anyhow::bail!("the scrape reply is not a dictionary")
+    };
+    let Some(BencodeValue::Dict(files)) = reply.get(&b"files"[..]) else {
+        anyhow::bail!("the scrape reply has no files dictionary")
+    };
+    let Some(BencodeValue::Dict(entry)) = files.get(&info_hash.0[..]) else {
+        anyhow::bail!("the scrape reply lists no counts for the torrent")
+    };
+    let count = |key: &[u8]| match entry.get(key) {
+        Some(BencodeValue::Integer(n)) => u32::try_from(*n).ok(),
+        _ => None,
+    };
+    Ok(ScrapeOk {
+        complete: count(b"complete"),
+        incomplete: count(b"incomplete"),
+        downloaded: count(b"downloaded"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +430,66 @@ mod tests {
             "{}",
             request.as_querystring()
         );
+    }
+
+    #[test]
+    fn scrape_url_replaces_the_announce_that_starts_the_last_component() {
+        let scrape = |s: &str| scrape_url(&url::Url::parse(s).unwrap()).map(|u| u.to_string());
+        assert_eq!(
+            scrape("http://t.invalid/announce").as_deref(),
+            Some("http://t.invalid/scrape")
+        );
+        assert_eq!(
+            scrape("https://t.invalid/x/announce.php?passkey=k").as_deref(),
+            Some("https://t.invalid/x/scrape.php?passkey=k")
+        );
+        // Not the last component, or not at its start: no scrape.
+        assert_eq!(scrape("http://t.invalid/announce/x"), None);
+        assert_eq!(scrape("http://t.invalid/x_announce"), None);
+        assert_eq!(scrape("http://announce.invalid/a"), None);
+        assert_eq!(scrape("http://t.invalid/"), None);
+    }
+
+    #[test]
+    fn scrape_reply_gives_the_torrents_counts() {
+        let hash = Id20::new([1; 20]);
+        let reply = |entry: &str| {
+            let mut b = b"d5:filesd20:".to_vec();
+            b.extend_from_slice(&hash.0);
+            b.extend_from_slice(entry.as_bytes());
+            b.extend_from_slice(b"ee");
+            b
+        };
+        let counts = parse_scrape(
+            &reply("d8:completei4e10:downloadedi9e10:incompletei6ee"),
+            &hash,
+        )
+        .unwrap();
+        assert_eq!(
+            counts,
+            ScrapeOk {
+                complete: Some(4),
+                incomplete: Some(6),
+                downloaded: Some(9),
+            }
+        );
+
+        // A count left out, or below zero, is not given.
+        let counts = parse_scrape(&reply("d8:completei-1e10:incompletei2ee"), &hash).unwrap();
+        assert_eq!(
+            counts,
+            ScrapeOk {
+                complete: None,
+                incomplete: Some(2),
+                downloaded: None,
+            }
+        );
+
+        // Another torrent's counts, no files, or a failure are no answer.
+        assert!(parse_scrape(&reply("de"), &Id20::new([2; 20])).is_err());
+        assert!(parse_scrape(b"d8:intervali1800ee", &hash).is_err());
+        let e = parse_scrape(b"d14:failure reason4:nopee", &hash).unwrap_err();
+        assert!(format!("{e:#}").contains("nope"), "{e:#}");
     }
 
     #[test]

@@ -296,51 +296,368 @@ pub struct TrackerAnnounce {
     pub last: Option<LastAnnounce>,
 }
 
-/// The announce table of one [`TrackerComms`]: one entry per tracker it was
-/// started with, in the order given, from the start. Clones share the table,
-/// which stays readable after the tracker task ends.
+/// A torrent's counts as a tracker's scrape reply gave them (BEP 48). A
+/// count the tracker left out is None.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrapeOk {
+    /// Peers with the whole torrent.
+    pub complete: Option<u32>,
+    /// Peers still downloading.
+    pub incomplete: Option<u32>,
+    /// Downloads the tracker has seen finish.
+    pub downloaded: Option<u32>,
+}
+
+impl ScrapeOk {
+    /// The larger of each count: trackers and hashes count the same swarm
+    /// (libtorrent `torrent::update_scrape_state`).
+    fn max(self, other: Self) -> Self {
+        Self {
+            complete: self.complete.max(other.complete),
+            incomplete: self.incomplete.max(other.incomplete),
+            downloaded: self.downloaded.max(other.downloaded),
+        }
+    }
+
+    /// The counts of two scrapes of one tracker, when either was answered.
+    fn either(a: anyhow::Result<Self>, b: anyhow::Result<Self>) -> anyhow::Result<Self> {
+        match (a, b) {
+            (Ok(a), Ok(b)) => Ok(a.max(b)),
+            (Ok(a), Err(_)) | (Err(_), Ok(a)) => Ok(a),
+            (Err(e), Err(_)) => Err(e),
+        }
+    }
+}
+
+impl From<tracker_comms_udp::ScrapeResponse> for ScrapeOk {
+    fn from(r: tracker_comms_udp::ScrapeResponse) -> Self {
+        Self {
+            complete: Some(r.complete),
+            incomplete: Some(r.incomplete),
+            downloaded: Some(r.downloaded),
+        }
+    }
+}
+
+/// The outcome of the most recent scrape of a tracker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastScrape {
+    /// When the scrape finished.
+    pub at: SystemTime,
+    pub result: Result<ScrapeOk, String>,
+}
+
+/// One tracker of a torrent and how scraping it last went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackerScrape {
+    /// The announce URL.
+    pub url: String,
+    /// None until the tracker has been scraped.
+    pub last: Option<LastScrape>,
+}
+
+/// When paused torrents scrape their trackers on their own (libtorrent
+/// `session_impl` auto-scrape of `torrent_want_scrape`): each torrent once
+/// every `interval`, and the session no more than once every
+/// `min_interval`, so with many torrents each waits its turn. Clones share
+/// the session's turns: create one per session.
 #[derive(Clone)]
-pub struct TrackerStatus(Arc<tokio::sync::watch::Sender<Vec<TrackerAnnounce>>>);
+pub struct AutoScrape {
+    interval: Duration,
+    min_interval: Duration,
+    last: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl Default for AutoScrape {
+    fn default() -> Self {
+        Self::new(Self::INTERVAL, Self::MIN_INTERVAL)
+    }
+}
+
+impl AutoScrape {
+    /// libtorrent `settings_pack::auto_scrape_interval`.
+    pub const INTERVAL: Duration = Duration::from_secs(1800);
+    /// libtorrent `settings_pack::auto_scrape_min_interval`.
+    pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+    pub fn new(interval: Duration, min_interval: Duration) -> Self {
+        Self {
+            interval,
+            min_interval,
+            last: Default::default(),
+        }
+    }
+
+    /// Runs `scrape` once every interval, each run in the session's next
+    /// turn, until dropped. libtorrent's round robin gives each of `n`
+    /// torrents a scrape every `max(interval, n * min_interval)`; waiting
+    /// out the interval, then queueing (fairly) for a turn spaced
+    /// `min_interval` after the previous one, gives the same.
+    async fn run<F: std::future::Future<Output = ()>>(&self, mut scrape: impl FnMut() -> F) {
+        loop {
+            tokio::time::sleep(self.interval).await;
+            {
+                let mut last = self.last.lock().await;
+                if let Some(at) = *last {
+                    tokio::time::sleep_until(at + self.min_interval).await;
+                }
+                *last = Some(tokio::time::Instant::now());
+            }
+            scrape().await;
+        }
+    }
+}
+
+/// Scrapes a torrent's trackers under every hash it announces.
+struct Scraper {
+    info_hashes: Vec<Id20>,
+    user_agent: String,
+    // In table order, one per URL.
+    trackers: Vec<SupportedTracker>,
+    reqwest_client: reqwest::Client,
+    udp_client: UdpTrackerClient,
+}
+
+impl Scraper {
+    /// The counts `tracker` gives under any of the torrent's hashes, the
+    /// larger of each when both are answered.
+    async fn scrape(&self, tracker: &SupportedTracker) -> anyhow::Result<ScrapeOk> {
+        let results = futures::future::join_all(
+            self.info_hashes
+                .iter()
+                .map(|info_hash| self.scrape_hash(tracker, *info_hash)),
+        )
+        .await;
+        results
+            .into_iter()
+            .reduce(ScrapeOk::either)
+            .context("the torrent has no hash to scrape")?
+    }
+
+    async fn scrape_hash(
+        &self,
+        tracker: &SupportedTracker,
+        info_hash: Id20,
+    ) -> anyhow::Result<ScrapeOk> {
+        match tracker {
+            SupportedTracker::Http(url) => {
+                self.scrape_http(url, info_hash)
+                    .instrument(trace_span!("http_scrape", tracker = %url))
+                    .await
+            }
+            SupportedTracker::Udp(url) => {
+                self.scrape_udp(url, info_hash)
+                    .instrument(trace_span!("udp_scrape", tracker = %url))
+                    .await
+            }
+        }
+    }
+
+    async fn scrape_http(&self, tracker_url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
+        let mut url =
+            tracker_comms_http::scrape_url(tracker_url).context("the tracker offers no scrape")?;
+        let mut query = tracker_comms_http::scrape_querystring(&info_hash);
+        if let Some(url_query) = url.query() {
+            query.push_str(&format!("&{url_query}"));
+        }
+        url.set_query(Some(&query));
+        let response = self
+            .reqwest_client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, &self.user_agent)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!("tracker responded with {:?}", response.status());
+        }
+        tracker_comms_http::parse_scrape(&response.bytes().await?, &info_hash)
+    }
+
+    async fn scrape_udp(&self, url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
+        let (host, port) = (
+            url.host().context("missing host")?,
+            url.port().context("missing port")?,
+        );
+        let scrape = |addr: SocketAddr| async move {
+            self.udp_client
+                .scrape(addr, info_hash)
+                .await
+                .map(ScrapeOk::from)
+        };
+        match udp_tracker_to_socket_addrs(host, port, self.udp_client.resolver()).await? {
+            UdpTrackerResolveResult::One(addr) => scrape(addr).await,
+            UdpTrackerResolveResult::Two(v4, v6) => {
+                let (r4, r6) = tokio::join!(scrape(v4.into()), scrape(v6.into()));
+                ScrapeOk::either(r4, r6)
+            }
+        }
+    }
+}
+
+struct StatusShared {
+    announces: tokio::sync::watch::Sender<Vec<TrackerAnnounce>>,
+    scrapes: tokio::sync::watch::Sender<Vec<TrackerScrape>>,
+    scraper: Scraper,
+}
+
+/// The announce table of one [`TrackerComms`]: one entry per tracker it was
+/// started with, in the order given, from the start, and beside it how
+/// scraping each went. Clones share the tables, which stay readable, and
+/// the trackers scrapable, after the tracker task ends.
+#[derive(Clone)]
+pub struct TrackerStatus(Arc<StatusShared>);
 
 impl std::fmt::Debug for TrackerStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("TrackerStatus")
-            .field(&*self.0.borrow())
+            .field(&*self.0.announces.borrow())
             .finish()
     }
 }
 
 impl TrackerStatus {
-    fn new<'a>(urls: impl IntoIterator<Item = &'a Url>) -> Self {
-        let mut announces: Vec<TrackerAnnounce> = Vec::new();
-        for url in urls {
-            let url = url.to_string();
-            if announces.iter().all(|a| a.url != url) {
-                announces.push(TrackerAnnounce {
-                    url,
-                    in_flight: false,
-                    last: None,
-                });
+    fn new<'a>(
+        trackers: impl IntoIterator<Item = &'a SupportedTracker>,
+        info_hashes: Vec<Id20>,
+        identity: &Identity,
+        reqwest_client: reqwest::Client,
+        udp_client: UdpTrackerClient,
+    ) -> Self {
+        let mut unique: Vec<SupportedTracker> = Vec::new();
+        for tracker in trackers {
+            if !unique.contains(tracker) {
+                unique.push(tracker.clone());
             }
         }
-        Self(Arc::new(tokio::sync::watch::channel(announces).0))
+        let announces = unique
+            .iter()
+            .map(|t| TrackerAnnounce {
+                url: t.url().to_string(),
+                in_flight: false,
+                last: None,
+            })
+            .collect();
+        let scrapes = unique
+            .iter()
+            .map(|t| TrackerScrape {
+                url: t.url().to_string(),
+                last: None,
+            })
+            .collect();
+        Self(Arc::new(StatusShared {
+            announces: tokio::sync::watch::channel(announces).0,
+            scrapes: tokio::sync::watch::channel(scrapes).0,
+            scraper: Scraper {
+                info_hashes,
+                user_agent: identity.user_agent.clone(),
+                trackers: unique,
+                reqwest_client,
+                udp_client,
+            },
+        }))
     }
 
     /// A snapshot of the table.
     pub fn announces(&self) -> Vec<TrackerAnnounce> {
-        self.0.borrow().clone()
+        self.0.announces.borrow().clone()
     }
 
     /// Sees every change to the table.
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Vec<TrackerAnnounce>> {
-        self.0.subscribe()
+        self.0.announces.subscribe()
+    }
+
+    /// How scraping each tracker last went, in the table's order.
+    pub fn scrapes(&self) -> Vec<TrackerScrape> {
+        self.0.scrapes.borrow().clone()
+    }
+
+    /// Asks the tracker that last accepted an announce, or the first
+    /// tracker when none has, for the torrent's counts under every hash it
+    /// announces (libtorrent `torrent::scrape_tracker` without an index,
+    /// `torrent::scrape_tracker_impl`). The outcome goes to
+    /// [`Self::scrapes`], and the counts given replace the seeds and
+    /// leechers of the tracker's last accepted announce: libtorrent keeps
+    /// one set of counts per tracker, which announce and scrape replies
+    /// alike overwrite (`torrent::tracker_scrape_response`).
+    pub async fn scrape(&self) -> anyhow::Result<ScrapeOk> {
+        let tracker = self
+            .scrape_target()
+            .context("the torrent has no trackers")?;
+        let result = self.0.scraper.scrape(&tracker).await;
+        self.record_scrape(&tracker, &result);
+        result
+    }
+
+    /// Scrapes on `schedule` until dropped.
+    pub(crate) async fn auto_scrape(&self, schedule: &AutoScrape) {
+        schedule
+            .run(|| async {
+                if let Err(e) = self.scrape().await {
+                    debug!("auto-scrape failed: {e:#}");
+                }
+            })
+            .await
+    }
+
+    /// libtorrent `tracker_list::last_working`, else `tracker_list::first`.
+    fn scrape_target(&self) -> Option<SupportedTracker> {
+        let last_working = self
+            .0
+            .announces
+            .borrow()
+            .iter()
+            .filter_map(|a| {
+                let last = a.last.as_ref()?;
+                last.result.is_ok().then(|| (last.at, a.url.clone()))
+            })
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, url)| url);
+        let trackers = &self.0.scraper.trackers;
+        match last_working {
+            Some(url) => trackers.iter().find(|t| t.url().as_str() == url),
+            None => trackers.first(),
+        }
+        .cloned()
+    }
+
+    fn record_scrape(&self, tracker: &SupportedTracker, result: &anyhow::Result<ScrapeOk>) {
+        let url = tracker.url().as_str();
+        if let Ok(counts) = result {
+            self.0.announces.send_if_modified(|announces| {
+                let Some(accepted) = announces
+                    .iter_mut()
+                    .find(|a| a.url == url)
+                    .and_then(|a| a.last.as_mut())
+                    .and_then(|last| last.result.as_mut().ok())
+                else {
+                    return false;
+                };
+                let before = (accepted.seeders, accepted.leechers);
+                accepted.seeders = counts.complete.or(accepted.seeders);
+                accepted.leechers = counts.incomplete.or(accepted.leechers);
+                before != (accepted.seeders, accepted.leechers)
+            });
+        }
+        let last = LastScrape {
+            at: SystemTime::now(),
+            result: match result {
+                Ok(counts) => Ok(*counts),
+                Err(e) => Err(format!("{e:#}")),
+            },
+        };
+        self.0.scrapes.send_modify(|scrapes| {
+            if let Some(s) = scrapes.iter_mut().find(|s| s.url == url) {
+                s.last = Some(last);
+            }
+        });
     }
 
     /// Marks an announce to `tracker` as sent; the returned guard records how
     /// it ended.
     fn begin(&self, tracker: &SupportedTracker) -> InFlight<'_> {
         let url = tracker.url().to_string();
-        self.0.send_modify(|announces| {
+        self.0.announces.send_modify(|announces| {
             if let Some(a) = announces.iter_mut().find(|a| a.url == url) {
                 a.in_flight = true;
             }
@@ -382,7 +699,7 @@ impl InFlight<'_> {
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         let last = self.last.take();
-        self.status.0.send_modify(|announces| {
+        self.status.0.announces.send_modify(|announces| {
             if let Some(a) = announces.iter_mut().find(|a| a.url == self.url) {
                 a.in_flight = false;
                 if last.is_some() {
@@ -665,9 +982,11 @@ impl TrackerComms {
         tracing::trace!(?tiers);
 
         let status = TrackerStatus::new(
-            tiers
-                .iter()
-                .flat_map(|tier| tier.trackers.iter().map(SupportedTracker::url)),
+            tiers.iter().flat_map(|tier| tier.trackers.iter()),
+            info_hashes.ids20().collect(),
+            &identity,
+            reqwest_client.clone(),
+            udp_client.clone(),
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(16);
@@ -990,9 +1309,10 @@ mod tests {
     use url::Url;
 
     use super::{
-        AnnounceOk, AnnounceState, ReannounceDelay, StoppedAnnounces, SupportedTracker, Tier,
-        TrackerAnnounce, TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerTask,
-        UdpTrackerResolveResult, udp_tracker_to_socket_addrs,
+        AnnounceOk, AnnounceState, AutoScrape, ReannounceDelay, ScrapeOk, StoppedAnnounces,
+        SupportedTracker, Tier, TrackerAnnounce, TrackerComms, TrackerCommsStats,
+        TrackerCommsStatsState, TrackerScrape, TrackerTask, UdpTrackerResolveResult,
+        udp_tracker_to_socket_addrs,
     };
     use crate::Identity;
     use crate::tracker::tracker_comms_http::TrackerRequestEvent;
@@ -1680,6 +2000,161 @@ mod tests {
         // `started` was never accepted, so no `stopped` is owed.
         stopped.wait_idle().await;
         token.cancel();
+    }
+
+    /// A scrape reply giving `entry` as the counts of the tests' torrent.
+    fn scrape_body(entry: &str) -> String {
+        format!("d5:filesd20:{}{entry}ee", "\u{1}".repeat(20))
+    }
+
+    #[tokio::test]
+    async fn scrape_asks_the_tracker_that_last_answered_and_keeps_its_counts() {
+        let (ok, ok_url) = http_listener().await;
+        let (err, err_url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) =
+            start(vec![vec![ok_url.clone()], vec![err_url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        assert_eq!(
+            status.scrapes(),
+            vec![
+                TrackerScrape {
+                    url: ok_url.to_string(),
+                    last: None,
+                },
+                TrackerScrape {
+                    url: err_url.to_string(),
+                    last: None,
+                },
+            ]
+        );
+
+        // `ok` accepts the announce with counts, `err` refuses it.
+        let ((ok_conn, _), (err_conn, _)) = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = async { tokio::join!(read_announce(&ok), read_announce(&err)) } => r,
+        };
+        respond(
+            ok_conn,
+            "d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e",
+        )
+        .await;
+        respond(err_conn, "d14:failure reason4:nopee").await;
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a.iter().all(|a| !a.in_flight && a.last.is_some())) => r.unwrap(),
+        };
+        // The run ends; the table stays scrapable.
+        drop(peers);
+        let q = next_announce(&ok).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+
+        // The scrape goes to `ok`, at its scrape URL, for the torrent's hash.
+        let tracker = async {
+            let (conn, request) = read_request(&ok).await;
+            let target = request.split(' ').nth(1).unwrap().to_owned();
+            respond(
+                conn,
+                &scrape_body("d8:completei7e10:downloadedi40e10:incompletei1ee"),
+            )
+            .await;
+            target
+        };
+        let (counts, target) = tokio::join!(status.scrape(), tracker);
+        assert_eq!(target, format!("/scrape?info_hash={}", "%01".repeat(20)));
+        let counts = counts.unwrap();
+        assert_eq!(
+            counts,
+            ScrapeOk {
+                complete: Some(7),
+                incomplete: Some(1),
+                downloaded: Some(40),
+            }
+        );
+        let scrapes = status.scrapes();
+        assert_eq!(scrapes[0].last.as_ref().unwrap().result, Ok(counts));
+        assert_eq!(scrapes[1].last, None);
+
+        // The tracker's counts are the scrape's now.
+        let announces = status.announces();
+        let accepted = announce_of(&announces, &ok_url)
+            .last
+            .as_ref()
+            .unwrap()
+            .result
+            .clone()
+            .unwrap();
+        assert_eq!((accepted.seeders, accepted.leechers), (Some(7), Some(1)));
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn scrape_without_an_answered_announce_asks_the_first_tracker() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        // Never polled: nothing was announced.
+        let TrackerTask { peers, status } = task;
+        drop(peers);
+
+        let tracker = async {
+            let (conn, _) = read_request(&listener).await;
+            respond(conn, "d14:failure reason4:nopee").await;
+        };
+        let (result, ()) = tokio::join!(status.scrape(), tracker);
+        let e = result.unwrap_err();
+        assert!(format!("{e:#}").contains("nope"), "{e:#}");
+        let last = status.scrapes()[0].last.clone().unwrap();
+        assert!(last.result.unwrap_err().contains("nope"));
+        // A refused scrape leaves the announce table alone.
+        assert_eq!(status.announces()[0].last, None);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_scrape_waits_the_interval_and_spaces_the_sessions_scrapes() {
+        let schedule = AutoScrape::default();
+        let start = tokio::time::Instant::now();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Two paused torrents on one session's schedule.
+        for torrent in ["a", "b"] {
+            let schedule = schedule.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                schedule
+                    .run(|| {
+                        let _ = tx.send((torrent, tokio::time::Instant::now()));
+                        async {}
+                    })
+                    .await
+            });
+        }
+        let mut scrapes = Vec::new();
+        while scrapes.len() < 4 {
+            scrapes.push(rx.recv().await.unwrap());
+        }
+        // Neither scrapes before the interval has passed.
+        assert!(scrapes[0].1 - start >= AutoScrape::INTERVAL);
+        // Every scrape is a minimum interval after the session's previous one.
+        for pair in scrapes.windows(2) {
+            assert!(
+                pair[1].1 - pair[0].1 >= AutoScrape::MIN_INTERVAL,
+                "{scrapes:?}"
+            );
+        }
+        // Each torrent waits the interval again after its scrape.
+        for torrent in ["a", "b"] {
+            let at: Vec<_> = scrapes
+                .iter()
+                .filter(|(t, _)| *t == torrent)
+                .map(|(_, at)| *at)
+                .collect();
+            assert_eq!(at.len(), 2, "{scrapes:?}");
+            assert!(at[1] - at[0] >= AutoScrape::INTERVAL, "{scrapes:?}");
+        }
     }
 
     struct CountingResolver {
