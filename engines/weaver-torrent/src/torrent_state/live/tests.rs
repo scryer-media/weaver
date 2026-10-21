@@ -4373,6 +4373,7 @@ impl Harness {
             writer,
             read_buf: crate::read_buf::ReadBuf::new(),
             handshake: Handshake::new(self.shared.info_hash, Id20::new([7; 20])),
+            encrypted: false,
             meter: Default::default(),
         };
         let slot = self._session.connection_slots.try_accept().unwrap();
@@ -4478,6 +4479,38 @@ async fn an_incoming_connection_at_the_cap_that_ranks_no_higher_is_refused() {
     assert!(!asked_to_close(&mut b_rx));
     assert!(!h.holds_place("192.0.2.1:6881"));
     assert_eq!(h.connections(), (2, 2));
+}
+
+// libtorrent `bt_peer_connection::init_bt_handshake` marks a connection
+// encrypted whichever side opened it, and `ut_pex_plugin::tick` flags a peer
+// by it (`supports_encryption()`): an incoming connection the listener took
+// encrypted is advertised encrypted, a plaintext one is not.
+#[tokio::test]
+async fn an_incoming_encrypted_connection_is_advertised_encrypted_in_our_pex() {
+    use crate::peer_protocol::extended::ut_pex::PEX_ENCRYPTION;
+    use tokio::io::AsyncReadExt;
+    let h = turnover_harness("incoming_pex_encryption", 10, 200).await;
+    tokio::time::pause();
+    let mut ends = Vec::new();
+    for (addr, encrypted) in [("192.0.2.1:6881", true), ("192.0.2.2:6881", false)] {
+        let (mut checked, slot, mut theirs) = h.incoming(addr);
+        checked.encrypted = encrypted;
+        let added = h.live.add_incoming_peer(checked, slot).unwrap();
+        assert!(matches!(added, AddIncomingPeerResult::Added));
+        // Our handshake and the first byte after it, which is written once
+        // the connection has told the torrent how the peer greeted.
+        let mut written = [0; 69];
+        theirs.read_exact(&mut written).await.unwrap();
+        ends.push(theirs);
+    }
+
+    let flags = |addr| {
+        h.peers
+            .with_live(sock(addr), |live| live.advertised_pex_flags())
+            .unwrap()
+    };
+    assert_eq!(flags("192.0.2.1:6881") & PEX_ENCRYPTION, PEX_ENCRYPTION);
+    assert_eq!(flags("192.0.2.2:6881") & PEX_ENCRYPTION, 0);
 }
 
 /// Every dial reaches the test as [`Dialed`](crate::peer_info_reader::tests::Dialed)

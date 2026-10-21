@@ -40,10 +40,17 @@ use crate::{
     },
     spawn_utils::BlockingSpawner,
     stream_connect::{ConnectionKind, StreamConnector},
+    torrent_state::live::peers::PeerStates,
 };
 
+/// Fetches metadata from the peer at `addr`, one of `peers`, which says
+/// which handshake the connection tries and hears which one completed, as
+/// the torrent's own connections do (libtorrent: metadata comes over the
+/// torrent's ordinary connections, so `torrent_peer::pe_support` applies).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_metainfo_from_peer(
     addr: SocketAddr,
+    peers: Arc<PeerStates>,
     peer_id: Id20,
     fetch: Arc<MetadataFetch>,
     peer_connection_options: Option<PeerConnectionOptions>,
@@ -60,6 +67,7 @@ pub(crate) async fn read_metainfo_from_peer(
     let info_hashes = fetch.info_hashes;
     let handler = Handler {
         addr,
+        peers,
         fetch,
         writer_tx,
         result_tx: Mutex::new(Some(result_tx)),
@@ -418,6 +426,8 @@ pub type TorrentAndInfoBytes = (TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned);
 
 struct Handler {
     addr: SocketAddr,
+    /// The list the peer is on.
+    peers: Arc<PeerStates>,
     fetch: Arc<MetadataFetch>,
     writer_tx: UnboundedSender<WriterRequest>,
     result_tx: Mutex<
@@ -440,6 +450,14 @@ impl PeerConnectionHandler for Handler {
 
     fn serialize_bitfield_message_to_buf(&self, _buf: &mut [u8]) -> anyhow::Result<usize> {
         Ok(0)
+    }
+
+    fn encrypt_outgoing(&self) -> bool {
+        self.peers.encrypt_outgoing(self.addr)
+    }
+
+    fn on_handshake_encryption(&self, encrypted: bool) {
+        self.peers.handshake_encryption(self.addr, encrypted);
     }
 
     fn on_handshake(

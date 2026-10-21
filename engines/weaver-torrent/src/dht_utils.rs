@@ -54,8 +54,9 @@ pub async fn read_metainfo_from_peer_receiver<
     // The peers asked fill one buffer between them.
     let fetch = MetadataFetch::new(info_hashes);
 
-    let read_info_guarded = |addr| {
+    let read_info_guarded = |addr, peers: &Arc<PeerStates>| {
         let semaphore = &semaphore;
+        let peers = peers.clone();
         let fetch = fetch.clone();
         let connector = connector.clone();
         let client_name_and_version = client_name_and_version.clone();
@@ -63,6 +64,7 @@ pub async fn read_metainfo_from_peer_receiver<
             let token = semaphore.acquire().await?;
             let ret = peer_info_reader::read_metainfo_from_peer(
                 addr,
+                peers,
                 peer_id,
                 fetch,
                 peer_connection_options,
@@ -96,7 +98,8 @@ pub async fn read_metainfo_from_peer_receiver<
 /// not answer is a connection that failed: it is asked again when the peer
 /// list's reconnect time for it comes, until it has failed too often, and
 /// sooner when a tracker names it again (libtorrent `peer_list`; a magnet's
-/// metadata comes from the torrent's ordinary connections). None once the
+/// metadata comes from the torrent's ordinary connections). `ask` is handed
+/// the list, so the connection keeps the peer's memory there. None once the
 /// stream has ended and no peer is left to ask.
 async fn first_answer<A, T, F, Fut>(
     initial_addrs: Vec<SocketAddr>,
@@ -105,12 +108,13 @@ async fn first_answer<A, T, F, Fut>(
 ) -> (Option<T>, A, HashSet<SocketAddr>)
 where
     A: Stream<Item = (SocketAddr, PeerSourceFlag)> + Unpin,
-    F: Fn(SocketAddr) -> Fut,
+    F: Fn(SocketAddr, &Arc<PeerStates>) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
     // No metadata yet, so no pieces to count availability over. Each answer
     // comes over a connection of its own, wherever its peer is.
-    let peers = PeerStates::new(Default::default(), 0).allowing_multiple_connections_per_ip(true);
+    let peers =
+        Arc::new(PeerStates::new(Default::default(), 0).allowing_multiple_connections_per_ip(true));
     let mut seen = HashSet::<SocketAddr>::new();
     let mut name = |addr, source| {
         seen.insert(addr);
@@ -124,7 +128,7 @@ where
     let mut addrs_completed = false;
     loop {
         while let Some((addr, _, _)) = peers.connect_next(Instant::now()) {
-            let answer = ask(addr);
+            let answer = ask(addr, &peers);
             asking.push(async move { (addr, answer.await) });
         }
         if addrs_completed
@@ -182,11 +186,11 @@ mod tests {
         fails: usize,
     ) -> (
         Arc<Mutex<Vec<(SocketAddr, Instant)>>>,
-        impl Fn(SocketAddr) -> std::future::Ready<anyhow::Result<SocketAddr>>,
+        impl Fn(SocketAddr, &Arc<PeerStates>) -> std::future::Ready<anyhow::Result<SocketAddr>>,
     ) {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let log = asked.clone();
-        let ask = move |addr| {
+        let ask = move |addr, _: &Arc<PeerStates>| {
             let mut log = log.lock().unwrap();
             log.push((addr, Instant::now()));
             let times = log.iter().filter(|(a, _)| *a == addr).count();

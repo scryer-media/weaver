@@ -938,6 +938,9 @@ pub(crate) struct CheckedIncomingConnection {
     pub writer: BoxAsyncWrite,
     pub read_buf: ReadBuf,
     pub handshake: Handshake,
+    /// The peer opened with the encryption handshake (libtorrent
+    /// `bt_peer_connection::m_encrypted`, header-only included).
+    pub encrypted: bool,
     /// What has crossed the socket so far, the handshakes included.
     pub meter: Meter,
 }
@@ -1455,8 +1458,9 @@ impl Session {
 
         // With encryption enabled, an encrypted connection is unwrapped here
         // and a plaintext one passed through (or refused); with it disabled
-        // the halves are left as they are.
-        crate::mse::upgrade_incoming(
+        // the halves are left as they are. A method is settled only when the
+        // encryption handshake ran.
+        let method = crate::mse::upgrade_incoming(
             self.connector.encryption(),
             &mut reader,
             &mut writer,
@@ -1506,6 +1510,7 @@ impl Session {
                 kind,
                 handshake: h,
                 read_buf,
+                encrypted: method != 0,
                 meter,
             },
         ))
@@ -3617,6 +3622,7 @@ mod tests {
             writer,
             read_buf: crate::read_buf::ReadBuf::new(),
             handshake: crate::peer_protocol::Handshake::new(info_hash, super::Id20::new([7; 20])),
+            encrypted: false,
             meter: Default::default(),
         };
         (checked, theirs)

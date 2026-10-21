@@ -526,13 +526,17 @@ impl Peer {
         }
     }
 
-    /// The connection we made to the peer completed its handshake, the
-    /// encrypted one when `encrypted`: the next tries that method again
-    /// (libtorrent `bt_peer_connection::on_receive_handshake`, and the
-    /// encrypted handshake's last step).
-    pub(crate) fn outgoing_handshake(&mut self, encrypted: bool) {
-        self.encrypt = encrypted;
-        self.fast_reconnect = false;
+    /// The peer's connection completed its handshake, the encrypted one
+    /// when `encrypted`, and says so in our PEX (libtorrent
+    /// `bt_peer_connection::init_bt_handshake` sets `m_encrypted` either
+    /// way round). One we made makes the next we make try that method again
+    /// (`init_bt_handshake` and `on_receive_impl` write `pe_support` only
+    /// when `is_outgoing()`).
+    pub(crate) fn handshake_encryption(&mut self, encrypted: bool) {
+        if self.connected_out() == Some(true) {
+            self.encrypt = encrypted;
+            self.fast_reconnect = false;
+        }
         if let Some(live) = self.get_live_mut() {
             live.encrypted = encrypted;
         }

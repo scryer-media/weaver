@@ -295,6 +295,22 @@ impl PeerStates {
         self.with_peer_mut(addr, "pex_flags", |peer| peer.pex_flags(flags));
     }
 
+    /// Whether the connection being made to the peer at `addr` tries the
+    /// encrypted handshake; see [`Peer::encrypt_outgoing`]. Every connection
+    /// to the peer asks here, whether it fetches metadata or pieces.
+    pub fn encrypt_outgoing(&self, addr: SocketAddr) -> bool {
+        self.with_peer_mut(addr, "encrypt_outgoing", |peer| peer.encrypt_outgoing())
+            .unwrap_or(true)
+    }
+
+    /// The connection of the peer at `addr` completed its handshake; see
+    /// [`Peer::handshake_encryption`].
+    pub fn handshake_encryption(&self, addr: SocketAddr, encrypted: bool) {
+        self.with_peer_mut(addr, "handshake_encryption", |peer| {
+            peer.handshake_encryption(encrypted)
+        });
+    }
+
     /// A peer connected to us while every slot was taken. The connection goes,
     /// the peer stays: a known one is named again, as incoming, which forgives
     /// it no failure (libtorrent `peer_list::new_connection` leaves the
@@ -2116,7 +2132,7 @@ mod tests {
                 let encrypted = peer.encrypt_outgoing();
                 if let Ends::Completed = ends {
                     peer.connecting_to_live(Id20::default(), peers, ConnectionKind::Tcp);
-                    peer.outgoing_handshake(encrypted);
+                    peer.handshake_encryption(encrypted);
                 }
                 peers.connection_closed(peer, at, matches!(ends, Ends::Failed), true);
                 encrypted
@@ -2160,9 +2176,9 @@ mod tests {
         ));
     }
 
-    // libtorrent `bt_peer_connection::on_receive_handshake` and the
-    // encrypted handshake's last step set `pe_support` to the method that
-    // completed: the next connection tries it again.
+    // libtorrent `bt_peer_connection::on_receive_impl` and
+    // `init_bt_handshake` set `pe_support` to the method that completed:
+    // the next connection tries it again.
     #[tokio::test(start_paused = true)]
     async fn a_peer_is_tried_again_with_the_handshake_it_last_completed() {
         let peers = make_peer_states();
@@ -2262,12 +2278,38 @@ mod tests {
             peers.with_peer_mut(addr, "test", |peer| {
                 peer.connect_if_due(now, &peers).expect("a due candidate");
                 peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
-                peer.outgoing_handshake(encrypt);
+                peer.handshake_encryption(encrypt);
             });
         }
 
         let listed = peers.pex_listed();
         assert_eq!(listed[&encrypted] & PEX_ENCRYPTION, PEX_ENCRYPTION);
         assert_eq!(listed[&plain] & PEX_ENCRYPTION, 0);
+    }
+
+    // libtorrent `bt_peer_connection::init_bt_handshake` marks a connection
+    // encrypted whichever side opened it; both writes of `pe_support`
+    // (`init_bt_handshake`, `on_receive_impl`) are `is_outgoing()`, so a
+    // handshake the peer opened leaves which one ours try alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_the_peer_opened_leaves_which_one_ours_try_alone() {
+        use crate::peer_protocol::extended::ut_pex::PEX_ENCRYPTION;
+        let peers = make_peer_states();
+        let mut ends = Vec::new();
+        for (addr, encrypted, flag) in [
+            ("10.0.0.1:6881", true, PEX_ENCRYPTION),
+            ("10.0.0.2:6881", false, 0),
+        ] {
+            let (addr, rx) = add_live_peer(&peers, addr);
+            ends.push(rx);
+            peers.handshake_encryption(addr, encrypted);
+            let advertised = peers.with_live(addr, |live| live.advertised_pex_flags());
+            assert_eq!(advertised.unwrap() & PEX_ENCRYPTION, flag);
+
+            peers.with_peer_mut(addr, "test", |peer| {
+                peers.connection_closed(peer, Instant::now(), false, true)
+            });
+            assert!(peers.encrypt_outgoing(addr), "{addr}");
+        }
     }
 }

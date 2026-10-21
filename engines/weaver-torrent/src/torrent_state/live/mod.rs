@@ -1839,20 +1839,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn encrypt_outgoing(&self) -> bool {
-        self.state
-            .peers
-            .with_peer_mut(self.addr, "encrypt_outgoing", |peer| {
-                peer.encrypt_outgoing()
-            })
-            .unwrap_or(true)
+        self.state.peers.encrypt_outgoing(self.addr)
     }
 
-    fn on_outgoing_handshake(&self, encrypted: bool) {
-        self.state
-            .peers
-            .with_peer_mut(self.addr, "outgoing_handshake", |peer| {
-                peer.outgoing_handshake(encrypted)
-            });
+    fn on_handshake_encryption(&self, encrypted: bool) {
+        self.state.peers.handshake_encryption(self.addr, encrypted);
     }
 
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {

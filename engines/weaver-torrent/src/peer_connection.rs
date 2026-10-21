@@ -52,9 +52,10 @@ pub trait PeerConnectionHandler {
     fn encrypt_outgoing(&self) -> bool {
         true
     }
-    /// The outgoing connection completed its handshake, the encrypted one
-    /// when `encrypted` holds.
-    fn on_outgoing_handshake(&self, _encrypted: bool) {}
+    /// The connection, whichever side opened it, completed its handshake,
+    /// the encrypted one when `encrypted` holds; told right after
+    /// [`Self::on_handshake`].
+    fn on_handshake_encryption(&self, _encrypted: bool) {}
     fn should_send_bitfield(&self) -> bool;
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
     /// `speaks_v2`: the peer speaks BEP 52, so it may exchange hashes.
@@ -403,6 +404,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         self.handler
             .on_handshake(incoming.handshake, incoming.kind, speaks_v2)
             .map_err(Error::Anyhow)?;
+        self.handler.on_handshake_encryption(incoming.encrypted);
 
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
@@ -480,8 +482,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 .on_handshake(h, ckind, speaks_v2)
                 .map_err(Error::Anyhow)?;
             // The peer answered, so the method this connection tried works
-            // with it (libtorrent `bt_peer_connection::on_receive_handshake`).
-            self.handler.on_outgoing_handshake(encrypted);
+            // with it (libtorrent `bt_peer_connection::on_receive_impl`).
+            self.handler.on_handshake_encryption(encrypted);
 
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
@@ -998,6 +1000,7 @@ mod tests {
             writer,
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encrypted: false,
             meter: Default::default(),
         };
         let (_tx, rx) = mpsc::unbounded_channel();
@@ -1098,6 +1101,7 @@ mod tests {
             writer,
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encrypted: false,
             meter: meter.clone(),
         };
         let (tx, rx) = mpsc::unbounded_channel();
