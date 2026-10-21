@@ -367,10 +367,11 @@ impl TorrentStateLive {
         let permit = match self.peer_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                debug!("limit of live peers reached, dropping incoming peer");
-                self.peers.with_peer(checked_peer.addr, |p| {
-                    atomic_inc(&p.stats.counters.incoming_connections);
-                });
+                debug!("limit of live peers reached, keeping incoming peer for later");
+                if self.may_connect_to(checked_peer.addr) {
+                    self.peers
+                        .add_refused_incoming(checked_peer.addr, checked_peer.kind);
+                }
                 return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
             }
         };

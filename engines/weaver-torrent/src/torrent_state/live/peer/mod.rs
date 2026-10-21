@@ -38,6 +38,16 @@ pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
 
+/// Where a peer that connected to us from `addr` listens, when its transport
+/// says: uTP runs over the peer's listening UDP socket, while TCP connects from
+/// an ephemeral port.
+pub(crate) fn listen_address(addr: SocketAddr, kind: ConnectionKind) -> Option<SocketAddr> {
+    match kind {
+        ConnectionKind::Utp => Some(addr),
+        ConnectionKind::Tcp => None,
+    }
+}
+
 /// Where a peer stands when a full peer list must forget one; the lowest goes
 /// first. Peers we would not connect to go before connect candidates, then the
 /// most failures in a row, then the oldest failure.
@@ -69,7 +79,7 @@ impl Peer {
             addr,
             state: PeerState::Live(LivePeerState::new(peer_id, tx, true, connection_kind)),
             stats: Default::default(),
-            outgoing_address: None,
+            outgoing_address: listen_address(addr, connection_kind),
             failcount: 0,
             last_failed: None,
         }

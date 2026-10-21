@@ -24,7 +24,7 @@ use self::stats::{AggregatePeerStats, AggregatePeerStatsAtomic};
 
 use super::peer::{
     EraseRank, IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx,
-    stats::atomic::PeerCountersAtomic,
+    listen_address, stats::atomic::PeerCountersAtomic,
 };
 
 pub mod stats;
@@ -117,7 +117,29 @@ impl PeerStates {
             addr,
             Displace::NonCandidates,
             |peer| peer.rediscovered(self),
-            || Peer::new_with_outgoing_address(addr),
+            || Some(Peer::new_with_outgoing_address(addr)),
+        );
+        self.candidates_changed.notify_one();
+    }
+
+    /// A peer connected to us while every slot was taken. The connection goes,
+    /// the peer stays: a known one is named again, and one we can connect back
+    /// to joins as a connect candidate.
+    pub fn add_refused_incoming(&self, addr: SocketAddr, kind: ConnectionKind) {
+        self.admit(
+            addr,
+            Displace::NonCandidates,
+            |peer| {
+                atomic_inc(&peer.stats.counters.incoming_connections);
+                peer.rediscovered(self);
+            },
+            || {
+                listen_address(addr, kind).map(|listen| {
+                    let peer = Peer::new_with_outgoing_address(listen);
+                    atomic_inc(&peer.stats.counters.incoming_connections);
+                    peer
+                })
+            },
         );
         self.candidates_changed.notify_one();
     }
@@ -137,7 +159,14 @@ impl PeerStates {
                 peer.incoming_connection(peer_id, tx.clone(), self, kind)
                     .map(|()| peer.stats.counters.clone())
             },
-            || Peer::new_live_for_incoming_connection(addr, peer_id, tx.clone(), kind),
+            || {
+                Some(Peer::new_live_for_incoming_connection(
+                    addr,
+                    peer_id,
+                    tx.clone(),
+                    kind,
+                ))
+            },
         );
         match admitted {
             Admitted::Known(Ok(counters)) | Admitted::New(counters) => Ok(counters),
@@ -156,13 +185,15 @@ impl PeerStates {
         addr: SocketAddr,
         displace: Displace,
         known: impl FnOnce(&mut Peer) -> R,
-        newcomer: impl FnOnce() -> Peer,
+        newcomer: impl FnOnce() -> Option<Peer>,
     ) -> Admitted<R> {
         let _admission = self.admission.lock();
         if let Some(r) = self.with_peer_mut(addr, "admit", known) {
             return Admitted::Known(r);
         }
-        let peer = newcomer();
+        let Some(peer) = newcomer() else {
+            return Admitted::Refused;
+        };
         if self.states.len() >= MAX_PEERLIST_SIZE && !self.erase_one(displace) {
             return Admitted::Refused;
         }
@@ -882,5 +913,39 @@ mod tests {
         assert_eq!(state_of(&peers, second), None);
         assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
         assert_eq!(peers.stats().live as usize, MAX_PEERLIST_SIZE);
+    }
+
+    #[test]
+    fn an_incoming_peer_refused_a_slot_is_kept() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+
+        // A uTP peer connects from where it listens: it is queued to be
+        // connected back.
+        let utp = peer_addr(1);
+        peers.add_refused_incoming(utp, ConnectionKind::Utp);
+        assert_eq!(state_of(&peers, utp), Some("queued"));
+        assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
+        let incoming = peers.with_peer(utp, |peer| {
+            peer.stats
+                .counters
+                .incoming_connections
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
+        assert_eq!(incoming, Some(1));
+
+        // A known peer that connects is named again, which revives it.
+        let known = peer_addr(2);
+        peers.add_peer(known);
+        fail_out(&peers, known, t0);
+        assert_eq!(state_of(&peers, known), Some("dead"));
+        peers.add_refused_incoming(known, ConnectionKind::Tcp);
+        assert_eq!(state_of(&peers, known), Some("queued"));
+
+        // An unknown TCP peer connects from an ephemeral port: there is no
+        // address to connect back to.
+        let tcp = peer_addr(3);
+        peers.add_refused_incoming(tcp, ConnectionKind::Tcp);
+        assert_eq!(state_of(&peers, tcp), None);
     }
 }
