@@ -647,7 +647,8 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
             | ("categories", "torrent_route")
             | ("torrents", "private")
             | ("torrents", "forced")
-            | ("torrent_files", "selected")
+            | ("torrents", "sequential")
+            | ("torrents", "first_last_piece_first")
     )
 }
 

@@ -208,10 +208,14 @@ where
 
 #[derive(Deserialize, Debug)]
 pub struct TrackerResponse<'a> {
-    #[allow(dead_code)]
+    /// Shown beside the tracker, the announce accepted (libtorrent
+    /// `parse_tracker_response` reads it into `announce_entry::message`).
     #[serde(rename = "warning message", borrow)]
     pub warning_message: Option<ByteBuf<'a>>,
     pub complete: Option<u64>,
+    /// Downloads the tracker has seen finish (libtorrent
+    /// `parse_tracker_response` reads `downloaded`).
+    pub downloaded: Option<u64>,
     #[serde(default = "default_interval", deserialize_with = "interval")]
     pub interval: Duration,
     #[serde(

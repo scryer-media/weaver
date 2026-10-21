@@ -4,25 +4,42 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useSubscription } from "urql";
 import {
+  ADD_TORRENT_TRACKERS_MUTATION,
   BAN_TORRENT_PEER_MUTATION,
+  SET_TORRENT_DOWNLOAD_LIMIT_MUTATION,
+  REANNOUNCE_TORRENT_MUTATION,
+  REMOVE_TORRENT_TRACKERS_MUTATION,
+  REPLACE_TORRENT_TRACKERS_MUTATION,
   SET_TORRENT_SEEDING_MUTATION,
+  SET_TORRENT_UPLOAD_LIMIT_MUTATION,
   TORRENT_PEERS_QUERY,
   TORRENT_UPDATES_SUBSCRIPTION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { torrentErrorText, type TorrentData, type TorrentPeerData } from "@/lib/torrents";
+import {
+  torrentErrorText,
+  type TorrentActionError,
+  type TorrentData,
+  type TorrentPeerData,
+  type TorrentTrackerData,
+} from "@/lib/torrents";
 import { DetailBlock, Field } from "@/next/components/chrome";
 import { SecondaryButton } from "@/next/components/controls";
 import { RecordEditor } from "@/next/components/RecordEditor";
 import { GridRow } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
+import { LimitControl } from "@/next/features/networking/limits";
 import { informationFields, transferFields, type TorrentField } from "@/next/features/torrents/general";
 import { countLabel } from "@/next/i18n/labels";
 import { EMPTY_SEEDING, durationText, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
-const TRACKER_COLUMNS = { base: "minmax(0,1fr) 112px", sm: "minmax(0,1fr) 112px minmax(0,1fr)" };
+const TRACKER_COLUMNS = {
+  base: "minmax(0,1fr) 112px max-content",
+  sm: "minmax(0,1fr) 112px 96px minmax(0,1fr) max-content",
+};
 const FILE_COLUMNS = { base: "minmax(0,1fr) 56px 90px" };
+const LIMIT_COLUMNS = { base: "minmax(0,1fr) max-content" };
 const PEER_COLUMNS = {
   base: "minmax(0,1fr) 56px max-content",
   sm: "minmax(0,1fr) minmax(0,1fr) 56px 90px 90px max-content",
@@ -162,7 +179,231 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
   );
 }
 
-/** A torrent job's own blocks on the job's screen: its transfer, its information, how it seeds, its trackers, its peers and its files. */
+/**
+ * The torrent's own download and upload limits, each set as it changes; off
+ * is unlimited.
+ */
+function LimitsBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (message: string) => void }) {
+  const t = useTranslate();
+  const [, setUpload] = useMutation(SET_TORRENT_UPLOAD_LIMIT_MUTATION);
+  const [, setDownload] = useMutation(SET_TORRENT_DOWNLOAD_LIMIT_MUTATION);
+  // Each control sends its own limit alone; the server keeps the other.
+  const report = (result: { error?: TorrentActionError }) => {
+    if (result.error) {
+      onReport(torrentErrorText(result.error));
+    }
+  };
+  const rows = [
+    {
+      label: t("next.torrent.downloadLimit"),
+      value: torrent.downloadLimit,
+      set: (download: number | null) => void setDownload({ id: torrent.id, download }).then(report),
+    },
+    {
+      label: t("next.torrent.uploadLimit"),
+      value: torrent.uploadLimit,
+      set: (upload: number | null) => void setUpload({ id: torrent.id, upload }).then(report),
+    },
+  ];
+  return (
+    <DetailBlock id="limits" title={t("next.torrent.limits")}>
+      {rows.map((row) => (
+        <GridRow key={row.label} columns={LIMIT_COLUMNS} gap={14} className="min-h-[46px] border-t border-wv-hairline">
+          <span className="min-w-0 truncate text-[12.5px] text-wv-fg">{row.label}</span>
+          <LimitControl label={row.label} value={row.value} onChange={row.set} />
+        </GridRow>
+      ))}
+    </DetailBlock>
+  );
+}
+
+/** The tracker being added to or edited, as its dialog holds it. */
+type TrackerEdit = { kind: "add"; urls: string } | { kind: "edit"; from: TorrentTrackerData; url: string };
+
+const count = (value: number | null) => (value === null ? EM_DASH : String(value));
+
+/**
+ * A torrent's trackers, each with how announcing to it went, and the
+ * actions on them: add, edit, remove and reannounce.
+ */
+function TrackersBlock({
+  torrent,
+  onChanged,
+  onReport,
+}: {
+  torrent: TorrentData;
+  onChanged: () => void;
+  onReport: (message: string) => void;
+}) {
+  const t = useTranslate();
+  const [addState, addTrackers] = useMutation(ADD_TORRENT_TRACKERS_MUTATION);
+  const [replaceState, replaceTrackers] = useMutation(REPLACE_TORRENT_TRACKERS_MUTATION);
+  const [removeState, removeTrackers] = useMutation(REMOVE_TORRENT_TRACKERS_MUTATION);
+  const [reannounceState, reannounce] = useMutation(REANNOUNCE_TORRENT_MUTATION);
+  const [editing, setEditing] = useState<TrackerEdit | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const busy = addState.fetching || replaceState.fetching || removeState.fetching || reannounceState.fetching;
+
+  const settle = (result: { error?: TorrentActionError }, report: (message: string) => void) => {
+    if (result.error) {
+      report(torrentErrorText(result.error));
+      return false;
+    }
+    onChanged();
+    return true;
+  };
+
+  const open = (edit: TrackerEdit) => {
+    setError(null);
+    setEditing(edit);
+  };
+
+  const save = () => {
+    if (editing === null) return;
+    const done = (result: { error?: TorrentActionError }) => {
+      if (settle(result, setError)) setEditing(null);
+    };
+    if (editing.kind === "add") {
+      const urls = editing.urls
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line !== "");
+      void addTrackers({ id: torrent.id, urls }).then(done);
+      return;
+    }
+    const { from, url } = editing;
+    const trackers = torrent.trackers.map((tracker) => ({
+      tier: tracker.tier,
+      url: tracker.url === from.url ? url.trim() : tracker.url,
+    }));
+    void replaceTrackers({ id: torrent.id, trackers }).then(done);
+  };
+
+  const remove = (url: string) => {
+    void removeTrackers({ id: torrent.id, urls: [url] }).then((result) => settle(result, onReport));
+  };
+
+  const announce = (tracker: string | null) => {
+    void reannounce({ id: torrent.id, tracker }).then((result) => settle(result, onReport));
+  };
+
+  const action = "cursor-pointer text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg disabled:cursor-default";
+
+  return (
+    <DetailBlock
+      id="trackers"
+      title={t("next.torrent.trackers")}
+      note={countLabel(t, "next.torrent.trackerCount", torrent.trackers.length)}
+      right={
+        <span className="flex gap-3">
+          <button type="button" disabled={busy} onClick={() => announce(null)} className={action}>
+            {t("next.torrent.reannounce")}
+          </button>
+          <button type="button" onClick={() => open({ kind: "add", urls: "" })} className={action}>
+            {t("next.torrent.addTrackers")}
+          </button>
+        </span>
+      }
+    >
+      {torrent.trackers.length === 0 ? (
+        <span className="text-[12.5px] text-wv-muted">{EM_DASH}</span>
+      ) : (
+        torrent.trackers.map((tracker) => (
+          <GridRow
+            key={`${tracker.tier}-${tracker.url}`}
+            columns={TRACKER_COLUMNS}
+            gap={14}
+            className="h-[38px] border-t border-wv-hairline"
+            title={tracker.url}
+          >
+            <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{tracker.url}</span>
+            <span className="font-wv-mono text-[11.5px] text-wv-muted">
+              {t(tracker.updating ? "next.torrent.tracker.UPDATING" : `next.torrent.tracker.${tracker.status}`)}
+            </span>
+            <span
+              className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block"
+              title={t("next.torrent.trackerSwarmTitle")}
+            >
+              {t("next.torrent.trackerSwarm", {
+                seeds: count(tracker.seeders),
+                leeches: count(tracker.leechers),
+                peers: count(tracker.peers),
+              })}
+            </span>
+            <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={tracker.message ?? undefined}>
+              {tracker.message ?? ""}
+            </span>
+            <span className="flex justify-end gap-3">
+              <button type="button" disabled={busy} onClick={() => announce(tracker.url)} className={action}>
+                {t("next.torrent.reannounce")}
+              </button>
+              <button
+                type="button"
+                onClick={() => open({ kind: "edit", from: tracker, url: tracker.url })}
+                className={action}
+              >
+                {t("next.common.edit")}
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => remove(tracker.url)}
+                className="cursor-pointer text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-error disabled:cursor-default"
+              >
+                {t("next.common.remove")}
+              </button>
+            </span>
+          </GridRow>
+        ))
+      )}
+      <RecordEditor
+        open={editing !== null}
+        title={t(editing?.kind === "edit" ? "next.torrent.editTracker" : "next.torrent.addTrackers")}
+        note={torrent.name}
+        error={error}
+        busy={busy}
+        onSave={save}
+        onDismiss={() => setEditing(null)}
+        sections={
+          editing === null
+            ? []
+            : [
+                {
+                  id: "trackers",
+                  title: t("next.torrent.trackers"),
+                  fields: [
+                    editing.kind === "add"
+                      ? {
+                          id: "tracker-urls",
+                          label: t("next.torrent.trackerUrls"),
+                          control: {
+                            kind: "textarea",
+                            rows: 6,
+                            value: editing.urls,
+                            onChange: (urls: string) => setEditing({ ...editing, urls }),
+                          },
+                        }
+                      : {
+                          id: "tracker-url",
+                          label: t("next.torrent.trackerUrl"),
+                          control: {
+                            kind: "text",
+                            type: "url",
+                            mono: true,
+                            value: editing.url,
+                            onChange: (url: string) => setEditing({ ...editing, url }),
+                          },
+                        },
+                  ],
+                },
+              ]
+        }
+      />
+    </DetailBlock>
+  );
+}
+
+/** A torrent job's own blocks on the job's screen: its transfer, its limits, its information, how it seeds, its trackers, its peers and its files. */
 export function TorrentDetail({
   torrent,
   onChanged,
@@ -195,6 +436,8 @@ export function TorrentDetail({
         <GeneralGrid fields={transferFields(t, torrent)} />
       </DetailBlock>
 
+      <LimitsBlock torrent={torrent} onReport={onReport} />
+
       <DetailBlock id="information" title={t("next.torrent.information")}>
         <GeneralGrid fields={informationFields(t, torrent)} />
       </DetailBlock>
@@ -224,33 +467,7 @@ export function TorrentDetail({
         </div>
       </DetailBlock>
 
-      <DetailBlock
-        id="trackers"
-        title={t("next.torrent.trackers")}
-        note={countLabel(t, "next.torrent.trackerCount", torrent.trackers.length)}
-      >
-        {torrent.trackers.length === 0 ? (
-          <span className="text-[12.5px] text-wv-muted">{EM_DASH}</span>
-        ) : (
-          torrent.trackers.map((tracker) => (
-            <GridRow
-              key={`${tracker.tier}-${tracker.url}`}
-              columns={TRACKER_COLUMNS}
-              gap={14}
-              className="h-[38px] border-t border-wv-hairline"
-              title={tracker.url}
-            >
-              <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{tracker.url}</span>
-              <span className="font-wv-mono text-[11.5px] text-wv-muted">
-                {t(`next.torrent.tracker.${tracker.status}`)}
-              </span>
-              <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={tracker.message ?? undefined}>
-                {tracker.message ?? ""}
-              </span>
-            </GridRow>
-          ))
-        )}
-      </DetailBlock>
+      <TrackersBlock torrent={torrent} onChanged={onChanged} onReport={onReport} />
 
       <PeersBlock torrent={torrent} onReport={onReport} />
 

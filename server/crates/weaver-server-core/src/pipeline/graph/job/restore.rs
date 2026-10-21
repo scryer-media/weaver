@@ -206,17 +206,7 @@ impl<R: Root> GraphJob<R> {
         );
         let mut refetched = Vec::with_capacity(missing.len());
         for (volume, ordinal, range) in missing {
-            self.root.unarrive(volume, ordinal);
-            if let Some(found) = self
-                .tree
-                .namespace_mut(NodeId::ROOT)
-                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
-            {
-                if let Some(range) = range {
-                    found.coverage.erase(range);
-                }
-                found.closed = false;
-            }
+            self.unarrive(volume, ordinal, range);
             refetched.push((volume, ordinal));
         }
         Ok(refetched)

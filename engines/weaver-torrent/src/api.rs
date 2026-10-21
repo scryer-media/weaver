@@ -5,7 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::{collections::HashSet, marker::PhantomData, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{marker::PhantomData, net::SocketAddr, str::FromStr, sync::Arc};
 
 use crate::buffers::ByteBufOwned;
 use crate::core::torrent_metainfo::{FileDetailsAttrs, ValidatedTorrentMetaV1Info};
@@ -18,6 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::{
     WithStatus, WithStatusError,
     api_error::ApiError,
+    piece_priority::FilePriority,
     session::{
         AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, TorrentId,
     },
@@ -216,6 +217,8 @@ impl Api {
                             .to_string_lossy()
                             .into_owned(),
                         total_pieces,
+                        sequential: mgr.sequential(),
+                        first_last_piece_first: mgr.first_last_piece_first(),
 
                         // These will be filled in /details and /stats endpoints
                         files: None,
@@ -234,7 +237,6 @@ impl Api {
     pub fn api_torrent_details(&self, idx: TorrentIdOrHash) -> Result<TorrentDetailsResponse> {
         let handle = self.mgr_handle(idx)?;
         let info_hash = handle.shared().info_hash;
-        let only_files = handle.only_files();
         let output_folder = handle
             .shared()
             .options
@@ -247,7 +249,7 @@ impl Api {
             &info_hash,
             handle.metadata.load().as_ref().map(|r| &r.info),
             handle.name().as_deref(),
-            only_files.as_deref(),
+            &Picking::of(&handle),
             output_folder,
         )
     }
@@ -326,16 +328,38 @@ impl Api {
         Ok(Default::default())
     }
 
-    pub async fn api_torrent_action_update_only_files(
+    pub async fn api_torrent_action_set_file_priorities(
         &self,
         idx: TorrentIdOrHash,
-        only_files: &HashSet<usize>,
+        priorities: &[(usize, FilePriority)],
     ) -> Result<EmptyJsonResponse> {
         let handle = self.mgr_handle(idx)?;
         self.session
-            .update_only_files(&handle, only_files)
+            .set_file_priorities(&handle, priorities)
             .await
-            .context("error updating only_files")?;
+            .context("error setting the file priorities")
+            .with_status(StatusCode::BAD_REQUEST)?;
+        Ok(Default::default())
+    }
+
+    pub fn api_torrent_action_set_sequential(
+        &self,
+        idx: TorrentIdOrHash,
+        sequential: bool,
+    ) -> Result<EmptyJsonResponse> {
+        self.mgr_handle(idx)?.set_sequential(sequential);
+        Ok(Default::default())
+    }
+
+    pub fn api_torrent_action_set_first_last_piece_first(
+        &self,
+        idx: TorrentIdOrHash,
+        on: bool,
+    ) -> Result<EmptyJsonResponse> {
+        self.mgr_handle(idx)?
+            .set_first_last_piece_first(on)
+            .context("error setting first and last piece first")
+            .with_status(StatusCode::BAD_REQUEST)?;
         Ok(Default::default())
     }
 
@@ -367,7 +391,7 @@ impl Api {
                     &handle.info_hash(),
                     handle.metadata.load().as_ref().map(|r| &r.info),
                     handle.name().as_deref(),
-                    handle.only_files().as_deref(),
+                    &Picking::of(&handle),
                     handle
                         .shared()
                         .options
@@ -391,7 +415,9 @@ impl Api {
             AddTorrentResponse::ListOnly(ListOnlyResponse {
                 info_hash,
                 info,
-                only_files,
+                file_priorities,
+                sequential,
+                first_last_piece_first,
                 seen_peers,
                 output_folder,
                 ..
@@ -404,7 +430,11 @@ impl Api {
                     &info_hash,
                     Some(&info),
                     None,
-                    only_files.as_deref(),
+                    &Picking {
+                        files: file_priorities,
+                        sequential,
+                        first_last_piece_first,
+                    },
                     output_folder.to_string_lossy().into_owned().to_string(),
                 )
                 .context("error making torrent details")?,
@@ -415,7 +445,7 @@ impl Api {
                     &handle.info_hash(),
                     handle.metadata.load().as_ref().map(|r| &r.info),
                     handle.name().as_deref(),
-                    handle.only_files().as_deref(),
+                    &Picking::of(&handle),
                     handle
                         .shared()
                         .options
@@ -503,7 +533,10 @@ pub struct TorrentDetailsResponseFile {
     pub name: String,
     pub components: Vec<String>,
     pub length: u64,
+    /// Fetched at all: `priority` is above `ignored`.
     pub included: bool,
+    #[serde(default)]
+    pub priority: FilePriority,
     pub attributes: FileDetailsAttrs,
 }
 
@@ -520,6 +553,10 @@ pub struct TorrentDetailsResponse {
 
     #[serde(default)]
     pub total_pieces: u32,
+    #[serde(default)]
+    pub sequential: bool,
+    #[serde(default)]
+    pub first_last_piece_first: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<TorrentDetailsResponseFile>>,
@@ -535,12 +572,30 @@ pub struct ApiAddTorrentResponse {
     pub seen_peers: Option<Vec<SocketAddr>>,
 }
 
+// How a torrent's pieces are picked: each file's level, and the two
+// switches.
+struct Picking {
+    files: Vec<FilePriority>,
+    sequential: bool,
+    first_last_piece_first: bool,
+}
+
+impl Picking {
+    fn of(handle: &ManagedTorrentHandle) -> Self {
+        Self {
+            files: handle.file_priorities(),
+            sequential: handle.sequential(),
+            first_last_piece_first: handle.first_last_piece_first(),
+        }
+    }
+}
+
 fn make_torrent_details(
     id: Option<TorrentId>,
     info_hash: &Id20,
     info: Option<&ValidatedTorrentMetaV1Info<ByteBufOwned>>,
     name: Option<&str>,
-    only_files: Option<&[usize]>,
+    picking: &Picking,
     output_folder: String,
 ) -> Result<TorrentDetailsResponse> {
     let files = match info {
@@ -550,12 +605,13 @@ fn make_torrent_details(
             .map(|(idx, d)| {
                 let name = d.filename.to_string();
                 let components = d.filename.to_vec();
-                let included = only_files.map(|o| o.contains(&idx)).unwrap_or(true);
+                let priority = picking.files.get(idx).copied().unwrap_or_default();
                 TorrentDetailsResponseFile {
                     name,
                     components,
                     length: d.len,
-                    included,
+                    included: priority.wanted(),
+                    priority,
                     attributes: d.attrs(),
                 }
             })
@@ -572,6 +628,8 @@ fn make_torrent_details(
         files: Some(files),
         output_folder,
         total_pieces,
+        sequential: picking.sequential,
+        first_last_piece_first: picking.first_last_piece_first,
         stats: None,
     })
 }

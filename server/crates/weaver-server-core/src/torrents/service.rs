@@ -16,7 +16,7 @@ use weaver_graph::VolumeIndex;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::core::{Id20, Id32, InfoHashes};
-use weaver_torrent::limits::{LimitKind, LimitsConfig};
+use weaver_torrent::limits::LimitsConfig;
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
     ManagedTorrent, ResumePeers, Session, TorrentVersion, TrackerAnnounce, torrent_from_bytes,
@@ -56,12 +56,13 @@ use crate::settings::{
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
+use crate::torrents::rate::limit_kind;
 use crate::torrents::sessions::{NetworkRoutes, RouteKey, SessionEnv, SessionError, Sessions};
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::torrents::{
-    Infohash, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
+    FilePriority, Infohash, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent,
+    TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
 };
 
 #[cfg(test)]
@@ -187,6 +188,18 @@ fn identity_of(record: &TorrentRecord, rules: &[TrackerRule]) -> Identity {
         .unwrap_or(Client::Weaver)
         .name()
         .identity()
+}
+
+// The limits `record`'s session holds it to: its own, and on upload its
+// seeding policy's cap where that is tighter. Each is a channel the
+// torrent's peers draw from beside the session's, as each peer class over a
+// libtorrent peer is (`bandwidth_manager::request_bandwidth`).
+fn ratelimits_of(record: &TorrentRecord, policy: Option<SeedingPolicy>) -> LimitsConfig {
+    let cap = policy.and_then(|policy| policy.max_upload_bps);
+    LimitsConfig {
+        upload_bps: limit_kind(record.upload_limit).tighter(limit_kind(cap)),
+        download_bps: limit_kind(record.download_limit),
+    }
 }
 
 /// Where a torrent's seeding policy comes from: the most specific level that
@@ -391,6 +404,10 @@ pub struct TorrentView {
     pub ratio: f64,
     pub download_bps: u64,
     pub upload_bps: u64,
+    /// The torrent's own upload and download limits in bytes per second;
+    /// None is unlimited and zero holds that direction closed.
+    pub upload_limit: Option<u64>,
+    pub download_limit: Option<u64>,
     pub eta_seconds: Option<u64>,
     pub peers: u32,
     pub seeds: u32,
@@ -431,6 +448,10 @@ pub struct TorrentView {
     pub unpack: bool,
     pub route: Option<String>,
     pub files: Vec<TorrentFile>,
+    /// Whether its pieces are fetched in order.
+    pub sequential: bool,
+    /// Whether each file's first and last pieces are fetched first.
+    pub first_last_piece_first: bool,
     /// Each file's bytes in hand, by its index in the torrent.
     pub file_have: Vec<u64>,
     pub trackers: Vec<TorrentTracker>,
@@ -493,7 +514,6 @@ struct Parsed {
     manifest: Manifest,
     layout: Arc<PieceLayout>,
     private: bool,
-    files: Vec<TorrentFile>,
     trackers: Vec<TrackerEntry>,
     total: u64,
     about: About,
@@ -519,6 +539,56 @@ fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
         tier,
         url: url.to_owned(),
     })
+}
+
+// `trackers` as a torrent lists them: by tier, in the order given within a
+// tier, each URL once where it is first named (libtorrent
+// `torrent::replace_trackers`). A tracker that is no URL is left out, as a
+// session leaves it out.
+fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
+    let mut tidy: Vec<TrackerEntry> = Vec::with_capacity(trackers.len());
+    for entry in trackers {
+        let url = entry.url.trim();
+        if weaver_torrent::Url::parse(url).is_err() {
+            continue;
+        }
+        if tidy.iter().all(|known| known.url != url) {
+            tidy.push(TrackerEntry {
+                tier: entry.tier,
+                url: url.to_owned(),
+            });
+        }
+    }
+    tidy.sort_by_key(|entry| entry.tier);
+    tidy
+}
+
+// Refuse an edit naming a tracker that is no URL.
+fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
+    trackers
+        .iter()
+        .map(|tracker| tracker.url.trim())
+        .filter(|url| !url.is_empty())
+        .try_for_each(|url| {
+            weaver_torrent::Url::parse(url)
+                .map(drop)
+                .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))
+        })
+}
+
+// The tiers of `trackers`, listed by tier, as a session announces to them.
+fn tracker_tiers(trackers: &[TrackerEntry]) -> Vec<Vec<weaver_torrent::Url>> {
+    let mut tiers: Vec<(u32, Vec<weaver_torrent::Url>)> = Vec::new();
+    for entry in trackers {
+        let Ok(url) = weaver_torrent::Url::parse(&entry.url) else {
+            continue;
+        };
+        match tiers.last_mut() {
+            Some((tier, urls)) if *tier == entry.tier => urls.push(url),
+            _ => tiers.push((entry.tier, vec![url])),
+        }
+    }
+    tiers.into_iter().map(|(_, urls)| urls).collect()
 }
 
 // The hashes a duplicate of a torrent going by `hashes` would share.
@@ -553,16 +623,6 @@ fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
         .name()
         .map(|name| name.into_owned())
         .unwrap_or_default();
-    let files: Vec<TorrentFile> = layout
-        .files()
-        .enumerate()
-        .map(|(index, file)| TorrentFile {
-            index: index as u32,
-            path: file.name.clone(),
-            length: file.length,
-            selected: !file.padding,
-        })
-        .collect();
     let mut trackers: Vec<TrackerEntry> = metainfo
         .announce_list
         .iter()
@@ -585,20 +645,19 @@ fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
         manifest: Manifest {
             name,
             single_file: info.is_single_file(),
-            paths: files
-                .iter()
-                .filter(|file| file.selected)
-                .map(|file| file.path.clone())
+            paths: layout
+                .files()
+                .filter(|file| !file.padding)
+                .map(|file| file.name.clone())
                 .collect(),
         },
-        total: files
-            .iter()
-            .filter(|file| file.selected)
+        total: layout
+            .files()
+            .filter(|file| !file.padding)
             .map(|file| file.length)
             .sum(),
         private: info.info().private,
         layout,
-        files,
         trackers,
         about: About {
             version: Some(info.version()),
@@ -640,7 +699,8 @@ struct Live {
     queued: bool,
     // Who holds it stopped, while a hold does.
     paused_by: Option<HoldOrigin>,
-    applied: Option<Vec<usize>>,
+    // The operator's level for each file, as stored.
+    levels: Vec<FilePriority>,
     speeds: (u64, u64),
     peers: (u32, u32),
     // The directory claimed for a move, while the move waits or is under
@@ -678,6 +738,21 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
 }
 
 impl Live {
+    // Its files: the metainfo's names and lengths, at the levels it holds.
+    fn files(&self) -> Vec<TorrentFile> {
+        self.layout
+            .iter()
+            .flat_map(|layout| layout.files())
+            .enumerate()
+            .map(|(index, file)| TorrentFile {
+                index: index as u32,
+                path: file.name.clone(),
+                length: file.length,
+                priority: self.levels.get(index).copied().unwrap_or_default(),
+            })
+            .collect()
+    }
+
     fn new(record: TorrentRecord, counters: TorrentCounters) -> Self {
         Self {
             record,
@@ -696,7 +771,7 @@ impl Live {
             run_error: None,
             queued: false,
             paused_by: None,
-            applied: None,
+            levels: Vec::new(),
             speeds: (0, 0),
             peers: (0, 0),
             moving: None,
@@ -1320,7 +1395,7 @@ impl TorrentService {
                 self.completed(job_id).await;
             }
         }
-        self.apply_selection().await;
+        self.apply_picking().await;
         self.publish().await;
     }
 
@@ -1542,6 +1617,19 @@ impl TorrentService {
         torrent.names = parsed.manifest.paths.clone();
         torrent.total = parsed.total;
         torrent.layout = Some(Arc::clone(&parsed.layout));
+        let stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
+            Vec::new()
+        });
+        torrent.levels = parsed
+            .layout
+            .files()
+            .enumerate()
+            .map(|(index, file)| {
+                let level = stored.get(index).copied().unwrap_or_default();
+                level.held_by(file.padding)
+            })
+            .collect();
         torrent.file_have = job.with(|job| job.file_have());
         torrent.job = Some(job);
         torrent.intake = Some(intake);
@@ -1597,7 +1685,7 @@ impl TorrentService {
                     parsed.private,
                     Some(dir.clone()),
                 );
-                if let Err(error) = self.insert(&mut record, &parsed.files, &parsed.trackers) {
+                if let Err(error) = self.insert(&mut record, &parsed.trackers) {
                     give_back(&dir).await;
                     return Err(error);
                 }
@@ -1657,7 +1745,7 @@ impl TorrentService {
                     false,
                     None,
                 );
-                self.insert(&mut record, &[], &trackers)?;
+                self.insert(&mut record, &trackers)?;
                 let identity = identity_of(&record, &rules);
                 let mut torrent = Live::new(record, TorrentCounters::default());
                 torrent.route = Some(plan.key.clone());
@@ -1756,6 +1844,10 @@ impl TorrentService {
             tracker_rule_id: None,
             unpack: request.unpack,
             metadata: request.metadata.clone(),
+            upload_limit: None,
+            download_limit: None,
+            sequential: false,
+            first_last_piece_first: false,
         }
     }
 
@@ -1763,11 +1855,10 @@ impl TorrentService {
     fn insert(
         &self,
         record: &mut TorrentRecord,
-        files: &[TorrentFile],
         trackers: &[TrackerEntry],
     ) -> Result<(), AddError> {
         record.tracker_rule_id = self.rule_id(trackers);
-        match self.inner.db.insert_torrent(record, files, trackers) {
+        match self.inner.db.insert_torrent(record, trackers) {
             Ok(TorrentInsert::Inserted) => Ok(()),
             Ok(TorrentInsert::Duplicate(existing)) => Err(AddError::Duplicate(existing)),
             Err(error) => Err(AddError::State(state_error(error))),
@@ -1851,7 +1942,16 @@ impl TorrentService {
         torrent.record.private = parsed.private;
         torrent.record.storage_dir = Some(dir.clone());
         torrent.record.metainfo = Some(bytes.clone());
-        let rule_id = self.rule_id(&parsed.trackers);
+        // libtorrent `torrent::set_metadata` keeps the trackers the magnet
+        // listed, edits included; the metainfo's own join after them.
+        let mut trackers = self
+            .inner
+            .db
+            .list_torrent_trackers(job_id)
+            .map_err(|error| AddError::State(state_error(error)))?;
+        trackers.extend(parsed.trackers.iter().cloned());
+        let trackers = tidy_trackers(trackers);
+        let rule_id = self.rule_id(&trackers);
         self.inner
             .db
             .set_torrent_tracker_rule(job_id, rule_id)
@@ -1867,8 +1967,7 @@ impl TorrentService {
                 &bytes,
                 parsed.private,
                 &dir,
-                &parsed.files,
-                &parsed.trackers,
+                &trackers,
             )
             .map_err(|error| AddError::State(state_error(error)))?;
         self.give_metainfo(torrent, &parsed);
@@ -1925,7 +2024,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.now_ms();
-        let (scope, bytes, layout, intake, dir, paused, limit, have, identity) = {
+        let (scope, bytes, layout, intake, dir, paused, ratelimits, have, identity, picking) = {
             let live = self.inner.live.lock().await;
             let Some(torrent) = live.get(&job_id) else {
                 return;
@@ -1941,10 +2040,8 @@ impl TorrentService {
             ) else {
                 return;
             };
-            let limit = settings
-                .policy(&torrent.record, &rules)
-                .and_then(|policy| policy.max_upload_bps)
-                .map(|bps| u32::try_from(bps).unwrap_or(u32::MAX));
+            let ratelimits =
+                ratelimits_of(&torrent.record, settings.policy(&torrent.record, &rules));
             (
                 settings.scope(torrent.record.category_id, rule_of(&torrent.record, &rules)),
                 bytes,
@@ -1957,9 +2054,14 @@ impl TorrentService {
                         .holds()
                         .reason_for(queued(&settings, &rules, torrent, now).target())
                         .is_some(),
-                limit,
+                ratelimits,
                 job.with(|job| initial_have(job)),
                 identity_of(&torrent.record, &rules),
+                (
+                    fetch_levels(torrent, job),
+                    torrent.record.sequential,
+                    torrent.record.first_last_piece_first,
+                ),
             )
         };
         let plan = match self.inner.sessions.routes().plan(scope) {
@@ -1982,6 +2084,18 @@ impl TorrentService {
             tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
             Default::default()
         });
+        // libtorrent `torrent::read_resume_data`: the trackers the torrent
+        // lists now stand in for its metainfo's.
+        let trackers = match self.inner.db.list_torrent_trackers(job_id) {
+            Ok(trackers) => tracker_tiers(&trackers)
+                .into_iter()
+                .map(|tier| tier.into_iter().map(String::from).collect())
+                .collect(),
+            Err(error) => {
+                self.fail(job_id, state_error(error)).await;
+                return;
+            }
+        };
         let factory =
             PieceStorageFactory::new(layout, intake as Arc<dyn Pieces>, self.resident(job_id));
         let mut options = AddTorrentOptions {
@@ -1989,13 +2103,14 @@ impl TorrentService {
             overwrite: true,
             output_folder: Some(dir),
             storage_factory: Some(factory.boxed_factory()),
-            ratelimits: LimitsConfig {
-                upload_bps: LimitKind::from(limit),
-                download_bps: LimitKind::Unlimited,
-            },
+            ratelimits,
             identity: Some(identity),
+            tracker_tiers: Some(trackers),
             initial_peers: (!saved.peers.is_empty()).then_some(saved.peers),
             banned_peers: saved.banned,
+            file_priorities: Some(picking.0),
+            sequential: picking.1,
+            first_last_piece_first: picking.2,
             ..Default::default()
         };
         apply_initial_have(&mut options, have);
@@ -2021,7 +2136,6 @@ impl TorrentService {
                 torrent.route = Some(plan.key);
                 torrent.held = None;
                 torrent.seen = Seen::default();
-                torrent.applied = None;
                 torrent.run_error = None;
             }
             None => {
@@ -2263,6 +2377,135 @@ impl TorrentService {
             .map_err(ActionError::State)
     }
 
+    /// The torrent's trackers, each with how announcing to it went.
+    pub async fn trackers(&self, job_id: JobId) -> Result<Vec<TorrentTracker>, ActionError> {
+        self.torrent(job_id)
+            .await
+            .map(|view| view.trackers)
+            .ok_or(ActionError::NotFound(job_id))
+    }
+
+    /// Add `tiers` after the torrent's last tier, leaving out the trackers
+    /// it already lists (libtorrent `torrent::add_tracker`; qBittorrent
+    /// `TorrentImpl::addTrackers`).
+    pub async fn add_trackers(
+        &self,
+        job_id: JobId,
+        tiers: Vec<Vec<String>>,
+    ) -> Result<(), ActionError> {
+        self.edit_trackers(job_id, |mut trackers| {
+            let next = trackers
+                .iter()
+                .map(|tracker| tracker.tier + 1)
+                .max()
+                .unwrap_or(0);
+            let added = tiers.into_iter().filter(|tier| !tier.is_empty());
+            for (tier, urls) in (next..).zip(added) {
+                trackers.extend(urls.into_iter().map(|url| TrackerEntry { tier, url }));
+            }
+            Ok(trackers)
+        })
+        .await
+    }
+
+    /// List `trackers` in place of the torrent's own (libtorrent
+    /// `torrent::replace_trackers`): announces to a tracker it no longer
+    /// lists stop.
+    pub async fn replace_trackers(
+        &self,
+        job_id: JobId,
+        trackers: Vec<TrackerEntry>,
+    ) -> Result<(), ActionError> {
+        self.edit_trackers(job_id, |_| Ok(trackers)).await
+    }
+
+    /// Stop listing each of `urls` (qBittorrent `TorrentImpl::removeTrackers`).
+    pub async fn remove_trackers(&self, job_id: JobId, urls: &[String]) -> Result<(), ActionError> {
+        self.edit_trackers(job_id, |mut trackers| {
+            trackers.retain(|tracker| !urls.iter().any(|url| url.trim() == tracker.url));
+            Ok(trackers)
+        })
+        .await
+    }
+
+    // Write the trackers `edit` makes of the torrent's list and hand them
+    // to its session. The rule they match is picked again in memory only:
+    // the stored rule is not this path's to write.
+    async fn edit_trackers(
+        &self,
+        job_id: JobId,
+        edit: impl FnOnce(Vec<TrackerEntry>) -> Result<Vec<TrackerEntry>, ActionError>,
+    ) -> Result<(), ActionError> {
+        {
+            let mut live = self.inner.live.lock().await;
+            let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            let listed = self
+                .inner
+                .db
+                .list_torrent_trackers(job_id)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            let trackers = edit(listed)?;
+            tracker_urls(&trackers)?;
+            let trackers = tidy_trackers(trackers);
+            let stored = self
+                .inner
+                .db
+                .set_torrent_trackers(job_id, &trackers)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            if !stored {
+                return Err(ActionError::NotFound(job_id));
+            }
+            torrent.record.tracker_rule_id = self.rule_id(&trackers);
+            if let Some(attached) = &torrent.attached {
+                attached.handle.replace_trackers(tracker_tiers(&trackers));
+            }
+        }
+        self.apply_queue().await;
+        self.publish().await;
+        Ok(())
+    }
+
+    /// Announce to every tracker now, past the floor each set (libtorrent
+    /// `torrent_handle::force_reannounce` with `ignore_min_interval`, as
+    /// qBittorrent `TorrentImpl::forceReannounce` calls it). A stopped
+    /// torrent announces nothing.
+    pub async fn reannounce(&self, job_id: JobId) -> Result<(), ActionError> {
+        if let Some(handle) = self.handle_of(job_id).await? {
+            handle.force_reannounce(Duration::ZERO, None, true);
+        }
+        Ok(())
+    }
+
+    /// Announce to the tracker at `url` now, as [`Self::reannounce`] does to
+    /// all of them.
+    pub async fn reannounce_tracker(&self, job_id: JobId, url: &str) -> Result<(), ActionError> {
+        let handle = self.handle_of(job_id).await?;
+        let url = url.trim();
+        let listed = self
+            .inner
+            .db
+            .list_torrent_trackers(job_id)
+            .map_err(|error| ActionError::State(state_error(error)))?;
+        if listed.iter().all(|tracker| tracker.url != url) {
+            return Err(ActionError::Invalid(format!("no tracker {url}")));
+        }
+        let url = weaver_torrent::Url::parse(url)
+            .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))?;
+        if let Some(handle) = handle {
+            handle.force_reannounce(Duration::ZERO, Some(&url), true);
+        }
+        Ok(())
+    }
+
+    /// Look the torrent up on the DHT now (libtorrent
+    /// `torrent_handle::force_dht_announce`).
+    pub async fn dht_announce(&self, job_id: JobId) -> Result<(), ActionError> {
+        if let Some(handle) = self.handle_of(job_id).await? {
+            handle.force_dht_announce();
+        }
+        Ok(())
+    }
+
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {
         let record = self
             .with_torrent(job_id, |torrent| {
@@ -2426,6 +2669,49 @@ impl TorrentService {
                 }
             }
         }
+    }
+
+    /// The torrent's own upload and download limits in bytes per second
+    /// (libtorrent `torrent::set_upload_limit`, `set_download_limit`):
+    /// `None` keeps that limit as it is, `Some(None)` is unlimited and zero
+    /// holds that direction closed. A limit is kept on the torrent's row
+    /// before the torrent takes it, then reaches its peers at once; its
+    /// seeding policy's upload cap holds it too where that is tighter.
+    pub async fn set_rate_limits(
+        &self,
+        job_id: JobId,
+        upload: Option<Option<u64>>,
+        download: Option<Option<u64>>,
+    ) -> Result<(), ActionError> {
+        if let Some(limit) = [upload, download]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|limit| i64::try_from(*limit).is_err())
+        {
+            return Err(ActionError::Invalid(format!(
+                "a limit of {limit} bytes a second is past the largest, {}",
+                i64::MAX
+            )));
+        }
+        self.with_torrent(job_id, |torrent| {
+            self.inner
+                .db
+                .set_torrent_rate_limits(job_id, upload, download)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            let record = &mut torrent.record;
+            if let Some(upload) = upload {
+                record.upload_limit = upload;
+            }
+            if let Some(download) = download {
+                record.download_limit = download;
+            }
+            Ok(())
+        })
+        .await?;
+        self.apply_limits().await;
+        self.publish().await;
+        Ok(())
     }
 
     pub async fn set_policy_override(
@@ -2628,7 +2914,8 @@ impl TorrentService {
             .await;
         self.apply_goals(now).await;
         self.apply_queue().await;
-        self.apply_selection().await;
+        self.apply_picking().await;
+        self.apply_limits().await;
         self.drop_idle_sessions().await;
         self.publish().await;
         self.inner.ticks.send_modify(|ticks| *ticks += 1);
@@ -2782,33 +3069,155 @@ impl TorrentService {
         }
     }
 
-    // The files the job wants now. A full disk leaves them as they are: the
-    // session stops fetching in upload mode, not by a narrower selection.
-    async fn apply_selection(&self) {
-        let mut live = self.inner.live.lock().await;
-        for torrent in live.values_mut() {
+    // What each session runs is what is stored: the levels the job wants
+    // the files fetched at now (the operator's, with the job's raise),
+    // sequential and first-and-last, each read from the torrent's handle and
+    // pushed only where it differs. A change the session refuses (while it
+    // checks its files) is pushed again on the next pass. A full disk
+    // leaves the levels as they are: the session stops fetching in upload
+    // mode, not by lower levels.
+    async fn apply_picking(&self) {
+        let live = self.inner.live.lock().await;
+        for torrent in live.values() {
             let (Some(attached), Some(job)) = (&torrent.attached, &torrent.job) else {
                 continue;
             };
-            let wanted = job.with(|job| job.selection());
-            if wanted.is_empty() {
+            let handle = &attached.handle;
+            let record = &torrent.record;
+            if handle.sequential() != record.sequential {
+                handle.set_sequential(record.sequential);
+            }
+            if handle.first_last_piece_first() != record.first_last_piece_first
+                && let Err(error) = handle.set_first_last_piece_first(record.first_last_piece_first)
+            {
+                tracing::debug!(job_id = record.job_id.0, error = %error, "a torrent's first and last pieces did not move");
+            }
+            let wanted = fetch_levels(torrent, job);
+            let running = attached.handle.file_priorities();
+            let changes: Vec<(usize, FilePriority)> = wanted
+                .iter()
+                .enumerate()
+                .filter(|(index, level)| running.get(*index) != Some(*level))
+                .map(|(index, level)| (index, *level))
+                .collect();
+            if changes.is_empty() {
                 continue;
             }
-            if torrent.applied.as_ref() == Some(&wanted) {
-                continue;
-            }
-            let set: HashSet<usize> = wanted.iter().copied().collect();
-            match attached
+            if let Err(error) = attached
                 .session
-                .update_only_files(&attached.handle, &set)
+                .set_file_priorities(&attached.handle, &changes)
                 .await
             {
-                Ok(()) => torrent.applied = Some(wanted),
-                Err(error) => {
-                    tracing::debug!(job_id = torrent.record.job_id.0, error = %error, "a torrent's files did not change");
-                }
+                tracing::debug!(job_id = torrent.record.job_id.0, error = %error, "a torrent's file levels did not change");
             }
         }
+    }
+
+    // The limits each torrent's session holds it to, from its own and its
+    // seeding policy's as they are now: a change of either at any level
+    // reaches the torrent's peers without reconnecting them.
+    async fn apply_limits(&self) {
+        let settings = self.settings();
+        let rules = self.rules();
+        let live = self.inner.live.lock().await;
+        for torrent in live.values() {
+            let Some(attached) = &torrent.attached else {
+                continue;
+            };
+            let limits = ratelimits_of(&torrent.record, settings.policy(&torrent.record, &rules));
+            if attached.handle.ratelimits() != limits {
+                attached.handle.set_ratelimits(limits);
+            }
+        }
+    }
+
+    /// Set the operator's level for each given file, by its index in the
+    /// torrent, and push the levels to the torrent's session.
+    pub async fn set_file_priorities(
+        &self,
+        job_id: JobId,
+        priorities: &[(u32, FilePriority)],
+    ) -> Result<(), ActionError> {
+        self.with_torrent(job_id, |torrent| {
+            let mut levels = torrent.levels.clone();
+            let count = levels.len();
+            for (index, priority) in priorities {
+                let Some(level) = levels.get_mut(*index as usize) else {
+                    return Err(ActionError::Invalid(format!(
+                        "file {index} is out of range: the torrent has {count} files"
+                    )));
+                };
+                *level = *priority;
+            }
+            let padding: Vec<bool> = torrent
+                .layout
+                .iter()
+                .flat_map(|layout| layout.files().map(|file| file.padding))
+                .collect();
+            // Padding holds Ignored whatever is asked, and is stored as
+            // nothing asked: the metainfo says which files are padding.
+            let asked: Vec<FilePriority> = levels
+                .iter()
+                .zip(&padding)
+                .map(|(level, padding)| {
+                    if *padding {
+                        FilePriority::Normal
+                    } else {
+                        *level
+                    }
+                })
+                .collect();
+            self.inner
+                .db
+                .set_torrent_file_priorities(job_id, &asked)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            torrent.levels = asked
+                .iter()
+                .zip(&padding)
+                .map(|(level, padding)| level.held_by(*padding))
+                .collect();
+            Ok(())
+        })
+        .await?;
+        self.apply_picking().await;
+        self.publish().await;
+        Ok(())
+    }
+
+    /// Whether the torrent's pieces are fetched in order.
+    pub async fn set_sequential(&self, job_id: JobId, on: bool) -> Result<(), ActionError> {
+        self.with_torrent(job_id, |torrent| {
+            self.inner
+                .db
+                .set_torrent_sequential(job_id, on)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            torrent.record.sequential = on;
+            Ok(())
+        })
+        .await?;
+        self.apply_picking().await;
+        self.publish().await;
+        Ok(())
+    }
+
+    /// Whether each file's first and last pieces are fetched first.
+    pub async fn set_first_last_piece_first(
+        &self,
+        job_id: JobId,
+        on: bool,
+    ) -> Result<(), ActionError> {
+        self.with_torrent(job_id, |torrent| {
+            self.inner
+                .db
+                .set_torrent_first_last_piece_first(job_id, on)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            torrent.record.first_last_piece_first = on;
+            Ok(())
+        })
+        .await?;
+        self.apply_picking().await;
+        self.publish().await;
+        Ok(())
     }
 
     async fn drop_idle_sessions(&self) {
@@ -2907,6 +3316,8 @@ impl TorrentService {
             ratio: status::ratio(counters, total),
             download_bps: reading.speeds.0,
             upload_bps: reading.speeds.1,
+            upload_limit: record.upload_limit,
+            download_limit: record.download_limit,
             eta_seconds: status::eta_seconds(total.saturating_sub(have), reading.speeds.0),
             peers: reading.peers.0,
             seeds: reading.peers.1,
@@ -2935,6 +3346,8 @@ impl TorrentService {
             unpack: settings.unpack(record, &rules),
             route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
+            sequential: record.sequential,
+            first_last_piece_first: record.first_last_piece_first,
             file_have: reading.file_have,
             trackers: Vec::new(),
             metadata: record.metadata.clone(),
@@ -2948,9 +3361,10 @@ impl TorrentService {
         let (mut view, announces) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
-            (self.view(&settings, torrent, now), torrent.announces())
+            let mut view = self.view(&settings, torrent, now);
+            view.files = torrent.files();
+            (view, torrent.announces())
         };
-        view.files = self.inner.db.list_torrent_files(job_id).unwrap_or_default();
         view.trackers = status::trackers(
             self.inner
                 .db
@@ -3050,12 +3464,13 @@ fn top_priority(value: &str) -> bool {
 // The checkpoint the session starts from, so it does not check the files:
 // the pieces the job has, and no block of any other. The storage keeps a
 // piece's blocks in memory until the piece verifies, so no block of a piece
-// not had is ever written to the job's files.
+// not had is ever written to the job's files. None while the job vouches
+// for nothing: the session checks every piece.
 fn apply_initial_have(
     options: &mut AddTorrentOptions,
-    have: bitvec::boxed::BitBox<u8, bitvec::order::Msb0>,
+    have: Option<bitvec::boxed::BitBox<u8, bitvec::order::Msb0>>,
 ) {
-    options.checkpoint = Some(Checkpoint::pieces(have));
+    options.checkpoint = have.map(Checkpoint::pieces);
 }
 
 // Why a session refusal leaves a torrent without one.
@@ -3126,6 +3541,26 @@ fn downloading(view: &TorrentView, now_ms: i64) -> Option<JobPhaseProgress> {
     })
 }
 
+// The levels the session fetches a torrent's files at now.
+fn fetch_levels(torrent: &Live, job: &TorrentJob) -> Vec<FilePriority> {
+    raised_levels(&torrent.levels, job.with(|job| job.selection()))
+}
+
+// The operator's levels with the files the job raised at Maximum
+// (qBittorrent's top level); every other file keeps its stored level. A file
+// the operator ignored stays ignored.
+fn raised_levels(levels: &[FilePriority], raised: Vec<usize>) -> Vec<FilePriority> {
+    let mut levels = levels.to_vec();
+    for index in raised {
+        if let Some(level) = levels.get_mut(index)
+            && level.wanted()
+        {
+            *level = FilePriority::Maximum;
+        }
+    }
+    levels
+}
+
 // The bytes in hand of the files that go to disk: the progress over the
 // torrent's total, which leaves padding out as the session's own does
 // (libtorrent `file_progress::total_on_disk`).
@@ -3141,8 +3576,8 @@ fn on_disk(layout: Option<&PieceLayout>, file_have: &[u64]) -> u64 {
 }
 
 // Every file's bytes in hand. The session's progress counts only the files
-// selected now, and the selection narrows as files finish. While the session
-// checks the files, the checkpoint's figure stands.
+// above Ignored, so each file's own figure is what is kept. While the
+// session checks the files, the checkpoint's figure stands.
 fn take_file_have(kept: &mut Vec<u64>, engine: &Engine, reported: &[u64]) {
     if *engine != Engine::Checking && !reported.is_empty() {
         kept.clear();

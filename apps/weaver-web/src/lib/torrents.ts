@@ -42,13 +42,24 @@ export interface SeedingPolicyData {
   maxUploadBps: number | null;
 }
 
-export type TrackerStatus = "NOT_CONTACTED" | "UPDATING" | "WORKING" | "NOT_WORKING" | "DISABLED";
+export type TrackerStatus =
+  | "NOT_CONTACTED"
+  | "WORKING"
+  | "NOT_WORKING"
+  | "TRACKER_ERROR"
+  | "UNREACHABLE"
+  | "DISABLED";
+
+/** How eagerly a torrent file is fetched; an ignored file is not fetched. */
+export type TorrentFilePriority = "IGNORED" | "NORMAL" | "HIGH" | "MAXIMUM";
 
 export interface TorrentFileData {
   index: number;
   path: string;
   length: number;
+  /** Whether the file is fetched at all: its level is above ignored. */
   selected: boolean;
+  priority: TorrentFilePriority;
   /** The share of the file in hand, from 0 to 1. */
   progress: number;
 }
@@ -57,9 +68,13 @@ export interface TorrentTrackerData {
   tier: number;
   url: string;
   status: TrackerStatus;
+  /** An announce to it is in flight. */
+  updating: boolean;
   message: string | null;
   seeders: number | null;
   leechers: number | null;
+  /** The peers its last answer named. */
+  peers: number | null;
 }
 
 /** One connection to a peer of a torrent. */
@@ -95,6 +110,9 @@ export interface TorrentData extends TorrentSummaryData {
   uploadedBytes: number;
   downloadedBytes: number;
   downloadBps: number;
+  /** The torrent's own limits in bytes per second; null is unlimited and 0 closed. */
+  uploadLimit: number | null;
+  downloadLimit: number | null;
   etaSeconds: number | null;
   peers: number;
   seeds: number;
@@ -132,6 +150,10 @@ export interface TorrentData extends TorrentSummaryData {
   unpack: boolean;
   route: string | null;
   files: TorrentFileData[];
+  /** Whether its pieces are fetched in order. */
+  sequential: boolean;
+  /** Whether each file's first and last pieces are fetched first. */
+  firstLastPieceFirst: boolean;
   trackers: TorrentTrackerData[];
 }
 

@@ -646,18 +646,16 @@ impl Peer {
         self.trust.piece_failed(bannable)
     }
 
-    /// The peer as a pause at `now` leaves it on the list: where it listens,
-    /// its failures, trust and holepunch support, without its connection or
-    /// this run's counters. A connection the pause closes is closed at `now`
-    /// and in no error, by the one close rule [`Peer::closed`]: what it
-    /// showed of the peer is kept and its wait to reconnect starts then
-    /// (libtorrent
-    /// `torrent::do_pause` disconnects every peer with `torrent_paused`, an
-    /// error too mild to mark the peer failed, through
-    /// `peer_list::connection_closed`, and its `torrent_peer` stays on
-    /// `torrent::m_peer_list`).
-    pub(crate) fn idle(&self, now: Instant) -> Peer {
-        let mut idle = Peer {
+    /// The peer as a new run takes it from the list: where it listens, its
+    /// failures, trust and holepunch support, without its connection or
+    /// this run's counters. Taking the peer closes nothing: an event that
+    /// closes the connection runs the one close rule first (see
+    /// [`PeerStates::close_all`]); a connection that carries on into the
+    /// next run, as a magnet's metadata connection does, leaves no wait to
+    /// reconnect. Holepunch mode and a fast reconnect end with the
+    /// connection.
+    pub(crate) fn idle(&self) -> Peer {
+        Peer {
             addr: self.addr,
             state: PeerState::Dead,
             stats: Default::default(),
@@ -667,25 +665,13 @@ impl Peer {
             last_connected: self.last_connected,
             encrypt: self.encrypt,
             fast_reconnects: self.fast_reconnects,
-            fast_reconnect: self.fast_reconnect,
+            fast_reconnect: false,
             last_optimistic_unchoke: self.last_optimistic_unchoke,
             trust: self.trust,
             supports_holepunch: self.supports_holepunch,
             holepunch: false,
             sources: self.sources,
-        };
-        if self.connected_out().is_some() {
-            idle.closed(
-                self.get_live().map(|live| live.is_upload_only()),
-                now,
-                false,
-            );
         }
-        debug_assert!(
-            !idle.fast_reconnect,
-            "a fast reconnect outlived its connection"
-        );
-        idle
     }
 
     /// An idle peer joins the list of a new run: a connect candidate or

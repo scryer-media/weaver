@@ -2047,15 +2047,45 @@ type MutationRoot {
 	"""
 	setTorrentLocation(id: Int!, path: String!): Boolean!
 	"""
+	Set each named file's level; the others keep theirs.
+	"""
+	setTorrentFilePriorities(id: Int!, priorities: [TorrentFilePriorityInput!]!): Boolean!
+	"""
 	Check every piece of the torrent again, trusting nothing saved.
 	"""
 	recheckTorrent(id: Int!): Boolean!
+	setTorrentSequential(id: Int!, sequential: Boolean!): Boolean!
+	setTorrentFirstLastPieceFirst(id: Int!, firstLastPieceFirst: Boolean!): Boolean!
 	setTorrentCategory(id: Int!, category: String): Boolean!
 	"""
 	Ban a peer's address from the torrent: an IP, or an IP and port
 	whose port is ignored.
 	"""
 	banTorrentPeer(id: Int!, address: String!): Boolean!
+	"""
+	The torrent's own upload and download limits in bytes per second,
+	in force on its peers at once; null is unlimited and 0 closes that
+	direction. A limit left out is kept.
+	"""
+	setTorrentRateLimits(id: Int!, upload: Int, download: Int): Boolean!
+	"""
+	Add `urls` as one tier after the torrent's last; the ones it lists
+	already are left out.
+	"""
+	addTorrentTrackers(id: Int!, urls: [String!]!): Boolean!
+	"""
+	List `trackers` in place of the torrent's own.
+	"""
+	replaceTorrentTrackers(id: Int!, trackers: [TorrentTrackerInput!]!): Boolean!
+	removeTorrentTrackers(id: Int!, urls: [String!]!): Boolean!
+	"""
+	Announce now, to every tracker or to `tracker` alone.
+	"""
+	reannounceTorrent(id: Int!, tracker: String): Boolean!
+	"""
+	Look the torrent up on the DHT now.
+	"""
+	dhtAnnounceTorrent(id: Int!): Boolean!
 	"""
 	The torrent's own seeding policy; null returns it to its category's
 	and the global one.
@@ -2923,6 +2953,10 @@ type QueryRoot {
 	The torrent's live peer connections, by address.
 	"""
 	torrentPeers(id: Int!): [TorrentPeer!]!
+	"""
+	The torrent's trackers, each with how announcing to it went.
+	"""
+	torrentTrackers(id: Int!): [TorrentTracker!]!
 	"""
 	The torrents the schedule's pause leaves seeding, by the tracker rule
 	that keeps them; empty while no such pause is in force.
@@ -4917,6 +4951,16 @@ type Torrent {
 	ratio: Float!
 	downloadBps: Int!
 	uploadBps: Int!
+	"""
+	The torrent's own upload limit in bytes per second; null is
+	unlimited and 0 closed.
+	"""
+	uploadLimit: Int
+	"""
+	The torrent's own download limit in bytes per second; null is
+	unlimited and 0 closed.
+	"""
+	downloadLimit: Int
 	etaSeconds: Int
 	peers: Int!
 	seeds: Int!
@@ -4988,6 +5032,14 @@ type Torrent {
 	unpack: Boolean!
 	route: String
 	files: [TorrentFile!]!
+	"""
+	Whether its pieces are fetched in order.
+	"""
+	sequential: Boolean!
+	"""
+	Whether each file's first and last pieces are fetched first.
+	"""
+	firstLastPieceFirst: Boolean!
 	trackers: [TorrentTracker!]!
 }
 
@@ -5009,11 +5061,34 @@ type TorrentFile {
 	index: Int!
 	path: String!
 	length: Int!
+	"""
+	Whether the file is fetched at all: its level is above ignored.
+	"""
 	selected: Boolean!
+	priority: TorrentFilePriority!
 	"""
 	The share of the file in hand, from 0 to 1.
 	"""
 	progress: Float!
+}
+
+"""
+How eagerly a torrent file is fetched: qBittorrent's four levels. An
+ignored file is not fetched; padding is always ignored.
+"""
+enum TorrentFilePriority {
+	IGNORED
+	NORMAL
+	HIGH
+	MAXIMUM
+}
+
+"""
+A file's level, by its index in the torrent.
+"""
+input TorrentFilePriorityInput {
+	index: Int!
+	priority: TorrentFilePriority!
 }
 
 """
@@ -5172,11 +5247,39 @@ type TorrentTracker {
 	tier: Int!
 	url: String!
 	status: TrackerStatus!
+	"""
+	An announce to it is in flight.
+	"""
+	updating: Boolean!
 	message: String
 	seeders: Int
 	leechers: Int
+	"""
+	The completed downloads it last counted.
+	"""
+	downloaded: Int
+	"""
+	The peers its last answer named.
+	"""
+	peers: Int
+	"""
+	Announces to it that failed in a row.
+	"""
+	fails: Int!
 	lastAnnounceMs: Int
 	nextAnnounceMs: Int
+	"""
+	The earliest the tracker takes the next announce.
+	"""
+	minAnnounceMs: Int
+}
+
+"""
+A tracker in a torrent's list, by tier.
+"""
+input TorrentTrackerInput {
+	tier: Int!
+	url: String!
 }
 
 """
@@ -5229,9 +5332,10 @@ input TrackerRuleInput {
 
 enum TrackerStatus {
 	NOT_CONTACTED
-	UPDATING
 	WORKING
 	NOT_WORKING
+	TRACKER_ERROR
+	UNREACHABLE
 	DISABLED
 }
 

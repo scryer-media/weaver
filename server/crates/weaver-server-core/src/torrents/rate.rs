@@ -126,17 +126,20 @@ pub fn session_rates(rate: Option<u64>, used: &[u64]) -> Vec<Option<u64>> {
 /// applies to the peers already waiting on it.
 pub fn apply_torrent_rates(session: &Session, rates: TorrentRates) {
     let limits = &session.ratelimits;
-    let download = limit(rates.download);
+    let download = limit_kind(rates.download);
     if limits.get_download_bps() != download {
         limits.set_download_bps(download);
     }
-    let upload = limit(rates.upload);
+    let upload = limit_kind(rates.upload);
     if limits.get_upload_bps() != upload {
         limits.set_upload_bps(upload);
     }
 }
 
-fn limit(rate: Option<u64>) -> LimitKind {
+/// A rate in bytes per second as a limit: `None` is unlimited and zero
+/// closed. A rate past the most a limit counts, `u32::MAX` bytes a second,
+/// is held at that most.
+pub fn limit_kind(rate: Option<u64>) -> LimitKind {
     LimitKind::from(rate.map(|rate| u32::try_from(rate).unwrap_or(u32::MAX)))
 }
 

@@ -319,6 +319,9 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
             min_interval: Duration::from_secs(30),
             seeders: Some(3),
             leechers: Some(5),
+            downloaded: None,
+            peers: 0,
+            warning: None,
         })
     );
 
@@ -339,7 +342,7 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         vec![TrackerAnnounce {
             url: url.clone(),
             in_flight: true,
-            last: None,
+            ..Default::default()
         }]
     );
     assert_eq!(first.announces(), answered);
@@ -351,8 +354,7 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         handle.tracker_announces(),
         vec![TrackerAnnounce {
             url,
-            in_flight: false,
-            last: None,
+            ..Default::default()
         }]
     );
     Ok(())

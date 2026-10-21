@@ -12,12 +12,11 @@ pub mod stats;
 mod streaming;
 pub mod utils;
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Weak;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -55,7 +54,10 @@ use crate::Session;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
 use crate::limits::{Limits, LimitsConfig};
-use crate::piece_priority::{PiecePriority, validate_piece_priorities};
+use crate::piece_priority::{
+    FilePriority, PiecePriority, file_priorities, file_to_piece_priorities,
+    validate_piece_priorities, wanted_files,
+};
 use crate::session::TorrentId;
 use crate::spawn_utils::BlockingSpawner;
 use crate::storage::BoxStorageFactory;
@@ -120,9 +122,17 @@ pub(crate) struct ManagedTorrentLocked {
     // This should change only on "unpause".
     pub(crate) paused: bool,
     pub(crate) state: ManagedTorrentState,
-    pub(crate) only_files: Option<Vec<usize>>,
-    // The fetch priority of every piece; None while all are Normal.
-    pub(crate) piece_priorities: Option<Vec<PiecePriority>>,
+    // Each file's level, padding at Ignored, and whether the first and last
+    // pieces of each wanted file go first: what the pieces' priorities are
+    // derived from (qBittorrent `TorrentImpl::m_filePriorities` and
+    // `m_hasFirstLastPiecePriority`).
+    pub(crate) files: Vec<FilePriority>,
+    pub(crate) first_last: bool,
+    // The fetch priority of every piece: the files' rule at each change to
+    // the files, with any piece set since over it (libtorrent keeps one
+    // priority a piece, which a change to the file priorities rewrites
+    // whole, `torrent::update_piece_priorities`).
+    pub(crate) piece_priorities: Vec<PiecePriority>,
     // The announce table of the trackers of the latest live run. It outlives
     // the run, so the last outcomes stay readable while paused.
     pub(crate) trackers: Option<crate::tracker::TrackerStatus>,
@@ -147,6 +157,10 @@ pub(crate) struct ManagedTorrentOptions {
     pub disable_v1_hashes: bool,
     /// [`AddTorrentOptions::super_seeding`](crate::AddTorrentOptions::super_seeding).
     pub super_seeding: bool,
+    /// [`AddTorrentOptions::sequential`](crate::AddTorrentOptions::sequential).
+    /// Every live run picks through this one flag, so a change reaches the
+    /// running peers and outlives pause/unpause.
+    pub sequential: AtomicBool,
 }
 
 impl ManagedTorrentOptions {
@@ -329,10 +343,13 @@ pub struct ManagedTorrentShared {
     /// Every hash the torrent answers to and announces under.
     pub info_hashes: InfoHashes,
     pub(crate) spawner: BlockingSpawner,
-    /// Every tracker in `tracker_tiers`.
-    pub trackers: HashSet<url::Url>,
-    /// The torrent's trackers grouped into tiers (BEP 12), in announce order.
-    pub tracker_tiers: Vec<Vec<url::Url>>,
+    /// The torrent's trackers grouped into tiers (BEP 12), in announce order
+    /// (libtorrent `torrent::m_trackers`); see
+    /// [`ManagedTorrent::replace_trackers`].
+    pub(crate) tracker_tiers: parking_lot::RwLock<Vec<Vec<url::Url>>>,
+    /// Each change starts a new DHT announce of the running torrent
+    /// (libtorrent `torrent::dht_announce`).
+    pub(crate) dht_announce: tokio::sync::watch::Sender<()>,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
@@ -376,6 +393,11 @@ pub(crate) struct RunCounters {
 impl ManagedTorrentShared {
     pub(crate) fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    /// The torrent's trackers grouped into tiers (BEP 12), in announce order.
+    pub fn tracker_tiers(&self) -> Vec<Vec<url::Url>> {
+        self.tracker_tiers.read().clone()
     }
 
     pub fn identity(&self) -> Identity {
@@ -450,7 +472,7 @@ impl ManagedTorrent {
     pub fn magnet(&self) -> Magnet {
         let trackers = self
             .shared
-            .tracker_tiers
+            .tracker_tiers()
             .iter()
             .flatten()
             .map(|t| t.to_string())
@@ -484,8 +506,91 @@ impl ManagedTorrent {
         self.shared.web_seeds.remove(seed)
     }
 
+    /// The files fetched at all, by index: those above `Ignored`.
     pub fn only_files(&self) -> Option<Vec<usize>> {
-        self.locked.read().only_files.clone()
+        Some(wanted_files(&self.locked.read().files))
+    }
+
+    /// Each file's level, by index; padding is `Ignored`.
+    pub fn file_priorities(&self) -> Vec<FilePriority> {
+        self.locked.read().files.clone()
+    }
+
+    /// Set the level of the given files; files not named keep theirs, and
+    /// padding stays `Ignored`. Every piece's priority is derived anew from
+    /// the levels, which undoes any set piece by piece (libtorrent
+    /// `torrent::prioritize_files`, `update_piece_priorities`). Refused,
+    /// with nothing changed, if an index names no file, or while the
+    /// initial check runs.
+    pub fn set_file_priorities(&self, priorities: &[(usize, FilePriority)]) -> anyhow::Result<()> {
+        self.prioritize_files(|files, _| {
+            let count = files.len();
+            for (index, priority) in priorities.iter().copied() {
+                let slot = files.get_mut(index).with_context(|| {
+                    format!("file {index} is out of range: the torrent has {count} files")
+                })?;
+                *slot = priority;
+            }
+            Ok(())
+        })
+    }
+
+    /// Whether the first and last pieces of each wanted file go first.
+    pub fn first_last_piece_first(&self) -> bool {
+        self.locked.read().first_last
+    }
+
+    /// Put the first and last ceil(1% of the file / piece length) pieces of
+    /// each wanted file at the top level, or, off, back at the file's
+    /// (qBittorrent `TorrentImpl::setFirstLastPiecePriority`). As
+    /// [`Self::set_file_priorities`], it derives every piece anew.
+    pub fn set_first_last_piece_first(&self, on: bool) -> anyhow::Result<()> {
+        self.prioritize_files(|_, first_last| {
+            *first_last = on;
+            Ok(())
+        })
+    }
+
+    /// Whether pieces are picked in order; see [`Self::set_sequential`].
+    pub fn sequential(&self) -> bool {
+        self.shared.options.sequential.load(Ordering::Relaxed)
+    }
+
+    /// Pick the top-level pieces first, then every other wanted piece by
+    /// index, in place of rarest first (libtorrent
+    /// `torrent::set_sequential_download`). The running peers take it at
+    /// their next pick.
+    pub fn set_sequential(&self, on: bool) {
+        self.shared.options.sequential.store(on, Ordering::Relaxed);
+    }
+
+    // The one path a change to the files takes: `change` edits the levels
+    // and the first-and-last switch, every piece's priority is derived from
+    // them, and the torrent's pieces take it.
+    fn prioritize_files(
+        &self,
+        change: impl FnOnce(&mut Vec<FilePriority>, &mut bool) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let metadata = self.metadata.load();
+        let metadata = metadata.as_ref().context("torrent is not resolved")?;
+        let mut g = self.locked.write();
+        let mut files = g.files.clone();
+        let mut first_last = g.first_last;
+        change(&mut files, &mut first_last)?;
+        let files = file_priorities(&metadata.file_infos, &files);
+        let pieces =
+            file_to_piece_priorities(metadata.lengths(), &metadata.file_infos, &files, first_last);
+        match &mut g.state {
+            ManagedTorrentState::Initializing(_) => bail!("can't update initializing torrent"),
+            ManagedTorrentState::Error(_) => {}
+            ManagedTorrentState::None => {}
+            ManagedTorrentState::Paused(p) => p.prioritize(&files, &pieces),
+            ManagedTorrentState::Live(l) => l.prioritize(&files, &pieces)?,
+        };
+        g.files = files;
+        g.first_last = first_last;
+        g.piece_priorities = pieces;
+        Ok(())
     }
 
     pub fn with_state<R>(&self, f: impl FnOnce(&ManagedTorrentState) -> R) -> R {
@@ -497,14 +602,11 @@ impl ManagedTorrent {
     pub fn piece_priority(&self, piece: u32) -> Option<PiecePriority> {
         let metadata = self.metadata.load();
         metadata.as_ref()?.lengths().validate_piece_index(piece)?;
-        Some(
-            self.locked
-                .read()
-                .piece_priorities
-                .as_ref()
-                .map(|p| p[piece as usize])
-                .unwrap_or_default(),
-        )
+        self.locked
+            .read()
+            .piece_priorities
+            .get(piece as usize)
+            .copied()
     }
 
     /// Set the fetch priority of the given pieces; see [`PiecePriority`]. Pieces not
@@ -528,11 +630,8 @@ impl ManagedTorrent {
             }
         };
 
-        let all = g.piece_priorities.get_or_insert_with(|| {
-            vec![PiecePriority::Normal; metadata.lengths().total_pieces() as usize]
-        });
         for (index, priority) in priorities {
-            all[index.get_usize()] = priority;
+            g.piece_priorities[index.get_usize()] = priority;
         }
         Ok(())
     }
@@ -840,6 +939,69 @@ impl ManagedTorrent {
             .unwrap_or_default()
     }
 
+    /// The torrent's trackers become `tiers`, each kept where first named
+    /// (libtorrent `torrent::replace_trackers`): its next run announces to
+    /// them, and a running torrent does from now on (see
+    /// [`crate::tracker::TrackerStatus::replace`]). The table of its latest
+    /// run lists them at once.
+    pub fn replace_trackers(&self, tiers: Vec<Vec<url::Url>>) {
+        let tiers = crate::tracker::tidy_tiers(tiers);
+        *self.shared.tracker_tiers.write() = tiers.clone();
+        let (Some(status), Some(session)) = (self.tracker_status(), self.shared.session.upgrade())
+        else {
+            return;
+        };
+        let private = self
+            .with_metadata(|m| m.info.info().private)
+            .unwrap_or(false);
+        status.replace(session.announce_tiers(tiers, private));
+    }
+
+    /// Adds `tiers` after the torrent's last tier, a tracker it has already
+    /// left where it is (libtorrent `torrent::add_tracker`).
+    pub fn add_trackers(&self, tiers: Vec<Vec<url::Url>>) {
+        let current = self.shared.tracker_tiers();
+        self.replace_trackers(crate::tracker::added_tiers(&current, tiers));
+    }
+
+    /// Removes `urls` from the torrent's trackers (qBittorrent
+    /// `TorrentImpl::removeTrackers`, through `replace_trackers`).
+    pub fn remove_trackers(&self, urls: &[url::Url]) {
+        let current = self.shared.tracker_tiers();
+        self.replace_trackers(crate::tracker::without_trackers(&current, urls));
+    }
+
+    /// Brings the next announce forward to `after` from now, to every
+    /// tracker or to `tracker` alone (libtorrent
+    /// `torrent_handle::force_reannounce`); see
+    /// [`crate::tracker::TrackerStatus::reannounce`]. Nothing happens unless
+    /// the torrent runs. False when `tracker` is not one of the torrent's.
+    pub fn force_reannounce(
+        &self,
+        after: Duration,
+        tracker: Option<&url::Url>,
+        ignore_min_interval: bool,
+    ) -> bool {
+        let known = tracker.is_none_or(|t| {
+            self.shared
+                .tracker_tiers
+                .read()
+                .iter()
+                .flatten()
+                .any(|u| u == t)
+        });
+        if known && let Some(status) = self.tracker_status() {
+            status.reannounce(after, tracker, ignore_min_interval);
+        }
+        known
+    }
+
+    /// Starts a new DHT announce of the running torrent under each of its
+    /// hashes (libtorrent `torrent_handle::force_dht_announce`).
+    pub fn force_dht_announce(&self) {
+        self.shared.dht_announce.send_replace(());
+    }
+
     /// The announce table behind [`Self::tracker_announces`], to wait for
     /// changes with [`crate::tracker::TrackerStatus::subscribe`]. A new live run
     /// brings a new table.
@@ -896,14 +1058,21 @@ impl ManagedTorrent {
             .shared
             .storage_factory
             .create_and_init(self.shared(), &metadata)?;
+        // Every piece is forgotten before anything is checked, so nothing
+        // the storage saves from here vouches for one the check has not
+        // found (libtorrent `torrent::force_recheck`: `set_have_all(false)`,
+        // `m_add_torrent_params.reset()`).
+        files
+            .on_check_everything()
+            .context("the storage did not forget its pieces")?;
         Ok(Arc::new(TorrentStateInitializing::new(
             self.shared.clone(),
             metadata,
-            g.only_files.clone(),
+            Some(wanted_files(&g.files)),
             files,
             true,
             None,
-            g.piece_priorities.clone(),
+            Some(g.piece_priorities.clone()),
             peers,
         )))
     }
@@ -1067,39 +1236,6 @@ impl ManagedTorrent {
             }
         }
         .boxed()
-    }
-
-    // Returns true if needed to unpause torrent.
-    // This is just implementation detail - it's easier to pause/unpause than to tinker with internals.
-    pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
-        let metadata = self.metadata.load();
-        let metadata = metadata.as_ref().context("torrent is not resolved")?;
-        let file_count = metadata.file_infos.len();
-        for f in only_files.iter().copied() {
-            if f >= file_count {
-                anyhow::bail!("only_files contains invalid value {f}")
-            }
-        }
-
-        // if live, need to update chunk tracker
-        // - if already finished: need to pause, then unpause (to reopen files etc)
-        // if paused, need to update chunk tracker
-
-        let mut g = self.locked.write();
-        match &mut g.state {
-            ManagedTorrentState::Initializing(_) => bail!("can't update initializing torrent"),
-            ManagedTorrentState::Error(_) => {}
-            ManagedTorrentState::None => {}
-            ManagedTorrentState::Paused(p) => {
-                p.update_only_files(only_files)?;
-            }
-            ManagedTorrentState::Live(l) => {
-                l.update_only_files(only_files)?;
-            }
-        };
-
-        g.only_files = Some(only_files.iter().copied().collect());
-        Ok(())
     }
 }
 

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::jobs::JobId;
 use crate::settings::SeedingPolicy;
+pub use weaver_torrent::FilePriority;
 
 // A hash a torrent is known by. A hybrid torrent has both, and a torrent
 // sharing either is a duplicate of it.
@@ -142,6 +143,14 @@ pub struct TorrentRecord {
     pub unpack: Option<bool>,
     // The attributes its job was added with.
     pub metadata: Vec<(String, String)>,
+    // Its own upload and download limits in bytes per second: None is
+    // unlimited and zero holds that direction closed.
+    pub upload_limit: Option<u64>,
+    pub download_limit: Option<u64>,
+    // Whether its pieces are fetched in order.
+    pub sequential: bool,
+    // Whether each file's first and last pieces are fetched first.
+    pub first_last_piece_first: bool,
 }
 
 impl TorrentRecord {
@@ -160,16 +169,77 @@ pub struct TorrentFile {
     pub index: u32,
     pub path: String,
     pub length: u64,
-    pub selected: bool,
+    // The operator's level for the file; padding is always Ignored.
+    pub priority: FilePriority,
 }
 
+impl TorrentFile {
+    /// Whether the file is fetched at all: above Ignored.
+    pub fn selected(&self) -> bool {
+        self.priority.wanted()
+    }
+}
+
+/// A file level as qBittorrent numbers it, in its API and in the resume
+/// data it hands libtorrent (qBittorrent `BitTorrent::DownloadPriority`).
+pub const fn file_priority_number(priority: FilePriority) -> u8 {
+    match priority {
+        FilePriority::Ignored => 0,
+        FilePriority::Normal => 1,
+        FilePriority::High => 6,
+        FilePriority::Maximum => 7,
+    }
+}
+
+/// The level a number names: the four qBittorrent defines and nothing else
+/// (qBittorrent `BitTorrent::isValidDownloadPriority`).
+pub const fn file_priority_of(number: u8) -> Option<FilePriority> {
+    Some(match number {
+        0 => FilePriority::Ignored,
+        1 => FilePriority::Normal,
+        6 => FilePriority::High,
+        7 => FilePriority::Maximum,
+        _ => return None,
+    })
+}
+
+/// A torrent's file levels as stored: one number per file in the
+/// metainfo's order, the normal files at the end left off, and nothing when
+/// every file is normal. A file past the list is normal, as one is past
+/// libtorrent resume data's `file_priority`.
+pub fn file_priorities_str(levels: &[FilePriority]) -> Option<String> {
+    let last = levels
+        .iter()
+        .rposition(|level| *level != FilePriority::Normal)?;
+    Some(
+        levels[..=last]
+            .iter()
+            .map(|level| char::from(b'0' + file_priority_number(*level)))
+            .collect(),
+    )
+}
+
+pub fn parse_file_priorities(value: &str) -> Option<Vec<FilePriority>> {
+    value
+        .chars()
+        .map(|digit| file_priority_of(u8::try_from(digit.to_digit(10)?).ok()?))
+        .collect()
+}
+
+/// How announcing to a tracker last went (qBittorrent
+/// `TrackerEndpointState`, from libtorrent's announce entry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackerStatus {
     NotContacted,
-    Updating,
     Working,
+    /// Not answering, or an answer that does not parse.
     NotWorking,
+    /// The tracker gave a failure reason (libtorrent `errors::tracker_failure`).
+    TrackerError,
+    /// No address of the tracker can be reached over the session's
+    /// families (libtorrent `errors::announce_skipped`).
+    Unreachable,
     Disabled,
 }
 
@@ -186,11 +256,23 @@ pub struct TorrentTracker {
     pub tier: u32,
     pub url: String,
     pub status: TrackerStatus,
+    /// An announce to it waits for its answer.
+    pub updating: bool,
     pub last_announce_ms: Option<i64>,
     pub next_announce_ms: Option<i64>,
+    /// The earliest the tracker takes the next announce: its last answer's
+    /// floor (libtorrent `announce_endpoint::min_announce`).
+    pub min_announce_ms: Option<i64>,
+    /// The tracker's warning, or why the last announce failed.
     pub message: Option<String>,
     pub seeders: Option<u32>,
     pub leechers: Option<u32>,
+    /// Downloads the tracker has seen finish.
+    pub downloaded: Option<u32>,
+    /// Peers its last answer named.
+    pub peers: Option<u32>,
+    /// Failures in a row since it last answered.
+    pub fails: u32,
 }
 
 // The seeding ledger.

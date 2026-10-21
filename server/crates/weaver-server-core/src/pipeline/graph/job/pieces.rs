@@ -90,7 +90,65 @@ impl GraphJob<PieceRoot> {
         Ok(())
     }
 
-    // The pieces in hand, for the fetch to start from.
+    // A piece that failed its hash, fetched or checked on disk: every
+    // file's share of it that was in hand is not, and waits to be fetched
+    // again, so the share it brings next is delivered and rewrites the
+    // file. Nothing is lost: a peer may yet send it.
+    // True when the job held any of it.
+    pub(crate) fn failed(
+        &mut self,
+        piece: u32,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<bool, GraphError> {
+        let in_hand = self.root.in_hand(piece);
+        for &(volume, range) in &in_hand {
+            self.unarrive(volume, piece, Some(range));
+        }
+        if in_hand.is_empty() {
+            return Ok(false);
+        }
+        self.after_units(in_hand.into_iter().map(|(volume, _)| volume), slots, limit)?;
+        Ok(true)
+    }
+
+    // A check of every piece began (libtorrent `torrent::force_recheck`
+    // forgets every piece): no piece in hand is had until the check finds
+    // it, and a checkpoint taken meanwhile says so. True when any was had.
+    pub(crate) fn checking(
+        &mut self,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<bool, GraphError> {
+        if !self.root.forget() {
+            return Ok(false);
+        }
+        self.after_units([], slots, limit)?;
+        Ok(true)
+    }
+
+    // The check found the piece (libtorrent `torrent::on_piece_hashed`,
+    // `we_have`): it is had again. True when it waited for the check.
+    pub(crate) fn found(
+        &mut self,
+        piece: u32,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<bool, GraphError> {
+        if !self.root.found(piece) {
+            return Ok(false);
+        }
+        self.after_units([], slots, limit)?;
+        Ok(true)
+    }
+
+    // Whether a piece in hand waits for a check to find it.
+    pub(crate) fn unchecked(&self) -> bool {
+        self.root.unchecked()
+    }
+
+    // The pieces in hand that no check waits to find, for the fetch to
+    // start from.
     pub(crate) fn have(&self) -> BitVec<u8, Msb0> {
         self.root.have()
     }
@@ -100,14 +158,38 @@ impl GraphJob<PieceRoot> {
         self.root.file_have()
     }
 
-    // The files the fetch should fetch now, by torrent index.
+    // The files the job has raised, by torrent index; none when it raised none.
     pub(crate) fn selection(&self) -> Vec<usize> {
         self.root.selection()
     }
 
-    // A volume's posted bytes as they are in hand now, for a peer.
+    // Raise every waiting piece of file `file` to critical, as an object's
+    // seek of all of it does.
+    #[cfg(test)]
+    pub(crate) fn raise(&mut self, file: u32) {
+        use crate::pipeline::graph::root::{Ask, Root};
+        use weaver_graph::{NodeId, Purpose, Seek, Weight};
+        let ask = Ask {
+            seek: Seek {
+                volume: VolumeIndex(file),
+                range: ByteRange::new(0, u64::MAX),
+                purpose: Purpose::Data,
+                weight: Weight::FIRST,
+            },
+            bidder: NodeId(1),
+            in_order: false,
+        };
+        self.root.answer(&[ask], |_| true);
+    }
+
+    // A volume's posted bytes as they are in hand now, for a peer or a
+    // check. A share the root does not hold is not read, though an object
+    // over it could still give its bytes back: the session is not told it
+    // has what the job waits for.
     pub(crate) fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.writer
-            .read_in_hand(&self.tree, MemberId(volume.0), range, into)
+        self.root.holds(volume, range)
+            && self
+                .writer
+                .read_in_hand(&self.tree, MemberId(volume.0), range, into)
     }
 }

@@ -32,7 +32,7 @@ use crate::peer_protocol::Piece;
 use crate::{
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, Moved},
     file_info::FileInfo,
-    piece_priority::PiecePriority,
+    piece_priority::{FilePriority, PiecePriority},
     type_aliases::{FileInfos, PeerHandle},
 };
 
@@ -133,6 +133,10 @@ pub struct PickOptions<'a> {
     /// pieces, the first of them it may take goes before the picker's own
     /// order (libtorrent `suggested_pieces`).
     pub suggested: &'a [ValidPieceIndex],
+    /// The torrent downloads in order: the top-level pieces first, rarest
+    /// first, then every other wanted piece by index, whatever its level
+    /// (libtorrent `sequential`, from `torrent::is_sequential_download`).
+    pub sequential: bool,
 }
 
 /// Parameters for acquiring a piece.
@@ -391,6 +395,12 @@ impl PieceTracker {
     ///   peer walks the order from its end, and takes the commonest.
     /// - Before that, the first piece it may take from a random place in
     ///   the order.
+    /// - In sequential mode, neither: the first top-level piece of the order
+    ///   it may take, then the first other piece it may take by index from
+    ///   the first wanted piece not had, whatever its level; started pieces
+    ///   go first only while they are many (libtorrent `pick_pieces` with
+    ///   `sequential`, walking `m_pieces` while at `top_priority`, then
+    ///   from `m_cursor`).
     fn pick<I, P, A, S>(&mut self, req: &AcquireRequest<'_, I, P, A, S>) -> Option<ValidPieceIndex>
     where
         I: Iterator<Item = ValidPieceIndex>,
@@ -406,13 +416,17 @@ impl PieceTracker {
         } = self;
         let chunks = &*chunks;
         let may = |p: &ValidPieceIndex| may_hand(chunks, &req.peer_has_piece, req.options, *p);
-        let rarest_first = chunks.have_count() >= INITIAL_PICKER_THRESHOLD;
+        let sequential = req.options.sequential;
+        // Sequential replaces both the random start and rarest first
+        // (libtorrent `peer_connection::picker_options`).
+        let rarest_first = !sequential && chunks.have_count() >= INITIAL_PICKER_THRESHOLD;
+        let random = !sequential && !rarest_first;
         // The first piece of a level's order the peer may take, the order
         // read the way this pick reads it: from a random place before we
         // have INITIAL_PICKER_THRESHOLD pieces, from its end for a snubbed
         // peer, from its front otherwise.
         let mut walk = |order: &[ValidPieceIndex]| {
-            let start = if rarest_first || order.is_empty() {
+            let start = if !random || order.is_empty() {
                 0
             } else {
                 rng.random_range(0..order.len())
@@ -425,22 +439,34 @@ impl PieceTracker {
                 walked.find(|p| may(p))
             }
         };
-        // The highest level with a piece the peer may take, and the piece
-        // the walk of its order stops at.
-        let (level, walked) = PiecePriority::WANTED_DESCENDING
-            .into_iter()
-            .find_map(|level| Some((level, walk(chunks.pick_order(level))?)))?;
+        // The tier a piece is picked in: its level, but in sequential mode
+        // every level below the top is one tier, walked by index.
+        let top = PiecePriority::WANTED_DESCENDING[0];
+        let tier = |p: ValidPieceIndex| {
+            let level = chunks.priority(p);
+            (!sequential || level == top).then_some(level)
+        };
+        // The highest tier with a piece the peer may take, and the piece the
+        // walk of its order stops at.
+        let walked = if sequential {
+            walk(chunks.pick_order(top)).or_else(|| chunks.iter_queued_pieces().find(|p| may(p)))
+        } else {
+            PiecePriority::WANTED_DESCENDING
+                .into_iter()
+                .find_map(|level| walk(chunks.pick_order(level)))
+        }?;
+        let tier_of_walked = tier(walked);
 
         let partials = inflight.len() + chunks.started_count();
         let chunks_per_piece = chunks.get_lengths().default_chunks_per_piece() as usize;
-        let prioritize_partials = !rarest_first
+        let prioritize_partials = random
             || partials > req.num_peers * 3 / 2
             || partials * chunks_per_piece > MAX_PARTIAL_CHUNKS;
 
         if prioritize_partials {
             let mut started_pieces = chunks
                 .started_pieces()
-                .filter(|p| chunks.priority(*p) == level && may(p));
+                .filter(|p| tier(*p) == tier_of_walked && may(p));
             let partial = if rarest_first {
                 started_pieces
                     .min_by_key(|p| (chunks.peers_with(*p), Reverse(chunks.received_chunks(*p))))
@@ -454,7 +480,7 @@ impl PieceTracker {
 
         let suggested = req.options.suggested.iter().copied();
         suggested
-            .filter(|p| chunks.picks_at(*p, level))
+            .filter(|p| chunks.picks_at(*p, chunks.priority(*p)) && tier(*p) == tier_of_walked)
             .find(|p| may(p))
             .or(Some(walked))
     }
@@ -738,33 +764,22 @@ impl PieceTracker {
         Some(result)
     }
 
-    /// Update which files are selected for download.
-    pub fn update_only_files(
+    /// The files' levels changed; see [`ChunkTracker::prioritize`].
+    pub fn prioritize(
         &mut self,
         file_infos: &FileInfos,
-        new_only_files: &HashSet<usize>,
-    ) -> anyhow::Result<crate::chunk_tracker::HaveNeededSelected> {
-        let hns = self.chunks.update_only_files(file_infos, new_only_files)?;
-        self.forget_dropped_blocks();
-        Ok(hns)
+        files: &[FilePriority],
+        pieces: &[PiecePriority],
+    ) -> crate::chunk_tracker::HaveNeededSelected {
+        self.chunks.prioritize(file_infos, files, pieces)
     }
 
     /// Set the fetch priority of the given pieces.
     pub fn set_piece_priorities(
         &mut self,
-        priorities: impl IntoIterator<Item = (ValidPieceIndex, crate::piece_priority::PiecePriority)>,
+        priorities: impl IntoIterator<Item = (ValidPieceIndex, PiecePriority)>,
     ) -> crate::chunk_tracker::HaveNeededSelected {
-        let hns = self.chunks.set_piece_priorities(priorities);
-        self.forget_dropped_blocks();
-        hns
-    }
-
-    /// A piece wanted again after it was not starts over without the blocks
-    /// it had received: who sent them goes with them.
-    fn forget_dropped_blocks(&mut self) {
-        let chunks = &self.chunks;
-        self.senders
-            .retain(|piece, _| chunks.received_chunks(*piece) > 0);
+        self.chunks.set_piece_priorities(priorities)
     }
 
     /// Update per-file have bytes when a piece completes. Returns remaining bytes for the file.
@@ -800,7 +815,7 @@ mod tests {
     use super::*;
     use crate::core::constants::CHUNK_SIZE;
     use crate::core::lengths::Lengths;
-    use crate::piece_priority::PiecePriority;
+    use crate::piece_priority::{FilePriority, PiecePriority};
     use crate::{bitv::BitV as BitVTrait, type_aliases::BF};
     use rand::SeedableRng;
     use std::cell::Cell;
@@ -1014,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn a_piece_that_drops_its_blocks_leaves_no_record() {
+    fn a_skipped_piece_keeps_its_blocks_and_their_record() {
         let mut tracker = tracker(2);
         deliver_from(&mut tracker, peer(1), 1, 0);
 
@@ -1025,10 +1040,15 @@ mod tests {
             Some(vec![Some(peer(1)), None, None, None])
         );
 
-        // Wanted again, it starts over without the block: the record goes.
+        // Wanted again, it asks only for the blocks it lacks (libtorrent
+        // `piece_picker::set_piece_priority` filters a piece, it does not
+        // forget it).
         pri(&mut tracker, &[(1, PiecePriority::Normal)]);
-        assert_eq!(tracker.missing_chunks(index(&tracker, 1)).count(), 4);
-        assert_eq!(record(&tracker, 1), None);
+        assert_eq!(tracker.missing_chunks(index(&tracker, 1)).count(), 3);
+        assert_eq!(
+            record(&tracker, 1),
+            Some(vec![Some(peer(1)), None, None, None])
+        );
     }
 
     #[test]
@@ -1527,6 +1547,177 @@ mod tests {
         pri(&mut tracker, &[(1, PiecePriority::Low)]);
         assert_eq!(tracker.chunks().get_hns().needed_bytes, full);
         assert_eq!(drain_for_peer(&mut tracker, all), vec![1]);
+    }
+
+    /// The one file of a [`make_test_chunk_tracker`] tracker.
+    fn one_file(tracker: &PieceTracker) -> crate::type_aliases::FileInfos {
+        let lengths = tracker.chunks().get_lengths();
+        vec![crate::file_info::FileInfo {
+            relative_filename: "test.dat".into(),
+            offset_in_torrent: 0,
+            len: lengths.total_length(),
+            piece_range: 0..lengths.total_pieces(),
+            attrs: Default::default(),
+        }]
+    }
+
+    /// Put the one file at `level`, its head and tail at the top with
+    /// `first_last`.
+    fn file_level(tracker: &mut PieceTracker, level: FilePriority, first_last: bool) {
+        let files = one_file(tracker);
+        let lengths = *tracker.chunks().get_lengths();
+        let pieces =
+            crate::piece_priority::file_to_piece_priorities(&lengths, &files, &[level], first_last);
+        tracker.prioritize(&files, &[level], &pieces);
+    }
+
+    #[test]
+    fn an_ignored_file_keeps_the_blocks_its_pieces_had() {
+        let mut tracker = tracker(3);
+        let full = tracker.chunks().get_hns().needed_bytes;
+        deliver_from(&mut tracker, peer(1), 1, 0);
+        deliver_from(&mut tracker, peer(1), 1, 1);
+
+        file_level(&mut tracker, FilePriority::Ignored, false);
+        assert_eq!(tracker.chunks().get_hns().needed_bytes, 0);
+        assert_eq!(drain_for_peer(&mut tracker, all), Vec::<u32>::new());
+        assert_eq!(tracker.missing_chunks(index(&tracker, 1)).count(), 2);
+
+        // Wanted again, the piece asks only for the two blocks it lacks.
+        file_level(&mut tracker, FilePriority::Normal, false);
+        assert_eq!(tracker.chunks().get_hns().needed_bytes, full);
+        assert_eq!(tracker.missing_chunks(index(&tracker, 1)).count(), 2);
+        let mut drained = drain_for_peer(&mut tracker, all);
+        drained.sort();
+        assert_eq!(drained, vec![0, 1, 2]);
+        let chunks: Vec<u32> = tracker
+            .chunks_to_request(index(&tracker, 1), peer(1))
+            .map(|c| c.chunk_index)
+            .collect();
+        assert_eq!(chunks, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_piece_in_flight_is_handed_to_no_other_peer_when_its_file_is_wanted_again() {
+        let mut tracker = tracker(2);
+        let held = reserved(tracker.acquire_piece(ask(peer(1), all, one)));
+        file_level(&mut tracker, FilePriority::Ignored, false);
+        file_level(&mut tracker, FilePriority::Normal, false);
+        assert!(tracker.is_owned_by(index(&tracker, held), peer(1)));
+        // The other peer gets the other piece, and then no piece of its own
+        // (the end game may double a block, which reserves nothing).
+        let other = reserved(tracker.acquire_piece(ask(peer(2), all, one)));
+        assert_ne!(other, held);
+        assert!(!matches!(
+            tracker.acquire_piece(ask(peer(3), all, one)),
+            AcquireResult::Reserved(_)
+        ));
+    }
+
+    // Every piece a peer that has them all would be handed in turn with
+    // sequential on.
+    fn drain_sequential(tracker: &mut PieceTracker) -> Vec<u32> {
+        drain_sequential_with(tracker, 100, false)
+    }
+
+    // [`drain_sequential`] with `num_peers` connected, by a peer that is
+    // snubbed when `reverse`.
+    fn drain_sequential_with(
+        tracker: &mut PieceTracker,
+        num_peers: usize,
+        reverse: bool,
+    ) -> Vec<u32> {
+        let mut order = Vec::new();
+        loop {
+            let mut req = ask(peer(1), all, |p: ValidPieceIndex| 100 - p.get());
+            req.options.sequential = true;
+            req.options.reverse = reverse;
+            req.num_peers = num_peers;
+            match tracker.acquire_piece(req) {
+                AcquireResult::Reserved(p) => order.push(p.get()),
+                AcquireResult::NoneAvailable => return order,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn sequential_hands_out_the_top_level_then_every_wanted_piece_by_index() {
+        // Rarest first would go from the end; sequential goes from the
+        // front, the Maximum piece first, the High piece in its place, the
+        // skipped piece never (libtorrent `piece_picker::pick_pieces`).
+        let mut tracker = rarest_first_tracker(7, 0);
+        deliver(&mut tracker, 0, 0);
+        pri(
+            &mut tracker,
+            &[
+                (5, PiecePriority::Critical),
+                (3, PiecePriority::High),
+                (4, PiecePriority::Skip),
+            ],
+        );
+        assert_eq!(drain_sequential(&mut tracker), vec![5, 0, 1, 2, 3, 6]);
+    }
+
+    #[test]
+    fn sequential_takes_started_pieces_first_only_while_they_are_many() {
+        // Two started pieces: few for a hundred peers, so the index order
+        // stands; more than one and a half per peer for one, so they go
+        // first (libtorrent `pick_pieces`, `prioritize_partials`).
+        let started = |tracker: &mut PieceTracker| {
+            deliver(tracker, 4, 0);
+            deliver(tracker, 6, 0);
+        };
+        let mut tracker = rarest_first_tracker(7, 0);
+        started(&mut tracker);
+        assert_eq!(
+            drain_sequential_with(&mut tracker, 100, false),
+            vec![0, 1, 2, 3, 4, 5, 6]
+        );
+        let mut tracker = rarest_first_tracker(7, 0);
+        started(&mut tracker);
+        assert_eq!(
+            drain_sequential_with(&mut tracker, 1, false),
+            vec![4, 6, 0, 1, 2, 3, 5]
+        );
+    }
+
+    #[test]
+    fn a_snubbed_peer_takes_pieces_by_index_in_sequential_mode() {
+        // Sequential turns rarest first off, and with it the snubbed peer's
+        // commonest-first walk (libtorrent `peer_connection::picker_options`
+        // sets `reverse` only alongside `rarest_first`).
+        let mut tracker = rarest_first_tracker(7, 0);
+        assert_eq!(
+            drain_sequential_with(&mut tracker, 100, true),
+            vec![0, 1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn the_first_and_last_pieces_of_a_file_go_first_and_off_restores_the_file_level() {
+        // 300 pieces: 1% is three at each end.
+        let mut tracker = tracker(300);
+        let edges = [0, 1, 2, 297, 298, 299];
+        file_level(&mut tracker, FilePriority::Normal, true);
+        let level = |tracker: &PieceTracker, p: u32| tracker.chunks().priority(index(tracker, p));
+        for p in 0..300 {
+            let expected = if edges.contains(&p) {
+                PiecePriority::Critical
+            } else {
+                PiecePriority::Normal
+            };
+            assert_eq!(level(&tracker, p), expected, "piece {p}");
+        }
+        // The head and tail go first.
+        let order = drain_for_peer(&mut tracker, all);
+        let first: BTreeSet<u32> = order[..6].iter().copied().collect();
+        assert_eq!(first, BTreeSet::from(edges));
+
+        file_level(&mut tracker, FilePriority::Normal, false);
+        for p in 0..300 {
+            assert_eq!(level(&tracker, p), PiecePriority::Normal, "piece {p}");
+        }
     }
 
     #[test]

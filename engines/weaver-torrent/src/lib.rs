@@ -74,7 +74,10 @@ mod vectored_traits;
 pub use error::{Error, Result};
 
 pub use crate::core::spawn_utils::spawn as librqbit_spawn;
-pub use crate::tracker::{AnnounceOk, LastAnnounce, TrackerAnnounce, TrackerStatus};
+pub use crate::tracker::{
+    AnnounceError, AnnounceErrorKind, AnnounceOk, LastAnnounce, TrackerAnnounce, TrackerStatus,
+};
+// Tracker edits name trackers by URL.
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
@@ -83,7 +86,7 @@ pub use listen::{ListenerMode, ListenerOptions};
 pub use mse::{Encryption, EncryptionPolicy, MseError};
 pub use network::{SocketFactory, StreamListener};
 pub use peer_connection::PeerConnectionOptions;
-pub use piece_priority::PiecePriority;
+pub use piece_priority::{FilePriority, PiecePriority};
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     SUPPORTED_SCHEMES, Session, SessionLimits, SessionOptions, SessionPersistenceConfig,
@@ -97,6 +100,7 @@ pub use torrent_state::{
     live::peers::ResumePeers,
 };
 pub use type_aliases::{BF, FileInfos, PeerSourceFlag, PeerSources};
+pub use url::Url;
 
 pub use crate::buffers::*;
 pub use crate::clone_to_owned::CloneToOwned;

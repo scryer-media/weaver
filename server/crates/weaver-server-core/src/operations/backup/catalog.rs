@@ -125,7 +125,6 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     // A torrent's rows describe its files in storage, which a database
     // restore does not bring back.
     table!("torrents", ResetOnRestore, RequireEmpty),
-    table!("torrent_files", ResetOnRestore, RequireEmpty),
     table!("torrent_trackers", ResetOnRestore, RequireEmpty),
     table!("torrent_counters", ResetOnRestore, RequireEmpty),
     // The hosts torrents have announced to outlive the torrents, and a

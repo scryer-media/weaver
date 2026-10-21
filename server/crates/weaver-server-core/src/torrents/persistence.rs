@@ -4,12 +4,13 @@
 use crate::StateError;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::settings::SeedingPolicy;
 use crate::settings::model::tracker_host;
+use crate::torrents::model::file_priorities_str;
 use crate::torrents::queries::{TORRENT_COLUMNS, torrent_by_infohash_tx};
 use crate::torrents::{
-    TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
+    FilePriority, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
 };
 use weaver_torrent::ResumePeers;
 
@@ -22,14 +23,30 @@ const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url) V
 const TRACKER_HOST_INSERT: &str =
     "INSERT INTO tracker_hosts (host) VALUES ({}) ON CONFLICT (host) DO NOTHING";
 
-fn tracker_host_args(trackers: &[TrackerEntry]) -> Vec<Vec<SqlArg>> {
-    trackers
+// The one place a torrent's tracker rows are written: each row, and the
+// host of each, recorded as `tracker_host` spells it.
+async fn insert_trackers(
+    tx: &mut SqlTx<'_>,
+    job_id: i64,
+    trackers: &[TrackerEntry],
+) -> Result<(), StateError> {
+    for tracker in trackers {
+        let args = [
+            SqlArg::I64(job_id),
+            SqlArg::I64(i64::from(tracker.tier)),
+            SqlArg::Text(tracker.url.clone()),
+        ];
+        tx.execute(TRACKER_INSERT, &args).await?;
+    }
+    let hosts: std::collections::BTreeSet<String> = trackers
         .iter()
         .filter_map(|tracker| tracker_host(&tracker.url))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(|host| vec![SqlArg::Text(host)])
-        .collect()
+        .collect();
+    for host in hosts {
+        tx.execute(TRACKER_HOST_INSERT, &[SqlArg::Text(host)])
+            .await?;
+    }
+    Ok(())
 }
 
 fn stored(value: u64) -> Result<i64, StateError> {
@@ -86,16 +103,19 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptI64(torrent.tracker_rule_id.map(i64::from)),
         SqlArg::OptBool(torrent.unpack),
         SqlArg::OptText(metadata),
+        SqlArg::OptI64(torrent.upload_limit.map(stored).transpose()?),
+        SqlArg::OptI64(torrent.download_limit.map(stored).transpose()?),
+        SqlArg::Bool(torrent.sequential),
+        SqlArg::Bool(torrent.first_last_piece_first),
     ])
 }
 
 impl Database {
-    // Add a torrent with its files and trackers and an empty seeding ledger,
+    // Add a torrent with its trackers and an empty seeding ledger,
     // unless a torrent with the same infohash is already a job.
     pub fn insert_torrent(
         &self,
         torrent: &TorrentRecord,
-        files: &[TorrentFile],
         trackers: &[TrackerEntry],
     ) -> Result<TorrentInsert, StateError> {
         let infohashes = torrent.infohashes();
@@ -107,67 +127,27 @@ impl Database {
         let job_id = torrent.job_id;
         let added_at_ms = torrent.added_at_ms;
         let torrent_args = torrent_args(torrent)?;
-        let file_args = files
-            .iter()
-            .map(|file| {
-                Ok(vec![
-                    SqlArg::I64(stored(job_id.0)?),
-                    SqlArg::I64(i64::from(file.index)),
-                    SqlArg::Text(file.path.clone()),
-                    SqlArg::I64(stored(file.length)?),
-                    SqlArg::Bool(file.selected),
-                ])
-            })
-            .collect::<Result<Vec<_>, StateError>>()?;
-        let tracker_args = trackers
-            .iter()
-            .map(|tracker| {
-                Ok(vec![
-                    SqlArg::I64(stored(job_id.0)?),
-                    SqlArg::I64(i64::from(tracker.tier)),
-                    SqlArg::Text(tracker.url.clone()),
-                ])
-            })
-            .collect::<Result<Vec<_>, StateError>>()?;
-        let host_args = tracker_host_args(trackers);
+        let id = stored(job_id.0)?;
+        let trackers = trackers.to_vec();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "insert_torrent", |tx| {
                 let infohashes = infohashes.clone();
                 let torrent_args = torrent_args.clone();
-                let file_args = file_args.clone();
-                let tracker_args = tracker_args.clone();
-                let host_args = host_args.clone();
+                let trackers = trackers.clone();
                 Box::pin(async move {
                     if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
                         return Ok(TorrentInsert::Duplicate(existing.job_id));
                     }
+                    // One placeholder per value: the column list and the
+                    // values are both TORRENT_COLUMNS' order.
+                    let values = vec!["{}"; torrent_args.len()].join(", ");
                     tx.execute(
-                        &format!(
-                            "INSERT INTO torrents ({TORRENT_COLUMNS})
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
-                        ),
+                        &format!("INSERT INTO torrents ({TORRENT_COLUMNS}) VALUES ({values})"),
                         &torrent_args,
                     )
                     .await?;
-                    for args in &file_args {
-                        tx.execute(
-                            "INSERT INTO torrent_files (job_id, file_index, path, length, selected)
-                             VALUES ({}, {}, {}, {}, {})",
-                            args,
-                        )
-                        .await?;
-                    }
-                    for args in &tracker_args {
-                        tx.execute(
-                            TRACKER_INSERT,
-                            args,
-                        )
-                        .await?;
-                    }
-                    for args in &host_args {
-                        tx.execute(TRACKER_HOST_INSERT, args).await?;
-                    }
+                    insert_trackers(tx, id, &trackers).await?;
                     tx.execute(
                         "INSERT INTO torrent_counters (job_id, updated_at_ms) VALUES ({}, {})",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(added_at_ms)],
@@ -318,6 +298,43 @@ impl Database {
         })
     }
 
+    // The torrent's trackers, as edited (libtorrent `write_resume_data`
+    // keeps them as its `trackers` and `tiers`). Returns whether the torrent
+    // exists.
+    pub fn set_torrent_trackers(
+        &self,
+        job_id: JobId,
+        trackers: &[TrackerEntry],
+    ) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let trackers = trackers.to_vec();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_trackers", |tx| {
+                let trackers = trackers.clone();
+                Box::pin(async move {
+                    let known = tx
+                        .fetch_optional(
+                            "SELECT job_id FROM torrents WHERE job_id = {}",
+                            &[SqlArg::I64(id)],
+                        )
+                        .await?;
+                    if known.is_none() {
+                        return Ok(false);
+                    }
+                    tx.execute(
+                        "DELETE FROM torrent_trackers WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_trackers(tx, id, &trackers).await?;
+                    Ok(true)
+                })
+            })
+            .await
+        })
+    }
+
     // Whether the torrent's archives are extracted, fixed when its job is
     // built. Returns whether the torrent exists.
     pub fn set_torrent_unpack(&self, job_id: JobId, unpack: bool) -> Result<bool, StateError> {
@@ -347,7 +364,6 @@ impl Database {
         metainfo: &[u8],
         private: bool,
         storage_dir: &str,
-        files: &[TorrentFile],
         trackers: &[TrackerEntry],
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
@@ -360,36 +376,12 @@ impl Database {
             SqlArg::Text(storage_dir.to_owned()),
             SqlArg::I64(id),
         ];
-        let file_args = files
-            .iter()
-            .map(|file| {
-                Ok(vec![
-                    SqlArg::I64(id),
-                    SqlArg::I64(i64::from(file.index)),
-                    SqlArg::Text(file.path.clone()),
-                    SqlArg::I64(stored(file.length)?),
-                    SqlArg::Bool(file.selected),
-                ])
-            })
-            .collect::<Result<Vec<_>, StateError>>()?;
-        let tracker_args = trackers
-            .iter()
-            .map(|tracker| {
-                vec![
-                    SqlArg::I64(id),
-                    SqlArg::I64(i64::from(tracker.tier)),
-                    SqlArg::Text(tracker.url.clone()),
-                ]
-            })
-            .collect::<Vec<_>>();
-        let host_args = tracker_host_args(trackers);
+        let trackers = trackers.to_vec();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_metainfo", |tx| {
                 let head = head.clone();
-                let file_args = file_args.clone();
-                let tracker_args = tracker_args.clone();
-                let host_args = host_args.clone();
+                let trackers = trackers.clone();
                 Box::pin(async move {
                     let changed = tx
                         .execute(
@@ -402,31 +394,12 @@ impl Database {
                     if changed == 0 {
                         return Ok(false);
                     }
-                    for table in ["torrent_files", "torrent_trackers"] {
-                        tx.execute(
-                            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
-                            &[SqlArg::I64(id)],
-                        )
-                        .await?;
-                    }
-                    for args in &file_args {
-                        tx.execute(
-                            "INSERT INTO torrent_files (job_id, file_index, path, length, selected)
-                             VALUES ({}, {}, {}, {}, {})",
-                            args,
-                        )
-                        .await?;
-                    }
-                    for args in &tracker_args {
-                        tx.execute(
-                            TRACKER_INSERT,
-                            args,
-                        )
-                        .await?;
-                    }
-                    for args in &host_args {
-                        tx.execute(TRACKER_HOST_INSERT, args).await?;
-                    }
+                    tx.execute(
+                        "DELETE FROM torrent_trackers WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_trackers(tx, id, &trackers).await?;
                     Ok(true)
                 })
             })
@@ -446,6 +419,79 @@ impl Database {
                 &args,
             )
             .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The torrent's own upload and download limits in bytes per second:
+    // `None` keeps a limit as it is, `Some(None)` is unlimited and zero
+    // closed. Returns whether the torrent exists.
+    pub fn set_torrent_rate_limits(
+        &self,
+        job_id: JobId,
+        upload: Option<Option<u64>>,
+        download: Option<Option<u64>>,
+    ) -> Result<bool, StateError> {
+        let mut args = Vec::new();
+        for limit in [upload, download] {
+            args.push(SqlArg::I64(i64::from(limit.is_some())));
+            args.push(SqlArg::OptI64(limit.flatten().map(stored).transpose()?));
+        }
+        args.push(SqlArg::I64(stored(job_id.0)?));
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET \
+                 upload_limit = CASE WHEN {} = 1 THEN {} ELSE upload_limit END, \
+                 download_limit = CASE WHEN {} = 1 THEN {} ELSE download_limit END \
+                 WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The operator's level for every file of a torrent, in the metainfo's
+    // order, written whole. Returns whether the torrent exists.
+    pub fn set_torrent_file_priorities(
+        &self,
+        job_id: JobId,
+        levels: &[FilePriority],
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(file_priorities_str(levels)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("file_priorities", args)
+    }
+
+    // Whether the torrent fetches its pieces in order. Returns whether the
+    // torrent exists.
+    pub fn set_torrent_sequential(&self, job_id: JobId, on: bool) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(on), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("sequential", args)
+    }
+
+    // Whether each of the torrent's files has its first and last pieces
+    // fetched first. Returns whether the torrent exists.
+    pub fn set_torrent_first_last_piece_first(
+        &self,
+        job_id: JobId,
+        on: bool,
+    ) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(on), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("first_last_piece_first", args)
+    }
+
+    // Write one column of a torrent and no other, so the writers of
+    // different columns never undo each other.
+    fn set_torrent_column(&self, column: &str, args: Vec<SqlArg>) -> Result<bool, StateError> {
+        let sql = format!("UPDATE torrents SET {column} = {{}} WHERE job_id = {{}}");
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
             Ok(changed > 0)
         })
     }

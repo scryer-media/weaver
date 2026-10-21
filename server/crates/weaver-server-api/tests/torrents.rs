@@ -716,3 +716,224 @@ async fn a_torrents_peers_are_listed_and_a_ban_is_kept() {
         .await;
     assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"));
 }
+
+// libtorrent `torrent::set_upload_limit` / `set_download_limit`: a torrent's
+// own limits are set together and read back; null is unlimited and 0 holds
+// that direction closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_rate_limits_are_set_and_read_back() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let limits = || async {
+        let read = rig
+            .execute(&format!(
+                "{{ torrent(id: {id}) {{ uploadLimit downloadLimit }} }}"
+            ))
+            .await;
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let data = read.data.into_json().unwrap();
+        (
+            data["torrent"]["uploadLimit"].clone(),
+            data["torrent"]["downloadLimit"].clone(),
+        )
+    };
+    assert_eq!(limits().await, (Value::Null, Value::Null));
+
+    // A limit left out is kept; null lifts it.
+    for (limits_set, read) in [
+        (
+            "upload: 65536, download: 0",
+            (Value::from(65_536), Value::from(0)),
+        ),
+        (
+            "download: 1048576",
+            (Value::from(65_536), Value::from(1_048_576)),
+        ),
+        ("upload: null", (Value::Null, Value::from(1_048_576))),
+    ] {
+        let set = rig
+            .execute(&format!(
+                "mutation {{ setTorrentRateLimits(id: {id}, {limits_set}) }}"
+            ))
+            .await;
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+        assert_eq!(limits().await, read);
+    }
+    let stored = rig
+        .harness
+        .db
+        .get_torrent(weaver_server_core::jobs::ids::JobId(id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (stored.upload_limit, stored.download_limit),
+        (None, Some(1_048_576))
+    );
+
+    let unknown = rig
+        .execute("mutation { setTorrentRateLimits(id: 999999, upload: 1) }")
+        .await;
+    assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"));
+}
+
+// A file's level and the torrent's two picking toggles are set by their
+// mutations and read back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_levels_and_picking_toggles_round_trip() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let read = |id: u64| {
+        format!(
+            "{{ torrent(id: {id}) {{ sequential firstLastPieceFirst files {{ selected priority }} }} }}"
+        )
+    };
+    let before = rig.execute(&read(id)).await.data.into_json().unwrap();
+    assert_eq!(before["torrent"]["files"][0]["priority"], "NORMAL");
+    assert_eq!(before["torrent"]["sequential"], false);
+    assert_eq!(before["torrent"]["firstLastPieceFirst"], false);
+
+    for mutation in [
+        format!(
+            "mutation {{ setTorrentFilePriorities(id: {id}, priorities: [{{ index: 0, priority: IGNORED }}]) }}"
+        ),
+        format!("mutation {{ setTorrentSequential(id: {id}, sequential: true) }}"),
+        format!(
+            "mutation {{ setTorrentFirstLastPieceFirst(id: {id}, firstLastPieceFirst: true) }}"
+        ),
+    ] {
+        let response = rig.execute(&mutation).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
+    let after = rig.execute(&read(id)).await.data.into_json().unwrap();
+    assert_eq!(after["torrent"]["files"][0]["priority"], "IGNORED");
+    assert_eq!(after["torrent"]["files"][0]["selected"], false);
+    assert_eq!(after["torrent"]["sequential"], true);
+    assert_eq!(after["torrent"]["firstLastPieceFirst"], true);
+
+    let out_of_range = rig
+        .execute(&format!(
+            "mutation {{ setTorrentFilePriorities(id: {id}, priorities: [{{ index: 1, priority: HIGH }}]) }}"
+        ))
+        .await;
+    assert_eq!(code(&out_of_range).as_deref(), Some("INVALID_INPUT"));
+}
+
+// A torrent's trackers are listed, added, replaced and removed, and a
+// reannounce or DHT announce is taken; an unknown torrent or tracker is
+// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_trackers_are_listed_and_edited() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let run = |query: String| {
+        let rig = &rig;
+        async move {
+            let response = rig.execute(&query).await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            response.data.into_json().unwrap()
+        }
+    };
+    let listed = || {
+        run(format!(
+            "{{ torrentTrackers(id: {id}) {{ tier url status updating message seeders \
+             leechers downloaded peers fails nextAnnounceMs }} }}"
+        ))
+    };
+
+    run(format!(
+        r#"mutation {{ addTorrentTrackers(id: {id}, urls: ["http://a.invalid/announce", "udp://b.invalid:80"]) }}"#
+    ))
+    .await;
+    run(format!(
+        r#"mutation {{ addTorrentTrackers(id: {id}, urls: ["http://a.invalid/announce", "http://c.invalid/announce"]) }}"#
+    ))
+    .await;
+    let trackers = listed().await;
+    let rows: Vec<(u64, &str, &str)> = trackers["torrentTrackers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tracker| {
+            (
+                tracker["tier"].as_u64().unwrap(),
+                tracker["url"].as_str().unwrap(),
+                tracker["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (0, "http://a.invalid/announce", "NOT_CONTACTED"),
+            (0, "udp://b.invalid:80", "NOT_CONTACTED"),
+            (1, "http://c.invalid/announce", "NOT_CONTACTED"),
+        ]
+    );
+    assert_eq!(trackers["torrentTrackers"][0]["updating"], false);
+    assert_eq!(trackers["torrentTrackers"][0]["fails"], 0);
+
+    run(format!(
+        r#"mutation {{ replaceTorrentTrackers(id: {id}, trackers: [{{ tier: 3, url: "http://c.invalid/announce" }}, {{ tier: 1, url: "udp://b.invalid:80" }}]) }}"#
+    ))
+    .await;
+    run(format!(
+        r#"mutation {{ removeTorrentTrackers(id: {id}, urls: ["udp://b.invalid:80"]) }}"#
+    ))
+    .await;
+    let trackers = listed().await;
+    assert_eq!(trackers["torrentTrackers"].as_array().unwrap().len(), 1);
+    assert_eq!(trackers["torrentTrackers"][0]["tier"], 3);
+    assert_eq!(
+        trackers["torrentTrackers"][0]["url"],
+        "http://c.invalid/announce"
+    );
+
+    run(format!("mutation {{ reannounceTorrent(id: {id}) }}")).await;
+    run(format!(
+        r#"mutation {{ reannounceTorrent(id: {id}, tracker: "http://c.invalid/announce") }}"#
+    ))
+    .await;
+    run(format!("mutation {{ dhtAnnounceTorrent(id: {id}) }}")).await;
+
+    let unknown = rig
+        .execute(&format!(
+            r#"mutation {{ reannounceTorrent(id: {id}, tracker: "http://d.invalid/announce") }}"#
+        ))
+        .await;
+    assert_eq!(code(&unknown).as_deref(), Some("INVALID_INPUT"));
+    let refused = rig
+        .execute(&format!(
+            r#"mutation {{ addTorrentTrackers(id: {id}, urls: ["not a tracker"]) }}"#
+        ))
+        .await;
+    assert_eq!(code(&refused).as_deref(), Some("INVALID_INPUT"));
+    for query in [
+        "{ torrentTrackers(id: 999999) { url } }",
+        r#"mutation { addTorrentTrackers(id: 999999, urls: ["http://a.invalid/"]) }"#,
+        r#"mutation { replaceTorrentTrackers(id: 999999, trackers: []) }"#,
+        r#"mutation { removeTorrentTrackers(id: 999999, urls: []) }"#,
+        "mutation { reannounceTorrent(id: 999999) }",
+        "mutation { dhtAnnounceTorrent(id: 999999) }",
+    ] {
+        let unknown = rig.execute(query).await;
+        assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"), "{query}");
+    }
+}

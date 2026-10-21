@@ -34,12 +34,13 @@ use weaver_server_core::settings::{
     SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentLimit,
     TorrentPeerProtocol, resolve_seeding_policy,
 };
+use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, SeedingSource, TorrentService, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{
-    ConnectionKind, Encryption, PeerInfo, PeerSourceFlag, TorrentState, TorrentTracker,
-    TrackerStatus, status,
+    ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
+    TorrentTracker, TrackerEntry, TrackerStatus, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle};
@@ -169,9 +170,14 @@ impl TorrentFacadeContext {
 
     // The torrents a `hashes` parameter names: `|`-separated, or `all`.
     async fn targets(&self, params: &Params) -> Vec<TorrentView> {
-        let wanted = params.get("hashes").unwrap_or_default();
+        self.named(params.get("hashes").unwrap_or_default()).await
+    }
+
+    // The torrents `wanted` names: `|`-separated hashes, or `all`
+    // (qBittorrent `applyToTorrents`).
+    async fn named(&self, wanted: &str) -> Vec<TorrentView> {
         let views = self.views().await;
-        if names_all(params) {
+        if wanted.trim() == "all" {
             return views;
         }
         let wanted: Vec<&str> = wanted.split('|').map(str::trim).collect();
@@ -387,7 +393,11 @@ enum Need {
 fn need(group: &str, action: &str) -> Option<Need> {
     Some(match (group, action) {
         ("app", "version" | "webapiVersion" | "buildInfo" | "preferences" | "defaultSavePath")
-        | ("torrents", "info" | "properties" | "files" | "trackers" | "categories" | "tags")
+        | (
+            "torrents",
+            "info" | "properties" | "files" | "trackers" | "categories" | "tags" | "uploadLimit"
+            | "downloadLimit",
+        )
         | ("sync", "maindata" | "torrentPeers")
         | ("transfer", "info")
         | ("log", "main") => Need::Read,
@@ -397,8 +407,12 @@ fn need(group: &str, action: &str) -> Option<Need> {
             "torrents",
             "add" | "delete" | "pause" | "stop" | "resume" | "start" | "setCategory"
             | "setForceStart" | "createCategory" | "setLocation" | "setShareLimits" | "topPrio"
-            | "addTags" | "removeTags" | "recheck" | "reannounce",
-        ) => Need::Control,
+            | "addTags" | "removeTags" | "recheck" | "reannounce" | "setUploadLimit"
+            | "setDownloadLimit" | "addTrackers" | "editTracker" | "removeTrackers",
+        )
+        | ("torrents", "filePrio" | "toggleSequentialDownload" | "toggleFirstLastPiecePrio") => {
+            Need::Control
+        }
         _ => return None,
     })
 }
@@ -508,6 +522,21 @@ async fn handle(
             })
             .await
         }
+        ("torrents", "filePrio") => file_prio(&ctx, &params).await,
+        ("torrents", "toggleSequentialDownload") => {
+            each(&ctx, &params, |torrents, view| async move {
+                torrents.set_sequential(view.job_id, !view.sequential).await
+            })
+            .await
+        }
+        ("torrents", "toggleFirstLastPiecePrio") => {
+            each(&ctx, &params, |torrents, view| async move {
+                torrents
+                    .set_first_last_piece_first(view.job_id, !view.first_last_piece_first)
+                    .await
+            })
+            .await
+        }
         ("torrents", "setCategory") => {
             let category = params
                 .get("category")
@@ -531,6 +560,14 @@ async fn handle(
         }
         ("torrents", "createCategory") => create_category(&ctx, &params).await,
         ("torrents", "setShareLimits") => set_share_limits(&ctx, &params).await,
+        ("torrents", "uploadLimit") => rate_limits(&ctx, &params, |view| view.upload_limit).await,
+        ("torrents", "downloadLimit") => {
+            rate_limits(&ctx, &params, |view| view.download_limit).await
+        }
+        ("torrents", "setUploadLimit") => set_rate_limit(&ctx, &params, Direction::Upload).await,
+        ("torrents", "setDownloadLimit") => {
+            set_rate_limit(&ctx, &params, Direction::Download).await
+        }
         ("torrents", "topPrio") => text(StatusCode::CONFLICT, "queueing is off"),
         ("torrents", "setLocation") => {
             let Some(location) = params
@@ -547,8 +584,12 @@ async fn handle(
             })
             .await
         }
-        // Tags are not kept; reannounce has no service action.
-        ("torrents", "addTags" | "removeTags" | "reannounce") => ok(),
+        ("torrents", "addTrackers") => add_trackers(&ctx, &params).await,
+        ("torrents", "editTracker") => edit_tracker(&ctx, &params).await,
+        ("torrents", "removeTrackers") => remove_trackers(&ctx, &params).await,
+        ("torrents", "reannounce") => reannounce(&ctx, &params).await,
+        // Tags are not kept.
+        ("torrents", "addTags" | "removeTags") => ok(),
         ("torrents", "tags") | ("log", "main") => axum::Json(json!([])).into_response(),
         ("sync", "maindata") => maindata(&ctx).await,
         ("sync", "torrentPeers") => torrent_peers(&ctx, &params).await,
@@ -712,13 +753,20 @@ pub(super) fn info(view: &TorrentView) -> Value {
         ("private", json!(view.private)),
         ("auto_tmm", json!(false)),
         ("super_seeding", json!(false)),
-        ("seq_dl", json!(false)),
-        ("f_l_piece_prio", json!(false)),
-        ("dl_limit", json!(-1)),
-        ("up_limit", json!(-1)),
+        ("seq_dl", json!(view.sequential)),
+        ("f_l_piece_prio", json!(view.first_last_piece_first)),
         ("tracker", json!("")),
         ("magnet_uri", json!(view.magnet)),
     ]);
+    // The limits as the client keeps them, 0 for none.
+    fields = with_limits(
+        fields,
+        0,
+        [
+            ("dl_limit", view.download_limit),
+            ("up_limit", view.upload_limit),
+        ],
+    );
     if let Some(fields) = fields.as_object_mut() {
         fields.extend(
             share_limits(view)
@@ -801,7 +849,7 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         return not_found();
     };
     let (save_path, content_path) = view.paths();
-    axum::Json(object([
+    let fields = object([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
         (
             "infohash_v1",
@@ -840,8 +888,6 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("total_uploaded_session", json!(view.uploaded_bytes)),
         ("total_downloaded", json!(view.downloaded_bytes)),
         ("total_downloaded_session", json!(view.downloaded_bytes)),
-        ("up_limit", json!(-1)),
-        ("dl_limit", json!(-1)),
         ("time_elapsed", json!(view.active_seconds)),
         ("nb_connections", json!(view.peers)),
         ("nb_connections_limit", json!(view.max_peers)),
@@ -868,8 +914,19 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("seeds", json!(view.seeds)),
         ("seeds_total", json!(view.swarm_seeds.unwrap_or(view.seeds))),
         ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
-    ]))
-    .into_response()
+        ("seq_dl", json!(view.sequential)),
+        ("f_l_piece_prio", json!(view.first_last_piece_first)),
+    ]);
+    // The properties read no limit as -1, where the list reads it as 0.
+    let fields = with_limits(
+        fields,
+        -1,
+        [
+            ("up_limit", view.upload_limit),
+            ("dl_limit", view.download_limit),
+        ],
+    );
+    axum::Json(fields).into_response()
 }
 
 async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
@@ -886,7 +943,7 @@ async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
                 "name": file.path,
                 "size": file.length,
                 "progress": progress,
-                "priority": u8::from(file.selected),
+                "priority": qbt_priority(file.priority),
                 "is_seed": view.completed_at_ms.is_some(),
                 "piece_range": [0, 0],
                 "availability": -1,
@@ -896,36 +953,314 @@ async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     axum::Json(list).into_response()
 }
 
+// A file's level as the client numbers it.
+fn qbt_priority(priority: FilePriority) -> u8 {
+    file_priority_number(priority)
+}
+
+// The client's number as a level; the four it defines and nothing else.
+fn level_of(priority: &str) -> Option<FilePriority> {
+    file_priority_of(priority.trim().parse().ok()?)
+}
+
+// Set the level of the files `id` names, `|`-separated, on the torrent
+// `hash` names (qBittorrent `TorrentsController::filePrioAction`): a missing
+// parameter, a level the client does not define or an id that is no integer
+// is 400, an unknown torrent 404, and an id the torrent has no file at,
+// negative or past its last, 409.
+async fn file_prio(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let (Some(hash), Some(ids), Some(priority)) =
+        (params.get("hash"), params.get("id"), params.get("priority"))
+    else {
+        return text(StatusCode::BAD_REQUEST, "Missing required parameters");
+    };
+    let Some(level) = level_of(priority) else {
+        return text(StatusCode::BAD_REQUEST, "Priority is not valid");
+    };
+    let Ok(ids) = ids
+        .split('|')
+        .map(|id| id.trim().parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return text(StatusCode::BAD_REQUEST, "File IDs must be integers");
+    };
+    let Some(view) = ctx.by_hash(hash).await else {
+        return not_found();
+    };
+    let Some(torrents) = &ctx.inner.torrents else {
+        return not_found();
+    };
+    let Ok(priorities) = ids
+        .into_iter()
+        .map(|id| u32::try_from(id).map(|id| (id, level)))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return text(StatusCode::CONFLICT, "File ID is not valid");
+    };
+    match torrents.set_file_priorities(view.job_id, &priorities).await {
+        Ok(()) => ok(),
+        Err(ActionError::NotFound(_)) => not_found(),
+        Err(error @ ActionError::Invalid(_)) => text(StatusCode::CONFLICT, error.to_string()),
+        Err(error) => internal(error),
+    }
+}
+
+// qBittorrent `TrackerEndpointState`, and 0 for a row that is off.
 fn tracker_status(status: TrackerStatus) -> u8 {
     match status {
         TrackerStatus::Disabled => 0,
         TrackerStatus::NotContacted => 1,
         TrackerStatus::Working => 2,
-        TrackerStatus::Updating => 3,
         TrackerStatus::NotWorking => 4,
+        TrackerStatus::TrackerError => 5,
+        TrackerStatus::Unreachable => 6,
     }
 }
 
+// `torrents/trackers` (qBittorrent `TorrentsController::trackersAction`):
+// the DHT, PeX and LSD rows, then the torrent's trackers.
 async fn trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let Some(torrents) = &ctx.inner.torrents else {
+        return not_found();
+    };
     let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
         return not_found();
     };
-    let list: Vec<Value> = view.trackers.iter().map(tracker_json).collect();
+    let peers = match torrents.peers(view.job_id).await {
+        Ok(peers) => peers,
+        Err(ActionError::NotFound(_)) => return not_found(),
+        Err(error) => return internal(error),
+    };
+    let dht = torrents
+        .carries_dht(torrents.scope_of(view.category.as_deref()))
+        .await;
+    let mut list = sticky_trackers(
+        view.private,
+        &peers,
+        [
+            ("** [DHT] **", PeerSourceFlag::Dht, dht),
+            ("** [PeX] **", PeerSourceFlag::Pex, PEX),
+            ("** [LSD] **", PeerSourceFlag::Lsd, LSD),
+        ],
+    );
+    list.extend(view.trackers.iter().map(tracker_json));
     axum::Json(list).into_response()
 }
 
+// qBittorrent `getStickyTrackers`: a row for each source of peers, working
+// while it is on and the torrent is not private, with the seeds and leeches
+// it brought among the connected peers.
+fn sticky_trackers(
+    private: bool,
+    peers: &[PeerInfo],
+    sources: [(&str, PeerSourceFlag, bool); 3],
+) -> Vec<Value> {
+    sources
+        .into_iter()
+        .map(|(url, source, on)| {
+            let (seeds, leeches) = peers
+                .iter()
+                .filter(|peer| peer.sources.contains(source))
+                .fold((0, 0), |(seeds, leeches), peer| {
+                    if peer.flags.seed {
+                        (seeds + 1, leeches)
+                    } else {
+                        (seeds, leeches + 1)
+                    }
+                });
+            json!({
+                "url": url,
+                "tier": -1,
+                "msg": if private { "This torrent is private" } else { "" },
+                "status": if on && !private { 2 } else { 0 },
+                "num_peers": 0,
+                "num_downloaded": 0,
+                "num_seeds": seeds,
+                "num_leeches": leeches,
+            })
+        })
+        .collect()
+}
+
+// qBittorrent `getTrackers`, each time in seconds since the epoch and -1
+// for a count the tracker has not given.
 fn tracker_json(tracker: &TorrentTracker) -> Value {
     let count = |value: Option<u32>| value.map_or(-1, i64::from);
+    let seconds = |ms: Option<i64>| ms.map_or(0, |ms| ms / 1000);
     json!({
         "url": tracker.url,
-        "status": tracker_status(tracker.status),
         "tier": tracker.tier,
-        "num_peers": count(tracker.leechers.zip(tracker.seeders).map(|(l, s)| l + s)),
+        "updating": tracker.updating,
+        "status": tracker_status(tracker.status),
+        "msg": tracker.message.clone().unwrap_or_default(),
+        "num_peers": count(tracker.peers),
         "num_seeds": count(tracker.seeders),
         "num_leeches": count(tracker.leechers),
-        "num_downloaded": -1,
-        "msg": tracker.message.clone().unwrap_or_default(),
+        "num_downloaded": count(tracker.downloaded),
+        "next_announce": seconds(tracker.next_announce_ms),
+        "min_announce": seconds(tracker.min_announce_ms),
+        "endpoints": [],
     })
+}
+
+// A `|`-separated list whose parts a client may percent-encode, as
+// qBittorrent reads `urls` (`QUrl::fromPercentEncoding`).
+fn url_list(list: &str) -> Vec<String> {
+    list.split('|')
+        .filter(|part| !part.is_empty())
+        .map(percent_decoded)
+        .collect()
+}
+
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[at], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                at += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// `torrents/addTrackers` (qBittorrent `addTrackersAction`): one tracker a
+// line, each blank line starting the next tier (`parseTrackerEntries`).
+// The tiers go after each torrent's last.
+async fn add_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let (Some(hash), Some(urls)) = (params.get("hash"), params.get("urls")) else {
+        return text(StatusCode::BAD_REQUEST, "Missing parameter: hash, urls");
+    };
+    let mut tiers: Vec<Vec<String>> = vec![Vec::new()];
+    for line in urls.split('\n').map(str::trim) {
+        match tiers.last_mut() {
+            Some(tier) if !line.is_empty() => tier.push(line.to_owned()),
+            _ => tiers.push(Vec::new()),
+        }
+    }
+    each_of(ctx, ctx.named(hash).await, move |torrents, view| {
+        let tiers = tiers.clone();
+        async move { torrents.add_trackers(view.job_id, tiers).await }
+    })
+    .await
+}
+
+// `torrents/editTracker` (qBittorrent `editTrackerAction`): a new URL or
+// tier for one tracker, then an announce to every tracker.
+async fn edit_tracker(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let (Some(hash), Some(url)) = (params.get("hash"), params.get("url")) else {
+        return text(StatusCode::BAD_REQUEST, "Missing parameter: hash, url");
+    };
+    let url = url.trim();
+    let Some(torrents) = &ctx.inner.torrents else {
+        return not_found();
+    };
+    let Some(view) = ctx.by_hash(hash).await else {
+        return not_found();
+    };
+    let (new_url, new_tier) = (params.get("newUrl"), params.get("tier"));
+    if new_url.is_none() && new_tier.is_none() {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "Must specify at least one of [newUrl, tier]",
+        );
+    }
+    let new_tier = match new_tier.map(|tier| tier.trim().parse::<i64>()) {
+        None => None,
+        Some(Ok(tier @ 0..=255)) => Some(tier as u32),
+        Some(Ok(_)) => return text(StatusCode::BAD_REQUEST, "tier must be between 0 and 255"),
+        Some(Err(_)) => return text(StatusCode::BAD_REQUEST, "tier must be an integer"),
+    };
+    let new_url = new_url
+        .map(str::trim)
+        .filter(|new| *new != url)
+        .map(str::to_owned);
+    if new_url.is_none() && new_tier.is_none() {
+        return ok();
+    }
+    let mut found = false;
+    let mut entries = Vec::with_capacity(view.trackers.len());
+    for tracker in &view.trackers {
+        if new_url.as_deref() == Some(tracker.url.as_str()) {
+            return text(StatusCode::CONFLICT, "New tracker URL already exists");
+        }
+        let mut entry = TrackerEntry {
+            tier: tracker.tier,
+            url: tracker.url.clone(),
+        };
+        if tracker.url == url {
+            if new_url.is_none() && new_tier == Some(tracker.tier) {
+                return ok();
+            }
+            found = true;
+            entry.url = new_url.clone().unwrap_or(entry.url);
+            entry.tier = new_tier.unwrap_or(entry.tier);
+        }
+        entries.push(entry);
+    }
+    if !found {
+        return text(StatusCode::CONFLICT, "Tracker not found");
+    }
+    let edited = match torrents.replace_trackers(view.job_id, entries).await {
+        Ok(()) => torrents.reannounce(view.job_id).await,
+        Err(error) => Err(error),
+    };
+    // The trackers kept are the torrent's own: only the new URL can be one
+    // the service refuses.
+    match edited {
+        Ok(()) => ok(),
+        Err(ActionError::NotFound(_)) => not_found(),
+        Err(ActionError::Invalid(_)) => text(StatusCode::BAD_REQUEST, "New tracker URL is invalid"),
+        Err(error) => internal(error),
+    }
+}
+
+// `torrents/removeTrackers` (qBittorrent `removeTrackersAction`): `*`
+// names every torrent.
+async fn remove_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let (Some(hash), Some(urls)) = (params.get("hash"), params.get("urls")) else {
+        return text(StatusCode::BAD_REQUEST, "Missing parameter: hash, urls");
+    };
+    let hash = if hash.trim() == "*" { "all" } else { hash };
+    let urls = url_list(urls);
+    each_of(ctx, ctx.named(hash).await, move |torrents, view| {
+        let urls = urls.clone();
+        async move { torrents.remove_trackers(view.job_id, &urls).await }
+    })
+    .await
+}
+
+// `torrents/reannounce` (qBittorrent `reannounceAction`): the trackers
+// `urls` names, else every tracker and the DHT.
+async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let urls = url_list(params.get("urls").unwrap_or_default());
+    each_of(ctx, ctx.targets(params).await, move |torrents, view| {
+        let urls = urls.clone();
+        async move {
+            if urls.is_empty() {
+                torrents.reannounce(view.job_id).await?;
+                return torrents.dht_announce(view.job_id).await;
+            }
+            for tracker in view.trackers.iter().filter(|t| urls.contains(&t.url)) {
+                torrents
+                    .reannounce_tracker(view.job_id, &tracker.url)
+                    .await?;
+            }
+            Ok(())
+        }
+    })
+    .await
 }
 
 async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
@@ -1139,10 +1474,19 @@ where
     F: Fn(TorrentService, TorrentView) -> Fut,
     Fut: std::future::Future<Output = Result<(), ActionError>>,
 {
+    each_of(ctx, ctx.targets(params).await, action).await
+}
+
+// `action` on each of `views`, as `each` does it.
+async fn each_of<F, Fut>(ctx: &TorrentFacadeContext, views: Vec<TorrentView>, action: F) -> Response
+where
+    F: Fn(TorrentService, TorrentView) -> Fut,
+    Fut: std::future::Future<Output = Result<(), ActionError>>,
+{
     let Some(torrents) = &ctx.inner.torrents else {
         return ok();
     };
-    for view in ctx.targets(params).await {
+    for view in views {
         match action(torrents.clone(), view).await {
             Ok(()) | Err(ActionError::NotFound(_)) => {}
             Err(error @ ActionError::Invalid(_)) => {
@@ -1154,20 +1498,96 @@ where
     ok()
 }
 
-// The limits as the client reads them, where 0 is no limit. A cap that lets
-// nothing through has no such number, so its field is left out.
-fn with_limits(mut fields: Value, limits: [(&str, Option<u64>); 2]) -> Value {
+// The limits as the client reads them, where `unlimited` is no limit. A cap
+// that lets nothing through has no such number, so its field is left out.
+fn with_limits(mut fields: Value, unlimited: i64, limits: [(&str, Option<u64>); 2]) -> Value {
     if let Some(fields) = fields.as_object_mut() {
         for (name, bps) in limits {
-            match bps {
-                None => fields.insert(name.to_owned(), json!(0)),
-                Some(0) => None,
-                Some(bps) => fields.insert(name.to_owned(), json!(bps)),
-            };
+            if let Some(limit) = client_limit(bps, unlimited) {
+                fields.insert(name.to_owned(), limit);
+            }
         }
     }
     fields
 }
+
+// A limit as the client reads it: `None` is `unlimited`, and a closed limit
+// has no reading.
+fn client_limit(bps: Option<u64>, unlimited: i64) -> Option<Value> {
+    match bps {
+        None => Some(json!(unlimited)),
+        Some(0) => None,
+        Some(bps) => Some(json!(bps)),
+    }
+}
+
+// One limit of each torrent `hashes` names, keyed by the hash as it was
+// sent: 0 is no limit and -1 a hash no torrent has. A closed limit has no reading and is
+// left out, as in the rows.
+async fn rate_limits(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    limit: impl Fn(&TorrentView) -> Option<u64>,
+) -> Response {
+    let views = ctx.views().await;
+    let reading = |view: &TorrentView| client_limit(limit(view), 0);
+    let map: Map<String, Value> = if names_all(params) {
+        views
+            .iter()
+            .filter_map(|view| Some((view.infohash.to_ascii_lowercase(), reading(view)?)))
+            .collect()
+    } else {
+        params
+            .get("hashes")
+            .unwrap_or_default()
+            .split('|')
+            .filter_map(|hash| {
+                let reading = match views
+                    .iter()
+                    .find(|view| view.infohash.eq_ignore_ascii_case(hash.trim()))
+                {
+                    Some(view) => reading(view)?,
+                    None => json!(-1),
+                };
+                Some((hash.to_owned(), reading))
+            })
+            .collect()
+    };
+    axum::Json(map).into_response()
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    Upload,
+    Download,
+}
+
+// Sets one limit on each torrent `hashes` names; the other is left as it
+// is. The client's 0 and any negative number are no limit.
+async fn set_rate_limit(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    direction: Direction,
+) -> Response {
+    let Some(Ok(limit)) = params.get("limit").map(|limit| limit.trim().parse::<i64>()) else {
+        return text(StatusCode::BAD_REQUEST, "limit is not a number");
+    };
+    let limit = Some(u64::try_from(limit).ok().filter(|limit| *limit > 0));
+    let (upload, download) = match direction {
+        Direction::Upload => (limit, None),
+        Direction::Download => (None, limit),
+    };
+    each(ctx, params, move |torrents, view| async move {
+        torrents
+            .set_rate_limits(view.job_id, upload, download)
+            .await
+    })
+    .await
+}
+
+// Peer exchange and local discovery are off on every session.
+const PEX: bool = false;
+const LSD: bool = false;
 
 // `dht` is whether any torrent route carries it: a client reads it before
 // handing over a magnet with no trackers, and the route refuses one it
@@ -1189,8 +1609,8 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "max_active_torrents": -1,
         "listen_port": torrent.base_port,
         "upnp": torrent.upnp,
-        "pex": false,
-        "lsd": false,
+        "pex": PEX,
+        "lsd": LSD,
         "encryption": match torrent.encryption {
             TorrentEncryption::Prefer => 0,
             TorrentEncryption::Require => 1,
@@ -1223,6 +1643,7 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
     });
     with_limits(
         fields,
+        0,
         [
             ("dl_limit", bandwidth.download_bps),
             ("up_limit", bandwidth.upload_bps),
@@ -1452,6 +1873,7 @@ fn transfer(views: &[TorrentView], download: Option<u64>, upload: Option<u64>) -
     });
     with_limits(
         fields,
+        0,
         [("dl_rate_limit", download), ("up_rate_limit", upload)],
     )
 }

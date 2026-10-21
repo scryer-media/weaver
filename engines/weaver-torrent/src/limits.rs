@@ -14,7 +14,9 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
 use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::time::Duration;
+use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
@@ -56,6 +58,19 @@ impl From<Option<NonZeroU32>> for LimitKind {
     }
 }
 
+impl LimitKind {
+    /// The one of two limits that lets less through: closed before any
+    /// rate, a lower rate before a higher one, any rate before unlimited.
+    pub fn tighter(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Closed, _) | (_, Self::Closed) => Self::Closed,
+            (Self::Bps(a), Self::Bps(b)) => Self::Bps(a.min(b)),
+            (Self::Bps(bps), Self::Unlimited) | (Self::Unlimited, Self::Bps(bps)) => Self::Bps(bps),
+            (Self::Unlimited, Self::Unlimited) => Self::Unlimited,
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct LimitsConfig {
@@ -80,7 +95,11 @@ const REQUEST_ROUNDS: u32 = 20;
 struct Request {
     id: u64,
     want: u64,
+    // What the request has taken so far; the channel is charged for it.
     assigned: u64,
+    // The channel's share for the request in its last round, not yet taken:
+    // a request on several channels takes the least of their shares.
+    share: Option<u64>,
     rounds_left: u32,
 }
 
@@ -135,27 +154,59 @@ impl Budget {
             id,
             want,
             assigned: 0,
+            share: None,
             rounds_left: REQUEST_ROUNDS,
         });
         id
     }
 
-    // The request `id`, once it is done, taken off the queue with what it
-    // was assigned.
-    fn take_done(&mut self, id: u64) -> Option<u64> {
-        let at = self.queue.iter().position(|r| r.id == id)?;
-        self.queue[at]
-            .done()
-            .then(|| self.queue.remove(at).assigned)
+    fn request(&mut self, id: u64) -> Option<&mut Request> {
+        self.queue.iter_mut().find(|r| r.id == id)
+    }
+
+    // What the channel offers the request `id` now: all it still wants
+    // while the channel is unlimited, nothing while it is closed, and
+    // otherwise its share of the last round.
+    fn offer(&mut self, id: u64) -> Option<u64> {
+        let kind = self.kind;
+        let request = self.request(id)?;
+        match kind {
+            LimitKind::Unlimited => Some(request.want - request.assigned),
+            LimitKind::Closed => None,
+            LimitKind::Bps(_) => request.share,
+        }
+    }
+
+    // The request `id` takes `bytes`, and the channel is charged for them
+    // (`bw_request::assign_bandwidth` charges every channel the same).
+    fn take(&mut self, id: u64, bytes: u64) {
+        let kind = self.kind;
+        if let Some(request) = self.request(id) {
+            request.assigned += bytes;
+            request.share = None;
+            if let LimitKind::Bps(_) = kind {
+                self.quota_left -= i64::try_from(bytes).unwrap_or(i64::MAX);
+            }
+        }
+    }
+
+    fn done(&self, id: u64) -> bool {
+        self.queue.iter().any(|r| r.id == id && r.done())
+    }
+
+    // The request `id` taken off the queue with what it was assigned.
+    fn remove(&mut self, id: u64) -> u64 {
+        match self.queue.iter().position(|r| r.id == id) {
+            Some(at) => self.queue.remove(at).assigned,
+            None => 0,
+        }
     }
 
     // A request given up: the quota it was assigned goes back to the
     // channel (`update_quotas` on a disconnecting peer).
     fn cancel(&mut self, id: u64) {
-        if let Some(at) = self.queue.iter().position(|r| r.id == id) {
-            let request = self.queue.remove(at);
-            self.give_back(request.assigned);
-        }
+        let assigned = self.remove(id);
+        self.give_back(assigned);
     }
 
     // `bandwidth_channel::return_quota`.
@@ -167,41 +218,34 @@ impl Budget {
         }
     }
 
-    // When the next round is due; none while the channel is closed.
+    // When the next round is due: only a rate has rounds, since an
+    // unlimited channel offers every request whole and a closed one
+    // nothing.
     fn next_round(&self) -> Option<Instant> {
         match self.kind {
-            LimitKind::Closed => None,
-            LimitKind::Unlimited | LimitKind::Bps(_) => Some(self.last_round + ROUND),
+            LimitKind::Bps(_) => Some(self.last_round + ROUND),
+            LimitKind::Unlimited | LimitKind::Closed => None,
         }
     }
 
     // A round: the channel fills at its rate for the time since the last,
-    // to at most three seconds' worth, and each waiting request is assigned
+    // to at most three seconds' worth, and each waiting request is offered
     // an equal share of what it holds, never more than it still wants;
     // what a request leaves is kept for later rounds (libtorrent
     // `bandwidth_channel::update_quota`, `bw_request::assign_bandwidth`).
-    // An unlimited channel assigns every request whole.
     fn round(&mut self, now: Instant) {
         let gap = (now - self.last_round).min(MAX_ROUND_GAP);
         self.last_round = now;
-        let distribute = match self.kind {
-            LimitKind::Closed => return,
-            LimitKind::Unlimited => u64::MAX,
-            LimitKind::Bps(limit) => {
-                let limit = i64::from(limit.get());
-                let gap_ms = i64::try_from(gap.as_millis()).unwrap_or(i64::MAX);
-                self.quota_left = (self.quota_left + (limit * gap_ms + 500) / 1000).min(3 * limit);
-                u64::try_from(self.quota_left).unwrap_or(0)
-            }
+        let LimitKind::Bps(limit) = self.kind else {
+            return;
         };
-        let share = distribute / self.queue.len().max(1) as u64;
+        let limit = i64::from(limit.get());
+        let gap_ms = i64::try_from(gap.as_millis()).unwrap_or(i64::MAX);
+        self.quota_left = (self.quota_left + (limit * gap_ms + 500) / 1000).min(3 * limit);
+        let share = u64::try_from(self.quota_left).unwrap_or(0) / self.queue.len().max(1) as u64;
         for request in &mut self.queue {
             request.rounds_left = request.rounds_left.saturating_sub(1);
-            let quota = share.min(request.want - request.assigned);
-            request.assigned += quota;
-            if let LimitKind::Bps(_) = self.kind {
-                self.quota_left -= quota as i64;
-            }
+            request.share = Some(share.min(request.want - request.assigned));
         }
     }
 }
@@ -214,15 +258,121 @@ struct Limit {
     granted: watch::Sender<u64>,
 }
 
-// Takes a waiting request off the queue when its wait is dropped.
+// A request waiting on one or two channels, the torrent's and the
+// session's, each with its id there. Dropped before it is granted, it
+// leaves each channel and gives back what it was assigned, so nothing is
+// charged for bytes that never cross.
 struct Waiting<'a> {
-    limit: &'a Limit,
-    id: u64,
+    on: [Option<(&'a Limit, u64)>; 2],
+}
+
+impl<'a> Waiting<'a> {
+    fn each(&self) -> impl Iterator<Item = (&'a Limit, u64)> + '_ {
+        self.on.iter().flatten().copied()
+    }
+}
+
+// A change on one of a request's channels; never, for a channel it has not.
+async fn changed(notified: Pin<&mut Option<Notified<'_>>>) {
+    match notified.as_pin_mut() {
+        Some(notified) => notified.await,
+        None => std::future::pending().await,
+    }
 }
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        self.limit.budget.lock().cancel(self.id);
+        for (limit, id) in self.each() {
+            limit.budget.lock().cancel(id);
+        }
+    }
+}
+
+// Waits for every one of `limits` to grant bytes of `want` together, and
+// returns how many. One request is queued on each, and each round every
+// channel offers it its equal share; it takes the least of them, and each
+// channel is charged that alone (libtorrent
+// `bandwidth_manager::request_bandwidth` and `bw_request::assign_bandwidth`).
+// A request every channel can grant at once is granted whole. A change of
+// limit applies to the requests already waiting.
+async fn acquire(limits: [Option<&Limit>; 2], want: u64) -> u64 {
+    let mut charged = 0;
+    for limit in limits.iter().flatten() {
+        if !limit.budget.lock().grant_at_once(want) {
+            break;
+        }
+        charged += 1;
+    }
+    if charged == limits.iter().flatten().count() {
+        for limit in limits.iter().flatten() {
+            limit.granted(want);
+        }
+        return want;
+    }
+    for limit in limits.iter().flatten().take(charged) {
+        limit.budget.lock().give_back(want);
+    }
+    let waiting = Waiting {
+        on: limits.map(|limit| limit.map(|limit| (limit, limit.budget.lock().enqueue(want)))),
+    };
+    loop {
+        let [first, second] = waiting
+            .on
+            .map(|on| on.map(|(limit, _)| limit.changed.notified()));
+        let (mut first, mut second) = (std::pin::pin!(first), std::pin::pin!(second));
+        for notified in [first.as_mut(), second.as_mut()] {
+            if let Some(notified) = notified.as_pin_mut() {
+                notified.enable();
+            }
+        }
+        let offer = waiting
+            .each()
+            .map(|(limit, id)| limit.budget.lock().offer(id))
+            .try_fold(u64::MAX, |least, offer| Some(least.min(offer?)));
+        if let Some(bytes) = offer {
+            for (limit, id) in waiting.each() {
+                limit.budget.lock().take(id, bytes);
+            }
+        }
+        if waiting
+            .each()
+            .any(|(limit, id)| limit.budget.lock().done(id))
+        {
+            let mut granted = 0;
+            for (limit, id) in waiting.each() {
+                granted = limit.budget.lock().remove(id);
+                limit.granted(granted);
+            }
+            std::mem::forget(waiting);
+            return granted;
+        }
+        let next_round = waiting
+            .each()
+            .filter_map(|(limit, _)| limit.budget.lock().next_round())
+            .min();
+        let next_round = async {
+            match next_round {
+                Some(due) => tokio::time::sleep_until(due).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = changed(first.as_mut()) => {}
+            () = changed(second.as_mut()) => {}
+            () = next_round => {
+                // The first request to wake runs the rounds due for all.
+                let now = Instant::now();
+                for (limit, _) in waiting.each() {
+                    let mut budget = limit.budget.lock();
+                    if budget.next_round().is_some_and(|due| due <= now) {
+                        budget.round(now);
+                        drop(budget);
+                        limit.changed.notify_waiters();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -241,53 +391,6 @@ impl Limit {
         }
     }
 
-    // Waits for the limit to grant bytes of `want`, and returns how many:
-    // all of them at once while it is unlimited, or when the quota left
-    // covers them; otherwise what the rounds assign. A closed limit assigns
-    // nothing; a change of limit applies to the requests already waiting.
-    async fn acquire(&self, want: u64) -> u64 {
-        let id = {
-            let mut budget = self.budget.lock();
-            if budget.grant_at_once(want) {
-                drop(budget);
-                return self.granted(want);
-            }
-            budget.enqueue(want)
-        };
-        let waiting = Waiting { limit: self, id };
-        loop {
-            let changed = self.changed.notified();
-            let mut changed = std::pin::pin!(changed);
-            changed.as_mut().enable();
-            let next_round = {
-                let mut budget = self.budget.lock();
-                if let Some(assigned) = budget.take_done(id) {
-                    drop(budget);
-                    std::mem::forget(waiting);
-                    return self.granted(assigned);
-                }
-                budget.next_round()
-            };
-            let Some(next_round) = next_round else {
-                changed.await;
-                continue;
-            };
-            tokio::select! {
-                biased;
-                () = changed => {}
-                () = tokio::time::sleep_until(next_round) => {
-                    // The first request to wake runs the round for all.
-                    let mut budget = self.budget.lock();
-                    if budget.next_round().is_some_and(|due| due <= Instant::now()) {
-                        budget.round(Instant::now());
-                        drop(budget);
-                        self.changed.notify_waiters();
-                    }
-                }
-            }
-        }
-    }
-
     fn granted(&self, bytes: u64) -> u64 {
         self.granted.send_modify(|g| *g += bytes);
         bytes
@@ -298,16 +401,14 @@ impl Limit {
         self.granted.send_modify(|g| *g -= bytes);
     }
 
-    // A new limit applies to the requests waiting: an unlimited one assigns
+    // A new limit applies to the requests waiting: an unlimited one offers
     // them whole at once; a rate fills from now, with the quota left kept,
     // so a change of rate is no fresh burst.
     fn set(&self, kind: LimitKind) {
         let mut budget = self.budget.lock();
         let was = std::mem::replace(&mut budget.kind, kind);
-        match kind {
-            LimitKind::Unlimited => budget.round(Instant::now()),
-            LimitKind::Bps(_) if was == LimitKind::Closed => budget.last_round = Instant::now(),
-            LimitKind::Bps(_) | LimitKind::Closed => {}
+        if matches!(kind, LimitKind::Bps(_)) && !matches!(was, LimitKind::Bps(_)) {
+            budget.last_round = Instant::now();
         }
         drop(budget);
         self.changed.notify_waiters();
@@ -354,19 +455,48 @@ impl Limits {
 
     /// Waits for `channel` to grant bytes of the `want` a peer asks for, and
     /// returns how many: one or more when `want` is not zero. Every peer
-    /// waiting on the channel is assigned an equal share each round. A grant
+    /// waiting on the channel is offered an equal share each round. A grant
     /// pays for bytes that cross a peer's socket.
     pub async fn request(&self, channel: Channel, want: u64) -> u64 {
         if want == 0 {
             return 0;
         }
-        self.limit(channel).acquire(want).await
+        acquire([Some(self.limit(channel)), None], want).await
     }
 
     /// `bytes` granted on `channel` that will not cross go back to it
     /// (libtorrent `bandwidth_channel::return_quota`).
     pub fn give_back(&self, channel: Channel, bytes: u64) {
         self.limit(channel).give_back(bytes);
+    }
+
+    /// Waits for these limits, a torrent's, and `session`'s together to
+    /// grant bytes of the `want` a peer of the torrent asks for, and returns
+    /// how many. The request waits on both at once: each round it takes the
+    /// lesser of the two channels' shares, so the tighter holds the peer,
+    /// and a peer that goes while it waits is charged nothing (libtorrent
+    /// `peer_connection::request_bandwidth` queues one request on the
+    /// channels of all the peer's classes).
+    pub async fn request_within(
+        &self,
+        session: Option<&Limits>,
+        channel: Channel,
+        want: u64,
+    ) -> u64 {
+        if want == 0 {
+            return 0;
+        }
+        let session = session.map(|session| session.limit(channel));
+        acquire([Some(self.limit(channel)), session], want).await
+    }
+
+    /// Bytes granted by `request_within` that will not cross go back to
+    /// these limits and the session's.
+    pub fn give_back_within(&self, session: Option<&Limits>, channel: Channel, bytes: u64) {
+        self.give_back(channel, bytes);
+        if let Some(session) = session {
+            session.give_back(channel, bytes);
+        }
     }
 
     pub fn set_upload_bps(&self, bps: impl Into<LimitKind>) {
@@ -546,6 +676,193 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
+    }
+
+    // A peer of a torrent asking `ask` bytes at a time through its
+    // torrent's limits within the session's until `rounds` rounds are over:
+    // the bytes of each grant and when it came.
+    async fn asking(
+        torrent: &Limits,
+        session: &Limits,
+        channel: Channel,
+        ask: u64,
+        rounds: u32,
+    ) -> Vec<(Duration, u64)> {
+        let start = Instant::now();
+        let mut grants = Vec::new();
+        while start.elapsed() < rounds * ROUND {
+            let granted = torrent.request_within(Some(session), channel, ask).await;
+            grants.push((start.elapsed(), granted));
+        }
+        grants
+    }
+
+    // libtorrent `torrent::set_download_limit` gives the torrent its own
+    // peer class (`torrent::setup_peer_class`), whose channel holds that
+    // torrent's peers alone. Two torrents in one unlimited session: the one
+    // limited to 1000 B/s is granted 500 bytes each half-second round,
+    // while the other's peer is granted whole at once throughout.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_limit_holds_its_own_peers_and_no_other_torrents() {
+        let session = Limits::default();
+        let held = down(bps(1000));
+        let free = Limits::default();
+        let grant_free = || {
+            free.request_within(Some(&session), Channel::Download, 10_000)
+                .now_or_never()
+        };
+        assert_eq!(grant_free(), Some(10_000));
+        let grants = asking(&held, &session, Channel::Download, 500, 10).await;
+        assert_eq!(
+            grants,
+            (1..=10)
+                .map(|round| (round * ROUND, 500))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(grant_free(), Some(10_000));
+        assert_eq!(*held.watch_download_granted().borrow(), 5_000);
+        assert_eq!(*free.watch_download_granted().borrow(), 20_000);
+        assert_eq!(*session.watch_download_granted().borrow(), 25_000);
+    }
+
+    // libtorrent `bw_request::assign_bandwidth` assigns a request no more
+    // than the tightest channel over it shares out: a session limit tighter
+    // than a torrent's holds that torrent's peers to it too, and every
+    // other torrent's. Under a session of 1000 B/s, a torrent limited to
+    // 4000 B/s and an unlimited one move no more together than the
+    // session's rate.
+    #[tokio::test(start_paused = true)]
+    async fn a_tighter_session_limit_holds_every_torrent() {
+        const RATE: u64 = 1000;
+        const ASK: u64 = 500;
+        let session = down(bps(RATE as u32));
+        let limited = down(bps(4000));
+        let unlimited = Limits::default();
+        let start = Instant::now();
+        let (limited_grants, unlimited_grants) = tokio::join!(
+            asking(&limited, &session, Channel::Download, ASK, 20),
+            asking(&unlimited, &session, Channel::Download, ASK, 20),
+        );
+        let total = |grants: &[(Duration, u64)]| grants.iter().map(|(_, g)| g).sum::<u64>();
+        let (limited_total, unlimited_total) = (total(&limited_grants), total(&unlimited_grants));
+        let session_allows = RATE * start.elapsed().as_millis() as u64 / 1000;
+        assert!(limited_total > 0 && unlimited_total > 0);
+        assert!(
+            limited_total + unlimited_total <= session_allows,
+            "{limited_total} + {unlimited_total} > {session_allows}"
+        );
+        assert_eq!(
+            *session.watch_download_granted().borrow(),
+            limited_total + unlimited_total
+        );
+        // What the session did not grant went back to the torrent.
+        assert_eq!(*limited.watch_download_granted().borrow(), limited_total);
+    }
+
+    // Two torrents at different limits under one session tighter than
+    // both together, each with a peer asking 1000 bytes at a time. Each
+    // round the session offers each waiter its equal share, 500; the slow
+    // torrent offers its own 500, the fast one 2000. Each waiter takes the
+    // least offer, so both are granted 500 a round: the fast torrent is held
+    // to the session's share, not given what the slow one leaves.
+    #[tokio::test(start_paused = true)]
+    async fn two_torrents_at_different_limits_share_one_session_by_rounds() {
+        let session = down(bps(2000));
+        let slow = down(bps(1000));
+        let fast = down(bps(4000));
+        let (slow_grants, fast_grants) = tokio::join!(
+            asking(&slow, &session, Channel::Download, 1000, 10),
+            asking(&fast, &session, Channel::Download, 1000, 10),
+        );
+        let each: Vec<_> = (1..=5u32).map(|k| (2 * k * ROUND, 1000)).collect();
+        assert_eq!((slow_grants, fast_grants), (each.clone(), each));
+    }
+
+    // A peer that goes while it waits on the session leaves nothing
+    // charged: its torrent offered it a share but charges only on the
+    // grant, and the grant waits for every channel.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_dropped_while_the_session_holds_it_costs_its_torrent_nothing() {
+        let session = down(LimitKind::Closed);
+        let torrent = down(bps(1000));
+        let granted = torrent.watch_download_granted();
+        {
+            let mut waiting =
+                std::pin::pin!(torrent.request_within(Some(&session), Channel::Download, 500));
+            assert!((&mut waiting).now_or_never().is_none());
+            tokio::time::advance(ROUND).await;
+            assert!((&mut waiting).now_or_never().is_none());
+            // The torrent offered it 500; the closed session holds it, so
+            // neither channel has charged anything.
+            assert_eq!(*granted.borrow(), 0);
+        }
+        assert_eq!(*granted.borrow(), 0);
+        assert_eq!(*session.watch_download_granted().borrow(), 0);
+        // The torrent's quota is whole: the round's 500 it filled with is
+        // all left, and no request of the peer stays queued.
+        let budget = torrent.limit(Channel::Download).budget.lock();
+        assert_eq!(budget.quota_left, 500);
+        assert!(budget.queue.is_empty());
+        drop(budget);
+        assert!(
+            session
+                .limit(Channel::Download)
+                .budget
+                .lock()
+                .queue
+                .is_empty()
+        );
+    }
+
+    // libtorrent `torrent::set_limit_impl` throttles the torrent's channel
+    // in place: a change reaches the peers already waiting on it, with no
+    // new connection. A peer waiting under 1000 B/s for 10_000 bytes is
+    // granted them whole the moment the torrent's limit is lifted; a closed
+    // upload then holds every byte a peer would send, protocol bytes
+    // included, while the download goes on.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_limit_set_live_reaches_the_waiting_peers() {
+        let session = Limits::default();
+        let torrent = down(bps(1000));
+        let mut waiting =
+            std::pin::pin!(torrent.request_within(Some(&session), Channel::Download, 10_000));
+        assert!((&mut waiting).now_or_never().is_none());
+        tokio::time::advance(ROUND).await;
+        assert!((&mut waiting).now_or_never().is_none());
+        torrent.set_download_bps(LimitKind::Unlimited);
+        assert_eq!((&mut waiting).now_or_never(), Some(10_000));
+
+        torrent.set_upload_bps(LimitKind::Closed);
+        let mut handshake =
+            std::pin::pin!(torrent.request_within(Some(&session), Channel::Upload, 68));
+        assert!((&mut handshake).now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!((&mut handshake).now_or_never().is_none());
+        assert_eq!(*session.watch_upload_granted().borrow(), 0);
+        assert_eq!(
+            torrent
+                .request_within(Some(&session), Channel::Download, 1000)
+                .now_or_never(),
+            Some(1000)
+        );
+        torrent.set_upload_bps(bps(1000));
+        assert_eq!(handshake.await, 68);
+        assert_eq!(*session.watch_upload_granted().borrow(), 68);
+    }
+
+    #[test]
+    fn the_tighter_limit_lets_less_through() {
+        use LimitKind::{Closed, Unlimited};
+        for (a, b, tighter) in [
+            (Unlimited, Unlimited, Unlimited),
+            (Unlimited, bps(10), bps(10)),
+            (bps(5), bps(10), bps(5)),
+            (bps(5), Closed, Closed),
+            (Unlimited, Closed, Closed),
+        ] {
+            assert_eq!(a.tighter(b), tighter);
+            assert_eq!(b.tighter(a), tighter);
+        }
     }
 
     #[test]

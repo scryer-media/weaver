@@ -436,6 +436,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         ratio: 0.0,
         download_bps: 500,
         upload_bps: 0,
+        upload_limit: None,
+        download_limit: None,
         eta_seconds: Some(6),
         peers: 1,
         seeds: 1,
@@ -459,6 +461,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         seeding_left: None,
         route: None,
         files: Vec::new(),
+        sequential: false,
+        first_last_piece_first: false,
         trackers: Vec::new(),
         file_have: Vec::new(),
         metadata: Vec::new(),
@@ -1144,10 +1148,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(view.detail.as_deref(), Some(DISK_FULL));
     assert_eq!(view.completed_at_ms, None);
-    assert_eq!(
-        rig.service.inner.live.lock().await[&job_id].applied,
-        Some(vec![0])
-    );
+    assert_eq!(torrent.file_priorities(), [FilePriority::Normal]);
     let warnings = rig.service.warnings().await;
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains(rig.dir.path().join("complete").to_str().unwrap()));
@@ -1843,6 +1844,231 @@ async fn a_torrent_in_no_session_is_not_rechecked() {
     rig.service.stop().await;
 }
 
+const RECHECKED_PIECE: usize = 16_384;
+
+// A torrent of four pieces fetched whole from a seeder on loopback, then
+// its file's piece 2 damaged on disk.
+struct Damaged {
+    rig: Rig,
+    job_id: JobId,
+    handle: Arc<ManagedTorrent>,
+    seeding: Arc<Session>,
+    // The seeder's files, read when a peer asks.
+    _seeds: tempfile::TempDir,
+    // What the file should hold.
+    data: Vec<u8>,
+    file: PathBuf,
+}
+
+async fn complete_then_damaged() -> Damaged {
+    complete_then_damaged_of(4).await
+}
+
+// As `complete_then_damaged`, of `pieces` pieces.
+async fn complete_then_damaged_of(pieces: usize) -> Damaged {
+    const PIECE: usize = RECHECKED_PIECE;
+    let data: Vec<u8> = (0..(pieces * PIECE) as u32)
+        .map(|at| (at % 251) as u8)
+        .collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let private = metainfo("set", &files, PIECE, true);
+
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &private, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let bytes = announcing(&private, &tracker(peer).await);
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_completed().await.unwrap();
+    let dir = rig
+        .service
+        .torrent(job_id)
+        .await
+        .unwrap()
+        .storage_dir
+        .unwrap();
+    let file = only_file(Path::new(&dir));
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut opened = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        opened
+            .seek(SeekFrom::Start(2 * PIECE as u64 + 100))
+            .unwrap();
+        opened.write_all(&[0x5a; 16]).unwrap();
+    }
+    Damaged {
+        rig,
+        job_id,
+        handle,
+        seeding,
+        _seeds: seeds,
+        data,
+        file,
+    }
+}
+
+// The job's pieces in hand, as its view shows them.
+async fn job_have(service: &TorrentService, job_id: JobId) -> u32 {
+    service.torrent(job_id).await.unwrap().pieces.unwrap().have
+}
+
+// libtorrent `torrent::force_recheck` forgets every piece and
+// `torrent::on_piece_hashed` has only the ones that pass: the session's
+// check is the one word on which pieces are had. The job lets the damaged
+// piece go, a peer sends it again, and the file holds the torrent's bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rechecked_piece_the_job_let_go_is_fetched_again_and_repairs_the_file() {
+    let Damaged {
+        rig,
+        job_id,
+        handle,
+        seeding,
+        _seeds,
+        data,
+        file,
+    } = complete_then_damaged().await;
+    assert_ne!(std::fs::read(&file).unwrap(), data);
+
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    handle.wait_until_completed().await.unwrap();
+
+    assert_eq!(std::fs::read(&file).unwrap(), data);
+    assert_eq!(job_have(&rig.service, job_id).await, 4);
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().have_bytes,
+        data.len() as u64
+    );
+    rig.service.stop().await;
+    seeding.stop().await;
+}
+
+// The job's checkpoint says what the check found: a restart before the
+// damaged piece came again neither has it nor trusts it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_after_a_recheck_does_not_have_the_piece_it_lost() {
+    use weaver_torrent::TorrentStatsState;
+
+    let Damaged {
+        rig,
+        job_id,
+        handle,
+        seeding,
+        data,
+        ..
+    } = complete_then_damaged().await;
+    // Nobody is left to fetch the damaged piece from again.
+    seeding.stop().await;
+    assert_eq!(job_have(&rig.service, job_id).await, 4);
+
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(job_have(&rig.service, job_id).await, 3);
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let handle = handle_of(&again, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    let stats = handle.stats();
+    assert!(matches!(stats.state, TorrentStatsState::Live));
+    assert!(!stats.finished);
+    assert_eq!(
+        stats.progress_bytes,
+        data.len() as u64 - RECHECKED_PIECE as u64
+    );
+    assert_eq!(job_have(&again, job_id).await, 3);
+    again.stop().await;
+}
+
+// libtorrent `torrent::on_piece_hashed` skips the rest of a file only when
+// the file ends: a recheck of a torrent the job holds only some pieces of
+// keeps every piece it holds after the one it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recheck_of_a_partial_torrent_keeps_its_pieces_after_a_hole() {
+    const PIECES: u32 = 16;
+    let Damaged {
+        rig,
+        job_id,
+        handle,
+        seeding,
+        data,
+        ..
+    } = complete_then_damaged_of(PIECES as usize).await;
+    // Nobody is left to fetch the damaged piece from again.
+    seeding.stop().await;
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(job_have(&rig.service, job_id).await, PIECES - 1);
+
+    // Piece 2 is a hole in the job now; piece 3 follows it in the file.
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(job_have(&rig.service, job_id).await, PIECES - 1);
+    assert_eq!(
+        handle.stats().progress_bytes,
+        data.len() as u64 - RECHECKED_PIECE as u64
+    );
+    rig.service.stop().await;
+}
+
+// libtorrent `torrent::force_recheck` forgets every piece before checking,
+// and `torrent::write_resume_data` saves none the check has not found: a
+// stop after a check of every piece began, before it found every piece,
+// trusts nothing on the next start, which checks every piece and does not
+// have the damaged one. The check is begun as the session begins it, by
+// telling the job's intake, and the service stopped before any piece is
+// checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_before_a_recheck_found_every_piece_checks_every_piece_on_the_next_start() {
+    use weaver_torrent::TorrentStatsState;
+
+    let Damaged {
+        rig,
+        job_id,
+        seeding,
+        data,
+        ..
+    } = complete_then_damaged().await;
+    // Nobody is left to fetch the damaged piece from again.
+    seeding.stop().await;
+    let intake = rig
+        .service
+        .with_torrent(job_id, |torrent| Ok(torrent.intake.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(intake.checking().unwrap());
+    assert_eq!(job_have(&rig.service, job_id).await, 0);
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let handle = handle_of(&again, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    let stats = handle.stats();
+    assert!(matches!(stats.state, TorrentStatsState::Live));
+    assert!(!stats.finished);
+    assert_eq!(
+        stats.progress_bytes,
+        data.len() as u64 - RECHECKED_PIECE as u64
+    );
+    assert_eq!(job_have(&again, job_id).await, 3);
+    again.stop().await;
+}
+
 // The next announce the tracker on `listener` hears, unanswered.
 async fn heard_announce(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
     use tokio::io::AsyncReadExt;
@@ -1899,9 +2125,14 @@ async fn a_trackers_status_follows_its_announces() {
     assert_eq!(
         trackers
             .iter()
-            .map(|tracker| (tracker.tier, tracker.url.as_str(), tracker.status))
+            .map(|tracker| (
+                tracker.tier,
+                tracker.url.as_str(),
+                tracker.status,
+                tracker.updating
+            ))
             .collect::<Vec<_>>(),
-        [(0, url.as_str(), TrackerStatus::Updating)]
+        [(0, url.as_str(), TrackerStatus::NotContacted, true)]
     );
 
     // The tracker stops once it has answered.
@@ -1921,8 +2152,9 @@ async fn a_trackers_status_follows_its_announces() {
     .await;
     let working = &trackers[0];
     assert_eq!(working.status, TrackerStatus::Working);
+    assert!(!working.updating);
     assert_eq!((working.seeders, working.leechers), (Some(3), Some(5)));
-    assert_eq!(working.message, None);
+    assert_eq!((working.message.as_deref(), working.fails), (None, 0));
     let at = working.last_announce_ms.unwrap();
     assert_eq!(working.next_announce_ms, Some(at + 1_800_000));
 
@@ -1972,7 +2204,7 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
 
     let mut started = heard_announce(&listener).await;
     let first = updates.next().await;
-    assert_eq!(first[0].trackers[0].status, TrackerStatus::Updating);
+    assert!(first[0].trackers[0].updating);
 
     let body = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
     let head = format!(
@@ -2307,6 +2539,10 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         tracker_rule_id: Some(1),
         unpack: None,
         metadata: Vec::new(),
+        upload_limit: None,
+        download_limit: None,
+        sequential: false,
+        first_last_piece_first: false,
     };
     let mut rules = vec![TrackerRule {
         id: 1,
@@ -2725,4 +2961,510 @@ async fn a_banned_peer_stays_banned_across_a_restart() {
     );
     again.stop().await;
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
+}
+
+// libtorrent `torrent::set_upload_limit` / `set_download_limit` throttle the
+// torrent's own channels in place, and qBittorrent's `TorrentImpl` keeps
+// them in its resume data: the limits reach the running torrent's session
+// at once, are what it reads back, and are handed to its session again
+// after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_rate_limits_reach_its_session_and_outlive_a_restart() {
+    use weaver_torrent::limits::{LimitKind, LimitsConfig};
+
+    let bps = |bps: u32| LimitKind::Bps(std::num::NonZeroU32::new(bps).unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    assert_eq!(handle.ratelimits(), LimitsConfig::default());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!((view.upload_limit, view.download_limit), (None, None));
+
+    // Zero holds the download closed.
+    rig.service
+        .set_rate_limits(job_id, Some(Some(65_536)), Some(Some(0)))
+        .await
+        .unwrap();
+    let limited = LimitsConfig {
+        upload_bps: bps(65_536),
+        download_bps: LimitKind::Closed,
+    };
+    assert_eq!(handle.ratelimits(), limited);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.upload_limit, view.download_limit),
+        (Some(65_536), Some(0))
+    );
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        (stored.upload_limit, stored.download_limit),
+        (Some(65_536), Some(0))
+    );
+    assert!(matches!(
+        rig.service
+            .set_rate_limits(JobId(999), Some(None), None)
+            .await,
+        Err(ActionError::NotFound(_))
+    ));
+    // A limit past what the row holds is refused before the torrent or
+    // its row takes it.
+    assert!(matches!(
+        rig.service
+            .set_rate_limits(job_id, Some(Some(u64::MAX)), Some(None))
+            .await,
+        Err(ActionError::Invalid(_))
+    ));
+    assert_eq!(handle.ratelimits(), limited);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        (stored.upload_limit, stored.download_limit),
+        (Some(65_536), Some(0))
+    );
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(handle_of(&again, job_id).await.ratelimits(), limited);
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.upload_limit, view.download_limit),
+        (Some(65_536), Some(0))
+    );
+    again.stop().await;
+}
+
+// A seeding policy's upload cap holds the torrent beside its own limit, as
+// a second channel over its peers would: the tighter of the two is in
+// force, and a change of either reaches the session without a restart.
+// The torrent reads back its own limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
+    use weaver_torrent::limits::LimitKind;
+
+    let bps = |bps: u32| LimitKind::Bps(std::num::NonZeroU32::new(bps).unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    rig.service
+        .set_rate_limits(job_id, Some(Some(65_536)), None)
+        .await
+        .unwrap();
+    let capped = |max_upload_bps| SeedingPolicy {
+        max_upload_bps,
+        ..SeedingPolicy::default()
+    };
+    rig.service
+        .set_policy_override(job_id, Some(capped(Some(1_000))))
+        .await
+        .unwrap();
+    rig.service.tick().await;
+    assert_eq!(handle.ratelimits().upload_bps, bps(1_000));
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().upload_limit,
+        Some(65_536)
+    );
+
+    rig.service
+        .set_policy_override(job_id, Some(capped(Some(1_000_000))))
+        .await
+        .unwrap();
+    rig.service.tick().await;
+    assert_eq!(handle.ratelimits().upload_bps, bps(65_536));
+
+    rig.service
+        .set_rate_limits(job_id, Some(None), None)
+        .await
+        .unwrap();
+    assert_eq!(handle.ratelimits().upload_bps, bps(1_000_000));
+    rig.service.stop().await;
+}
+
+// The job's raise puts the files it names at Maximum and leaves every other
+// file at its stored level; no raise leaves every level as stored, and an
+// ignored file stays ignored.
+#[test]
+fn a_raise_sets_maximum_on_the_raised_files_and_leaves_the_rest() {
+    use FilePriority::*;
+    let stored = [Normal, High, Ignored, Normal];
+    assert_eq!(raised_levels(&stored, vec![]), stored);
+    assert_eq!(
+        raised_levels(&stored, vec![1]),
+        [Normal, Maximum, Ignored, Normal]
+    );
+    assert_eq!(
+        raised_levels(&stored, vec![0, 2]),
+        [Maximum, High, Ignored, Normal]
+    );
+}
+
+// A file the job raises reaches the session at Maximum through the one
+// reconcile, an ignored file stays ignored under a raise, and a toggle the
+// session runs against what is stored is put back on the next pass.
+#[tokio::test(start_paused = true)]
+async fn a_raise_and_the_stored_toggles_reach_the_session_through_one_reconcile() {
+    use FilePriority::*;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let bytes = metainfo(
+        "trio",
+        // Whole pieces each, so a raise of one file raises no piece of another.
+        &[
+            ("trio/a.bin", &[1; 3072]),
+            ("trio/b.bin", &[2; 3072]),
+            ("trio/c.bin", &[3; 3072]),
+        ],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(0, High), (2, Ignored)])
+        .await
+        .unwrap();
+    assert_eq!(handle.file_priorities(), [High, Normal, Ignored]);
+
+    {
+        let live = rig.service.inner.live.lock().await;
+        let job = live[&job_id].job.as_ref().unwrap();
+        job.with(|job| {
+            job.raise(1);
+            job.raise(2);
+        });
+    }
+    rig.service.apply_picking().await;
+    assert_eq!(handle.file_priorities(), [High, Maximum, Ignored]);
+    // The operator's levels are what is stored; the raise is the job's.
+    let stored = rig.db.torrent_file_priorities(job_id).unwrap();
+    assert_eq!(stored, [High, Normal, Ignored]);
+
+    rig.service
+        .set_first_last_piece_first(job_id, true)
+        .await
+        .unwrap();
+    handle.set_sequential(true);
+    handle.set_first_last_piece_first(false).unwrap();
+    rig.service.apply_picking().await;
+    assert!(!handle.sequential());
+    assert!(handle.first_last_piece_first());
+    rig.service.stop().await;
+}
+
+// The two picking toggles set at once both hold: each call writes only its
+// own, so neither puts back the other's old value, in the database or in
+// memory.
+#[tokio::test(start_paused = true)]
+async fn the_two_picking_toggles_set_at_once_both_hold() {
+    use std::future::Future;
+    use std::task::Poll;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let bytes = metainfo("pair", &[("pair/a.bin", &[1; 3000])], 1024, false);
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+
+    // Both calls queue on the live lock before either runs, so each reads
+    // the torrent before the other has changed it.
+    let live = rig.service.inner.live.lock().await;
+    let mut both = std::pin::pin!(async {
+        tokio::join!(
+            rig.service.set_sequential(job_id, true),
+            rig.service.set_first_last_piece_first(job_id, true),
+        )
+    });
+    std::future::poll_fn(|cx| {
+        assert!(both.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(live);
+    let (sequential, first_last) = both.await;
+    sequential.unwrap();
+    first_last.unwrap();
+
+    let record = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert!(record.sequential && record.first_last_piece_first);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.sequential && view.first_last_piece_first);
+    assert!(handle.sequential() && handle.first_last_piece_first());
+    rig.service.stop().await;
+}
+
+// A level change and the two picking toggles are stored, reach the
+// torrent's session at once, and come back with it after a restart.
+#[tokio::test(start_paused = true)]
+async fn file_levels_and_picking_toggles_reach_the_session_and_outlive_a_restart() {
+    use FilePriority::*;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let bytes = metainfo(
+        "pair",
+        &[("pair/a.bin", &[1; 3000]), ("pair/b.bin", &[2; 3000])],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.file_priorities(), [Normal, Normal]);
+
+    rig.service
+        .set_file_priorities(job_id, &[(0, Ignored), (1, High)])
+        .await
+        .unwrap();
+    assert!(
+        rig.service
+            .set_file_priorities(job_id, &[(2, High)])
+            .await
+            .is_err()
+    );
+    let stored = rig.db.torrent_file_priorities(job_id).unwrap();
+    assert_eq!(stored, [Ignored, High]);
+    assert_eq!(handle.file_priorities(), [Ignored, High]);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        view.files
+            .iter()
+            .map(|file| file.selected())
+            .collect::<Vec<_>>(),
+        [false, true]
+    );
+
+    rig.service.set_sequential(job_id, true).await.unwrap();
+    rig.service
+        .set_first_last_piece_first(job_id, true)
+        .await
+        .unwrap();
+    assert!(handle.sequential() && handle.first_last_piece_first());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.sequential && view.first_last_piece_first);
+    rig.service.set_sequential(job_id, false).await.unwrap();
+    assert!(!handle.sequential());
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let handle = handle_of(&again, job_id).await;
+    assert_eq!(handle.file_priorities(), [Ignored, High]);
+    assert!(!handle.sequential());
+    assert!(handle.first_last_piece_first());
+    let view = again.torrent(job_id).await.unwrap();
+    assert!(!view.sequential && view.first_last_piece_first);
+    again.stop().await;
+}
+
+// The torrent's trackers as the service lists them: tier and URL.
+async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, String)> {
+    service
+        .trackers(job_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|tracker| (tracker.tier, tracker.url))
+        .collect()
+}
+
+// Added, replaced and removed trackers are written where the torrent's
+// trackers live, reach its session, and are what a restart starts with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tracker_edits_outlive_a_restart() {
+    let a = "http://a.invalid/announce";
+    let b = "http://b.invalid/announce";
+    let c = "udp://c.invalid:80";
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    // Paused, it announces to none of them.
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(announcing(&plain("edited", 3), a)))
+        })
+        .await
+        .unwrap();
+
+    // Added tiers go after the last; a tracker it lists is left out.
+    rig.service
+        .add_trackers(
+            job_id,
+            vec![vec![b.into(), a.into()], vec![], vec![c.into()]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_trackers(&rig.service, job_id).await,
+        [(0, a.into()), (1, b.into()), (2, c.into())]
+    );
+
+    rig.service
+        .replace_trackers(
+            job_id,
+            vec![
+                TrackerEntry {
+                    tier: 1,
+                    url: a.into(),
+                },
+                TrackerEntry {
+                    tier: 0,
+                    url: c.into(),
+                },
+                TrackerEntry {
+                    tier: 0,
+                    url: c.into(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_trackers(&rig.service, job_id).await,
+        [(0, c.into()), (1, a.into())]
+    );
+
+    rig.service
+        .remove_trackers(job_id, &[a.into()])
+        .await
+        .unwrap();
+    assert_eq!(listed_trackers(&rig.service, job_id).await, [(0, c.into())]);
+    assert_eq!(
+        handle_of(&rig.service, job_id)
+            .await
+            .shared()
+            .tracker_tiers(),
+        [vec![weaver_torrent::Url::parse(c).unwrap()]]
+    );
+
+    // An edit naming no URL changes nothing.
+    assert!(matches!(
+        rig.service
+            .add_trackers(job_id, vec![vec!["not a tracker".into()]])
+            .await,
+        Err(ActionError::Invalid(_))
+    ));
+    assert_eq!(
+        rig.service
+            .add_trackers(JobId(9_999), vec![vec![b.into()]])
+            .await,
+        Err(ActionError::NotFound(JobId(9_999)))
+    );
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(listed_trackers(&again, job_id).await, [(0, c.into())]);
+    assert_eq!(
+        handle_of(&again, job_id).await.shared().tracker_tiers(),
+        [vec![weaver_torrent::Url::parse(c).unwrap()]]
+    );
+    again.stop().await;
+}
+
+// A reannounce reaches the tracker now, long before the interval it set
+// is up, for every tracker or for the one named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reannounce_reaches_the_tracker_now() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(announcing(
+            &plain("again", 4),
+            &url,
+        ))))
+        .await
+        .unwrap();
+    let body = b"d8:completei3e10:incompletei5e8:intervali1800e12:min intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let answer = [head.as_bytes(), body].concat();
+    // The announce table once an answer other than `before` has landed.
+    let answered = |before: Option<std::time::SystemTime>| {
+        move |announces: &[TrackerAnnounce]| {
+            !announces[0].in_flight
+                && announces[0]
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.result.is_ok() && Some(last.at) != before)
+        }
+    };
+    let last_at = |service: &TorrentService| {
+        let service = service.clone();
+        async move {
+            handle_of(&service, job_id).await.tracker_announces()[0]
+                .last
+                .as_ref()
+                .map(|last| last.at)
+        }
+    };
+
+    let mut started = heard_announce(&listener).await;
+    started.write_all(&answer).await.unwrap();
+    trackers_once(&rig.service, job_id, answered(None)).await;
+    let first = last_at(&rig.service).await;
+
+    // The tracker asked for 30 minutes between announces.
+    rig.service.reannounce(job_id).await.unwrap();
+    let mut again = heard_announce(&listener).await;
+    again.write_all(&answer).await.unwrap();
+    let second = trackers_once(&rig.service, job_id, answered(first)).await;
+    assert_eq!(second[0].status, TrackerStatus::Working);
+
+    assert!(matches!(
+        rig.service
+            .reannounce_tracker(job_id, "http://other.invalid/announce")
+            .await,
+        Err(ActionError::Invalid(_))
+    ));
+    rig.service.reannounce_tracker(job_id, &url).await.unwrap();
+    let mut once_more = heard_announce(&listener).await;
+    once_more.write_all(&answer).await.unwrap();
+
+    rig.service.dht_announce(job_id).await.unwrap();
+    assert_eq!(
+        rig.service.reannounce(JobId(9_999)).await,
+        Err(ActionError::NotFound(JobId(9_999)))
+    );
+    rig.service.stop().await;
 }

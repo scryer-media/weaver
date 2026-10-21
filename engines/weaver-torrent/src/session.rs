@@ -67,7 +67,10 @@ use crate::{
     merge_streams::merge_streams,
     network::SocketFactory,
     peer_connection::PeerConnectionOptions,
-    piece_priority::{PiecePriority, validate_piece_priorities},
+    piece_priority::{
+        FilePriority, PiecePriority, file_priorities, file_to_piece_priorities,
+        validate_piece_priorities, wanted_files,
+    },
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
     session_stats::SessionStats,
@@ -212,11 +215,18 @@ impl AnnouncePort {
 /// The peers the DHT finds for `info_hash`, announcing `port` to the nodes
 /// closest to it. The DHT search reads the port when it starts, so a new
 /// port starts a new search, which announces it (libtorrent
-/// `torrent::dht_announce` reads the port at each announce).
-fn dht_peers(dht: Dht, info_hash: Id20, mut port: ListenPort) -> BoxStream<'static, SocketAddr> {
+/// `torrent::dht_announce` reads the port at each announce), and so does
+/// each change of `announce` (libtorrent `torrent_handle::force_dht_announce`).
+fn dht_peers(
+    dht: Dht,
+    info_hash: Id20,
+    mut port: ListenPort,
+    mut announce: tokio::sync::watch::Receiver<()>,
+) -> BoxStream<'static, SocketAddr> {
     async_stream::stream! {
         loop {
             let mut peers = dht.get_peers(info_hash, *port.borrow_and_update());
+            announce.mark_unchanged();
             loop {
                 tokio::select! {
                     peer = peers.next() => match peer {
@@ -224,6 +234,7 @@ fn dht_peers(dht: Dht, info_hash: Id20, mut port: ListenPort) -> BoxStream<'stat
                         None => return,
                     },
                     Ok(()) = port.changed() => break,
+                    Ok(()) = announce.changed() => break,
                 }
             }
         }
@@ -460,6 +471,42 @@ fn compute_only_files(
     }
 }
 
+// Each file's level at the start: those given, one a file; or Normal for the
+// files `only_files` names and Ignored for the rest; or every file Normal.
+// Padding is Ignored whatever is given.
+fn compute_file_priorities(
+    file_infos: &FileInfos,
+    given: Option<Vec<FilePriority>>,
+    only_files: Option<&[usize]>,
+) -> anyhow::Result<Vec<FilePriority>> {
+    let levels = match (given, only_files) {
+        (Some(_), Some(_)) => {
+            bail!("file_priorities and only_files are mutually exclusive");
+        }
+        (Some(given), None) => {
+            if given.len() != file_infos.len() {
+                bail!(
+                    "file_priorities has {} levels, but the torrent has {} files",
+                    given.len(),
+                    file_infos.len()
+                );
+            }
+            given
+        }
+        (None, Some(only_files)) => (0..file_infos.len())
+            .map(|index| {
+                if only_files.contains(&index) {
+                    FilePriority::Normal
+                } else {
+                    FilePriority::Ignored
+                }
+            })
+            .collect(),
+        (None, None) => vec![FilePriority::Normal; file_infos.len()],
+    };
+    Ok(file_priorities(file_infos, &levels))
+}
+
 fn merge_two_optional_streams<T>(
     s1: Option<impl Stream<Item = T> + Unpin + Send + 'static>,
     s2: Option<impl Stream<Item = T> + Unpin + Send + 'static>,
@@ -482,9 +529,22 @@ pub struct AddTorrentOptions {
     pub paused: bool,
     /// A regex to only download files matching it.
     pub only_files_regex: Option<String>,
-    /// An explicit list of file IDs to download.
-    /// To see the file indices, run with "list_only".
+    /// An explicit list of file IDs to download: they are Normal, every
+    /// other file Ignored. To see the file indices, run with "list_only".
     pub only_files: Option<Vec<usize>>,
+    /// Each file's level, one a file by index (qBittorrent's four; see
+    /// [`FilePriority`] and [`ManagedTorrent::set_file_priorities`]). None
+    /// is every file Normal. Exclusive with `only_files` and
+    /// `only_files_regex`; a list of the wrong length is refused.
+    pub file_priorities: Option<Vec<FilePriority>>,
+    /// Pick the top-level pieces first, then every other wanted piece by
+    /// index (see [`ManagedTorrent::set_sequential`]).
+    #[serde(default)]
+    pub sequential: bool,
+    /// Put the first and last pieces of each wanted file at the top level
+    /// (see [`ManagedTorrent::set_first_last_piece_first`]).
+    #[serde(default)]
+    pub first_last_piece_first: bool,
     /// Allow writing on top of existing files, including when resuming a torrent.
     /// You probably want to set it, however for safety it's not default.
     ///
@@ -538,6 +598,12 @@ pub struct AddTorrentOptions {
     // Custom trackers
     pub trackers: Option<Vec<String>>,
 
+    /// The torrent's trackers, in tiers, in place of those its metainfo or
+    /// magnet link names (libtorrent `add_torrent_params::trackers` and
+    /// `tracker_tiers` from resume data, which replace the .torrent's).
+    /// [`Self::trackers`] still follow them.
+    pub tracker_tiers: Option<Vec<Vec<String>>>,
+
     /// What the storage already holds, as a checkpoint of an earlier run
     /// recorded it (see [`Checkpoint`]). When set, the initial hash check
     /// does not run: its pieces are taken as have and its blocks as
@@ -549,9 +615,11 @@ pub struct AddTorrentOptions {
     #[serde(skip)]
     pub checkpoint: Option<Checkpoint>,
 
-    /// The initial fetch priority of the given pieces, by piece index; every
-    /// other piece is Normal. See [`PiecePriority`] and
-    /// [`ManagedTorrent::set_piece_priorities`]. An index out of range is refused.
+    /// The initial fetch priority of the given pieces, by piece index, over
+    /// what the files' levels give them (libtorrent applies
+    /// `add_torrent_params::piece_priorities` after the file priorities).
+    /// See [`PiecePriority`] and [`ManagedTorrent::set_piece_priorities`].
+    /// An index out of range is refused.
     pub piece_priorities: Option<Vec<(u32, PiecePriority)>>,
 
     /// How the torrent names itself to its peers and trackers. If not set,
@@ -584,6 +652,9 @@ impl Default for AddTorrentOptions {
             paused: false,
             only_files_regex: None,
             only_files: None,
+            file_priorities: None,
+            sequential: false,
+            first_last_piece_first: false,
             overwrite: false,
             list_only: false,
             output_folder: None,
@@ -599,6 +670,7 @@ impl Default for AddTorrentOptions {
             preferred_id: None,
             storage_factory: None,
             trackers: None,
+            tracker_tiers: None,
             checkpoint: None,
             piece_priorities: None,
             identity: None,
@@ -611,7 +683,10 @@ impl Default for AddTorrentOptions {
 pub struct ListOnlyResponse {
     pub info_hash: Id20,
     pub info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
-    pub only_files: Option<Vec<usize>>,
+    /// Each file's level, as the options give it.
+    pub file_priorities: Vec<FilePriority>,
+    pub sequential: bool,
+    pub first_last_piece_first: bool,
     pub output_folder: PathBuf,
     pub seen_peers: Vec<SocketAddr>,
     pub torrent_bytes: Bytes,
@@ -1010,6 +1085,20 @@ fn metainfo_tracker_tiers(meta: &TorrentMetaV1Owned) -> Vec<Vec<url::Url>> {
     }
 }
 
+/// The tiers the caller gave in place of the torrent's own.
+fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<url::Url>>> {
+    opts.tracker_tiers.as_ref().map(|tiers| {
+        tiers
+            .iter()
+            .map(|tier| {
+                tier.iter()
+                    .filter_map(|t| url::Url::parse(t).ok())
+                    .collect()
+            })
+            .collect()
+    })
+}
+
 /// The tiers a torrent announces to: its own tiers in order, then each of
 /// `extra` as a tier of its own, unless the torrent is private. A private
 /// torrent (BEP 27) talks only to the trackers it came with. A tracker listed
@@ -1020,16 +1109,7 @@ fn merge_tracker_tiers(
     private: bool,
 ) -> Vec<Vec<url::Url>> {
     let extra = (!private).then(|| extra.into_iter().map(|t| vec![t]));
-    let mut seen = HashSet::new();
-    own.into_iter()
-        .chain(extra.into_iter().flatten())
-        .map(|tier| {
-            tier.into_iter()
-                .filter(|t| seen.insert(t.clone()))
-                .collect::<Vec<_>>()
-        })
-        .filter(|tier| !tier.is_empty())
-        .collect()
+    crate::tracker::tidy_tiers(own.into_iter().chain(extra.into_iter().flatten()))
 }
 
 impl Session {
@@ -1912,7 +1992,8 @@ impl Session {
                         }));
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
-                        if opts.only_files.is_none() {
+                        // the files
+                        if opts.only_files.is_none() && opts.file_priorities.is_none() {
                             opts.only_files = Some(so);
                         }
                     }
@@ -1921,12 +2002,14 @@ impl Session {
                         info_hashes: magnet.info_hashes(),
                         // Each tracker of a magnet link is a tier of its own.
                         tracker_tiers: merge_tracker_tiers(
-                            magnet
-                                .trackers
-                                .into_iter()
-                                .filter_map(|t| url::Url::parse(&t).ok())
-                                .map(|t| vec![t])
-                                .collect(),
+                            own_tracker_tiers(&opts).unwrap_or_else(|| {
+                                magnet
+                                    .trackers
+                                    .into_iter()
+                                    .filter_map(|t| url::Url::parse(&t).ok())
+                                    .map(|t| vec![t])
+                                    .collect()
+                            }),
                             std::iter::empty(),
                             false,
                         ),
@@ -1953,7 +2036,8 @@ impl Session {
                     };
 
                     let tracker_tiers = merge_tracker_tiers(
-                        metainfo_tracker_tiers(&torrent.meta),
+                        own_tracker_tiers(&opts)
+                            .unwrap_or_else(|| metainfo_tracker_tiers(&torrent.meta)),
                         opts.trackers
                             .iter()
                             .flatten()
@@ -2037,6 +2121,7 @@ impl Session {
             .identity
             .take()
             .unwrap_or_else(|| self.identity.clone());
+        let dht_announce = tokio::sync::watch::channel(()).0;
 
         let make_peer_rx = |private: bool| {
             self.make_peer_rx(
@@ -2047,6 +2132,7 @@ impl Session {
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
+                dht_announce.subscribe(),
             )
         };
 
@@ -2070,6 +2156,15 @@ impl Session {
                     (metadata, peer_rx, peer_list)
                 }
                 None => {
+                    if self.dht.is_none()
+                        && self.lsd.is_none()
+                        && tracker_tiers.is_empty()
+                        && opts.initial_peers.as_ref().is_none_or(Vec::is_empty)
+                    {
+                        bail!(
+                            "no known way to resolve peers (no DHT, no trackers, no initial_peers)"
+                        );
+                    }
                     // Whether the torrent is private is known only once its
                     // metadata arrives.
                     let PeerSource { peers, trackers } = make_peer_rx(false).context(
@@ -2124,17 +2219,26 @@ impl Session {
             .map(|checkpoint| normalize_checkpoint(checkpoint, metadata.info.lengths()))
             .transpose()?;
 
-        let piece_priorities = match opts.piece_priorities.take() {
-            Some(priorities) => {
-                let lengths = metadata.info.lengths();
-                let mut all = vec![PiecePriority::Normal; lengths.total_pieces() as usize];
-                for (index, priority) in validate_piece_priorities(lengths, &priorities)? {
-                    all[index.get_usize()] = priority;
-                }
-                Some(all)
-            }
-            None => None,
-        };
+        let file_priorities = compute_file_priorities(
+            &metadata.file_infos,
+            opts.file_priorities.take(),
+            only_files.as_deref(),
+        )?;
+        // The files' rule first, then the pieces set one by one over it
+        // (libtorrent `torrent::init`).
+        let lengths = metadata.info.lengths();
+        let mut piece_priorities = file_to_piece_priorities(
+            lengths,
+            &metadata.file_infos,
+            &file_priorities,
+            opts.first_last_piece_first,
+        );
+        for (index, priority) in
+            validate_piece_priorities(lengths, &opts.piece_priorities.take().unwrap_or_default())?
+        {
+            piece_priorities[index.get_usize()] = priority;
+        }
+        let only_files = Some(wanted_files(&file_priorities));
 
         let output_folder = match (opts.output_folder, opts.sub_folder) {
             (None, None) => self.output_folder.join(
@@ -2153,7 +2257,9 @@ impl Session {
                 info_hash,
                 torrent_bytes: metadata.torrent_bytes(),
                 info: metadata.info,
-                only_files,
+                file_priorities,
+                sequential: opts.sequential,
+                first_last_piece_first: opts.first_last_piece_first,
                 output_folder,
                 seen_peers,
             }));
@@ -2196,8 +2302,8 @@ impl Session {
                 span,
                 info_hash,
                 info_hashes,
-                trackers: tracker_tiers.iter().flatten().cloned().collect(),
-                tracker_tiers,
+                tracker_tiers: parking_lot::RwLock::new(tracker_tiers),
+                dht_announce,
                 spawner: self.spawner.clone(),
                 peer_id: identity.peer_id,
                 storage_factory,
@@ -2211,6 +2317,7 @@ impl Session {
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_v1_hashes: opts.disable_v1_hashes,
                     super_seeding: opts.super_seeding,
+                    sequential: opts.sequential.into(),
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
@@ -2224,19 +2331,20 @@ impl Session {
             let initializing = Arc::new(TorrentStateInitializing::new(
                 minfo.clone(),
                 metadata.clone(),
-                only_files.clone(),
+                only_files,
                 self.spawner
                     .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
                 false,
                 checkpoint,
-                piece_priorities.clone(),
+                Some(piece_priorities.clone()),
                 peer_list,
             ));
             let handle = Arc::new(ManagedTorrent {
                 locked: RwLock::new(ManagedTorrentLocked {
                     paused: opts.paused,
                     state: ManagedTorrentState::Initializing(initializing),
-                    only_files,
+                    files: file_priorities,
+                    first_last: opts.first_last_piece_first,
                     piece_priorities,
                     trackers: None,
                     auto_scrape: None,
@@ -2389,17 +2497,18 @@ impl Session {
         self.make_peer_rx(
             t.info_hashes(),
             &t.shared().identity(),
-            t.shared().tracker_tiers.clone(),
+            t.shared().tracker_tiers(),
             announce,
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
             is_private,
+            t.shared().dht_announce.subscribe(),
         )
     }
 
     /// The tiers a torrent announces to: its own, then the session's trackers
     /// unless the torrent is private.
-    fn announce_tiers(
+    pub(crate) fn announce_tiers(
         &self,
         tracker_tiers: Vec<Vec<url::Url>>,
         is_private: bool,
@@ -2432,9 +2541,11 @@ impl Session {
 
     /// [`Session::may_reach`] for the tracker task, which already holds the
     /// session (its counters).
+    // Weak, as the tracker task outlives no session: holding it strongly
+    // would keep a session whose torrents announce nowhere alive.
     fn reachable(self: &Arc<Self>) -> Reachable {
-        let session = self.clone();
-        Arc::new(move |ip| session.may_reach(ip))
+        let session = Arc::downgrade(self);
+        Arc::new(move |ip| session.upgrade().map_or(Ok(()), |s| s.may_reach(ip)))
     }
 
     // Get a peer stream from both DHT and trackers, under every hash the
@@ -2449,6 +2560,7 @@ impl Session {
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
+        dht_announce: tokio::sync::watch::Receiver<()>,
     ) -> Option<PeerSource> {
         let dht_rx = if is_private {
             None
@@ -2463,6 +2575,7 @@ impl Session {
                         } else {
                             tokio::sync::watch::channel(None).1
                         },
+                        dht_announce.clone(),
                     )
                 }))
             })
@@ -2494,30 +2607,35 @@ impl Session {
 
         let tracker_rx_stats = PeerRxTorrentInfo {
             info_hashes,
-            session: self.clone(),
+            session: Arc::downgrade(self),
             torrent: Default::default(),
         };
-        let (tracker_rx, trackers) = TrackerComms::start_with_tiers(
-            info_hashes,
-            identity.clone(),
-            self.announce_tiers(tracker_tiers, is_private),
-            Box::new(tracker_rx_stats),
-            force_tracker_interval,
-            self.announce_port.subscribe(),
-            // Only a private torrent tells its trackers our addresses
-            // (libtorrent `torrent::build_tracker_request`).
-            if is_private {
-                self.own_ips.clone()
-            } else {
-                Arc::new(Vec::new)
-            },
-            self.http_clients.clone(),
-            self.reachable(),
-            self.udp_tracker_client.clone(),
-            self.stopped_announces.clone(),
-        )
-        .map(|task| (task.peers, task.status))
-        .unzip();
+        // The task runs with no tracker too, so trackers added later are
+        // announced to; a session without trackers starts none.
+        let (tracker_rx, trackers) = (!self.disable_trackers)
+            .then(|| {
+                TrackerComms::start_with_tiers(
+                    info_hashes,
+                    identity.clone(),
+                    self.announce_tiers(tracker_tiers, is_private),
+                    Box::new(tracker_rx_stats),
+                    force_tracker_interval,
+                    self.announce_port.subscribe(),
+                    // Only a private torrent tells its trackers our addresses
+                    // (libtorrent `torrent::build_tracker_request`).
+                    if is_private {
+                        self.own_ips.clone()
+                    } else {
+                        Arc::new(Vec::new)
+                    },
+                    self.http_clients.clone(),
+                    self.reachable(),
+                    self.udp_tracker_client.clone(),
+                    self.stopped_announces.clone(),
+                )
+            })
+            .map(|task| (task.peers, task.status))
+            .unzip();
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
@@ -2579,12 +2697,14 @@ impl Session {
         handle.start(peer_rx, paused)
     }
 
-    pub async fn update_only_files(
+    /// [`ManagedTorrent::set_file_priorities`], and the session's saved
+    /// state follows.
+    pub async fn set_file_priorities(
         self: &Arc<Self>,
         handle: &ManagedTorrentHandle,
-        only_files: &HashSet<usize>,
+        priorities: &[(usize, FilePriority)],
     ) -> anyhow::Result<()> {
-        handle.update_only_files(only_files)?;
+        handle.set_file_priorities(priorities)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
@@ -2751,7 +2871,8 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
 // Ad adapter for converting stats into the format that tracker_comms accepts.
 struct PeerRxTorrentInfo {
     info_hashes: InfoHashes,
-    session: Arc<Session>,
+    // Weak for the reason `Session::reachable` gives.
+    session: std::sync::Weak<Session>,
     // Kept once found, so the counters stay readable after the torrent is
     // removed from the session (for the `stopped` announce).
     torrent: std::sync::OnceLock<ManagedTorrentHandle>,
@@ -2762,7 +2883,7 @@ impl PeerRxTorrentInfo {
         if let Some(t) = self.torrent.get() {
             return Some(t);
         }
-        let found = self.session.with_torrents(|torrents| {
+        let found = self.session.upgrade()?.with_torrents(|torrents| {
             torrents
                 .map(|(_, t)| t)
                 .find(|t| t.info_hashes().overlaps(&self.info_hashes))
@@ -2844,7 +2965,9 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             // A magnet still receiving its metadata isn't in the session
             // yet: it is looked for again as each torrent is added
             // (libtorrent waits on `metadata_received_alert`).
-            let added = self.session.db.read().added.clone();
+            let Some(added) = self.session.upgrade().map(|s| s.db.read().added.clone()) else {
+                return futures::future::pending().await;
+            };
             loop {
                 let mut next_added = std::pin::pin!(added.notified());
                 next_added.as_mut().enable();
@@ -3090,7 +3213,8 @@ mod tests {
         dht.add_node(node_addr);
         let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
         // The node is the closest there is to the hash: its own id.
-        let mut peers = super::dht_peers(dht, Id20::new(NODE_ID), listen_port);
+        let (announce, announce_rx) = tokio::sync::watch::channel(());
+        let mut peers = super::dht_peers(dht, Id20::new(NODE_ID), listen_port, announce_rx);
         let first = tokio::select! {
             _ = peers.next() => panic!("the node gave no peers"),
             port = next_announced(&node) => port,
@@ -3102,6 +3226,15 @@ mod tests {
             port = next_announced(&node) => port,
         };
         assert_eq!(second, 40001);
+
+        // A forced DHT announce (libtorrent torrent_handle::force_dht_announce)
+        // starts a new search, which announces again.
+        announce.send_replace(());
+        let third = tokio::select! {
+            _ = peers.next() => panic!("the node gave no peers"),
+            port = next_announced(&node) => port,
+        };
+        assert_eq!(third, 40001);
     }
 
     #[tokio::test]
@@ -3266,9 +3399,9 @@ mod tests {
         };
 
         let private = add("private", true).await;
-        assert_eq!(private.shared().tracker_tiers, own_tiers());
+        assert_eq!(private.shared().tracker_tiers(), own_tiers());
         assert_eq!(
-            session.announce_tiers(private.shared().tracker_tiers.clone(), true),
+            session.announce_tiers(private.shared().tracker_tiers(), true),
             own_tiers()
         );
 
@@ -3278,11 +3411,11 @@ mod tests {
             &["http://b1.test/announce"],
             &["http://added.test/announce"],
         ]);
-        assert_eq!(public.shared().tracker_tiers, with_added);
+        assert_eq!(public.shared().tracker_tiers(), with_added);
         let mut with_session = with_added;
         with_session.push(vec![url("http://session.test/announce")]);
         assert_eq!(
-            session.announce_tiers(public.shared().tracker_tiers.clone(), false),
+            session.announce_tiers(public.shared().tracker_tiers(), false),
             with_session
         );
 
@@ -3400,7 +3533,7 @@ mod tests {
         use crate::tracker::TorrentStatsProvider;
         let info = super::PeerRxTorrentInfo {
             info_hashes: handle.info_hashes(),
-            session: session.clone(),
+            session: std::sync::Arc::downgrade(session),
             torrent: Default::default(),
         };
         let stats = info.get();
@@ -3465,7 +3598,7 @@ mod tests {
             .info_hashes;
         let info = super::PeerRxTorrentInfo {
             info_hashes,
-            session: session.clone(),
+            session: std::sync::Arc::downgrade(&session),
             torrent: Default::default(),
         };
         let mut wait = info.wait_until_completed();
@@ -3515,6 +3648,103 @@ mod tests {
         assert!((&mut wait).now_or_never().is_none());
         session.delete(handle.id().into(), false).await.unwrap();
         assert!(wait.await.is_err());
+        session.stop().await;
+    }
+
+    // The file levels, sequential and first-and-last given at add are the
+    // torrent's, and each change rewrites the pieces from the levels
+    // (libtorrent `torrent::prioritize_files`, qBittorrent
+    // `TorrentImpl::setFirstLastPiecePriority`).
+    #[tokio::test(start_paused = true)]
+    async fn file_levels_and_the_picking_toggles_are_set_at_add_and_changed_after() {
+        use crate::{FilePriority::*, PiecePriority};
+        const PIECE: usize = 16384;
+        let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
+            2,
+            PIECE,
+            Some("levels"),
+        );
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(PIECE as u32),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let both = AddTorrentOptions {
+            output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+            overwrite: true,
+            only_files: Some(vec![0]),
+            file_priorities: Some(vec![Normal, Normal]),
+            ..Default::default()
+        };
+        assert!(
+            session
+                .add_torrent(AddTorrent::from_bytes(torrent.clone()), Some(both))
+                .await
+                .is_err()
+        );
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    file_priorities: Some(vec![Ignored, High]),
+                    sequential: true,
+                    first_last_piece_first: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        let level = |file: usize| {
+            let start = handle
+                .with_metadata(|m| m.file_infos[file].piece_range.start)
+                .unwrap();
+            handle.piece_priority(start).unwrap()
+        };
+        assert_eq!(handle.file_priorities(), [Ignored, High]);
+        assert_eq!(handle.only_files(), Some(vec![1]));
+        assert!(handle.sequential());
+        assert!(handle.first_last_piece_first());
+        // A one-piece file is all head and tail.
+        assert_eq!(level(0), PiecePriority::Skip);
+        assert_eq!(level(1), PiecePriority::Critical);
+
+        handle.set_first_last_piece_first(false).unwrap();
+        assert_eq!(level(1), PiecePriority::High);
+        handle
+            .set_file_priorities(&[(0, Maximum), (1, Ignored)])
+            .unwrap();
+        assert_eq!(handle.file_priorities(), [Maximum, Ignored]);
+        assert_eq!(handle.only_files(), Some(vec![0]));
+        assert_eq!(level(0), PiecePriority::Critical);
+        assert_eq!(level(1), PiecePriority::Skip);
+        assert!(handle.set_file_priorities(&[(2, Normal)]).is_err());
+        handle.set_sequential(false);
+        assert!(!handle.sequential());
         session.stop().await;
     }
 
@@ -3582,7 +3812,11 @@ mod tests {
                     .unwrap()
             })
             .unwrap();
-        handle.update_only_files(&HashSet::from([had])).unwrap();
+        let ignored: Vec<_> = (0..handle.file_priorities().len())
+            .filter(|file| *file != had)
+            .map(|file| (file, crate::FilePriority::Ignored))
+            .collect();
+        handle.set_file_priorities(&ignored).unwrap();
         assert!(handle.live().unwrap().finished_during_run());
 
         let (info, stats) = tracker_stats(&session, &handle);

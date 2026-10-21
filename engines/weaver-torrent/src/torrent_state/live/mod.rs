@@ -105,7 +105,7 @@ use crate::{
         DEFAULT_CONNECT_TIMEOUT, PeerConnection, PeerConnectionHandler, PeerConnectionOptions,
         WriterRequest,
     },
-    piece_priority::PiecePriority,
+    piece_priority::{FilePriority, PiecePriority},
     piece_tracker::{AcquireRequest, AcquireResult, Arrival, PickOptions, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
@@ -1179,29 +1179,26 @@ impl TorrentStateLive {
         }
     }
 
-    /// The torrent's limits grant bytes of the `want` a peer asks for, and
-    /// the session's then grant some or all of those; the torrent has back
-    /// what the session did not grant (libtorrent
-    /// `peer_connection::request_bandwidth` asks every channel over the peer
-    /// for one request).
+    /// The torrent's limits and the session's grant bytes of the `want` a
+    /// peer asks for (`Limits::request_within`).
     async fn grant_bandwidth(&self, channel: Channel, want: u64) -> u64 {
-        let torrent = &self.shared.options.ratelimits;
-        let granted = torrent.request(channel, want).await;
-        let Some(session) = self.shared.session.upgrade() else {
-            return granted;
-        };
-        let both = session.ratelimits.request(channel, granted).await;
-        torrent.give_back(channel, granted - both);
-        both
+        let session = self.shared.session.upgrade();
+        self.shared
+            .options
+            .ratelimits
+            .request_within(session.as_ref().map(|s| &s.ratelimits), channel, want)
+            .await
     }
 
     /// Bytes granted to a peer that will not cross its socket go back to
     /// the torrent's limits and the session's.
     fn give_back_bandwidth(&self, channel: Channel, bytes: u64) {
-        self.shared.options.ratelimits.give_back(channel, bytes);
-        if let Some(session) = self.shared.session.upgrade() {
-            session.ratelimits.give_back(channel, bytes);
-        }
+        let session = self.shared.session.upgrade();
+        self.shared.options.ratelimits.give_back_within(
+            session.as_ref().map(|s| &s.ratelimits),
+            channel,
+            bytes,
+        );
     }
 
     pub fn stats_snapshot(&self) -> StatsSnapshot {
@@ -1273,7 +1270,8 @@ impl TorrentStateLive {
         // The peer list is read before the state lock: a dying peer holds
         // its own entry while it takes the state lock, so the state lock
         // never waits on a peer entry.
-        let peers = self.peers.idle_list(tokio::time::Instant::now());
+        self.peers.close_all(tokio::time::Instant::now());
+        let peers = self.peers.idle_list();
         let mut g = self.lock_write("pause");
 
         // It should be impossible to make a fatal error after pausing.
@@ -1317,11 +1315,17 @@ impl TorrentStateLive {
         Err(res)
     }
 
-    pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
-        let hns = self
-            .lock_write("update_only_files")
-            .get_pieces_mut()?
-            .update_only_files(&self.metadata.file_infos, only_files)?;
+    /// The files' levels changed; see [`crate::chunk_tracker::ChunkTracker::prioritize`].
+    pub(crate) fn prioritize(
+        &self,
+        files: &[FilePriority],
+        pieces: &[PiecePriority],
+    ) -> anyhow::Result<()> {
+        let hns = self.lock_write("prioritize").get_pieces_mut()?.prioritize(
+            &self.metadata.file_infos,
+            files,
+            pieces,
+        );
         // The peers' requesters look again at what they may ask for, and
         // whether we want anything at all (libtorrent
         // `torrent::update_piece_priorities` calls `update_interest` on
@@ -1345,10 +1349,10 @@ impl TorrentStateLive {
             .lock_write("set_piece_priorities")
             .get_pieces_mut()?
             .set_piece_priorities(priorities);
-        // As in update_only_files().
+        // As in prioritize().
         self.new_pieces_notify.notify_waiters();
         // Wanting a skipped piece again may make peers we let go useful. With the
-        // state lock released, for the reason given in update_only_files().
+        // state lock released, for the reason given in prioritize().
         self.update_upload_only();
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
@@ -2574,6 +2578,12 @@ impl PeerHandler {
                             reverse: live.is_snubbed(),
                             on_parole,
                             suggested: &live.suggested,
+                            sequential: self
+                                .state
+                                .shared
+                                .options
+                                .sequential
+                                .load(Ordering::Relaxed),
                         },
                         can_steal: |p| {
                             self.state.per_piece_locks[p.get_usize()]

@@ -160,9 +160,12 @@ where
             _ = peers.wait_for_candidate() => {}
         }
     };
-    // The connections still asking end here.
+    // The connections still asking end here, and their peers go to the
+    // torrent with no wait to reconnect: libtorrent's metadata connections
+    // are the torrent's own and carry on past `torrent::set_metadata`, so
+    // the torrent connects to them again at once.
     drop(asking);
-    (found, addrs, seen, peers.idle_list(Instant::now()))
+    (found, addrs, seen, peers.idle_list())
 }
 
 #[cfg(test)]
@@ -267,6 +270,36 @@ mod tests {
             let times = asked.iter().filter(|(a, _)| *a == peer).count();
             assert_eq!(times, MAX_FAILCOUNT as usize, "{peer}: {asked:?}");
         }
+    }
+
+    // libtorrent `torrent::set_metadata`: the connections that brought the
+    // metadata are the torrent's own and carry on, so the torrent has the
+    // peers they reached at once, the one that answered and one still
+    // asking alike.
+    #[tokio::test(start_paused = true)]
+    async fn the_peers_still_connected_when_the_metadata_comes_are_due_at_once() {
+        // At two hosts: the torrent's list keeps one connection per address.
+        let (answers, asking) = (
+            SocketAddr::from(([10, 0, 0, 1], 1)),
+            SocketAddr::from(([10, 0, 0, 2], 1)),
+        );
+        let ask = |peer, _: &Arc<PeerStates>| async move {
+            if peer == answers {
+                Ok(peer)
+            } else {
+                std::future::pending().await
+            }
+        };
+        let (found, _, _, list) =
+            first_answer(listing([answers, asking]), futures::stream::pending(), ask).await;
+        assert_eq!(found, Some(answers));
+
+        let next = PeerStates::founded_on(list, Default::default(), 0);
+        let now = Instant::now();
+        let due = HashSet::from_iter(
+            std::iter::from_fn(|| next.connect_next(now)).map(|(peer, ..)| peer),
+        );
+        assert_eq!(due, HashSet::from([answers, asking]));
     }
 
     #[tokio::test]

@@ -5,9 +5,11 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
+mod tiers;
 mod tracker_comms;
 mod tracker_comms_http;
 mod tracker_comms_udp;
 
+pub use tiers::{added_tiers, tidy_tiers, without_trackers};
 pub use tracker_comms::*;
 pub use tracker_comms_udp::UdpTrackerClient;
