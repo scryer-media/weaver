@@ -485,6 +485,7 @@ impl TorrentStateLive {
             incoming: false,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
+            sent_dht_port: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
@@ -1067,6 +1068,10 @@ impl TorrentStateLive {
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {
         self.cancellation_token.cancel();
 
+        // The peer list is read before the state lock: a dying peer holds
+        // its own entry while it takes the state lock, so the state lock
+        // never waits on a peer entry.
+        let peers = self.peers.idle_list();
         let mut g = self.lock_write("pause");
 
         // It should be impossible to make a fatal error after pausing.
@@ -1093,7 +1098,7 @@ impl TorrentStateLive {
             files: self.files.take()?,
             chunk_tracker,
             streams: self.streams.clone(),
-            peers: self.peers.idle_list(),
+            peers,
         })
     }
 
@@ -1541,8 +1546,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
     /// What we have, as libtorrent `bt_peer_connection::write_bitfield` tells
     /// it: on a fast connection Have All when we have every piece and Have
-    /// None when we show none, a bitfield otherwise. With upload off we show
-    /// no piece.
+    /// None when we show none, a bitfield otherwise. With upload off, or
+    /// while we super-seed, we show no piece.
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
         let fast = self.speaks_fast();
         let total_pieces = self.state.lengths.total_pieces() as usize;
@@ -1550,7 +1555,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         let g = self.state.lock_read("serialize_bitfield_message_to_buf");
         let have = g.get_chunks()?.get_have_pieces();
         let pieces = &have.as_slice()[..total_pieces];
-        let msg = if fast && (!upload || pieces.not_any()) {
+        let msg = if fast && (!upload || pieces.not_any() || self.state.super_seeding) {
             Message::HaveNone
         } else if fast && pieces.all() {
             Message::HaveAll
@@ -1960,6 +1965,14 @@ impl PeerHandler {
         // Steal info to process after releasing the peer lock
         let mut steal_info: Option<(SocketAddr, ValidPieceIndex)> = None;
 
+        // A peer on parole downloads whole pieces alone until one passes
+        // (libtorrent `peer_connection::picker_options`).
+        let on_parole = self
+            .state
+            .peers
+            .with_peer(self.addr, |peer| peer.trust().on_parole())
+            .unwrap_or_default();
+
         let result = self
             .state
             .peers
@@ -1998,7 +2011,7 @@ impl PeerHandler {
                         outstanding_requests: live.requested_inflight_count(),
                         options: PickOptions {
                             reverse: live.is_snubbed(),
-                            on_parole: false,
+                            on_parole,
                             suggested: &live.suggested,
                         },
                         can_steal: |p| {

@@ -1147,7 +1147,7 @@ mod tests {
             buf[5..9].copy_from_slice(&42u32.to_be_bytes());
             for split_point in 0..buf.len() {
                 let (first, second) = buf.split_at(split_point);
-                let (msg, len) = Message::deserialize(first, second).unwrap();
+                let (msg, len) = Message::deserialize(first, second, None).unwrap();
                 match (msgid, &msg) {
                     (MSGID_SUGGEST, Message::Suggest(42))
                     | (MSGID_ALLOWED_FAST, Message::AllowedFast(42)) => {}
@@ -1173,7 +1173,7 @@ mod tests {
         buf[13..17].copy_from_slice(&16384u32.to_be_bytes());
         for split_point in 0..buf.len() {
             let (first, second) = buf.split_at(split_point);
-            let (msg, len) = Message::deserialize(first, second).unwrap();
+            let (msg, len) = Message::deserialize(first, second, None).unwrap();
             let Message::Reject(request) = &msg else {
                 panic!("expected reject, got {msg:?}");
             };
@@ -1206,7 +1206,7 @@ mod tests {
             buf[4] = msgid;
             assert!(
                 matches!(
-                    Message::deserialize(&buf, &[]),
+                    Message::deserialize(&buf, &[], None),
                     Err(MessageDeserializeError::IncorrectMsgLen { .. })
                 ),
                 "msgid={msgid}"
@@ -1470,7 +1470,8 @@ mod tests {
         let dht = plain().offering_dht(true).offering_v2(true);
         let mut buf = [0u8; 68];
         let _ = dht.serialize_unchecked_len(&mut buf);
-        assert_eq!(buf[20 + 7], 0x11);
+        // Beside the fast bit every handshake of ours carries.
+        assert_eq!(buf[20 + 7], 0x11 | FAST_BIT);
         let back = Handshake::deserialize(&buf).unwrap().0;
         assert!(back.supports_dht() && back.offers_v2() && back.supports_extended());
     }

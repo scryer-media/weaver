@@ -42,7 +42,9 @@ pub const MY_EXTENDED_UPLOAD_ONLY: u8 = 2;
 // `bt_peer_connection::write_handshake` lists the loaded plugins only).
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct PeerExtendedMessageIds {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ut_metadata: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ut_pex: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ut_holepunch: Option<u8>,

@@ -503,6 +503,8 @@ struct Gated {
     storage: PieceStorage,
     gate: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     refused: Arc<watch::Sender<usize>>,
+    // The pieces granted room, in order.
+    granted: Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
 impl TorrentStorage for Gated {
@@ -552,7 +554,9 @@ impl TorrentStorage for Gated {
 
     fn reserve_piece(&self, piece: ValidPieceIndex, room: &Arc<Notify>) -> bool {
         let granted = self.storage.reserve_piece(piece, room);
-        if !granted {
+        if granted {
+            self.granted.lock().unwrap().push(piece.get());
+        } else {
             self.refused.send_modify(|refused| *refused += 1);
         }
         granted
@@ -564,6 +568,8 @@ struct GatedFactory {
     factory: PieceStorageFactory,
     gate: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     refused: Arc<watch::Sender<usize>>,
+    // The pieces granted room, in order.
+    granted: Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
 impl StorageFactory for GatedFactory {
@@ -578,6 +584,7 @@ impl StorageFactory for GatedFactory {
             storage: self.factory.create(shared, metadata)?,
             gate: Arc::clone(&self.gate),
             refused: Arc::clone(&self.refused),
+            granted: Arc::clone(&self.granted),
         })
     }
 
@@ -600,6 +607,7 @@ async fn a_session_at_its_budget_waits_for_room_and_resumes_when_a_piece_lets_go
     let budget = accountant(layout.piece_length());
     let (go, gate) = std::sync::mpsc::channel();
     let (refused, mut refusals) = watch::channel(0);
+    let granted = Arc::new(std::sync::Mutex::new(Vec::new()));
     let factory = GatedFactory {
         factory: PieceStorageFactory::new(
             Arc::clone(layout),
@@ -608,14 +616,17 @@ async fn a_session_at_its_budget_waits_for_room_and_resumes_when_a_piece_lets_go
         ),
         gate: Arc::new(std::sync::Mutex::new(Some(gate))),
         refused: Arc::new(refused),
+        granted: Arc::clone(&granted),
     };
     let leecher = fetch(&seeded, fetch_dir.path(), Some(1), factory.boxed()).await;
 
     refusals.wait_for(|refused| *refused > 0).await.unwrap();
     assert!(watched.job.with(|job| job.have().not_any()));
+    // The one piece granted is resident, whichever the picker started from.
+    let first = granted.lock().unwrap()[0];
     assert_eq!(
         budget.namespace_usage(NAMESPACE).resident,
-        layout.piece_length()
+        layout.piece_range(first).len()
     );
     go.send(()).unwrap();
 

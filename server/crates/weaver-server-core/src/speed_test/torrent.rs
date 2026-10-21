@@ -355,6 +355,10 @@ impl Joined {
             }),
             peer_limit: Some(PEER_LIMIT),
             disable_local_service_discovery: true,
+            // The probe measures demand from every peer the tracker names,
+            // several behind one address included; it holds its few slots
+            // for seconds (libtorrent `allow_multiple_connections_per_ip`).
+            allow_multiple_connections_per_ip: true,
             socket_factory: Some(Arc::new(ProbeSockets::new(
                 path.stage.clone(),
                 path.kind.clone(),
