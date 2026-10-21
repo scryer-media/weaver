@@ -11,6 +11,7 @@ use crate::categories::CategoryConfig;
 use crate::jobs::DuplicatePolicy;
 use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
+use crate::torrents::identity::{ClientIdentity, IDENTITY};
 use crate::watch_folder::WatchFolderConfig;
 
 // Shared config handle for runtime reads and writes.
@@ -456,15 +457,6 @@ pub enum Client {
     Transmission,
 }
 
-// How a client names itself: the Azureus prefix of its peer id, the
-// User-Agent of its HTTP announces and the `v` of its extended handshake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClientName {
-    pub prefix: [u8; 8],
-    pub user_agent: &'static str,
-    pub version: &'static str,
-}
-
 impl Client {
     pub const ALL: [Self; 3] = [Self::Weaver, Self::QBittorrent, Self::Transmission];
 
@@ -483,28 +475,19 @@ impl Client {
     }
 
     // Each client as its current stable release names itself.
-    pub const fn name(self) -> ClientName {
-        use crate::torrents::identity::IDENTITY;
+    pub const fn name(self) -> ClientIdentity {
         match self {
-            Self::Weaver => ClientName {
-                prefix: *IDENTITY.prefix(),
-                user_agent: IDENTITY.user_agent(),
-                version: IDENTITY.user_agent(),
-            },
+            Self::Weaver => IDENTITY,
             // libtorrent's fingerprint of `qB` 5.2.3.0; libtorrent sends the
             // user agent as `v`.
-            Self::QBittorrent => ClientName {
-                prefix: *b"-qB5230-",
-                user_agent: "qBittorrent/5.2.3",
-                version: "qBittorrent/5.2.3",
-            },
+            Self::QBittorrent => {
+                ClientIdentity::new(*b"-qB5230-", "qBittorrent/5.2.3", "qBittorrent/5.2.3")
+            }
             // Major, minor and patch in base 62, then `0` for a stable
             // release.
-            Self::Transmission => ClientName {
-                prefix: *b"-TR4100-",
-                user_agent: "Transmission/4.1.0",
-                version: "Transmission 4.1.0",
-            },
+            Self::Transmission => {
+                ClientIdentity::new(*b"-TR4100-", "Transmission/4.1.0", "Transmission 4.1.0")
+            }
         }
     }
 }
@@ -795,28 +778,29 @@ mod tests {
         const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
         let qb = Client::QBittorrent.name();
-        assert_eq!(qb.prefix, libtorrent(b"qB", &version(qb.user_agent, '/')));
-        assert_eq!(&qb.prefix, b"-qB5230-");
-        assert_eq!(qb.version, qb.user_agent);
+        assert_eq!(
+            qb.prefix(),
+            &libtorrent(b"qB", &version(qb.user_agent(), '/'))
+        );
+        assert_eq!(qb.prefix(), b"-qB5230-");
+        assert_eq!(qb.version(), qb.user_agent());
         assert_eq!(&libtorrent(b"qB", &[5, 1, 2]), b"-qB5120-");
         assert_eq!(&libtorrent(b"qB", &[5, 10, 0]), b"-qB5A00-");
 
         let tr = Client::Transmission.name();
-        let parts = version(tr.user_agent, '/');
-        assert_eq!(parts, version(tr.version, ' '));
-        assert!(tr.version.starts_with("Transmission "));
+        let parts = version(tr.user_agent(), '/');
+        assert_eq!(parts, version(tr.version(), ' '));
+        assert!(tr.version().starts_with("Transmission "));
         let mut prefix = *b"-TR...0-";
         for (at, part) in parts.iter().enumerate() {
             prefix[3 + at] = BASE62[*part as usize];
         }
-        assert_eq!(tr.prefix, prefix);
-        assert_eq!(&tr.prefix, b"-TR4100-");
+        assert_eq!(tr.prefix(), &prefix);
+        assert_eq!(tr.prefix(), b"-TR4100-");
 
         let weaver = Client::Weaver.name();
-        let identity = crate::torrents::identity::IDENTITY;
-        assert_eq!(&weaver.prefix, identity.prefix());
-        assert_eq!(weaver.user_agent, identity.user_agent());
-        assert_eq!(weaver.version, identity.user_agent());
+        assert_eq!(weaver, IDENTITY);
+        assert_eq!(weaver.version(), weaver.user_agent());
 
         for client in Client::ALL {
             assert_eq!(Client::parse(client.as_str()), Some(client));

@@ -39,6 +39,7 @@ mod dht_utils;
 mod error;
 pub mod file_info;
 mod file_ops;
+mod identity;
 mod ip_ranges;
 pub mod limits;
 mod listen;
@@ -94,6 +95,7 @@ pub use crate::clone_to_owned::CloneToOwned;
 pub use crate::core::magnet::*;
 pub use crate::core::peer_id::*;
 pub use crate::core::torrent_metainfo::*;
+pub use crate::identity::Identity;
 
 #[cfg(test)]
 mod tests;

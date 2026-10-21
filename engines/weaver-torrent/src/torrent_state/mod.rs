@@ -44,6 +44,7 @@ use tracing::debug_span;
 use tracing::trace;
 use tracing::warn;
 
+use crate::Identity;
 use crate::Session;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
@@ -205,7 +206,10 @@ pub struct ManagedTorrentShared {
     // "dn" from magnet link
     pub(crate) magnet_name: Option<String>,
 
+    // With `peer_id`, how the torrent names itself: the `v` of its extended
+    // handshake and the User-Agent of its HTTP announces.
     pub(crate) client_name_and_version: String,
+    pub(crate) user_agent: String,
 
     /// Counters of the most recent live run, recorded as the run ends, so a
     /// `stopped` tracker announce made after it ended reports them.
@@ -227,6 +231,14 @@ pub(crate) struct RunCounters {
 impl ManagedTorrentShared {
     pub(crate) fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    pub fn identity(&self) -> Identity {
+        Identity {
+            peer_id: self.peer_id,
+            version: self.client_name_and_version.clone(),
+            user_agent: self.user_agent.clone(),
+        }
     }
 }
 

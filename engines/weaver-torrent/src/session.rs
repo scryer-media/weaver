@@ -18,16 +18,15 @@ use std::{
     time::Duration,
 };
 
+use crate::Identity;
 use crate::bencode::bencode_serialize_to_writer;
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     magnet::Magnet,
-    peer_id::generate_azereus_style,
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info},
 };
-use crate::crate_version;
 use crate::dht::{
     Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr,
 };
@@ -123,7 +122,8 @@ pub struct Session {
     spawner: BlockingSpawner,
 
     // Network
-    peer_id: Id20,
+    // The DHT's, and every torrent's that names none of its own.
+    identity: Identity,
     announce_port: Option<u16>,
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
@@ -162,7 +162,6 @@ pub struct Session {
     // Feature flags
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
-    client_name_and_version: String,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -327,6 +326,11 @@ pub struct AddTorrentOptions {
     /// other piece is Normal. See [`PiecePriority`] and
     /// [`ManagedTorrent::set_piece_priorities`]. An index out of range is refused.
     pub piece_priorities: Option<Vec<(u32, PiecePriority)>>,
+
+    /// How the torrent names itself to its peers and trackers. If not set,
+    /// the session's identity is used.
+    #[serde(skip)]
+    pub identity: Option<Identity>,
 }
 
 pub struct ListOnlyResponse {
@@ -490,8 +494,10 @@ pub struct SessionOptions {
     /// all remembered torrents will continue where they left off.
     pub persistence: Option<SessionPersistenceConfig>,
 
-    /// The peer ID to use. If not specified, a random one will be generated.
-    pub peer_id: Option<Id20>,
+    /// How the session names itself: its DHT node, and every torrent added
+    /// without an identity of its own. Defaults to this build under a fresh
+    /// peer id, and the DHT then keeps its own defaults.
+    pub identity: Option<Identity>,
 
     /// Options for listening on TCP and/or uTP for incoming connections.
     pub listen: Option<ListenerOptions>,
@@ -529,16 +535,12 @@ pub struct SessionOptions {
     /// Force IPv4 only.
     pub ipv4_only: bool,
 
-    /// Override the client name and version used in User-Agent headers and
-    /// peer extended handshakes. Defaults to "Weaver/X.Y.Z".
-    pub client_name_and_version: Option<String>,
-
     /// Create peer sockets with this factory instead of binding kernel
     /// sockets. See [`SocketFactory`] for what it covers.
     pub socket_factory: Option<Arc<dyn SocketFactory>>,
 
     /// Use this HTTP client (HTTP trackers, torrent, blocklist and allowlist
-    /// downloads) instead of building one. When set, `bind_device_name` and `client_name_and_version` do not apply to HTTP
+    /// downloads) instead of building one. When set, `bind_device_name` and the identity's User-Agent do not apply to HTTP
     /// requests; configure them on the client.
     ///
     /// The client also does its own DNS lookups: [`SocketFactory::resolver`]
@@ -560,7 +562,7 @@ impl Default for SessionOptions {
             tracker_stopped_timeout: None,
             fastresume: false,
             persistence: None,
-            peer_id: None,
+            identity: None,
             listen: None,
             connect: None,
             default_storage_factory: None,
@@ -575,7 +577,6 @@ impl Default for SessionOptions {
             peer_limit: None,
             disable_local_service_discovery: false,
             ipv4_only: false,
-            client_name_and_version: None,
             socket_factory: None,
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
@@ -692,8 +693,8 @@ impl Session {
         &self.cancellation_token
     }
 
-    pub fn client_name_and_version(&self) -> &str {
-        &self.client_name_and_version
+    pub fn identity(&self) -> &Identity {
+        &self.identity
     }
 
     /// Create a new session with options.
@@ -703,10 +704,9 @@ impl Session {
         mut opts: SessionOptions,
     ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
         async move {
-            let (dht_node_id_prefix, dht_client_version) = dht_identity(opts.peer_id.as_ref());
-            let peer_id = opts
-                .peer_id
-                .unwrap_or_else(|| generate_azereus_style(*b"WV", crate_version!()));
+            let (dht_node_id_prefix, dht_client_version) =
+                dht_identity(opts.identity.as_ref().map(|identity| &identity.peer_id));
+            let identity = opts.identity.take().unwrap_or_default();
             let token = opts.cancellation_token.take().unwrap_or_default();
             let tasks = TaskTracker::new();
 
@@ -835,10 +835,6 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let client_name_and_version = opts
-                .client_name_and_version
-                .unwrap_or_else(|| crate::client_name_and_version().to_owned());
-
             let reqwest_client = if let Some(client) = opts.http_client.take() {
                 client
             } else {
@@ -850,7 +846,7 @@ impl Session {
                 }
 
                 builder
-                    .user_agent(&client_name_and_version)
+                    .user_agent(&identity.user_agent)
                     .build()
                     .context("error building HTTP(S) client")?
             };
@@ -926,7 +922,7 @@ impl Session {
             let session = Arc::new(Self {
                 persistence,
                 bitv_factory,
-                peer_id,
+                identity,
                 dht,
                 peer_opts,
                 spawner: spawner.clone(),
@@ -956,7 +952,6 @@ impl Session {
                         .unwrap_or(StoppedAnnounces::DEFAULT_TIMEOUT),
                 ),
                 peer_limit: opts.peer_limit,
-                client_name_and_version,
                 blocklist,
                 allowlist,
                 lsd,
@@ -1120,10 +1115,6 @@ impl Session {
             .context("error reading handshake")?;
         trace!("received handshake from {addr}: {:?}", h);
 
-        if h.peer_id == self.peer_id {
-            bail!("seems like we are connecting to ourselves, ignoring");
-        }
-
         let (id, torrent) = self
             .db
             .read()
@@ -1132,6 +1123,9 @@ impl Session {
             .find(|(_, t)| t.info_hash() == h.info_hash)
             .map(|(id, t)| (*id, t.clone()))
             .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
+        if h.peer_id == torrent.shared().peer_id {
+            bail!("seems like we are connecting to ourselves, ignoring");
+        }
 
         let live = torrent
             .live_wait_initializing(Duration::from_secs(5))
@@ -1425,10 +1419,15 @@ impl Session {
             tracker_tiers,
             name,
         } = add_res;
+        let identity = opts
+            .identity
+            .take()
+            .unwrap_or_else(|| self.identity.clone());
 
         let make_peer_rx = |private: bool| {
             self.make_peer_rx(
                 info_hash,
+                &identity,
                 tracker_tiers.clone(),
                 !opts.paused && !opts.list_only,
                 opts.force_tracker_interval,
@@ -1455,7 +1454,7 @@ impl Session {
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
                     let resolved_magnet = self
-                        .resolve_magnet(info_hash, peers, &tracker_tiers, opts.peer_opts)
+                        .resolve_magnet(info_hash, &identity, peers, &tracker_tiers, opts.peer_opts)
                         .await?;
 
                     seen_peers = resolved_magnet.seen_peers.clone();
@@ -1571,7 +1570,7 @@ impl Session {
                 trackers: tracker_tiers.iter().flatten().cloned().collect(),
                 tracker_tiers,
                 spawner: self.spawner.clone(),
-                peer_id: self.peer_id,
+                peer_id: identity.peer_id,
                 storage_factory,
                 options: ManagedTorrentOptions {
                     force_tracker_interval: opts.force_tracker_interval,
@@ -1587,7 +1586,8 @@ impl Session {
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,
-                client_name_and_version: self.client_name_and_version.clone(),
+                client_name_and_version: identity.version.clone(),
+                user_agent: identity.user_agent.clone(),
                 last_run: Default::default(),
             });
 
@@ -1756,6 +1756,7 @@ impl Session {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
             t.info_hash(),
+            &t.shared().identity(),
             t.shared().tracker_tiers.clone(),
             announce,
             t.shared().options.force_tracker_interval,
@@ -1781,6 +1782,7 @@ impl Session {
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
+        identity: &Identity,
         tracker_tiers: Vec<Vec<url::Url>>,
         announce: bool,
         force_tracker_interval: Option<Duration>,
@@ -1810,7 +1812,7 @@ impl Session {
         };
         let (tracker_rx, trackers) = TrackerComms::start_with_tiers(
             info_hash,
-            self.peer_id,
+            identity.clone(),
             self.announce_tiers(tracker_tiers, is_private),
             Box::new(tracker_rx_stats),
             force_tracker_interval,
@@ -1891,18 +1893,19 @@ impl Session {
     async fn resolve_magnet(
         self: &Arc<Self>,
         info_hash: Id20,
+        identity: &Identity,
         peer_rx: PeerStream,
         tracker_tiers: &[Vec<url::Url>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
-            self.peer_id,
+            identity.peer_id,
             info_hash,
             Default::default(),
             peer_rx,
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
-            self.client_name_and_version.clone(),
+            identity.version.clone(),
         )
         .await
         {

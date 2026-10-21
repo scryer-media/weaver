@@ -329,11 +329,10 @@ fn session_options_follow_the_leg() {
     assert_eq!(listen.listen_addr.port(), 6881);
     assert_eq!(listen.announce_port, Some(51413));
     assert!(!system.disable_local_service_discovery);
-    assert_eq!(&system.peer_id.unwrap().0[..8], IDENTITY.prefix());
-    assert_eq!(
-        system.client_name_and_version.as_deref(),
-        Some(IDENTITY.user_agent())
-    );
+    let identity = system.identity.as_ref().unwrap();
+    assert_eq!(&identity.peer_id.0[..8], IDENTITY.prefix());
+    assert_eq!(identity.user_agent, IDENTITY.user_agent());
+    assert_eq!(identity.version, IDENTITY.version());
     assert!(system.http_client.is_some());
 
     let interface = session_options(

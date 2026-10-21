@@ -344,7 +344,7 @@ impl Joined {
             disable_trackers: false,
             fastresume: false,
             persistence: None,
-            peer_id: Some(IDENTITY.peer_id()),
+            identity: Some(IDENTITY.identity()),
             listen: listens.then(|| ListenerOptions {
                 mode: ListenerMode::TcpOnly,
                 listen_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -357,7 +357,6 @@ impl Joined {
             }),
             peer_limit: Some(PEER_LIMIT),
             disable_local_service_discovery: true,
-            client_name_and_version: Some(IDENTITY.user_agent().to_owned()),
             socket_factory: Some(Arc::new(ProbeSockets::new(
                 path.stage.clone(),
                 path.kind.clone(),

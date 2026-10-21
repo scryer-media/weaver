@@ -16,7 +16,7 @@ use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::limits::{LimitKind, LimitsConfig};
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent, Session,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Identity, Magnet, ManagedTorrent, Session,
     TrackerAnnounce, torrent_from_bytes,
 };
 
@@ -49,7 +49,7 @@ use crate::pipeline::graph::status::RepairSlots;
 use crate::proxies::TorrentScope;
 use crate::settings::model::{TrackerRule, tracker_rule_for};
 use crate::settings::{
-    Config, SeedingAction, SeedingPolicy, TorrentConfig, resolve_seeding_policy,
+    Client, Config, SeedingAction, SeedingPolicy, TorrentConfig, resolve_seeding_policy,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
@@ -170,6 +170,16 @@ impl TorrentSettings {
 fn rule_of<'r>(record: &TorrentRecord, rules: &'r [TrackerRule]) -> Option<&'r TrackerRule> {
     let id = record.tracker_rule_id?;
     rules.iter().find(|rule| rule.id == id)
+}
+
+// How `record` names itself to peers and trackers: as the client its tracker
+// rule names, else Weaver, under a fresh peer id.
+fn identity_of(record: &TorrentRecord, rules: &[TrackerRule]) -> Identity {
+    rule_of(record, rules)
+        .and_then(|rule| rule.client)
+        .unwrap_or(Client::Weaver)
+        .name()
+        .identity()
 }
 
 /// Where a torrent's seeding policy comes from: the most specific level that
@@ -1517,10 +1527,11 @@ impl TorrentService {
                     .filter_map(|url| tracker(0, url.as_bytes()))
                     .collect();
                 self.insert(&mut record, &[], &trackers)?;
+                let identity = identity_of(&record, &self.rules());
                 let mut torrent = Live::new(record, TorrentCounters::default());
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
-                self.spawn_resolve(job_id, session, uri, None);
+                self.spawn_resolve(job_id, session, uri, None, identity);
                 self.publish().await;
                 Ok(job_id)
             }
@@ -1639,6 +1650,7 @@ impl TorrentService {
         session: Arc<Session>,
         uri: String,
         trackers: Option<Vec<String>>,
+        identity: Identity,
     ) {
         let service = self.clone();
         self.keep(tokio::spawn(async move {
@@ -1648,6 +1660,7 @@ impl TorrentService {
                     Some(AddTorrentOptions {
                         list_only: true,
                         trackers,
+                        identity: Some(identity),
                         ..Default::default()
                     }),
                 )
@@ -1761,7 +1774,8 @@ impl TorrentService {
             .into_iter()
             .map(|tracker| tracker.url)
             .collect();
-        self.spawn_resolve(job_id, session, uri, Some(trackers));
+        let identity = identity_of(&record, &self.rules());
+        self.spawn_resolve(job_id, session, uri, Some(trackers), identity);
     }
 
     // Put a torrent in its route's session, or hold it while the route is
@@ -1770,7 +1784,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.now_ms();
-        let (scope, bytes, layout, intake, dir, paused, limit, have) = {
+        let (scope, bytes, layout, intake, dir, paused, limit, have, identity) = {
             let live = self.inner.live.lock().await;
             let Some(torrent) = live.get(&job_id) else {
                 return;
@@ -1804,6 +1818,7 @@ impl TorrentService {
                         .is_some(),
                 limit,
                 job.with(|job| initial_have(job)),
+                identity_of(&torrent.record, &rules),
             )
         };
         let plan = match self.inner.sessions.routes().plan(scope) {
@@ -1831,6 +1846,7 @@ impl TorrentService {
                 upload_bps: LimitKind::from(limit),
                 download_bps: LimitKind::Unlimited,
             },
+            identity: Some(identity),
             ..Default::default()
         };
         apply_initial_have(&mut options, have);

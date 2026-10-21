@@ -38,7 +38,10 @@ pub fn isolated_session_opts(listen: bool) -> SessionOptions {
         persistence: None,
         disable_trackers: true,
         disable_local_service_discovery: true,
-        peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+        identity: Some(crate::Identity {
+            peer_id: TestPeerMetadata::good().as_peer_id(),
+            ..Default::default()
+        }),
         listen: listen.then(|| ListenerOptions {
             mode: ListenerMode::TcpOnly,
             listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),

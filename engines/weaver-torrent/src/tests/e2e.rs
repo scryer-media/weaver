@@ -110,7 +110,10 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
                     std::env::temp_dir().join("does_not_exist"),
                     SessionOptions {
                         dht: None,
-                        peer_id: Some(peer_id),
+                        identity: Some(crate::Identity {
+                            peer_id,
+                            ..Default::default()
+                        }),
                         listen: Some(ListenerOptions {
                             mode,
                             listen_addr: (Ipv4Addr::LOCALHOST, listen_port).into(),

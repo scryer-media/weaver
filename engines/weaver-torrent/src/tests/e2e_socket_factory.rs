@@ -123,7 +123,10 @@ fn session_opts(
     SessionOptions {
         dht: None,
         persistence: None,
-        peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+        identity: Some(crate::Identity {
+            peer_id: TestPeerMetadata::good().as_peer_id(),
+            ..Default::default()
+        }),
         disable_local_service_discovery: true,
         listen,
         connect,

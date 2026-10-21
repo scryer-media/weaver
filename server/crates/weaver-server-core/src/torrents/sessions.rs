@@ -295,7 +295,7 @@ pub fn session_options(
         disable_trackers: false,
         fastresume: false,
         persistence: None,
-        peer_id: Some(env.identity.peer_id()),
+        identity: Some(env.identity.identity()),
         listen: shape.listen.then(|| ListenerOptions {
             mode: ListenerMode::TcpOnly,
             listen_addr: SocketAddr::new(listen_ip, port),
@@ -314,7 +314,6 @@ pub fn session_options(
         }),
         peer_limit: Some(peers.max(1)),
         disable_local_service_discovery: !shape.own_sockets,
-        client_name_and_version: Some(env.identity.user_agent().to_owned()),
         socket_factory: leg.factory.clone(),
         http_client: Some(leg.http.clone()),
         ..SessionOptions::default()

@@ -62,7 +62,10 @@ async fn test_session_peer_id_fingerprint_is_the_dht_node_id_prefix() -> anyhow:
     let session = Session::new_with_opts(
         dir.path().into(),
         SessionOptions {
-            peer_id: Some(peer_id),
+            identity: Some(crate::Identity {
+                peer_id,
+                ..Default::default()
+            }),
             dht: Some(DhtSessionConfig {
                 bootstrap_addrs: Some(vec![bootstrap.local_addr()?.to_string()]),
                 port: None,

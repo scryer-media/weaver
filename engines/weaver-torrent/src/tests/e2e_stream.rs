@@ -39,7 +39,10 @@ async fn e2e_stream() -> anyhow::Result<()> {
         files.path().into(),
         crate::SessionOptions {
             dht: None,
-            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+            identity: Some(crate::Identity {
+                peer_id: TestPeerMetadata::good().as_peer_id(),
+                ..Default::default()
+            }),
             persistence: None,
             listen: Some(crate::listen::ListenerOptions {
                 listen_addr: (Ipv4Addr::LOCALHOST, 16001).into(),
@@ -86,7 +89,10 @@ async fn e2e_stream() -> anyhow::Result<()> {
         crate::SessionOptions {
             dht: None,
             persistence: None,
-            peer_id: Some(TestPeerMetadata::good().as_peer_id()),
+            identity: Some(crate::Identity {
+                peer_id: TestPeerMetadata::good().as_peer_id(),
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )

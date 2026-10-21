@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-//! How Weaver names itself to peers and trackers. Fixed by the build.
+//! How a client names itself to peers and trackers.
 
+use weaver_torrent::Identity;
 use weaver_torrent::core::Id20;
 
-/// The Azureus-style peer-id prefix and user agent of this build.
+/// A client's Azureus-style peer-id prefix, the User-Agent of its HTTP
+/// announces and the `v` of its extended handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIdentity {
     prefix: [u8; 8],
     user_agent: &'static str,
+    version: &'static str,
 }
 
 /// The identity of this build: `-WV<major><minor:02><patch>-`, `Weaver/<version>`.
-pub const IDENTITY: ClientIdentity = ClientIdentity {
-    prefix: prefix_for(env!("CARGO_PKG_VERSION")),
-    user_agent: concat!("Weaver/", env!("CARGO_PKG_VERSION")),
-};
+pub const IDENTITY: ClientIdentity = ClientIdentity::new(
+    prefix_for(env!("CARGO_PKG_VERSION")),
+    concat!("Weaver/", env!("CARGO_PKG_VERSION")),
+    concat!("Weaver/", env!("CARGO_PKG_VERSION")),
+);
 
 const DIGITS: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-";
 
@@ -52,12 +56,33 @@ const fn prefix_for(version: &str) -> [u8; 8] {
 }
 
 impl ClientIdentity {
+    pub const fn new(prefix: [u8; 8], user_agent: &'static str, version: &'static str) -> Self {
+        Self {
+            prefix,
+            user_agent,
+            version,
+        }
+    }
+
     pub const fn prefix(&self) -> &[u8; 8] {
         &self.prefix
     }
 
     pub const fn user_agent(&self) -> &'static str {
         self.user_agent
+    }
+
+    pub const fn version(&self) -> &'static str {
+        self.version
+    }
+
+    /// This client under a fresh peer id.
+    pub fn identity(&self) -> Identity {
+        Identity {
+            peer_id: self.peer_id(),
+            version: self.version.to_owned(),
+            user_agent: self.user_agent.to_owned(),
+        }
     }
 
     /// A fresh peer id carrying this prefix.

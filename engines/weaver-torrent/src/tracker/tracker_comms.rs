@@ -31,6 +31,7 @@ use tracing::trace;
 use tracing::trace_span;
 use url::Url;
 
+use crate::Identity;
 use crate::core::hash_id::Id20;
 use crate::core::net::Resolver;
 use crate::tracker::tracker_comms_http;
@@ -40,7 +41,7 @@ use crate::tracker::tracker_comms_udp::UdpTrackerClient;
 
 pub struct TrackerComms {
     info_hash: Id20,
-    peer_id: Id20,
+    identity: Identity,
     stats: Box<dyn TorrentStatsProvider>,
     force_tracker_interval: Option<Duration>,
     tx: Sender,
@@ -594,7 +595,7 @@ impl TrackerComms {
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         info_hash: Id20,
-        peer_id: Id20,
+        identity: Identity,
         trackers: HashSet<Url>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
@@ -604,7 +605,7 @@ impl TrackerComms {
     ) -> Option<TrackerTask> {
         Self::start_with_tiers(
             info_hash,
-            peer_id,
+            identity,
             trackers.into_iter().map(|t| vec![t]).collect(),
             stats,
             force_interval,
@@ -628,7 +629,7 @@ impl TrackerComms {
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_tiers(
         info_hash: Id20,
-        peer_id: Id20,
+        identity: Identity,
         tiers: Vec<Vec<Url>>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
@@ -668,7 +669,7 @@ impl TrackerComms {
 
         let comms = Arc::new(Self {
             info_hash,
-            peer_id,
+            identity,
             stats,
             force_tracker_interval: force_interval,
             tx,
@@ -807,7 +808,7 @@ impl TrackerComms {
         let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
-            peer_id: &self.peer_id,
+            peer_id: &self.identity.peer_id,
             port: self.announce_port,
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
@@ -829,7 +830,12 @@ impl TrackerComms {
         }
         url.set_query(Some(&queries));
 
-        let response: reqwest::Response = self.reqwest_client.get(url).send().await?;
+        let response: reqwest::Response = self
+            .reqwest_client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, &self.identity.user_agent)
+            .send()
+            .await?;
         if !response.status().is_success() {
             anyhow::bail!("tracker responded with {:?}", response.status());
         }
@@ -913,7 +919,7 @@ impl TrackerComms {
 
         let request = AnnounceFields {
             info_hash: self.info_hash,
-            peer_id: self.peer_id,
+            peer_id: self.identity.peer_id,
             downloaded: stats.downloaded_bytes,
             left: stats.announced_left(),
             uploaded: stats.uploaded_bytes,
@@ -968,6 +974,7 @@ mod tests {
         TrackerAnnounce, TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerTask,
         UdpTrackerResolveResult, udp_tracker_to_socket_addrs,
     };
+    use crate::Identity;
     use crate::tracker::tracker_comms_http::TrackerRequestEvent;
     use crate::tracker::tracker_comms_udp::{
         ACTION_CONNECT, CONNECTION_ID_MAGIC, UdpTrackerClient,
@@ -1160,8 +1167,24 @@ mod tests {
         query
     }
 
+    /// The identity the tests' torrent names itself by.
+    fn identity() -> Identity {
+        Identity {
+            peer_id: Id20::new([2; 20]),
+            version: "Test 1.0".into(),
+            user_agent: "Test/1.0".into(),
+        }
+    }
+
     /// The next HTTP request, unanswered, and its query string.
     async fn read_announce(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
+        let (conn, request) = read_request(listener).await;
+        let path = request.split(' ').nth(1).unwrap().to_owned();
+        (conn, path.split_once('?').unwrap().1.to_owned())
+    }
+
+    /// The next HTTP request, unanswered: its request line and headers.
+    async fn read_request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
         let (conn, _) = listener.accept().await.unwrap();
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -1174,9 +1197,7 @@ mod tests {
                 Err(e) => panic!("{e}"),
             }
         }
-        let request = String::from_utf8(buf).unwrap();
-        let path = request.split(' ').nth(1).unwrap().to_owned();
-        (conn, path.split_once('?').unwrap().1.to_owned())
+        (conn, String::from_utf8(buf).unwrap())
     }
 
     /// Answers an HTTP request with `body`.
@@ -1225,7 +1246,7 @@ mod tests {
         let stopped = StoppedAnnounces::default();
         let mut peers = TrackerComms::start_with_tiers(
             Id20::new([1; 20]),
-            Id20::new([2; 20]),
+            identity(),
             vec![vec![tracker]],
             Box::new(stats.clone()),
             None,
@@ -1277,6 +1298,67 @@ mod tests {
         token.cancel();
     }
 
+    // An announce names the torrent as its identity does, whatever the
+    // client's own User-Agent.
+    #[tokio::test]
+    async fn test_http_announce_carries_the_torrents_peer_id_and_user_agent() {
+        let (listener, url) = http_listener().await;
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let stopped = StoppedAnnounces::default();
+        let mut peers = TrackerComms::start_with_tiers(
+            Id20::new([1; 20]),
+            identity(),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            Some(6881),
+            reqwest::Client::builder()
+                .no_proxy()
+                .user_agent("Session/1.0")
+                .build()
+                .unwrap(),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap()
+        .peers;
+
+        let request = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            request = async {
+                let (conn, request) = read_request(&listener).await;
+                respond(conn, "d8:intervali1800e5:peers0:e").await;
+                request
+            } => request,
+        };
+        let headers = request.to_ascii_lowercase();
+        assert!(
+            headers.contains("\r\nuser-agent: test/1.0\r\n"),
+            "{request}"
+        );
+        assert!(!headers.contains("session/1.0"), "{request}");
+        let query = request
+            .split(' ')
+            .nth(1)
+            .unwrap()
+            .split_once('?')
+            .unwrap()
+            .1;
+        assert_eq!(
+            query_param(query, "peer_id"),
+            Some("%02".repeat(20).as_str())
+        );
+
+        drop(listener);
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
     #[tokio::test]
     async fn test_tracker_id_is_sent_back_and_stopped_wants_no_peers() {
         let (listener, url) = http_listener().await;
@@ -1292,7 +1374,7 @@ mod tests {
         let stopped = StoppedAnnounces::default();
         let mut peers = TrackerComms::start_with_tiers(
             Id20::new([1; 20]),
-            Id20::new([2; 20]),
+            identity(),
             vec![vec![url]],
             Box::new(stats.clone()),
             None,
@@ -1352,7 +1434,7 @@ mod tests {
         let stopped = StoppedAnnounces::default();
         let peers = TrackerComms::start_with_tiers(
             Id20::new([1; 20]),
-            Id20::new([2; 20]),
+            identity(),
             vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]],
             Box::new(()),
             None,
@@ -1392,7 +1474,7 @@ mod tests {
         let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
         let task = TrackerComms::start_with_tiers(
             Id20::new([1; 20]),
-            Id20::new([2; 20]),
+            identity(),
             tiers,
             Box::new(()),
             None,

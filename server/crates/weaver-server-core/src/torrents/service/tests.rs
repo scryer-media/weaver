@@ -1723,6 +1723,69 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
     rig.service.stop().await;
 }
 
+// A torrent under a tracker rule that names a client names itself as that
+// client to its peers and trackers; a torrent under no rule names itself as
+// Weaver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_rules_client_names_its_torrents() {
+    use crate::torrents::identity::IDENTITY;
+
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "*.test".into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: Some(Client::QBittorrent),
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    let kept = rig
+        .service
+        .add(request(AddSource::Metainfo(announcing(
+            &plain("kept", 1),
+            "http://tracker.test/announce",
+        ))))
+        .await
+        .unwrap();
+    let plain = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("plain", 2))))
+        .await
+        .unwrap();
+
+    let named = |identity: weaver_torrent::Identity| {
+        (
+            identity.peer_id.0[..8].to_vec(),
+            identity.user_agent,
+            identity.version,
+        )
+    };
+    let qbittorrent = Client::QBittorrent.name();
+    assert_eq!(
+        named(handle_of(&rig.service, kept).await.shared().identity()),
+        (
+            qbittorrent.prefix().to_vec(),
+            qbittorrent.user_agent().to_owned(),
+            qbittorrent.version().to_owned()
+        )
+    );
+    assert_eq!(
+        named(handle_of(&rig.service, plain).await.shared().identity()),
+        (
+            IDENTITY.prefix().to_vec(),
+            IDENTITY.user_agent().to_owned(),
+            IDENTITY.version().to_owned()
+        )
+    );
+}
+
 // Who holds `job_id` stopped, as the queue last applied the holds.
 async fn paused_by(service: &TorrentService, job_id: JobId) -> Option<HoldOrigin> {
     service.inner.live.lock().await[&job_id].paused_by
