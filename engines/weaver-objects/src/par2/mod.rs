@@ -273,6 +273,15 @@ impl Object for Par2 {
     // still come; what is lost reaches `volume_lost` at its exact range.
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
+    // What arrived there is to come again, and the blocks it carried; a
+    // volume closed over them is open until they do.
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
+            found.arrived.erase(range);
+            found.closed = false;
+        }
+    }
+
     // The volume's bytes are all envelope: they stay in the volume's own
     // file, which is the .par2 member itself.
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {

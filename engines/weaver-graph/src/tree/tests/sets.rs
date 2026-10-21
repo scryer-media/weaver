@@ -23,6 +23,9 @@ impl Durable for Set {
 }
 
 impl Object for Set {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::Par2
     }

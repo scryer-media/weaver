@@ -219,6 +219,16 @@ impl Padding {
         }
         self.provenance = Some(provenance);
     }
+
+    // The plaintext past a payload `unpacked_size` long at stream `range` is
+    // not in hand any more: it comes out again when its cipher comes again.
+    pub fn forget(&mut self, unpacked_size: u64, range: ByteRange) {
+        let from = range.start.max(unpacked_size) - unpacked_size;
+        let to = range.end.saturating_sub(unpacked_size).min(BLOCK - 1);
+        for index in from..to {
+            self.tail_filled &= !(1u16 << index);
+        }
+    }
 }
 
 #[derive(Clone)]

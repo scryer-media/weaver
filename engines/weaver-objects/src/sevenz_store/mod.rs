@@ -95,6 +95,15 @@ impl Lock {
     fn is_locked(&self) -> bool {
         matches!(self, Lock::Locked | Lock::Sealed(..))
     }
+
+    // The plaintext past the files, of a cipher that was ever open.
+    fn padding_mut(&mut self) -> Option<&mut Padding> {
+        match self {
+            Lock::Open(_, padding) => Some(Arc::make_mut(padding)),
+            Lock::Sealed(_, padding) => Some(padding),
+            Lock::Plain | Lock::Locked => None,
+        }
+    }
 }
 
 // A lock as its facts keep it: an open cipher is kept as its chain, never
@@ -730,6 +739,10 @@ impl Object for SevenZipStore {
 
     fn posting(&self, ranges: &[(VolumeIndex, ByteRange)]) -> Box<dyn Posting> {
         Box::new(self.posted_over(ranges))
+    }
+
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        self.unsay(volume, range);
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {

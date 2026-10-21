@@ -71,6 +71,37 @@ impl RarStore {
         }
     }
 
+    // The bytes posted at `range` of the volume come again: each member
+    // they reached forgets what came out of them, its padding with it, and
+    // is open until it comes out again. A locked member's bytes were held,
+    // and nothing came out of them; a sealed one's came out before the
+    // restart, through the cipher its chain was kept from.
+    pub(super) fn unsay(&mut self, volume: VolumeIndex, range: ByteRange) {
+        for (id, _, stream) in self.linked(volume, range) {
+            let Some(entry) = self.entries.get_mut(id) else {
+                continue;
+            };
+            let plain_len = entry.plain_len();
+            let payload = plain_len.map_or(stream, |length| {
+                ByteRange::new(stream.start.min(length), stream.end.min(length))
+            });
+            let said = Arc::make_mut(&mut entry.out);
+            match &entry.lock {
+                Lock::Locked => continue,
+                Lock::Plain => {}
+                Lock::Open(_) | Lock::Sealed(_) => {
+                    if let Some(length) = plain_len {
+                        said.padding.forget(length, stream);
+                    }
+                }
+            }
+            if !payload.is_empty() {
+                said.coverage.erase(payload);
+                said.closed = false;
+            }
+        }
+    }
+
     // A part's packed bytes, against the part's own CRC.
     fn check_part(
         &mut self,

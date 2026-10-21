@@ -438,6 +438,22 @@ impl Object for Tar {
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
+    // Each member the bytes reached forgets what was said of them and is
+    // open until they are said again.
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let mut placements = Vec::new();
+        self.locate(volume, range, &mut placements);
+        for placement in placements {
+            if let Placement::Member { member, range } = placement
+                && !range.is_empty()
+                && let Some(said) = self.members.get_mut(member.0 as usize)
+            {
+                said.coverage.erase(range);
+                said.closed = false;
+            }
+        }
+    }
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         if volume != VOLUME {
             return out.push(Placement::Held { range });

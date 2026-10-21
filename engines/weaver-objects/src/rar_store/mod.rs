@@ -545,6 +545,10 @@ impl Object for RarStore {
         Box::new(self.posted_over(ranges))
     }
 
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        self.unsay(volume, range);
+    }
+
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         let found = self.volume(volume);
         if found.length.is_some() {

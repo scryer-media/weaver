@@ -2607,8 +2607,46 @@ impl Tree {
 
     fn descend(
         &mut self,
-        mut pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
+        pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
         effects: &mut Vec<Effect>,
+    ) {
+        self.walk_down(pending, |tree, node, member, range, pending| {
+            tree.mark(node, member, range, effects, pending);
+        });
+    }
+
+    // A range of `node`'s volume a restart could not read back, which comes
+    // again: at every depth it reaches it is not covered, its members are
+    // open, and each object bound below forgets what it said of it, so the
+    // bytes are said again as they first were.
+    pub fn uncover(&mut self, node: NodeId, volume: VolumeIndex, range: ByteRange) {
+        if let Some(object) = self
+            .nodes
+            .get_mut(&node)
+            .and_then(|found| found.object.as_mut())
+        {
+            object.unposted(volume, range);
+        }
+        self.walk_down(
+            vec![(node, volume, range)],
+            |tree, node, member, range, pending| {
+                tree.unsay(node, member, range, pending);
+            },
+        );
+    }
+
+    // Each member the ranges of the nodes' volumes landed in, by the node's
+    // object, handed to `each`, which pushes what goes on down.
+    fn walk_down(
+        &mut self,
+        mut pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
+        mut each: impl FnMut(
+            &mut Self,
+            NodeId,
+            MemberId,
+            ByteRange,
+            &mut Vec<(NodeId, VolumeIndex, ByteRange)>,
+        ),
     ) {
         while let Some((at, volume, range)) = pending.pop() {
             let Some(found) = self.nodes.get(&at) else {
@@ -2616,8 +2654,7 @@ impl Tree {
             };
             let Some(object) = found.object.as_ref() else {
                 // The root: the volume is the member.
-                let member = MemberId(volume.0);
-                self.mark(at, member, range, effects, &mut pending);
+                each(self, at, MemberId(volume.0), range, &mut pending);
                 continue;
             };
             let mut placements = std::mem::take(&mut self.placements);
@@ -2625,11 +2662,38 @@ impl Tree {
             object.locate(volume, range, &mut placements);
             for placement in placements.drain(..) {
                 if let Placement::Member { member, range } = placement {
-                    self.mark(at, member, range, effects, &mut pending);
+                    each(self, at, member, range, &mut pending);
                 }
             }
             self.placements = placements;
         }
+    }
+
+    fn unsay(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+        pending: &mut Vec<(NodeId, VolumeIndex, ByteRange)>,
+    ) {
+        if range.is_empty() {
+            return;
+        }
+        let Some(found) = self.nodes.get_mut(&node) else {
+            return;
+        };
+        let member = found.namespace.uncover(member, range);
+        let Some((child, volume)) = found.children.get(&member).copied() else {
+            return;
+        };
+        if let Some(object) = self
+            .nodes
+            .get_mut(&child)
+            .and_then(|found| found.object.as_mut())
+        {
+            object.unposted(volume, range);
+        }
+        pending.push((child, volume, range));
     }
 
     fn mark(
@@ -2727,6 +2791,9 @@ mod tests {
     }
 
     impl Object for Split {
+        // It keeps no record of what it said of its posted bytes.
+        fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
         fn kind(&self) -> Kind {
             Kind::RarStore
         }
@@ -2828,6 +2895,9 @@ mod tests {
     struct Reader(Vec<(VolumeIndex, String)>);
 
     impl Object for Reader {
+        // It keeps no record of what it said of its posted bytes.
+        fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
         fn kind(&self) -> Kind {
             Kind::RarEngine
         }
@@ -2862,6 +2932,9 @@ mod tests {
     struct Named(Vec<VolumeIndex>);
 
     impl Object for Named {
+        // It keeps no record of what it said of its posted bytes.
+        fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
         fn kind(&self) -> Kind {
             Kind::Split
         }
@@ -4046,6 +4119,9 @@ mod tests {
     }
 
     impl Object for Yielder {
+        // It keeps no record of what it said of its posted bytes.
+        fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
         fn kind(&self) -> Kind {
             Kind::RarStore
         }
@@ -4194,6 +4270,9 @@ mod tests {
     }
 
     impl Object for Giver {
+        // It keeps no record of what it said of its posted bytes.
+        fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
         fn kind(&self) -> Kind {
             Kind::RarStore
         }

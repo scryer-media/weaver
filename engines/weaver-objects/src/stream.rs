@@ -185,6 +185,10 @@ impl<D: Decoder> Object for Stream<D> {
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
+    // The front it copies out is in its facts, which a restart keeps, and its
+    // run reads the volumes themselves: it says nothing of the posted bytes.
+    fn unposted(&mut self, _volume: VolumeIndex, _range: ByteRange) {}
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
             envelope: volume.0,

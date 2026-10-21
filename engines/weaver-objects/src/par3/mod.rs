@@ -316,6 +316,15 @@ impl Object for Par3 {
     // `volume_lost` at its exact range, and the rest of it still comes.
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
+    // What arrived there is to come again, and the blocks it carried; a
+    // volume closed over them is open until they do.
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
+            found.arrived.erase(range);
+            found.closed = false;
+        }
+    }
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
             envelope: volume.0,
