@@ -2541,9 +2541,11 @@ impl Session {
 
     /// [`Session::may_reach`] for the tracker task, which already holds the
     /// session (its counters).
+    // Weak, as the tracker task outlives no session: holding it strongly
+    // would keep a session whose torrents announce nowhere alive.
     fn reachable(self: &Arc<Self>) -> Reachable {
-        let session = self.clone();
-        Arc::new(move |ip| session.may_reach(ip))
+        let session = Arc::downgrade(self);
+        Arc::new(move |ip| session.upgrade().map_or(Ok(()), |s| s.may_reach(ip)))
     }
 
     // Get a peer stream from both DHT and trackers, under every hash the
@@ -2605,7 +2607,7 @@ impl Session {
 
         let tracker_rx_stats = PeerRxTorrentInfo {
             info_hashes,
-            session: self.clone(),
+            session: Arc::downgrade(self),
             torrent: Default::default(),
         };
         // The task runs with no tracker too, so trackers added later are
@@ -2869,7 +2871,8 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
 // Ad adapter for converting stats into the format that tracker_comms accepts.
 struct PeerRxTorrentInfo {
     info_hashes: InfoHashes,
-    session: Arc<Session>,
+    // Weak for the reason `Session::reachable` gives.
+    session: std::sync::Weak<Session>,
     // Kept once found, so the counters stay readable after the torrent is
     // removed from the session (for the `stopped` announce).
     torrent: std::sync::OnceLock<ManagedTorrentHandle>,
@@ -2880,7 +2883,7 @@ impl PeerRxTorrentInfo {
         if let Some(t) = self.torrent.get() {
             return Some(t);
         }
-        let found = self.session.with_torrents(|torrents| {
+        let found = self.session.upgrade()?.with_torrents(|torrents| {
             torrents
                 .map(|(_, t)| t)
                 .find(|t| t.info_hashes().overlaps(&self.info_hashes))
@@ -2962,7 +2965,9 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             // A magnet still receiving its metadata isn't in the session
             // yet: it is looked for again as each torrent is added
             // (libtorrent waits on `metadata_received_alert`).
-            let added = self.session.db.read().added.clone();
+            let Some(added) = self.session.upgrade().map(|s| s.db.read().added.clone()) else {
+                return futures::future::pending().await;
+            };
             loop {
                 let mut next_added = std::pin::pin!(added.notified());
                 next_added.as_mut().enable();
@@ -3528,7 +3533,7 @@ mod tests {
         use crate::tracker::TorrentStatsProvider;
         let info = super::PeerRxTorrentInfo {
             info_hashes: handle.info_hashes(),
-            session: session.clone(),
+            session: std::sync::Arc::downgrade(session),
             torrent: Default::default(),
         };
         let stats = info.get();
@@ -3593,7 +3598,7 @@ mod tests {
             .info_hashes;
         let info = super::PeerRxTorrentInfo {
             info_hashes,
-            session: session.clone(),
+            session: std::sync::Arc::downgrade(&session),
             torrent: Default::default(),
         };
         let mut wait = info.wait_until_completed();
