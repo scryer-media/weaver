@@ -263,10 +263,12 @@ impl PieceTracker {
         self.chunks.mark_piece_broken_if_not_have(piece);
     }
 
-    /// Release all pieces owned by a peer (on peer death).
+    /// Release all pieces owned by a peer: it died, choked us, or let its
+    /// requests time out.
     ///
-    /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED.
-    /// Returns the number of pieces released.
+    /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED, with
+    /// the chunks they already received, so the next owner asks only for the
+    /// rest. Returns the number of pieces released.
     pub fn release_pieces_owned_by(&mut self, peer: PeerHandle) -> usize {
         // Collect pieces to release (can't modify while iterating)
         let pieces_to_release: Vec<_> = self
@@ -279,7 +281,7 @@ impl PieceTracker {
         let count = pieces_to_release.len();
         for piece in pieces_to_release {
             self.inflight.remove(&piece);
-            self.chunks.mark_piece_broken_if_not_have(piece);
+            self.chunks.requeue_piece_if_not_have(piece);
         }
         count
     }

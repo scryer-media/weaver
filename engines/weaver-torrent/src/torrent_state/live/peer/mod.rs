@@ -365,6 +365,19 @@ impl LivePeerState {
         }
     }
 
+    /// Stops waiting for every request outstanding to the peer and returns
+    /// them. A block the peer already had on its way is let through as late.
+    pub fn take_inflight_requests(&mut self) -> Vec<InflightRequest> {
+        let taken: Vec<_> = self.inflight_requests.drain().collect();
+        self.late_cancelled_request_tolerance = self
+            .late_cancelled_request_tolerance
+            .saturating_add(u32::try_from(taken.len()).unwrap_or(u32::MAX));
+        if !taken.is_empty() {
+            self.request_slots_changed.notify_waiters();
+        }
+        taken
+    }
+
     pub fn inflight_requests(&self) -> impl Iterator<Item = &InflightRequest> {
         self.inflight_requests.iter()
     }

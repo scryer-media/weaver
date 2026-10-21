@@ -49,6 +49,8 @@
 pub mod peer;
 pub mod peers;
 pub mod stats;
+#[cfg(test)]
+mod tests;
 
 use std::{
     borrow::Cow,
@@ -107,7 +109,7 @@ use crate::{
 
 use self::{
     peer::{
-        PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
+        InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -1105,7 +1107,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Bitfield(b) => self
                 .on_bitfield(b.clone_to_owned(None))
                 .context("on_bitfield")?,
-            Message::Choke => self.on_i_am_choked(),
+            Message::Choke => self.on_i_am_choked().context("on_i_am_choked")?,
             Message::Unchoke => self.on_i_am_unchoked(),
             Message::Interested => self.on_peer_interested(),
             Message::Piece(piece) => self
@@ -1802,9 +1804,41 @@ impl PeerHandler {
         }
     }
 
-    fn on_i_am_choked(&self) {
+    fn on_i_am_choked(&self) -> crate::Result<()> {
         self.lock_flow_control("i_am_choked = true").i_am_choked = true;
+        // A peer that chokes us drops every request we sent it (BEP 3). We
+        // do not speak the fast extension (BEP 6), so no allowed-fast piece
+        // keeps its requests.
+        self.return_requests()?;
         self.notify_request_slots_changed();
+        Ok(())
+    }
+
+    /// Every request outstanding to this peer stops being in flight, and every
+    /// piece it owns goes back to the queue with the chunks it already
+    /// delivered, for any peer to take. One step under this peer's lock, as a
+    /// request is checked and added: the requester either finds the piece gone
+    /// or has its request taken here. Returns the requests taken.
+    fn return_requests(&self) -> crate::Result<Vec<InflightRequest>> {
+        let returned = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "return_requests", |live| {
+                let released = self
+                    .state
+                    .lock_write("return_requests")
+                    .get_pieces_mut()?
+                    .release_pieces_owned_by(self.addr);
+                Ok::<_, Error>((released, live.take_inflight_requests()))
+            })
+            .transpose()?;
+        let Some((released, taken)) = returned else {
+            return Ok(Vec::new());
+        };
+        if released > 0 {
+            self.state.new_pieces_notify.notify_waiters();
+        }
+        Ok(taken)
     }
 
     fn on_peer_interested(&self) {
