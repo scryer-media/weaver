@@ -583,6 +583,44 @@ async fn a_snubbed_peer_keeps_the_requests_of_pieces_that_still_have_free_blocks
 }
 
 #[tokio::test]
+async fn a_snub_gives_back_one_piece_the_newest_that_waits_on_the_peer_alone() {
+    // libtorrent `peer_connection::snub_peer` times out one request a snub,
+    // the last of the download queue, and `second_tick` snubs again each
+    // second the peer stays overdue.
+    let h = Harness::new("a_snub_gives_back_one_piece").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
+    peer.on_i_am_unchoked();
+    let mut take_and_ask = || {
+        let piece = peer.acquire_next_piece().unwrap().unwrap().get();
+        for block in 0..CHUNKS_PER_PIECE {
+            h.peers
+                .with_live_mut(peer.addr, "test", |live| {
+                    live.add_inflight_request(h.chunk(piece, block))
+                })
+                .unwrap();
+        }
+        piece
+    };
+    let older = take_and_ask();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let newer = take_and_ask();
+
+    peer.on_requests_timed_out().unwrap();
+    assert!(!h.owns(&peer, newer));
+    assert!(h.owns(&peer, older));
+    assert!(h.queued_pieces().contains(&newer));
+
+    peer.on_requests_timed_out().unwrap();
+    assert!(!h.owns(&peer, older));
+    assert!(h.queued_pieces().contains(&older));
+
+    // Every request stays outstanding, and none is cancelled.
+    assert_eq!(h.inflight_count(&peer), 2 * CHUNKS_PER_PIECE as usize);
+    assert!(cancels_sent(&mut rx).is_empty());
+}
+
+#[tokio::test]
 async fn a_parole_peer_is_not_snubbed_of_its_requests() {
     // libtorrent `peer_connection::snub_peer` returns on parole before it
     // times out any request: a paroled peer was handed only a piece no one

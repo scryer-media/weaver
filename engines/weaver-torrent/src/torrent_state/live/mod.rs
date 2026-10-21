@@ -2691,11 +2691,14 @@ impl PeerHandler {
         }
     }
 
-    /// The peer is snubbed, and the pieces it owns that wait on it alone go
-    /// back to the queue for other peers to fetch. Its requests stay
-    /// outstanding, so a block it still sends is kept. A peer on parole is
-    /// left its pieces: it was handed only pieces no one else had started
-    /// (libtorrent `peer_connection::snub_peer` returns early on parole).
+    /// The peer is snubbed, and the newest piece it owns that waits on it
+    /// alone goes back to the queue for other peers to fetch: one a snub, so
+    /// a peer that stays overdue gives its pieces back one at a time
+    /// (libtorrent `peer_connection::snub_peer` times out one block each
+    /// `second_tick`). Its requests stay outstanding, so a block it still
+    /// sends is kept. A peer on parole is left its pieces: it was handed
+    /// only pieces no one else had started (`snub_peer` returns early on
+    /// parole).
     fn on_requests_timed_out(&self) -> crate::Result<()> {
         let on_parole = self
             .state
@@ -2708,21 +2711,21 @@ impl PeerHandler {
             .with_live_mut(self.addr, "snub", |live| {
                 live.snub();
                 if on_parole {
-                    return Ok(0);
+                    return Ok(None);
                 }
                 Ok::<_, Error>(
                     self.state
                         .lock_write("snub")
                         .get_pieces_mut()?
-                        .release_pieces_blocked_by(self.addr, |chunk| {
+                        .release_piece_blocked_by(self.addr, |chunk| {
                             live.has_inflight_request(chunk)
                         }),
                 )
             })
             .transpose()?
-            .unwrap_or(0);
-        debug!(released, on_parole, "requests timed out");
-        if released > 0 {
+            .flatten();
+        debug!(?released, on_parole, "requests timed out");
+        if released.is_some() {
             self.state.new_pieces_notify.notify_waiters();
         }
         Ok(())

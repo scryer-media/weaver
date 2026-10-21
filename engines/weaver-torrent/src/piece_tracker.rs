@@ -563,21 +563,22 @@ impl PieceTracker {
         self.requeue(owned)
     }
 
-    /// The pieces `peer` owns that wait on it alone go back to the queue,
-    /// with the chunks they already received: those none of whose missing
-    /// chunks is free, each one asked of the peer (`asked`), doubled by
-    /// another or being written. A piece with a free chunk stays the peer's:
-    /// it is not held up while any peer may still fetch that chunk. The
-    /// peer's requests stay outstanding, and a block it still sends is kept
-    /// (libtorrent `peer_connection::snub_peer` times out a request only when
-    /// its piece has no free block, and leaves it in the download queue).
-    /// Returns the number of pieces released.
-    pub fn release_pieces_blocked_by(
+    /// The newest piece `peer` owns that waits on it alone goes back to the
+    /// queue, with the chunks it already received: one none of whose
+    /// missing chunks is free, each one asked of the peer (`asked`), doubled
+    /// by another or being written. A piece with a free chunk stays the
+    /// peer's: it is not held up while any peer may still fetch that chunk.
+    /// The peer's requests stay outstanding, and a block it still sends is
+    /// kept (libtorrent `peer_connection::snub_peer` times out one request
+    /// a snub, the last of the download queue, only when its piece has no
+    /// free block, and leaves it in the download queue). Returns the piece
+    /// released, if any.
+    pub fn release_piece_blocked_by(
         &mut self,
         peer: PeerHandle,
         asked: impl Fn(&ChunkInfo) -> bool,
-    ) -> usize {
-        let blocked: Vec<_> = self
+    ) -> Option<ValidPieceIndex> {
+        let blocked = self
             .inflight
             .iter()
             .filter(|(_, info)| info.peer == peer)
@@ -588,9 +589,10 @@ impl PieceTracker {
                         || info.duplicates.iter().any(|(b, _)| *b == chunk.chunk_index)
                 })
             })
-            .map(|(p, _)| *p)
-            .collect();
-        self.requeue(blocked)
+            .max_by_key(|(piece, info)| (info.started, piece.get()))
+            .map(|(p, _)| *p)?;
+        self.requeue(vec![blocked]);
+        Some(blocked)
     }
 
     // `pieces` leave flight and are queued again, with the chunks they
@@ -1173,8 +1175,8 @@ mod tests {
             deliver_from(&mut tracker, slow, 0, chunk);
         }
         assert_eq!(
-            tracker.release_pieces_blocked_by(slow, |c| c.chunk_index == 3),
-            1
+            tracker.release_piece_blocked_by(slow, |c| c.chunk_index == 3),
+            Some(piece)
         );
         assert!(tracker.chunks().iter_queued_pieces().any(|p| p == piece));
 
@@ -1199,9 +1201,10 @@ mod tests {
     }
 
     #[test]
-    fn a_snub_releases_only_the_pieces_with_no_free_block() {
+    fn a_snub_releases_one_piece_with_no_free_block() {
         // libtorrent `peer_connection::snub_peer`: a request times out only
-        // when its piece has no free block left for another peer.
+        // when its piece has no free block left for another peer, and one
+        // a snub.
         let mut tracker = tracker(3);
         let (slow, other) = (peer(1), peer(2));
         let mut owned = Vec::new();
@@ -1225,7 +1228,10 @@ mod tests {
             .duplicates
             .push((3, other));
 
-        assert_eq!(tracker.release_pieces_blocked_by(slow, asked), 2);
+        let mut released: Vec<u32> = (0..2)
+            .map(|_| tracker.release_piece_blocked_by(slow, asked).unwrap().get())
+            .collect();
+        assert_eq!(tracker.release_piece_blocked_by(slow, asked), None);
         assert!(!tracker.is_inflight(index(&tracker, whole)));
         assert!(!tracker.is_inflight(index(&tracker, doubled_rest)));
         assert!(tracker.is_owned_by(index(&tracker, part), slow));
@@ -1235,9 +1241,11 @@ mod tests {
             .map(|p| p.get())
             .collect();
         queued.sort_unstable();
-        let mut released = vec![whole, doubled_rest];
         released.sort_unstable();
         assert_eq!(queued, released);
+        let mut expected = vec![whole, doubled_rest];
+        expected.sort_unstable();
+        assert_eq!(released, expected);
     }
 
     #[tokio::test(start_paused = true)]
