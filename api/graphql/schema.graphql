@@ -2156,6 +2156,7 @@ enum NetworkConsumerKind {
 	OUTBOUND
 	TORRENT_DEFAULT
 	TORRENT_CATEGORY
+	TORRENT_TRACKER
 }
 
 """
@@ -4828,7 +4829,15 @@ enum TimelineStage {
 type Torrent {
 	id: Int!
 	name: String!
+	"""
+	Its v1 hash; empty when it has none.
+	"""
 	infohash: String!
+	infohashV2: String
+	"""
+	Which hashes verify its pieces, once its metainfo is in hand.
+	"""
+	version: TorrentVersion
 	state: TorrentState!
 	"""
 	Why the torrent is in its state, when there is a reason to give.
@@ -4999,6 +5008,15 @@ type TorrentTracker {
 }
 
 """
+Which hashes verify a torrent's pieces.
+"""
+enum TorrentVersion {
+	V1
+	V2
+	HYBRID
+}
+
+"""
 Seeding goals for the torrents announcing to a host, and whether the
 schedule's pause leaves them seeding until their goal is met.
 """
@@ -5022,6 +5040,10 @@ type TrackerRule {
 	The client its torrents name themselves as; absent is Weaver.
 	"""
 	client: TorrentClient
+	"""
+	Whether its torrents route through their own consumer.
+	"""
+	torrentRoute: Boolean!
 }
 
 input TrackerRuleInput {
@@ -5030,6 +5052,7 @@ input TrackerRuleInput {
 	neverPause: Boolean! = false
 	unpack: Boolean
 	client: TorrentClient
+	torrentRoute: Boolean! = false
 }
 
 enum TrackerStatus {

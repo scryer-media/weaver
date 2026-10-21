@@ -593,6 +593,8 @@ impl SettingsMutation {
         })
         .await??
         .map_err(async_graphql::Error::new)?;
+        // A tracker rule is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
         crate::torrents::reload_tracker_rules(ctx).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
@@ -612,6 +614,8 @@ impl SettingsMutation {
             db.list_tracker_rules()
         })
         .await??;
+        // A tracker rule is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
         crate::torrents::reload_tracker_rules(ctx).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }

@@ -361,6 +361,7 @@ impl Consumer {
             Self::Outbound => "outbound".into(),
             Self::Torrent(TorrentScope::Default) => "torrent:default".into(),
             Self::Torrent(TorrentScope::Category(id)) => format!("torrent:category:{id}"),
+            Self::Torrent(TorrentScope::TrackerRule(id)) => format!("torrent:tracker:{id}"),
         }
     }
 
@@ -370,14 +371,12 @@ impl Consumer {
         matches!(self, Self::Torrent(_))
     }
 
-    // A torrent session dials through one path at a time, trying its rungs in
-    // order: it cannot spread over weighted legs or a pool.
+    // A torrent session dials through one path at a time: its route's first
+    // leg that is up, trying that leg's rungs in order. It cannot spread over
+    // a pool.
     pub fn validate_route(self, route: &super::Route) -> Result<(), super::NetworkRefusal> {
         if !matches!(self, Self::Torrent(_)) {
             return Ok(());
-        }
-        if route.legs.len() != 1 {
-            return Err(super::NetworkRefusal::TorrentRouteLegs);
         }
         let pooled = route.legs.iter().any(|leg| match &leg.path {
             super::LegPath::Direct => false,
@@ -392,12 +391,14 @@ impl Consumer {
     }
 }
 
-// Which torrents a torrent consumer carries: every torrent whose category
-// has no route of its own, or one category's.
+// Which torrents a torrent consumer carries: every torrent whose tracker
+// rule and category have no route of their own, one category's, or one
+// tracker rule's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TorrentScope {
     Default,
     Category(u32),
+    TrackerRule(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

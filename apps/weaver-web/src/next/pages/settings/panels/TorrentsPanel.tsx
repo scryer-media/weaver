@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useMemo, useState, type ReactNode } from "react";
+import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   DELETE_TRACKER_RULE_MUTATION,
@@ -13,6 +14,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
+import { Toggle } from "../../../components/controls";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
@@ -47,6 +49,7 @@ interface TrackerRule {
   unpack: boolean | null;
   /** Null names the torrents as Weaver. */
   client: TorrentClient | null;
+  torrentRoute: boolean;
 }
 
 type TorrentClient = "WEAVER" | "QBITTORRENT" | "TRANSMISSION";
@@ -63,6 +66,7 @@ interface TrackerRuleForm {
   neverPause: boolean;
   unpack: boolean | null;
   client: TorrentClient | null;
+  torrentRoute: boolean;
 }
 
 const NEW_TRACKER_RULE: TrackerRuleForm = {
@@ -71,6 +75,7 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   neverPause: false,
   unpack: null,
   client: null,
+  torrentRoute: false,
 };
 
 /** A rule's goals in one line, as its row shows them. */
@@ -114,6 +119,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           neverPause: rule.neverPause,
           unpack: rule.unpack,
           client: rule.client,
+          torrentRoute: rule.torrentRoute,
         }
       : NEW_TRACKER_RULE;
     setForm(start);
@@ -131,6 +137,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         neverPause: form.neverPause,
         unpack: form.unpack,
         client: form.client,
+        torrentRoute: form.torrentRoute,
       },
     });
     setBusy(false);
@@ -248,6 +255,35 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                       ...current,
                       client: client === "WEAVER" ? null : (client as TorrentClient),
                     })),
+                },
+              },
+              {
+                id: "torrentRoute",
+                label: t("next.torrents.trackerRuleTorrentRoute"),
+                keywords: "torrent route networking",
+                control: {
+                  kind: "custom",
+                  // Off, the rule's torrents ride their category's route or the default torrent
+                  // route; on, the rule owns a route, edited under Networking's routes.
+                  control: (
+                    <div className="flex items-center gap-[10px]">
+                      <Toggle
+                        checked={form.torrentRoute}
+                        label={t("next.torrents.trackerRuleTorrentRoute")}
+                        onChange={(torrentRoute) => setForm((current) => ({ ...current, torrentRoute }))}
+                      />
+                      {form.torrentRoute && typeof editingId === "number" ? (
+                        <Link
+                          to={`/settings/networking/routes?consumer=torrent:tracker:${editingId}`}
+                          className="font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
+                        >
+                          {t("next.torrents.trackerRuleRouteOwn")}
+                        </Link>
+                      ) : form.torrentRoute ? (
+                        <span className="font-wv-mono text-[11.5px] text-wv-muted">{t("next.torrents.trackerRuleRouteOwn")}</span>
+                      ) : null}
+                    </div>
+                  ),
                 },
               },
               {

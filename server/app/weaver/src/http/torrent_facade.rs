@@ -639,8 +639,14 @@ pub(super) fn info(view: &TorrentView) -> Value {
     let (save_path, content_path) = view.paths();
     let mut fields = object([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
-        ("infohash_v1", json!(view.infohash.to_ascii_lowercase())),
-        ("infohash_v2", json!("")),
+        (
+            "infohash_v1",
+            json!(view.infohash_v1.clone().unwrap_or_default()),
+        ),
+        (
+            "infohash_v2",
+            json!(view.infohash_v2.clone().unwrap_or_default()),
+        ),
         ("name", json!(view.name)),
         ("size", json!(view.total_bytes)),
         ("total_size", json!(view.total_bytes)),
@@ -681,13 +687,7 @@ pub(super) fn info(view: &TorrentView) -> Value {
         ("dl_limit", json!(-1)),
         ("up_limit", json!(-1)),
         ("tracker", json!("")),
-        (
-            "magnet_uri",
-            json!(format!(
-                "magnet:?xt=urn:btih:{}",
-                view.infohash.to_ascii_lowercase()
-            )),
-        ),
+        ("magnet_uri", json!(view.magnet)),
     ]);
     if let Some(fields) = fields.as_object_mut() {
         fields.extend(
@@ -773,8 +773,14 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let (save_path, content_path) = view.paths();
     axum::Json(object([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
-        ("infohash_v1", json!(view.infohash.to_ascii_lowercase())),
-        ("infohash_v2", json!("")),
+        (
+            "infohash_v1",
+            json!(view.infohash_v1.clone().unwrap_or_default()),
+        ),
+        (
+            "infohash_v2",
+            json!(view.infohash_v2.clone().unwrap_or_default()),
+        ),
         ("name", json!(view.name)),
         ("save_path", json!(save_path)),
         ("content_path", json!(content_path)),

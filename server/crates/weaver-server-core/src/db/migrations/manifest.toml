@@ -956,17 +956,51 @@ scope = "all"
 
 [[migration]]
 version = 78
-description = "a torrent keeps its peers and bans across a restart"
+description = "a torrent's v2 hash is unique wherever it is known"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0078_torrent_peers/sqlite.sql"
+file = "migrations/0078_torrent_infohash_v2/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0078_torrent_peers/postgres.sql"
+file = "migrations/0078_torrent_infohash_v2/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 79
+description = "a tracker rule may route its torrents through their own consumer"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0079_tracker_rule_route/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0079_tracker_rule_route/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 80
+description = "a torrent keeps its peers and bans across a restart"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0080_torrent_peers/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0080_torrent_peers/postgres.sql"
 engine = "postgres"
 scope = "all"

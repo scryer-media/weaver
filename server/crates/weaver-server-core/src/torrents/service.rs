@@ -14,10 +14,11 @@ use tokio::sync::{Notify, mpsc, watch};
 use weaver_graph::VolumeIndex;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_torrent::api::TorrentIdOrHash;
+use weaver_torrent::core::{Id20, Id32, InfoHashes};
 use weaver_torrent::limits::{LimitKind, LimitsConfig};
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
-    ManagedTorrent, Session, TrackerAnnounce, torrent_from_bytes,
+    ManagedTorrent, Session, TorrentVersion, TrackerAnnounce, torrent_from_bytes,
 };
 
 use crate::SchedulerError;
@@ -107,9 +108,13 @@ impl TorrentSettings {
         id.and_then(|id| self.categories.iter().find(|category| category.id == id))
     }
 
-    fn scope(&self, id: Option<u32>) -> TorrentScope {
-        match self.category(id) {
-            Some(category) if category.torrent_route => TorrentScope::Category(category.id),
+    // The scope whose route a torrent takes: its tracker rule's when the
+    // rule routes its torrents itself, else its category's when that does,
+    // else the default.
+    fn scope(&self, id: Option<u32>, rule: Option<&TrackerRule>) -> TorrentScope {
+        match (rule, self.category(id)) {
+            (Some(rule), _) if rule.torrent_route => TorrentScope::TrackerRule(rule.id),
+            (_, Some(category)) if category.torrent_route => TorrentScope::Category(category.id),
             _ => TorrentScope::Default,
         }
     }
@@ -359,7 +364,15 @@ fn state_error(error: StateError) -> String {
 pub struct TorrentView {
     pub job_id: JobId,
     pub name: String,
+    /// The hash it goes by: its v1 hash, or its v2 hash cut to 20 bytes
+    /// when it has no v1 hash.
     pub infohash: String,
+    pub infohash_v1: Option<String>,
+    pub infohash_v2: Option<String>,
+    /// Which hashes verify its pieces, once its metainfo is in hand.
+    pub version: Option<TorrentVersion>,
+    /// The link to it: both its hashes and its name.
+    pub magnet: String,
     pub source: TorrentSource,
     pub state: TorrentState,
     pub detail: Option<String>,
@@ -474,7 +487,7 @@ impl TorrentView {
 
 // A torrent's metainfo, read.
 struct Parsed {
-    infohash: [u8; 20],
+    hashes: InfoHashes,
     manifest: Manifest,
     layout: Arc<PieceLayout>,
     private: bool,
@@ -487,6 +500,7 @@ struct Parsed {
 // What a torrent's metainfo says of where it came from.
 #[derive(Debug, Clone, Default)]
 struct About {
+    version: Option<TorrentVersion>,
     created_by: Option<String>,
     created_at_ms: Option<i64>,
     comment: Option<String>,
@@ -503,6 +517,24 @@ fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
         tier,
         url: url.to_owned(),
     })
+}
+
+// The hashes a duplicate of a torrent going by `hashes` would share.
+fn infohashes(hashes: InfoHashes) -> Vec<Infohash> {
+    hashes
+        .v1
+        .map(|hash| Infohash::V1(hash.0))
+        .into_iter()
+        .chain(hashes.v2.map(|hash| Infohash::V2(hash.0)))
+        .collect()
+}
+
+// The hashes `record` goes by.
+fn hashes_of(record: &TorrentRecord) -> InfoHashes {
+    InfoHashes {
+        v1: record.infohash_v1.map(Id20::new),
+        v2: record.infohash_v2.map(Id32::new),
+    }
 }
 
 fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
@@ -547,10 +579,10 @@ fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
         );
     }
     Ok(Parsed {
-        infohash: metainfo.info_hash.0,
+        hashes: metainfo.info_hashes,
         manifest: Manifest {
             name,
-            single_file: info.info().files.is_none(),
+            single_file: info.is_single_file(),
             paths: files
                 .iter()
                 .filter(|file| file.selected)
@@ -567,6 +599,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
         files,
         trackers,
         about: About {
+            version: Some(info.version()),
             created_by: text(metainfo.created_by.as_ref().map(|by| by.as_ref())),
             created_at_ms: metainfo
                 .creation_date
@@ -1500,7 +1533,7 @@ impl TorrentService {
                 let bytes = Bytes::from(bytes);
                 let parsed = parse(&bytes)?;
                 self.admit(&parsed.manifest)?;
-                self.duplicate(Infohash::V1(parsed.infohash))?;
+                self.duplicate(parsed.hashes)?;
                 let job_id = self.reserve()?;
                 let dir = self
                     .claim_dir(&settings, category.as_ref(), &parsed.manifest, job_id)
@@ -1509,7 +1542,7 @@ impl TorrentService {
                     job_id,
                     &request,
                     category.as_ref(),
-                    parsed.infohash,
+                    parsed.hashes,
                     parsed.manifest.name.clone(),
                     TorrentSource::Metainfo,
                     Some(bytes),
@@ -1531,12 +1564,17 @@ impl TorrentService {
             AddSource::Magnet(uri) => {
                 let magnet = Magnet::parse(&uri)
                     .map_err(|error| AddError::Invalid(format!("not a magnet: {error}")))?;
-                let infohash = magnet
-                    .as_id20()
-                    .ok_or_else(|| AddError::Invalid("the magnet has no v1 infohash".into()))?
-                    .0;
-                self.duplicate(Infohash::V1(infohash))?;
-                let scope = settings.scope(category.as_ref().map(|category| category.id));
+                let hashes = magnet.info_hashes();
+                self.duplicate(hashes)?;
+                let trackers: Vec<TrackerEntry> = magnet
+                    .trackers
+                    .iter()
+                    .filter_map(|url| tracker(0, url.as_bytes()))
+                    .collect();
+                let rules = self.rules();
+                let rule =
+                    tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
+                let scope = settings.scope(category.as_ref().map(|category| category.id), rule);
                 let plan = self
                     .inner
                     .sessions
@@ -1556,25 +1594,23 @@ impl TorrentService {
                     ));
                 }
                 let job_id = self.reserve()?;
-                let name = magnet.name.clone().unwrap_or_else(|| hex::encode(infohash));
+                let name = magnet
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| hashes.best().as_string());
                 let mut record = self.record(
                     job_id,
                     &request,
                     category.as_ref(),
-                    infohash,
+                    hashes,
                     name,
                     TorrentSource::Magnet,
                     None,
                     false,
                     None,
                 );
-                let trackers: Vec<TrackerEntry> = magnet
-                    .trackers
-                    .iter()
-                    .filter_map(|url| tracker(0, url.as_bytes()))
-                    .collect();
                 self.insert(&mut record, &[], &trackers)?;
-                let identity = identity_of(&record, &self.rules());
+                let identity = identity_of(&record, &rules);
                 let mut torrent = Live::new(record, TorrentCounters::default());
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
@@ -1594,8 +1630,8 @@ impl TorrentService {
         Ok(admission::admit(&policy, manifest)?)
     }
 
-    fn duplicate(&self, infohash: Infohash) -> Result<(), AddError> {
-        match self.inner.db.get_torrent_by_infohash(infohash) {
+    fn duplicate(&self, hashes: InfoHashes) -> Result<(), AddError> {
+        match self.inner.db.get_torrent_by_infohash(&infohashes(hashes)) {
             Ok(Some(existing)) => Err(AddError::Duplicate(existing.job_id)),
             Ok(None) => Ok(()),
             Err(error) => Err(AddError::State(state_error(error))),
@@ -1643,7 +1679,7 @@ impl TorrentService {
         job_id: JobId,
         request: &AddRequest,
         category: Option<&CategoryConfig>,
-        infohash: [u8; 20],
+        hashes: InfoHashes,
         name: String,
         source: TorrentSource,
         metainfo: Option<Bytes>,
@@ -1652,8 +1688,8 @@ impl TorrentService {
     ) -> TorrentRecord {
         TorrentRecord {
             job_id,
-            infohash_v1: Some(infohash),
-            infohash_v2: None,
+            infohash_v1: hashes.v1.map(|hash| hash.0),
+            infohash_v2: hashes.v2.map(|hash| hash.0),
             name,
             source,
             metainfo,
@@ -1735,16 +1771,22 @@ impl TorrentService {
         let parsed = parse(&bytes)?;
         self.admit(&parsed.manifest)?;
         let settings = self.settings();
-        let Some(category_id) = self
+        let Some((category_id, known)) = self
             .inner
             .live
             .lock()
             .await
             .get(&job_id)
-            .map(|torrent| torrent.record.category_id)
+            .map(|torrent| (torrent.record.category_id, hashes_of(&torrent.record)))
         else {
             return Ok(());
         };
+        // A hash only the metainfo names may be another torrent's: a hybrid
+        // added once by each of its hashes.
+        self.duplicate(InfoHashes {
+            v1: parsed.hashes.v1.filter(|_| known.v1.is_none()),
+            v2: parsed.hashes.v2.filter(|_| known.v2.is_none()),
+        })?;
         let category = settings.category(category_id).cloned();
         let dir = self
             .claim_dir(&settings, category.as_ref(), &parsed.manifest, job_id)
@@ -1755,6 +1797,8 @@ impl TorrentService {
             give_back(&dir).await;
             return Ok(());
         };
+        torrent.record.infohash_v1 = parsed.hashes.v1.map(|hash| hash.0);
+        torrent.record.infohash_v2 = parsed.hashes.v2.map(|hash| hash.0);
         torrent.record.name = parsed.manifest.name.clone();
         torrent.record.private = parsed.private;
         torrent.record.storage_dir = Some(dir.clone());
@@ -1769,6 +1813,8 @@ impl TorrentService {
             .db
             .set_torrent_metainfo(
                 job_id,
+                torrent.record.infohash_v1,
+                torrent.record.infohash_v2,
                 &parsed.manifest.name,
                 &bytes,
                 parsed.private,
@@ -1796,7 +1842,10 @@ impl TorrentService {
         else {
             return;
         };
-        let scope = self.settings().scope(record.category_id);
+        let rules = self.rules();
+        let scope = self
+            .settings()
+            .scope(record.category_id, rule_of(&record, &rules));
         let plan = match self.inner.sessions.routes().plan(scope) {
             Ok(plan) => plan,
             Err(reason) => return self.held(job_id, None, Held::RouteDown(reason)).await,
@@ -1809,10 +1858,7 @@ impl TorrentService {
             torrent.route = Some(plan.key);
             torrent.held = None;
         }
-        let uri = format!(
-            "magnet:?xt=urn:btih:{}",
-            hex::encode(record.infohash_v1.unwrap_or_default())
-        );
+        let uri = Magnet::of(hashes_of(&record), None, Vec::new()).to_string();
         let trackers = self
             .inner
             .db
@@ -1821,7 +1867,7 @@ impl TorrentService {
             .into_iter()
             .map(|tracker| tracker.url)
             .collect();
-        let identity = identity_of(&record, &self.rules());
+        let identity = identity_of(&record, &rules);
         self.spawn_resolve(job_id, session, uri, Some(trackers), identity);
     }
 
@@ -1852,7 +1898,7 @@ impl TorrentService {
                 .and_then(|policy| policy.max_upload_bps)
                 .map(|bps| u32::try_from(bps).unwrap_or(u32::MAX));
             (
-                settings.scope(torrent.record.category_id),
+                settings.scope(torrent.record.category_id, rule_of(&torrent.record, &rules)),
                 bytes,
                 layout,
                 intake,
@@ -2005,7 +2051,7 @@ impl TorrentService {
                 JobStatus::Failed { error },
                 now,
             );
-            (report, torrent.record.infohash_v1)
+            (report, hashes_of(&torrent.record).best())
         };
         self.apply_queue().await;
         self.finish(report, "failed", hash, now).await;
@@ -2029,15 +2075,15 @@ impl TorrentService {
         if let Err(error) = self.inner.db.delete_torrent(job_id) {
             tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent");
         }
-        self.finish(report, status, torrent.record.infohash_v1, now)
+        self.finish(report, status, hashes_of(&torrent.record).best(), now)
             .await;
     }
 
     // A torrent's job, finished as `status`: into history and the queue's
     // finished jobs.
-    async fn finish(&self, report: JobReport, status: &str, hash: Option<[u8; 20]>, now: i64) {
+    async fn finish(&self, report: JobReport, status: &str, hash: Id20, now: i64) {
         let job_id = report.job_id;
-        let row = report.history_row(status, hash.map(|hash| hash.to_vec()), now);
+        let row = report.history_row(status, Some(hash.0.to_vec()), now);
         if let Err(error) = self.inner.db.insert_job_history(&row) {
             tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's history");
         }
@@ -2197,13 +2243,15 @@ impl TorrentService {
             ),
             None => None,
         };
+        let rules = self.rules();
         let moved = {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
-            let before = settings.scope(torrent.record.category_id);
+            let rule = rule_of(&torrent.record, &rules);
+            let before = settings.scope(torrent.record.category_id, rule);
             torrent.record.category_id = category_id;
             self.save_options(&torrent.record)?;
-            let moved = before != settings.scope(category_id);
+            let moved = before != settings.scope(category_id, rule);
             if moved {
                 self.detach(torrent).await;
                 torrent.route = None;
@@ -2371,6 +2419,7 @@ impl TorrentService {
     // whose route went down is held, and comes back when it is up.
     async fn follow_routes(&self) {
         let settings = self.settings();
+        let rules = self.rules();
         let mut reattach = Vec::new();
         let mut down: BTreeMap<RouteKey, String> = BTreeMap::new();
         let mut unresolved = Vec::new();
@@ -2383,7 +2432,8 @@ impl TorrentService {
                     }
                     continue;
                 }
-                let scope = settings.scope(torrent.record.category_id);
+                let scope =
+                    settings.scope(torrent.record.category_id, rule_of(&torrent.record, &rules));
                 match self.inner.sessions.routes().plan(scope) {
                     Ok(plan) => {
                         if let Some(reason) = &plan.down {
@@ -2560,6 +2610,12 @@ impl TorrentService {
                     .filter(|category| category.torrent_route)
                     .map(|category| TorrentScope::Category(category.id)),
             )
+            .chain(
+                self.rules()
+                    .iter()
+                    .filter(|rule| rule.torrent_route)
+                    .map(|rule| TorrentScope::TrackerRule(rule.id)),
+            )
             .filter_map(|scope| routes.plan(scope).ok())
             .map(|plan| plan.key)
             .collect();
@@ -2598,7 +2654,12 @@ impl TorrentService {
         TorrentView {
             job_id: record.job_id,
             name: record.name.clone(),
-            infohash: record.infohash_v1.map(hex::encode).unwrap_or_default(),
+            infohash: hashes_of(record).best().as_string(),
+            infohash_v1: record.infohash_v1.map(hex::encode),
+            infohash_v2: record.infohash_v2.map(hex::encode),
+            version: torrent.about.version,
+            magnet: Magnet::of(hashes_of(record), Some(record.name.clone()), Vec::new())
+                .to_string(),
             source: record.source,
             state,
             detail,
@@ -2707,13 +2768,14 @@ impl TorrentService {
             .collect()
     }
 
-    /// The scope whose route a torrent added in `category` takes.
+    /// The scope whose route a torrent added in `category` takes before its
+    /// trackers are known.
     pub fn scope_of(&self, category: Option<&str>) -> TorrentScope {
         let settings = self.settings();
         let id = category
             .and_then(|name| resolve_category_config(&settings.categories, name))
             .map(|category| category.id);
-        settings.scope(id)
+        settings.scope(id, None)
     }
 }
 

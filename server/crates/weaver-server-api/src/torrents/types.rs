@@ -3,7 +3,7 @@
 
 use async_graphql::{Enum, InputObject, SimpleObject};
 use weaver_server_core::torrents::service::{ScheduleSeeding, SeedingSource, TorrentView};
-use weaver_server_core::torrents::{TorrentState, TorrentTracker, TrackerStatus};
+use weaver_server_core::torrents::{TorrentState, TorrentTracker, TorrentVersion, TrackerStatus};
 
 use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
 
@@ -31,6 +31,25 @@ impl From<TorrentState> for TorrentStateGql {
             TorrentState::Seeding => Self::Seeding,
             TorrentState::Paused => Self::Paused,
             TorrentState::Stopped => Self::Stopped,
+        }
+    }
+}
+
+/// Which hashes verify a torrent's pieces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentVersion")]
+pub enum TorrentVersionGql {
+    V1,
+    V2,
+    Hybrid,
+}
+
+impl From<TorrentVersion> for TorrentVersionGql {
+    fn from(version: TorrentVersion) -> Self {
+        match version {
+            TorrentVersion::V1 => Self::V1,
+            TorrentVersion::V2 => Self::V2,
+            TorrentVersion::Hybrid => Self::Hybrid,
         }
     }
 }
@@ -138,7 +157,11 @@ impl From<TorrentTracker> for TorrentTrackerGql {
 pub struct Torrent {
     pub id: u64,
     pub name: String,
+    /// Its v1 hash; empty when it has none.
     pub infohash: String,
+    pub infohash_v2: Option<String>,
+    /// Which hashes verify its pieces, once its metainfo is in hand.
+    pub version: Option<TorrentVersionGql>,
     pub state: TorrentStateGql,
     /// Why the torrent is in its state, when there is a reason to give.
     pub detail: Option<String>,
@@ -218,7 +241,9 @@ impl From<TorrentView> for Torrent {
         Self {
             id: view.job_id.0,
             name: view.name,
-            infohash: view.infohash,
+            infohash: view.infohash_v1.clone().unwrap_or_default(),
+            infohash_v2: view.infohash_v2.clone(),
+            version: view.version.map(Into::into),
             state: view.state.into(),
             detail: view.detail,
             category: view.category,

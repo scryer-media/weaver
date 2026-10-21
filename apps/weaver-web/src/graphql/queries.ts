@@ -1448,6 +1448,7 @@ const TRACKER_RULE_FIELDS = `
     neverPause
     unpack
     client
+    torrentRoute
   }
   ${SEEDING_POLICY_FIELDS}
 `;
@@ -1511,6 +1512,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       id
       name
       infohash
+      infohashV2
       state
       detail
       category

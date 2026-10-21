@@ -399,6 +399,9 @@ impl SpeedTestService {
                 Consumer::Outbound => "Default outbound".into(),
                 Consumer::Torrent(TorrentScope::Default) => "Default torrent".into(),
                 Consumer::Torrent(TorrentScope::Category(id)) => format!("torrent category {id}"),
+                Consumer::Torrent(TorrentScope::TrackerRule(id)) => {
+                    format!("torrent tracker rule {id}")
+                }
             });
 
         let policy = match &request.route {

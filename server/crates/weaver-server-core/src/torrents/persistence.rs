@@ -82,9 +82,12 @@ impl Database {
         files: &[TorrentFile],
         trackers: &[TrackerEntry],
     ) -> Result<TorrentInsert, StateError> {
-        let infohash = torrent.infohash().ok_or_else(|| {
-            StateError::Database("a torrent needs a v1 or a v2 infohash".to_string())
-        })?;
+        let infohashes = torrent.infohashes();
+        if infohashes.is_empty() {
+            return Err(StateError::Database(
+                "a torrent needs a v1 or a v2 infohash".to_string(),
+            ));
+        }
         let job_id = torrent.job_id;
         let added_at_ms = torrent.added_at_ms;
         let torrent_args = torrent_args(torrent)?;
@@ -113,11 +116,12 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "insert_torrent", |tx| {
+                let infohashes = infohashes.clone();
                 let torrent_args = torrent_args.clone();
                 let file_args = file_args.clone();
                 let tracker_args = tracker_args.clone();
                 Box::pin(async move {
-                    if let Some(existing) = torrent_by_infohash_tx(tx, infohash).await? {
+                    if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
                         return Ok(TorrentInsert::Duplicate(existing.job_id));
                     }
                     tx.execute(
@@ -309,13 +313,15 @@ impl Database {
         })
     }
 
-    // A magnet's metainfo once its peers sent it: the name, the file, the
-    // directory its files go to, and the files and trackers it lists.
-    // Returns whether the torrent exists.
+    // A magnet's metainfo once its peers sent it: the hashes and name it
+    // carries, the file, the directory its files go to, and the files and
+    // trackers it lists. Returns whether the torrent exists.
     #[allow(clippy::too_many_arguments)]
     pub fn set_torrent_metainfo(
         &self,
         job_id: JobId,
+        infohash_v1: Option<[u8; 20]>,
+        infohash_v2: Option<[u8; 32]>,
         name: &str,
         metainfo: &[u8],
         private: bool,
@@ -325,6 +331,8 @@ impl Database {
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
         let head = vec![
+            SqlArg::OptBytes(infohash_v1.map(|hash| hash.to_vec())),
+            SqlArg::OptBytes(infohash_v2.map(|hash| hash.to_vec())),
             SqlArg::Text(name.to_owned()),
             SqlArg::Bytes(metainfo.to_vec()),
             SqlArg::Bool(private),
@@ -362,7 +370,8 @@ impl Database {
                 Box::pin(async move {
                     let changed = tx
                         .execute(
-                            "UPDATE torrents SET name = {}, metainfo = {}, private = {}, storage_dir = {}
+                            "UPDATE torrents SET infohash_v1 = {}, infohash_v2 = {}, name = {}, metainfo = {},
+                                     private = {}, storage_dir = {}
                               WHERE job_id = {}",
                             &head,
                         )

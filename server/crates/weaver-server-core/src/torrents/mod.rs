@@ -18,6 +18,7 @@ pub use model::{
     Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
     TorrentSource, TorrentState, TorrentTracker, TrackerEntry, TrackerStatus,
 };
+pub use weaver_torrent::TorrentVersion;
 
 #[cfg(test)]
 mod tests;

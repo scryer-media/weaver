@@ -44,6 +44,7 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
   uploadBps: 1024,
   name: "set",
   infohash: "ab".repeat(20),
+  infohashV2: null,
   detail: null,
   category: null,
   private: true,
@@ -142,9 +143,12 @@ test("the information section names the pieces, the maker and where the torrent 
   assert.equal(values["Comment"], EM_DASH);
   assert.equal(values["Private"], "Yes");
   assert.equal(values["Info hash v1"], "ab".repeat(20));
+  assert.equal(values["Info hash v2"], EM_DASH);
   assert.equal(values["Save path"], "/complete/set");
   assert.equal(values["Route"], EM_DASH);
   assert.equal(values["Unpack"], "On");
+  const hybrid = byLabel(informationFields(t, torrent({ infohashV2: "cd".repeat(32) })));
+  assert.equal(hybrid["Info hash v2"], "cd".repeat(32));
   // A magnet without its metainfo has no pieces yet.
   const magnet = byLabel(informationFields(t, torrent({ pieceCount: null, pieceSize: null, piecesHave: null })));
   assert.equal(magnet["Pieces"], EM_DASH);

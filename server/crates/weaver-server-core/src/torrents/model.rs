@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::JobId;
 use crate::settings::SeedingPolicy;
 
-// The hash a torrent is known by. A hybrid torrent has both; a duplicate is
-// found by its v1 hash, or by its full v2 hash when it has no v1 hash.
+// A hash a torrent is known by. A hybrid torrent has both, and a torrent
+// sharing either is a duplicate of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Infohash {
     V1([u8; 20]),
@@ -141,11 +141,13 @@ pub struct TorrentRecord {
 }
 
 impl TorrentRecord {
-    // The hash a duplicate of this torrent shares; `None` when it has neither.
-    pub fn infohash(&self) -> Option<Infohash> {
+    // The hashes it goes by: a torrent sharing either is a duplicate of it.
+    pub fn infohashes(&self) -> Vec<Infohash> {
         self.infohash_v1
             .map(Infohash::V1)
-            .or(self.infohash_v2.map(Infohash::V2))
+            .into_iter()
+            .chain(self.infohash_v2.map(Infohash::V2))
+            .collect()
     }
 }
 

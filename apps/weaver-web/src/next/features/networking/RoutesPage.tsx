@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { SAVE_ROUTE } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import { routeInput, routeProblem, type ConsumerKind, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
+import { isTorrentConsumer, routeInput, routeProblem, type ConsumerKind, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
 import { cn } from "@/lib/utils";
 import { Dialog } from "../../components/Dialog";
 import { PrimaryButton, SecondaryButton } from "../../components/controls";
@@ -29,6 +29,7 @@ export function consumerType(kind: ConsumerKind): ConsumerType {
       return "HTTP";
     case "TORRENT_DEFAULT":
     case "TORRENT_CATEGORY":
+    case "TORRENT_TRACKER":
       return "TORRENT";
   }
 }
@@ -222,7 +223,7 @@ export function RouteDialog({
       onDismiss={onClose}
       footer={
         <>
-          {consumer.kind === "TORRENT_DEFAULT" || consumer.kind === "TORRENT_CATEGORY" ? (
+          {isTorrentConsumer(consumer.kind) ? (
             <SecondaryButton icon="test" disabled={problem !== null} onClick={() => setTesting(true)}>
               {t("next.networking.testVia.title")}
             </SecondaryButton>
@@ -251,7 +252,7 @@ export function RouteDialog({
           {error}
         </div>
       ) : null}
-      {testing && (consumer.kind === "TORRENT_DEFAULT" || consumer.kind === "TORRENT_CATEGORY") ? (
+      {testing && isTorrentConsumer(consumer.kind) ? (
         <TestViaDialog subject={null} route={route} torrent={consumer.kind} onClose={() => setTesting(false)} />
       ) : null}
     </Dialog>

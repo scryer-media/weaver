@@ -87,11 +87,13 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
 
     assert_eq!(db.get_torrent(JobId(7)).unwrap(), Some(record.clone()));
     assert_eq!(
-        db.get_torrent_by_infohash(Infohash::V1([1; 20])).unwrap(),
+        db.get_torrent_by_infohash(&[Infohash::V1([1; 20])])
+            .unwrap(),
         Some(record.clone())
     );
     assert_eq!(
-        db.get_torrent_by_infohash(Infohash::V2([2; 32])).unwrap(),
+        db.get_torrent_by_infohash(&[Infohash::V2([2; 32])])
+            .unwrap(),
         Some(record)
     );
     assert_eq!(db.list_torrent_files(JobId(7)).unwrap(), files());
@@ -177,13 +179,35 @@ fn a_v2_only_infohash_admits_one_job() {
 }
 
 #[test]
+fn a_v2_hash_admits_one_job_whether_or_not_a_v1_hash_comes_with_it() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(1, Some([3; 20]), Some([3; 32])), &[], &[])
+        .unwrap();
+    db.insert_torrent(&torrent(2, None, Some([8; 32])), &[], &[])
+        .unwrap();
+
+    // A hybrid's v2 hash alone is the hybrid.
+    assert_eq!(
+        db.insert_torrent(&torrent(3, None, Some([3; 32])), &[], &[])
+            .unwrap(),
+        TorrentInsert::Duplicate(JobId(1))
+    );
+    // A v2-only torrent is the hybrid that shares its v2 hash.
+    assert_eq!(
+        db.insert_torrent(&torrent(4, Some([8; 20]), Some([8; 32])), &[], &[])
+            .unwrap(),
+        TorrentInsert::Duplicate(JobId(2))
+    );
+}
+
+#[test]
 fn a_hybrid_torrent_is_found_by_either_hash() {
     let db = Database::open_in_memory().unwrap();
     db.insert_torrent(&torrent(1, Some([4; 20]), Some([4; 32])), &[], &[])
         .unwrap();
 
     assert_eq!(
-        db.get_torrent_by_infohash(Infohash::V2([4; 32]))
+        db.get_torrent_by_infohash(&[Infohash::V2([4; 32])])
             .unwrap()
             .map(|t| t.job_id),
         Some(JobId(1))
@@ -252,6 +276,7 @@ fn a_torrent_keeps_the_tracker_rule_it_matched_until_the_rule_goes() {
                 never_pause: true,
                 unpack: None,
                 client: None,
+                torrent_route: false,
             },
             1,
         )

@@ -417,6 +417,10 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         job_id: JobId(7),
         name: "set".into(),
         infohash: String::new(),
+        infohash_v1: None,
+        infohash_v2: None,
+        version: None,
+        magnet: String::new(),
         source: TorrentSource::Metainfo,
         state: TorrentState::Downloading,
         detail: None,
@@ -544,6 +548,81 @@ async fn a_magnet_is_refused_without_a_network_to_fetch_it_on() {
         Err(AddError::NoNetwork(_))
     ));
     assert!(rig.db.list_torrents().unwrap().is_empty());
+}
+
+const V2_ONLY: &[u8] = include_bytes!(concat!(
+    std::env!("CARGO_MANIFEST_DIR"),
+    "/../../../engines/weaver-torrent/resources/test/libtorrent/v2_only.torrent"
+));
+const V2_HYBRID: &[u8] = include_bytes!(concat!(
+    std::env!("CARGO_MANIFEST_DIR"),
+    "/../../../engines/weaver-torrent/resources/test/libtorrent/v2_hybrid.torrent"
+));
+
+// A v2 or hybrid torrent is one job, found by either of its hashes, whether
+// it arrives as metainfo or as a magnet naming one hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_torrent_is_added_and_found_by_either_hash() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+
+    let v2_only = rig
+        .service
+        .add(request(AddSource::Metainfo(V2_ONLY.to_vec())))
+        .await
+        .unwrap();
+    let stored = rig.db.get_torrent(v2_only).unwrap().unwrap();
+    assert_eq!(stored.infohash_v1, None);
+    let v2 = Id32::new(stored.infohash_v2.unwrap()).as_string();
+    let view = rig.service.torrent(v2_only).await.unwrap();
+    assert_eq!(view.version, Some(TorrentVersion::V2));
+    assert_eq!(view.infohash_v1, None);
+    assert_eq!(view.infohash_v2.as_deref(), Some(v2.as_str()));
+    assert_eq!(view.infohash, v2[..40]);
+    assert_eq!(
+        rig.service
+            .add(request(AddSource::Metainfo(V2_ONLY.to_vec())))
+            .await,
+        Err(AddError::Duplicate(v2_only))
+    );
+
+    let hybrid = rig
+        .service
+        .add(request(AddSource::Metainfo(V2_HYBRID.to_vec())))
+        .await
+        .unwrap();
+    let stored = rig.db.get_torrent(hybrid).unwrap().unwrap();
+    let v1 = Id20::new(stored.infohash_v1.unwrap()).as_string();
+    let v2 = Id32::new(stored.infohash_v2.unwrap()).as_string();
+    let view = rig.service.torrent(hybrid).await.unwrap();
+    assert_eq!(view.version, Some(TorrentVersion::Hybrid));
+    assert_eq!(view.infohash, v1);
+    assert!(view.magnet.contains(&format!("urn:btih:{v1}")));
+    assert!(view.magnet.contains(&format!("urn:btmh:1220{v2}")));
+    let tracker = "&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce";
+    for xt in [format!("urn:btih:{v1}"), format!("urn:btmh:1220{v2}")] {
+        assert_eq!(
+            rig.service
+                .add(request(AddSource::Magnet(format!(
+                    "magnet:?xt={xt}{tracker}"
+                ))))
+                .await,
+            Err(AddError::Duplicate(hybrid))
+        );
+    }
+
+    // A magnet naming only a v2 hash waits for its metainfo with that hash.
+    let fresh = "ab".repeat(32);
+    let magnet = rig
+        .service
+        .add(request(AddSource::Magnet(format!(
+            "magnet:?xt=urn:btmh:1220{fresh}{tracker}"
+        ))))
+        .await
+        .unwrap();
+    let stored = rig.db.get_torrent(magnet).unwrap().unwrap();
+    assert_eq!(stored.infohash_v1, None);
+    assert_eq!(stored.infohash_v2, Some([0xab; 32]));
 }
 
 // The attributes a torrent is added with stay with its job, from the queue
@@ -1731,6 +1810,7 @@ async fn a_tracker_rules_client_names_its_torrents() {
                 never_pause: false,
                 unpack: None,
                 client: Some(Client::QBittorrent),
+                torrent_route: false,
             },
             EPOCH_MS,
         )
@@ -1805,6 +1885,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                 never_pause: true,
                 unpack: None,
                 client: None,
+                torrent_route: false,
             },
             EPOCH_MS,
         )
@@ -2033,6 +2114,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         never_pause: false,
         unpack: None,
         client: None,
+        torrent_route: false,
     }];
     let mut settings = TorrentSettings {
         complete_dir: PathBuf::from("/complete"),
@@ -2058,6 +2140,114 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
     assert!(!settings.unpack(&record, &rules));
     record.unpack = Some(true);
     assert!(settings.unpack(&record, &rules));
+}
+
+// A torrent takes its tracker rule's route when the rule routes its torrents
+// itself, else its category's when that does, else the default.
+#[test]
+fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
+    let category = |id, torrent_route| CategoryConfig {
+        id,
+        name: format!("c{id}"),
+        dest_dir: None,
+        aliases: String::new(),
+        seeding: None,
+        torrent_route,
+        unpack: None,
+    };
+    let settings = TorrentSettings {
+        complete_dir: PathBuf::from("/complete"),
+        categories: vec![category(1, true), category(2, false)],
+        seeding: None,
+        torrent: TorrentConfig::default(),
+    };
+    let mut rule = TrackerRule {
+        id: 3,
+        host_pattern: "tracker.test".into(),
+        seeding: None,
+        never_pause: false,
+        unpack: None,
+        client: None,
+        torrent_route: true,
+    };
+
+    for category in [Some(1), Some(2), None] {
+        assert_eq!(
+            settings.scope(category, Some(&rule)),
+            TorrentScope::TrackerRule(3)
+        );
+    }
+    rule.torrent_route = false;
+    for rule in [Some(&rule), None] {
+        assert_eq!(settings.scope(Some(1), rule), TorrentScope::Category(1));
+        assert_eq!(settings.scope(Some(2), rule), TorrentScope::Default);
+        assert_eq!(settings.scope(None, rule), TorrentScope::Default);
+    }
+}
+
+// A torrent under a tracker rule that routes its torrents itself joins the
+// rule's session ahead of its category's; one under no rule joins its
+// category's. Once the rule's route is off, its torrent moves to its
+// category's session at the next tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let rule = rig
+        .db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "*.test".into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: true,
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    rig.routes.route(TorrentScope::Category(1), 9);
+    rig.routes.route(TorrentScope::TrackerRule(rule.id), 7);
+    let key = |scope| rig.routes.plan(scope).unwrap().key.as_str().to_owned();
+    // Paused, so nothing announces.
+    let in_tv = |metainfo| AddRequest {
+        category: Some("tv".into()),
+        paused: true,
+        ..request(AddSource::Metainfo(metainfo))
+    };
+    let ruled = rig
+        .service
+        .add(in_tv(announcing(
+            &plain("ruled", 1),
+            "http://tracker.test/announce",
+        )))
+        .await
+        .unwrap();
+    let unruled = rig.service.add(in_tv(plain("unruled", 2))).await.unwrap();
+    let route = async |job_id| rig.service.torrent(job_id).await.unwrap().route;
+
+    assert_eq!(
+        route(ruled).await,
+        Some(key(TorrentScope::TrackerRule(rule.id)))
+    );
+    assert_eq!(route(unruled).await, Some(key(TorrentScope::Category(1))));
+
+    rig.db
+        .update_tracker_rule(
+            &TrackerRule {
+                torrent_route: false,
+                ..rule
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    rig.service.tick().await;
+    assert_eq!(route(ruled).await, Some(key(TorrentScope::Category(1))));
+    rig.service.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

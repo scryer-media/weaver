@@ -67,14 +67,14 @@ test("a ladder that repeats a proxy, or a leg on a disabled egress, cannot be sa
   assert.equal(routeProblem(direct,{egresses:egress(true)}),null);
 });
 
-test("a torrent route takes exactly one leg and no pool",()=>{
+test("a torrent route takes several legs but no pool",()=>{
   const pools=[{id:5,name:"pool",kind:"SOCKS5" as const,memberIds:[1,2],enabled:true}];
   const one={failover:"HOLD" as const,legs:[directLeg()]};
   const two={failover:"HOLD" as const,legs:[{...directLeg(),weight:50},{...directLeg(),weight:50}]};
   const viaPool={failover:"HOLD" as const,legs:[{egressId:0,weight:100,path:{kind:"LADDER" as const,directFallback:false,rungs:[{kind:"POOL" as const,proxyId:null,poolId:5,chainIds:[]}]}}]};
-  for(const kind of ["TORRENT_DEFAULT","TORRENT_CATEGORY"] as const){
+  for(const kind of ["TORRENT_DEFAULT","TORRENT_CATEGORY","TORRENT_TRACKER"] as const){
     assert.equal(routeProblem(one,{kind}),null);
-    assert.equal(routeProblem(two,{kind}),"torrentLegs");
+    assert.equal(routeProblem(two,{kind}),null);
     assert.equal(routeProblem(viaPool,{pools,kind}),"torrentPool");
   }
   assert.equal(routeProblem(two,{kind:"SERVER"}),null);

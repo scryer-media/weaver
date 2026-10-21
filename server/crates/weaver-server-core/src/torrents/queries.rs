@@ -70,21 +70,31 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
     })
 }
 
-fn infohash_filter(infohash: Infohash) -> (&'static str, SqlArg) {
-    match infohash {
-        Infohash::V1(hash) => ("infohash_v1 = {}", SqlArg::Bytes(hash.to_vec())),
-        Infohash::V2(hash) => ("infohash_v2 = {}", SqlArg::Bytes(hash.to_vec())),
-    }
+// The torrents going by any of `infohashes`; it matches none when empty.
+fn infohash_filter(infohashes: &[Infohash]) -> (String, Vec<SqlArg>) {
+    let (columns, args): (Vec<_>, Vec<_>) = infohashes
+        .iter()
+        .map(|infohash| match infohash {
+            Infohash::V1(hash) => ("infohash_v1 = {}", SqlArg::Bytes(hash.to_vec())),
+            Infohash::V2(hash) => ("infohash_v2 = {}", SqlArg::Bytes(hash.to_vec())),
+        })
+        .unzip();
+    let filter = if columns.is_empty() {
+        "1 = 0".to_owned()
+    } else {
+        columns.join(" OR ")
+    };
+    (filter, args)
 }
 
 pub(crate) async fn torrent_by_infohash_tx(
     tx: &mut SqlTx<'_>,
-    infohash: Infohash,
+    infohashes: &[Infohash],
 ) -> Result<Option<TorrentRecord>, StateError> {
-    let (filter, arg) = infohash_filter(infohash);
+    let (filter, args) = infohash_filter(infohashes);
     tx.fetch_optional(
         &format!("SELECT {TORRENT_COLUMNS} FROM torrents WHERE {filter}"),
-        &[arg],
+        &args,
     )
     .await?
     .as_ref()
@@ -108,17 +118,18 @@ impl Database {
         })
     }
 
+    // The torrent going by any of `infohashes`.
     pub fn get_torrent_by_infohash(
         &self,
-        infohash: Infohash,
+        infohashes: &[Infohash],
     ) -> Result<Option<TorrentRecord>, StateError> {
         let datastore = self.datastore();
-        let (filter, arg) = infohash_filter(infohash);
+        let (filter, args) = infohash_filter(infohashes);
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 &format!("SELECT {TORRENT_COLUMNS} FROM torrents WHERE {filter}"),
-                &[arg],
+                &args,
             )
             .await?
             .as_ref()
