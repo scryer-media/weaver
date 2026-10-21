@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-use rand::{RngExt, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tokio::time::Instant;
 
 use crate::buffers::ByteBuf;
@@ -30,7 +30,7 @@ use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
 use crate::peer_protocol::Piece;
 
 use crate::{
-    chunk_tracker::{ChunkMarkingResult, ChunkTracker},
+    chunk_tracker::{ChunkMarkingResult, ChunkTracker, Moved},
     file_info::FileInfo,
     piece_priority::PiecePriority,
     type_aliases::{FileInfos, PeerHandle},
@@ -156,6 +156,10 @@ where
     pub peer_has_piece: P,
     /// How many connected peers have the given piece.
     pub availability: A,
+    /// The pieces whose count of peers moved since the last pick: the
+    /// picker reads their counts through `availability` and moves them in
+    /// its order before it picks.
+    pub moved: Moved,
     /// How many peers are connected.
     pub num_peers: usize,
     /// How many chunk requests the peer has outstanding.
@@ -199,7 +203,8 @@ impl PieceTracker {
         Self::with_rng(chunks, rand::make_rng())
     }
 
-    fn with_rng(chunks: ChunkTracker, rng: StdRng) -> Self {
+    fn with_rng(mut chunks: ChunkTracker, mut rng: StdRng) -> Self {
+        chunks.start_picking(StdRng::from_rng(&mut rng));
         Self {
             chunks,
             inflight: HashMap::new(),
@@ -269,6 +274,9 @@ impl PieceTracker {
         S: Fn(ValidPieceIndex) -> bool,
         F: FnOnce(ValidPieceIndex) -> bool,
     {
+        self.chunks
+            .catch_up(std::mem::take(&mut req.moved), &req.availability);
+
         // A peer on parole takes no piece another peer is downloading.
         let may_steal = !req.options.on_parole;
 
@@ -368,7 +376,8 @@ impl PieceTracker {
     }
 
     /// The queued piece to hand the peer `req` asks for, after libtorrent
-    /// `piece_picker::pick_pieces`:
+    /// `piece_picker::pick_pieces`. It walks the pick order the chunk tracker
+    /// keeps, and the started pieces, only as far as the piece it hands out:
     ///
     /// - Only the highest priority level with a piece the peer may take.
     /// - Started pieces first while they are many: more than one and a half
@@ -376,10 +385,12 @@ impl PieceTracker {
     ///   while we have fewer than [`INITIAL_PICKER_THRESHOLD`] pieces. The
     ///   rarest goes first, then the one most received.
     /// - Then the peer's latest suggestion it may take.
-    /// - Then, once we have [`INITIAL_PICKER_THRESHOLD`] pieces, the rarest
-    ///   piece, a started one before an unstarted one as rare, and a random
-    ///   one among those equal. A snubbed peer takes the commonest instead.
-    /// - Before that, the first free piece from a random place.
+    /// - Then, once we have [`INITIAL_PICKER_THRESHOLD`] pieces, the first
+    ///   piece of the order it may take: the rarest, a started one before an
+    ///   unstarted one as rare, a random one among those equal. A snubbed
+    ///   peer walks the order from its end, and takes the commonest.
+    /// - Before that, the first piece it may take from a random place in
+    ///   the order.
     fn pick<I, P, A, S>(&mut self, req: &AcquireRequest<'_, I, P, A, S>) -> Option<ValidPieceIndex>
     where
         I: Iterator<Item = ValidPieceIndex>,
@@ -394,24 +405,32 @@ impl PieceTracker {
             ..
         } = self;
         let chunks = &*chunks;
-        let started = |p: ValidPieceIndex| chunks.received_chunks(p) > 0;
-        let level = PiecePriority::WANTED_DESCENDING
-            .into_iter()
-            .filter(|level| chunks.any_at(*level))
-            .find(|level| {
-                chunks.iter_queued_pieces().any(|p| {
-                    chunks.priority(p) == *level
-                        && may_hand(chunks, &req.peer_has_piece, req.options, p)
-                })
-            })?;
-        let candidates = || {
-            chunks.iter_queued_pieces().filter(move |p| {
-                chunks.priority(*p) == level
-                    && may_hand(chunks, &req.peer_has_piece, req.options, *p)
-            })
-        };
-
+        let may = |p: &ValidPieceIndex| may_hand(chunks, &req.peer_has_piece, req.options, *p);
         let rarest_first = chunks.have_count() >= INITIAL_PICKER_THRESHOLD;
+        // The first piece of a level's order the peer may take, the order
+        // read the way this pick reads it: from a random place before we
+        // have INITIAL_PICKER_THRESHOLD pieces, from its end for a snubbed
+        // peer, from its front otherwise.
+        let mut walk = |order: &[ValidPieceIndex]| {
+            let start = if rarest_first || order.is_empty() {
+                0
+            } else {
+                rng.random_range(0..order.len())
+            };
+            let (head, tail) = order.split_at(start);
+            let mut walked = tail.iter().chain(head).copied();
+            if rarest_first && req.options.reverse {
+                walked.rfind(|p| may(p))
+            } else {
+                walked.find(|p| may(p))
+            }
+        };
+        // The highest level with a piece the peer may take, and the piece
+        // the walk of its order stops at.
+        let (level, walked) = PiecePriority::WANTED_DESCENDING
+            .into_iter()
+            .find_map(|level| Some((level, walk(chunks.pick_order(level))?)))?;
+
         let partials = inflight.len() + chunks.started_count();
         let chunks_per_piece = chunks.get_lengths().default_chunks_per_piece() as usize;
         let prioritize_partials = !rarest_first
@@ -419,13 +438,12 @@ impl PieceTracker {
             || partials * chunks_per_piece > MAX_PARTIAL_CHUNKS;
 
         if prioritize_partials {
-            let mut started_pieces = chunks.started_pieces().filter(|p| {
-                chunks.priority(*p) == level
-                    && may_hand(chunks, &req.peer_has_piece, req.options, *p)
-            });
+            let mut started_pieces = chunks
+                .started_pieces()
+                .filter(|p| chunks.priority(*p) == level && may(p));
             let partial = if rarest_first {
                 started_pieces
-                    .min_by_key(|p| ((req.availability)(*p), Reverse(chunks.received_chunks(*p))))
+                    .min_by_key(|p| (chunks.peers_with(*p), Reverse(chunks.received_chunks(*p))))
             } else {
                 started_pieces.next()
             };
@@ -434,49 +452,11 @@ impl PieceTracker {
             }
         }
 
-        let suggested = req.options.suggested;
-        if !suggested.is_empty() {
-            let latest = candidates()
-                .filter_map(|p| Some((suggested.iter().position(|s| *s == p)?, p)))
-                .min_by_key(|(at, _)| *at);
-            if let Some((_, piece)) = latest {
-                return Some(piece);
-            }
-        }
-
-        if !rarest_first {
-            let total = chunks.get_lengths().total_pieces();
-            let start = rng.random_range(0..total);
-            return candidates().min_by_key(|p| (p.get() + total - start) % total);
-        }
-
-        // One pass, keeping a random one of the pieces with the best key:
-        // the k-th equal replaces the kept one with chance 1/k.
-        let key = |p: ValidPieceIndex| {
-            let (availability, open) = ((req.availability)(p), !started(p));
-            if req.options.reverse {
-                (u32::MAX - availability, !open)
-            } else {
-                (availability, open)
-            }
-        };
-        let mut best = None;
-        let mut ties = 0u32;
-        for piece in candidates() {
-            let k = key(piece);
-            match best {
-                Some((best_key, _)) if k > best_key => continue,
-                Some((best_key, _)) if k == best_key => {
-                    ties += 1;
-                    if rng.random_range(0..ties) != 0 {
-                        continue;
-                    }
-                }
-                _ => ties = 1,
-            }
-            best = Some((k, piece));
-        }
-        best.map(|(_, piece)| piece)
+        let suggested = req.options.suggested.iter().copied();
+        suggested
+            .filter(|p| chunks.picks_at(*p, level))
+            .find(|p| may(p))
+            .or(Some(walked))
     }
 
     /// Reserve a piece: remove from queue, add to inflight.
@@ -782,6 +762,7 @@ mod tests {
     use crate::piece_priority::PiecePriority;
     use crate::{bitv::BitV as BitVTrait, type_aliases::BF};
     use rand::SeedableRng;
+    use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -869,9 +850,10 @@ mod tests {
     type Ask<'a, P, A> = AcquireRequest<'a, NoStream, P, A, fn(ValidPieceIndex) -> bool>;
 
     /// A request from `who`, which has the pieces `has` names, when the
-    /// pieces have the availability `availability` gives. Many peers are
-    /// connected, the peer has no request outstanding, and it has no average
-    /// piece time, so it steals nothing.
+    /// pieces have the availability `availability` gives, any count of
+    /// which may have moved since the last ask. Many peers are connected,
+    /// the peer has no request outstanding, and it has no average piece
+    /// time, so it steals nothing.
     fn ask<'a, P, A>(who: PeerHandle, has: P, availability: A) -> Ask<'a, P, A>
     where
         P: Fn(ValidPieceIndex) -> bool,
@@ -883,6 +865,10 @@ mod tests {
             priority_pieces: std::iter::empty(),
             peer_has_piece: has,
             availability,
+            moved: Moved {
+                pieces: Vec::new(),
+                all: true,
+            },
             num_peers: 100,
             outstanding_requests: 0,
             options: PickOptions::default(),
@@ -898,9 +884,10 @@ mod tests {
         1
     }
 
-    /// Availability from a table, one count per piece.
+    /// Availability from a table, one count per piece; no peer has a piece
+    /// past its end (the had pieces of [`rarest_first_tracker`]).
     fn table(counts: &[u32]) -> impl Fn(ValidPieceIndex) -> u32 + '_ {
-        |p| counts[p.get_usize()]
+        |p| counts.get(p.get_usize()).copied().unwrap_or(0)
     }
 
     fn reserved(result: AcquireResult) -> u32 {
@@ -1124,6 +1111,7 @@ mod tests {
             priority_pieces: stream.into_iter(),
             peer_has_piece: all,
             availability: |p| 10 - p.get(),
+            moved: Moved::default(),
             num_peers: 100,
             outstanding_requests: 0,
             options: PickOptions::default(),
@@ -1606,5 +1594,294 @@ mod tests {
         assert!(!tracker.may_request(index(&tracker, 0), gone));
         assert_eq!(tracker.block_arrived(&last, gone), Arrival::Discard);
         assert_eq!(doubled(&mut tracker, next), Some(last));
+    }
+
+    /// The pick order catches up with the counts `counts` gives, `moved`
+    /// naming those that moved since the last catch-up, and is checked
+    /// whole: every piece where its key puts it, and every count read.
+    fn catch_up(tracker: &mut PieceTracker, counts: &[Cell<u32>], moved: Moved) {
+        tracker
+            .chunks
+            .catch_up(moved, |p| counts[p.get_usize()].get());
+        tracker.chunks.check_index();
+        for (id, count) in counts.iter().enumerate() {
+            let piece = index(tracker, id as u32);
+            assert_eq!(tracker.chunks.peers_with(piece), count.get(), "piece {id}");
+        }
+    }
+
+    fn moved(pieces: &[u32]) -> Moved {
+        Moved {
+            pieces: pieces.to_vec(),
+            all: false,
+        }
+    }
+
+    /// The pick order of `level`, its buckets as sets: pieces in one
+    /// bucket are equals, in random order.
+    fn order(tracker: &PieceTracker, level: PiecePriority) -> Vec<BTreeSet<u32>> {
+        let chunks = &tracker.chunks;
+        let mut buckets: Vec<(u32, bool, BTreeSet<u32>)> = Vec::new();
+        for piece in chunks.pick_order(level) {
+            let key = (
+                chunks.peers_with(*piece),
+                chunks.received_chunks(*piece) == 0,
+            );
+            match buckets.last_mut() {
+                Some((peers, open, set)) if (*peers, *open) == key => {
+                    set.insert(piece.get());
+                }
+                _ => buckets.push((key.0, key.1, BTreeSet::from([piece.get()]))),
+            }
+        }
+        buckets.into_iter().map(|(_, _, set)| set).collect()
+    }
+
+    fn sets(buckets: &[&[u32]]) -> Vec<BTreeSet<u32>> {
+        buckets
+            .iter()
+            .map(|b| b.iter().copied().collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_pick_order_follows_every_move_of_a_piece_or_its_count() {
+        use PiecePriority::{High, Normal, Skip};
+        let mut tracker = rarest_first_tracker(8, 0);
+        // Piece i of the eight wanted is had by i + 1 peers; no peer has the
+        // four we have.
+        let counts: Vec<Cell<u32>> = (0..12)
+            .map(|i| Cell::new(if i < 8 { i + 1 } else { 0 }))
+            .collect();
+        let set = |piece: usize, count: u32| counts[piece].set(count);
+        let all = Moved {
+            pieces: Vec::new(),
+            all: true,
+        };
+        catch_up(&mut tracker, &counts, all);
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[0], &[1], &[2], &[3], &[4], &[5], &[6], &[7]])
+        );
+
+        // A count falls: the piece rises to its equals.
+        set(7, 1);
+        catch_up(&mut tracker, &counts, moved(&[7]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[0, 7], &[1], &[2], &[3], &[4], &[5], &[6]])
+        );
+        // A count rises past every other: the piece sinks to the end.
+        set(0, 10);
+        catch_up(&mut tracker, &counts, moved(&[0]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1], &[2], &[3], &[4], &[5], &[6], &[0]])
+        );
+        // The last peer with a piece goes: it leaves; a peer comes with it:
+        // it joins its equals.
+        set(3, 0);
+        catch_up(&mut tracker, &counts, moved(&[3]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1], &[2], &[4], &[5], &[6], &[0]])
+        );
+        set(3, 2);
+        set(4, 3);
+        catch_up(&mut tracker, &counts, moved(&[3, 4]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[2, 4], &[5], &[6], &[0]])
+        );
+        // A logged piece whose count is back where it was, and a had piece's
+        // count, move nothing.
+        set(9, 3);
+        catch_up(&mut tracker, &counts, moved(&[5, 9]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[2, 4], &[5], &[6], &[0]])
+        );
+
+        // A first block: the piece goes before the open ones as rare.
+        deliver(&mut tracker, 4, 0);
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[4], &[2], &[5], &[6], &[0]])
+        );
+
+        // A priority: the piece moves to its level's order, and back.
+        pri(&mut tracker, &[(6, High)]);
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(order(&tracker, High), sets(&[&[6]]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[4], &[2], &[5], &[0]])
+        );
+        pri(&mut tracker, &[(6, Normal)]);
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(order(&tracker, High), sets(&[]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[4], &[2], &[5], &[6], &[0]])
+        );
+
+        // Reserved: the piece leaves; its peer goes: it is requeued.
+        tracker.reserve_piece(index(&tracker, 7), peer(2));
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[1, 3], &[4], &[2], &[5], &[6], &[0]])
+        );
+        tracker.release_pieces_owned_by(peer(2));
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[4], &[2], &[5], &[6], &[0]])
+        );
+        // A piece that fails its check is back, open again.
+        tracker.reserve_piece(index(&tracker, 4), peer(2));
+        tracker.take_inflight(index(&tracker, 4));
+        tracker.mark_piece_hash_failed(index(&tracker, 4));
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[2, 4], &[5], &[6], &[0]])
+        );
+        // A piece had is gone.
+        tracker.reserve_piece(index(&tracker, 2), peer(2));
+        tracker.take_inflight(index(&tracker, 2));
+        tracker.mark_piece_hash_ok(index(&tracker, 2));
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[4], &[5], &[6], &[0]])
+        );
+
+        // Skipped: the order is laid out anew without it, and with it again.
+        pri(&mut tracker, &[(1, Skip)]);
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[3], &[4], &[5], &[6], &[0]])
+        );
+        pri(&mut tracker, &[(1, Normal)]);
+        catch_up(&mut tracker, &counts, moved(&[]));
+        assert_eq!(
+            order(&tracker, Normal),
+            sets(&[&[7], &[1, 3], &[4], &[5], &[6], &[0]])
+        );
+
+        // Every count moved: every piece is read again.
+        for count in &counts {
+            count.set(1);
+        }
+        let all = Moved {
+            pieces: Vec::new(),
+            all: true,
+        };
+        catch_up(&mut tracker, &counts, all);
+        assert_eq!(order(&tracker, Normal), sets(&[&[0, 1, 3, 4, 5, 6, 7]]));
+    }
+
+    #[test]
+    fn the_pick_order_holds_through_any_run_of_moves() {
+        use PiecePriority::{Critical, High, Low, Normal, Skip};
+        const WANTED: u32 = 48;
+        let mut tracker = rarest_first_tracker(WANTED, 1);
+        let mut rng = StdRng::seed_from_u64(7);
+        let counts: Vec<Cell<u32>> = (0..WANTED + INITIAL_PICKER_THRESHOLD as u32)
+            .map(|_| Cell::new(0))
+            .collect();
+        let all = Moved {
+            pieces: Vec::new(),
+            all: true,
+        };
+        catch_up(&mut tracker, &counts, all);
+        for _ in 0..4000 {
+            let piece = rng.random_range(0..WANTED);
+            let who = peer(rng.random_range(1..4));
+            let mut logged = Vec::new();
+            match rng.random_range(0..16) {
+                0..6 => {
+                    counts[piece as usize].set(rng.random_range(0..8));
+                    logged.push(piece);
+                }
+                6 if !tracker.chunks.is_piece_have(index(&tracker, piece)) => {
+                    deliver(&mut tracker, piece, rng.random_range(0..3));
+                }
+                7..9 => {
+                    let level = [Low, Normal, High, Critical][rng.random_range(0..4)];
+                    pri(&mut tracker, &[(piece, level)]);
+                }
+                9 => pri(&mut tracker, &[(piece, Skip)]),
+                10..12 => {
+                    let queued: Vec<_> = tracker.chunks.iter_queued_pieces().collect();
+                    if !queued.is_empty() {
+                        let piece = queued[rng.random_range(0..queued.len())];
+                        tracker.reserve_piece(piece, who);
+                    }
+                }
+                12 => {
+                    tracker.release_pieces_owned_by(who);
+                }
+                13..16 => {
+                    let mut inflight: Vec<_> = tracker.inflight.keys().copied().collect();
+                    inflight.sort_unstable_by_key(|p| p.get());
+                    if !inflight.is_empty() {
+                        let piece = inflight[rng.random_range(0..inflight.len())];
+                        tracker.take_inflight(piece);
+                        if rng.random_bool(0.5) {
+                            tracker.mark_piece_hash_ok(piece);
+                        } else {
+                            tracker.mark_piece_hash_failed(piece);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            catch_up(&mut tracker, &counts, moved(&logged));
+        }
+    }
+
+    #[test]
+    fn a_pick_walks_the_order_only_to_the_piece_it_hands_out() {
+        let mut tracker = rarest_first_tracker(1000, 0);
+        // The rarer the lower: the order is the pieces in index order.
+        let (asked, read) = (Cell::new(0), Cell::new(0));
+        let rarer_first = |p: ValidPieceIndex| {
+            read.set(read.get() + 1);
+            p.get() + 1
+        };
+        // The piece handed to a peer with the pieces `has` names, how many
+        // pieces the pick asked whether the peer has, and how many counts it
+        // read, after the counts of `logged` moved.
+        let mut pick = |has: &dyn Fn(u32) -> bool, reverse: bool, logged: &[u32]| {
+            asked.set(0);
+            read.set(0);
+            let mut req = ask(
+                peer(1),
+                |p: ValidPieceIndex| {
+                    asked.set(asked.get() + 1);
+                    has(p.get())
+                },
+                &rarer_first,
+            );
+            req.moved = moved(logged);
+            req.options.reverse = reverse;
+            let piece = reserved(tracker.acquire_piece(req));
+            (piece, asked.get(), read.get())
+        };
+
+        // The first pick reads every count once, to lay the order out.
+        assert_eq!(pick(&|_| true, false, &[]), (0, 1, 1004));
+        // Then a peer with every piece: the first piece of the order.
+        assert_eq!(pick(&|_| true, false, &[]), (1, 1, 0));
+        // A peer with one piece: the walk passes the 698 pieces before it.
+        assert_eq!(pick(&|p| p == 700, false, &[]), (700, 699, 0));
+        // A snubbed peer walks from the end: the 99 pieces after its one.
+        assert_eq!(pick(&|p| p == 900, true, &[]), (900, 100, 0));
+        // Counts that moved are read, and only they.
+        assert_eq!(pick(&|_| true, false, &[5, 6, 2]), (2, 1, 3));
     }
 }

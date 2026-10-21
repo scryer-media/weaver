@@ -3591,6 +3591,53 @@ async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
     );
 }
 
+// libtorrent `piece_picker::inc_refcount` and `dec_refcount`: a HAVE and a
+// peer leaving move the piece in the pick order before the next pick.
+#[tokio::test]
+async fn a_have_and_a_peer_leaving_move_a_piece_in_the_pick_order() {
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        ..Default::default()
+    };
+    // Eight pieces, the first four had: the rarest goes first.
+    let h = Harness::build_added(
+        "have_and_leaving_move_pieces",
+        8,
+        0xf0,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    let (a, _a_rx) = h.peer("127.0.0.1:6881");
+    let (g, _g_rx) = h.peer("127.0.0.2:6881");
+    let (k, _k_rx) = h.peer("127.0.0.3:6881");
+    let _b = h.peer_with("127.0.0.4:6881", &[5, 6, 7]).await;
+    let _c = h.peer_with("127.0.0.5:6881", &[6, 7]).await;
+    let (d, _d_rx) = h.peer_with("127.0.0.6:6881", &[7]).await;
+    let (j, _j_rx) = h.peer_with("127.0.0.7:6881", &[7]).await;
+    for peer in [&a, &g, &k] {
+        peer.on_i_am_unchoked();
+    }
+    let pick = |peer: &PeerHandler| peer.acquire_next_piece().unwrap().map(|p| p.get());
+
+    // Three peers have piece 4, four 5, five 6, seven 7.
+    assert_eq!(pick(&a), Some(4));
+
+    // Two HAVEs of 5: six peers have it, one more than 6.
+    let mut later = Vec::new();
+    for addr in ["127.0.0.8:6881", "127.0.0.9:6881"] {
+        let (peer, rx) = h.peer_with(addr, &[]).await;
+        (&peer).on_received_message(Message::Have(5)).await.unwrap();
+        later.push((peer, rx));
+    }
+    assert_eq!(pick(&g), Some(6));
+
+    // Two of the seven with 7 go: five have it, one fewer than 5.
+    d.on_peer_died(None).unwrap();
+    j.on_peer_died(None).unwrap();
+    assert_eq!(pick(&k), Some(7));
+}
+
 // wait_until_completed takes its wait before it checks: a finish rung
 // between the check and the await wakes it, where a wait taken after the
 // ring sleeps on (tokio `Notify::notify_waiters` wakes only the waits taken
