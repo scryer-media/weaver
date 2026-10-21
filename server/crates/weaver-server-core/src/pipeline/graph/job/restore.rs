@@ -86,6 +86,7 @@ impl GraphJob {
             storage.free_disk,
         )
         .capped(storage.caps);
+        writer.restore_members(&tree);
         let mut unusable = Vec::new();
         for ((node, member), state) in &snapshot.files {
             if tree

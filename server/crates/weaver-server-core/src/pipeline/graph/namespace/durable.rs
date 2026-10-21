@@ -53,6 +53,12 @@ impl NamespaceWriter {
         Ok(())
     }
 
+    // The restored tree's members, counted and charged against the job's
+    // budget as the tree holds them.
+    pub(crate) fn restore_members(&mut self, tree: &Tree) {
+        self.caps.restore_members(tree);
+    }
+
     // The members carrying recovery data no object here reads, in the order
     // the job found them, and the member reads its repairs made.
     pub(crate) fn restore_recovery_facts(

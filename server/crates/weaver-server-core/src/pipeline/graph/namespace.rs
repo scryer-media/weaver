@@ -253,7 +253,7 @@ impl NamespaceWriter {
             .ok_or(WriteError::UnknownMember { node, member })?;
         let (output_name, length) = (record.output_name.clone(), record.length);
         self.caps.admit_name(&output_name)?;
-        self.caps.admit_entry(tree, node)?;
+        self.caps.admit_member(tree, node, member)?;
         if Leaf::is_directory(&output_name) {
             self.settle(tree, builder, segments, node, member, out)?;
             Leaf::at(&self.working_dir, &output_name)?.create_directory()?;
@@ -392,7 +392,7 @@ impl NamespaceWriter {
         if let Some(leaf) = files.leaves.remove(&copy) {
             leaf.remove()?;
         }
-        self.caps.forget(node, copy);
+        self.caps.forget(tree, node, copy);
         Ok(())
     }
 
@@ -630,6 +630,16 @@ impl NamespaceWriter {
         effect: Effect,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        // Every delivery the tree takes for a member ends in a write or a
+        // reach, after the namespace kept what it keeps of the bytes: the
+        // member's front and the runs of what arrived. A rename changes the
+        // names its record keeps. Here what changed is charged.
+        if let Effect::WriteLeaf { node, member, .. }
+        | Effect::Reached { node, member, .. }
+        | Effect::Renamed { node, member, .. } = &effect
+        {
+            self.caps.admit_member(tree, *node, *member)?;
+        }
         match &effect {
             Effect::WriteLeaf {
                 node,
@@ -724,7 +734,7 @@ impl NamespaceWriter {
                 volume,
             } => self.given_back(tree, (*node, *member), (*from, *volume))?,
             Effect::Retracted { node, member } => {
-                self.retract(*node, *member)?;
+                self.retract(tree, *node, *member)?;
                 self.prune(tree)?;
             }
             Effect::RecoveryAt {
@@ -1117,7 +1127,7 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    fn retract(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
+    fn retract(&mut self, tree: &Tree, node: NodeId, member: MemberId) -> Result<(), WriteError> {
         self.take_held(node, member, ALL)?;
         if let Some(leaf) = self
             .files
@@ -1126,14 +1136,16 @@ impl NamespaceWriter {
         {
             leaf.truncate()?;
         }
-        self.caps.forget(node, member);
+        self.caps.forget(tree, node, member);
         Ok(())
     }
 
     // Forget what the tree dropped: the envelopes of every node nothing
     // reads back through, and the file of every member no namespace holds,
-    // with the namespace's own files once the namespace is gone too.
+    // with the namespace's own files once the namespace is gone too. A
+    // namespace retired or gone holds no entries and keeps nothing resident.
     fn prune(&mut self, tree: &Tree) -> Result<(), WriteError> {
+        self.caps.release_gone(tree);
         let nodes: Vec<NodeId> = self.files.keys().copied().collect();
         for node in nodes {
             if tree.buried(node) {
@@ -1143,7 +1155,7 @@ impl NamespaceWriter {
                 // Dropping the namespace's holds gives their count back.
                 if let Some(files) = self.files.remove(&node) {
                     for member in files.leaves.keys() {
-                        self.caps.forget(node, *member);
+                        self.caps.forget(tree, node, *member);
                     }
                     for leaf in files.leaves.into_values().chain(files.scratch) {
                         leaf.remove()?;
@@ -1166,7 +1178,7 @@ impl NamespaceWriter {
                 if let Some(leaf) = files.leaves.remove(&member) {
                     leaf.remove()?;
                 }
-                self.caps.forget(node, member);
+                self.caps.forget(tree, node, member);
             }
         }
         Ok(())

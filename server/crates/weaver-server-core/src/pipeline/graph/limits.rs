@@ -57,7 +57,9 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //   job bytes, ratio   bytes objects produced, against the job byte cap or
 //                      the ratio over the bytes posted for the objects
 //   member bytes       one member's extent
-//   entries            members announced below the root
+//   entries            members of the live namespaces objects produced
+//   resident           what those namespaces keep in memory for their
+//                      members, against the memory limit
 //   deadline           the job's wall clock since its budget was built
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take
@@ -73,7 +75,20 @@ pub(crate) struct Caps {
     // How far each member an object produced is written.
     extents: BTreeMap<(NodeId, MemberId), u64>,
     written: u64,
+    // Each live namespace an object produced, as last charged; with the
+    // members they hold and the bytes they keep resident, all together.
+    accounts: BTreeMap<NodeId, Account>,
+    entries: u64,
+    resident: u64,
     refusal: Option<ExtractionFailure>,
+}
+
+// One namespace's charge: how many members it held, and what it kept
+// resident for each record it was charged for.
+#[derive(Default)]
+struct Account {
+    members: u64,
+    resident: BTreeMap<MemberId, u64>,
 }
 
 impl Caps {
@@ -90,6 +105,9 @@ impl Caps {
             debits: CapacityDebits::default(),
             extents: BTreeMap::new(),
             written: 0,
+            accounts: BTreeMap::new(),
+            entries: 0,
+            resident: 0,
             refusal: None,
         }
     }
@@ -151,32 +169,77 @@ impl Caps {
         }
     }
 
-    // A namespace announced a member. Every member an object's namespace
-    // holds is an entry; the posts are not.
-    pub(crate) fn admit_entry(
+    // A namespace announced a member, or bytes of one reached it: the
+    // member is charged again as it stands. Every member an object's
+    // namespace holds is an entry, and what the namespace keeps of it is
+    // resident; the posts are neither.
+    pub(crate) fn admit_member(
         &mut self,
         tree: &Tree,
         node: NodeId,
+        member: MemberId,
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
-        if !produced(tree, node) {
-            return Ok(());
-        }
-        let entries: u64 = tree
-            .live()
-            .into_iter()
-            .filter(|node| produced(tree, *node))
-            .filter_map(|node| tree.namespace(node))
-            .map(|namespace| namespace.len() as u64)
-            .sum();
-        if entries > self.limits.max_entries {
+        self.charge(tree, node, member);
+        if self.entries > self.limits.max_entries {
             let detail = format!(
-                "archive contains {entries} entries, limit is {}",
-                self.limits.max_entries
+                "archive contains {} entries, limit is {}",
+                self.entries, self.limits.max_entries
             );
             return Err(self.breach(ExtractionRejectionReason::Entries, detail));
         }
+        if self.resident > self.limits.max_memory_bytes {
+            let detail = format!(
+                "members hold {} bytes resident, limit is {}",
+                self.resident, self.limits.max_memory_bytes
+            );
+            return Err(self.breach(ExtractionRejectionReason::Memory, detail));
+        }
         Ok(())
+    }
+
+    // The member's namespace as it stands now: its count of members and
+    // what it keeps for the member replace what they were charged at. A
+    // namespace that is no longer live is charged nothing.
+    fn charge(&mut self, tree: &Tree, node: NodeId, member: MemberId) {
+        if !produced(tree, node) {
+            return;
+        }
+        let Some(namespace) = tree.namespace(node).filter(|_| tree.is_live(node)) else {
+            self.release(node);
+            return;
+        };
+        let account = self.accounts.entry(node).or_default();
+        let members = namespace.len() as u64;
+        self.entries = self.entries + members - account.members;
+        account.members = members;
+        let resident = namespace.resident(member);
+        let was = match resident {
+            0 => account.resident.remove(&member),
+            _ => account.resident.insert(member, resident),
+        };
+        self.resident = self.resident + resident - was.unwrap_or(0);
+    }
+
+    fn release(&mut self, node: NodeId) {
+        if let Some(account) = self.accounts.remove(&node) {
+            self.entries -= account.members;
+            self.resident -= account.resident.values().sum::<u64>();
+        }
+    }
+
+    // The tree retired or dropped namespaces: they hold no entries and keep
+    // nothing resident any more.
+    pub(crate) fn release_gone(&mut self, tree: &Tree) {
+        let gone: Vec<NodeId> = self
+            .accounts
+            .keys()
+            .copied()
+            .filter(|node| !tree.is_live(*node))
+            .collect();
+        for node in gone {
+            self.release(node);
+        }
     }
 
     // Bytes up to `end` of a member of `node`, against the disk reading the
@@ -231,8 +294,15 @@ impl Caps {
         Ok(())
     }
 
-    // The member's file was emptied or removed: its bytes no longer count.
-    pub(crate) fn forget(&mut self, node: NodeId, member: MemberId) {
+    // The member's file was emptied or removed, and its record started
+    // over, folded or went: its bytes no longer count, and it is charged
+    // as it stands.
+    pub(crate) fn forget(&mut self, tree: &Tree, node: NodeId, member: MemberId) {
+        self.unwrite(node, member);
+        self.charge(tree, node, member);
+    }
+
+    fn unwrite(&mut self, node: NodeId, member: MemberId) {
         if let Some(extent) = self.extents.remove(&(node, member)) {
             self.written = self.written.saturating_sub(extent);
         }
@@ -249,10 +319,24 @@ impl Caps {
             .and_then(|namespace| namespace.get(member))
             .and_then(|record| record.coverage.runs().map(|run| run.range.end).max())
             .unwrap_or(0);
-        self.forget(node, member);
+        self.unwrite(node, member);
         if extent > 0 {
             self.extents.insert((node, member), extent);
             self.written = self.written.saturating_add(extent);
+        }
+    }
+
+    // The restored tree's members, each charged as the tree holds it: what
+    // a checkpoint brings back is counted from the tree, never stored.
+    pub(crate) fn restore_members(&mut self, tree: &Tree) {
+        for node in tree.live() {
+            let records: Vec<MemberId> = tree
+                .namespace(node)
+                .map(|namespace| namespace.records().map(|record| record.id).collect())
+                .unwrap_or_default();
+            for member in records {
+                self.charge(tree, node, member);
+            }
         }
     }
 

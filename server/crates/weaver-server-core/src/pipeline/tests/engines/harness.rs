@@ -472,6 +472,9 @@ pub(super) struct GraphView {
     // What the job's checkpoints asked the database to write, at the last
     // look.
     pub(super) checkpoints: crate::pipeline::graph::checkpoint::Tally,
+    // The most the live namespaces objects produced kept resident for their
+    // members at any look, summed from the tree.
+    pub(super) resident: u64,
 }
 
 #[derive(Debug)]
@@ -1126,6 +1129,18 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
         })
         .sum();
     view.outcomes = summary.iter().map(|set| set.outcome).collect();
+    let resident = tree
+        .live()
+        .into_iter()
+        .filter(|node| tree.volumes(*node).is_some())
+        .filter_map(|node| tree.namespace(node))
+        .flat_map(|namespace| {
+            namespace
+                .records()
+                .map(|record| namespace.resident(record.id))
+        })
+        .sum();
+    view.resident = view.resident.max(resident);
     *reads = job.writer().read_backs();
 }
 

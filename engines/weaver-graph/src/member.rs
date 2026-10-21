@@ -565,6 +565,25 @@ impl Namespace {
         &front.bytes[..usize::try_from(reached).unwrap_or(0).min(front.bytes.len())]
     }
 
+    // The bytes the namespace keeps in memory for the record `member`: the
+    // record with its names and the runs of what arrived, and its front with
+    // the runs of where that arrived. Zero for a record it does not hold.
+    pub fn resident(&self, member: MemberId) -> u64 {
+        let Some(record) = self.members.get(&member) else {
+            return 0;
+        };
+        let run = std::mem::size_of::<(u64, Run)>();
+        let mut bytes = std::mem::size_of::<Member>()
+            + record.name.len()
+            + record.output_name.len()
+            + record.coverage.runs.len() * run;
+        if let Some(front) = self.first_bytes.get(&member) {
+            bytes +=
+                std::mem::size_of::<Front>() + front.bytes.len() + front.arrived.runs.len() * run;
+        }
+        bytes as u64
+    }
+
     pub fn find_by_name(&self, name: &str) -> Option<&Member> {
         self.members().find(|member| member.name == name)
     }
@@ -682,6 +701,28 @@ mod tests {
             (record.name.as_str(), record.output_name.as_str()),
             ("other.srt", "3f9a.bin")
         );
+    }
+
+    #[test]
+    fn a_member_is_charged_its_record_and_the_front_kept_for_it() {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(2 * FIRST_BYTES as u64));
+        let run = std::mem::size_of::<(u64, Run)>() as u64;
+        let record = std::mem::size_of::<Member>() as u64 + 2 * "ember.bin".len() as u64;
+        assert_eq!(namespace.resident(member), record);
+        let bytes = vec![7u8; 2 * FIRST_BYTES];
+        namespace
+            .get_mut(member)
+            .unwrap()
+            .coverage
+            .write(ByteRange::new(0, bytes.len() as u64), Provenance::Fresh);
+        namespace.keep_first_bytes(member, 0, &bytes);
+        let front = std::mem::size_of::<Front>() as u64 + FIRST_BYTES as u64 + run;
+        assert_eq!(namespace.resident(member), record + run + front);
+        namespace.retract(member);
+        assert_eq!(namespace.resident(member), record);
+        namespace.remove(member);
+        assert_eq!(namespace.resident(member), 0);
     }
 
     #[test]

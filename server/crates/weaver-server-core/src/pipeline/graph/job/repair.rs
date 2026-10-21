@@ -47,12 +47,7 @@ impl GraphJob {
     // repairs bring into being is walked too.
     fn walk(&mut self, mut slots: Option<(&mut RepairSlots, usize)>) -> Result<(), GraphError> {
         let mut walked = None;
-        while let Some(node) = self
-            .tree
-            .live()
-            .into_iter()
-            .find(|node| walked.is_none_or(|last| *node > last))
-        {
+        while let Some(node) = self.tree.next_live(walked) {
             walked = Some(node);
             let runs = &self.runs;
             let mut lending = self

@@ -10,6 +10,7 @@
 // namespace with a recovery object that covers it takes over.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use bytes::Bytes;
 
@@ -639,6 +640,21 @@ impl Tree {
             .filter(|(_, found)| !found.retired)
             .map(|(node, _)| *node)
             .collect()
+    }
+
+    // The first live node after `after` in node order, or the first live
+    // node when `after` is none.
+    pub fn next_live(&self, after: Option<NodeId>) -> Option<NodeId> {
+        let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.nodes
+            .range((from, Bound::Unbounded))
+            .find(|(_, found)| !found.retired)
+            .map(|(node, _)| *node)
+    }
+
+    // Whether `node` is in the tree and not retired.
+    pub fn is_live(&self, node: NodeId) -> bool {
+        self.nodes.get(&node).is_some_and(|found| !found.retired)
     }
 
     // Every live node whose object has an engine face, in node order.
