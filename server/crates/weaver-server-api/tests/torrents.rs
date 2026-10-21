@@ -781,3 +781,51 @@ async fn a_torrents_rate_limits_are_set_and_read_back() {
         .await;
     assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"));
 }
+
+// A file's level and the torrent's two picking toggles are set by their
+// mutations and read back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_levels_and_picking_toggles_round_trip() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let read = |id: u64| {
+        format!(
+            "{{ torrent(id: {id}) {{ sequential firstLastPieceFirst files {{ selected priority }} }} }}"
+        )
+    };
+    let before = rig.execute(&read(id)).await.data.into_json().unwrap();
+    assert_eq!(before["torrent"]["files"][0]["priority"], "NORMAL");
+    assert_eq!(before["torrent"]["sequential"], false);
+    assert_eq!(before["torrent"]["firstLastPieceFirst"], false);
+
+    for mutation in [
+        format!(
+            "mutation {{ setTorrentFilePriorities(id: {id}, priorities: [{{ index: 0, priority: IGNORED }}]) }}"
+        ),
+        format!("mutation {{ setTorrentSequential(id: {id}, sequential: true) }}"),
+        format!(
+            "mutation {{ setTorrentFirstLastPieceFirst(id: {id}, firstLastPieceFirst: true) }}"
+        ),
+    ] {
+        let response = rig.execute(&mutation).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
+    let after = rig.execute(&read(id)).await.data.into_json().unwrap();
+    assert_eq!(after["torrent"]["files"][0]["priority"], "IGNORED");
+    assert_eq!(after["torrent"]["files"][0]["selected"], false);
+    assert_eq!(after["torrent"]["sequential"], true);
+    assert_eq!(after["torrent"]["firstLastPieceFirst"], true);
+
+    let out_of_range = rig
+        .execute(&format!(
+            "mutation {{ setTorrentFilePriorities(id: {id}, priorities: [{{ index: 1, priority: HIGH }}]) }}"
+        ))
+        .await;
+    assert_eq!(code(&out_of_range).as_deref(), Some("INVALID_INPUT"));
+}

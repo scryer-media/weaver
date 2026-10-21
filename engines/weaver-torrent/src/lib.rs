@@ -83,7 +83,7 @@ pub use listen::{ListenerMode, ListenerOptions};
 pub use mse::{Encryption, EncryptionPolicy, MseError};
 pub use network::{SocketFactory, StreamListener};
 pub use peer_connection::PeerConnectionOptions;
-pub use piece_priority::PiecePriority;
+pub use piece_priority::{FilePriority, PiecePriority};
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     SUPPORTED_SCHEMES, Session, SessionLimits, SessionOptions, SessionPersistenceConfig,

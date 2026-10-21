@@ -1043,3 +1043,20 @@ kind = "sql"
 file = "migrations/0082_torrent_rate_limits/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 83
+description = "a torrent keeps its file levels as one value and its sequential and first-and-last toggles; its file rows go"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0083_torrent_file_priority/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0083_torrent_file_priority/postgres.sql"
+engine = "postgres"
+scope = "all"

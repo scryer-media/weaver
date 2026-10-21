@@ -67,7 +67,10 @@ use crate::{
     merge_streams::merge_streams,
     network::SocketFactory,
     peer_connection::PeerConnectionOptions,
-    piece_priority::{PiecePriority, validate_piece_priorities},
+    piece_priority::{
+        FilePriority, PiecePriority, file_priorities, file_to_piece_priorities,
+        validate_piece_priorities, wanted_files,
+    },
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
     session_stats::SessionStats,
@@ -460,6 +463,42 @@ fn compute_only_files(
     }
 }
 
+// Each file's level at the start: those given, one a file; or Normal for the
+// files `only_files` names and Ignored for the rest; or every file Normal.
+// Padding is Ignored whatever is given.
+fn compute_file_priorities(
+    file_infos: &FileInfos,
+    given: Option<Vec<FilePriority>>,
+    only_files: Option<&[usize]>,
+) -> anyhow::Result<Vec<FilePriority>> {
+    let levels = match (given, only_files) {
+        (Some(_), Some(_)) => {
+            bail!("file_priorities and only_files are mutually exclusive");
+        }
+        (Some(given), None) => {
+            if given.len() != file_infos.len() {
+                bail!(
+                    "file_priorities has {} levels, but the torrent has {} files",
+                    given.len(),
+                    file_infos.len()
+                );
+            }
+            given
+        }
+        (None, Some(only_files)) => (0..file_infos.len())
+            .map(|index| {
+                if only_files.contains(&index) {
+                    FilePriority::Normal
+                } else {
+                    FilePriority::Ignored
+                }
+            })
+            .collect(),
+        (None, None) => vec![FilePriority::Normal; file_infos.len()],
+    };
+    Ok(file_priorities(file_infos, &levels))
+}
+
 fn merge_two_optional_streams<T>(
     s1: Option<impl Stream<Item = T> + Unpin + Send + 'static>,
     s2: Option<impl Stream<Item = T> + Unpin + Send + 'static>,
@@ -482,9 +521,22 @@ pub struct AddTorrentOptions {
     pub paused: bool,
     /// A regex to only download files matching it.
     pub only_files_regex: Option<String>,
-    /// An explicit list of file IDs to download.
-    /// To see the file indices, run with "list_only".
+    /// An explicit list of file IDs to download: they are Normal, every
+    /// other file Ignored. To see the file indices, run with "list_only".
     pub only_files: Option<Vec<usize>>,
+    /// Each file's level, one a file by index (qBittorrent's four; see
+    /// [`FilePriority`] and [`ManagedTorrent::set_file_priorities`]). None
+    /// is every file Normal. Exclusive with `only_files` and
+    /// `only_files_regex`; a list of the wrong length is refused.
+    pub file_priorities: Option<Vec<FilePriority>>,
+    /// Pick the top-level pieces first, then every other wanted piece by
+    /// index (see [`ManagedTorrent::set_sequential`]).
+    #[serde(default)]
+    pub sequential: bool,
+    /// Put the first and last pieces of each wanted file at the top level
+    /// (see [`ManagedTorrent::set_first_last_piece_first`]).
+    #[serde(default)]
+    pub first_last_piece_first: bool,
     /// Allow writing on top of existing files, including when resuming a torrent.
     /// You probably want to set it, however for safety it's not default.
     ///
@@ -549,9 +601,11 @@ pub struct AddTorrentOptions {
     #[serde(skip)]
     pub checkpoint: Option<Checkpoint>,
 
-    /// The initial fetch priority of the given pieces, by piece index; every
-    /// other piece is Normal. See [`PiecePriority`] and
-    /// [`ManagedTorrent::set_piece_priorities`]. An index out of range is refused.
+    /// The initial fetch priority of the given pieces, by piece index, over
+    /// what the files' levels give them (libtorrent applies
+    /// `add_torrent_params::piece_priorities` after the file priorities).
+    /// See [`PiecePriority`] and [`ManagedTorrent::set_piece_priorities`].
+    /// An index out of range is refused.
     pub piece_priorities: Option<Vec<(u32, PiecePriority)>>,
 
     /// How the torrent names itself to its peers and trackers. If not set,
@@ -584,6 +638,9 @@ impl Default for AddTorrentOptions {
             paused: false,
             only_files_regex: None,
             only_files: None,
+            file_priorities: None,
+            sequential: false,
+            first_last_piece_first: false,
             overwrite: false,
             list_only: false,
             output_folder: None,
@@ -611,7 +668,10 @@ impl Default for AddTorrentOptions {
 pub struct ListOnlyResponse {
     pub info_hash: Id20,
     pub info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
-    pub only_files: Option<Vec<usize>>,
+    /// Each file's level, as the options give it.
+    pub file_priorities: Vec<FilePriority>,
+    pub sequential: bool,
+    pub first_last_piece_first: bool,
     pub output_folder: PathBuf,
     pub seen_peers: Vec<SocketAddr>,
     pub torrent_bytes: Bytes,
@@ -1912,7 +1972,8 @@ impl Session {
                         }));
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
-                        if opts.only_files.is_none() {
+                        // the files
+                        if opts.only_files.is_none() && opts.file_priorities.is_none() {
                             opts.only_files = Some(so);
                         }
                     }
@@ -2124,17 +2185,26 @@ impl Session {
             .map(|checkpoint| normalize_checkpoint(checkpoint, metadata.info.lengths()))
             .transpose()?;
 
-        let piece_priorities = match opts.piece_priorities.take() {
-            Some(priorities) => {
-                let lengths = metadata.info.lengths();
-                let mut all = vec![PiecePriority::Normal; lengths.total_pieces() as usize];
-                for (index, priority) in validate_piece_priorities(lengths, &priorities)? {
-                    all[index.get_usize()] = priority;
-                }
-                Some(all)
-            }
-            None => None,
-        };
+        let file_priorities = compute_file_priorities(
+            &metadata.file_infos,
+            opts.file_priorities.take(),
+            only_files.as_deref(),
+        )?;
+        // The files' rule first, then the pieces set one by one over it
+        // (libtorrent `torrent::init`).
+        let lengths = metadata.info.lengths();
+        let mut piece_priorities = file_to_piece_priorities(
+            lengths,
+            &metadata.file_infos,
+            &file_priorities,
+            opts.first_last_piece_first,
+        );
+        for (index, priority) in
+            validate_piece_priorities(lengths, &opts.piece_priorities.take().unwrap_or_default())?
+        {
+            piece_priorities[index.get_usize()] = priority;
+        }
+        let only_files = Some(wanted_files(&file_priorities));
 
         let output_folder = match (opts.output_folder, opts.sub_folder) {
             (None, None) => self.output_folder.join(
@@ -2153,7 +2223,9 @@ impl Session {
                 info_hash,
                 torrent_bytes: metadata.torrent_bytes(),
                 info: metadata.info,
-                only_files,
+                file_priorities,
+                sequential: opts.sequential,
+                first_last_piece_first: opts.first_last_piece_first,
                 output_folder,
                 seen_peers,
             }));
@@ -2211,6 +2283,7 @@ impl Session {
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_v1_hashes: opts.disable_v1_hashes,
                     super_seeding: opts.super_seeding,
+                    sequential: opts.sequential.into(),
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
@@ -2224,19 +2297,20 @@ impl Session {
             let initializing = Arc::new(TorrentStateInitializing::new(
                 minfo.clone(),
                 metadata.clone(),
-                only_files.clone(),
+                only_files,
                 self.spawner
                     .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
                 false,
                 checkpoint,
-                piece_priorities.clone(),
+                Some(piece_priorities.clone()),
                 peer_list,
             ));
             let handle = Arc::new(ManagedTorrent {
                 locked: RwLock::new(ManagedTorrentLocked {
                     paused: opts.paused,
                     state: ManagedTorrentState::Initializing(initializing),
-                    only_files,
+                    files: file_priorities,
+                    first_last: opts.first_last_piece_first,
                     piece_priorities,
                     trackers: None,
                     auto_scrape: None,
@@ -2579,12 +2653,14 @@ impl Session {
         handle.start(peer_rx, paused)
     }
 
-    pub async fn update_only_files(
+    /// [`ManagedTorrent::set_file_priorities`], and the session's saved
+    /// state follows.
+    pub async fn set_file_priorities(
         self: &Arc<Self>,
         handle: &ManagedTorrentHandle,
-        only_files: &HashSet<usize>,
+        priorities: &[(usize, FilePriority)],
     ) -> anyhow::Result<()> {
-        handle.update_only_files(only_files)?;
+        handle.set_file_priorities(priorities)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
@@ -3518,6 +3594,103 @@ mod tests {
         session.stop().await;
     }
 
+    // The file levels, sequential and first-and-last given at add are the
+    // torrent's, and each change rewrites the pieces from the levels
+    // (libtorrent `torrent::prioritize_files`, qBittorrent
+    // `TorrentImpl::setFirstLastPiecePriority`).
+    #[tokio::test(start_paused = true)]
+    async fn file_levels_and_the_picking_toggles_are_set_at_add_and_changed_after() {
+        use crate::{FilePriority::*, PiecePriority};
+        const PIECE: usize = 16384;
+        let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
+            2,
+            PIECE,
+            Some("levels"),
+        );
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(PIECE as u32),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let both = AddTorrentOptions {
+            output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+            overwrite: true,
+            only_files: Some(vec![0]),
+            file_priorities: Some(vec![Normal, Normal]),
+            ..Default::default()
+        };
+        assert!(
+            session
+                .add_torrent(AddTorrent::from_bytes(torrent.clone()), Some(both))
+                .await
+                .is_err()
+        );
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    file_priorities: Some(vec![Ignored, High]),
+                    sequential: true,
+                    first_last_piece_first: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        let level = |file: usize| {
+            let start = handle
+                .with_metadata(|m| m.file_infos[file].piece_range.start)
+                .unwrap();
+            handle.piece_priority(start).unwrap()
+        };
+        assert_eq!(handle.file_priorities(), [Ignored, High]);
+        assert_eq!(handle.only_files(), Some(vec![1]));
+        assert!(handle.sequential());
+        assert!(handle.first_last_piece_first());
+        // A one-piece file is all head and tail.
+        assert_eq!(level(0), PiecePriority::Skip);
+        assert_eq!(level(1), PiecePriority::Critical);
+
+        handle.set_first_last_piece_first(false).unwrap();
+        assert_eq!(level(1), PiecePriority::High);
+        handle
+            .set_file_priorities(&[(0, Maximum), (1, Ignored)])
+            .unwrap();
+        assert_eq!(handle.file_priorities(), [Maximum, Ignored]);
+        assert_eq!(handle.only_files(), Some(vec![0]));
+        assert_eq!(level(0), PiecePriority::Critical);
+        assert_eq!(level(1), PiecePriority::Skip);
+        assert!(handle.set_file_priorities(&[(2, Normal)]).is_err());
+        handle.set_sequential(false);
+        assert!(!handle.sequential());
+        session.stop().await;
+    }
+
     #[tokio::test]
     async fn a_finished_selection_short_of_a_seed_announces_what_the_torrent_lacks() {
         // libtorrent torrent::bytes_left counts the whole torrent, and
@@ -3582,7 +3755,11 @@ mod tests {
                     .unwrap()
             })
             .unwrap();
-        handle.update_only_files(&HashSet::from([had])).unwrap();
+        let ignored: Vec<_> = (0..handle.file_priorities().len())
+            .filter(|file| *file != had)
+            .map(|file| (file, crate::FilePriority::Ignored))
+            .collect();
+        handle.set_file_priorities(&ignored).unwrap();
         assert!(handle.live().unwrap().finished_during_run());
 
         let (info, stats) = tracker_stats(&session, &handle);

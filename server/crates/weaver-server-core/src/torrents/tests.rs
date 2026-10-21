@@ -5,7 +5,7 @@ use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::settings::{SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
-    Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
+    FilePriority, Infohash, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
     TorrentSource, TrackerEntry,
 };
 
@@ -30,24 +30,9 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         metadata: Vec::new(),
         upload_limit: None,
         download_limit: None,
+        sequential: false,
+        first_last_piece_first: false,
     }
-}
-
-fn files() -> Vec<TorrentFile> {
-    vec![
-        TorrentFile {
-            index: 0,
-            path: "a/one.bin".to_string(),
-            length: 10,
-            selected: true,
-        },
-        TorrentFile {
-            index: 1,
-            path: "a/two.bin".to_string(),
-            length: 5_000_000_000,
-            selected: false,
-        },
-    ]
 }
 
 fn trackers() -> Vec<TrackerEntry> {
@@ -85,7 +70,7 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
     record.download_limit = Some(5_000_000_000);
 
     assert_eq!(
-        db.insert_torrent(&record, &files(), &trackers()).unwrap(),
+        db.insert_torrent(&record, &trackers()).unwrap(),
         TorrentInsert::Inserted
     );
 
@@ -100,7 +85,6 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
             .unwrap(),
         Some(record)
     );
-    assert_eq!(db.list_torrent_files(JobId(7)).unwrap(), files());
     assert_eq!(db.list_torrent_trackers(JobId(7)).unwrap(), trackers());
     assert_eq!(
         db.get_torrent_counters(JobId(7)).unwrap(),
@@ -115,7 +99,7 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
 #[test]
 fn rate_limits_update_in_place() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(3, Some([3; 20]), None), &[], &[])
+    db.insert_torrent(&torrent(3, Some([3; 20]), None), &[])
         .unwrap();
     let limits = |db: &Database| {
         let stored = db.get_torrent(JobId(3)).unwrap().unwrap();
@@ -148,7 +132,7 @@ fn rate_limits_update_in_place() {
 #[test]
 fn intent_and_counters_update_in_place() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(3, Some([3; 20]), None), &[], &[])
+    db.insert_torrent(&torrent(3, Some([3; 20]), None), &[])
         .unwrap();
 
     assert!(
@@ -183,33 +167,32 @@ fn intent_and_counters_update_in_place() {
 #[test]
 fn a_v1_infohash_admits_one_job() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(1, Some([9; 20]), None), &[], &[])
+    db.insert_torrent(&torrent(1, Some([9; 20]), None), &[])
         .unwrap();
 
     // The same v1 hash is the same torrent whatever v2 hash comes with it.
     assert_eq!(
-        db.insert_torrent(&torrent(2, Some([9; 20]), Some([5; 32])), &files(), &[])
+        db.insert_torrent(&torrent(2, Some([9; 20]), Some([5; 32])), &[])
             .unwrap(),
         TorrentInsert::Duplicate(JobId(1))
     );
     assert_eq!(db.get_torrent(JobId(2)).unwrap(), None);
-    assert!(db.list_torrent_files(JobId(2)).unwrap().is_empty());
 }
 
 #[test]
 fn a_v2_only_infohash_admits_one_job() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(1, None, Some([6; 32])), &[], &[])
+    db.insert_torrent(&torrent(1, None, Some([6; 32])), &[])
         .unwrap();
 
     assert_eq!(
-        db.insert_torrent(&torrent(2, None, Some([6; 32])), &[], &[])
+        db.insert_torrent(&torrent(2, None, Some([6; 32])), &[])
             .unwrap(),
         TorrentInsert::Duplicate(JobId(1))
     );
     // A different v2-only torrent is its own job.
     assert_eq!(
-        db.insert_torrent(&torrent(3, None, Some([7; 32])), &[], &[])
+        db.insert_torrent(&torrent(3, None, Some([7; 32])), &[])
             .unwrap(),
         TorrentInsert::Inserted
     );
@@ -218,20 +201,20 @@ fn a_v2_only_infohash_admits_one_job() {
 #[test]
 fn a_v2_hash_admits_one_job_whether_or_not_a_v1_hash_comes_with_it() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(1, Some([3; 20]), Some([3; 32])), &[], &[])
+    db.insert_torrent(&torrent(1, Some([3; 20]), Some([3; 32])), &[])
         .unwrap();
-    db.insert_torrent(&torrent(2, None, Some([8; 32])), &[], &[])
+    db.insert_torrent(&torrent(2, None, Some([8; 32])), &[])
         .unwrap();
 
     // A hybrid's v2 hash alone is the hybrid.
     assert_eq!(
-        db.insert_torrent(&torrent(3, None, Some([3; 32])), &[], &[])
+        db.insert_torrent(&torrent(3, None, Some([3; 32])), &[])
             .unwrap(),
         TorrentInsert::Duplicate(JobId(1))
     );
     // A v2-only torrent is the hybrid that shares its v2 hash.
     assert_eq!(
-        db.insert_torrent(&torrent(4, Some([8; 20]), Some([8; 32])), &[], &[])
+        db.insert_torrent(&torrent(4, Some([8; 20]), Some([8; 32])), &[])
             .unwrap(),
         TorrentInsert::Duplicate(JobId(2))
     );
@@ -240,7 +223,7 @@ fn a_v2_hash_admits_one_job_whether_or_not_a_v1_hash_comes_with_it() {
 #[test]
 fn a_hybrid_torrent_is_found_by_either_hash() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(1, Some([4; 20]), Some([4; 32])), &[], &[])
+    db.insert_torrent(&torrent(1, Some([4; 20]), Some([4; 32])), &[])
         .unwrap();
 
     assert_eq!(
@@ -250,16 +233,13 @@ fn a_hybrid_torrent_is_found_by_either_hash() {
         Some(JobId(1))
     );
     // A torrent with no hash at all is refused before it reaches the table.
-    assert!(
-        db.insert_torrent(&torrent(2, None, None), &[], &[])
-            .is_err()
-    );
+    assert!(db.insert_torrent(&torrent(2, None, None), &[]).is_err());
 }
 
 #[test]
 fn the_hosts_a_torrent_announces_to_outlive_it() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(5, Some([5; 20]), None), &files(), &trackers())
+    db.insert_torrent(&torrent(5, Some([5; 20]), None), &trackers())
         .unwrap();
     // A magnet's metainfo names its trackers again, spelled otherwise, and
     // more: each host is stored once, as a rule matches it.
@@ -285,7 +265,6 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             b"d4:infodee",
             true,
             "/data/t5",
-            &files(),
             &more
         )
         .unwrap()
@@ -307,19 +286,18 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
 #[test]
 fn deleting_a_torrent_removes_its_rows() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(5, Some([5; 20]), None), &files(), &trackers())
+    db.insert_torrent(&torrent(5, Some([5; 20]), None), &trackers())
         .unwrap();
 
     assert!(db.delete_torrent(JobId(5)).unwrap());
     assert_eq!(db.get_torrent(JobId(5)).unwrap(), None);
-    assert!(db.list_torrent_files(JobId(5)).unwrap().is_empty());
     assert!(db.list_torrent_trackers(JobId(5)).unwrap().is_empty());
     assert_eq!(db.get_torrent_counters(JobId(5)).unwrap(), None);
     assert!(!db.delete_torrent(JobId(5)).unwrap());
 
     // The hash is free again once the job is gone.
     assert_eq!(
-        db.insert_torrent(&torrent(6, Some([5; 20]), None), &[], &[])
+        db.insert_torrent(&torrent(6, Some([5; 20]), None), &[])
             .unwrap(),
         TorrentInsert::Inserted
     );
@@ -331,7 +309,7 @@ fn torrents_list_by_category_in_the_order_added() {
     for (job_id, category) in [(1, Some(2)), (2, None), (3, Some(2)), (4, Some(3))] {
         let mut record = torrent(job_id, Some([job_id as u8; 20]), None);
         record.category_id = category;
-        db.insert_torrent(&record, &[], &[]).unwrap();
+        db.insert_torrent(&record, &[]).unwrap();
     }
 
     let ids = |category| {
@@ -368,7 +346,7 @@ fn a_torrent_keeps_the_tracker_rule_it_matched_until_the_rule_goes() {
         .unwrap();
     let mut record = torrent(1, Some([1; 20]), None);
     record.tracker_rule_id = Some(rule.id);
-    db.insert_torrent(&record, &[], &trackers()).unwrap();
+    db.insert_torrent(&record, &trackers()).unwrap();
     assert_eq!(db.get_torrent(JobId(1)).unwrap(), Some(record.clone()));
 
     assert!(db.set_torrent_tracker_rule(JobId(1), None).unwrap());
@@ -397,7 +375,7 @@ fn a_torrents_peers_and_bans_round_trip() {
     use weaver_torrent::ResumePeers;
 
     let db = Database::open_in_memory().unwrap();
-    db.insert_torrent(&torrent(1, Some([1; 20]), None), &[], &[])
+    db.insert_torrent(&torrent(1, Some([1; 20]), None), &[])
         .unwrap();
     assert_eq!(db.torrent_peers(JobId(1)).unwrap(), ResumePeers::default());
 
@@ -420,4 +398,70 @@ fn a_torrents_peers_and_bans_round_trip() {
 
     assert!(!db.save_torrent_peers(JobId(2), &saved).unwrap());
     assert_eq!(db.torrent_peers(JobId(2)).unwrap(), ResumePeers::default());
+}
+
+#[test]
+fn file_levels_and_picking_toggles_are_stored() {
+    use FilePriority::*;
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(1, Some([1; 20]), None), &[])
+        .unwrap();
+    // Nothing set: every file is normal, and nothing is stored.
+    assert!(db.torrent_file_priorities(JobId(1)).unwrap().is_empty());
+
+    // The normal files at the end are left off.
+    assert!(
+        db.set_torrent_file_priorities(JobId(1), &[Maximum, Ignored, High, Normal, Normal])
+            .unwrap()
+    );
+    assert_eq!(
+        db.torrent_file_priorities(JobId(1)).unwrap(),
+        [Maximum, Ignored, High]
+    );
+    // Back to all normal is back to nothing stored.
+    assert!(
+        db.set_torrent_file_priorities(JobId(1), &[Normal, Normal])
+            .unwrap()
+    );
+    assert!(db.torrent_file_priorities(JobId(1)).unwrap().is_empty());
+    assert!(!db.set_torrent_file_priorities(JobId(2), &[High]).unwrap());
+
+    let record = db.get_torrent(JobId(1)).unwrap().unwrap();
+    assert!(!record.sequential && !record.first_last_piece_first);
+    // Each toggle is written alone, so setting one keeps the other.
+    assert!(db.set_torrent_sequential(JobId(1), true).unwrap());
+    assert!(
+        db.set_torrent_first_last_piece_first(JobId(1), true)
+            .unwrap()
+    );
+    let record = db.get_torrent(JobId(1)).unwrap().unwrap();
+    assert!(record.sequential && record.first_last_piece_first);
+    assert!(db.set_torrent_sequential(JobId(1), false).unwrap());
+    let record = db.get_torrent(JobId(1)).unwrap().unwrap();
+    assert!(!record.sequential && record.first_last_piece_first);
+    assert!(!db.set_torrent_sequential(JobId(2), true).unwrap());
+    assert!(
+        !db.set_torrent_first_last_piece_first(JobId(2), true)
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_stored_file_level_reads_back_as_the_level_it_was() {
+    use crate::torrents::model::{file_priorities_str, parse_file_priorities};
+    use FilePriority::*;
+    assert_eq!(file_priorities_str(&[]), None);
+    assert_eq!(file_priorities_str(&[Normal, Normal]), None);
+    assert_eq!(
+        file_priorities_str(&[Ignored, Normal, High, Maximum, Normal]).as_deref(),
+        Some("0167")
+    );
+    assert_eq!(
+        parse_file_priorities("0167"),
+        Some(vec![Ignored, Normal, High, Maximum])
+    );
+    // A number qBittorrent does not define is no level.
+    for value in ["2", "4", "x", "1-"] {
+        assert_eq!(parse_file_priorities(value), None, "{value}");
+    }
 }

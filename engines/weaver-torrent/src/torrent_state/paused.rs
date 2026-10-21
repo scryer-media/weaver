@@ -5,13 +5,13 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use crate::core::lengths::ValidPieceIndex;
 
 use crate::{
     chunk_tracker::{ChunkTracker, HaveNeededSelected},
-    piece_priority::PiecePriority,
+    piece_priority::{FilePriority, PiecePriority},
     type_aliases::FileStorage,
 };
 
@@ -30,10 +30,9 @@ pub struct TorrentStatePaused {
 }
 
 impl TorrentStatePaused {
-    pub(crate) fn update_only_files(&mut self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
+    pub(crate) fn prioritize(&mut self, files: &[FilePriority], pieces: &[PiecePriority]) {
         self.chunk_tracker
-            .update_only_files(&self.metadata.file_infos, only_files)?;
-        Ok(())
+            .prioritize(&self.metadata.file_infos, files, pieces);
     }
 
     pub(crate) fn set_piece_priorities(

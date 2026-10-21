@@ -424,6 +424,8 @@ fn view(state: TorrentState) -> TorrentView {
         unpack: true,
         route: None,
         files: Vec::new(),
+        sequential: false,
+        first_last_piece_first: false,
         file_have: Vec::new(),
         trackers: Vec::new(),
         metadata: Vec::new(),
@@ -578,7 +580,7 @@ fn file(index: u32, path: &str) -> TorrentFile {
         index,
         path: path.into(),
         length: 5,
-        selected: true,
+        priority: weaver_server_core::torrents::FilePriority::Normal,
     }
 }
 
@@ -1974,4 +1976,115 @@ async fn peers_are_listed_by_hash_and_a_ban_reaches_every_torrent() {
             .status,
         StatusCode::FORBIDDEN
     );
+}
+
+// A file's level reads as the client's number and back; the client's other
+// numbers are no level (qBittorrent `downloadpriority.h`).
+#[test]
+fn a_files_level_reads_as_the_clients_number_and_back() {
+    use weaver_server_core::torrents::FilePriority::*;
+    for (level, number) in [(Ignored, 0), (Normal, 1), (High, 6), (Maximum, 7)] {
+        assert_eq!(qbt_priority(level), number);
+        assert_eq!(level_of(&number.to_string()), Some(level));
+    }
+    for number in ["2", "4", "8", "-1", "", "high"] {
+        assert_eq!(level_of(number), None, "{number:?}");
+    }
+}
+
+// filePrio sets the named files' level, which files reports; the two
+// toggles flip each named torrent, which info and properties report.
+#[tokio::test(start_paused = true)]
+async fn file_levels_and_picking_toggles_are_set_and_reported() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let level = async || {
+        rig.get(&format!("/api/v2/torrents/files?hash={hash}"))
+            .await
+            .json()[0]["priority"]
+            .clone()
+    };
+    let picking = async || {
+        let info = rig.torrents().await[0].clone();
+        let properties = rig
+            .get(&format!("/api/v2/torrents/properties?hash={hash}"))
+            .await
+            .json();
+        assert_eq!(info["seq_dl"], properties["seq_dl"]);
+        assert_eq!(info["f_l_piece_prio"], properties["f_l_piece_prio"]);
+        (info["seq_dl"].clone(), info["f_l_piece_prio"].clone())
+    };
+    assert_eq!(level().await, 1);
+    assert_eq!(picking().await, (json!(false), json!(false)));
+
+    for number in [6, 7, 0, 1] {
+        let set = rig
+            .post(
+                "/api/v2/torrents/filePrio",
+                &format!("hash={hash}&id=0&priority={number}"),
+            )
+            .await;
+        assert_eq!(set.status, StatusCode::OK);
+        assert_eq!(level().await, number);
+    }
+    let refused = [
+        (
+            format!("hash={hash}&id=0&priority=2"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("hash={hash}&id=0|x&priority=6"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("hash={hash}&id=0|1&priority=6"),
+            StatusCode::CONFLICT,
+        ),
+        (
+            format!("hash={hash}&id=-1&priority=6"),
+            StatusCode::CONFLICT,
+        ),
+        ("id=0&priority=6".to_owned(), StatusCode::BAD_REQUEST),
+        (
+            format!("hash={}&id=0&priority=6", "0".repeat(40)),
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (form, status) in refused {
+        assert_eq!(
+            rig.post("/api/v2/torrents/filePrio", &form).await.status,
+            status,
+            "{form}"
+        );
+    }
+    // Nothing refused changed the level.
+    assert_eq!(level().await, 1);
+    let read = rig
+        .post_as(
+            "/api/v2/torrents/filePrio",
+            &format!("hash={hash}&id=0&priority=6"),
+            READER,
+        )
+        .await;
+    assert_eq!(read.status, StatusCode::FORBIDDEN);
+
+    rig.post(
+        "/api/v2/torrents/toggleSequentialDownload",
+        &format!("hashes={hash}"),
+    )
+    .await;
+    assert_eq!(picking().await, (json!(true), json!(false)));
+    rig.post(
+        "/api/v2/torrents/toggleFirstLastPiecePrio",
+        &format!("hashes={hash}"),
+    )
+    .await;
+    assert_eq!(picking().await, (json!(true), json!(true)));
+    rig.post(
+        "/api/v2/torrents/toggleSequentialDownload",
+        &format!("hashes={hash}"),
+    )
+    .await;
+    assert_eq!(picking().await, (json!(false), json!(true)));
 }

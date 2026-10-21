@@ -100,9 +100,28 @@ impl GraphJob<PieceRoot> {
         self.root.file_have()
     }
 
-    // The files the fetch should fetch now, by torrent index.
+    // The files the job has raised, by torrent index; none when it raised none.
     pub(crate) fn selection(&self) -> Vec<usize> {
         self.root.selection()
+    }
+
+    // Raise every waiting piece of file `file` to critical, as an object's
+    // seek of all of it does.
+    #[cfg(test)]
+    pub(crate) fn raise(&mut self, file: u32) {
+        use crate::pipeline::graph::root::{Ask, Root};
+        use weaver_graph::{NodeId, Purpose, Seek, Weight};
+        let ask = Ask {
+            seek: Seek {
+                volume: VolumeIndex(file),
+                range: ByteRange::new(0, u64::MAX),
+                purpose: Purpose::Data,
+                weight: Weight::FIRST,
+            },
+            bidder: NodeId(1),
+            in_order: false,
+        };
+        self.root.answer(&[ask], |_| true);
     }
 
     // A volume's posted bytes as they are in hand now, for a peer.

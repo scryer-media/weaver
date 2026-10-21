@@ -5,7 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use crate::buffers::ByteBuf;
 use crate::core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
@@ -17,7 +17,7 @@ use tracing::{debug, trace};
 use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
-    piece_priority::PiecePriority,
+    piece_priority::{FilePriority, PiecePriority},
     storage::TorrentStorage,
     torrent_state::initializing::Checkpoint,
     type_aliases::{BF, BS, FileInfos},
@@ -282,6 +282,12 @@ pub struct ChunkTracker {
     // needed initial value = selected & !have
     queue_pieces: BF,
 
+    // The pieces out of the queue for a peer or their hash check: taken
+    // when reserved, given back when requeued or broken, done when had. A
+    // taken piece is never queued, whatever is wanted again meanwhile
+    // (libtorrent `piece_picker::is_piece_free` takes no downloading piece).
+    taken: BF,
+
     // How many pieces are queued, and the queued pieces a block of which was
     // received, by index. Kept, not recounted: moved wherever a piece joins
     // or leaves the queue or receives or drops its blocks (libtorrent keeps
@@ -302,8 +308,8 @@ pub struct ChunkTracker {
     have: BoxBitV,
     have_count: u32,
 
-    // The pieces that are wanted: those with bytes in the selected files, less the
-    // ones whose priority is Skip. This doesn't change unless update_only_files or
+    // The pieces that are wanted: those with bytes in the wanted files, less the
+    // ones whose priority is Skip. This doesn't change unless prioritize or
     // set_piece_priorities was called.
     selected: BF,
 
@@ -485,6 +491,9 @@ impl ChunkTracker {
             chunk_status: compute_chunk_have_status(&lengths, have_pieces.as_slice())
                 .context("error computing chunk status")?,
             queue_pieces: needed_pieces,
+            taken: BF::from_boxed_slice(
+                vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice(),
+            ),
             queued: 0,
             started: BTreeSet::new(),
             index: PickIndex::new(total_pieces),
@@ -567,12 +576,22 @@ impl ChunkTracker {
     }
 
     pub fn reserve_needed_piece(&mut self, index: ValidPieceIndex) {
+        self.taken.set(index.get_usize(), true);
         self.set_queued(index, false);
     }
 
     // Every change to the queue passes here, piece by piece, but the
-    // selection's wholesale one, which recounts.
+    // selection's wholesale one, which recounts. The queue holds only
+    // wanted pieces with a block still to come that no peer or hash check
+    // has taken: one with every block is being checked, and a piece not
+    // wanted keeps its blocks out of it (libtorrent
+    // `piece_picker::is_piece_free` takes neither a filtered piece, nor a
+    // downloading one, nor one whose blocks are all finished).
     fn set_queued(&mut self, piece: ValidPieceIndex, queued: bool) {
+        let queued = queued
+            && !self.taken[piece.get_usize()]
+            && self.selected[piece.get_usize()]
+            && self.received_chunks(piece) < self.lengths.chunks_per_piece(piece) as usize;
         if self.queue_pieces.replace(piece.get_usize(), queued) != queued {
             if queued {
                 self.queued += 1;
@@ -761,8 +780,8 @@ impl ChunkTracker {
     }
 
     /// The pieces a peer may be handed, in index order: wanted, not had, and
-    /// not in flight. Which one goes first is the piece picker's call.
-    #[cfg(test)]
+    /// not in flight. Which one goes first is the piece picker's call; in
+    /// sequential mode it walks these.
     pub(crate) fn iter_queued_pieces(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
         self.queue_pieces
             .iter_ones()
@@ -814,6 +833,7 @@ impl ChunkTracker {
         if self.is_piece_have(index) {
             return false;
         }
+        self.taken.set(index.get_usize(), false);
         self.set_queued(index, true);
         true
     }
@@ -826,16 +846,13 @@ impl ChunkTracker {
         if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
             s.fill(false);
         }
+        self.taken.set(index.get_usize(), false);
         self.set_queued(index, true);
     }
 
     pub fn mark_piece_downloaded(&mut self, idx: ValidPieceIndex) {
         let id = idx.get() as usize;
-        // While its hash was being checked the piece was neither in-flight nor have, and
-        // anything that queues "selected and not have" - update_only_files() re-selecting
-        // its file - queued it. A piece we have is not one a peer should be handed, so
-        // whatever queued it in that window is undone here.
-        self.set_queued(idx, false);
+        self.taken.set(id, false);
         if !self.have.as_slice()[id] {
             self.have.as_slice_mut().set(id, true);
             self.have_count += 1;
@@ -906,17 +923,29 @@ impl ChunkTracker {
         Some(ChunkMarkingResult::NotCompleted)
     }
 
-    pub fn update_only_files(
+    /// The files' levels changed: each piece's bytes in the wanted files,
+    /// and every piece's priority, are set anew from them (libtorrent
+    /// `torrent::update_piece_priorities`, then `prioritize_pieces`).
+    /// `pieces` is [`crate::piece_priority::file_to_piece_priorities`] of
+    /// `files`, with any piece set since over it.
+    pub fn prioritize(
         &mut self,
         file_infos: &FileInfos,
-        new_only_files: &HashSet<usize>,
-    ) -> anyhow::Result<HaveNeededSelected> {
+        files: &[FilePriority],
+        pieces: &[PiecePriority],
+    ) -> HaveNeededSelected {
         self.selection.file_bytes = compute_selected_bytes(
             &self.lengths,
-            |idx| new_only_files.contains(&idx),
+            |idx| files.get(idx).is_none_or(|level| level.wanted()),
             file_infos,
         );
-        Ok(self.apply_selection())
+        let sel = &mut *self.selection;
+        for (slot, priority) in sel.priorities.iter_mut().zip(pieces) {
+            sel.priority_counts[*slot as usize] -= 1;
+            sel.priority_counts[*priority as usize] += 1;
+            *slot = *priority;
+        }
+        self.apply_selection()
     }
 
     /// Set the fetch priority of the given pieces. Moving a piece to or from Skip
@@ -940,8 +969,11 @@ impl ChunkTracker {
         self.hns
     }
 
-    // Recompute what is wanted (the selected files' pieces less the skipped ones),
-    // and bring the queue in line with it.
+    // Recompute what is wanted (the wanted files' pieces less the skipped ones),
+    // and bring the queue in line with it. A piece no longer wanted leaves
+    // the queue and keeps its blocks; one wanted again comes back with them
+    // (libtorrent `piece_picker::set_piece_priority` filters a piece, it
+    // does not forget it).
     fn apply_selection(&mut self) -> HaveNeededSelected {
         let mut selected = pieces_with_bytes(&self.lengths, &self.selection.file_bytes);
         if self.selection.priority_counts[PiecePriority::Skip as usize] > 0 {
@@ -953,7 +985,8 @@ impl ChunkTracker {
         }
         let prev_selected = std::mem::replace(&mut self.selected, selected);
 
-        // prev_selected=false and selected=true and have=false: requeue the piece
+        // prev_selected=false and selected=true and have=false: queue the piece
+        // again, with the blocks it had.
         {
             let mut b = BF::from_boxed_slice(
                 vec![0u8; self.lengths.piece_bitfield_bytes()].into_boxed_slice(),
@@ -969,7 +1002,7 @@ impl ChunkTracker {
             for idx in b.iter_ones() {
                 #[allow(clippy::cast_possible_truncation)]
                 if let Some(idx) = self.lengths.validate_piece_index(idx as u32) {
-                    self.mark_piece_broken_if_not_have(idx);
+                    self.set_queued(idx, true);
                 }
             }
         }
@@ -1038,13 +1071,31 @@ impl ChunkTracker {
 #[cfg(test)]
 mod tests {
     use crate::core::{constants::CHUNK_SIZE, lengths::Lengths};
-    use std::collections::HashSet;
 
     use crate::{
-        bitv::BitV, chunk_tracker::HaveNeededSelected, file_info::FileInfo, type_aliases::BF,
+        bitv::BitV,
+        chunk_tracker::HaveNeededSelected,
+        file_info::FileInfo,
+        piece_priority::{FilePriority, file_to_piece_priorities},
+        type_aliases::{BF, FileInfos},
     };
 
     use super::{ChunkTracker, compute_chunk_have_status, compute_selected_bytes};
+
+    /// The files `wanted` names at Normal, every other one Ignored.
+    fn select(ct: &mut ChunkTracker, files: &FileInfos, wanted: &[usize]) -> HaveNeededSelected {
+        let levels: Vec<FilePriority> = (0..files.len())
+            .map(|file| {
+                if wanted.contains(&file) {
+                    FilePriority::Normal
+                } else {
+                    FilePriority::Ignored
+                }
+            })
+            .collect();
+        let pieces = file_to_piece_priorities(ct.get_lengths(), files, &levels, false);
+        ct.prioritize(files, &levels, &pieces)
+    }
 
     #[test]
     fn test_compute_chunk_status() {
@@ -1145,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_only_files() {
+    fn test_selecting_files_by_level() {
         let piece_len = CHUNK_SIZE * 2 + 1;
         let total_len = piece_len as u64 * 2 + 1;
         let l = Lengths::new(total_len, piece_len).unwrap();
@@ -1202,8 +1253,7 @@ mod tests {
 
         // Select all file, no changes.
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([0, 1, 2, 3]))
-                .unwrap(),
+            select(&mut ct, &all_files, &[0, 1, 2, 3]),
             HaveNeededSelected {
                 have_bytes: 0,
                 wanted_bytes: total_len,
@@ -1217,8 +1267,7 @@ mod tests {
         // Select only the first file.
         println!("Select only the first file.");
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([0]))
-                .unwrap(),
+            select(&mut ct, &all_files, &[0]),
             HaveNeededSelected {
                 have_bytes: 0,
                 wanted_bytes: all_files[0].len,
@@ -1232,8 +1281,7 @@ mod tests {
 
         // Select only the second file.
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([1]))
-                .unwrap(),
+            select(&mut ct, &all_files, &[1]),
             HaveNeededSelected {
                 have_bytes: 0,
                 wanted_bytes: all_files[1].len,
@@ -1247,8 +1295,7 @@ mod tests {
 
         // Select only the third file (zero sized one!).
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([2]))
-                .unwrap(),
+            select(&mut ct, &all_files, &[2]),
             HaveNeededSelected {
                 have_bytes: 0,
                 wanted_bytes: 0,
@@ -1262,8 +1309,7 @@ mod tests {
 
         // Select only the fourth file.
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([3]))
-                .unwrap(),
+            select(&mut ct, &all_files, &[3]),
             HaveNeededSelected {
                 have_bytes: 0,
                 wanted_bytes: all_files[3].len,
@@ -1277,8 +1323,7 @@ mod tests {
 
         // Select first and last file
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([0, 3]))
-                .unwrap(),
+            select(&mut ct, &all_files, &[0, 3]),
             HaveNeededSelected {
                 have_bytes: 0,
                 wanted_bytes: all_files[0].len + all_files[3].len,
@@ -1292,8 +1337,7 @@ mod tests {
 
         // Select all files
         assert_eq!(
-            ct.update_only_files(&all_files, &HashSet::from_iter([0, 1, 2, 3]))
-                .unwrap(),
+            select(&mut ct, &all_files, &[0, 1, 2, 3]),
             HaveNeededSelected {
                 have_bytes: 0,
                 wanted_bytes: total_len,
@@ -1306,12 +1350,13 @@ mod tests {
         assert!(ct.queue_pieces[2]);
     }
 
-    // Between its last chunk arriving and its hash passing, a piece is neither queued,
-    // in-flight nor have. update_only_files() sees "selected and not have" and queues it,
-    // and the hash then passes: without this, the piece is have AND queued, and the next
-    // peer to ask is handed a piece we have.
+    // A piece with every block is never queued: between its last block and
+    // its hash check passing it is taken, and a piece whose last block came
+    // with no one holding it is not free either (libtorrent
+    // `piece_picker::is_piece_free`). Wanting its file again meanwhile
+    // queues neither, so no second peer is handed a piece in hand.
     #[test]
-    fn test_a_piece_queued_during_its_hash_check_is_dequeued_when_it_passes() {
+    fn test_a_piece_with_every_block_is_not_queued_when_its_file_is_wanted_again() {
         let piece_len = CHUNK_SIZE * 2;
         let l = Lengths::new(piece_len as u64 * 3, piece_len).unwrap();
         let files = vec![FileInfo {
@@ -1325,32 +1370,40 @@ mod tests {
         let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
         let selected = compute_selected_bytes(&l, |_| true, &files);
         let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
-        let p0 = l.validate_piece_index(0).unwrap();
-
-        // A peer takes the piece, delivers all of it, and the hash check starts: it is
-        // out of the queue and, in the real thing, just out of the in-flight map too.
-        ct.reserve_needed_piece(p0);
+        let p = |i| l.validate_piece_index(i).unwrap();
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        for (i, chunk) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            ct.mark_chunk_downloaded(&crate::peer_protocol::Piece::from_data(
+                i,
+                chunk * CHUNK_SIZE,
+                &block[..],
+            ))
+            .unwrap();
+        }
+        // Piece 0 goes to its hash check; piece 1's blocks all came while
+        // no one held it, and it waits in the queue for its check.
+        ct.reserve_needed_piece(p(0));
         assert!(!ct.queue_pieces[0]);
 
-        // Meanwhile the user deselects the file and selects it again.
-        ct.update_only_files(&files, &HashSet::new()).unwrap();
-        ct.update_only_files(&files, &HashSet::from_iter([0]))
-            .unwrap();
-        assert!(ct.queue_pieces[0]);
+        // Meanwhile the user ignores the file and wants it again.
+        select(&mut ct, &files, &[]);
+        select(&mut ct, &files, &[0]);
+        assert!(!ct.queue_pieces[0], "a piece in its hash check is queued");
+        assert!(!ct.queue_pieces[1], "a piece with every block is queued");
+        assert!(ct.queue_pieces[2]);
 
         // The hash passes.
-        ct.mark_piece_downloaded(p0);
-        assert!(ct.is_piece_have(p0));
-        assert!(
-            !ct.queue_pieces[0],
-            "a piece we have is still queued, so a second peer will download it again"
-        );
+        ct.mark_piece_downloaded(p(0));
+        assert!(ct.is_piece_have(p(0)));
+        assert!(!ct.queue_pieces[0]);
     }
 
-    // only_files and Skip both narrow what is wanted: a piece is wanted if a selected
-    // file needs it and it is not skipped, however the two were reached.
+    // The files' levels give every piece its priority, and a piece set on its
+    // own is set over them until the levels change again, which rewrites
+    // every piece (libtorrent `torrent::update_piece_priorities` calls
+    // `prioritize_pieces` with the whole vector).
     #[test]
-    fn test_only_files_and_skip_compose() {
+    fn test_file_levels_and_piece_priorities_compose() {
         use crate::piece_priority::PiecePriority;
 
         let piece_len = CHUNK_SIZE;
@@ -1380,28 +1433,26 @@ mod tests {
         let p = |i| l.validate_piece_index(i).unwrap();
         let wanted = |ct: &ChunkTracker| -> Vec<usize> { ct.selected.iter_ones().collect() };
 
-        // Deselecting file 1 keeps piece 2, which file 0 still needs.
-        ct.update_only_files(&files, &HashSet::from_iter([0]))
-            .unwrap();
+        // Ignoring file 1 keeps piece 2, which file 0 still needs.
+        select(&mut ct, &files, &[0]);
         assert_eq!(wanted(&ct), vec![0, 1, 2]);
 
-        // A priority does not bring back a piece only a deselected file needs.
+        // A priority does not bring back a piece only an ignored file needs.
         ct.set_piece_priorities([(p(3), PiecePriority::High)]);
         assert_eq!(wanted(&ct), vec![0, 1, 2]);
         assert!(!ct.queue_pieces[3]);
 
-        // Skip removes a piece a selected file needs.
+        // Skip removes a piece a wanted file needs.
         ct.set_piece_priorities([(p(1), PiecePriority::Skip)]);
         assert_eq!(wanted(&ct), vec![0, 2]);
         assert!(!ct.queue_pieces[1]);
 
-        // Changing the file selection keeps the skip, and the raised piece now counts.
-        ct.update_only_files(&files, &HashSet::from_iter([0, 1]))
-            .unwrap();
-        assert_eq!(wanted(&ct), vec![0, 2, 3]);
-        assert!(ct.queue_pieces[3]);
-        assert!(!ct.queue_pieces[1]);
-        assert_eq!(ct.get_hns().needed_bytes, piece_len as u64 * 3);
+        // A change to the levels gives every piece its files' level again.
+        select(&mut ct, &files, &[0, 1]);
+        assert_eq!(wanted(&ct), vec![0, 1, 2, 3]);
+        assert!(ct.queue_pieces[1]);
+        assert_eq!(ct.priority(p(3)), PiecePriority::Normal);
+        assert_eq!(ct.get_hns().needed_bytes, piece_len as u64 * 4);
     }
 
     // What is left is the whole torrent less what is had, whatever is
@@ -1453,13 +1504,11 @@ mod tests {
         assert_eq!(ct.get_hns().remaining(), p64 * 2 + half);
 
         // Deselecting b leaves what is left as it was.
-        ct.update_only_files(&files, &HashSet::from_iter([0]))
-            .unwrap();
+        select(&mut ct, &files, &[0]);
         assert_eq!(ct.bytes_left(), p64 * 3);
         assert_eq!(ct.get_hns().total(), files[0].len);
         assert_eq!(ct.get_hns().progress(), 0);
-        ct.update_only_files(&files, &HashSet::from_iter([0, 2]))
-            .unwrap();
+        select(&mut ct, &files, &[0, 2]);
         assert_eq!(ct.get_hns().progress(), half);
 
         // Finished flips with the last wanted piece and not before.
@@ -1477,7 +1526,7 @@ mod tests {
     // bitfields after every kind of move.
     #[test]
     fn the_kept_counts_follow_every_move() {
-        use crate::{peer_protocol::Piece, piece_priority::PiecePriority};
+        use crate::piece_priority::PiecePriority;
 
         let piece_len = CHUNK_SIZE * 2;
         let l = Lengths::new(piece_len as u64 * 4, piece_len).unwrap();
@@ -1496,8 +1545,12 @@ mod tests {
         let p = |i| l.validate_piece_index(i).unwrap();
         let block = vec![0u8; CHUNK_SIZE as usize];
         let deliver = |ct: &mut ChunkTracker, i: u32, chunk: u32| {
-            ct.mark_chunk_downloaded(&Piece::from_data(i, chunk * CHUNK_SIZE, &block[..]))
-                .unwrap();
+            ct.mark_chunk_downloaded(&crate::peer_protocol::Piece::from_data(
+                i,
+                chunk * CHUNK_SIZE,
+                &block[..],
+            ))
+            .unwrap();
         };
         // (queued, started, had), kept and recounted.
         let counts = |ct: &ChunkTracker| {
@@ -1546,10 +1599,11 @@ mod tests {
         assert!(!ct.requeue_piece_if_not_have(p(2)));
         assert_eq!(counts(&ct), (2, vec![0], 2));
 
-        // Skipped and wanted again, a piece starts over.
+        // Skipped, a piece leaves the queue; wanted again, it comes back with
+        // its blocks.
         ct.set_piece_priorities([(p(0), PiecePriority::Skip)]);
         assert_eq!(counts(&ct), (1, vec![], 2));
         ct.set_piece_priorities([(p(0), PiecePriority::Normal)]);
-        assert_eq!(counts(&ct), (2, vec![], 2));
+        assert_eq!(counts(&ct), (2, vec![0], 2));
     }
 }

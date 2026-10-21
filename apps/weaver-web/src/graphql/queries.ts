@@ -1582,8 +1582,11 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         path
         length
         selected
+        priority
         progress
       }
+      sequential
+      firstLastPieceFirst
       trackers {
         tier
         url

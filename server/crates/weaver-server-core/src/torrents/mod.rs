@@ -15,8 +15,8 @@ pub mod status;
 pub(crate) mod storage;
 
 pub use model::{
-    Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TorrentState, TorrentTracker, TrackerEntry, TrackerStatus,
+    FilePriority, Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent,
+    TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry, TrackerStatus,
 };
 pub use weaver_torrent::{
     ConnectionKind, Encryption, PeerFlags, PeerInfo, PeerSourceFlag, PeerSources, TorrentVersion,

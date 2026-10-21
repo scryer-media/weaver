@@ -105,7 +105,7 @@ use crate::{
         DEFAULT_CONNECT_TIMEOUT, PeerConnection, PeerConnectionHandler, PeerConnectionOptions,
         WriterRequest,
     },
-    piece_priority::PiecePriority,
+    piece_priority::{FilePriority, PiecePriority},
     piece_tracker::{AcquireRequest, AcquireResult, Arrival, PickOptions, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
@@ -1314,11 +1314,17 @@ impl TorrentStateLive {
         Err(res)
     }
 
-    pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
-        let hns = self
-            .lock_write("update_only_files")
-            .get_pieces_mut()?
-            .update_only_files(&self.metadata.file_infos, only_files)?;
+    /// The files' levels changed; see [`crate::chunk_tracker::ChunkTracker::prioritize`].
+    pub(crate) fn prioritize(
+        &self,
+        files: &[FilePriority],
+        pieces: &[PiecePriority],
+    ) -> anyhow::Result<()> {
+        let hns = self.lock_write("prioritize").get_pieces_mut()?.prioritize(
+            &self.metadata.file_infos,
+            files,
+            pieces,
+        );
         // The peers' requesters look again at what they may ask for, and
         // whether we want anything at all (libtorrent
         // `torrent::update_piece_priorities` calls `update_interest` on
@@ -1342,10 +1348,10 @@ impl TorrentStateLive {
             .lock_write("set_piece_priorities")
             .get_pieces_mut()?
             .set_piece_priorities(priorities);
-        // As in update_only_files().
+        // As in prioritize().
         self.new_pieces_notify.notify_waiters();
         // Wanting a skipped piece again may make peers we let go useful. With the
-        // state lock released, for the reason given in update_only_files().
+        // state lock released, for the reason given in prioritize().
         self.update_upload_only();
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
@@ -2571,6 +2577,12 @@ impl PeerHandler {
                             reverse: live.is_snubbed(),
                             on_parole,
                             suggested: &live.suggested,
+                            sequential: self
+                                .state
+                                .shared
+                                .options
+                                .sequential
+                                .load(Ordering::Relaxed),
                         },
                         can_steal: |p| {
                             self.state.per_piece_locks[p.get_usize()]

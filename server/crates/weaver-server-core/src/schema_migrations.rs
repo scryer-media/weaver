@@ -35,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 82;
+const CURRENT_SCHEMA_VERSION: i64 = 83;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1701,6 +1701,79 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row, ("limits".to_string(), None, None));
+        pool.close().await;
+    }
+
+    // The file-priority migration, the latest, gives each torrent one
+    // value for its file levels, none set, and its sequential and
+    // first-and-last toggles, both off, and drops the file rows: their path
+    // and length are the metainfo's, and `selected` held only whether the
+    // file was padding.
+    #[tokio::test]
+    async fn sqlite_file_priority_migration_keeps_levels_on_the_torrent() {
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let columns = ["file_priorities", "sequential", "first_last_piece_first"];
+        async fn has_file_rows(pool: &sqlx::SqlitePool) -> bool {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'torrent_files'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+                > 0
+        }
+
+        let fresh = open_test_pool(&temp.path().join("fresh.db")).await;
+        replay_catalog_into_fresh_db(&fresh, &catalog, &payload, None, true)
+            .await
+            .unwrap();
+        assert_eq!(pragma_column_count(&fresh, "torrents", &columns).await, 3);
+        assert!(!has_file_rows(&fresh).await);
+        fresh.close().await;
+
+        let db_path = temp.path().join("pre-file-priority.db");
+        let pool = open_test_pool(&db_path).await;
+        replay_catalog_into_fresh_db(
+            &pool,
+            &catalog,
+            &payload,
+            Some(CURRENT_SCHEMA_VERSION - 1),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
+        sqlx::query(
+            "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
+             VALUES (7, ?, 'levels', 'metainfo', 1, 'queued')",
+        )
+        .bind(vec![7_u8; 20])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO torrent_files (job_id, file_index, path, length, selected)
+             VALUES (7, 0, 'a.bin', 10, 1), (7, 1, '.pad/1', 6, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        assert!(!has_file_rows(&pool).await);
+        let row: (Option<String>, bool, bool) = sqlx::query_as(
+            "SELECT file_priorities, sequential, first_last_piece_first
+               FROM torrents WHERE job_id = 7",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (None, false, false));
         pool.close().await;
     }
 

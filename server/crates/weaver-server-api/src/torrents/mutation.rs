@@ -10,7 +10,7 @@ use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::torrents::service::{ActionError, AddError, AddRequest, AddSource};
 
 use super::service;
-use super::types::{SubmitTorrentInput, Torrent};
+use super::types::{SubmitTorrentInput, Torrent, TorrentFilePriorityInput};
 use crate::auth::{ControlGuard, graphql_error};
 use crate::settings::types::SeedingPolicyInput;
 
@@ -163,11 +163,58 @@ impl TorrentsMutation {
         Ok(true)
     }
 
+    /// Set each named file's level; the others keep theirs.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_torrent_file_priorities(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        priorities: Vec<TorrentFilePriorityInput>,
+    ) -> Result<bool> {
+        let priorities: Vec<_> = priorities
+            .into_iter()
+            .map(|file| (file.index, file.priority.into()))
+            .collect();
+        service(ctx)?
+            .set_file_priorities(JobId(id), &priorities)
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
     /// Check every piece of the torrent again, trusting nothing saved.
     #[graphql(guard = "ControlGuard")]
     async fn recheck_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         service(ctx)?
             .recheck(JobId(id))
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
+    #[graphql(guard = "ControlGuard")]
+    async fn set_torrent_sequential(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        sequential: bool,
+    ) -> Result<bool> {
+        service(ctx)?
+            .set_sequential(JobId(id), sequential)
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
+    #[graphql(guard = "ControlGuard")]
+    async fn set_torrent_first_last_piece_first(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        first_last_piece_first: bool,
+    ) -> Result<bool> {
+        service(ctx)?
+            .set_first_last_piece_first(JobId(id), first_last_piece_first)
             .await
             .map_err(action_error)?;
         Ok(true)

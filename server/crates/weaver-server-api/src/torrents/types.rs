@@ -4,8 +4,8 @@
 use async_graphql::{Enum, InputObject, SimpleObject};
 use weaver_server_core::torrents::service::{ScheduleSeeding, SeedingSource, TorrentView};
 use weaver_server_core::torrents::{
-    ConnectionKind, Encryption, PeerInfo, PeerSourceFlag, TorrentState, TorrentTracker,
-    TorrentVersion, TrackerStatus,
+    ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
+    TorrentTracker, TorrentVersion, TrackerStatus,
 };
 
 use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
@@ -119,13 +119,55 @@ impl From<ScheduleSeeding> for ScheduleSeedingGql {
     }
 }
 
+/// How eagerly a torrent file is fetched: qBittorrent's four levels. An
+/// ignored file is not fetched; padding is always ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentFilePriority")]
+pub enum TorrentFilePriorityGql {
+    Ignored,
+    Normal,
+    High,
+    Maximum,
+}
+
+impl From<FilePriority> for TorrentFilePriorityGql {
+    fn from(priority: FilePriority) -> Self {
+        match priority {
+            FilePriority::Ignored => Self::Ignored,
+            FilePriority::Normal => Self::Normal,
+            FilePriority::High => Self::High,
+            FilePriority::Maximum => Self::Maximum,
+        }
+    }
+}
+
+impl From<TorrentFilePriorityGql> for FilePriority {
+    fn from(priority: TorrentFilePriorityGql) -> Self {
+        match priority {
+            TorrentFilePriorityGql::Ignored => Self::Ignored,
+            TorrentFilePriorityGql::Normal => Self::Normal,
+            TorrentFilePriorityGql::High => Self::High,
+            TorrentFilePriorityGql::Maximum => Self::Maximum,
+        }
+    }
+}
+
+/// A file's level, by its index in the torrent.
+#[derive(Debug, InputObject)]
+pub struct TorrentFilePriorityInput {
+    pub index: u32,
+    pub priority: TorrentFilePriorityGql,
+}
+
 #[derive(Clone, Debug, SimpleObject)]
 #[graphql(name = "TorrentFile")]
 pub struct TorrentFileGql {
     pub index: u32,
     pub path: String,
     pub length: u64,
+    /// Whether the file is fetched at all: its level is above ignored.
     pub selected: bool,
+    pub priority: TorrentFilePriorityGql,
     /// The share of the file in hand, from 0 to 1.
     pub progress: f64,
 }
@@ -232,6 +274,10 @@ pub struct Torrent {
     pub unpack: bool,
     pub route: Option<String>,
     pub files: Vec<TorrentFileGql>,
+    /// Whether its pieces are fetched in order.
+    pub sequential: bool,
+    /// Whether each file's first and last pieces are fetched first.
+    pub first_last_piece_first: bool,
     pub trackers: Vec<TorrentTrackerGql>,
 }
 
@@ -244,7 +290,8 @@ impl From<TorrentView> for Torrent {
                 index: file.index,
                 path: file.path.clone(),
                 length: file.length,
-                selected: file.selected,
+                selected: file.selected(),
+                priority: file.priority.into(),
                 progress: view.file_progress(file),
             })
             .collect();
@@ -304,6 +351,8 @@ impl From<TorrentView> for Torrent {
             unpack: view.unpack,
             route: view.route,
             files,
+            sequential: view.sequential,
+            first_last_piece_first: view.first_last_piece_first,
             trackers: view.trackers.into_iter().map(Into::into).collect(),
         }
     }

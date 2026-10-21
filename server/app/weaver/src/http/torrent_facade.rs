@@ -34,12 +34,13 @@ use weaver_server_core::settings::{
     SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentLimit,
     TorrentPeerProtocol, resolve_seeding_policy,
 };
+use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, SeedingSource, TorrentService, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{
-    ConnectionKind, Encryption, PeerInfo, PeerSourceFlag, TorrentState, TorrentTracker,
-    TrackerStatus, status,
+    ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
+    TorrentTracker, TrackerStatus, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle};
@@ -403,7 +404,10 @@ fn need(group: &str, action: &str) -> Option<Need> {
             | "setForceStart" | "createCategory" | "setLocation" | "setShareLimits" | "topPrio"
             | "addTags" | "removeTags" | "recheck" | "reannounce" | "setUploadLimit"
             | "setDownloadLimit",
-        ) => Need::Control,
+        )
+        | ("torrents", "filePrio" | "toggleSequentialDownload" | "toggleFirstLastPiecePrio") => {
+            Need::Control
+        }
         _ => return None,
     })
 }
@@ -510,6 +514,21 @@ async fn handle(
             let forced = params.flag("value").unwrap_or(false);
             each(&ctx, &params, move |torrents, view| async move {
                 torrents.set_forced(view.job_id, forced).await
+            })
+            .await
+        }
+        ("torrents", "filePrio") => file_prio(&ctx, &params).await,
+        ("torrents", "toggleSequentialDownload") => {
+            each(&ctx, &params, |torrents, view| async move {
+                torrents.set_sequential(view.job_id, !view.sequential).await
+            })
+            .await
+        }
+        ("torrents", "toggleFirstLastPiecePrio") => {
+            each(&ctx, &params, |torrents, view| async move {
+                torrents
+                    .set_first_last_piece_first(view.job_id, !view.first_last_piece_first)
+                    .await
             })
             .await
         }
@@ -725,8 +744,8 @@ pub(super) fn info(view: &TorrentView) -> Value {
         ("private", json!(view.private)),
         ("auto_tmm", json!(false)),
         ("super_seeding", json!(false)),
-        ("seq_dl", json!(false)),
-        ("f_l_piece_prio", json!(false)),
+        ("seq_dl", json!(view.sequential)),
+        ("f_l_piece_prio", json!(view.first_last_piece_first)),
         ("tracker", json!("")),
         ("magnet_uri", json!(view.magnet)),
     ]);
@@ -886,6 +905,8 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("seeds", json!(view.seeds)),
         ("seeds_total", json!(view.swarm_seeds.unwrap_or(view.seeds))),
         ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
+        ("seq_dl", json!(view.sequential)),
+        ("f_l_piece_prio", json!(view.first_last_piece_first)),
     ]);
     // The properties read no limit as -1, where the list reads it as 0.
     let fields = with_limits(
@@ -913,7 +934,7 @@ async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
                 "name": file.path,
                 "size": file.length,
                 "progress": progress,
-                "priority": u8::from(file.selected),
+                "priority": qbt_priority(file.priority),
                 "is_seed": view.completed_at_ms.is_some(),
                 "piece_range": [0, 0],
                 "availability": -1,
@@ -921,6 +942,58 @@ async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         })
         .collect();
     axum::Json(list).into_response()
+}
+
+// A file's level as the client numbers it.
+fn qbt_priority(priority: FilePriority) -> u8 {
+    file_priority_number(priority)
+}
+
+// The client's number as a level; the four it defines and nothing else.
+fn level_of(priority: &str) -> Option<FilePriority> {
+    file_priority_of(priority.trim().parse().ok()?)
+}
+
+// Set the level of the files `id` names, `|`-separated, on the torrent
+// `hash` names (qBittorrent `TorrentsController::filePrioAction`): a missing
+// parameter, a level the client does not define or an id that is no integer
+// is 400, an unknown torrent 404, and an id the torrent has no file at,
+// negative or past its last, 409.
+async fn file_prio(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let (Some(hash), Some(ids), Some(priority)) =
+        (params.get("hash"), params.get("id"), params.get("priority"))
+    else {
+        return text(StatusCode::BAD_REQUEST, "Missing required parameters");
+    };
+    let Some(level) = level_of(priority) else {
+        return text(StatusCode::BAD_REQUEST, "Priority is not valid");
+    };
+    let Ok(ids) = ids
+        .split('|')
+        .map(|id| id.trim().parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return text(StatusCode::BAD_REQUEST, "File IDs must be integers");
+    };
+    let Some(view) = ctx.by_hash(hash).await else {
+        return not_found();
+    };
+    let Some(torrents) = &ctx.inner.torrents else {
+        return not_found();
+    };
+    let Ok(priorities) = ids
+        .into_iter()
+        .map(|id| u32::try_from(id).map(|id| (id, level)))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return text(StatusCode::CONFLICT, "File ID is not valid");
+    };
+    match torrents.set_file_priorities(view.job_id, &priorities).await {
+        Ok(()) => ok(),
+        Err(ActionError::NotFound(_)) => not_found(),
+        Err(error @ ActionError::Invalid(_)) => text(StatusCode::CONFLICT, error.to_string()),
+        Err(error) => internal(error),
+    }
 }
 
 fn tracker_status(status: TrackerStatus) -> u8 {

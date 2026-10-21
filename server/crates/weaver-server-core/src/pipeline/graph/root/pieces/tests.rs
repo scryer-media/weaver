@@ -253,8 +253,8 @@ fn receive_delivers_each_file_share_in_its_own_coordinates() {
 fn a_class_raised_by_a_seek_becomes_the_selection() {
     let layout = layout();
     let mut root = PieceRoot::new(Arc::clone(&layout));
-    // Nothing raised: every file still waiting is fetched.
-    assert_eq!(root.selection(), vec![0, 1, 2]);
+    // Nothing raised: no file is named.
+    assert!(root.selection().is_empty());
 
     // c's first bytes lie in piece 3, which also carries b's last.
     let answers = root.answer(&[critical(2, ByteRange::new(0, 10))], |_| true);
@@ -292,14 +292,14 @@ fn a_class_raised_by_a_seek_becomes_the_selection() {
     assert_eq!(root.class(VolumeIndex(1), 3), Some(Class::Critical));
     assert_eq!(root.selection(), vec![0, 1, 2]);
 
-    // Once the raised pieces are in, nothing is raised, and every file
-    // with a piece to come is fetched again.
+    // Once the raised pieces are in, nothing is raised, and no file is
+    // named, though c still has a piece to come.
     for piece in 0..4 {
         for share in shares(&layout, piece) {
             root.receive(share);
         }
     }
-    assert_eq!(root.selection(), vec![2]);
+    assert!(root.selection().is_empty());
 
     // The first piece of every file still waiting heads the fetch.
     root.sample();
@@ -430,7 +430,8 @@ fn a_torrent_job_writes_its_files_and_restores_its_pieces() {
         bytes[1000..3500]
     );
     assert_eq!(job.have().iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
-    assert_eq!(job.selection(), vec![2]);
+    // c still has a piece to come, but nothing raised it.
+    assert!(job.selection().is_empty());
     // c's share of piece 3 is in hand; its share of piece 4 is not.
     assert_eq!(job.file_have(), vec![1000, 2500, 4096 - 3500]);
 

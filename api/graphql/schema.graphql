@@ -2047,9 +2047,15 @@ type MutationRoot {
 	"""
 	setTorrentLocation(id: Int!, path: String!): Boolean!
 	"""
+	Set each named file's level; the others keep theirs.
+	"""
+	setTorrentFilePriorities(id: Int!, priorities: [TorrentFilePriorityInput!]!): Boolean!
+	"""
 	Check every piece of the torrent again, trusting nothing saved.
 	"""
 	recheckTorrent(id: Int!): Boolean!
+	setTorrentSequential(id: Int!, sequential: Boolean!): Boolean!
+	setTorrentFirstLastPieceFirst(id: Int!, firstLastPieceFirst: Boolean!): Boolean!
 	setTorrentCategory(id: Int!, category: String): Boolean!
 	"""
 	Ban a peer's address from the torrent: an IP, or an IP and port
@@ -5004,6 +5010,14 @@ type Torrent {
 	unpack: Boolean!
 	route: String
 	files: [TorrentFile!]!
+	"""
+	Whether its pieces are fetched in order.
+	"""
+	sequential: Boolean!
+	"""
+	Whether each file's first and last pieces are fetched first.
+	"""
+	firstLastPieceFirst: Boolean!
 	trackers: [TorrentTracker!]!
 }
 
@@ -5025,11 +5039,34 @@ type TorrentFile {
 	index: Int!
 	path: String!
 	length: Int!
+	"""
+	Whether the file is fetched at all: its level is above ignored.
+	"""
 	selected: Boolean!
+	priority: TorrentFilePriority!
 	"""
 	The share of the file in hand, from 0 to 1.
 	"""
 	progress: Float!
+}
+
+"""
+How eagerly a torrent file is fetched: qBittorrent's four levels. An
+ignored file is not fetched; padding is always ignored.
+"""
+enum TorrentFilePriority {
+	IGNORED
+	NORMAL
+	HIGH
+	MAXIMUM
+}
+
+"""
+A file's level, by its index in the torrent.
+"""
+input TorrentFilePriorityInput {
+	index: Int!
+	priority: TorrentFilePriority!
 }
 
 """

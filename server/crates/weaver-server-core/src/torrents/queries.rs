@@ -5,14 +5,17 @@ use crate::StateError;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
+use crate::torrents::model::parse_file_priorities;
 use crate::torrents::{
-    Infohash, TorrentCounters, TorrentFile, TorrentIntent, TorrentRecord, TorrentSource,
+    FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord, TorrentSource,
     TrackerEntry,
 };
 
-pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
+pub(crate) const TORRENT_COLUMNS: &str =
+    "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
      private, category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
-     policy_override, tracker_rule_id, unpack, metadata, upload_limit, download_limit";
+     policy_override, tracker_rule_id, unpack, metadata, upload_limit, download_limit,
+     sequential, first_last_piece_first";
 
 fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
     StateError::Database(format!("stored torrent {what} is not valid: {value}"))
@@ -75,6 +78,8 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         metadata,
         upload_limit: opt_u64(row, "upload_limit")?,
         download_limit: opt_u64(row, "download_limit")?,
+        sequential: row.bool("sequential")?,
+        first_last_piece_first: row.bool("first_last_piece_first")?,
     })
 }
 
@@ -196,27 +201,25 @@ impl Database {
         })
     }
 
-    pub fn list_torrent_files(&self, job_id: JobId) -> Result<Vec<TorrentFile>, StateError> {
+    // The operator's level for each file of a torrent, in the metainfo's
+    // order, as far as one was stored; a file past them is normal.
+    pub fn torrent_file_priorities(&self, job_id: JobId) -> Result<Vec<FilePriority>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
+            let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT file_index, path, length, selected FROM torrent_files
-                  WHERE job_id = {} ORDER BY file_index",
+                "SELECT file_priorities FROM torrents WHERE job_id = {}",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
             .await?;
-            rows.iter()
-                .map(|row| {
-                    let index = row.i64("file_index")?;
-                    Ok(TorrentFile {
-                        index: u32::try_from(index).map_err(|_| corrupt("file index", index))?,
-                        path: row.text("path")?,
-                        length: count(row, "length")?,
-                        selected: row.bool("selected")?,
-                    })
-                })
-                .collect()
+            let Some(value) = row
+                .map(|row| row.opt_text("file_priorities"))
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(Vec::new());
+            };
+            parse_file_priorities(&value).ok_or_else(|| corrupt("file priorities", &value))
         })
     }
 

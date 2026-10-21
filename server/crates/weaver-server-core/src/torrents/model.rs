@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::jobs::JobId;
 use crate::settings::SeedingPolicy;
+pub use weaver_torrent::FilePriority;
 
 // A hash a torrent is known by. A hybrid torrent has both, and a torrent
 // sharing either is a duplicate of it.
@@ -146,6 +147,10 @@ pub struct TorrentRecord {
     // unlimited and zero holds that direction closed.
     pub upload_limit: Option<u64>,
     pub download_limit: Option<u64>,
+    // Whether its pieces are fetched in order.
+    pub sequential: bool,
+    // Whether each file's first and last pieces are fetched first.
+    pub first_last_piece_first: bool,
 }
 
 impl TorrentRecord {
@@ -164,7 +169,61 @@ pub struct TorrentFile {
     pub index: u32,
     pub path: String,
     pub length: u64,
-    pub selected: bool,
+    // The operator's level for the file; padding is always Ignored.
+    pub priority: FilePriority,
+}
+
+impl TorrentFile {
+    /// Whether the file is fetched at all: above Ignored.
+    pub fn selected(&self) -> bool {
+        self.priority.wanted()
+    }
+}
+
+/// A file level as qBittorrent numbers it, in its API and in the resume
+/// data it hands libtorrent (qBittorrent `BitTorrent::DownloadPriority`).
+pub const fn file_priority_number(priority: FilePriority) -> u8 {
+    match priority {
+        FilePriority::Ignored => 0,
+        FilePriority::Normal => 1,
+        FilePriority::High => 6,
+        FilePriority::Maximum => 7,
+    }
+}
+
+/// The level a number names: the four qBittorrent defines and nothing else
+/// (qBittorrent `BitTorrent::isValidDownloadPriority`).
+pub const fn file_priority_of(number: u8) -> Option<FilePriority> {
+    Some(match number {
+        0 => FilePriority::Ignored,
+        1 => FilePriority::Normal,
+        6 => FilePriority::High,
+        7 => FilePriority::Maximum,
+        _ => return None,
+    })
+}
+
+/// A torrent's file levels as stored: one number per file in the
+/// metainfo's order, the normal files at the end left off, and nothing when
+/// every file is normal. A file past the list is normal, as one is past
+/// libtorrent resume data's `file_priority`.
+pub fn file_priorities_str(levels: &[FilePriority]) -> Option<String> {
+    let last = levels
+        .iter()
+        .rposition(|level| *level != FilePriority::Normal)?;
+    Some(
+        levels[..=last]
+            .iter()
+            .map(|level| char::from(b'0' + file_priority_number(*level)))
+            .collect(),
+    )
+}
+
+pub fn parse_file_priorities(value: &str) -> Option<Vec<FilePriority>> {
+    value
+        .chars()
+        .map(|digit| file_priority_of(u8::try_from(digit.to_digit(10)?).ok()?))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

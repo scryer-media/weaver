@@ -184,23 +184,18 @@ impl PieceRoot {
         have
     }
 
-    // The files to fetch now, by their index in the torrent: the ones
-    // carrying a waiting piece raised above the ordinary class, or every
-    // file still waiting when none is raised. A selection of files is all
-    // the fetch can be told, so the order among the raised is the fetch's.
+    // The files the job has raised, by their index in the torrent: the ones
+    // carrying a waiting piece raised above the ordinary class, and none when
+    // nothing is raised. The service puts a raised file at the top level, so
+    // the order among the raised is the session's; raising the pieces alone
+    // (the session takes piece priorities) is a later option.
     pub(crate) fn selection(&self) -> Vec<usize> {
-        let waiting: Vec<(VolumeIndex, u32)> = self
+        let mut files: Vec<usize> = self
             .each()
-            .filter(|(_, _, unit)| *unit == Unit::Waiting)
-            .map(|(volume, piece, _)| (volume, piece))
-            .collect();
-        let raised = waiting
-            .iter()
-            .any(|(_, piece)| self.classes[*piece as usize] < Class::Ordinary);
-        let mut files: Vec<usize> = waiting
-            .into_iter()
-            .filter(|(_, piece)| !raised || self.classes[*piece as usize] < Class::Ordinary)
-            .map(|(volume, _)| self.layout.volume_file(volume))
+            .filter(|(_, piece, unit)| {
+                *unit == Unit::Waiting && self.classes[*piece as usize] < Class::Ordinary
+            })
+            .map(|(volume, _, _)| self.layout.volume_file(volume))
             .collect();
         files.dedup();
         files

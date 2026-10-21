@@ -461,6 +461,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         seeding_left: None,
         route: None,
         files: Vec::new(),
+        sequential: false,
+        first_last_piece_first: false,
         trackers: Vec::new(),
         file_have: Vec::new(),
         metadata: Vec::new(),
@@ -1146,10 +1148,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(view.detail.as_deref(), Some(DISK_FULL));
     assert_eq!(view.completed_at_ms, None);
-    assert_eq!(
-        rig.service.inner.live.lock().await[&job_id].applied,
-        Some(vec![0])
-    );
+    assert_eq!(torrent.file_priorities(), [FilePriority::Normal]);
     let warnings = rig.service.warnings().await;
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains(rig.dir.path().join("complete").to_str().unwrap()));
@@ -2311,6 +2310,8 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         metadata: Vec::new(),
         upload_limit: None,
         download_limit: None,
+        sequential: false,
+        first_last_piece_first: false,
     };
     let mut rules = vec![TrackerRule {
         id: 1,
@@ -2863,4 +2864,195 @@ async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
         .unwrap();
     assert_eq!(handle.ratelimits().upload_bps, bps(1_000_000));
     rig.service.stop().await;
+}
+
+// The job's raise puts the files it names at Maximum and leaves every other
+// file at its stored level; no raise leaves every level as stored, and an
+// ignored file stays ignored.
+#[test]
+fn a_raise_sets_maximum_on_the_raised_files_and_leaves_the_rest() {
+    use FilePriority::*;
+    let stored = [Normal, High, Ignored, Normal];
+    assert_eq!(raised_levels(&stored, vec![]), stored);
+    assert_eq!(
+        raised_levels(&stored, vec![1]),
+        [Normal, Maximum, Ignored, Normal]
+    );
+    assert_eq!(
+        raised_levels(&stored, vec![0, 2]),
+        [Maximum, High, Ignored, Normal]
+    );
+}
+
+// A file the job raises reaches the session at Maximum through the one
+// reconcile, an ignored file stays ignored under a raise, and a toggle the
+// session runs against what is stored is put back on the next pass.
+#[tokio::test(start_paused = true)]
+async fn a_raise_and_the_stored_toggles_reach_the_session_through_one_reconcile() {
+    use FilePriority::*;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let bytes = metainfo(
+        "trio",
+        // Whole pieces each, so a raise of one file raises no piece of another.
+        &[
+            ("trio/a.bin", &[1; 3072]),
+            ("trio/b.bin", &[2; 3072]),
+            ("trio/c.bin", &[3; 3072]),
+        ],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(0, High), (2, Ignored)])
+        .await
+        .unwrap();
+    assert_eq!(handle.file_priorities(), [High, Normal, Ignored]);
+
+    {
+        let live = rig.service.inner.live.lock().await;
+        let job = live[&job_id].job.as_ref().unwrap();
+        job.with(|job| {
+            job.raise(1);
+            job.raise(2);
+        });
+    }
+    rig.service.apply_picking().await;
+    assert_eq!(handle.file_priorities(), [High, Maximum, Ignored]);
+    // The operator's levels are what is stored; the raise is the job's.
+    let stored = rig.db.torrent_file_priorities(job_id).unwrap();
+    assert_eq!(stored, [High, Normal, Ignored]);
+
+    rig.service
+        .set_first_last_piece_first(job_id, true)
+        .await
+        .unwrap();
+    handle.set_sequential(true);
+    handle.set_first_last_piece_first(false).unwrap();
+    rig.service.apply_picking().await;
+    assert!(!handle.sequential());
+    assert!(handle.first_last_piece_first());
+    rig.service.stop().await;
+}
+
+// The two picking toggles set at once both hold: each call writes only its
+// own, so neither puts back the other's old value, in the database or in
+// memory.
+#[tokio::test(start_paused = true)]
+async fn the_two_picking_toggles_set_at_once_both_hold() {
+    use std::future::Future;
+    use std::task::Poll;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let bytes = metainfo("pair", &[("pair/a.bin", &[1; 3000])], 1024, false);
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+
+    // Both calls queue on the live lock before either runs, so each reads
+    // the torrent before the other has changed it.
+    let live = rig.service.inner.live.lock().await;
+    let mut both = std::pin::pin!(async {
+        tokio::join!(
+            rig.service.set_sequential(job_id, true),
+            rig.service.set_first_last_piece_first(job_id, true),
+        )
+    });
+    std::future::poll_fn(|cx| {
+        assert!(both.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(live);
+    let (sequential, first_last) = both.await;
+    sequential.unwrap();
+    first_last.unwrap();
+
+    let record = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert!(record.sequential && record.first_last_piece_first);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.sequential && view.first_last_piece_first);
+    assert!(handle.sequential() && handle.first_last_piece_first());
+    rig.service.stop().await;
+}
+
+// A level change and the two picking toggles are stored, reach the
+// torrent's session at once, and come back with it after a restart.
+#[tokio::test(start_paused = true)]
+async fn file_levels_and_picking_toggles_reach_the_session_and_outlive_a_restart() {
+    use FilePriority::*;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let bytes = metainfo(
+        "pair",
+        &[("pair/a.bin", &[1; 3000]), ("pair/b.bin", &[2; 3000])],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(handle.file_priorities(), [Normal, Normal]);
+
+    rig.service
+        .set_file_priorities(job_id, &[(0, Ignored), (1, High)])
+        .await
+        .unwrap();
+    assert!(
+        rig.service
+            .set_file_priorities(job_id, &[(2, High)])
+            .await
+            .is_err()
+    );
+    let stored = rig.db.torrent_file_priorities(job_id).unwrap();
+    assert_eq!(stored, [Ignored, High]);
+    assert_eq!(handle.file_priorities(), [Ignored, High]);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        view.files
+            .iter()
+            .map(|file| file.selected())
+            .collect::<Vec<_>>(),
+        [false, true]
+    );
+
+    rig.service.set_sequential(job_id, true).await.unwrap();
+    rig.service
+        .set_first_last_piece_first(job_id, true)
+        .await
+        .unwrap();
+    assert!(handle.sequential() && handle.first_last_piece_first());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.sequential && view.first_last_piece_first);
+    rig.service.set_sequential(job_id, false).await.unwrap();
+    assert!(!handle.sequential());
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let handle = handle_of(&again, job_id).await;
+    assert_eq!(handle.file_priorities(), [Ignored, High]);
+    assert!(!handle.sequential());
+    assert!(handle.first_last_piece_first());
+    let view = again.torrent(job_id).await.unwrap();
+    assert!(!view.sequential && view.first_last_piece_first);
+    again.stop().await;
 }

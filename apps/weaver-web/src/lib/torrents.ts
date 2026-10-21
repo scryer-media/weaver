@@ -44,11 +44,16 @@ export interface SeedingPolicyData {
 
 export type TrackerStatus = "NOT_CONTACTED" | "UPDATING" | "WORKING" | "NOT_WORKING" | "DISABLED";
 
+/** How eagerly a torrent file is fetched; an ignored file is not fetched. */
+export type TorrentFilePriority = "IGNORED" | "NORMAL" | "HIGH" | "MAXIMUM";
+
 export interface TorrentFileData {
   index: number;
   path: string;
   length: number;
+  /** Whether the file is fetched at all: its level is above ignored. */
   selected: boolean;
+  priority: TorrentFilePriority;
   /** The share of the file in hand, from 0 to 1. */
   progress: number;
 }
@@ -135,6 +140,10 @@ export interface TorrentData extends TorrentSummaryData {
   unpack: boolean;
   route: string | null;
   files: TorrentFileData[];
+  /** Whether its pieces are fetched in order. */
+  sequential: boolean;
+  /** Whether each file's first and last pieces are fetched first. */
+  firstLastPieceFirst: boolean;
   trackers: TorrentTrackerData[];
 }
 
