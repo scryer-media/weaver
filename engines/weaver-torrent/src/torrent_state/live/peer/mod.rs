@@ -1378,6 +1378,11 @@ impl LivePeerState {
         true
     }
 
+    /// Whether we want to download from the peer, as we last told it.
+    pub(crate) fn is_interesting(&self) -> bool {
+        self.interesting
+    }
+
     /// Whether the connection is idle enough at `now` to end, with
     /// `upload_only` when we only seed the torrent and `full` when
     /// connections run short (libtorrent `peer_connection::second_tick`).

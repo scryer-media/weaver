@@ -114,8 +114,8 @@ use crate::{
 use self::{
     choker::CHOKED_REQUEST_GRACE,
     peer::{
-        InflightRequest, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx, PeerState, PeerTx, Refused,
-        RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
+        InflightRequest, LivePeerState, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx, PeerState, PeerTx,
+        Refused, RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -936,6 +936,47 @@ impl TorrentStateLive {
             return;
         }
         self.peers.announce_have(index);
+    }
+
+    /// Our interest in the peer `live` is whether it has a piece we want and
+    /// lack: a selected one we do not have, or one a stream reads next. The
+    /// peer is told when that changes. Returns it (libtorrent
+    /// `peer_connection::do_update_interest`).
+    fn update_interest(&self, live: &mut LivePeerState) -> bool {
+        let interesting = {
+            let g = self.lock_read("update_interest");
+            g.get_chunks().is_ok_and(|chunks| {
+                let has = |p: ValidPieceIndex| live.bitfield.get(p.get_usize()).is_some_and(|b| *b);
+                chunks.wants_any_of(&live.bitfield)
+                    || self
+                        .streams
+                        .iter_next_pieces(&self.lengths)
+                        .any(|p| has(p) && !chunks.is_piece_have(p))
+            })
+        };
+        if live.interest(interesting, tokio::time::Instant::now()) {
+            let message = if interesting {
+                Message::Interested
+            } else {
+                Message::NotInterested
+            };
+            let _ = live.tx.send(WriterRequest::Message(message));
+        }
+        interesting
+    }
+
+    /// We have `piece` now: a peer we want it of may have nothing else we
+    /// want (libtorrent `torrent::piece_passed` updates the interest of each
+    /// interesting peer that has the piece).
+    fn update_interest_of_holders(&self, piece: ValidPieceIndex) {
+        for mut entry in self.peers.states.iter_mut() {
+            if let Some(live) = entry.value_mut().get_live_mut()
+                && live.is_interesting()
+                && live.bitfield.get(piece.get_usize()).is_some_and(|b| *b)
+            {
+                self.update_interest(live);
+            }
+        }
     }
 
     /// A tracker, DHT or PEX named `addr`.
@@ -2372,45 +2413,33 @@ impl PeerHandler {
         let handle = self.addr;
         self.wait_for_bitfield().await;
 
-        let update_interest = |h: &PeerHandler, new_value: bool| -> crate::Result<()> {
-            let now = tokio::time::Instant::now();
-            let changed = h
-                .state
-                .peers
-                .with_live_mut(h.addr, "update_interest", |live| {
-                    live.interest(new_value, now)
-                })
-                .unwrap_or(false);
-            if changed {
-                h.tx.send(if new_value {
-                    WriterRequest::Message(Message::Interested)
-                } else {
-                    WriterRequest::Message(Message::NotInterested)
-                })
-                .ok()
-                .ok_or(Error::PeerTaskDead)?;
-            }
-            Ok(())
-        };
-
         loop {
             // Taken before what they guard is read, so no change in between
             // is missed.
-            let wants_changed = self.wants_changed();
-            // If we have full torrent, we don't need to request more pieces.
-            // However we might still need to seed them to the peer.
-            if self.state.is_finished_and_no_active_streams() {
-                update_interest(self, false)?;
-                // A seed has nothing for us, nor we for it (libtorrent
-                // `peer_connection::disconnect_if_redundant`,
-                // upload_upload_connection, from `do_update_interest`).
-                if self
-                    .state
+            let mut wants_changed = std::pin::pin!(self.wants_changed());
+            let Some(interesting) =
+                self.state
                     .peers
-                    .with_live(self.addr, |live| {
-                        live.has_full_torrent(self.state.lengths.total_pieces() as usize)
+                    .with_live_mut(self.addr, "update_interest", |live| {
+                        self.state.update_interest(live)
                     })
-                    .unwrap_or(false)
+            else {
+                return Ok(());
+            };
+            // The peer has nothing we want: we wait until it, or what we
+            // want, changes.
+            if !interesting {
+                // A seed has nothing for us, nor we for it, once we only
+                // upload (libtorrent `peer_connection::disconnect_if_redundant`,
+                // upload_upload_connection, from `do_update_interest`).
+                if self.state.is_finished_and_no_active_streams()
+                    && self
+                        .state
+                        .peers
+                        .with_live(self.addr, |live| {
+                            live.has_full_torrent(self.state.lengths.total_pieces() as usize)
+                        })
+                        .unwrap_or(false)
                 {
                     debug!("nothing left to do, neither of us is interested, disconnecting peer");
                     self.tx
@@ -2426,8 +2455,12 @@ impl PeerHandler {
                 continue;
             }
 
-            update_interest(self, true)?;
-            aframe!(self.wait_for_request_slot()).await;
+            // What we want of the peer may change while we wait to ask it:
+            // we look again.
+            tokio::select! {
+                () = aframe!(self.wait_for_request_slot()) => {}
+                () = wants_changed.as_mut() => continue,
+            }
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             // What the peer lets us request changes too: it unchokes us, or
@@ -2869,6 +2902,7 @@ impl PeerHandler {
                     state.on_piece_completed(chunk_info.piece_index)?;
 
                     state.transmit_haves(chunk_info.piece_index);
+                    state.update_interest_of_holders(chunk_info.piece_index);
                 }
                 Verdict::Failed => {
                     warn!(

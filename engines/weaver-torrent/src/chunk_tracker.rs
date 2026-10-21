@@ -923,6 +923,16 @@ impl ChunkTracker {
         self.get_hns().finished()
     }
 
+    /// Whether `pieces` names a piece we want and lack: a selected one we do
+    /// not have (libtorrent `peer_connection::do_update_interest`).
+    pub(crate) fn wants_any_of(&self, pieces: &BS) -> bool {
+        let have = self.have.as_slice();
+        !self.is_finished()
+            && pieces.iter_ones().any(|p| {
+                self.selected.get(p).is_some_and(|s| *s) && !have.get(p).is_some_and(|h| *h)
+            })
+    }
+
     pub fn per_file_have_bytes(&self) -> &[u64] {
         &self.per_file_bytes
     }

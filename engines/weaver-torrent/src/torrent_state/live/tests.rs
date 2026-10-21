@@ -3478,13 +3478,12 @@ fn bitfield_of(pieces: &[u32]) -> Vec<u8> {
 async fn a_torrent_that_stops_wanting_says_so_at_once_and_lets_a_seed_go() {
     let h = Harness::build("stops_wanting", 0x80, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await;
     let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
-    peer.on_bitfield(&bitfield_of(&[])).unwrap();
-    peer.on_i_am_unchoked();
+    peer.on_bitfield(&bitfield_of(&[1])).unwrap();
     tokio::time::pause();
     let start = tokio::time::Instant::now();
     let mut requester: Task<'_> = Box::pin(peer.request_chunks());
 
-    // We want piece 1, which the peer lacks.
+    // We want piece 1, which the peer has; it chokes us, so we wait.
     assert!(matches!(
         next_queued(&mut requester, &mut rx).await,
         WriterRequest::Message(Message::Interested)
@@ -3502,13 +3501,134 @@ async fn a_torrent_that_stops_wanting_says_so_at_once_and_lets_a_seed_go() {
     // The peer becomes a seed: the connection is to close once what was
     // queued before has gone out, and the requester waits for that.
     peer.on_have(0).unwrap();
-    peer.on_have(1).unwrap();
     assert!(matches!(
         next_queued(&mut requester, &mut rx).await,
         WriterRequest::Disconnect(Ok(()))
     ));
     assert!(waiting(&mut requester, &mut rx));
     assert_eq!(tokio::time::Instant::now(), start);
+}
+
+impl Harness {
+    /// Whether we last told `peer` we are interested.
+    fn interesting(&self, peer: &PeerHandler) -> bool {
+        self.peers
+            .with_live(peer.addr, |live| live.is_interesting())
+            .unwrap()
+    }
+}
+
+// libtorrent `peer_connection::incoming_have_none` and `do_update_interest`:
+// we are interested only in a peer that has a piece we want and lack, so
+// neither a peer with no piece nor one with only pieces we skip hears
+// Interested.
+#[tokio::test]
+async fn a_peer_with_nothing_we_want_is_never_told_interested() {
+    let h = Harness::new("nothing_we_want").await;
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+        .unwrap();
+    let (none, mut none_rx) = h.new_peer("127.0.0.1:6881");
+    (&none)
+        .on_received_message(Message::HaveNone)
+        .await
+        .unwrap();
+    let (skipped, mut skipped_rx) = h.new_peer("127.0.0.2:6881");
+    skipped.on_bitfield(&bitfield_of(&[1])).unwrap();
+    tokio::time::pause();
+    for (peer, rx) in [(&none, &mut none_rx), (&skipped, &mut skipped_rx)] {
+        peer.on_i_am_unchoked();
+        let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+        assert!(waiting(&mut requester, rx));
+        assert!(!h.interesting(peer));
+    }
+}
+
+// libtorrent `peer_connection::incoming_have`: a HAVE of a piece we want
+// and lack makes the peer interesting at once.
+#[tokio::test]
+async fn a_have_of_a_wanted_piece_makes_the_peer_interesting() {
+    let h = Harness::new("have_makes_interesting").await;
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    (&peer)
+        .on_received_message(Message::HaveNone)
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    assert!(waiting(&mut requester, &mut rx));
+
+    (&peer).on_received_message(Message::Have(1)).await.unwrap();
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Message(Message::Interested)
+    ));
+    assert!(h.interesting(&peer));
+}
+
+// libtorrent `torrent::piece_passed`: once we have a piece, each peer we
+// were interested in that has it updates its interest, and one with
+// nothing else we want hears NotInterested.
+#[tokio::test]
+async fn a_peer_whose_pieces_we_come_to_have_stops_being_interesting() {
+    let h = Harness::new("pieces_we_come_to_have").await;
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    peer.on_bitfield(&bitfield_of(&[0])).unwrap();
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    peer.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(0, 0..CHUNKS_PER_PIECE)
+    );
+    assert!(h.interesting(&peer));
+
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.deliver(&peer, (0, chunk * CHUNK_SIZE)).await;
+    }
+    assert!(
+        h.lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .is_piece_have(h.piece(0))
+    );
+    assert!(matches!(
+        next_message(&mut requester, &mut rx).await,
+        Message::NotInterested
+    ));
+    assert!(!h.interesting(&peer));
+    assert!(waiting(&mut requester, &mut rx));
+}
+
+// libtorrent `peer_connection::second_tick`: a connection neither side is
+// interested in ends after the inactivity timeout when connections run
+// short, while the torrent still downloads.
+#[tokio::test]
+async fn a_downloading_torrent_parts_from_a_peer_with_nothing_it_wants() {
+    // Five connections in all: the torrent's connections run short.
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        peer_limit: Some(5),
+        ..Default::default()
+    };
+    let h = Harness::build_added(
+        "no_interest_downloading",
+        PIECES,
+        0x00,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    (&peer)
+        .on_received_message(Message::HaveNone)
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+
+    peer.task_peer_chunk_requester().await.unwrap();
+    assert!(tokio::time::Instant::now().duration_since(start) > peer::INACTIVITY_TIMEOUT);
+    assert!(rx.try_recv().is_err());
 }
 
 // libtorrent `torrent::update_piece_priorities`: a piece wanted again makes
