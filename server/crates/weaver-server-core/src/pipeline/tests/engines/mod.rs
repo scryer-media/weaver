@@ -82,6 +82,7 @@ mod lines;
 mod nesting;
 mod par3;
 mod partial;
+mod perf;
 mod plain_par2;
 mod rar;
 mod rar_engine;

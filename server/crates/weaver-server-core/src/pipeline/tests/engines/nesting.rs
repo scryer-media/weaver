@@ -30,7 +30,7 @@ fn delivered(name: &str) -> String {
 }
 
 // Bytes no period runs through, so a compressing level cannot fold them.
-fn noise(len: usize, seed: u64) -> Vec<u8> {
+pub(super) fn noise(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     (0..len)
         .map(|_| {
@@ -73,7 +73,7 @@ fn zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-fn sevenz_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub(super) fn sevenz_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let borrowed: Vec<(&str, &[u8])> = entries
         .iter()
         .map(|(name, bytes)| (*name, bytes.as_slice()))
@@ -120,14 +120,14 @@ impl Kind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Level {
+pub(super) struct Level {
     kind: Kind,
     name: &'static str,
 }
 
 // root ──► a.rar ──► b.7z ──► c.tar.gz ──► d.zip ──► e.rar ──► f.xz ──►
 // g.rar ──► h.7z ──► i.tar ──► j.rar ──► ember.bin
-const CHAIN: [Level; 10] = [
+pub(super) const CHAIN: [Level; 10] = [
     Level {
         kind: Kind::Rar,
         name: "a.rar",
@@ -180,7 +180,7 @@ fn chain(levels: &[Level]) -> Vec<u8> {
     inner.1
 }
 
-fn chained(levels: &[Level]) -> Scenario {
+pub(super) fn chained(levels: &[Level]) -> Scenario {
     Scenario::new(vec![Post::plain(levels[0].name, chain(levels))])
 }
 
