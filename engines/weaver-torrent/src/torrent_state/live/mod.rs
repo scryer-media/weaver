@@ -190,6 +190,8 @@ pub enum AddIncomingPeerResult {
     // Finished, with its upload closed: the torrent wants no peers.
     NotWanted,
     PeerListFull,
+    // The peer's address is banned for sending bad data.
+    Banned,
 }
 
 pub struct TorrentStateLive {
@@ -455,6 +457,10 @@ impl TorrentStateLive {
                     "peer list holds only connected peers, dropping incoming peer"
                 );
                 return Ok(AddIncomingPeerResult::PeerListFull);
+            }
+            Err(IncomingRefused::Banned) => {
+                debug!(addr = %checked_peer.addr, "peer is banned, dropping incoming peer");
+                return Ok(AddIncomingPeerResult::Banned);
             }
         };
         atomic_inc(&counters.incoming_connections);

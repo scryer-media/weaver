@@ -5,12 +5,17 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use crate::core::{hash_id::Id20, lengths::ValidPieceIndex};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use tokio::{sync::Notify, time::Instant};
+use tracing::warn;
 
 use crate::{
     peer_connection::WriterRequest,
@@ -40,8 +45,14 @@ pub(crate) struct PeerStates {
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
 
-    // Held while a peer joins, so the list never grows past MAX_PEERLIST_SIZE.
+    // Held while a peer joins, so the list never grows past MAX_PEERLIST_SIZE,
+    // and while an address is banned, so no peer at it joins meanwhile.
     admission: Mutex<()>,
+    // The addresses banned for sending bad data. One host is one address, as
+    // libtorrent's peer list keeps one peer per address
+    // (`allow_multiple_connections_per_ip` off): a ban covers every port.
+    // Taken last, after any other lock.
+    banned: RwLock<HashSet<IpAddr>>,
     // Wakes the connect loop when a connect candidate appears or may come due
     // sooner.
     candidates_changed: Notify,
@@ -70,6 +81,7 @@ enum Admitted<R> {
     Known(R),
     New(Arc<PeerCountersAtomic>),
     Refused,
+    Banned,
 }
 
 /// When the connect loop may next connect to someone.
@@ -84,6 +96,7 @@ pub(crate) enum NextCandidate {
 pub(crate) enum IncomingRefused {
     AlreadyActive,
     ListFull,
+    Banned,
 }
 
 impl Drop for PeerStates {
@@ -102,7 +115,29 @@ impl PeerStates {
             stats: Default::default(),
             states: Default::default(),
             admission: Mutex::new(()),
+            banned: Default::default(),
             candidates_changed: Notify::new(),
+        }
+    }
+
+    /// Whether peers at `ip` are banned.
+    pub fn is_banned(&self, ip: IpAddr) -> bool {
+        self.banned.read().contains(&ip)
+    }
+
+    /// Bans the address of `addr`: no peer at it joins the list again, and
+    /// every one there now has its connection closed and is no connect
+    /// candidate (libtorrent `torrent::ban_peer`, `peer_list::ban_peer`).
+    pub fn ban(&self, addr: SocketAddr) {
+        let _admission = self.admission.lock();
+        if !self.banned.write().insert(addr.ip()) {
+            return;
+        }
+        warn!(?addr, "banning the peer for sending bad data");
+        for mut peer in self.states.iter_mut() {
+            if peer.key().ip() == addr.ip() {
+                peer.value_mut().ban(self);
+            }
         }
     }
 
@@ -174,12 +209,15 @@ impl PeerStates {
                 Err(IncomingRefused::AlreadyActive)
             }
             Admitted::Refused => Err(IncomingRefused::ListFull),
+            Admitted::Banned => Err(IncomingRefused::Banned),
         }
     }
 
-    // The one way into the list. A known peer is handed to `known`. A newcomer
-    // from `newcomer` joins, first pushing out the peer that ranks lowest when
-    // the list is full; it is refused when nobody `displace` allows is there.
+    // The one way into the list. A peer at a banned address is turned away
+    // (libtorrent `peer_list::new_connection`, `peer_list::add_peer`). A known
+    // peer is handed to `known`. A newcomer from `newcomer` joins, first
+    // pushing out the peer that ranks lowest when the list is full; it is
+    // refused when nobody `displace` allows is there.
     fn admit<R>(
         &self,
         addr: SocketAddr,
@@ -188,6 +226,9 @@ impl PeerStates {
         newcomer: impl FnOnce() -> Option<Peer>,
     ) -> Admitted<R> {
         let _admission = self.admission.lock();
+        if self.is_banned(addr.ip()) {
+            return Admitted::Banned;
+        }
         if let Some(r) = self.with_peer_mut(addr, "admit", known) {
             return Admitted::Known(r);
         }
@@ -905,6 +946,65 @@ mod tests {
         assert_eq!(state_of(&peers, second), None);
         assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
         assert_eq!(peers.stats().live as usize, MAX_PEERLIST_SIZE);
+    }
+
+    fn at_port(addr: SocketAddr, port: u16) -> SocketAddr {
+        SocketAddr::new(addr.ip(), port)
+    }
+
+    #[test]
+    fn a_banned_address_is_disconnected_and_never_admitted_again_on_any_port() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let banned = peer_addr(1);
+        let (live, mut live_rx) = add_live_peer(&peers, &at_port(banned, 50000).to_string());
+        peers.add_peer(banned);
+        let other = peer_addr(2);
+        peers.add_peer(other);
+
+        peers.ban(live);
+
+        // The connection is closed; the candidate at the address is one no
+        // longer; a peer at another address is untouched.
+        assert!(matches!(
+            live_rx.try_recv(),
+            Ok(WriterRequest::Disconnect(Err(_)))
+        ));
+        assert_eq!(state_of(&peers, banned), Some("dead"));
+        assert_eq!(state_of(&peers, other), Some("queued"));
+
+        // The closed connection leaves the peer Dead, needed or not.
+        peers
+            .with_peer_mut(live, "test", |peer| {
+                peer.take_state(&peers);
+                peers.connection_closed(peer, Some(t0), true);
+            })
+            .unwrap();
+        assert_eq!(state_of(&peers, live), Some("dead"));
+
+        // Named again or connecting from any port, the address is turned away.
+        peers.add_peer(banned);
+        peers.add_peer(at_port(banned, 6882));
+        peers.add_refused_incoming(at_port(banned, 6883), ConnectionKind::Utp);
+        assert_eq!(state_of(&peers, banned), Some("dead"));
+        assert_eq!(state_of(&peers, at_port(banned, 6882)), None);
+        assert_eq!(state_of(&peers, at_port(banned, 6883)), None);
+        for addr in [live, at_port(banned, 50001)] {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            assert_eq!(
+                peers
+                    .add_incoming(addr, Id20::default(), tx, ConnectionKind::Tcp)
+                    .unwrap_err(),
+                IncomingRefused::Banned
+            );
+        }
+        peers.requeue_not_needed();
+        let much_later = t0 + Duration::from_secs(365 * 24 * 3600);
+        assert_eq!(
+            peers.connect_next(much_later).map(|(addr, ..)| addr),
+            Some(other)
+        );
+        assert!(peers.connect_next(much_later).is_none());
     }
 
     #[test]

@@ -39,6 +39,13 @@ pub struct PeerStats {
     /// The peer went its request timeout without delivering a block, and has
     /// not delivered one since.
     pub snubbed: bool,
+    /// Points won by pieces the peer took part in that passed, and lost by
+    /// ones that failed, from -7 to 8.
+    pub trust_points: i8,
+    /// Pieces the peer took part in that failed their hash check.
+    pub hashfails: u8,
+    /// A piece the peer took part in failed, and none has passed since.
+    pub on_parole: bool,
 }
 
 impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
@@ -67,6 +74,7 @@ impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
 impl From<&Peer> for PeerStats {
     fn from(peer: &Peer) -> Self {
         let state = peer.get_state();
+        let trust = peer.trust();
         Self {
             counters: peer.stats.counters.as_ref().into(),
             state: state.name(),
@@ -82,6 +90,9 @@ impl From<&Peer> for PeerStats {
                 PeerState::Live(l) => l.is_snubbed(),
                 _ => false,
             },
+            trust_points: trust.points(),
+            hashfails: trust.hashfails(),
+            on_parole: trust.on_parole(),
         }
     }
 }

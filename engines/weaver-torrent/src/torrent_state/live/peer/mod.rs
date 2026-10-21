@@ -40,6 +40,53 @@ pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
 
+/// What the pieces a peer took part in say of it, kept across its
+/// connections (libtorrent `torrent_peer::trust_points`, `hashfails`,
+/// `on_parole`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Trust {
+    points: i8,
+    hashfails: u8,
+    on_parole: bool,
+}
+
+impl Trust {
+    // libtorrent `torrent_peer::trust_points` is a 4-bit field: [-7, 8].
+    pub(crate) const MIN_POINTS: i8 = -7;
+    pub(crate) const MAX_POINTS: i8 = 8;
+
+    pub(crate) fn points(&self) -> i8 {
+        self.points
+    }
+
+    pub(crate) fn hashfails(&self) -> u8 {
+        self.hashfails
+    }
+
+    pub(crate) fn on_parole(&self) -> bool {
+        self.on_parole
+    }
+
+    /// A piece the peer sent a block of passed: a point gained, up to the
+    /// most, and parole ends (libtorrent `torrent::piece_passed`).
+    fn piece_passed(&mut self) {
+        self.on_parole = false;
+        self.points = (self.points + 1).min(Self::MAX_POINTS);
+    }
+
+    /// A piece the peer sent a block of failed: two points lost, down to the
+    /// least, as failing costs more than passing earns; one more hash failure;
+    /// and parole (libtorrent `torrent::penalize_peers`, with
+    /// `use_parole_mode` at its default, on). Returns whether the peer is to
+    /// be banned: it has lost every point it can, or it sent the whole piece.
+    fn piece_failed(&mut self, sole_sender: bool) -> bool {
+        self.on_parole = true;
+        self.points = self.points.saturating_sub(2).max(Self::MIN_POINTS);
+        self.hashfails = self.hashfails.saturating_add(1);
+        self.points <= Self::MIN_POINTS || sole_sender
+    }
+}
+
 /// Where a peer that connected to us from `addr` listens, when its transport
 /// says: uTP runs over the peer's listening UDP socket, while TCP connects from
 /// an ephemeral port.
@@ -70,6 +117,8 @@ pub(crate) struct Peer {
     // When the choker last gave the peer the optimistic slot, on any
     // connection to it.
     pub last_optimistic_unchoke: Option<Instant>,
+    // What the pieces it took part in say of it.
+    trust: Trust,
 }
 
 impl Peer {
@@ -94,6 +143,7 @@ impl Peer {
             failcount: 0,
             last_failed: None,
             last_optimistic_unchoke: None,
+            trust: Trust::default(),
         }
     }
 
@@ -108,12 +158,17 @@ impl Peer {
             failcount: 0,
             last_failed: None,
             last_optimistic_unchoke: None,
+            trust: Trust::default(),
         }
     }
 
-    // The state of a peer we want and are not connected to.
-    fn idle_state(&self) -> PeerState {
-        if self.outgoing_address == Some(self.addr) && self.failcount < MAX_FAILCOUNT {
+    // The state of a peer we want and are not connected to. A banned peer is
+    // no connect candidate (libtorrent `peer_list::is_connect_candidate`).
+    fn idle_state(&self, peers: &PeerStates) -> PeerState {
+        if self.outgoing_address == Some(self.addr)
+            && self.failcount < MAX_FAILCOUNT
+            && !peers.is_banned(self.addr.ip())
+        {
             PeerState::Queued
         } else {
             PeerState::Dead
@@ -147,7 +202,7 @@ impl Peer {
     pub(crate) fn rediscovered(&mut self, counters: &PeerStates) {
         self.failcount = self.failcount.saturating_sub(1);
         if matches!(self.state, PeerState::Dead) {
-            self.set_state(self.idle_state(), counters);
+            self.set_state(self.idle_state(counters), counters);
         }
     }
 
@@ -171,7 +226,7 @@ impl Peer {
             self.last_failed = Some(at);
         }
         let next = if needed {
-            self.idle_state()
+            self.idle_state(counters)
         } else {
             PeerState::NotNeeded
         };
@@ -181,8 +236,31 @@ impl Peer {
     /// We want a peer we let go again.
     pub(crate) fn needed_again(&mut self, counters: &PeerStates) {
         if matches!(self.state, PeerState::NotNeeded) {
-            self.set_state(self.idle_state(), counters);
+            self.set_state(self.idle_state(counters), counters);
         }
+    }
+
+    /// The peer's address was banned: a connection to it is closed, which
+    /// leaves it Dead, and a connect candidate is one no longer
+    /// (libtorrent `peer_list::ban_peer`, and the disconnect in
+    /// `torrent::penalize_peers`).
+    pub(crate) fn ban(&mut self, peers: &PeerStates) {
+        let tx = match &self.state {
+            PeerState::Connecting(tx) => tx,
+            PeerState::Live(live) => &live.tx,
+            PeerState::Queued => {
+                self.set_state(self.idle_state(peers), peers);
+                return;
+            }
+            PeerState::Dead | PeerState::NotNeeded => return,
+        };
+        let _ = tx.send(WriterRequest::Disconnect(Err(anyhow::anyhow!(
+            "the peer is banned"
+        ))));
+    }
+
+    pub(crate) fn trust(&self) -> Trust {
+        self.trust
     }
 
     /// Where the peer stands when a full list must forget one; None for a
@@ -700,5 +778,61 @@ impl BlockTime {
             _ => self.mean_secs + 4.0 * self.deviation_secs,
         };
         Duration::from_secs_f64(secs).clamp(Self::MIN_TIMEOUT, Self::MAX_TIMEOUT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Trust;
+
+    #[test]
+    fn a_failed_piece_costs_two_points_and_a_passed_one_earns_one_within_bounds() {
+        let mut trust = Trust::default();
+        for _ in 0..20 {
+            trust.piece_passed();
+        }
+        assert_eq!(trust.points(), Trust::MAX_POINTS);
+
+        // From the ceiling, eight failures reach the floor and ban the peer
+        // each time from then on.
+        let mut banned = Vec::new();
+        for _ in 0..9 {
+            banned.push(trust.piece_failed(false));
+        }
+        assert_eq!(
+            banned,
+            [false, false, false, false, false, false, false, true, true]
+        );
+        assert_eq!(trust.points(), Trust::MIN_POINTS);
+        assert_eq!(trust.hashfails(), 9);
+    }
+
+    #[test]
+    fn a_new_peer_is_banned_at_its_fourth_failure_or_at_once_when_it_sent_the_whole_piece() {
+        let mut trust = Trust::default();
+        let banned: Vec<_> = (0..4).map(|_| trust.piece_failed(false)).collect();
+        assert_eq!(banned, [false, false, false, true]);
+
+        assert!(Trust::default().piece_failed(true));
+    }
+
+    #[test]
+    fn a_failure_puts_the_peer_on_parole_until_a_piece_passes() {
+        let mut trust = Trust::default();
+        assert!(!trust.on_parole());
+        trust.piece_failed(false);
+        assert!(trust.on_parole());
+        trust.piece_passed();
+        assert!(!trust.on_parole());
+        assert_eq!(trust.points(), -1);
+    }
+
+    #[test]
+    fn hash_failures_stop_counting_at_255() {
+        let mut trust = Trust::default();
+        for _ in 0..300 {
+            trust.piece_failed(false);
+        }
+        assert_eq!(trust.hashfails(), u8::MAX);
     }
 }
