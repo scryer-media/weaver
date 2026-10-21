@@ -1029,8 +1029,7 @@ impl Tree {
     pub fn deciding(&self, node: NodeId) -> bool {
         self.nodes.get(&node).is_some_and(|found| {
             found.undecided.iter().any(|member| {
-                found.namespace.get(*member).is_some()
-                    && found.namespace.copy_of(*member).is_none()
+                found.namespace.get(*member).is_some() && found.namespace.copy_of(*member).is_none()
             })
         })
     }
