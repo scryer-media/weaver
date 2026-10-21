@@ -59,6 +59,28 @@ impl BlockingSpawner {
         f()
     }
 
+    /// Like [`Self::block_in_place_with_semaphore`], holding every permit
+    /// free once one is had, up to `most`: `f` is given how many it holds,
+    /// the threads it may run at once.
+    pub async fn block_in_place_with_permits<F: FnOnce(usize) -> R, R>(
+        &self,
+        most: usize,
+        f: F,
+    ) -> R {
+        let semaphore = &self.concurrent_block_in_place_semaphore;
+        let mut permits = vec![semaphore.acquire().await.unwrap()];
+        while permits.len() < most
+            && let Ok(permit) = semaphore.try_acquire()
+        {
+            permits.push(permit);
+        }
+        let threads = permits.len();
+        if self.allow_block_in_place {
+            return tokio::task::block_in_place(|| f(threads));
+        }
+        f(threads)
+    }
+
     pub fn semaphore(&self) -> Arc<Semaphore> {
         self.concurrent_block_in_place_semaphore.clone()
     }
