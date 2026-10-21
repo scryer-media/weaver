@@ -470,52 +470,60 @@ fn scheduler_handle_with_mock_commands_with_db(
                 SchedulerCommand::ReprocessJob { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::CancelJob { job_id, reply, .. } => {
-                    let mut jobs = state.list_jobs();
-                    let original_len = jobs.len();
-                    let cancelled = jobs.iter().find(|job| job.job_id == job_id).cloned();
-                    jobs.retain(|job| job.job_id != job_id);
-                    let result = if jobs.len() == original_len {
-                        Err(SchedulerError::JobNotFound(job_id))
-                    } else {
-                        if let (Some(db), Some(job)) = (&db, cancelled) {
-                            let _ = db.insert_job_history(&weaver_server_core::JobHistoryRow {
-                                job_id: job_id.0,
-                                job_hash: job.job_hash.map(|hash| hash.to_vec()),
-                                name: job.name,
-                                status: "cancelled".to_string(),
-                                error_message: None,
-                                total_bytes: job.total_bytes,
-                                downloaded_bytes: job.downloaded_bytes,
-                                optional_recovery_bytes: job.optional_recovery_bytes,
-                                optional_recovery_downloaded_bytes: job
-                                    .optional_recovery_downloaded_bytes,
-                                failed_bytes: job.failed_bytes,
-                                health: job.health,
-                                category: job.category,
-                                output_dir: job.output_dir,
-                                nzb_path: None,
-                                created_at: (job.created_at_epoch_ms / 1000.0) as i64,
-                                completed_at: (job.created_at_epoch_ms / 1000.0) as i64,
-                                metadata: if job.metadata.is_empty() {
-                                    None
-                                } else {
-                                    serde_json::to_string(&job.metadata).ok()
-                                },
-                                server_attribution: None,
-                            });
-                        }
-                        state.publish_jobs(jobs);
-                        Ok(())
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::DeleteHistory { job_id, reply, .. } => {
-                    if let Some(db) = &db {
-                        let _ = db.delete_job_history(job_id.0);
-                        let _ = db.delete_job_events(job_id.0);
+                SchedulerCommand::CancelJobs { job_ids, reply, .. } => {
+                    let mut outcome = weaver_server_core::CancelJobsOutcome::new();
+                    for job_id in job_ids {
+                        let mut jobs = state.list_jobs();
+                        let original_len = jobs.len();
+                        let cancelled = jobs.iter().find(|job| job.job_id == job_id).cloned();
+                        jobs.retain(|job| job.job_id != job_id);
+                        let result = if jobs.len() == original_len {
+                            Err(SchedulerError::JobNotFound(job_id))
+                        } else {
+                            if let (Some(db), Some(job)) = (&db, cancelled) {
+                                let _ = db.insert_job_history(&weaver_server_core::JobHistoryRow {
+                                    job_id: job_id.0,
+                                    job_hash: job.job_hash.map(|hash| hash.to_vec()),
+                                    name: job.name,
+                                    status: "cancelled".to_string(),
+                                    error_message: None,
+                                    total_bytes: job.total_bytes,
+                                    downloaded_bytes: job.downloaded_bytes,
+                                    optional_recovery_bytes: job.optional_recovery_bytes,
+                                    optional_recovery_downloaded_bytes: job
+                                        .optional_recovery_downloaded_bytes,
+                                    failed_bytes: job.failed_bytes,
+                                    health: job.health,
+                                    category: job.category,
+                                    output_dir: job.output_dir,
+                                    nzb_path: None,
+                                    created_at: (job.created_at_epoch_ms / 1000.0) as i64,
+                                    completed_at: (job.created_at_epoch_ms / 1000.0) as i64,
+                                    metadata: if job.metadata.is_empty() {
+                                        None
+                                    } else {
+                                        serde_json::to_string(&job.metadata).ok()
+                                    },
+                                    server_attribution: None,
+                                });
+                            }
+                            state.publish_jobs(jobs);
+                            Ok(())
+                        };
+                        outcome.insert(job_id, result);
                     }
-                    let _ = reply.send(Ok(Default::default()));
+                    let _ = reply.send(outcome);
+                }
+                SchedulerCommand::DeleteHistory { job_ids, reply, .. } => {
+                    let mut outcome = weaver_server_core::HistoryDeleteBatchOutcome::default();
+                    for job_id in job_ids {
+                        if let Some(db) = &db {
+                            let _ = db.delete_job_history(job_id.0);
+                            let _ = db.delete_job_events(job_id.0);
+                        }
+                        outcome.deleted.insert(job_id, Default::default());
+                    }
+                    let _ = reply.send(Ok(outcome));
                 }
                 SchedulerCommand::RedownloadJob { reply, .. } => {
                     let _ = reply.send(Ok(()));

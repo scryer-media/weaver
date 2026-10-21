@@ -740,6 +740,16 @@ pub struct SemanticPromotionResult {
     pub message: Option<String>,
 }
 
+/// One job's result from a batched cancel.
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct CancelJobResult {
+    pub id: u64,
+    pub cancelled: bool,
+    /// `NOT_FOUND`, `CONFLICT` or `INTERNAL` when the job was not cancelled.
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct QueueCommandResult {
     pub success: bool,

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -791,6 +791,11 @@ impl CancellationOrigin {
     }
 }
 
+// What one batched cancel did, id by id: `Ok` once the job is cancelled and
+// its history row committed, or why it was refused (`Conflict`), not found
+// (`JobNotFound`) or not archived.
+pub type CancelJobsOutcome = BTreeMap<JobId, Result<(), SchedulerError>>;
+
 // Which hardware profile's limits the pipeline is running under, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HardwareProfileInForce {
@@ -819,6 +824,21 @@ pub struct HistoryDeleteOutcome {
     pub left_in_place: Vec<std::path::PathBuf>,
 }
 
+// How many history ids one delete command carries. It matches the SQL bind
+// chunk, so one command's delete is one statement per table.
+pub const HISTORY_DELETE_BATCH_SIZE: usize =
+    crate::persistence::sql_runtime::SQLITE_BATCH_BIND_LIMIT;
+
+// What one batched history delete did, id by id. A refused id never holds
+// back the rest of the batch.
+#[derive(Debug, Default)]
+pub struct HistoryDeleteBatchOutcome {
+    // Ids whose record is gone, with what each left on disk.
+    pub deleted: BTreeMap<JobId, HistoryDeleteOutcome>,
+    // Ids that were not deleted, or whose cleanup did not finish, and why.
+    pub refused: BTreeMap<JobId, SchedulerError>,
+}
+
 pub enum SchedulerCommand {
     // Submit a new job.
     AddJob {
@@ -844,11 +864,12 @@ pub enum SchedulerCommand {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    // Cancel and remove a job.
-    CancelJob {
-        job_id: JobId,
+    // Cancel and remove a batch of jobs. The reply carries every id's result
+    // and arrives once each cancelled job's history row has committed.
+    CancelJobs {
+        job_ids: BTreeSet<JobId>,
         origin: CancellationOrigin,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
+        reply: oneshot::Sender<CancelJobsOutcome>,
     },
     // Update a job's category and/or metadata.
     UpdateJob {
@@ -965,16 +986,11 @@ pub enum SchedulerCommand {
         password: Option<String>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    // Delete a completed/failed/cancelled job from history.
+    // Delete completed/failed/cancelled jobs from history, as one batch.
     DeleteHistory {
-        job_id: JobId,
+        job_ids: BTreeSet<JobId>,
         delete_files: bool,
-        reply: oneshot::Sender<Result<HistoryDeleteOutcome, SchedulerError>>,
-    },
-    // Delete all completed/failed/cancelled jobs from history.
-    DeleteAllHistory {
-        delete_files: bool,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
+        reply: oneshot::Sender<Result<HistoryDeleteBatchOutcome, SchedulerError>>,
     },
     // Copy a read-only diagnostics snapshot out of the pipeline actor.
     //
@@ -1193,19 +1209,35 @@ impl SchedulerHandle {
         job_id: JobId,
         origin: CancellationOrigin,
     ) -> Result<(), SchedulerError> {
+        self.cancel_jobs(BTreeSet::from([job_id]), origin)
+            .await?
+            .remove(&job_id)
+            .unwrap_or(Err(SchedulerError::JobNotFound(job_id)))
+    }
+
+    // Cancel a batch of jobs in one pipeline command. Resolves once every
+    // cancelled job's history row has committed; a refused id never holds
+    // back the rest.
+    pub async fn cancel_jobs(
+        &self,
+        job_ids: BTreeSet<JobId>,
+        origin: CancellationOrigin,
+    ) -> Result<CancelJobsOutcome, SchedulerError> {
         if origin.is_user() {
-            self.state.cancel_active_job_work(job_id);
+            for job_id in &job_ids {
+                self.state.cancel_active_job_work(*job_id);
+            }
         }
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::CancelJob {
-                job_id,
+            .send(SchedulerCommand::CancelJobs {
+                job_ids,
                 origin,
                 reply: tx,
             })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)
     }
 
     // Update a job's category and/or metadata.
@@ -1327,23 +1359,27 @@ impl SchedulerHandle {
         job_id: JobId,
         delete_files: bool,
     ) -> Result<HistoryDeleteOutcome, SchedulerError> {
+        let mut outcome = self
+            .delete_history_batch(BTreeSet::from([job_id]), delete_files)
+            .await?;
+        if let Some(error) = outcome.refused.remove(&job_id) {
+            return Err(error);
+        }
+        Ok(outcome.deleted.remove(&job_id).unwrap_or_default())
+    }
+
+    // Delete a batch of completed/failed/cancelled jobs from history in one
+    // pipeline command. Callers holding more than `HISTORY_DELETE_BATCH_SIZE`
+    // ids send them in batches of that size.
+    pub async fn delete_history_batch(
+        &self,
+        job_ids: BTreeSet<JobId>,
+        delete_files: bool,
+    ) -> Result<HistoryDeleteBatchOutcome, SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::DeleteHistory {
-                job_id,
-                delete_files,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
-    }
-
-    // Delete all completed/failed/cancelled jobs from history.
-    pub async fn delete_all_history(&self, delete_files: bool) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::DeleteAllHistory {
+                job_ids,
                 delete_files,
                 reply: tx,
             })

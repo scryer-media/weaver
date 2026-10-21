@@ -71,15 +71,13 @@ async fn checkpoint_deadline_is_consumed_when_capacity_pressure_or_pause_bypasse
             .contains_key(&HOT)
     );
     pipeline.resume_job_runtime(HOT).unwrap();
-    let (reply, result) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::CancelJob {
-            job_id: HOT,
-            origin: crate::jobs::handle::CancellationOrigin::User,
-            reply,
-        })
-        .await;
-    assert!(result.await.unwrap().is_ok());
+    let result = cancel_one_job(
+        &mut pipeline,
+        HOT,
+        crate::jobs::handle::CancellationOrigin::User,
+    )
+    .await;
+    assert!(result.is_ok());
     assert!(
         !pipeline
             .download_restart_durable_lead_retry_after
@@ -211,15 +209,13 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
         pipeline.rate_limiter.set_rate(1);
         pipeline.rate_limiter.consume(reserved + 100);
         if cancel {
-            let (reply, done) = oneshot::channel();
-            pipeline
-                .handle_command(SchedulerCommand::CancelJob {
-                    job_id: HOT,
-                    origin: crate::jobs::handle::CancellationOrigin::User,
-                    reply,
-                })
-                .await;
-            done.await.unwrap().unwrap();
+            let done = cancel_one_job(
+                &mut pipeline,
+                HOT,
+                crate::jobs::handle::CancellationOrigin::User,
+            )
+            .await;
+            done.unwrap();
         } else {
             pipeline.jobs.get_mut(&HOT).unwrap().status = JobStatus::Failed {
                 error: "removed".into(),
@@ -688,15 +684,13 @@ async fn checkpoint_progress_diagnostics_track_staggered_retries_and_cancel() {
     );
     pipeline.dispatch_downloads();
     assert!(pipeline.checkpoint_progress_articles.contains_key(&HOT));
-    let (reply, result) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::CancelJob {
-            job_id: HOT,
-            origin: crate::jobs::handle::CancellationOrigin::User,
-            reply,
-        })
-        .await;
-    assert!(result.await.unwrap().is_ok());
+    let result = cancel_one_job(
+        &mut pipeline,
+        HOT,
+        crate::jobs::handle::CancellationOrigin::User,
+    )
+    .await;
+    assert!(result.is_ok());
     assert_eq!(pipeline.infrastructure_retries.len(), 0);
     assert!(!pipeline.pending_retries_by_job.contains_key(&HOT));
     assert!(!pipeline.checkpoint_progress_articles.contains_key(&HOT));

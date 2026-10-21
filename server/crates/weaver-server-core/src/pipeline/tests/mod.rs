@@ -46,6 +46,7 @@ macro_rules! segment_spec {
 }
 
 mod archive_topology;
+mod cancel_batch;
 mod core;
 mod decode_and_files;
 mod direct_store;
@@ -1881,6 +1882,24 @@ fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobS
 fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
     spec.metadata = vec![("priority".to_string(), priority.to_string())];
     spec
+}
+
+// Sends one single-id cancel command and returns that id's result, which
+// arrives once the cancelled job's history row has committed.
+async fn cancel_one_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    origin: crate::jobs::handle::CancellationOrigin,
+) -> Result<(), crate::SchedulerError> {
+    let (reply, done) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::CancelJobs {
+            job_ids: std::collections::BTreeSet::from([job_id]),
+            origin,
+            reply,
+        })
+        .await;
+    done.await.unwrap().remove(&job_id).unwrap()
 }
 
 async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {

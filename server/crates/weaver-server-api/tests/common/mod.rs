@@ -705,13 +705,19 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::CancelJob { job_id, reply, .. } => {
-                    let result = if jobs.remove(&job_id).is_some() {
-                        Ok(())
-                    } else {
-                        Err(weaver_server_core::SchedulerError::JobNotFound(job_id))
-                    };
-                    let _ = reply.send(result);
+                SchedulerCommand::CancelJobs { job_ids, reply, .. } => {
+                    let outcome = job_ids
+                        .into_iter()
+                        .map(|job_id| {
+                            let result = if jobs.remove(&job_id).is_some() {
+                                Ok(())
+                            } else {
+                                Err(weaver_server_core::SchedulerError::JobNotFound(job_id))
+                            };
+                            (job_id, result)
+                        })
+                        .collect();
+                    let _ = reply.send(outcome);
                 }
                 SchedulerCommand::SetSpeedTestPause { paused, reply } => {
                     scheduler_state.set_speed_test_paused(paused);
@@ -834,53 +840,32 @@ fn spawn_test_scheduler(
                     let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::DeleteHistory {
-                    job_id,
+                    job_ids,
                     delete_files,
                     reply,
                 } => {
-                    if delete_files
-                        && let Some(output_dir) = db
-                            .get_job_history(job_id.0)
-                            .expect("failed to load history row from test db")
-                            .and_then(|row| row.output_dir)
-                    {
-                        let output_dir = PathBuf::from(output_dir);
-                        if output_dir.exists() {
-                            std::fs::remove_dir_all(&output_dir)
-                                .expect("failed to remove test history output directory");
-                        }
-                    }
-                    jobs.remove(&job_id);
-                    db.delete_job_history(job_id.0)
-                        .expect("failed to delete history row from test db");
-                    db.delete_job_events(job_id.0)
-                        .expect("failed to delete history events from test db");
-                    let _ = reply.send(Ok(Default::default()));
-                }
-                SchedulerCommand::DeleteAllHistory {
-                    delete_files,
-                    reply,
-                } => {
-                    if delete_files {
-                        for row in db
-                            .list_job_history(&weaver_server_core::HistoryFilter::default())
-                            .expect("failed to load history rows from test db")
+                    let mut outcome = weaver_server_core::HistoryDeleteBatchOutcome::default();
+                    for job_id in job_ids {
+                        if delete_files
+                            && let Some(output_dir) = db
+                                .get_job_history(job_id.0)
+                                .expect("failed to load history row from test db")
+                                .and_then(|row| row.output_dir)
                         {
-                            if let Some(output_dir) = row.output_dir {
-                                let output_dir = PathBuf::from(output_dir);
-                                if output_dir.exists() {
-                                    std::fs::remove_dir_all(&output_dir)
-                                        .expect("failed to remove test history output directory");
-                                }
+                            let output_dir = PathBuf::from(output_dir);
+                            if output_dir.exists() {
+                                std::fs::remove_dir_all(&output_dir)
+                                    .expect("failed to remove test history output directory");
                             }
                         }
+                        jobs.remove(&job_id);
+                        db.delete_job_history(job_id.0)
+                            .expect("failed to delete history row from test db");
+                        db.delete_job_events(job_id.0)
+                            .expect("failed to delete history events from test db");
+                        outcome.deleted.insert(job_id, Default::default());
                     }
-                    jobs.retain(|_, state| {
-                        !matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
-                    });
-                    db.delete_all_job_history()
-                        .expect("failed to delete all history rows from test db");
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(Ok(outcome));
                 }
                 SchedulerCommand::ReprocessJob {
                     job_id,

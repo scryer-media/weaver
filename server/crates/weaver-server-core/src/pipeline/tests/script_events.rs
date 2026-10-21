@@ -104,18 +104,13 @@ async fn downloaded_barrier_persists_and_mark_bad_prevents_native_finalization()
         pipeline.pause_job_runtime(job_id),
         Err(crate::SchedulerError::Conflict(_))
     ));
-    let (reply, cancelled) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::CancelJob {
-            job_id,
-            origin: crate::jobs::handle::CancellationOrigin::SemanticSuperseded,
-            reply,
-        })
-        .await;
-    assert!(matches!(
-        cancelled.await.unwrap(),
-        Err(crate::SchedulerError::Conflict(_))
-    ));
+    let cancelled = cancel_one_job(
+        &mut pipeline,
+        job_id,
+        crate::jobs::handle::CancellationOrigin::SemanticSuperseded,
+    )
+    .await;
+    assert!(matches!(cancelled, Err(crate::SchedulerError::Conflict(_))));
     let listed = pipeline
         .list_jobs()
         .into_iter()

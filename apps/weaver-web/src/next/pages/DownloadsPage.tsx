@@ -2,8 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
-import { useClient, useMutation, useQuery } from "urql";
-import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
+import { gql, useClient, useMutation, useQuery } from "urql";
+import { ALIASED_GROUP_SIZE, executeAliasedIdMutation } from "@/graphql/aliased-mutations";
 import {
   CANCEL_JOB_MUTATION,
   PAUSE_ALL_MUTATION,
@@ -120,6 +120,15 @@ function sortJobs(
   }
   return sorted;
 }
+
+const CANCEL_JOBS_MUTATION = gql`
+  mutation CancelSelectedJobs($ids: [Int!]!) {
+    cancelJobs(ids: $ids) {
+      id
+      cancelled
+    }
+  }
+`;
 
 export function DownloadsPage() {
   const { queue, categories: configured, speed, isPaused, downloadBlock } = useNextData();
@@ -329,21 +338,25 @@ export function DownloadsPage() {
     });
 
   // Rows leave the list the moment the cancel is sent, and any the daemon
-  // refuses come back once it answers.
+  // refuses come back once it answers. Each selection group is one cancel
+  // the daemon carries out as a batch.
   const cancelPicked = async () => {
     const ids = [...picked];
     setBulkBusy(true);
     setRemovedIds((current) => new Set([...current, ...ids]));
     setSelectedId((current) => (current !== null && ids.includes(current) ? null : current));
-    const result = await executeAliasedIdMutation<boolean>({
-      client,
-      ids,
-      operationName: "CancelSelectedJobs",
-      aliasPrefix: "cancelJob",
-      fieldName: "cancelJob",
-    });
-    const cancelled = ids.filter((_id, index) => result.data?.[`cancelJob${index}`] === true);
-    const failed = ids.filter((id) => !cancelled.includes(id));
+    const cancelled = new Set<number>();
+    for (let start = 0; start < ids.length; start += ALIASED_GROUP_SIZE) {
+      const result = await client
+        .mutation<{ cancelJobs: { id: number; cancelled: boolean }[] }>(CANCEL_JOBS_MUTATION, {
+          ids: ids.slice(start, start + ALIASED_GROUP_SIZE),
+        })
+        .toPromise();
+      for (const row of result.data?.cancelJobs ?? []) {
+        if (row.cancelled) cancelled.add(row.id);
+      }
+    }
+    const failed = ids.filter((id) => !cancelled.has(id));
     if (failed.length > 0) {
       setRemovedIds((current) => new Set([...current].filter((id) => !failed.includes(id))));
     }

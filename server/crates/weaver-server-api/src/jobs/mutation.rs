@@ -13,12 +13,12 @@ use crate::history::types::{
 };
 use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
 use crate::jobs::types::{
-    DuplicateDecisionInfo, DuplicateModeGql, PRIORITY_ATTRIBUTE_KEY, PersistedQueueEvent,
-    QueueCommandResult, QueueEventKind, QueueMoveKind, SemanticDuplicateAdmissionInfo,
-    SemanticPromotionResult, StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult,
-    SubmissionResult, SubmissionStatus, SubmitNzbInput, SubmitStagedNzbsInput,
-    SubmitStagedNzbsResult, global_queue_state, normalize_priority_value, queue_item_from_job,
-    queue_item_from_submission, submit_metadata,
+    CancelJobResult, DuplicateDecisionInfo, DuplicateModeGql, PRIORITY_ATTRIBUTE_KEY,
+    PersistedQueueEvent, QueueCommandResult, QueueEventKind, QueueMoveKind,
+    SemanticDuplicateAdmissionInfo, SemanticPromotionResult, StageNzbUploadInput,
+    StagedNzbSubmissionResult, StagedNzbUploadResult, SubmissionResult, SubmissionStatus,
+    SubmitNzbInput, SubmitStagedNzbsInput, SubmitStagedNzbsResult, global_queue_state,
+    normalize_priority_value, queue_item_from_job, queue_item_from_submission, submit_metadata,
 };
 use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
@@ -373,6 +373,45 @@ impl JobsMutation {
         handle.cancel_job(JobId(id)).await?;
         Ok(true)
     }
+    /// Cancel and remove several jobs in one pipeline command. Each id gets
+    /// its own result; a job that cannot be cancelled never holds back the
+    /// rest.
+    #[graphql(guard = "ControlGuard")]
+    async fn cancel_jobs(&self, ctx: &Context<'_>, ids: Vec<u64>) -> Result<Vec<CancelJobResult>> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let outcome = map_scheduler_result(
+            handle
+                .cancel_jobs(
+                    ids.iter().copied().map(JobId).collect(),
+                    weaver_server_core::jobs::handle::CancellationOrigin::User,
+                )
+                .await,
+        )?;
+        Ok(outcome
+            .into_iter()
+            .map(|(job_id, result)| match result {
+                Ok(()) => CancelJobResult {
+                    id: job_id.0,
+                    cancelled: true,
+                    error_code: None,
+                    message: None,
+                },
+                Err(error) => CancelJobResult {
+                    id: job_id.0,
+                    cancelled: false,
+                    error_code: Some(
+                        match error {
+                            SchedulerError::JobNotFound(_) => "NOT_FOUND",
+                            SchedulerError::Conflict(_) => "CONFLICT",
+                            _ => "INTERNAL",
+                        }
+                        .to_string(),
+                    ),
+                    message: Some(error.to_string()),
+                },
+            })
+            .collect())
+    }
     /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     #[graphql(guard = "ControlGuard")]
     async fn reprocess_job(
@@ -552,9 +591,7 @@ impl JobsMutation {
     ) -> Result<Vec<HistoryItem>> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
-        for &id in &ids {
-            handle.delete_history(JobId(id), delete_files).await?;
-        }
+        delete_history_ids(handle, ids, delete_files).await?;
         history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Delete all completed/failed/cancelled jobs from history.
@@ -567,7 +604,25 @@ impl JobsMutation {
     ) -> Result<Vec<HistoryItem>> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
-        handle.delete_all_history(delete_files).await?;
+        let lookup_db = db.clone();
+        let mut ids = tokio::task::spawn_blocking(move || lookup_db.list_all_history_job_ids())
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        ids.extend(
+            handle
+                .list_jobs()
+                .into_iter()
+                .filter(|info| {
+                    matches!(
+                        info.status,
+                        weaver_server_core::JobStatus::Complete
+                            | weaver_server_core::JobStatus::Failed { .. }
+                    )
+                })
+                .map(|info| info.job_id.0),
+        );
+        delete_history_ids(handle, ids, delete_files).await?;
         history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Update category and/or priority for one or more jobs.
@@ -802,8 +857,8 @@ impl JobsMutation {
     ) -> Result<HistoryCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        map_scheduler_result(delete_history_ids(handle, ids.iter().copied(), delete_files).await)?;
         for id in &ids {
-            map_scheduler_result(handle.delete_history(JobId(*id), delete_files).await)?;
             replay
                 .append(PersistedQueueEvent {
                     occurred_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -908,6 +963,31 @@ fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {
         SchedulerError::State(error) => graphql_error("INTERNAL", format!("state error: {error}")),
         SchedulerError::Io(error) => graphql_error("INTERNAL", format!("i/o error: {error}")),
     }
+}
+
+// Deletes `ids` from history through the pipeline, one command per
+// `HISTORY_DELETE_BATCH_SIZE` ids, and fails with the first refusal once
+// every batch has run.
+async fn delete_history_ids(
+    handle: &SchedulerHandle,
+    ids: impl IntoIterator<Item = u64>,
+    delete_files: bool,
+) -> std::result::Result<(), SchedulerError> {
+    let ids = ids
+        .into_iter()
+        .map(JobId)
+        .collect::<std::collections::BTreeSet<_>>();
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    let mut first_refusal = None;
+    for batch in ids.chunks(weaver_server_core::HISTORY_DELETE_BATCH_SIZE) {
+        let outcome = handle
+            .delete_history_batch(batch.iter().copied().collect(), delete_files)
+            .await?;
+        if first_refusal.is_none() {
+            first_refusal = outcome.refused.into_values().next();
+        }
+    }
+    first_refusal.map_or(Ok(()), Err)
 }
 
 fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Result<T> {

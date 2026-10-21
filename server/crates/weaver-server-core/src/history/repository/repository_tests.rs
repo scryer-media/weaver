@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::jobs::ids::JobId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 fn sample_history() -> JobHistoryRow {
@@ -113,6 +114,104 @@ fn delete_history() {
     db.insert_job_history(&sample_history()).unwrap();
     assert!(db.delete_job_history(1).unwrap());
     assert!(!db.delete_job_history(1).unwrap());
+}
+
+fn child_row_count(db: &Database, table: &'static str, job_id: u64) -> i64 {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        let rows = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            &format!("SELECT COUNT(*) AS n FROM {table} WHERE job_id = {{}}"),
+            &[SqlArg::I64(job_id as i64)],
+        )
+        .await?;
+        rows[0].i64("n")
+    })
+    .unwrap()
+}
+
+#[test]
+fn batched_bundle_delete_clears_every_child_table_and_leaves_other_jobs() {
+    const CHILD_TABLES: [&str; 5] = [
+        "job_events",
+        "job_history_attributes",
+        "script_outputs",
+        "script_event_queue",
+        "script_job_state",
+    ];
+    let db = Database::open_in_memory().unwrap();
+    for job_id in [1_u64, 2, 3] {
+        let mut row = sample_history();
+        row.job_id = job_id;
+        db.insert_job_history(&row).unwrap();
+        db.insert_job_event(job_id, 1, "note", "event", None)
+            .unwrap();
+        let datastore = db.datastore();
+        db.run_sql_blocking(async move {
+            let id = job_id as i64;
+            for (template, args) in [
+                (
+                    "INSERT INTO job_history_attributes (job_id, key, value, completed_at)
+                     VALUES ({}, 'k', 'v', 2)",
+                    vec![SqlArg::I64(id)],
+                ),
+                (
+                    "INSERT INTO script_outputs (id, job_id, event, script, seq, raw_bytes,
+                        truncated, output, stored_bytes, result_json, status, created_at)
+                     VALUES ({}, {}, 'complete', 's', {}, 0, false, {}, 0, '[]', 'ok', 1)",
+                    vec![
+                        SqlArg::Text(format!("out-{id}")),
+                        SqlArg::I64(id),
+                        SqlArg::I64(id),
+                        SqlArg::Bytes(Vec::new()),
+                    ],
+                ),
+                (
+                    "INSERT INTO script_event_queue (run_id, job_id, event, priority, seq,
+                        state, payload, created_at)
+                     VALUES ({}, {}, 'complete', 0, {}, 'done', '[]', 1)",
+                    vec![
+                        SqlArg::Text(format!("run-{id}")),
+                        SqlArg::I64(id),
+                        SqlArg::I64(id),
+                    ],
+                ),
+                (
+                    "INSERT INTO script_job_state (job_id, state) VALUES ({}, '[]')",
+                    vec![SqlArg::I64(id)],
+                ),
+            ] {
+                SqlRuntime::execute(datastore.read_exec(), template, &args).await?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    for table in CHILD_TABLES {
+        assert_eq!(child_row_count(&db, table, 2), 1, "{table} seeded");
+    }
+
+    // Job 9 never existed: the batch skips it.
+    assert_eq!(
+        db.delete_job_histories_and_forget_duplicate_identities(&[JobId(1), JobId(3), JobId(9)])
+            .unwrap(),
+        vec![JobId(1), JobId(3)]
+    );
+
+    for job_id in [1, 3] {
+        assert!(db.get_job_history(job_id).unwrap().is_none());
+        for table in CHILD_TABLES {
+            assert_eq!(
+                child_row_count(&db, table, job_id),
+                0,
+                "{table} for {job_id}"
+            );
+        }
+    }
+    assert!(db.get_job_history(2).unwrap().is_some());
+    for table in CHILD_TABLES {
+        assert_eq!(child_row_count(&db, table, 2), 1, "{table} kept for job 2");
+    }
 }
 
 #[test]

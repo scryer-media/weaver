@@ -222,3 +222,30 @@ async fn update_jobs_nonexistent() {
         .await;
     assert_has_errors(&resp);
 }
+
+#[tokio::test]
+async fn cancel_jobs_reports_each_id_in_one_batch() {
+    let h = TestHarness::new().await;
+    let id1 = h.submit_test_nzb("bulk-cancel-1").await;
+    let id2 = h.submit_test_nzb("bulk-cancel-2").await;
+    let missing = 999_999;
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{ cancelJobs(ids: [{id1}, {missing}, {id2}]) {{ id cancelled errorCode }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let rows = data["cancelJobs"].as_array().unwrap();
+    let row = |id: u64| {
+        rows.iter()
+            .find(|row| row["id"].as_u64() == Some(id))
+            .unwrap_or_else(|| panic!("no result for {id}"))
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(row(id1)["cancelled"], true);
+    assert_eq!(row(id2)["cancelled"], true);
+    assert_eq!(row(missing)["cancelled"], false);
+    assert_eq!(row(missing)["errorCode"], "NOT_FOUND");
+}
