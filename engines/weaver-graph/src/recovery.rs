@@ -138,7 +138,7 @@ pub trait Recovery {
 
     // Recovery blocks this object wants ahead of the normal order, given the
     // damage it knows about.
-    fn wants(&mut self, out: &mut Vec<Seek>);
+    fn wants(&self, out: &mut Vec<Seek>);
 
     // Repair what is damaged among the members this object covers.
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome;

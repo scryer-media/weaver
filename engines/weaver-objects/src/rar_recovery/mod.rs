@@ -296,7 +296,7 @@ impl Object for RarRecovery {
         self.rev(volume).lost = true;
     }
 
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
@@ -449,7 +449,7 @@ impl Recovery for RarRecovery {
         });
     }
 
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
         let outcome = self.rule(access);

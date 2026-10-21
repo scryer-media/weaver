@@ -361,18 +361,26 @@ impl Delta {
     // What `after` changes of `before`, which is the checkpoint the
     // database holds or will once what is queued is written; `None` when
     // nothing says what it holds. Both are in key order.
+    #[cfg(test)]
     pub(crate) fn between(before: Option<&GraphCheckpoint>, after: &GraphCheckpoint) -> Self {
-        let empty = GraphCheckpoint::default();
-        let was = before.unwrap_or(&empty);
-        Self {
+        let mut out = Self {
             whole: before.is_none(),
-            nodes: changes(&was.nodes, &after.nodes),
-            members: changes(&was.members, &after.members),
-            coverage: changes(&was.coverage, &after.coverage),
-            envelopes: changes(&was.envelopes, &after.envelopes),
-            crypt: changes(&was.crypt, &after.crypt),
-            parts: changes(&was.parts, &after.parts),
-        }
+            ..Self::default()
+        };
+        out.compare(before.unwrap_or(&GraphCheckpoint::default()), after);
+        out
+    }
+
+    // What `after` changes of `before`, taken into this change: rows of one
+    // part of the job, whose other rows are compared apart. Both are in key
+    // order.
+    pub(crate) fn compare(&mut self, before: &GraphCheckpoint, after: &GraphCheckpoint) {
+        changes(&mut self.nodes, &before.nodes, &after.nodes);
+        changes(&mut self.members, &before.members, &after.members);
+        changes(&mut self.coverage, &before.coverage, &after.coverage);
+        changes(&mut self.envelopes, &before.envelopes, &after.envelopes);
+        changes(&mut self.crypt, &before.crypt, &after.crypt);
+        changes(&mut self.parts, &before.parts, &after.parts);
     }
 
     // This change followed by `later`, as one.
@@ -413,10 +421,9 @@ impl Delta {
 }
 
 // The rows of `after` not in `before` as they are, and the keys of
-// `before` not in `after`. Both are in key order, so one pass over each
-// finds them.
-fn changes<R: Row>(before: &[R], after: &[R]) -> Changes<R> {
-    let mut out = BTreeMap::new();
+// `before` not in `after`, into `out`. Both are in key order, so one pass
+// over each finds them.
+fn changes<R: Row>(out: &mut Changes<R>, before: &[R], after: &[R]) {
     let mut was = before.iter().peekable();
     for row in after {
         let key = row.key();
@@ -431,7 +438,6 @@ fn changes<R: Row>(before: &[R], after: &[R]) -> Changes<R> {
         }
     }
     out.extend(was.map(|gone| (gone.key(), None)));
-    out
 }
 
 impl Database {

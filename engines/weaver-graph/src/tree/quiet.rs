@@ -189,7 +189,7 @@ impl Standing for Stood<'_> {
             && namespace.members().any(|member| {
                 tree.child_of(node, member.id).is_none()
                     && member.coverage.damaged_ranges().next().is_some()
-                    && !tree.retired.contains_key(&(node, member.id))
+                    && !tree.nodes.retired().contains_key(&(node, member.id))
                     && !tree.given_back(node, member.id)
                     && !tree.ruled(node, member.id, |outcome| outcome != RepairOutcome::Waiting)
             })

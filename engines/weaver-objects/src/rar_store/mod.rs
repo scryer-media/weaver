@@ -491,7 +491,7 @@ impl Object for RarStore {
         }
     }
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         // The first volume not read to its end.
         let reading = (0..)
             .find(|index| {

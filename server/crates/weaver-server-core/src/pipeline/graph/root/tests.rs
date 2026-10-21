@@ -40,8 +40,8 @@ use weaver_graph::recovery::RepairOutcome;
 
 const ZIP_FRONT: &[u8] = b"PK\x03\x04";
 
-// A stand-in for a format's object: it asks for what it was told to and
-// remembers the answers.
+// A stand-in for a format's object: it asks for what it was told to until
+// it is answered, and remembers the answers.
 struct Probe {
     wants: Vec<Seek>,
     answers: Arc<Mutex<Vec<Pull>>>,
@@ -78,10 +78,12 @@ impl Object for Probe {
             out.push(Emit::Refuse(Why::Unmapped));
         }
     }
-    fn wants(&mut self, out: &mut Vec<Seek>) {
-        out.append(&mut self.wants);
+    fn wants(&self, out: &mut Vec<Seek>) {
+        out.extend_from_slice(&self.wants);
     }
-    fn pulled(&mut self, _: Seek, pull: Pull, _: &mut Vec<Emit>) {
+    // A seek answered is wanted no more.
+    fn pulled(&mut self, seek: Seek, pull: Pull, _: &mut Vec<Emit>) {
+        self.wants.retain(|want| *want != seek);
         self.answers.lock().unwrap().push(pull);
     }
     fn locate(&self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Placement>) {}

@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Binding, Node, NodeId, Tree};
+use super::{Binding, Node, NodeId, Nodes, Tree};
 use crate::facts::{Restore, RestoreError};
 use crate::member::{Coverage, Member};
 use crate::records::{CoverageRecord, MemberRecord, NodeRecord, NodeState, TreeRecord};
@@ -27,6 +27,26 @@ impl Tree {
                 .collect(),
             next_node: self.next_node,
         }
+    }
+
+    // The generation of the tree's nodes: a change to a node marks it under
+    // a later one.
+    pub fn generation(&self) -> u64 {
+        self.nodes.generation()
+    }
+
+    // The nodes changed since generation `at`, a node gone since among them.
+    pub fn changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.changed_since(at)
+    }
+
+    // One node's record, `None` for a node not in the tree.
+    pub fn record(&self, node: NodeId) -> Option<NodeRecord> {
+        Some(self.node_record(node, self.nodes.get(&node)?))
+    }
+
+    pub fn next_node(&self) -> u32 {
+        self.next_node
     }
 
     fn node_record(&self, node: NodeId, found: &Node) -> NodeRecord {
@@ -62,9 +82,15 @@ impl Tree {
                     closed: member.closed,
                     bound_to: member.bound_to,
                     owner: found.children.get(&member.id).copied(),
-                    given_up: self.retired.get(&(node, member.id)).copied().flatten(),
+                    given_up: self
+                        .nodes
+                        .retired()
+                        .get(&(node, member.id))
+                        .copied()
+                        .flatten(),
                     buried: self
-                        .retired
+                        .nodes
+                        .retired()
                         .get(&(node, member.id))
                         .is_some_and(Option::is_none),
                     undecided: found.undecided.contains(&member.id),
@@ -90,7 +116,7 @@ impl Tree {
 
     pub fn rebuild(record: &TreeRecord, restore: &dyn Restore) -> Result<Tree, RestoreError> {
         let mut tree = Tree::new();
-        tree.nodes.clear();
+        tree.nodes = Nodes::default();
         for node in &record.nodes {
             tree.place_record(node, restore)?;
         }
@@ -284,11 +310,11 @@ impl Tree {
                 if !self.nodes.contains_key(&node) {
                     return Err(refuse("a member was given up by a node not in the record"));
                 }
-                self.retired
-                    .insert((record.node, member.member), Some((node, volume)));
+                self.nodes
+                    .retire((record.node, member.member), Some((node, volume)));
             }
             if member.buried {
-                self.retired.insert((record.node, member.member), None);
+                self.nodes.retire((record.node, member.member), None);
             }
         }
         Ok(())

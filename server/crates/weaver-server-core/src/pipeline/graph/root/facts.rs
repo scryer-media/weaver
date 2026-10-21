@@ -12,12 +12,12 @@
 // state marks the chunks each change touches, so an encoding reads again
 // only the chunks marked since it last read.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     ByteRange, Change, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
-    encode_changes, encode_parts, stamped,
+    encode_since,
 };
 
 use super::ArticleRoot;
@@ -117,46 +117,6 @@ pub(crate) enum Chunk {
     Segments(u32),
 }
 
-// The keys a part of the root's state changed, each under the generation of
-// its latest change, which rises with every change: what was read whole at
-// generation `at` is brought up to date by reading again what changed since.
-#[derive(Debug)]
-pub(crate) struct Marks<K> {
-    at: u64,
-    latest: BTreeMap<K, u64>,
-    by_at: BTreeMap<u64, K>,
-}
-
-impl<K> Default for Marks<K> {
-    fn default() -> Self {
-        Self {
-            at: 0,
-            latest: BTreeMap::new(),
-            by_at: BTreeMap::new(),
-        }
-    }
-}
-
-impl<K: Ord + Copy> Marks<K> {
-    pub(crate) fn mark(&mut self, key: K) {
-        self.at += 1;
-        if let Some(was) = self.latest.insert(key, self.at) {
-            self.by_at.remove(&was);
-        }
-        self.by_at.insert(self.at, key);
-    }
-
-    pub(crate) fn at(&self) -> u64 {
-        self.at
-    }
-
-    pub(crate) fn since(&self, at: u64) -> impl Iterator<Item = K> + '_ {
-        self.by_at
-            .range(at.saturating_add(1)..)
-            .map(|(_, key)| *key)
-    }
-}
-
 // The facts as they are encoded: kept from one checkpoint to the next, so a
 // part whose entries did not change keeps its bytes and is not encoded again.
 #[derive(Default, Serialize, Deserialize)]
@@ -166,9 +126,10 @@ pub(crate) struct Encoded {
     volumes: Vec<EncodedVolume>,
     read_backs: u64,
     reported: Option<RootPhase>,
-    // The stamp its parts were last taken at.
+    // The generation of each of its sealed values when its parts were last
+    // taken, by number in the walk.
     #[serde(skip)]
-    taken: u64,
+    taken: Vec<u64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -348,12 +309,12 @@ impl ArticleRoot {
             volume.ordered_only = self.map.ordered_only(index);
             volume.read = Some(read);
         }
-        encoded.taken = stamped();
-        let (bytes, parts) = encode_parts(encoded)?;
+        let taken = encode_since(encoded, None)?;
+        encoded.taken = taken.at;
         Ok(Encoding {
             version: RootFacts::VERSION,
-            bytes,
-            parts: Parts::All(parts),
+            bytes: taken.bytes,
+            parts: Parts::All(taken.parts),
         })
     }
 
@@ -390,12 +351,12 @@ impl ArticleRoot {
             }
             volume.read = Some(now);
         }
-        let since = std::mem::replace(&mut encoded.taken, stamped());
-        let (bytes, changed) = encode_changes(encoded, since)?;
+        let taken = encode_since(encoded, Some(&encoded.taken))?;
+        encoded.taken = taken.at;
         Ok(Encoding {
             version: RootFacts::VERSION,
-            bytes,
-            parts: Parts::Changed(changed),
+            bytes: taken.bytes,
+            parts: Parts::Changed(taken.changes),
         })
     }
 

@@ -678,7 +678,7 @@ impl Object for SevenZipStore {
         }
     }
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         // Only volumes bound so far can be bid: a seek into one not yet
         // claimed would be answered as unseekable.
         if self.geometry.is_none() {

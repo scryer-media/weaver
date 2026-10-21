@@ -181,7 +181,7 @@ impl<D: Decoder> Object for Stream<D> {
     }
 
     // One volume, read in order: there is nothing to bid for.
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 

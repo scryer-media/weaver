@@ -21,6 +21,17 @@ impl NamespaceWriter {
         }
     }
 
+    // The generation of the writer's namespaces: a change to what a
+    // namespace's members hold marks it under a later one.
+    pub(crate) fn files_generation(&self) -> u64 {
+        self.files.marks().at()
+    }
+
+    // The namespaces whose members' states changed since generation `at`.
+    pub(crate) fn files_changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.files.marks().since(at)
+    }
+
     pub(crate) fn kept_records(&self) -> Vec<KeptRecord> {
         self.envelopes.records()
     }

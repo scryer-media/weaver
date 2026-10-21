@@ -10,7 +10,8 @@ use weaver_graph::{
 };
 
 use super::{
-    CheckpointError, FileState, Pending, Snapshot, part_rows, root_row, rows_of, snapshot,
+    CheckpointError, FileState, Pending, Snapshot, envelope_rows, node_rows, part_rows, root_row,
+    snapshot,
 };
 use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint, PartRow, Row};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
@@ -220,15 +221,35 @@ fn rows(taken: &Snapshot) -> GraphCheckpoint {
     let Parts::All(parts) = encoding.parts else {
         panic!("a fresh encoding is whole");
     };
-    let mut out = rows_of(
-        root_row(encoding.version, encoding.bytes),
-        &taken.tree,
-        &taken.files,
-        &taken.kept,
-        &taken.passwords,
-    );
+    let mut out = GraphCheckpoint {
+        nodes: vec![root_row(encoding.version, encoding.bytes)],
+        envelopes: envelope_rows(&taken.kept),
+        ..GraphCheckpoint::default()
+    };
+    for node in &taken.tree.nodes {
+        let rows = node_rows(
+            node,
+            |member| {
+                taken
+                    .files
+                    .get(&(node.node, member))
+                    .copied()
+                    .unwrap_or_default()
+            },
+            taken.passwords.get(&node.node).map(|index| *index as i64),
+        );
+        out.nodes.extend(rows.nodes);
+        out.members.extend(rows.members);
+        out.coverage.extend(rows.coverage);
+        out.crypt.extend(rows.crypt);
+        out.parts.extend(rows.parts);
+    }
     out.parts
         .extend(part_rows(i64::from(NodeId::ROOT.0), &parts));
+    out.nodes.sort_by_key(Row::key);
+    out.members.sort_by_key(Row::key);
+    out.coverage.sort_by_key(Row::key);
+    out.crypt.sort_by_key(Row::key);
     out.parts.sort_by_key(Row::key);
     out
 }

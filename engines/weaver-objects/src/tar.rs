@@ -434,7 +434,7 @@ impl Object for Tar {
     }
 
     // A tar is read in order; it never asks for anything ahead of it.
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 

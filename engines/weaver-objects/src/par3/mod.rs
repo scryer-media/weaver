@@ -308,7 +308,7 @@ impl Object for Par3 {
     // volume still closes once the rest is in.
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         Recovery::wants(self, out);
     }
 
@@ -462,7 +462,7 @@ impl Recovery for Par3 {
     // Nothing is known before a readback.
     fn verdicts(&self, _member: MemberId, _out: &mut Vec<SliceVerdict>) {}
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         if self.needed == 0 {
             return;
         }

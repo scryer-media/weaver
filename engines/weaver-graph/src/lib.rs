@@ -30,6 +30,7 @@ pub mod deliver;
 pub mod engine;
 pub mod facts;
 pub mod holds;
+pub mod marks;
 pub mod member;
 pub mod names;
 pub mod object;
@@ -45,9 +46,10 @@ mod wire;
 pub use deliver::{Delivery, Emit, Posted, Provenance, RecoveryKind, Why};
 pub use engine::{Engine, Extraction, Sink, Volumes};
 pub use facts::{
-    Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, decode_parts,
-    encode_changes, encode_parts, stamped,
+    Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
+    decode_parts, encode_parts, encode_since,
 };
+pub use marks::{Marked, Marks};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{

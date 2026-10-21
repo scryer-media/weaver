@@ -17,7 +17,7 @@ use crate::tree::NodeId;
 mod sealed;
 
 pub use sealed::{
-    Change, Give, Part, Sealed, Shelf, Take, decode_parts, encode_changes, encode_parts, stamped,
+    Change, Give, Part, Sealed, Shelf, Take, Taken, decode_parts, encode_parts, encode_since,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

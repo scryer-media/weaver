@@ -273,7 +273,7 @@ impl Object for RarRecord {
     // A lost range of the record is found when the ruling reads it.
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
@@ -371,7 +371,7 @@ impl Recovery for RarRecord {
         });
     }
 
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     // The bytes before the record's header. Until a ruling read the
     // record, the volume passed whole and there is nothing to prove apart.
