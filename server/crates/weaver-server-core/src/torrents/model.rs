@@ -142,6 +142,10 @@ pub struct TorrentRecord {
     pub unpack: Option<bool>,
     // The attributes its job was added with.
     pub metadata: Vec<(String, String)>,
+    // Its own upload and download limits in bytes per second: None is
+    // unlimited and zero holds that direction closed.
+    pub upload_limit: Option<u64>,
+    pub download_limit: Option<u64>,
 }
 
 impl TorrentRecord {

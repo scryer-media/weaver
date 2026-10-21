@@ -16,7 +16,7 @@ use weaver_graph::VolumeIndex;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::core::{Id20, Id32, InfoHashes};
-use weaver_torrent::limits::{LimitKind, LimitsConfig};
+use weaver_torrent::limits::LimitsConfig;
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
     ManagedTorrent, ResumePeers, Session, TorrentVersion, TrackerAnnounce, torrent_from_bytes,
@@ -56,6 +56,7 @@ use crate::settings::{
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
+use crate::torrents::rate::limit_kind;
 use crate::torrents::sessions::{NetworkRoutes, RouteKey, SessionEnv, SessionError, Sessions};
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
@@ -187,6 +188,18 @@ fn identity_of(record: &TorrentRecord, rules: &[TrackerRule]) -> Identity {
         .unwrap_or(Client::Weaver)
         .name()
         .identity()
+}
+
+// The limits `record`'s session holds it to: its own, and on upload its
+// seeding policy's cap where that is tighter. Each is a channel the
+// torrent's peers draw from beside the session's, as each peer class over a
+// libtorrent peer is (`bandwidth_manager::request_bandwidth`).
+fn ratelimits_of(record: &TorrentRecord, policy: Option<SeedingPolicy>) -> LimitsConfig {
+    let cap = policy.and_then(|policy| policy.max_upload_bps);
+    LimitsConfig {
+        upload_bps: limit_kind(record.upload_limit).tighter(limit_kind(cap)),
+        download_bps: limit_kind(record.download_limit),
+    }
 }
 
 /// Where a torrent's seeding policy comes from: the most specific level that
@@ -391,6 +404,10 @@ pub struct TorrentView {
     pub ratio: f64,
     pub download_bps: u64,
     pub upload_bps: u64,
+    /// The torrent's own upload and download limits in bytes per second;
+    /// None is unlimited and zero holds that direction closed.
+    pub upload_limit: Option<u64>,
+    pub download_limit: Option<u64>,
     pub eta_seconds: Option<u64>,
     pub peers: u32,
     pub seeds: u32,
@@ -1756,6 +1773,8 @@ impl TorrentService {
             tracker_rule_id: None,
             unpack: request.unpack,
             metadata: request.metadata.clone(),
+            upload_limit: None,
+            download_limit: None,
         }
     }
 
@@ -1925,7 +1944,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.now_ms();
-        let (scope, bytes, layout, intake, dir, paused, limit, have, identity) = {
+        let (scope, bytes, layout, intake, dir, paused, ratelimits, have, identity) = {
             let live = self.inner.live.lock().await;
             let Some(torrent) = live.get(&job_id) else {
                 return;
@@ -1941,10 +1960,8 @@ impl TorrentService {
             ) else {
                 return;
             };
-            let limit = settings
-                .policy(&torrent.record, &rules)
-                .and_then(|policy| policy.max_upload_bps)
-                .map(|bps| u32::try_from(bps).unwrap_or(u32::MAX));
+            let ratelimits =
+                ratelimits_of(&torrent.record, settings.policy(&torrent.record, &rules));
             (
                 settings.scope(torrent.record.category_id, rule_of(&torrent.record, &rules)),
                 bytes,
@@ -1957,7 +1974,7 @@ impl TorrentService {
                         .holds()
                         .reason_for(queued(&settings, &rules, torrent, now).target())
                         .is_some(),
-                limit,
+                ratelimits,
                 job.with(|job| initial_have(job)),
                 identity_of(&torrent.record, &rules),
             )
@@ -1989,10 +2006,7 @@ impl TorrentService {
             overwrite: true,
             output_folder: Some(dir),
             storage_factory: Some(factory.boxed_factory()),
-            ratelimits: LimitsConfig {
-                upload_bps: LimitKind::from(limit),
-                download_bps: LimitKind::Unlimited,
-            },
+            ratelimits,
             identity: Some(identity),
             initial_peers: (!saved.peers.is_empty()).then_some(saved.peers),
             banned_peers: saved.banned,
@@ -2428,6 +2442,49 @@ impl TorrentService {
         }
     }
 
+    /// The torrent's own upload and download limits in bytes per second
+    /// (libtorrent `torrent::set_upload_limit`, `set_download_limit`):
+    /// `None` keeps that limit as it is, `Some(None)` is unlimited and zero
+    /// holds that direction closed. A limit is kept on the torrent's row
+    /// before the torrent takes it, then reaches its peers at once; its
+    /// seeding policy's upload cap holds it too where that is tighter.
+    pub async fn set_rate_limits(
+        &self,
+        job_id: JobId,
+        upload: Option<Option<u64>>,
+        download: Option<Option<u64>>,
+    ) -> Result<(), ActionError> {
+        if let Some(limit) = [upload, download]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|limit| i64::try_from(*limit).is_err())
+        {
+            return Err(ActionError::Invalid(format!(
+                "a limit of {limit} bytes a second is past the largest, {}",
+                i64::MAX
+            )));
+        }
+        self.with_torrent(job_id, |torrent| {
+            self.inner
+                .db
+                .set_torrent_rate_limits(job_id, upload, download)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            let record = &mut torrent.record;
+            if let Some(upload) = upload {
+                record.upload_limit = upload;
+            }
+            if let Some(download) = download {
+                record.download_limit = download;
+            }
+            Ok(())
+        })
+        .await?;
+        self.apply_limits().await;
+        self.publish().await;
+        Ok(())
+    }
+
     pub async fn set_policy_override(
         &self,
         job_id: JobId,
@@ -2629,6 +2686,7 @@ impl TorrentService {
         self.apply_goals(now).await;
         self.apply_queue().await;
         self.apply_selection().await;
+        self.apply_limits().await;
         self.drop_idle_sessions().await;
         self.publish().await;
         self.inner.ticks.send_modify(|ticks| *ticks += 1);
@@ -2811,6 +2869,24 @@ impl TorrentService {
         }
     }
 
+    // The limits each torrent's session holds it to, from its own and its
+    // seeding policy's as they are now: a change of either at any level
+    // reaches the torrent's peers without reconnecting them.
+    async fn apply_limits(&self) {
+        let settings = self.settings();
+        let rules = self.rules();
+        let live = self.inner.live.lock().await;
+        for torrent in live.values() {
+            let Some(attached) = &torrent.attached else {
+                continue;
+            };
+            let limits = ratelimits_of(&torrent.record, settings.policy(&torrent.record, &rules));
+            if attached.handle.ratelimits() != limits {
+                attached.handle.set_ratelimits(limits);
+            }
+        }
+    }
+
     async fn drop_idle_sessions(&self) {
         let used: BTreeSet<RouteKey> = self
             .inner
@@ -2907,6 +2983,8 @@ impl TorrentService {
             ratio: status::ratio(counters, total),
             download_bps: reading.speeds.0,
             upload_bps: reading.speeds.1,
+            upload_limit: record.upload_limit,
+            download_limit: record.download_limit,
             eta_seconds: status::eta_seconds(total.saturating_sub(have), reading.speeds.0),
             peers: reading.peers.0,
             seeds: reading.peers.1,

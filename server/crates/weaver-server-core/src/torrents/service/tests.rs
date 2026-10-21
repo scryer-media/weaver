@@ -436,6 +436,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         ratio: 0.0,
         download_bps: 500,
         upload_bps: 0,
+        upload_limit: None,
+        download_limit: None,
         eta_seconds: Some(6),
         peers: 1,
         seeds: 1,
@@ -2307,6 +2309,8 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         tracker_rule_id: Some(1),
         unpack: None,
         metadata: Vec::new(),
+        upload_limit: None,
+        download_limit: None,
     };
     let mut rules = vec![TrackerRule {
         id: 1,
@@ -2725,4 +2729,138 @@ async fn a_banned_peer_stays_banned_across_a_restart() {
     );
     again.stop().await;
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
+}
+
+// libtorrent `torrent::set_upload_limit` / `set_download_limit` throttle the
+// torrent's own channels in place, and qBittorrent's `TorrentImpl` keeps
+// them in its resume data: the limits reach the running torrent's session
+// at once, are what it reads back, and are handed to its session again
+// after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_rate_limits_reach_its_session_and_outlive_a_restart() {
+    use weaver_torrent::limits::{LimitKind, LimitsConfig};
+
+    let bps = |bps: u32| LimitKind::Bps(std::num::NonZeroU32::new(bps).unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    assert_eq!(handle.ratelimits(), LimitsConfig::default());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!((view.upload_limit, view.download_limit), (None, None));
+
+    // Zero holds the download closed.
+    rig.service
+        .set_rate_limits(job_id, Some(Some(65_536)), Some(Some(0)))
+        .await
+        .unwrap();
+    let limited = LimitsConfig {
+        upload_bps: bps(65_536),
+        download_bps: LimitKind::Closed,
+    };
+    assert_eq!(handle.ratelimits(), limited);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.upload_limit, view.download_limit),
+        (Some(65_536), Some(0))
+    );
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        (stored.upload_limit, stored.download_limit),
+        (Some(65_536), Some(0))
+    );
+    assert!(matches!(
+        rig.service
+            .set_rate_limits(JobId(999), Some(None), None)
+            .await,
+        Err(ActionError::NotFound(_))
+    ));
+    // A limit past what the row holds is refused before the torrent or
+    // its row takes it.
+    assert!(matches!(
+        rig.service
+            .set_rate_limits(job_id, Some(Some(u64::MAX)), Some(None))
+            .await,
+        Err(ActionError::Invalid(_))
+    ));
+    assert_eq!(handle.ratelimits(), limited);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        (stored.upload_limit, stored.download_limit),
+        (Some(65_536), Some(0))
+    );
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(handle_of(&again, job_id).await.ratelimits(), limited);
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.upload_limit, view.download_limit),
+        (Some(65_536), Some(0))
+    );
+    again.stop().await;
+}
+
+// A seeding policy's upload cap holds the torrent beside its own limit, as
+// a second channel over its peers would: the tighter of the two is in
+// force, and a change of either reaches the session without a restart.
+// The torrent reads back its own limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
+    use weaver_torrent::limits::LimitKind;
+
+    let bps = |bps: u32| LimitKind::Bps(std::num::NonZeroU32::new(bps).unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    rig.service
+        .set_rate_limits(job_id, Some(Some(65_536)), None)
+        .await
+        .unwrap();
+    let capped = |max_upload_bps| SeedingPolicy {
+        max_upload_bps,
+        ..SeedingPolicy::default()
+    };
+    rig.service
+        .set_policy_override(job_id, Some(capped(Some(1_000))))
+        .await
+        .unwrap();
+    rig.service.tick().await;
+    assert_eq!(handle.ratelimits().upload_bps, bps(1_000));
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().upload_limit,
+        Some(65_536)
+    );
+
+    rig.service
+        .set_policy_override(job_id, Some(capped(Some(1_000_000))))
+        .await
+        .unwrap();
+    rig.service.tick().await;
+    assert_eq!(handle.ratelimits().upload_bps, bps(65_536));
+
+    rig.service
+        .set_rate_limits(job_id, Some(None), None)
+        .await
+        .unwrap();
+    assert_eq!(handle.ratelimits().upload_bps, bps(1_000_000));
+    rig.service.stop().await;
 }

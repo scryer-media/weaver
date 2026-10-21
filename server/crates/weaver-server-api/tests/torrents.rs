@@ -716,3 +716,68 @@ async fn a_torrents_peers_are_listed_and_a_ban_is_kept() {
         .await;
     assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"));
 }
+
+// libtorrent `torrent::set_upload_limit` / `set_download_limit`: a torrent's
+// own limits are set together and read back; null is unlimited and 0 holds
+// that direction closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_rate_limits_are_set_and_read_back() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let limits = || async {
+        let read = rig
+            .execute(&format!(
+                "{{ torrent(id: {id}) {{ uploadLimit downloadLimit }} }}"
+            ))
+            .await;
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let data = read.data.into_json().unwrap();
+        (
+            data["torrent"]["uploadLimit"].clone(),
+            data["torrent"]["downloadLimit"].clone(),
+        )
+    };
+    assert_eq!(limits().await, (Value::Null, Value::Null));
+
+    // A limit left out is kept; null lifts it.
+    for (limits_set, read) in [
+        (
+            "upload: 65536, download: 0",
+            (Value::from(65_536), Value::from(0)),
+        ),
+        (
+            "download: 1048576",
+            (Value::from(65_536), Value::from(1_048_576)),
+        ),
+        ("upload: null", (Value::Null, Value::from(1_048_576))),
+    ] {
+        let set = rig
+            .execute(&format!(
+                "mutation {{ setTorrentRateLimits(id: {id}, {limits_set}) }}"
+            ))
+            .await;
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+        assert_eq!(limits().await, read);
+    }
+    let stored = rig
+        .harness
+        .db
+        .get_torrent(weaver_server_core::jobs::ids::JobId(id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (stored.upload_limit, stored.download_limit),
+        (None, Some(1_048_576))
+    );
+
+    let unknown = rig
+        .execute("mutation { setTorrentRateLimits(id: 999999, upload: 1) }")
+        .await;
+    assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"));
+}

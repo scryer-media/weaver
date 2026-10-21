@@ -1542,6 +1542,8 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       ratio
       downloadBps
       uploadBps
+      uploadLimit
+      downloadLimit
       etaSeconds
       peers
       seeds
@@ -1623,6 +1625,20 @@ export const TORRENT_PEERS_QUERY = gql`
 export const BAN_TORRENT_PEER_MUTATION = gql`
   mutation BanTorrentPeer($id: Int!, $address: String!) {
     banTorrentPeer(id: $id, address: $address)
+  }
+`;
+
+/** A torrent's own upload limit in bytes per second; null is unlimited. Its download limit is kept. */
+export const SET_TORRENT_UPLOAD_LIMIT_MUTATION = gql`
+  mutation SetTorrentUploadLimit($id: Int!, $upload: Int) {
+    setTorrentRateLimits(id: $id, upload: $upload)
+  }
+`;
+
+/** A torrent's own download limit in bytes per second; null is unlimited. Its upload limit is kept. */
+export const SET_TORRENT_DOWNLOAD_LIMIT_MUTATION = gql`
+  mutation SetTorrentDownloadLimit($id: Int!, $download: Int) {
+    setTorrentRateLimits(id: $id, download: $download)
   }
 `;
 

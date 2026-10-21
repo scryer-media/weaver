@@ -1026,3 +1026,20 @@ scope = "all"
 kind = "rust"
 hook_id = "fill_tracker_hosts_v81"
 scope = "upgrade_only"
+
+[[migration]]
+version = 82
+description = "a torrent keeps its own upload and download limits"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0082_torrent_rate_limits/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0082_torrent_rate_limits/postgres.sql"
+engine = "postgres"
+scope = "all"

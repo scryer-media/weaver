@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tower::ServiceExt;
 
@@ -394,6 +394,8 @@ fn view(state: TorrentState) -> TorrentView {
         ratio: 0.0,
         download_bps: 0,
         upload_bps: 0,
+        upload_limit: None,
+        download_limit: None,
         eta_seconds: None,
         peers: 0,
         seeds: 0,
@@ -1638,6 +1640,137 @@ async fn share_limits_are_set_on_add_and_after() {
         .post("/api/v2/torrents/setShareLimits", &limits("ratioLimit=-3"))
         .await;
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+}
+
+// Each limit is set alone and read back as the client reads it: 0 and any
+// negative number are no limit, which the list and the map read as 0 and
+// the properties as -1; a hash no torrent has reads -1.
+#[tokio::test]
+async fn a_torrents_rate_limits_are_set_and_read_back() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    rig.add_file(&metainfo("two.mkv", 3000, false), &[]).await;
+    let mut hashes: Vec<String> = rig
+        .torrents()
+        .await
+        .iter()
+        .map(|torrent| torrent["hash"].as_str().unwrap().to_owned())
+        .collect();
+    hashes.sort();
+    let (one, two) = (hashes[0].clone(), hashes[1].clone());
+    let row =
+        |rows: Vec<Value>, hash: &str| rows.into_iter().find(|row| row["hash"] == hash).unwrap();
+    let missing = "cd".repeat(20);
+
+    let first = row(rig.torrents().await, &one);
+    assert_eq!(
+        (first["up_limit"].clone(), first["dl_limit"].clone()),
+        (json!(0), json!(0))
+    );
+
+    let set = rig
+        .post(
+            "/api/v2/torrents/setUploadLimit",
+            &format!("hashes={one}&limit=65536"),
+        )
+        .await;
+    assert_eq!(set.status, StatusCode::OK);
+    rig.post(
+        "/api/v2/torrents/setDownloadLimit",
+        &format!("hashes={one}|{two}&limit=1048576"),
+    )
+    .await;
+    let first = row(rig.torrents().await, &one);
+    assert_eq!(first["up_limit"], 65_536);
+    assert_eq!(first["dl_limit"], 1_048_576);
+    let second = row(rig.torrents().await, &two);
+    assert_eq!(second["up_limit"], 0);
+    assert_eq!(second["dl_limit"], 1_048_576);
+
+    // The map is keyed by each hash as it was sent.
+    let upper = one.to_ascii_uppercase();
+    let upload = rig
+        .post(
+            "/api/v2/torrents/uploadLimit",
+            &format!("hashes={upper}|{two}|{missing}"),
+        )
+        .await
+        .json();
+    assert_eq!(upload, json!({ &upper: 65_536, &two: 0, &missing: -1 }));
+    let download = rig
+        .post("/api/v2/torrents/downloadLimit", "hashes=all")
+        .await
+        .json();
+    assert_eq!(download, json!({ &one: 1_048_576, &two: 1_048_576 }));
+
+    let properties = rig
+        .get(&format!("/api/v2/torrents/properties?hash={two}"))
+        .await
+        .json();
+    assert_eq!(properties["up_limit"], -1);
+    assert_eq!(properties["dl_limit"], 1_048_576);
+
+    // 0 and -1 are both no limit, and `all` reaches every torrent.
+    rig.post("/api/v2/torrents/setDownloadLimit", "hashes=all&limit=0")
+        .await;
+    rig.post(
+        "/api/v2/torrents/setUploadLimit",
+        &format!("hashes={one}&limit=-1"),
+    )
+    .await;
+    let all = rig
+        .post("/api/v2/torrents/downloadLimit", "hashes=all")
+        .await
+        .json();
+    assert_eq!(all, json!({ &one: 0, &two: 0 }));
+    let properties = rig
+        .get(&format!("/api/v2/torrents/properties?hash={one}"))
+        .await
+        .json();
+    assert_eq!(
+        (
+            properties["up_limit"].clone(),
+            properties["dl_limit"].clone()
+        ),
+        (json!(-1), json!(-1))
+    );
+
+    let invalid = rig
+        .post(
+            "/api/v2/torrents/setUploadLimit",
+            &format!("hashes={one}&limit=fast"),
+        )
+        .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+}
+
+// A torrent held closed has no reading the client knows: its field and its
+// entry are left out, never read as no limit.
+#[tokio::test]
+async fn a_closed_torrent_limit_is_never_read_as_no_limit() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let torrents = rig.context.inner.torrents.as_ref().unwrap();
+    let job_id = torrents.torrents(None).await[0].job_id;
+    torrents
+        .set_rate_limits(job_id, Some(Some(0)), None)
+        .await
+        .unwrap();
+    let row = &rig.torrents().await[0];
+    assert!(row.get("up_limit").is_none());
+    assert_eq!(row["dl_limit"], 0);
+    let hash = row["hash"].as_str().unwrap().to_owned();
+    let upload = rig
+        .post("/api/v2/torrents/uploadLimit", &format!("hashes={hash}"))
+        .await
+        .json();
+    assert_eq!(upload, json!({}));
+    let properties = rig
+        .get(&format!("/api/v2/torrents/properties?hash={hash}"))
+        .await
+        .json();
+    assert!(properties.get("up_limit").is_none());
+    assert_eq!(properties["dl_limit"], -1);
 }
 
 #[tokio::test]

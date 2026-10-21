@@ -95,6 +95,9 @@ export interface TorrentData extends TorrentSummaryData {
   uploadedBytes: number;
   downloadedBytes: number;
   downloadBps: number;
+  /** The torrent's own limits in bytes per second; null is unlimited and 0 closed. */
+  uploadLimit: number | null;
+  downloadLimit: number | null;
   etaSeconds: number | null;
   peers: number;
   seeds: number;

@@ -2057,6 +2057,12 @@ type MutationRoot {
 	"""
 	banTorrentPeer(id: Int!, address: String!): Boolean!
 	"""
+	The torrent's own upload and download limits in bytes per second,
+	in force on its peers at once; null is unlimited and 0 closes that
+	direction. A limit left out is kept.
+	"""
+	setTorrentRateLimits(id: Int!, upload: Int, download: Int): Boolean!
+	"""
 	The torrent's own seeding policy; null returns it to its category's
 	and the global one.
 	"""
@@ -4917,6 +4923,16 @@ type Torrent {
 	ratio: Float!
 	downloadBps: Int!
 	uploadBps: Int!
+	"""
+	The torrent's own upload limit in bytes per second; null is
+	unlimited and 0 closed.
+	"""
+	uploadLimit: Int
+	"""
+	The torrent's own download limit in bytes per second; null is
+	unlimited and 0 closed.
+	"""
+	downloadLimit: Int
 	etaSeconds: Int
 	peers: Int!
 	seeds: Int!

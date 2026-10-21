@@ -35,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 81;
+const CURRENT_SCHEMA_VERSION: i64 = 82;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1654,6 +1654,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hosts, ["tracker.invalid", "xn--bcher-kva.invalid"]);
+        pool.close().await;
+    }
+
+    // Migration 82 gives each torrent its own upload and download limits: a
+    // fresh database has them, and an existing torrent is unlimited both
+    // ways.
+    #[tokio::test]
+    async fn sqlite_migration_82_gives_torrents_their_own_rate_limits() {
+        let columns = ["upload_limit", "download_limit"];
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+
+        let fresh = open_test_pool(&temp.path().join("fresh.db")).await;
+        replay_catalog_into_fresh_db(&fresh, &catalog, &payload, None, true)
+            .await
+            .unwrap();
+        assert_eq!(pragma_column_count(&fresh, "torrents", &columns).await, 2);
+        fresh.close().await;
+
+        let db_path = temp.path().join("pre-rate-limits.db");
+        let pool = open_test_pool(&db_path).await;
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(81), true)
+            .await
+            .unwrap();
+        assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
+        sqlx::query(
+            "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
+             VALUES (7, ?, 'limits', 'magnet', 1, 'queued')",
+        )
+        .bind(vec![7_u8; 20])
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 2);
+        let row: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT name, upload_limit, download_limit FROM torrents WHERE job_id = 7",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, ("limits".to_string(), None, None));
         pool.close().await;
     }
 

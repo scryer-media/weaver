@@ -181,6 +181,12 @@ pub struct Torrent {
     pub ratio: f64,
     pub download_bps: u64,
     pub upload_bps: u64,
+    /// The torrent's own upload limit in bytes per second; null is
+    /// unlimited and 0 closed.
+    pub upload_limit: Option<u64>,
+    /// The torrent's own download limit in bytes per second; null is
+    /// unlimited and 0 closed.
+    pub download_limit: Option<u64>,
     pub eta_seconds: Option<u64>,
     pub peers: u32,
     pub seeds: u32,
@@ -262,6 +268,8 @@ impl From<TorrentView> for Torrent {
             ratio: view.ratio,
             download_bps: view.download_bps,
             upload_bps: view.upload_bps,
+            upload_limit: view.upload_limit,
+            download_limit: view.download_limit,
             eta_seconds: view.eta_seconds,
             peers: view.peers,
             seeds: view.seeds,

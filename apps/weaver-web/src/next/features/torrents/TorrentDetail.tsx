@@ -5,24 +5,28 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useSubscription } from "urql";
 import {
   BAN_TORRENT_PEER_MUTATION,
+  SET_TORRENT_DOWNLOAD_LIMIT_MUTATION,
   SET_TORRENT_SEEDING_MUTATION,
+  SET_TORRENT_UPLOAD_LIMIT_MUTATION,
   TORRENT_PEERS_QUERY,
   TORRENT_UPDATES_SUBSCRIPTION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { torrentErrorText, type TorrentData, type TorrentPeerData } from "@/lib/torrents";
+import { torrentErrorText, type TorrentActionError, type TorrentData, type TorrentPeerData } from "@/lib/torrents";
 import { DetailBlock, Field } from "@/next/components/chrome";
 import { SecondaryButton } from "@/next/components/controls";
 import { RecordEditor } from "@/next/components/RecordEditor";
 import { GridRow } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
+import { LimitControl } from "@/next/features/networking/limits";
 import { informationFields, transferFields, type TorrentField } from "@/next/features/torrents/general";
 import { countLabel } from "@/next/i18n/labels";
 import { EMPTY_SEEDING, durationText, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
 const TRACKER_COLUMNS = { base: "minmax(0,1fr) 112px", sm: "minmax(0,1fr) 112px minmax(0,1fr)" };
 const FILE_COLUMNS = { base: "minmax(0,1fr) 56px 90px" };
+const LIMIT_COLUMNS = { base: "minmax(0,1fr) max-content" };
 const PEER_COLUMNS = {
   base: "minmax(0,1fr) 56px max-content",
   sm: "minmax(0,1fr) minmax(0,1fr) 56px 90px 90px max-content",
@@ -162,7 +166,45 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
   );
 }
 
-/** A torrent job's own blocks on the job's screen: its transfer, its information, how it seeds, its trackers, its peers and its files. */
+/**
+ * The torrent's own download and upload limits, each set as it changes; off
+ * is unlimited.
+ */
+function LimitsBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (message: string) => void }) {
+  const t = useTranslate();
+  const [, setUpload] = useMutation(SET_TORRENT_UPLOAD_LIMIT_MUTATION);
+  const [, setDownload] = useMutation(SET_TORRENT_DOWNLOAD_LIMIT_MUTATION);
+  // Each control sends its own limit alone; the server keeps the other.
+  const report = (result: { error?: TorrentActionError }) => {
+    if (result.error) {
+      onReport(torrentErrorText(result.error));
+    }
+  };
+  const rows = [
+    {
+      label: t("next.torrent.downloadLimit"),
+      value: torrent.downloadLimit,
+      set: (download: number | null) => void setDownload({ id: torrent.id, download }).then(report),
+    },
+    {
+      label: t("next.torrent.uploadLimit"),
+      value: torrent.uploadLimit,
+      set: (upload: number | null) => void setUpload({ id: torrent.id, upload }).then(report),
+    },
+  ];
+  return (
+    <DetailBlock id="limits" title={t("next.torrent.limits")}>
+      {rows.map((row) => (
+        <GridRow key={row.label} columns={LIMIT_COLUMNS} gap={14} className="min-h-[46px] border-t border-wv-hairline">
+          <span className="min-w-0 truncate text-[12.5px] text-wv-fg">{row.label}</span>
+          <LimitControl label={row.label} value={row.value} onChange={row.set} />
+        </GridRow>
+      ))}
+    </DetailBlock>
+  );
+}
+
+/** A torrent job's own blocks on the job's screen: its transfer, its limits, its information, how it seeds, its trackers, its peers and its files. */
 export function TorrentDetail({
   torrent,
   onChanged,
@@ -194,6 +236,8 @@ export function TorrentDetail({
       <DetailBlock id="transfer" title={t("next.torrent.transfer")} note={torrent.detail ?? undefined}>
         <GeneralGrid fields={transferFields(t, torrent)} />
       </DetailBlock>
+
+      <LimitsBlock torrent={torrent} onReport={onReport} />
 
       <DetailBlock id="information" title={t("next.torrent.information")}>
         <GeneralGrid fields={informationFields(t, torrent)} />

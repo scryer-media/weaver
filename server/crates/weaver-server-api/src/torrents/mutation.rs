@@ -3,7 +3,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use async_graphql::{Context, Object, Result};
+use async_graphql::{Context, MaybeUndefined, Object, Result};
 use base64::Engine;
 use weaver_server_core::SchedulerHandle;
 use weaver_server_core::jobs::ids::JobId;
@@ -199,6 +199,24 @@ impl TorrentsMutation {
             .map_err(|_| graphql_error("INVALID_INPUT", "address is not an IP address"))?;
         service(ctx)?
             .ban_peers(JobId(id), &[ip])
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
+    /// The torrent's own upload and download limits in bytes per second,
+    /// in force on its peers at once; null is unlimited and 0 closes that
+    /// direction. A limit left out is kept.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_torrent_rate_limits(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        upload: MaybeUndefined<u64>,
+        download: MaybeUndefined<u64>,
+    ) -> Result<bool> {
+        service(ctx)?
+            .set_rate_limits(JobId(id), upload.into(), download.into())
             .await
             .map_err(action_error)?;
         Ok(true)

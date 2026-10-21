@@ -387,7 +387,11 @@ enum Need {
 fn need(group: &str, action: &str) -> Option<Need> {
     Some(match (group, action) {
         ("app", "version" | "webapiVersion" | "buildInfo" | "preferences" | "defaultSavePath")
-        | ("torrents", "info" | "properties" | "files" | "trackers" | "categories" | "tags")
+        | (
+            "torrents",
+            "info" | "properties" | "files" | "trackers" | "categories" | "tags" | "uploadLimit"
+            | "downloadLimit",
+        )
         | ("sync", "maindata" | "torrentPeers")
         | ("transfer", "info")
         | ("log", "main") => Need::Read,
@@ -397,7 +401,8 @@ fn need(group: &str, action: &str) -> Option<Need> {
             "torrents",
             "add" | "delete" | "pause" | "stop" | "resume" | "start" | "setCategory"
             | "setForceStart" | "createCategory" | "setLocation" | "setShareLimits" | "topPrio"
-            | "addTags" | "removeTags" | "recheck" | "reannounce",
+            | "addTags" | "removeTags" | "recheck" | "reannounce" | "setUploadLimit"
+            | "setDownloadLimit",
         ) => Need::Control,
         _ => return None,
     })
@@ -531,6 +536,14 @@ async fn handle(
         }
         ("torrents", "createCategory") => create_category(&ctx, &params).await,
         ("torrents", "setShareLimits") => set_share_limits(&ctx, &params).await,
+        ("torrents", "uploadLimit") => rate_limits(&ctx, &params, |view| view.upload_limit).await,
+        ("torrents", "downloadLimit") => {
+            rate_limits(&ctx, &params, |view| view.download_limit).await
+        }
+        ("torrents", "setUploadLimit") => set_rate_limit(&ctx, &params, Direction::Upload).await,
+        ("torrents", "setDownloadLimit") => {
+            set_rate_limit(&ctx, &params, Direction::Download).await
+        }
         ("torrents", "topPrio") => text(StatusCode::CONFLICT, "queueing is off"),
         ("torrents", "setLocation") => {
             let Some(location) = params
@@ -714,11 +727,18 @@ pub(super) fn info(view: &TorrentView) -> Value {
         ("super_seeding", json!(false)),
         ("seq_dl", json!(false)),
         ("f_l_piece_prio", json!(false)),
-        ("dl_limit", json!(-1)),
-        ("up_limit", json!(-1)),
         ("tracker", json!("")),
         ("magnet_uri", json!(view.magnet)),
     ]);
+    // The limits as the client keeps them, 0 for none.
+    fields = with_limits(
+        fields,
+        0,
+        [
+            ("dl_limit", view.download_limit),
+            ("up_limit", view.upload_limit),
+        ],
+    );
     if let Some(fields) = fields.as_object_mut() {
         fields.extend(
             share_limits(view)
@@ -801,7 +821,7 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         return not_found();
     };
     let (save_path, content_path) = view.paths();
-    axum::Json(object([
+    let fields = object([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
         (
             "infohash_v1",
@@ -840,8 +860,6 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("total_uploaded_session", json!(view.uploaded_bytes)),
         ("total_downloaded", json!(view.downloaded_bytes)),
         ("total_downloaded_session", json!(view.downloaded_bytes)),
-        ("up_limit", json!(-1)),
-        ("dl_limit", json!(-1)),
         ("time_elapsed", json!(view.active_seconds)),
         ("nb_connections", json!(view.peers)),
         ("nb_connections_limit", json!(view.max_peers)),
@@ -868,8 +886,17 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("seeds", json!(view.seeds)),
         ("seeds_total", json!(view.swarm_seeds.unwrap_or(view.seeds))),
         ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
-    ]))
-    .into_response()
+    ]);
+    // The properties read no limit as -1, where the list reads it as 0.
+    let fields = with_limits(
+        fields,
+        -1,
+        [
+            ("up_limit", view.upload_limit),
+            ("dl_limit", view.download_limit),
+        ],
+    );
+    axum::Json(fields).into_response()
 }
 
 async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
@@ -1154,19 +1181,91 @@ where
     ok()
 }
 
-// The limits as the client reads them, where 0 is no limit. A cap that lets
-// nothing through has no such number, so its field is left out.
-fn with_limits(mut fields: Value, limits: [(&str, Option<u64>); 2]) -> Value {
+// The limits as the client reads them, where `unlimited` is no limit. A cap
+// that lets nothing through has no such number, so its field is left out.
+fn with_limits(mut fields: Value, unlimited: i64, limits: [(&str, Option<u64>); 2]) -> Value {
     if let Some(fields) = fields.as_object_mut() {
         for (name, bps) in limits {
-            match bps {
-                None => fields.insert(name.to_owned(), json!(0)),
-                Some(0) => None,
-                Some(bps) => fields.insert(name.to_owned(), json!(bps)),
-            };
+            if let Some(limit) = client_limit(bps, unlimited) {
+                fields.insert(name.to_owned(), limit);
+            }
         }
     }
     fields
+}
+
+// A limit as the client reads it: `None` is `unlimited`, and a closed limit
+// has no reading.
+fn client_limit(bps: Option<u64>, unlimited: i64) -> Option<Value> {
+    match bps {
+        None => Some(json!(unlimited)),
+        Some(0) => None,
+        Some(bps) => Some(json!(bps)),
+    }
+}
+
+// One limit of each torrent `hashes` names, keyed by the hash as it was
+// sent: 0 is no limit and -1 a hash no torrent has. A closed limit has no reading and is
+// left out, as in the rows.
+async fn rate_limits(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    limit: impl Fn(&TorrentView) -> Option<u64>,
+) -> Response {
+    let views = ctx.views().await;
+    let reading = |view: &TorrentView| client_limit(limit(view), 0);
+    let map: Map<String, Value> = if names_all(params) {
+        views
+            .iter()
+            .filter_map(|view| Some((view.infohash.to_ascii_lowercase(), reading(view)?)))
+            .collect()
+    } else {
+        params
+            .get("hashes")
+            .unwrap_or_default()
+            .split('|')
+            .filter_map(|hash| {
+                let reading = match views
+                    .iter()
+                    .find(|view| view.infohash.eq_ignore_ascii_case(hash.trim()))
+                {
+                    Some(view) => reading(view)?,
+                    None => json!(-1),
+                };
+                Some((hash.to_owned(), reading))
+            })
+            .collect()
+    };
+    axum::Json(map).into_response()
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    Upload,
+    Download,
+}
+
+// Sets one limit on each torrent `hashes` names; the other is left as it
+// is. The client's 0 and any negative number are no limit.
+async fn set_rate_limit(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    direction: Direction,
+) -> Response {
+    let Some(Ok(limit)) = params.get("limit").map(|limit| limit.trim().parse::<i64>()) else {
+        return text(StatusCode::BAD_REQUEST, "limit is not a number");
+    };
+    let limit = Some(u64::try_from(limit).ok().filter(|limit| *limit > 0));
+    let (upload, download) = match direction {
+        Direction::Upload => (limit, None),
+        Direction::Download => (None, limit),
+    };
+    each(ctx, params, move |torrents, view| async move {
+        torrents
+            .set_rate_limits(view.job_id, upload, download)
+            .await
+    })
+    .await
 }
 
 // `dht` is whether any torrent route carries it: a client reads it before
@@ -1223,6 +1322,7 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
     });
     with_limits(
         fields,
+        0,
         [
             ("dl_limit", bandwidth.download_bps),
             ("up_limit", bandwidth.upload_bps),
@@ -1452,6 +1552,7 @@ fn transfer(views: &[TorrentView], download: Option<u64>, upload: Option<u64>) -
     });
     with_limits(
         fields,
+        0,
         [("dl_rate_limit", download), ("up_rate_limit", upload)],
     )
 }

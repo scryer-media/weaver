@@ -86,6 +86,8 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptI64(torrent.tracker_rule_id.map(i64::from)),
         SqlArg::OptBool(torrent.unpack),
         SqlArg::OptText(metadata),
+        SqlArg::OptI64(torrent.upload_limit.map(stored).transpose()?),
+        SqlArg::OptI64(torrent.download_limit.map(stored).transpose()?),
     ])
 }
 
@@ -145,7 +147,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO torrents ({TORRENT_COLUMNS})
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &torrent_args,
                     )
@@ -443,6 +445,36 @@ impl Database {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE torrents SET storage_dir = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The torrent's own upload and download limits in bytes per second:
+    // `None` keeps a limit as it is, `Some(None)` is unlimited and zero
+    // closed. Returns whether the torrent exists.
+    pub fn set_torrent_rate_limits(
+        &self,
+        job_id: JobId,
+        upload: Option<Option<u64>>,
+        download: Option<Option<u64>>,
+    ) -> Result<bool, StateError> {
+        let mut args = Vec::new();
+        for limit in [upload, download] {
+            args.push(SqlArg::I64(i64::from(limit.is_some())));
+            args.push(SqlArg::OptI64(limit.flatten().map(stored).transpose()?));
+        }
+        args.push(SqlArg::I64(stored(job_id.0)?));
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET \
+                 upload_limit = CASE WHEN {} = 1 THEN {} ELSE upload_limit END, \
+                 download_limit = CASE WHEN {} = 1 THEN {} ELSE download_limit END \
+                 WHERE job_id = {}",
                 &args,
             )
             .await?;

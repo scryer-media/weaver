@@ -12,7 +12,7 @@ use crate::torrents::{
 
 pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
      private, category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
-     policy_override, tracker_rule_id, unpack, metadata";
+     policy_override, tracker_rule_id, unpack, metadata, upload_limit, download_limit";
 
 fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
     StateError::Database(format!("stored torrent {what} is not valid: {value}"))
@@ -29,6 +29,12 @@ fn hash<const N: usize>(row: &SqlRow, column: &str) -> Result<Option<[u8; N]>, S
 fn count(row: &SqlRow, column: &str) -> Result<u64, StateError> {
     let value = row.i64(column)?;
     u64::try_from(value).map_err(|_| corrupt(column, value))
+}
+
+fn opt_u64(row: &SqlRow, column: &str) -> Result<Option<u64>, StateError> {
+    row.opt_i64(column)?
+        .map(|value| u64::try_from(value).map_err(|_| corrupt(column, value)))
+        .transpose()
 }
 
 fn opt_u32(row: &SqlRow, column: &str) -> Result<Option<u32>, StateError> {
@@ -67,6 +73,8 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         tracker_rule_id: opt_u32(row, "tracker_rule_id")?,
         unpack: row.opt_bool("unpack")?,
         metadata,
+        upload_limit: opt_u64(row, "upload_limit")?,
+        download_limit: opt_u64(row, "download_limit")?,
     })
 }
 

@@ -28,6 +28,8 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         tracker_rule_id: None,
         unpack: None,
         metadata: Vec::new(),
+        upload_limit: None,
+        download_limit: None,
     }
 }
 
@@ -79,6 +81,8 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
         action: SeedingAction::RemoveWithData,
         max_upload_bps: Some(1_000_000),
     });
+    record.upload_limit = Some(0);
+    record.download_limit = Some(5_000_000_000);
 
     assert_eq!(
         db.insert_torrent(&record, &files(), &trackers()).unwrap(),
@@ -106,6 +110,39 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
         })
     );
     assert_eq!(db.get_torrent(JobId(8)).unwrap(), None);
+}
+
+#[test]
+fn rate_limits_update_in_place() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(3, Some([3; 20]), None), &[], &[])
+        .unwrap();
+    let limits = |db: &Database| {
+        let stored = db.get_torrent(JobId(3)).unwrap().unwrap();
+        (stored.upload_limit, stored.download_limit)
+    };
+    assert_eq!(limits(&db), (None, None));
+
+    assert!(
+        db.set_torrent_rate_limits(JobId(3), Some(Some(65_536)), Some(Some(0)))
+            .unwrap()
+    );
+    assert_eq!(limits(&db), (Some(65_536), Some(0)));
+    // A direction left out is kept.
+    assert!(
+        db.set_torrent_rate_limits(JobId(3), Some(None), None)
+            .unwrap()
+    );
+    assert_eq!(limits(&db), (None, Some(0)));
+    assert!(
+        db.set_torrent_rate_limits(JobId(3), None, Some(None))
+            .unwrap()
+    );
+    assert_eq!(limits(&db), (None, None));
+    assert!(
+        !db.set_torrent_rate_limits(JobId(4), Some(Some(1)), None)
+            .unwrap()
+    );
 }
 
 #[test]
