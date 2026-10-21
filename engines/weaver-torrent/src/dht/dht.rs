@@ -17,7 +17,7 @@ use std::{
 
 use crate::bencode::ByteBufOwned;
 use crate::dht::{
-    DHT_ANNOUNCE_INTERVAL, Error, INACTIVITY_TIMEOUT, REQUERY_INTERVAL, RESPONSE_TIMEOUT,
+    DHT_ANNOUNCE_INTERVAL, Error, INACTIVITY_TIMEOUT, RESPONSE_TIMEOUT,
     bprotocol::{
         self, AnnouncePeer, CompactNodeInfo, CompactNodeInfoOwned, ErrorDescription,
         FindNodeRequest, GetPeersRequest, Message, MessageKind, Node, PingRequest, Response, Want,
@@ -311,8 +311,6 @@ trait RecursiveRequestCallbacks: Sized + Send + Sync + 'static {
 
 struct RecursiveRequestCallbacksGetPeers {
     announce_port: Option<u16>,
-    // When a search last announced us.
-    announced: parking_lot::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
@@ -327,18 +325,13 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
     ) {
     }
 
-    // Every DHT_ANNOUNCE_INTERVAL, the search that ends announces us to the k
-    // closest nodes that gave it a token (libtorrent `node::announce`, whose
-    // get_peers traversal ends in `announce_fun`).
+    // A search that ends announces us to the k closest nodes that gave it a
+    // token (libtorrent `node::announce`, whose get_peers traversal ends in
+    // `announce_fun`).
     fn on_search_end(&self, req: &RecursiveRequest<Self>, candidates: &Candidates) {
         let Some(port) = self.announce_port else {
             return;
         };
-        let now = tokio::time::Instant::now();
-        let mut announced = self.announced.lock();
-        if announced.is_some_and(|at| now < at + DHT_ANNOUNCE_INTERVAL) {
-            return;
-        }
         for (addr, token) in candidates.token_holders() {
             let (tid, message) = req.dht.create_request(
                 Request::Announce {
@@ -353,7 +346,6 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
                 message,
                 addr,
             });
-            *announced = Some(now);
         }
     }
 }
@@ -485,16 +477,17 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
             request: Request::GetPeers(info_hash),
             dht,
             peer_tx,
-            callbacks: RecursiveRequestCallbacksGetPeers {
-                announce_port,
-                announced: parking_lot::Mutex::new(None),
-            },
+            callbacks: RecursiveRequestCallbacksGetPeers { announce_port },
         }
     }
 
-    // One search at a time, from the closest nodes of the routing table, again
-    // every minute, or sooner while the table is short of nodes. A search
-    // announces us when it ends, every DHT_ANNOUNCE_INTERVAL.
+    // One search at a time, from the closest nodes of the routing table: the
+    // first as soon as the torrent asks for peers, that is when the stream
+    // starts, then one every DHT_ANNOUNCE_INTERVAL. Each announces us when it
+    // ends (libtorrent `torrent::start_announcing` asks
+    // `session_impl::prioritize_dht` for a search at once, and
+    // `session_impl::on_dht_announce` gives every torrent its
+    // `torrent::dht_announce` once a `dht_announce_interval`).
     fn request_peers_forever(self: Arc<Self>, is_v4: bool) -> tokio::task::JoinHandle<()> {
         spawn::<Error>(
             debug_span!(parent: None, "get_peers", is_v4, info_hash = format!("{:?}", self.info_hash)),
@@ -502,17 +495,13 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
             async move {
                 loop {
                     let seeds = self.closest_known(is_v4);
-                    let known = seeds.len();
-                    if known > 0 {
-                        let outcome = self.search(seeds.into_iter()).await?;
-                        trace!(?outcome, "search finished");
+                    if seeds.is_empty() {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
-                    let pause = match known {
-                        0 => Duration::from_secs(1),
-                        n if n < SEARCH_K => REQUERY_INTERVAL / SEARCH_K as u32 * n as u32,
-                        _ => REQUERY_INTERVAL,
-                    };
-                    tokio::time::sleep(pause).await;
+                    let outcome = self.search(seeds.into_iter()).await?;
+                    trace!(?outcome, "search finished");
+                    tokio::time::sleep(DHT_ANNOUNCE_INTERVAL).await;
                 }
             },
         )
@@ -2217,12 +2206,13 @@ mod tests {
         .unwrap();
     }
 
-    // libtorrent `dht_announce_interval`: searches go on every minute, and one
-    // in fifteen minutes ends in an announce.
+    // libtorrent `torrent::start_announcing` / `session_impl::prioritize_dht`
+    // and `dht_announce_interval`: a torrent searches as it starts, then every
+    // fifteen minutes, and every search ends in an announce.
     #[tokio::test(start_paused = true)]
-    async fn test_peers_are_searched_every_minute_and_announced_every_fifteen() {
+    async fn test_peers_are_searched_and_announced_every_fifteen_minutes() {
         use crate::core::hash_id::Id20;
-        use crate::dht::{DHT_ANNOUNCE_INTERVAL, REQUERY_INTERVAL};
+        use crate::dht::DHT_ANNOUNCE_INTERVAL;
         use std::collections::BTreeMap;
 
         let (dht, mut sent) = fixture_dht();
@@ -2262,7 +2252,7 @@ mod tests {
 
         assert_eq!(
             searched,
-            (0..=30).map(|n| (REQUERY_INTERVAL * n, 8)).collect()
+            (0..=2).map(|n| (DHT_ANNOUNCE_INTERVAL * n, 8)).collect()
         );
         assert_eq!(
             announced,
