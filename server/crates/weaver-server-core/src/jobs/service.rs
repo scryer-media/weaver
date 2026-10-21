@@ -1720,13 +1720,15 @@ impl Pipeline {
             return Err(crate::SchedulerError::JobExists(request.job_id));
         }
         // The status the job goes back to when unpaused: the stored one, else
-        // the one its stored download and post states name. Read here once,
-        // so the job installs with it whether its restore succeeds or blocks.
+        // the one its stored resume lanes name, else the one its lanes at
+        // shutdown name. Read here once, so the job installs with it whether
+        // its restore succeeds or blocks.
         request.paused_resume_status = Self::normalize_paused_resume_status(
             request.paused_resume_status.take().or_else(|| {
                 request
                     .paused_resume_download_state
                     .zip(request.paused_resume_post_state)
+                    .or(request.download_state.zip(request.post_state))
                     .map(|(download_state, post_state)| {
                         crate::jobs::model::derive_legacy_job_status(
                             download_state,
@@ -1768,13 +1770,6 @@ impl Pipeline {
                 tracing::warn!(%error, job_id = job_id.0, "could not load blocked job support facts");
                 Default::default()
             });
-        let resume = request.paused_resume_status.clone().unwrap_or_else(|| {
-            if matches!(request.status, JobStatus::Paused) {
-                JobStatus::Downloading
-            } else {
-                request.status.clone()
-            }
-        });
         let floor = request
             .spec
             .files
@@ -1820,7 +1815,7 @@ impl Pipeline {
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms: request.queued_repair_at_epoch_ms,
             queued_extract_at_epoch_ms: request.queued_extract_at_epoch_ms,
-            paused_resume_status: Some(resume),
+            paused_resume_status: request.paused_resume_status.clone(),
             paused_resume_download_state: request.paused_resume_download_state,
             paused_resume_post_state: request.paused_resume_post_state,
             failure_error: Some(format!("Placement recovery blocked: {error}")),
