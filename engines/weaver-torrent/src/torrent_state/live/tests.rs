@@ -4,7 +4,7 @@
 //! peer, calling the handler as the connection would, and reads what the
 //! handler queues for the wire.
 
-use std::{collections::BTreeSet, future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin, sync::atomic::AtomicU32};
 
 use tempfile::TempDir;
 
@@ -12,7 +12,7 @@ use super::*;
 use crate::{
     AddTorrent, AddTorrentOptions, Session, SessionOptions,
     core::constants::CHUNK_SIZE,
-    storage::StorageFactory,
+    storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage},
     tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
     type_aliases::BF,
 };
@@ -47,6 +47,17 @@ impl Harness {
 
     // `have` is the bitfield of the pieces had, `slots` the upload slots.
     async fn build(name: &str, have: u8, slots: usize) -> Self {
+        Self::build_on(
+            name,
+            have,
+            slots,
+            MemoryStorageFactory::default().clone_box(),
+        )
+        .await
+    }
+
+    /// As [`Harness::build`], on the storage `storage` makes.
+    async fn build_on(name: &str, have: u8, slots: usize, storage: BoxStorageFactory) -> Self {
         let torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
             .await
             .unwrap();
@@ -63,7 +74,7 @@ impl Harness {
             .add_torrent(
                 AddTorrent::from_bytes(torrent.torrent.clone()),
                 Some(AddTorrentOptions {
-                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    storage_factory: Some(storage),
                     initial_have: Some(have),
                     ..Default::default()
                 }),
@@ -1401,4 +1412,156 @@ async fn choking_a_peer_starts_its_count_of_unservable_requests_again() {
     assert!(rx.is_empty());
     h.ask_unservable(peer, 1).await;
     assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+}
+
+/// A memory storage that refuses the next `refusals` pieces it is handed.
+#[derive(Clone, Default)]
+struct RefusingStorageFactory {
+    inner: MemoryStorageFactory,
+    refusals: Arc<AtomicU32>,
+}
+
+struct RefusingStorage {
+    inner: Box<dyn TorrentStorage>,
+    refusals: Arc<AtomicU32>,
+}
+
+impl StorageFactory for RefusingStorageFactory {
+    type Storage = RefusingStorage;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<RefusingStorage> {
+        Ok(RefusingStorage {
+            inner: Box::new(self.inner.create(shared, metadata)?),
+            refusals: self.refusals.clone(),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+impl TorrentStorage for RefusingStorage {
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.inner.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.inner.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.inner.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.inner.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(RefusingStorage {
+            inner: self.inner.take()?,
+            refusals: self.refusals.clone(),
+        }))
+    }
+
+    fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        let refuse = self
+            .refusals
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        anyhow::ensure!(!refuse, "no room for piece {piece:?}");
+        self.inner.on_piece_completed(piece)
+    }
+}
+
+impl Harness {
+    fn have(&self, index: u32) -> bool {
+        self.live
+            .lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .get_have_pieces()
+            .as_slice()[index as usize]
+    }
+}
+
+// libtorrent: the write completes before the hash job, and only then
+// `torrent::piece_passed`; on a disk error `torrent::on_piece_verified`
+// neither credits nor blames the senders.
+#[tokio::test]
+async fn a_piece_the_storage_refuses_is_not_had_and_is_downloaded_again() {
+    let storage = RefusingStorageFactory::default();
+    storage.refusals.store(1, Ordering::SeqCst);
+    let h = Harness::build_on(
+        "storage_refuses",
+        0x00,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+        storage.clone_box(),
+    )
+    .await;
+    tokio::time::pause();
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.take(&peer, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&peer, (0, chunk), false).await.unwrap();
+    }
+    assert!(!h.have(0));
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert!(h.queued_pieces().contains(&0));
+    assert_eq!(h.trust(&peer), (0, 0, false));
+    assert!(storage.inner.log.completed_pieces().is_empty());
+
+    // Taken the second time, it is ours.
+    h.take(&peer, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&peer, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.have(0));
+    assert_eq!(h.trust(&peer), (1, 0, false));
+    assert_eq!(storage.inner.log.completed_pieces(), vec![0]);
+}
+
+// A piece is counted into every file with bytes in it, an empty file among
+// them or not (libtorrent `torrent::we_have` updates every file the piece
+// maps to).
+#[test]
+fn a_piece_is_counted_into_every_file_past_an_empty_one() {
+    let file = |name: &str, piece_range: std::ops::Range<u32>| FileInfo {
+        relative_filename: name.into(),
+        offset_in_torrent: 0,
+        piece_range,
+        attrs: Default::default(),
+        len: 0,
+    };
+    let files = [
+        file("a", 0..1),
+        file("empty at the start of piece 1", 1..1),
+        file("b", 1..2),
+        file("empty inside piece 1", 1..1),
+        file("c", 1..3),
+        file("d", 3..4),
+    ];
+    let names = |piece| -> Vec<usize> { files_in_piece(&files, piece).map(|(i, _)| i).collect() };
+    assert_eq!(names(0), vec![0]);
+    assert_eq!(names(1), vec![2, 3, 4]);
+    assert_eq!(names(2), vec![4]);
+    assert_eq!(names(3), vec![5]);
 }

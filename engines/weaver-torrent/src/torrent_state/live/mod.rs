@@ -96,6 +96,7 @@ use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     connection_slots::ConnectionSlot,
+    file_info::FileInfo,
     file_ops::{FileOps, Verdict, inconsistent_hashes},
     limits::LimitKind,
     peer_connection::{
@@ -942,7 +943,8 @@ impl TorrentStateLive {
             || !self.is_finished_and_no_active_streams()
     }
 
-    /// The piece did not pass its hash check: it is downloaded again.
+    /// The piece did not pass its hash check, or the storage refused it: it
+    /// is downloaded again.
     fn requeue_piece(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         // Before it is queued again, so the storage has let go of the failed
         // bytes by the time another peer is handed the piece.
@@ -959,23 +961,13 @@ impl TorrentStateLive {
         Ok(())
     }
 
+    /// The piece, which the storage took, is had: it is counted into its
+    /// files (libtorrent `torrent::we_have`).
     fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {
-        if let Err(e) = self.files.on_piece_completed(id) {
-            debug!(?id, "file storage errored in on_piece_completed(): {e:#}");
-        }
         let mut g = self.lock_write("on_piece_completed");
         let locked = &mut **g;
         let pieces = locked.get_pieces_mut()?;
-
-        // if we have all the pieces of the file, reopen it read only
-        for (idx, file_info) in self
-            .metadata
-            .file_infos
-            .iter()
-            .enumerate()
-            .skip_while(|(_, fi)| !fi.piece_range.contains(&id.get()))
-            .take_while(|(_, fi)| fi.piece_range.contains(&id.get()))
-        {
+        for (idx, file_info) in files_in_piece(&self.metadata.file_infos, id.get()) {
             let _remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
         }
 
@@ -1154,6 +1146,18 @@ struct PeerHandler {
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
+}
+
+/// The files with bytes in piece `piece`, by index. Files are in torrent
+/// order, so they are the run from the first that ends past the piece to
+/// the last that starts in it. An empty file inside that run holds no piece
+/// and adds nothing, but does not end it.
+fn files_in_piece(file_infos: &[FileInfo], piece: u32) -> impl Iterator<Item = (usize, &FileInfo)> {
+    file_infos
+        .iter()
+        .enumerate()
+        .skip_while(move |(_, fi)| fi.piece_range.end <= piece)
+        .take_while(move |(_, fi)| fi.piece_range.start <= piece)
 }
 
 impl PeerConnectionHandler for &'_ PeerHandler {
@@ -2136,23 +2140,40 @@ impl PeerHandler {
                     return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
                 }
                 Verdict::Passed => {
-                    let failed = {
-                        let mut g = state.lock_write("mark_piece_downloaded");
-                        g.get_pieces_mut()?
-                            .mark_piece_hash_ok(chunk_info.piece_index);
-                        g.smart_ban.piece_passed(piece_index)
-                    };
+                    let failed = state
+                        .lock_write("smart_ban")
+                        .smart_ban
+                        .piece_passed(piece_index);
+                    // Before the storage takes the piece, while the good bytes
+                    // are still there to read back.
+                    for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
+                        state.peers.ban(sender);
+                    }
+                    // The piece is ours only once the storage has taken it
+                    // (libtorrent: the write completes before the hash job,
+                    // and only then `torrent::piece_passed`). One it refuses
+                    // is downloaded again, and its senders are neither
+                    // credited nor blamed: on a disk error libtorrent
+                    // `torrent::on_piece_verified` calls neither
+                    // `piece_passed` nor `piece_failed`.
+                    if let Err(e) = state.files.on_piece_completed(piece_index) {
+                        warn!(
+                            id = state.shared.id,
+                            info_hash = ?state.shared.info_hash,
+                            "the storage refused piece={index}: {e:#}"
+                        );
+                        return state.requeue_piece(piece_index);
+                    }
+                    state
+                        .lock_write("mark_piece_downloaded")
+                        .get_pieces_mut()?
+                        .mark_piece_hash_ok(piece_index);
                     // Every peer that sent a block of it earns a point and
                     // leaves parole (libtorrent `torrent::piece_passed`).
                     for peer in senders.participants() {
                         state
                             .peers
                             .with_peer_mut(peer, "piece_passed", |p| p.piece_passed());
-                    }
-                    // Before the storage is told the piece is complete, while
-                    // the good bytes are still there to read back.
-                    for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
-                        state.peers.ban(sender);
                     }
 
                     // Global piece counters.
