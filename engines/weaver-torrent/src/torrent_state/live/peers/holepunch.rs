@@ -8,7 +8,6 @@
 use std::net::{IpAddr, SocketAddr};
 
 use super::{Displace, PeerStates};
-use crate::peer_protocol::extended::ut_pex::PEX_HOLEPUNCH;
 use crate::torrent_state::live::peer::{Peer, PeerTx};
 
 impl PeerStates {
@@ -26,15 +25,6 @@ impl PeerStates {
             || Some(Peer::new_holepunched(addr)),
         );
         self.candidates_changed.notify_one();
-    }
-
-    /// A PEX message named the peer at `addr` with `flags`: one that speaks
-    /// the holepunch extension is marked so (libtorrent
-    /// `peer_list::add_peer`, `update_peer`).
-    pub fn pex_flags(&self, addr: SocketAddr, flags: u8) {
-        if flags & PEX_HOLEPUNCH != 0 {
-            self.with_peer_mut(addr, "pex_flags", |peer| peer.supports_holepunch = true);
-        }
     }
 
     /// The connection to `addr` failed, and the peer speaks the holepunch

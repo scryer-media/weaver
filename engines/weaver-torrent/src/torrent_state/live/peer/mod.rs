@@ -25,7 +25,9 @@ use tokio::sync::{
 use tokio::time::Instant;
 
 use crate::peer_connection::WriterRequest;
-use crate::peer_protocol::extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo};
+use crate::peer_protocol::extended::ut_pex::{
+    PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo,
+};
 use crate::stream_connect::{ConnectionKind, Transports};
 use crate::type_aliases::{BF, PeerSourceFlag};
 
@@ -508,6 +510,20 @@ impl Peer {
         self.encrypt = !encrypt;
         self.fast_reconnect = encrypt && self.fast_reconnects < MAX_FAST_RECONNECTS;
         encrypt
+    }
+
+    /// A PEX message named the peer with `flags`: one that speaks the
+    /// holepunch extension is marked so (libtorrent `peer_list::insert_peer`,
+    /// `update_peer`), and one the sender is connected to encrypted is
+    /// tried encrypted next (`insert_peer`; a known peer too, as ours start
+    /// at encrypted).
+    pub(crate) fn pex_flags(&mut self, flags: u8) {
+        if flags & PEX_HOLEPUNCH != 0 {
+            self.supports_holepunch = true;
+        }
+        if flags & PEX_ENCRYPTION != 0 {
+            self.encrypt = true;
+        }
     }
 
     /// The connection we made to the peer completed its handshake, the
@@ -1096,12 +1112,14 @@ impl LivePeerState {
             .collect()
     }
 
-    /// What our PEX messages say of the peer: a seed, connected over uTP,
-    /// speaking the holepunch extension (libtorrent `ut_pex_plugin::tick`).
-    /// Encryption is not flagged: the peer's state does not hold whether its
-    /// connection is encrypted.
+    /// What our PEX messages say of the peer: connected encrypted, a seed,
+    /// connected over uTP, speaking the holepunch extension (libtorrent
+    /// `ut_pex_plugin::tick`).
     pub fn advertised_pex_flags(&self) -> u8 {
         let mut flags = 0;
+        if self.encrypted {
+            flags |= PEX_ENCRYPTION;
+        }
         if self.seeder {
             flags |= PEX_SEED;
         }

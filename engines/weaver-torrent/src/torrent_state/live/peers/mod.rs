@@ -289,6 +289,12 @@ impl PeerStates {
         self.candidates_changed.notify_one();
     }
 
+    /// A PEX message named the peer at `addr` with `flags`; see
+    /// [`Peer::pex_flags`].
+    pub fn pex_flags(&self, addr: SocketAddr, flags: u8) {
+        self.with_peer_mut(addr, "pex_flags", |peer| peer.pex_flags(flags));
+    }
+
     /// A peer connected to us while every slot was taken. The connection goes,
     /// the peer stays: a known one is named again, as incoming, which forgives
     /// it no failure (libtorrent `peer_list::new_connection` leaves the
@@ -2219,5 +2225,49 @@ mod tests {
         );
         let tried = peers.with_peer_mut(a, "test", |peer| peer.encrypt_outgoing());
         assert_eq!(tried, Some(true));
+    }
+
+    // libtorrent `peer_list::insert_peer` sets `pe_support` on a PEX
+    // `pex_encryption` flag, and never clears it on a naming without one:
+    // a peer remembered as plaintext is tried encrypted again.
+    #[tokio::test(start_paused = true)]
+    async fn a_pex_naming_with_the_encryption_flag_points_a_peer_back_at_encryption() {
+        use crate::peer_protocol::extended::ut_pex::{PEX_ENCRYPTION, PEX_SEED};
+        let peers = make_peer_states();
+        let (named, unflagged) = (peer_addr(1), peer_addr(2));
+        let t0 = Instant::now();
+        for addr in [named, unflagged] {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+            assert!(attempt_at(&peers, addr, t0, Ends::Failed));
+            assert!(!attempt_at(&peers, addr, t0, Ends::Completed));
+        }
+
+        peers.pex_flags(named, PEX_ENCRYPTION);
+        peers.pex_flags(unflagged, PEX_SEED);
+        let t1 = due_after(&peers, t0);
+        assert!(attempt_at(&peers, named, t1, Ends::Completed));
+        assert!(!attempt_at(&peers, unflagged, t1, Ends::Completed));
+    }
+
+    // libtorrent `ut_pex_plugin::tick` flags `pex_encryption` for a peer
+    // whose connection is encrypted (`bt_peer_connection::supports_encryption`).
+    #[tokio::test(start_paused = true)]
+    async fn our_pex_flags_a_peer_whose_connection_is_encrypted() {
+        use crate::peer_protocol::extended::ut_pex::PEX_ENCRYPTION;
+        let peers = make_peer_states();
+        let (encrypted, plain) = (peer_addr(1), peer_addr(2));
+        let now = Instant::now();
+        for (addr, encrypt) in [(encrypted, true), (plain, false)] {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+            peers.with_peer_mut(addr, "test", |peer| {
+                peer.connect_if_due(now, &peers).expect("a due candidate");
+                peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
+                peer.outgoing_handshake(encrypt);
+            });
+        }
+
+        let listed = peers.pex_listed();
+        assert_eq!(listed[&encrypted] & PEX_ENCRYPTION, PEX_ENCRYPTION);
+        assert_eq!(listed[&plain] & PEX_ENCRYPTION, 0);
     }
 }

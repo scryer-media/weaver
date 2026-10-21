@@ -14,6 +14,8 @@ use crate::core::compact_ip::{
 use serde_derive::{Deserialize, Serialize};
 
 // libtorrent `pex_flags.hpp`: what a PEX message says of a peer it adds.
+/// Our connection to the peer is encrypted (libtorrent `pex_encryption`).
+pub const PEX_ENCRYPTION: u8 = 0x01;
 /// The peer is a seed (libtorrent `pex_seed`).
 pub const PEX_SEED: u8 = 0x02;
 /// We are connected to the peer over uTP (libtorrent `pex_utp`).
@@ -246,7 +248,9 @@ mod tests {
             .unwrap();
 
         let addrs = [a1, aa1, a2, aa2];
-        let added = addrs.iter().zip([PEX_SEED, PEX_UTP, 0, PEX_HOLEPUNCH]);
+        let added = addrs
+            .iter()
+            .zip([PEX_SEED | PEX_ENCRYPTION, PEX_UTP, 0, PEX_HOLEPUNCH]);
         let pex = UtPex::from_peers(
             added.map(|(&addr, flags)| PexPeerInfo { flags, addr }),
             addrs.iter().copied(),
@@ -261,7 +265,7 @@ mod tests {
         assert_eq!(
             addrs2,
             [
-                (a1, PEX_SEED),
+                (a1, PEX_SEED | PEX_ENCRYPTION),
                 (a2, 0),
                 (aa1, PEX_UTP),
                 (aa2, PEX_HOLEPUNCH)
