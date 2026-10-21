@@ -18,12 +18,12 @@ use crate::core::{
     peer_id::try_decode_peer_id,
 };
 use crate::peer_protocol::{
-    Handshake, Hashes, MAX_MSG_LEN, Message,
+    Handshake, Hashes, Message,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
     },
-    serialize_piece_preamble,
+    max_frame_len, serialize_piece_preamble,
 };
 use crate::{Error, Result, session::CheckedIncomingConnection, stream_connect::ConnectionKind};
 use futures::TryFutureExt;
@@ -71,6 +71,11 @@ pub trait PeerConnectionHandler {
     }
     fn client_name_and_version(&self) -> &str {
         crate::client_name_and_version()
+    }
+    /// The torrent's piece count once its metadata is known: it sets the
+    /// length of a bitfield, and so of the longest frame.
+    fn num_pieces(&self) -> Option<u32> {
+        None
     }
 }
 
@@ -153,7 +158,7 @@ struct ManagePeerArgs {
     handshake_supports_extended: bool,
     speaks_v2: bool,
     read_buf: ReadBuf,
-    write_buf: Box<[u8; MAX_MSG_LEN]>,
+    write_buf: Box<[u8]>,
     read: BoxAsyncReadVectored,
     write: BoxAsyncWrite,
     outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
@@ -212,7 +217,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             try_decode_peer_id(incoming.handshake.peer_id)
         );
 
-        let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
+        let mut write_buf = self.frame_buf();
         let my_handshake = self.greeting(speaks_v2);
         let hlen = my_handshake.serialize_unchecked_len(&mut *write_buf);
         with_timeout(
@@ -258,7 +263,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connect_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
 
-        let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
+        let mut write_buf = self.frame_buf();
         // Every peer is greeted as v1 first, which a hybrid's v2 peers
         // answer too (libtorrent `peer_connection::associated_info_hash`).
         let handshake = self.greeting(false);
@@ -318,6 +323,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         }
         .instrument(trace_span!("", kind=%ckind))
         .await
+    }
+
+    /// A buffer for the longest frame of the torrent.
+    fn frame_buf(&self) -> Box<[u8]> {
+        vec![0u8; max_frame_len(self.handler.num_pieces())].into_boxed_slice()
     }
 
     /// Our handshake: the hash of the protocol the peer speaks, offering
@@ -502,8 +512,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         };
 
         let reader = async move {
+            let num_pieces = self.handler.num_pieces();
             loop {
-                let message = read_buf.read_message(&mut read, rwtimeout).await?;
+                let message = read_buf
+                    .read_message(&mut read, rwtimeout, num_pieces)
+                    .await?;
                 trace!("received: {:?}", &message);
                 // libtorrent `bt_peer_connection::on_hash_request`, `on_hashes`
                 // and `on_hash_reject` disconnect a peer that does not speak v2.

@@ -1377,6 +1377,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
     }
+
+    fn num_pieces(&self) -> Option<u32> {
+        Some(self.state.lengths.total_pieces())
+    }
 }
 
 impl PeerHandler {

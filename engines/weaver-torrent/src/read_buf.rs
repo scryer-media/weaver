@@ -16,13 +16,19 @@ use crate::{
 use futures::TryFutureExt;
 use tokio::io::AsyncReadExt;
 
-// This should be greater than MAX_MSG_LEN
+// The buffer's size between frames longer than it. Greater than
+// MAX_MSG_LEN, so only a frame longer than every message but the bitfield
+// grows it.
 const BUFLEN: usize = 0x8000; // 32kb
 
 /// A ringbuffer for reading bittorrent messages from socket.
 /// Messages may thus span 2 slices (notably, Piece message and UtMetadata messages), which is reflected in their contents.
+///
+/// A frame longer than the buffer grows it to the frame, which its message's
+/// length rule bounds, and the buffer shrinks back once the frame is read
+/// (libtorrent `receive_buffer::grow`, `receive_buffer::normalize`).
 pub struct ReadBuf {
-    buf: Box<[u8; BUFLEN]>,
+    buf: Box<[u8]>,
     start: usize,
     len: usize,
 }
@@ -32,7 +38,7 @@ pub struct ReadBuf {
 macro_rules! advance {
     ($self:expr, $len:expr) => {
         $self.len = $self.len.saturating_sub($len);
-        $self.start = ($self.start + $len) % BUFLEN;
+        $self.start = ($self.start + $len) % $self.buf.len();
     };
 }
 
@@ -48,7 +54,7 @@ macro_rules! as_slices {
 impl ReadBuf {
     pub fn new() -> Self {
         Self {
-            buf: Box::new([0u8; BUFLEN]),
+            buf: vec![0u8; BUFLEN].into_boxed_slice(),
             start: 0,
             len: 0,
         }
@@ -91,7 +97,7 @@ impl ReadBuf {
     }
 
     fn is_contiguous(&self) -> bool {
-        self.start + self.len == (self.start + self.len) % BUFLEN
+        self.start + self.len == (self.start + self.len) % self.buf.len()
     }
 
     // In rare cases, we might need to make the buffer contiguous, as the message
@@ -112,22 +118,28 @@ impl ReadBuf {
         // This should be so rare that it's not worth writing complex in-place code.
         // See the source in VecDequeue::make_contiguous to see how involved it would be
         // otherwise.
-        let mut new = [0u8; BUFLEN];
+        self.relocate(self.buf.len());
+        Ok(())
+    }
+
+    /// Moves the unread bytes to the start of a buffer of `size` bytes.
+    fn relocate(&mut self, size: usize) {
+        let mut new = vec![0u8; size].into_boxed_slice();
         let (first, second) = as_slices!(self);
         new[..first.len()].copy_from_slice(first);
         new[first.len()..first.len() + second.len()].copy_from_slice(second);
-        *self.buf = new;
+        self.buf = new;
         self.start = 0;
-        Ok(())
     }
 
     /// Convert into 2 slices (as ranges).
     fn as_slice_ranges(&self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
         // These .min() calls are for asm to be branchless and the code panicless.
-        let len = self.len.min(BUFLEN);
-        let start = self.start.min(BUFLEN);
+        let size = self.buf.len();
+        let len = self.len.min(size);
+        let start = self.start.min(size);
 
-        let first_len = len.min(BUFLEN - start);
+        let first_len = len.min(size - start);
         let first = start..start + first_len;
         let second = 0..len.saturating_sub(first_len);
         (first, second)
@@ -137,15 +149,12 @@ impl ReadBuf {
         advance!(self, len);
     }
 
-    fn is_full(&self) -> bool {
-        self.len == BUFLEN
-    }
-
     /// Get a part of the buffer for reading into.
     fn unfilled_ioslices(&mut self) -> [IoSliceMut<'_>; 2] {
-        let write_start = (self.start.saturating_add(self.len)) % BUFLEN;
-        let available_len = BUFLEN.saturating_sub(self.len);
-        let first_len = (BUFLEN.saturating_sub(write_start)).min(available_len);
+        let size = self.buf.len();
+        let write_start = (self.start.saturating_add(self.len)) % size;
+        let available_len = size.saturating_sub(self.len);
+        let first_len = (size.saturating_sub(write_start)).min(available_len);
         let second_len = available_len.saturating_sub(first_len);
 
         let (second, first) = self.buf.split_at_mut(write_start);
@@ -159,11 +168,18 @@ impl ReadBuf {
     }
 
     /// Read a message into the buffer, try to deserialize it and call the callback on it.
+    /// `num_pieces` is the torrent's piece count once its metadata is known,
+    /// which sets the length of a bitfield.
     pub async fn read_message(
         &mut self,
         conn: &mut BoxAsyncReadVectored,
         timeout: Duration,
+        num_pieces: Option<u32>,
     ) -> Result<Message<'_>> {
+        // The frame that grew the buffer was read.
+        if self.buf.len() > BUFLEN && self.len <= BUFLEN {
+            self.relocate(BUFLEN);
+        }
         loop {
             let err = {
                 // A workaround for borrow-checker not understanding early returns.
@@ -181,7 +197,7 @@ impl ReadBuf {
                 // Run with `cargo +nightly miri test -p librqbit --features miri test_read_buf_miri -- --nocapture --ignore`
                 let this = unsafe { &mut *(self as *mut Self) };
                 let (first, second) = as_slices!(this);
-                match Message::deserialize(first, second) {
+                match Message::deserialize(first, second, num_pieces) {
                     Ok((msg, size)) => {
                         advance!(this, size);
                         return Ok(msg);
@@ -192,13 +208,11 @@ impl ReadBuf {
 
             match err {
                 MessageDeserializeError::NotEnoughData(mut need_additional_bytes, ..) => {
+                    // The frame is within its rule, so the buffer grows to it.
+                    if self.len + need_additional_bytes > self.buf.len() {
+                        self.relocate(self.len + need_additional_bytes);
+                    }
                     while need_additional_bytes > 0 {
-                        if self.is_full() {
-                            return Err(Error::ReadBufFull {
-                                #[allow(clippy::cast_possible_truncation)]
-                                need_additional_bytes: need_additional_bytes as u16,
-                            });
-                        }
                         let size = with_timeout(
                             "reading",
                             timeout,
@@ -225,18 +239,23 @@ impl ReadBuf {
 
 #[cfg(test)]
 mod tests {
+    use crate::buffers::ByteBuf;
     use crate::core::constants::CHUNK_SIZE;
     use crate::peer_protocol::{
-        Handshake, MAX_MSG_LEN, Message,
+        Handshake, MAX_MSG_LEN, MAX_PACKET_LEN, Message, MessageDeserializeError,
         extended::{
             ExtendedMessage, PeerExtendedMessageIds,
             ut_metadata::{UtMetadata, UtMetadataData},
         },
+        max_frame_len,
     };
     use std::{net::Ipv4Addr, time::Duration};
     use tokio::io::AsyncWriteExt;
 
-    use crate::{tests::test_util::setup_test_logging, type_aliases::BoxAsyncReadVectored};
+    use crate::{
+        tests::test_util::setup_test_logging, type_aliases::BoxAsyncReadVectored,
+        vectored_traits::AsyncReadVectoredIntoCompat,
+    };
 
     use super::{BUFLEN, ReadBuf};
 
@@ -441,7 +460,7 @@ mod tests {
 
             for piece in 0..ITERATIONS {
                 let msg = rb
-                    .read_message(&mut reader, Duration::from_millis(1000))
+                    .read_message(&mut reader, Duration::from_millis(1000), None)
                     .await
                     .unwrap();
                 let utdata = match msg {
@@ -485,5 +504,77 @@ mod tests {
         };
 
         tokio::join!(reader, writer);
+    }
+
+    // A reader of `bytes`, all written before the first read.
+    async fn reader_of(bytes: &[u8]) -> BoxAsyncReadVectored {
+        let (mut w, r) = tokio::io::duplex(bytes.len() + 1);
+        w.write_all(bytes).await.unwrap();
+        // The writer half stays open, as a peer's would.
+        std::mem::forget(w);
+        Box::new(r.into_vectored_compat())
+    }
+
+    // A bitfield longer than the buffer, of a torrent with that many pieces,
+    // grows the buffer to its frame, and the buffer shrinks back once the
+    // frame is read (libtorrent `receive_buffer::grow`, `normalize`).
+    #[tokio::test(start_paused = true)]
+    async fn a_bitfield_longer_than_the_buffer_is_read() {
+        const PIECES: u32 = 8 * (BUFLEN as u32 + 1000);
+        let bits = vec![0x5au8; (PIECES / 8) as usize];
+        let mut wire = vec![0u8; max_frame_len(Some(PIECES)) + 9];
+        let len = Message::Bitfield(ByteBuf(&bits))
+            .serialize(&mut wire, &Default::default)
+            .unwrap();
+        let len = len
+            + Message::Have(7)
+                .serialize(&mut wire[len..], &Default::default)
+                .unwrap();
+        let mut reader = reader_of(&wire[..len]).await;
+
+        let mut rb = ReadBuf::new();
+        let timeout = Duration::from_secs(10);
+        match rb.read_message(&mut reader, timeout, Some(PIECES)).await {
+            Ok(Message::Bitfield(b)) => assert_eq!(b.as_ref(), &bits[..]),
+            other => panic!("{other:?}"),
+        }
+        assert!(rb.buf.len() > BUFLEN);
+        match rb.read_message(&mut reader, timeout, Some(PIECES)).await {
+            Ok(Message::Have(7)) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rb.buf.len(), BUFLEN);
+    }
+
+    // A frame past the packet limit, or a bitfield of the wrong size for the
+    // torrent, ends the read on its header: the buffer never grows for it
+    // (libtorrent `bt_peer_connection::on_receive`, `on_bitfield`).
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_past_its_rule_is_refused_before_it_is_read() {
+        let timeout = Duration::from_secs(10);
+        for (len_prefix, num_pieces) in [
+            (MAX_PACKET_LEN as u32 + 1, None),
+            (1 + BUFLEN as u32 * 2, Some(8 * BUFLEN as u32 * 2 + 8)),
+        ] {
+            let mut header = len_prefix.to_be_bytes().to_vec();
+            header.push(5); // bitfield
+            let mut reader = reader_of(&header).await;
+            let mut rb = ReadBuf::new();
+            let err = rb
+                .read_message(&mut reader, timeout, num_pieces)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::Error::Deserialize(
+                        MessageDeserializeError::PacketTooLarge(..)
+                            | MessageDeserializeError::IncorrectMsgLen { .. }
+                    )
+                ),
+                "{err:?}"
+            );
+            assert_eq!(rb.buf.len(), BUFLEN);
+        }
     }
 }
