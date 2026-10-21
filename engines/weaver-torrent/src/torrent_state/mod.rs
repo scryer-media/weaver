@@ -1039,41 +1039,28 @@ fn spawn_fatal_errors_receiver(
     );
 }
 
+/// Hands each peer the trackers, the DHT and the initial list find to the
+/// live run, as each comes (libtorrent `torrent::add_peer`, called from
+/// `tracker_response`, `on_dht_announce_response` and `ut_pex`). The run's
+/// cancellation token ends it (`TorrentStateLive::spawn`), as does the
+/// stream closing; it holds the run weakly, as libtorrent's DHT callback
+/// holds the torrent (`on_dht_announce_response_disp`).
 fn spawn_peer_adder(live: &Arc<TorrentStateLive>, mut peer_rx: PeerStream) {
     live.spawn(
         debug_span!(parent: live.torrent().span.clone(), "external_peer_adder"),
         format!("[{}]external_peer_adder", live.shared.id),
         {
-            let live = live.clone();
+            let live = Arc::downgrade(live);
             async move {
-                let live = {
-                    let weak = Arc::downgrade(&live);
-                    drop(live);
-                    weak
-                };
-
-                loop {
-                    match timeout(Duration::from_secs(5), peer_rx.next()).await {
-                        Ok(Some(peer)) => {
-                            trace!(?peer, "received peer");
-                            let live = match live.upgrade() {
-                                Some(live) => live,
-                                None => return Ok(()),
-                            };
-                            live.add_peer(peer);
-                        }
-                        Ok(None) => {
-                            debug!("peer_rx closed, closing peer adder");
-                            return Ok(());
-                        }
-                        // If timeout, check if the torrent is live.
-                        Err(_) if live.strong_count() == 0 => {
-                            debug!("timed out waiting for peers, torrent isn't live, closing peer adder");
-                            return Ok(());
-                        }
-                        Err(_) => continue,
-                    }
+                while let Some(peer) = peer_rx.next().await {
+                    trace!(?peer, "received peer");
+                    let Some(live) = live.upgrade() else {
+                        return Ok(());
+                    };
+                    live.add_peer(peer);
                 }
+                debug!("peer_rx closed, closing peer adder");
+                Ok(())
             }
         },
     );
