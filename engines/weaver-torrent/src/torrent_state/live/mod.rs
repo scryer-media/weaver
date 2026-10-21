@@ -80,7 +80,7 @@ use crate::core::{
 use crate::peer_protocol::{
     Handshake, MY_EXTENDED_UT_HOLEPUNCH, Message, Piece, Request,
     extended::{
-        self, ExtendedMessage,
+        ExtendedMessage,
         handshake::ExtendedHandshake,
         ut_holepunch::{self, UtHolepunch},
         ut_metadata::{UtMetadata, UtMetadataData},
@@ -284,7 +284,11 @@ impl TorrentStateLive {
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
             metadata: paused.metadata.clone(),
-            peers: PeerStates::new(session_stats.peers.clone(), lengths.total_pieces()),
+            peers: PeerStates::founded_on(
+                paused.peers,
+                session_stats.peers.clone(),
+                lengths.total_pieces(),
+            ),
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 fatal_errors_tx: Some(fatal_errors_tx),
@@ -1025,6 +1029,7 @@ impl TorrentStateLive {
             files: self.files.take()?,
             chunk_tracker,
             streams: self.streams.clone(),
+            peers: self.peers.idle_list(),
         })
     }
 

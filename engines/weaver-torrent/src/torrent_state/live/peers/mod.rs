@@ -83,6 +83,16 @@ pub(crate) struct PeerStates {
     web_seeds: AtomicUsize,
 }
 
+/// The peer list as a pause leaves it: every peer on it, idle, and the
+/// banned addresses. The next run's list is founded on it, so bans, trust
+/// and failures outlive a pause, as libtorrent keeps `torrent::m_peer_list`
+/// across one (`torrent::do_pause` only disconnects).
+#[derive(Debug, Default)]
+pub(crate) struct PeerList {
+    peers: Vec<Peer>,
+    banned: HashSet<IpAddr>,
+}
+
 /// What a newcomer may push out of a full peer list.
 #[derive(Clone, Copy)]
 enum Displace {
@@ -134,7 +144,17 @@ impl Drop for PeerStates {
 
 impl PeerStates {
     pub fn new(session_stats: Arc<AggregatePeerStatsAtomic>, total_pieces: u32) -> Self {
-        Self {
+        Self::founded_on(PeerList::default(), session_stats, total_pieces)
+    }
+
+    /// The list of a run that follows a pause, founded on the `list` the
+    /// pause left.
+    pub fn founded_on(
+        list: PeerList,
+        session_stats: Arc<AggregatePeerStatsAtomic>,
+        total_pieces: u32,
+    ) -> Self {
+        let peers = Self {
             session_stats,
             live_outgoing_peers: Default::default(),
             stats: Default::default(),
@@ -142,10 +162,29 @@ impl PeerStates {
             availability: Availability::new(total_pieces),
             total_pieces,
             admission: Mutex::new(()),
-            banned: Default::default(),
+            banned: RwLock::new(list.banned),
             candidates_changed: Notify::new(),
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
+        };
+        for mut peer in list.peers {
+            peer.rejoin(&peers);
+            peers.states.insert(peer.addr, peer);
+        }
+        peers
+    }
+
+    /// The list as a pause leaves it: every peer on it, without its
+    /// connection, and the banned addresses. Web seeds are not on it.
+    pub fn idle_list(&self) -> PeerList {
+        PeerList {
+            peers: self
+                .states
+                .iter()
+                .filter(|e| !is_web_seed(*e.key()))
+                .map(|e| e.value().idle())
+                .collect(),
+            banned: self.banned.read().clone(),
         }
     }
 
@@ -1128,6 +1167,46 @@ mod tests {
         assert_eq!(state_of(&peers, second), None);
         assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
         assert_eq!(peers.stats().live as usize, MAX_PEERLIST_SIZE);
+    }
+
+    // libtorrent `torrent::do_pause` disconnects every peer and keeps
+    // `torrent::m_peer_list`: the next run's list knows the banned
+    // addresses and each peer's trust and failures, and a peer we were
+    // connecting to is a connect candidate again.
+    #[test]
+    fn the_next_run_is_founded_on_the_list_a_pause_leaves() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let banned = peer_addr(1);
+        peers.ban(banned);
+        let failed = peer_addr(2);
+        peers.add_peer(failed);
+        fail_at(&peers, failed, t0);
+        peers
+            .with_peer_mut(failed, "test", |p| p.piece_failed(false))
+            .unwrap();
+        let connecting = peer_addr(3);
+        peers.add_peer(connecting);
+        assert_eq!(
+            peers.connect_next(t0).map(|(addr, ..)| addr),
+            Some(connecting)
+        );
+
+        let next =
+            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        assert!(next.is_banned(banned.ip()));
+        next.add_peer(banned);
+        assert_eq!(state_of(&next, banned), None);
+        let standing = |list: &PeerStates| {
+            list.with_peer(failed, |p| (p.trust(), p.reconnect_at()))
+                .unwrap()
+        };
+        assert_eq!(standing(&next), standing(&peers));
+        assert!(next.with_peer(failed, |p| p.trust().on_parole()).unwrap());
+        assert_eq!(state_of(&next, connecting), Some("queued"));
+        assert_eq!(state_of(&peers, connecting), Some("connecting"));
+        assert_eq!(next.stats().queued, 2);
+        assert_eq!(next.stats().connecting, 0);
     }
 
     fn at_port(addr: SocketAddr, port: u16) -> SocketAddr {

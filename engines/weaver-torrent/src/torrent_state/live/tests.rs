@@ -12,6 +12,7 @@ use super::*;
 use crate::{
     AddTorrent, AddTorrentOptions, Session, SessionOptions,
     core::constants::CHUNK_SIZE,
+    peer_protocol::extended,
     storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage},
     tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
     type_aliases::BF,
@@ -2585,4 +2586,32 @@ async fn our_pex_message_flags_each_peer_it_adds_for_what_it_is_to_us() {
     );
     let dropped: Vec<_> = msg.dropped_peers().map(|p| p.addr).collect();
     assert_eq!(dropped, [sock("203.0.113.9:6881")]);
+}
+
+// libtorrent `torrent::do_pause` only disconnects: `torrent::m_peer_list`,
+// with each `torrent_peer`'s `banned` and `trust_points`, is the list the
+// resumed torrent works from.
+#[tokio::test]
+async fn a_pause_keeps_the_bans_and_the_trust_of_the_peer_list() {
+    let h = Harness::new("pause_keeps_peer_list").await;
+    let banned = sock("203.0.113.1:6881");
+    let (peer, _rx) = h.peer("203.0.113.2:6881");
+    h.peers.ban(banned);
+    h.peers
+        .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false))
+        .unwrap();
+    let trust = h.peers.with_peer(peer.addr, |p| p.trust()).unwrap();
+    assert_ne!(trust, Default::default());
+
+    let session = &h._session;
+    let handle = session.get(h.shared.id.into()).unwrap();
+    session.pause(&handle).await.unwrap();
+    session.unpause(&handle).await.unwrap();
+    let resumed = handle.live().unwrap();
+    assert!(!Arc::ptr_eq(&resumed, &h.live));
+    assert!(resumed.peers.is_banned(banned.ip()));
+    assert_eq!(
+        resumed.peers.with_peer(peer.addr, |p| p.trust()),
+        Some(trust)
+    );
 }

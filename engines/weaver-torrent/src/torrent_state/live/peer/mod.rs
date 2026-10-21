@@ -416,6 +416,33 @@ impl Peer {
         self.trust.piece_failed(sole_sender)
     }
 
+    /// The peer as a pause leaves it on the list: where it listens, its
+    /// failures, trust and holepunch support, without its connection or
+    /// this run's counters. Holepunch mode ends with the connection
+    /// (libtorrent `torrent::do_pause` disconnects every peer, and its
+    /// `torrent_peer` stays on `torrent::m_peer_list`).
+    pub(crate) fn idle(&self) -> Peer {
+        Peer {
+            addr: self.addr,
+            state: PeerState::Dead,
+            stats: Default::default(),
+            outgoing_address: self.outgoing_address,
+            failcount: self.failcount,
+            last_failed: self.last_failed,
+            last_optimistic_unchoke: self.last_optimistic_unchoke,
+            trust: self.trust,
+            supports_holepunch: self.supports_holepunch,
+            holepunch: false,
+        }
+    }
+
+    /// An idle peer joins the list of a new run: a connect candidate or
+    /// not, as the list says now.
+    pub(crate) fn rejoin(&mut self, peers: &PeerStates) {
+        peers.count_in(&self.state);
+        self.set_state(self.idle_state(peers), peers);
+    }
+
     /// Where the peer stands when a full list must forget one; None for a
     /// connected peer, which is never forgotten.
     pub(crate) fn erase_rank(&self) -> Option<EraseRank> {

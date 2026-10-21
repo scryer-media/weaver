@@ -15,7 +15,9 @@ use crate::{
     type_aliases::FileStorage,
 };
 
-use super::{ManagedTorrentShared, TorrentMetadata, streaming::TorrentStreams};
+use super::{
+    ManagedTorrentShared, TorrentMetadata, live::peers::PeerList, streaming::TorrentStreams,
+};
 
 pub struct TorrentStatePaused {
     pub(crate) shared: Arc<ManagedTorrentShared>,
@@ -23,6 +25,8 @@ pub struct TorrentStatePaused {
     pub(crate) files: FileStorage,
     pub(crate) chunk_tracker: ChunkTracker,
     pub(crate) streams: Arc<TorrentStreams>,
+    // The peer list the next run is founded on.
+    pub(crate) peers: PeerList,
 }
 
 impl TorrentStatePaused {

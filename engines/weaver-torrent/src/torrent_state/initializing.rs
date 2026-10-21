@@ -384,6 +384,7 @@ impl TorrentStateInitializing {
             files: self.files.take()?,
             chunk_tracker,
             streams: Arc::new(Default::default()),
+            peers: Default::default(),
         };
         Ok(paused)
     }
