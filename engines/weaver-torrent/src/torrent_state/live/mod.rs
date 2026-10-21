@@ -180,6 +180,7 @@ pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
     ConcurrencyLimitReached,
+    PeerListFull,
 }
 
 pub struct TorrentStateLive {
@@ -388,6 +389,13 @@ impl TorrentStateLive {
                     "peer already active, ignoring incoming connection"
                 );
                 return Ok(AddIncomingPeerResult::AlreadyActive);
+            }
+            Err(IncomingRefused::ListFull) => {
+                debug!(
+                    addr = %checked_peer.addr,
+                    "peer list holds only connected peers, dropping incoming peer"
+                );
+                return Ok(AddIncomingPeerResult::PeerListFull);
             }
         };
         atomic_inc(&counters.incoming_connections);

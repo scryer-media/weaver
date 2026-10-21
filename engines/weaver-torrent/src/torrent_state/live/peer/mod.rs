@@ -7,6 +7,7 @@
 
 pub mod stats;
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
@@ -36,6 +37,11 @@ pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
+
+/// Where a peer stands when a full peer list must forget one; the lowest goes
+/// first. Peers we would not connect to go before connect candidates, then the
+/// most failures in a row, then the oldest failure.
+pub(crate) type EraseRank = (bool, Reverse<u32>, Option<Instant>);
 
 #[derive(Debug)]
 pub(crate) struct Peer {
@@ -155,6 +161,17 @@ impl Peer {
             self.set_state(self.idle_state(), counters);
         }
     }
+
+    /// Where the peer stands when a full list must forget one; None for a
+    /// connected peer, which is never forgotten.
+    pub(crate) fn erase_rank(&self) -> Option<EraseRank> {
+        let candidate = match self.state {
+            PeerState::Connecting(_) | PeerState::Live(_) => return None,
+            PeerState::Queued => true,
+            PeerState::Dead | PeerState::NotNeeded => false,
+        };
+        Some((candidate, Reverse(self.failcount), self.last_failed))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -166,7 +183,8 @@ pub(crate) enum PeerState {
     Connecting(PeerTx),
     Live(LivePeerState),
     // Not a connect candidate: it failed MAX_FAILCOUNT times in a row, or we do
-    // not know where it listens. Kept until someone names it again.
+    // not know where it listens. Kept until someone names it again or the list
+    // needs the room.
     Dead,
     // We don't need to do anything with the peer any longer.
     // The peer has the full torrent, and we have the full torrent, so no need

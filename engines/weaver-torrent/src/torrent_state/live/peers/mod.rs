@@ -9,7 +9,7 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use crate::core::{hash_id::Id20, lengths::ValidPieceIndex};
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::{sync::Notify, time::Instant};
 
 use crate::{
@@ -23,11 +23,14 @@ use crate::{
 use self::stats::{AggregatePeerStats, AggregatePeerStatsAtomic};
 
 use super::peer::{
-    IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx,
+    EraseRank, IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx,
     stats::atomic::PeerCountersAtomic,
 };
 
 pub mod stats;
+
+// libtorrent `max_peerlist_size`: the most peers one torrent's peer list holds.
+pub(crate) const MAX_PEERLIST_SIZE: usize = 3000;
 
 pub(crate) struct PeerStates {
     pub session_stats: Arc<AggregatePeerStatsAtomic>,
@@ -37,14 +40,36 @@ pub(crate) struct PeerStates {
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
 
+    // Held while a peer joins, so the list never grows past MAX_PEERLIST_SIZE.
+    admission: Mutex<()>,
     // Wakes the connect loop when a connect candidate appears or may come due
     // sooner.
     candidates_changed: Notify,
 }
 
+/// What a newcomer may push out of a full peer list.
+#[derive(Clone, Copy)]
+enum Displace {
+    /// Only peers we would not connect to: a peer someone named is worth no
+    /// more than a connect candidate we hold.
+    NonCandidates,
+    /// Any peer we are not connected to: a connected peer outranks them.
+    AnyIdle,
+}
+
+impl Displace {
+    fn allows(self, (candidate, ..): &EraseRank) -> bool {
+        match self {
+            Displace::NonCandidates => !candidate,
+            Displace::AnyIdle => true,
+        }
+    }
+}
+
 enum Admitted<R> {
     Known(R),
     New(Arc<PeerCountersAtomic>),
+    Refused,
 }
 
 /// When the connect loop may next connect to someone.
@@ -58,6 +83,7 @@ pub(crate) enum NextCandidate {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IncomingRefused {
     AlreadyActive,
+    ListFull,
 }
 
 impl Drop for PeerStates {
@@ -75,6 +101,7 @@ impl PeerStates {
             live_outgoing_peers: Default::default(),
             stats: Default::default(),
             states: Default::default(),
+            admission: Mutex::new(()),
             candidates_changed: Notify::new(),
         }
     }
@@ -88,6 +115,7 @@ impl PeerStates {
     pub fn add_peer(&self, addr: SocketAddr) {
         self.admit(
             addr,
+            Displace::NonCandidates,
             |peer| peer.rediscovered(self),
             || Peer::new_with_outgoing_address(addr),
         );
@@ -104,6 +132,7 @@ impl PeerStates {
     ) -> Result<Arc<PeerCountersAtomic>, IncomingRefused> {
         let admitted = self.admit(
             addr,
+            Displace::AnyIdle,
             |peer| {
                 peer.incoming_connection(peer_id, tx.clone(), self, kind)
                     .map(|()| peer.stats.counters.clone())
@@ -115,30 +144,58 @@ impl PeerStates {
             Admitted::Known(Err(IncomingConnectionResult::AlreadyActive)) => {
                 Err(IncomingRefused::AlreadyActive)
             }
+            Admitted::Refused => Err(IncomingRefused::ListFull),
         }
     }
 
-    // The one way into the list. A known peer is handed to `known`; a newcomer
-    // from `newcomer` joins.
+    // The one way into the list. A known peer is handed to `known`. A newcomer
+    // from `newcomer` joins, first pushing out the peer that ranks lowest when
+    // the list is full; it is refused when nobody `displace` allows is there.
     fn admit<R>(
         &self,
         addr: SocketAddr,
+        displace: Displace,
         known: impl FnOnce(&mut Peer) -> R,
         newcomer: impl FnOnce() -> Peer,
     ) -> Admitted<R> {
-        use dashmap::mapref::entry::Entry;
-        match self.states.entry(addr) {
-            Entry::Occupied(mut occupied) => Admitted::Known(known(occupied.get_mut())),
-            Entry::Vacant(vacant) => {
-                let peer = newcomer();
-                for counter in [&*self.session_stats, &self.stats] {
-                    counter.inc(peer.get_state());
-                    atomic_inc(&counter.seen);
-                }
-                let counters = peer.stats.counters.clone();
-                vacant.insert(peer);
-                Admitted::New(counters)
+        let _admission = self.admission.lock();
+        if let Some(r) = self.with_peer_mut(addr, "admit", known) {
+            return Admitted::Known(r);
+        }
+        let peer = newcomer();
+        if self.states.len() >= MAX_PEERLIST_SIZE && !self.erase_one(displace) {
+            return Admitted::Refused;
+        }
+        for counter in [&*self.session_stats, &self.stats] {
+            counter.inc(peer.get_state());
+            atomic_inc(&counter.seen);
+        }
+        let counters = peer.stats.counters.clone();
+        self.states.insert(addr, peer);
+        Admitted::New(counters)
+    }
+
+    // Forgets the lowest-ranked peer `displace` allows. Connected peers are
+    // never forgotten.
+    fn erase_one(&self, displace: Displace) -> bool {
+        let victim = self
+            .states
+            .iter()
+            .filter_map(|e| Some((e.value().erase_rank()?, *e.key())))
+            .filter(|(rank, _)| displace.allows(rank))
+            .min();
+        let Some((_, addr)) = victim else {
+            return false;
+        };
+        match self
+            .states
+            .remove_if(&addr, |_, peer| peer.erase_rank().is_some())
+        {
+            Some((_, peer)) => {
+                peer.destroy(self);
+                true
             }
+            None => false,
         }
     }
 
@@ -743,5 +800,87 @@ mod tests {
         peers.requeue_not_needed();
         assert_eq!(state_of(&peers, a), Some("queued"));
         assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
+    }
+
+    #[test]
+    fn a_full_list_forgets_peers_we_would_not_connect_to_most_failed_and_oldest_first() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+
+        let (older, newer, not_needed, live) =
+            (peer_addr(0), peer_addr(1), peer_addr(2), peer_addr(3));
+        for addr in [older, newer, not_needed] {
+            peers.add_peer(addr);
+        }
+        fail_out(&peers, older, t0);
+        fail_out(&peers, newer, t0 + Duration::from_secs(1));
+        peers
+            .with_peer_mut(not_needed, "test", |peer| peer.set_not_needed(&peers))
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        peers
+            .add_incoming(live, Id20::default(), tx, ConnectionKind::Tcp)
+            .unwrap();
+        for i in 4..MAX_PEERLIST_SIZE {
+            peers.add_peer(peer_addr(i));
+        }
+        assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
+
+        let newcomer = |i| peer_addr(MAX_PEERLIST_SIZE + i);
+        peers.add_peer(newcomer(0));
+        assert_eq!(state_of(&peers, older), None);
+        assert_eq!(state_of(&peers, newer), Some("dead"));
+        peers.add_peer(newcomer(1));
+        assert_eq!(state_of(&peers, newer), None);
+        assert_eq!(state_of(&peers, not_needed), Some("not needed"));
+        peers.add_peer(newcomer(2));
+        assert_eq!(state_of(&peers, not_needed), None);
+
+        // Only connect candidates and a connected peer are left: a named
+        // peer does not push out a candidate we hold.
+        peers.add_peer(newcomer(3));
+        assert_eq!(state_of(&peers, newcomer(3)), None);
+        assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
+        assert_eq!(state_of(&peers, live), Some("live"));
+        assert_eq!(peers.stats().seen as usize, MAX_PEERLIST_SIZE + 3);
+        assert_eq!(peers.stats().queued as usize, MAX_PEERLIST_SIZE - 1);
+    }
+
+    #[test]
+    fn a_connected_peer_is_never_forgotten() {
+        let peers = make_peer_states();
+        let mut channels = Vec::new();
+        for i in 0..MAX_PEERLIST_SIZE - 1 {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            peers
+                .add_incoming(peer_addr(i), Id20::default(), tx, ConnectionKind::Tcp)
+                .unwrap();
+            channels.push(rx);
+        }
+        let candidate = peer_addr(MAX_PEERLIST_SIZE - 1);
+        peers.add_peer(candidate);
+
+        // An incoming peer holding a slot pushes out the one idle peer.
+        let first = peer_addr(MAX_PEERLIST_SIZE);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        peers
+            .add_incoming(first, Id20::default(), tx, ConnectionKind::Tcp)
+            .unwrap();
+        assert_eq!(state_of(&peers, candidate), None);
+        assert_eq!(state_of(&peers, first), Some("live"));
+
+        // Then the list holds connected peers only, and nobody gets in.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let second = peer_addr(MAX_PEERLIST_SIZE + 1);
+        assert_eq!(
+            peers
+                .add_incoming(second, Id20::default(), tx, ConnectionKind::Tcp)
+                .unwrap_err(),
+            IncomingRefused::ListFull
+        );
+        peers.add_peer(second);
+        assert_eq!(state_of(&peers, second), None);
+        assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
+        assert_eq!(peers.stats().live as usize, MAX_PEERLIST_SIZE);
     }
 }
