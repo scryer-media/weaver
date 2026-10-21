@@ -172,6 +172,13 @@ impl TorrentStateInitializing {
         self.peers.lock().ban(ip);
     }
 
+    // The peer list, out of the torrent being checked and into the state
+    // that takes its place. Only that change of state takes it, under the
+    // torrent's lock, so nothing reads the torrent between with no list.
+    pub(crate) fn take_peers(&self) -> PeerList {
+        std::mem::take(&mut *self.peers.lock())
+    }
+
     pub fn get_checked_bytes(&self) -> u64 {
         self.checked_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -546,7 +553,9 @@ impl TorrentStateInitializing {
             files: self.files.take()?,
             chunk_tracker,
             streams: Arc::new(Default::default()),
-            peers: std::mem::take(&mut *self.peers.lock()),
+            // The list stays here until the state changes; see
+            // [`Self::take_peers`].
+            peers: PeerList::default(),
         };
         Ok(paused)
     }

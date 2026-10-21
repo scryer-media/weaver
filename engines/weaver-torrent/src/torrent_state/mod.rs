@@ -744,16 +744,17 @@ impl ManagedTorrent {
                             init.finish_check();
 
                             match check_result {
-                                Ok(paused) => {
+                                Ok(mut paused) => {
                                     let mut g = t.locked.write();
-                                    if let ManagedTorrentState::Initializing(_) = &g.state {
-                                    } else {
+                                    let ManagedTorrentState::Initializing(checked) = &g.state
+                                    else {
                                         debug!(
                                             "no need to start torrent anymore, as it switched state from initializing"
                                         );
                                         return Ok(());
-                                    }
+                                    };
 
+                                    paused.peers = checked.take_peers();
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
                                     _start(&t, peer_rx, start_paused, session, Some(g), token)

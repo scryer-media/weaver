@@ -5596,3 +5596,54 @@ async fn saved_peers_and_bans_come_back_as_initial_peers_and_bans() {
     });
     assert_eq!(paused_list, saved);
 }
+
+// libtorrent keeps a torrent's peer list in the torrent itself through every
+// state, so `torrent::write_resume_data` reads it whenever it is asked. The
+// list stays with a torrent being checked and moves on only with the change
+// of state: a save between the end of the check and that change reads the
+// list, not an empty one.
+#[tokio::test]
+async fn a_checked_torrent_keeps_its_peer_list_until_its_state_changes() {
+    let h = Harness::seeding("peers_through_the_check").await;
+    let session = h._session.clone();
+    let bytes = h._torrent.as_ref().unwrap().torrent.clone();
+    session
+        .delete(crate::api::TorrentIdOrHash::Id(h.shared.id), false)
+        .await
+        .unwrap();
+    let saved = crate::ResumePeers {
+        peers: vec!["127.0.0.3:6881".parse().unwrap()],
+        banned: vec!["127.0.0.4".parse().unwrap()],
+    };
+    // Every check waits here, so the session's own check of the torrent
+    // does not start; the test runs the check itself.
+    let semaphore = session.concurrent_initialize_semaphore.clone();
+    let permits = u32::try_from(semaphore.available_permits()).unwrap();
+    let _held = semaphore.acquire_many_owned(permits).await.unwrap();
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(bytes),
+            Some(AddTorrentOptions {
+                paused: true,
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                checkpoint: Some(crate::Checkpoint::pieces(BF::from_boxed_slice(
+                    vec![0xc0].into_boxed_slice(),
+                ))),
+                initial_peers: Some(saved.peers.clone()),
+                banned_peers: saved.banned.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    let init = handle.with_state(|s| match s {
+        crate::ManagedTorrentState::Initializing(init) => init.clone(),
+        _ => panic!("the added torrent is not being checked"),
+    });
+
+    let paused = init.check().await.unwrap();
+    assert_eq!(handle.resume_peers().unwrap(), saved);
+    drop(paused);
+}
