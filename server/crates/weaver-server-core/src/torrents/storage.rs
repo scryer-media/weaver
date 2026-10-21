@@ -51,6 +51,15 @@ mod tests;
 pub(crate) trait Pieces: Send + Sync {
     // A piece verified: its files' shares, in torrent order.
     fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()>;
+    // A piece failed its hash, fetched or checked on disk: none of it is in
+    // hand. True when any of it was.
+    fn failed(&self, piece: u32) -> anyhow::Result<bool>;
+    // A check of every piece began: no piece in hand is had until the check
+    // finds it. True when any was had.
+    fn checking(&self) -> anyhow::Result<bool>;
+    // The check found the piece: it is had again. True when it waited for
+    // the check.
+    fn found(&self, piece: u32) -> anyhow::Result<bool>;
     // The volume's posted bytes of the range, appended to `into`; false
     // when they are not all in hand.
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool;
@@ -109,6 +118,19 @@ impl TorrentJob {
         result
     }
 
+    // A step that says whether it changed the job.
+    fn stepped(
+        &self,
+        step: impl FnOnce(&mut GraphJob<PieceRoot>, &mut RepairSlots, usize) -> Result<bool, GraphError>,
+    ) -> anyhow::Result<bool> {
+        let mut changed = false;
+        self.step(self.limit, |job, repairs, limit| {
+            changed = step(job, repairs, limit)?;
+            Ok(())
+        })?;
+        Ok(changed)
+    }
+
     // A slot handed to the job while it waited goes to the repair it could
     // not lend for want of one. Every step lends what it made due, so a
     // job no slot was handed to has nothing to lend here.
@@ -151,6 +173,18 @@ impl Pieces for TorrentJob {
         })?)
     }
 
+    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
+        self.stepped(|job, repairs, limit| job.failed(piece, repairs, limit))
+    }
+
+    fn checking(&self) -> anyhow::Result<bool> {
+        self.stepped(|job, repairs, limit| job.checking(repairs, limit))
+    }
+
+    fn found(&self, piece: u32) -> anyhow::Result<bool> {
+        self.stepped(|job, repairs, limit| job.found(piece, repairs, limit))
+    }
+
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
         self.with(|job| job.posted(volume, range, into))
     }
@@ -158,11 +192,17 @@ impl Pieces for TorrentJob {
 
 // The pieces the job has, as the session takes them to skip checking the
 // files: one bit per piece, most significant first, the spare bits of the
-// last byte clear, as BEP 3 sends them.
-pub(crate) fn initial_have(job: &GraphJob<PieceRoot>) -> BitBox<u8, Msb0> {
+// last byte clear, as BEP 3 sends them. None while a check of every piece
+// has not found every piece in hand: the job vouches for nothing then, and
+// the session checks every piece again (libtorrent
+// `torrent::write_resume_data` saves no piece past those checked).
+pub(crate) fn initial_have(job: &GraphJob<PieceRoot>) -> Option<BitBox<u8, Msb0>> {
+    if job.unchecked() {
+        return None;
+    }
     let mut have = job.have();
     have.set_uninitialized(false);
-    have.into_boxed_bitslice()
+    Some(have.into_boxed_bitslice())
 }
 
 // The layout of a torrent's files over its pieces, from its metainfo.
@@ -433,11 +473,24 @@ impl TorrentStorage for PieceStorage {
         Ok(())
     }
 
-    // What failed is dropped, and the piece is fetched again into room
-    // granted afresh.
+    // What failed is dropped, from memory and from the job, and the piece
+    // is fetched again into room granted afresh. A piece the session's
+    // check of the files did not find is one the job has no longer: the
+    // session's check is the one word on which pieces are had.
     fn on_piece_hash_failed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let failed = self.flight().remove(&piece.get());
         self.inner.release(failed.as_ref().map_or(0, Flight::held));
+        self.inner.pieces.failed(piece.get())?;
+        Ok(())
+    }
+
+    fn on_check_everything(&self) -> anyhow::Result<()> {
+        self.inner.pieces.checking()?;
+        Ok(())
+    }
+
+    fn on_piece_checked(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.inner.pieces.found(piece.get())?;
         Ok(())
     }
 }

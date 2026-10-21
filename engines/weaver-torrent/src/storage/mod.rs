@@ -209,9 +209,26 @@ pub trait TorrentStorage: Send + Sync {
         Ok(())
     }
 
-    /// Callback called every time a piece failed its hash check, before it is queued again.
-    /// Default implementation does nothing, but can be override in trait implementations.
+    /// Callback called every time a piece failed its hash check, before it is queued again:
+    /// a downloaded piece, or one a check of the files did not find, which the storage then
+    /// holds no longer. Default implementation does nothing, but can be override in trait
+    /// implementations.
     fn on_piece_hash_failed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Called when a run that checks every piece and trusts nothing saved begins, before it
+    /// reads anything: from here the storage has no piece the check has not found, and what it
+    /// saves must not vouch for one. Each piece comes back through
+    /// [`Self::on_piece_checked`] or [`Self::on_piece_hash_failed`] as the check finds it or not.
+    /// Default implementation does nothing.
+    fn on_check_everything(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Callback called when a check of the files found a piece whole: the storage has it again.
+    /// Default implementation does nothing.
+    fn on_piece_checked(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -277,6 +294,14 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_hash_failed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_hash_failed(piece_id)
+    }
+
+    fn on_check_everything(&self) -> anyhow::Result<()> {
+        (**self).on_check_everything()
+    }
+
+    fn on_piece_checked(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).on_piece_checked(piece_id)
     }
 
     fn reserve_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {

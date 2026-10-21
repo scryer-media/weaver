@@ -457,6 +457,131 @@ fn a_torrent_job_writes_its_files_and_restores_its_pieces() {
     assert!(job.namespace().members().all(|member| member.closed));
 }
 
+// A piece that fails its hash after it verified is in hand no longer:
+// each file's share of it waits again, its bytes are no longer covered and
+// its files are open, so the share fetched again is delivered and rewrites
+// what was damaged. A checkpoint taken meanwhile says the same, and a
+// piece no share of which is in hand is left as it stands.
+#[test]
+fn a_piece_that_fails_its_hash_waits_to_be_fetched_again() {
+    let layout = layout();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = torrent_job(&layout, dir.path());
+    for piece in 0..5 {
+        job.verified(shares(&layout, piece), &mut RepairSlots::default(), 1)
+            .unwrap();
+    }
+    assert!(job.have().all());
+    let bytes = torrent_bytes(&layout);
+    // Piece 3 carries b's 3072..3500 and c's 0..596.
+    let damaged = vec![0x5a; 4096 - 3072];
+    let mut on_disk = bytes.clone();
+    on_disk[3072..4096].copy_from_slice(&damaged);
+    std::fs::write(dir.path().join("b.bin"), &on_disk[1000..3500]).unwrap();
+    std::fs::write(dir.path().join("c.bin"), &on_disk[3500..]).unwrap();
+
+    assert!(job.failed(3, &mut RepairSlots::default(), 1).unwrap());
+    assert_eq!(job.have().iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
+    assert_eq!(job.selection(), vec![1, 2]);
+    assert_eq!(job.file_have(), vec![1000, 2500 - 428, 700 - 596]);
+    for (member, hole) in [(1, ByteRange::new(2072, 2500)), (2, ByteRange::new(0, 596))] {
+        let record = job.namespace().get(MemberId(member)).unwrap();
+        assert!(!record.closed, "{member}");
+        assert!(!record.coverage.covered(hole), "{member}");
+    }
+    assert!(job.namespace().get(MemberId(0)).unwrap().closed);
+    // Nothing of it is in hand: failing again changes nothing.
+    assert!(!job.failed(3, &mut RepairSlots::default(), 1).unwrap());
+    assert_eq!(job.have().iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
+
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    let restored =
+        GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
+            .unwrap();
+    assert!(restored.refetched.is_empty());
+    assert_eq!(restored.job.have(), job.have());
+
+    // Fetched again, the piece rewrites both files and closes them again.
+    job.verified(shares(&layout, 3), &mut RepairSlots::default(), 1)
+        .unwrap();
+    assert!(job.have().all());
+    assert_eq!(
+        std::fs::read(dir.path().join("b.bin")).unwrap(),
+        bytes[1000..3500]
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("c.bin")).unwrap(),
+        bytes[3500..]
+    );
+    assert!(job.namespace().members().all(|member| member.closed));
+}
+
+// libtorrent `torrent::force_recheck` forgets every piece before checking,
+// and `torrent::write_resume_data` saves none the check has not found: once
+// a check of every piece begins, no piece is had, though every share in hand
+// still reads, and a checkpoint taken then restores a job that still waits
+// for the check. Each piece the check finds is had again, and one it does
+// not is given back.
+#[test]
+fn a_check_of_every_piece_has_none_until_it_finds_them() {
+    let layout = layout();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = torrent_job(&layout, dir.path());
+    for piece in 0..5 {
+        job.verified(shares(&layout, piece), &mut RepairSlots::default(), 1)
+            .unwrap();
+    }
+    assert!(!job.unchecked());
+    let bytes = torrent_bytes(&layout);
+
+    assert!(job.checking(&mut RepairSlots::default(), 1).unwrap());
+    assert!(job.unchecked());
+    assert_eq!(job.have().count_ones(), 0);
+    let mut read = Vec::new();
+    assert!(job.posted(VolumeIndex(1), ByteRange::new(0, 2500), &mut read));
+    assert_eq!(read, bytes[1000..3500]);
+    // Nothing is fetched while the check reads.
+    assert!(job.selection().is_empty());
+
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    let restored =
+        GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
+            .unwrap();
+    assert!(restored.refetched.is_empty());
+    assert!(restored.job.unchecked());
+    assert_eq!(restored.job.have().count_ones(), 0);
+
+    for piece in [0, 1, 2, 4] {
+        assert!(job.found(piece, &mut RepairSlots::default(), 1).unwrap());
+    }
+    assert!(!job.found(0, &mut RepairSlots::default(), 1).unwrap());
+    assert!(job.failed(3, &mut RepairSlots::default(), 1).unwrap());
+    assert!(!job.unchecked());
+    assert_eq!(job.have().iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
+    assert_eq!(job.selection(), vec![1, 2]);
+}
+
+// A share that never arrived, or was lost, is not in hand: only an arrived
+// one is given back.
+#[test]
+fn only_a_share_in_hand_is_given_back() {
+    let layout = layout();
+    let mut root = PieceRoot::new(Arc::clone(&layout));
+    for share in shares(&layout, 0) {
+        root.receive(share);
+    }
+    root.lost(VolumeIndex(2), 4);
+    assert_eq!(
+        root.in_hand(0),
+        vec![
+            (VolumeIndex(0), ByteRange::new(0, 1000)),
+            (VolumeIndex(1), ByteRange::new(0, 24))
+        ]
+    );
+    assert!(root.in_hand(1).is_empty());
+    assert!(root.in_hand(4).is_empty());
+}
+
 // A torrent's checkpoint never restores into an article job, nor the
 // other way about.
 #[test]

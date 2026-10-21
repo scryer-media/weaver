@@ -1058,6 +1058,13 @@ impl ManagedTorrent {
             .shared
             .storage_factory
             .create_and_init(self.shared(), &metadata)?;
+        // Every piece is forgotten before anything is checked, so nothing
+        // the storage saves from here vouches for one the check has not
+        // found (libtorrent `torrent::force_recheck`: `set_have_all(false)`,
+        // `m_add_torrent_params.reset()`).
+        files
+            .on_check_everything()
+            .context("the storage did not forget its pieces")?;
         Ok(Arc::new(TorrentStateInitializing::new(
             self.shared.clone(),
             metadata,

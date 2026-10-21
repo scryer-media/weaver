@@ -1844,6 +1844,231 @@ async fn a_torrent_in_no_session_is_not_rechecked() {
     rig.service.stop().await;
 }
 
+const RECHECKED_PIECE: usize = 16_384;
+
+// A torrent of four pieces fetched whole from a seeder on loopback, then
+// its file's piece 2 damaged on disk.
+struct Damaged {
+    rig: Rig,
+    job_id: JobId,
+    handle: Arc<ManagedTorrent>,
+    seeding: Arc<Session>,
+    // The seeder's files, read when a peer asks.
+    _seeds: tempfile::TempDir,
+    // What the file should hold.
+    data: Vec<u8>,
+    file: PathBuf,
+}
+
+async fn complete_then_damaged() -> Damaged {
+    complete_then_damaged_of(4).await
+}
+
+// As `complete_then_damaged`, of `pieces` pieces.
+async fn complete_then_damaged_of(pieces: usize) -> Damaged {
+    const PIECE: usize = RECHECKED_PIECE;
+    let data: Vec<u8> = (0..(pieces * PIECE) as u32)
+        .map(|at| (at % 251) as u8)
+        .collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let private = metainfo("set", &files, PIECE, true);
+
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &private, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let bytes = announcing(&private, &tracker(peer).await);
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_completed().await.unwrap();
+    let dir = rig
+        .service
+        .torrent(job_id)
+        .await
+        .unwrap()
+        .storage_dir
+        .unwrap();
+    let file = only_file(Path::new(&dir));
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut opened = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        opened
+            .seek(SeekFrom::Start(2 * PIECE as u64 + 100))
+            .unwrap();
+        opened.write_all(&[0x5a; 16]).unwrap();
+    }
+    Damaged {
+        rig,
+        job_id,
+        handle,
+        seeding,
+        _seeds: seeds,
+        data,
+        file,
+    }
+}
+
+// The job's pieces in hand, as its view shows them.
+async fn job_have(service: &TorrentService, job_id: JobId) -> u32 {
+    service.torrent(job_id).await.unwrap().pieces.unwrap().have
+}
+
+// libtorrent `torrent::force_recheck` forgets every piece and
+// `torrent::on_piece_hashed` has only the ones that pass: the session's
+// check is the one word on which pieces are had. The job lets the damaged
+// piece go, a peer sends it again, and the file holds the torrent's bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rechecked_piece_the_job_let_go_is_fetched_again_and_repairs_the_file() {
+    let Damaged {
+        rig,
+        job_id,
+        handle,
+        seeding,
+        _seeds,
+        data,
+        file,
+    } = complete_then_damaged().await;
+    assert_ne!(std::fs::read(&file).unwrap(), data);
+
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    handle.wait_until_completed().await.unwrap();
+
+    assert_eq!(std::fs::read(&file).unwrap(), data);
+    assert_eq!(job_have(&rig.service, job_id).await, 4);
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().have_bytes,
+        data.len() as u64
+    );
+    rig.service.stop().await;
+    seeding.stop().await;
+}
+
+// The job's checkpoint says what the check found: a restart before the
+// damaged piece came again neither has it nor trusts it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_after_a_recheck_does_not_have_the_piece_it_lost() {
+    use weaver_torrent::TorrentStatsState;
+
+    let Damaged {
+        rig,
+        job_id,
+        handle,
+        seeding,
+        data,
+        ..
+    } = complete_then_damaged().await;
+    // Nobody is left to fetch the damaged piece from again.
+    seeding.stop().await;
+    assert_eq!(job_have(&rig.service, job_id).await, 4);
+
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(job_have(&rig.service, job_id).await, 3);
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let handle = handle_of(&again, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    let stats = handle.stats();
+    assert!(matches!(stats.state, TorrentStatsState::Live));
+    assert!(!stats.finished);
+    assert_eq!(
+        stats.progress_bytes,
+        data.len() as u64 - RECHECKED_PIECE as u64
+    );
+    assert_eq!(job_have(&again, job_id).await, 3);
+    again.stop().await;
+}
+
+// libtorrent `torrent::on_piece_hashed` skips the rest of a file only when
+// the file ends: a recheck of a torrent the job holds only some pieces of
+// keeps every piece it holds after the one it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recheck_of_a_partial_torrent_keeps_its_pieces_after_a_hole() {
+    const PIECES: u32 = 16;
+    let Damaged {
+        rig,
+        job_id,
+        handle,
+        seeding,
+        data,
+        ..
+    } = complete_then_damaged_of(PIECES as usize).await;
+    // Nobody is left to fetch the damaged piece from again.
+    seeding.stop().await;
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(job_have(&rig.service, job_id).await, PIECES - 1);
+
+    // Piece 2 is a hole in the job now; piece 3 follows it in the file.
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(job_have(&rig.service, job_id).await, PIECES - 1);
+    assert_eq!(
+        handle.stats().progress_bytes,
+        data.len() as u64 - RECHECKED_PIECE as u64
+    );
+    rig.service.stop().await;
+}
+
+// libtorrent `torrent::force_recheck` forgets every piece before checking,
+// and `torrent::write_resume_data` saves none the check has not found: a
+// stop after a check of every piece began, before it found every piece,
+// trusts nothing on the next start, which checks every piece and does not
+// have the damaged one. The check is begun as the session begins it, by
+// telling the job's intake, and the service stopped before any piece is
+// checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_before_a_recheck_found_every_piece_checks_every_piece_on_the_next_start() {
+    use weaver_torrent::TorrentStatsState;
+
+    let Damaged {
+        rig,
+        job_id,
+        seeding,
+        data,
+        ..
+    } = complete_then_damaged().await;
+    // Nobody is left to fetch the damaged piece from again.
+    seeding.stop().await;
+    let intake = rig
+        .service
+        .with_torrent(job_id, |torrent| Ok(torrent.intake.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(intake.checking().unwrap());
+    assert_eq!(job_have(&rig.service, job_id).await, 0);
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let handle = handle_of(&again, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    let stats = handle.stats();
+    assert!(matches!(stats.state, TorrentStatsState::Live));
+    assert!(!stats.finished);
+    assert_eq!(
+        stats.progress_bytes,
+        data.len() as u64 - RECHECKED_PIECE as u64
+    );
+    assert_eq!(job_have(&again, job_id).await, 3);
+    again.stop().await;
+}
+
 // The next announce the tracker on `listener` hears, unanswered.
 async fn heard_announce(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
     use tokio::io::AsyncReadExt;

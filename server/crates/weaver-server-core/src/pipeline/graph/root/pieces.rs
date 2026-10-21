@@ -78,6 +78,9 @@ pub(crate) enum Unit {
     // In hand, with the SHA-1 of the share as it was handed over; `None`
     // when an earlier run fetched it and this one never saw the bytes.
     Arrived(Option<[u8; 20]>),
+    // In hand, but a check of every piece began and has not found it yet:
+    // the bytes are read as ever, and the piece is not had.
+    Unchecked(Option<[u8; 20]>),
     // The torrent was abandoned without it. `damaged` once its range went
     // to the tree.
     Lost { damaged: bool },
@@ -171,6 +174,68 @@ impl PieceRoot {
             }
         }
         have
+    }
+
+    // Each file's share of the piece that is in hand, with its range in
+    // the file's coordinates.
+    pub(crate) fn in_hand(&self, piece: u32) -> Vec<(VolumeIndex, ByteRange)> {
+        self.layout
+            .spans(piece)
+            .into_iter()
+            .filter_map(|span| Some((span.volume?, span.range)))
+            .filter(|(volume, _)| {
+                matches!(
+                    self.unit(*volume, piece),
+                    Some(Unit::Arrived(_) | Unit::Unchecked(_))
+                )
+            })
+            .collect()
+    }
+
+    // Whether every share the volume's range lies in is in hand.
+    pub(crate) fn holds(&self, volume: VolumeIndex, range: ByteRange) -> bool {
+        self.layout.pieces(volume, range).all(|piece| {
+            matches!(
+                self.unit(volume, piece),
+                Some(Unit::Arrived(_) | Unit::Unchecked(_))
+            )
+        })
+    }
+
+    // A check of every piece began: every share in hand waits for the check
+    // to find it. True when any was in hand.
+    pub(crate) fn forget(&mut self) -> bool {
+        let mut forgot = false;
+        for unit in self.units.iter_mut().flatten() {
+            if let Unit::Arrived(digest) = *unit {
+                *unit = Unit::Unchecked(digest);
+                forgot = true;
+            }
+        }
+        forgot
+    }
+
+    // The check found the piece: every share of it in hand is had again.
+    // True when any waited for the check.
+    pub(crate) fn found(&mut self, piece: u32) -> bool {
+        let mut found = false;
+        for span in self.layout.spans(piece) {
+            if let Some(unit) = span.volume.and_then(|volume| self.unit_mut(volume, piece))
+                && let Unit::Unchecked(digest) = *unit
+            {
+                *unit = Unit::Arrived(digest);
+                found = true;
+            }
+        }
+        found
+    }
+
+    // Whether a share in hand waits for a check to find it.
+    pub(crate) fn unchecked(&self) -> bool {
+        self.units
+            .iter()
+            .flatten()
+            .any(|unit| matches!(unit, Unit::Unchecked(_)))
     }
 
     // Each file's bytes in hand, by its index in the torrent.
@@ -373,7 +438,9 @@ impl Root for PieceRoot {
 
     fn arrived_ranges(&self, volume: VolumeIndex) -> Vec<(u32, ByteRange)> {
         self.each()
-            .filter(|(found, _, unit)| *found == volume && matches!(unit, Unit::Arrived(_)))
+            .filter(|(found, _, unit)| {
+                *found == volume && matches!(unit, Unit::Arrived(_) | Unit::Unchecked(_))
+            })
             .filter_map(|(_, piece, _)| Some((piece, self.layout.span(volume, piece)?)))
             .collect()
     }
@@ -403,7 +470,7 @@ impl Root for PieceRoot {
         self.layout
             .pieces(volume, range)
             .filter_map(|piece| match self.unit(volume, piece) {
-                Some(Unit::Arrived(Some(digest))) => {
+                Some(Unit::Arrived(Some(digest)) | Unit::Unchecked(Some(digest))) => {
                     Some((self.layout.span(volume, piece)?, *digest))
                 }
                 _ => None,

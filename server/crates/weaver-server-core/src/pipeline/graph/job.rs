@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 use weaver_graph::holds::HoldsAccountant;
 use weaver_graph::{
-    Builder, Effect, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
+    Builder, ByteRange, Effect, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
 };
 
 use self::loans::Loans;
@@ -403,10 +403,7 @@ impl<R: Root> GraphJob<R> {
             &mut out,
         )?;
         self.heard(out)?;
-        self.mark_damage()?;
-        self.after_member(volume)?;
-        self.step_runs(Vec::new(), limit)?;
-        self.lend(slots, limit)
+        self.after_units([volume], slots, limit)
     }
 
     // Every server failed the article; nothing will fetch it again.
@@ -418,8 +415,23 @@ impl<R: Root> GraphJob<R> {
         limit: usize,
     ) -> Result<(), GraphError> {
         self.root.lost(volume, ordinal);
+        self.after_units([volume], slots, limit)
+    }
+
+    // After units of `volumes` changed state on a live job, whatever changed
+    // them: the damage is told, a member with nothing left to fetch is
+    // closed, every run is brought up to the tree, and the repairs it made
+    // due are lent.
+    pub(super) fn after_units(
+        &mut self,
+        volumes: impl IntoIterator<Item = VolumeIndex>,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         self.mark_damage()?;
-        self.after_member(volume)?;
+        for volume in volumes {
+            self.after_member(volume)?;
+        }
         self.step_runs(Vec::new(), limit)?;
         self.lend(slots, limit)
     }
@@ -448,6 +460,24 @@ impl<R: Root> GraphJob<R> {
         self.namespace()
             .get(member)
             .is_some_and(|record| record.closed)
+    }
+
+    // A unit of `volume` is in hand no longer: the root waits for it again,
+    // the bytes it covered at `range` are covered no longer, and its member
+    // is open to them. A unit a restore could not read back and a piece that
+    // failed its hash go back this one way.
+    fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32, range: Option<ByteRange>) {
+        self.root.unarrive(volume, ordinal);
+        if let Some(found) = self
+            .tree
+            .namespace_mut(NodeId::ROOT)
+            .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
+        {
+            if let Some(range) = range {
+                found.coverage.erase(range);
+            }
+            found.closed = false;
+        }
     }
 
     // A root member that is not a recovery volume still has articles to

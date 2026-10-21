@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Notify, watch};
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant, HoldsNamespace};
-use weaver_graph::{ByteRange, NodeId, VolumeIndex};
+use weaver_graph::{ByteRange, MemberId, NodeId, VolumeIndex};
 use weaver_torrent::core::lengths::{Lengths, ValidPieceIndex};
 use weaver_torrent::spawn_utils::BlockingSpawner;
 use weaver_torrent::{
@@ -239,7 +239,7 @@ fn a_restored_job_gives_the_session_the_pieces_it_has() {
         1,
     )
     .unwrap();
-    let have = initial_have(&restored.job);
+    let have = initial_have(&restored.job).unwrap();
     assert_eq!(have.len(), 5);
     // Piece 4 waited in memory behind piece 3, so the checkpoint left it out
     // and it is fetched again.
@@ -300,6 +300,62 @@ async fn a_rar_store_archive_in_pieces_delivers_its_member_and_seeds_from_it() {
     }
 }
 
+// libtorrent `torrent::on_piece_hashed` has only the pieces that pass: a
+// piece of a RAR store archive the job unpacked that then fails its hash is
+// in hand no longer, the job steps with the member open again, and the
+// piece fetched again settles the job with the member whole.
+#[tokio::test]
+async fn a_failed_piece_under_an_archive_reopens_it_until_fetched_again() {
+    let archive = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let member = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/originals/small.txt"
+    ));
+    let mut shim = shim(128, vec![file("set.rar", archive.len() as u64)]);
+    let pieces = shim.layout.piece_count();
+    assert!(pieces > 2);
+    for piece in 0..pieces {
+        shim.complete(piece, archive);
+    }
+    shim.settle().await;
+
+    let piece = pieces / 2;
+    shim.storage
+        .on_piece_hash_failed(shim.index(piece))
+        .unwrap();
+    shim.job.with(|job| {
+        assert!(!job.have()[piece as usize]);
+        assert_eq!(job.have().count_ones() as u32, pieces - 1);
+        assert!(!job.namespace().get(MemberId(0)).unwrap().closed);
+        assert!(job.phase() != RootPhase::Done);
+    });
+    let range = shim.layout.piece_range(piece);
+    assert!(
+        shim.storage
+            .pread_exact(0, range.start, &mut [0; 8])
+            .is_err()
+    );
+
+    shim.complete(piece, archive);
+    shim.settle().await;
+    assert!(shim.job.with(|job| job.have().all()));
+    assert_eq!(
+        std::fs::read(shim.dir.path().join("small.txt")).unwrap(),
+        member
+    );
+    for piece in 0..pieces {
+        let range = shim.layout.piece_range(piece);
+        assert_eq!(
+            shim.read(piece),
+            archive[range.start as usize..range.end as usize],
+            "piece {piece}"
+        );
+    }
+}
+
 // The job's side of the storage, telling the test when every piece is in.
 struct Watched {
     job: Arc<TorrentJob>,
@@ -312,6 +368,27 @@ impl Pieces for Watched {
         self.whole
             .send_replace(self.job.with(|job| job.have().all()));
         Ok(())
+    }
+
+    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
+        let held = self.job.failed(piece)?;
+        self.whole
+            .send_replace(self.job.with(|job| job.have().all()));
+        Ok(held)
+    }
+
+    fn checking(&self) -> anyhow::Result<bool> {
+        let had = self.job.checking()?;
+        self.whole
+            .send_replace(self.job.with(|job| job.have().all()));
+        Ok(had)
+    }
+
+    fn found(&self, piece: u32) -> anyhow::Result<bool> {
+        let found = self.job.found(piece)?;
+        self.whole
+            .send_replace(self.job.with(|job| job.have().all()));
+        Ok(found)
     }
 
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
@@ -552,6 +629,14 @@ impl TorrentStorage for Gated {
         self.storage.on_piece_hash_failed(piece)
     }
 
+    fn on_check_everything(&self) -> anyhow::Result<()> {
+        self.storage.on_check_everything()
+    }
+
+    fn on_piece_checked(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.storage.on_piece_checked(piece)
+    }
+
     fn reserve_piece(&self, piece: ValidPieceIndex, room: &Arc<Notify>) -> bool {
         let granted = self.storage.reserve_piece(piece, room);
         if granted {
@@ -637,14 +722,16 @@ async fn a_session_at_its_budget_waits_for_room_and_resumes_when_a_piece_lets_go
 }
 
 // A piece that fails its hash is dropped with the room it held, the session
-// waiting for that room is rung, and the storage going gives back the rest.
+// waiting for that room is rung, the job is told, and the storage going
+// gives back the rest.
 #[tokio::test]
 async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
     let layout = Arc::new(PieceLayout::new(8, vec![file("a", 16)]).unwrap());
     let budget = accountant(8);
+    let kept = Arc::new(Kept::default());
     let storage = PieceStorage::new(
         Arc::clone(&layout),
-        Arc::new(Kept::default()) as Arc<dyn Pieces>,
+        Arc::clone(&kept) as Arc<dyn Pieces>,
         holds(&budget),
     );
     let lengths = Lengths::new(16, 8).unwrap();
@@ -659,6 +746,7 @@ async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
     let rung = room.notified();
     storage.on_piece_hash_failed(first).unwrap();
     rung.await;
+    assert_eq!(*kept.failed.lock().unwrap(), [0]);
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
     assert!(storage.pread_exact(0, 0, &mut [0; 8]).is_err());
 
@@ -668,13 +756,15 @@ async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
 }
 
-// The job's side that keeps what it is handed, and reads the piece back
-// through the storage while it is being handed over.
+// The job's side that keeps what it is handed, reads the piece back
+// through the storage while it is being handed over, and the pieces it was
+// told failed.
 #[derive(Default)]
 struct Kept {
     storage: std::sync::OnceLock<PieceStorage>,
     shares: std::sync::Mutex<Vec<Verified>>,
     read_while_handed: std::sync::Mutex<Vec<u8>>,
+    failed: std::sync::Mutex<Vec<u32>>,
 }
 
 impl Pieces for Kept {
@@ -688,6 +778,19 @@ impl Pieces for Kept {
         }
         self.shares.lock().unwrap().extend(shares);
         Ok(())
+    }
+
+    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
+        self.failed.lock().unwrap().push(piece);
+        Ok(false)
+    }
+
+    fn checking(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn found(&self, _: u32) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     fn posted(&self, _: VolumeIndex, _: ByteRange, _: &mut Vec<u8>) -> bool {

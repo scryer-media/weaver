@@ -3464,12 +3464,13 @@ fn top_priority(value: &str) -> bool {
 // The checkpoint the session starts from, so it does not check the files:
 // the pieces the job has, and no block of any other. The storage keeps a
 // piece's blocks in memory until the piece verifies, so no block of a piece
-// not had is ever written to the job's files.
+// not had is ever written to the job's files. None while the job vouches
+// for nothing: the session checks every piece.
 fn apply_initial_have(
     options: &mut AddTorrentOptions,
-    have: bitvec::boxed::BitBox<u8, bitvec::order::Msb0>,
+    have: Option<bitvec::boxed::BitBox<u8, bitvec::order::Msb0>>,
 ) {
-    options.checkpoint = Some(Checkpoint::pieces(have));
+    options.checkpoint = have.map(Checkpoint::pieces);
 }
 
 // Why a session refusal leaves a torrent without one.

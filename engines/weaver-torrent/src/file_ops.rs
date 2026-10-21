@@ -140,6 +140,19 @@ fn update_hash_from_file(
     Ok(())
 }
 
+/// Whether a read failed because the file ends before the range, or is not
+/// there at all.
+fn ends_the_file(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::NotFound
+            )
+        })
+}
+
 pub(crate) struct FileOps<'a> {
     metadata: &'a TorrentMetadata,
     torrent: &'a ValidatedTorrentMetaV1Info<ByteBufOwned>,
@@ -263,8 +276,23 @@ impl<'a> FileOps<'a> {
         let done = checked.len();
         let mut have_pieces =
             BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into());
+        // The storage hears each verdict: a piece the check found it has, and
+        // one the check did not find failed its hash as a downloaded one
+        // does, so the storage lets go of whatever it held of it. What the
+        // storage holds is what the check found (libtorrent
+        // `torrent::on_piece_hashed`: `we_have` on a pass, nothing on a miss).
         for (piece, had) in checked {
-            have_pieces.set(piece.get() as usize, had?);
+            let had = had?;
+            if had {
+                self.files
+                    .on_piece_checked(piece)
+                    .with_context(|| format!("the storage did not take piece {piece}"))?;
+            } else {
+                self.files
+                    .on_piece_hash_failed(piece)
+                    .with_context(|| format!("the storage did not let go of piece {piece}"))?;
+            }
+            have_pieces.set(piece.get() as usize, had);
         }
         if done < total {
             bail!("initial check paused");
@@ -273,9 +301,11 @@ impl<'a> FileOps<'a> {
     }
 
     /// Whether `piece`'s data is there, read once from the files it spans.
-    /// A file that cannot be read from some offset on is `broken` from
-    /// there and not read there again: every piece of it from there on is
-    /// needed, whichever piece found it.
+    /// A file that ends at some offset, or is not there at all, is `broken`
+    /// from there and not read there again: every piece of it from there on
+    /// is needed, whichever piece found it. Any other miss fails that piece
+    /// alone (libtorrent `torrent::on_piece_hashed` skips the rest of a file
+    /// only on eof, a missing file or a file too short).
     fn has_piece(
         &self,
         piece: ValidPieceIndex,
@@ -308,7 +338,9 @@ impl<'a> FileOps<'a> {
                     "error reading from file {file} ({:?}) at {at}: {err:#}",
                     fi.relative_filename
                 );
-                broken[file].fetch_min(at, Ordering::Relaxed);
+                if ends_the_file(&err) {
+                    broken[file].fetch_min(at, Ordering::Relaxed);
+                }
                 trace!("piece {piece} had errors, marking as needed");
                 return Ok(false);
             }
@@ -508,8 +540,17 @@ mod tests {
     use crate::core::v2_test_torrent::{TestTorrent, metadata, payload};
     use crate::torrent_state::ManagedTorrentShared;
 
-    /// Each file's bytes, read only, and how many bytes were read.
-    struct Files(Vec<Vec<u8>>, AtomicU64);
+    /// Each file's bytes, read only, how many bytes were read, the pieces
+    /// it was told failed, ranges of files it does not hand out though the
+    /// file goes on past them, as a storage that holds only some pieces, and
+    /// the pieces it was told a check found.
+    struct Files(
+        Vec<Vec<u8>>,
+        AtomicU64,
+        std::sync::Mutex<Vec<u32>>,
+        Vec<(usize, std::ops::Range<u64>)>,
+        std::sync::Mutex<Vec<u32>>,
+    );
 
     impl Files {
         /// `payload` laid out over the torrent's files.
@@ -524,6 +565,9 @@ mod tests {
                     })
                     .collect(),
                 AtomicU64::new(0),
+                Default::default(),
+                Vec::new(),
+                Default::default(),
             )
         }
     }
@@ -538,11 +582,19 @@ mod tests {
         }
 
         fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            let end = offset + buf.len() as u64;
+            if self
+                .3
+                .iter()
+                .any(|(file, hole)| *file == file_id && hole.start < end && offset < hole.end)
+            {
+                bail!("not in hand");
+            }
             let start = offset as usize;
             buf.copy_from_slice(
                 self.0[file_id]
                     .get(start..start + buf.len())
-                    .context("read past the end")?,
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?,
             );
             self.1.fetch_add(buf.len() as u64, Ordering::Relaxed);
             Ok(())
@@ -565,7 +617,23 @@ mod tests {
         }
 
         fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
-            Ok(Box::new(Files(self.0.clone(), AtomicU64::new(0))))
+            Ok(Box::new(Files(
+                self.0.clone(),
+                AtomicU64::new(0),
+                Default::default(),
+                self.3.clone(),
+                Default::default(),
+            )))
+        }
+
+        fn on_piece_hash_failed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+            self.2.lock().unwrap().push(piece.get());
+            Ok(())
+        }
+
+        fn on_piece_checked(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+            self.4.lock().unwrap().push(piece.get());
+            Ok(())
         }
     }
 
@@ -813,7 +881,9 @@ mod tests {
     #[test]
     fn a_short_or_missing_file_leaves_its_pieces_needed_on_any_number_of_threads() {
         // libtorrent test_checking.cpp `incomplete`: every file but each
-        // third cut to half its length, or to nothing.
+        // third cut to half its length, or to nothing. The storage is told
+        // each piece the check did not find, so it holds none of them, and
+        // each it found.
         let t = checking_torrent();
         let metadata = metadata(&t.torrent_bytes());
         let payload = t.v1_payload();
@@ -859,6 +929,63 @@ mod tests {
                 .unwrap();
             let have: Vec<bool> = have.iter().by_vals().take(expected.len()).collect();
             assert_eq!(have, expected, "{threads}");
+            let mut failed = std::mem::take(&mut *files.2.lock().unwrap());
+            failed.sort_unstable();
+            let missing: Vec<u32> = (0..expected.len() as u32)
+                .filter(|piece| !expected[*piece as usize])
+                .collect();
+            assert_eq!(failed, missing, "{threads}");
+            let mut found = std::mem::take(&mut *files.4.lock().unwrap());
+            found.sort_unstable();
+            let had: Vec<u32> = (0..expected.len() as u32)
+                .filter(|piece| expected[*piece as usize])
+                .collect();
+            assert_eq!(found, had, "{threads}");
+        }
+    }
+
+    #[test]
+    fn a_range_the_storage_does_not_hand_out_fails_only_its_pieces() {
+        // libtorrent `torrent::on_piece_hashed` skips the rest of a file
+        // only when the file ends; a storage that holds some pieces of a
+        // file and not others has every piece it holds checked.
+        let t = checking_torrent();
+        let metadata = metadata(&t.torrent_bytes());
+        let mut files = Files::new(&metadata, &t.v1_payload());
+        let (file, fi) = metadata
+            .file_infos
+            .iter()
+            .enumerate()
+            .find(|(_, fi)| fi.relative_filename == Path::new("f39"))
+            .unwrap();
+        let hole = 20000..20100;
+        files.3.push((file, hole.clone()));
+        let lengths = metadata.lengths();
+        let expected: Vec<bool> = lengths
+            .iter_piece_infos()
+            .map(|p| {
+                let start = lengths.piece_offset(p.piece_index);
+                let end = start + u64::from(p.len);
+                !(fi.offset_in_torrent + hole.start < end
+                    && start < fi.offset_in_torrent + hole.end)
+            })
+            .collect();
+        assert_eq!(expected.iter().filter(|had| !**had).count(), 1);
+        // The file goes on past the hole for whole pieces, which the check
+        // still finds.
+        assert!(lengths.iter_piece_infos().any(|p| {
+            let start = lengths.piece_offset(p.piece_index);
+            start >= fi.offset_in_torrent + hole.end
+                && start + u64::from(p.len) <= fi.offset_in_torrent + fi.len
+        }));
+        for threads in [1, 4, 64] {
+            let have = FileOps::new(&metadata, &files, true)
+                .initial_check(threads, &AtomicU64::new(0), &AtomicBool::new(false))
+                .unwrap();
+            let have: Vec<bool> = have.iter().by_vals().take(expected.len()).collect();
+            assert_eq!(have, expected, "{threads}");
+            let failed = std::mem::take(&mut *files.2.lock().unwrap());
+            assert_eq!(failed.len(), 1, "{threads}");
         }
     }
 
@@ -876,7 +1003,13 @@ mod tests {
 
     /// Which pieces of `metadata` get a SHA-1 digest.
     fn sha1_pieces(metadata: &TorrentMetadata, disable_v1_hashes: bool) -> Vec<bool> {
-        let files = Files(Vec::new(), AtomicU64::new(0));
+        let files = Files(
+            Vec::new(),
+            AtomicU64::new(0),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+        );
         let ops = FileOps::new(metadata, &files, disable_v1_hashes);
         metadata
             .lengths()
