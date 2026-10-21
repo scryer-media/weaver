@@ -109,7 +109,7 @@ use crate::{
 };
 
 use self::{
-    choker::{Choker, UNCHOKE_INTERVAL},
+    choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     peer::{
         InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
         stats::{
@@ -360,19 +360,34 @@ impl TorrentStateLive {
         Ok(state)
     }
 
-    /// Hands the upload slots out every UNCHOKE_INTERVAL, and at once when a
-    /// peer holding one gives it up.
+    /// Hands the upload slots out every UNCHOKE_INTERVAL and passes the
+    /// optimistic one on every OPTIMISTIC_UNCHOKE_INTERVAL, each at once when
+    /// the choker asks for it sooner. When both fall due the optimistic slot
+    /// passes first, so the round sees its new holder.
     async fn task_choker(self: Arc<Self>) -> crate::Result<()> {
         let first = tokio::time::Instant::now() + UNCHOKE_INTERVAL;
         let mut rounds = tokio::time::interval_at(first, UNCHOKE_INTERVAL);
+        let mut rotations = tokio::time::interval_at(first, OPTIMISTIC_UNCHOKE_INTERVAL);
         loop {
-            tokio::select! {
+            let rotate = tokio::select! {
                 biased;
-                _ = rounds.tick() => {}
-                _ = self.choker.reshuffle_requested() => rounds.reset(),
+                _ = rotations.tick() => true,
+                _ = self.choker.rotation_requested() => {
+                    rotations.reset();
+                    true
+                }
+                _ = self.choker.reshuffle_requested() => {
+                    rounds.reset();
+                    false
+                }
+                _ = rounds.tick() => false,
+            };
+            let now = tokio::time::Instant::now();
+            if rotate {
+                self.choker.rotate_optimistic(&self.peers, now);
+            } else {
+                self.choker.recalculate(&self.peers, now);
             }
-            self.choker
-                .recalculate(&self.peers, tokio::time::Instant::now());
         }
     }
 
@@ -1350,12 +1365,14 @@ impl PeerHandler {
         };
         let prev = pe.value_mut().take_state(peers);
 
+        // Whether the connection held an upload slot, when it was live. The
+        // choker hears of it once the peer table is let go: it takes its own
+        // lock before the table's.
+        let mut held_slot = None;
         match prev {
             PeerState::Connecting(_) => {}
             PeerState::Live(live) => {
-                if !live.is_choked() {
-                    self.state.choker.slot_freed();
-                }
+                held_slot = Some(!live.is_choked());
                 let mut g = self.state.lock_write("mark_chunk_requests_canceled");
 
                 // Release all pieces owned by this peer (fixes the bug where pieces
@@ -1411,6 +1428,10 @@ impl PeerHandler {
         let needed = failed_at.is_some() && !self.state.is_finished_and_no_active_streams();
         peers.connection_closed(pe.value_mut(), failed_at, needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
+        drop(pe);
+        if let Some(held_slot) = held_slot {
+            self.state.choker.peer_gone(handle, held_slot);
+        }
         Ok(())
     }
 

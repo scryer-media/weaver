@@ -67,6 +67,9 @@ pub(crate) struct Peer {
     failcount: u32,
     // When the last of those failures happened.
     last_failed: Option<Instant>,
+    // When the choker last gave the peer the optimistic slot, on any
+    // connection to it.
+    pub last_optimistic_unchoke: Option<Instant>,
 }
 
 impl Peer {
@@ -90,6 +93,7 @@ impl Peer {
             outgoing_address: listen_address(addr, connection_kind),
             failcount: 0,
             last_failed: None,
+            last_optimistic_unchoke: None,
         }
     }
 
@@ -103,6 +107,7 @@ impl Peer {
             state: Default::default(),
             failcount: 0,
             last_failed: None,
+            last_optimistic_unchoke: None,
         }
     }
 

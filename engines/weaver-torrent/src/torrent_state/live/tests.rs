@@ -495,22 +495,35 @@ async fn only_as_many_peers_as_there_are_upload_slots_are_unchoked() {
 
 #[tokio::test]
 async fn a_peer_that_sends_us_more_takes_the_slot_of_one_that_sends_less() {
-    let h = Harness::seeding_with_slots("the_faster_peer_takes_a_slot", 2).await;
+    // Two regular slots and the optimistic one.
+    let h = Harness::seeding_with_slots("the_faster_peer_takes_a_slot", 3).await;
     tokio::time::pause();
     let (slow, mut slow_rx) = h.peer("127.0.0.1:6881");
     let (steady, mut steady_rx) = h.peer("127.0.0.2:6881");
-    let (fast, mut fast_rx) = h.peer("127.0.0.3:6881");
-    for (peer, rx) in [(&slow, &mut slow_rx), (&steady, &mut steady_rx)] {
+    let (optimistic, mut optimistic_rx) = h.peer("127.0.0.3:6881");
+    let (fast, mut fast_rx) = h.peer("127.0.0.4:6881");
+    for (peer, rx) in [
+        (&slow, &mut slow_rx),
+        (&steady, &mut steady_rx),
+        (&optimistic, &mut optimistic_rx),
+    ] {
         peer.on_received_message(Message::Interested).await.unwrap();
         assert_eq!(next_sent(rx).await, Sent::Unchoke);
     }
+
+    // The first round keeps two of the three, none having sent a byte, and
+    // the third comes back on the optimistic slot.
+    assert_eq!(next_sent(&mut optimistic_rx).await, Sent::Choke);
+    assert_eq!(next_sent(&mut optimistic_rx).await, Sent::Unchoke);
+
     (&fast)
         .on_received_message(Message::Interested)
         .await
         .unwrap();
     assert!(fast_rx.is_empty());
 
-    // Over the round the fast peer sends us the most, the slow one the least.
+    // Over the round the fast peer sends us the most, the slow one the least:
+    // the fast one takes the slow one's slot.
     for (peer, pieces) in [(&slow, 1u64), (&steady, 2), (&fast, 3)] {
         peer.counters
             .fetched_bytes
@@ -520,6 +533,43 @@ async fn a_peer_that_sends_us_more_takes_the_slot_of_one_that_sends_less() {
     assert_eq!(next_sent(&mut slow_rx).await, Sent::Choke);
     assert!(steady_rx.is_empty());
     assert!(!h.choked(&steady));
+    assert!(optimistic_rx.is_empty());
+    assert!(!h.choked(&optimistic));
+}
+
+#[tokio::test]
+async fn the_optimistic_slot_passes_every_30_s_to_a_peer_that_never_held_it() {
+    // The one slot is the optimistic one.
+    let h = Harness::seeding_with_slots("the_optimistic_slot_rotates", 1).await;
+    tokio::time::pause();
+    let (first, mut first_rx) = h.peer("127.0.0.1:6881");
+    let (new, mut new_rx) = h.peer("127.0.0.2:6881");
+
+    // The first peer takes the free slot, loses it at the first round, as
+    // there is no regular slot, and gets it back as the optimistic one.
+    (&first)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Choke);
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Unchoke);
+    let first_held_it = tokio::time::Instant::now();
+
+    // A new peer waits for the slot, then takes it from the first peer, which
+    // held it last, after the interval.
+    (&new)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert!(new_rx.is_empty());
+    assert_eq!(next_sent(&mut new_rx).await, Sent::Unchoke);
+    assert_eq!(
+        tokio::time::Instant::now(),
+        first_held_it + choker::OPTIMISTIC_UNCHOKE_INTERVAL
+    );
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Choke);
+    assert!(h.choked(&first));
 }
 
 #[tokio::test]
