@@ -10,17 +10,18 @@ use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     str::{FromStr, from_utf8},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, SystemTime},
+    sync::Arc,
+    time::Duration,
 };
 
-use crate::core::{Id20, spawn_utils::spawn_with_cancel};
+use crate::{
+    core::{Id20, spawn_utils::spawn_with_cancel},
+    upnp::get_local_ip_relative_to,
+};
 use anyhow::Context;
 use futures::{Stream, future::BoxFuture};
 use librqbit_dualstack_sockets::{BindDevice, MulticastUdpSocket};
+use network_interface::NetworkInterface;
 use parking_lot::Mutex;
 use tokio::{
     sync::{
@@ -30,7 +31,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, debug_span, trace};
+use tracing::{debug_span, trace};
 
 const LSD_PORT: u16 = 6771;
 const LSD_IPV4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 192, 152, 143), LSD_PORT);
@@ -55,34 +56,6 @@ const FIRST_ANNOUNCE_SPACING: Duration = Duration::from_secs(4);
 const SENDS_PER_ANNOUNCE: u32 = 3;
 const RESEND_STEP: Duration = Duration::from_secs(2);
 
-const RATE_LIMIT_PERIOD: Duration = Duration::from_secs(1);
-
-#[derive(Default)]
-struct RateLimiter {
-    last_reply: AtomicU64,
-}
-
-impl RateLimiter {
-    fn check(&self) -> Option<()> {
-        // If we can't get system time for some reason, just disable rate limit
-        let now = match SystemTime::UNIX_EPOCH.elapsed() {
-            Ok(t) => t.as_secs(),
-            _ => return Some(()),
-        };
-
-        let last = self.last_reply.load(Ordering::Relaxed);
-        if now.saturating_sub(last) >= RATE_LIMIT_PERIOD.as_secs()
-            && self
-                .last_reply
-                .compare_exchange_weak(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            return Some(());
-        }
-        None
-    }
-}
-
 /// What the LSD sends on and receives from: the multicast socket, or a
 /// test's.
 trait Socket: Send + Sync + 'static {
@@ -93,12 +66,8 @@ trait Socket: Send + Sync + 'static {
     fn send_everywhere<'a>(&'a self, msg: &'a (dyn Fn(bool) -> String + Sync))
     -> BoxFuture<'a, ()>;
 
-    /// Sends `msg(is_v6)` to the LSD group on the interface that reaches `to`.
-    fn reply<'a>(
-        &'a self,
-        to: SocketAddr,
-        msg: &'a (dyn Fn(bool) -> String + Sync),
-    ) -> BoxFuture<'a, ()>;
+    /// The host's interfaces, whose networks are the local ones.
+    fn nics(&self) -> &[NetworkInterface];
 }
 
 impl Socket for MulticastUdpSocket {
@@ -119,31 +88,14 @@ impl Socket for MulticastUdpSocket {
         })
     }
 
-    fn reply<'a>(
-        &'a self,
-        to: SocketAddr,
-        msg: &'a (dyn Fn(bool) -> String + Sync),
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            let Some(mopts) = self.find_mcast_opts_for_replying_to(&to) else {
-                debug!(addr=?to, "couldn't find where to reply");
-                return;
-            };
-            let reply = msg(to.is_ipv6());
-            if let Err(e) = self.send_multicast_msg(reply.as_bytes(), &mopts).await {
-                trace!(addr=?to, ?reply, ?mopts, "error sending reply: {e:#}");
-            } else {
-                trace!(addr=?to, ?reply, ?mopts, "sent reply");
-            }
-        })
+    fn nics(&self) -> &[NetworkInterface] {
+        MulticastUdpSocket::nics(self)
     }
 }
 
 struct Announce {
     tx: UnboundedSender<SocketAddr>,
     port: Option<u16>,
-    last_reply_ipv4: RateLimiter,
-    last_reply_ipv6: RateLimiter,
 }
 
 /// An announce with sends still to go (libtorrent `lsd::resend_announce`).
@@ -355,32 +307,26 @@ cookie: {cookie}\r
         )
     }
 
+    /// Takes one packet: an announce from the local network names a peer of
+    /// the torrent it announces, and is never answered (libtorrent
+    /// `lsd::process_packet`).
     async fn recv_and_process_one(&self, buf: &mut [u8]) -> anyhow::Result<()> {
-        macro_rules! return_if_none {
-            ($e:expr) => {
-                return_if_none!($e, ())
-            };
-            ($e:expr, $if_err:expr) => {
-                match $e {
-                    Some(e) => e,
-                    None => {
-                        $if_err;
-                        return Ok(());
-                    }
-                }
-            };
-        }
-
         let mut headers = [httparse::EMPTY_HEADER; 16];
 
         let (sz, addr) = self.inner.socket.recv_from(buf).await?;
+        if get_local_ip_relative_to(addr, self.inner.socket.nics()).is_err() {
+            trace!(?addr, "ignoring a packet from outside the local network");
+            return Ok(());
+        }
         let buf = bstr::BStr::new(&buf[..sz]);
 
-        let bts = return_if_none!(
-            try_parse_bt_search(buf, &mut headers)
-                .inspect_err(|e| trace!(?buf, ?addr, "error parsing message: {e:#}"))
-                .ok()
-        );
+        let bts = match try_parse_bt_search(buf, &mut headers) {
+            Ok(bts) => bts,
+            Err(e) => {
+                trace!(?buf, ?addr, "error parsing message: {e:#}");
+                return Ok(());
+            }
+        };
 
         trace!(?addr, ?bts, "received");
 
@@ -391,31 +337,9 @@ cookie: {cookie}\r
 
         let mut addr = addr;
         addr.set_port(bts.port);
-        let announce_port = {
-            let g = self.inner.registry.lock();
-            let announce = return_if_none!(g.receivers.get(&bts.hash));
-
-            return_if_none!(announce.tx.send(addr).ok());
-
-            let announce_port = return_if_none!(announce.port);
-
-            let rl = if addr.is_ipv4() {
-                &announce.last_reply_ipv4
-            } else {
-                &announce.last_reply_ipv6
-            };
-
-            return_if_none!(rl.check(), trace!(?addr, ?bts, "replying rate-limited"));
-
-            announce_port
-        };
-
-        self.inner
-            .socket
-            .reply(addr, &|is_v6| {
-                self.gen_announce_msg(bts.hash, announce_port, is_v6)
-            })
-            .await;
+        if let Some(announce) = self.inner.registry.lock().receivers.get(&bts.hash) {
+            let _ = announce.tx.send(addr);
+        }
         Ok(())
     }
 
@@ -485,8 +409,6 @@ cookie: {cookie}\r
             Announce {
                 tx,
                 port: announce_port,
-                last_reply_ipv4: Default::default(),
-                last_reply_ipv6: Default::default(),
             },
             Instant::now(),
         );
@@ -561,9 +483,10 @@ fn try_parse_bt_search<'a: 'h, 'h>(
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
-    use futures::future::BoxFuture;
+    use futures::{StreamExt, future::BoxFuture};
+    use network_interface::NetworkInterface;
     use tokio::{
         sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
         time::Instant,
@@ -580,6 +503,7 @@ mod tests {
     struct TestSocket {
         incoming: tokio::sync::Mutex<UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
         sent: UnboundedSender<(Instant, Id20)>,
+        nics: Vec<NetworkInterface>,
     }
 
     impl TestSocket {
@@ -613,20 +537,14 @@ mod tests {
             Box::pin(async {})
         }
 
-        fn reply<'a>(
-            &'a self,
-            _to: SocketAddr,
-            msg: &'a (dyn Fn(bool) -> String + Sync),
-        ) -> BoxFuture<'a, ()> {
-            self.record(&msg(false));
-            Box::pin(async {})
+        fn nics(&self) -> &[NetworkInterface] {
+            &self.nics
         }
     }
 
     struct Harness {
         lsd: LocalServiceDiscovery,
         sent: UnboundedReceiver<(Instant, Id20)>,
-        #[allow(unused)]
         incoming: UnboundedSender<(Vec<u8>, SocketAddr)>,
         start: Instant,
     }
@@ -635,9 +553,18 @@ mod tests {
         fn new() -> Self {
             let (incoming, incoming_rx) = unbounded_channel();
             let (sent_tx, sent) = unbounded_channel();
+            // The host is on 10.0.0.0/24 alone.
             let socket = TestSocket {
                 incoming: tokio::sync::Mutex::new(incoming_rx),
                 sent: sent_tx,
+                nics: vec![NetworkInterface::new_afinet(
+                    "test0",
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    Some(Ipv4Addr::new(255, 255, 255, 0)),
+                    None,
+                    1,
+                    false,
+                )],
             };
             Self {
                 lsd: LocalServiceDiscovery::with_socket(
@@ -655,6 +582,18 @@ mod tests {
         async fn next(&mut self) -> (Id20, u64) {
             let (at, hash) = self.sent.recv().await.unwrap();
             (hash, (at - self.start).as_secs())
+        }
+
+        /// A peer at `from` announces `info_hash` on `port`.
+        fn receive(&self, from: &str, info_hash: Id20, port: u16) {
+            let msg = format!(
+                "BT-SEARCH * HTTP/1.1\r\nHost: 239.192.152.143:6771\r\nPort: {port}\r\n\
+                 Infohash: {}\r\ncookie: 2\r\n\r\n\r\n",
+                info_hash.as_string()
+            );
+            self.incoming
+                .send((msg.into_bytes(), from.parse().unwrap()))
+                .unwrap();
         }
 
         /// The sends up to and including the first at or after `secs`.
@@ -764,5 +703,31 @@ mod tests {
         let _a = h.lsd.announce(a, None);
         let _b = h.lsd.announce(b, Some(PORT));
         assert_eq!(h.until(300).await, [(b, 0), (b, 2), (b, 6), (b, 300)]);
+    }
+
+    // libtorrent `lsd::process_packet`: a source outside the netmask of the
+    // interface is dropped. The peer on the host's network comes through
+    // first, so the one outside it was dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_packet_from_outside_the_local_network_is_ignored() {
+        let h = Harness::new();
+        let a = hash(1);
+        let mut peers = h.lsd.announce(a, None);
+        h.receive("192.168.1.5:6771", a, 7000);
+        h.receive("10.0.0.7:6771", a, 7001);
+        assert_eq!(peers.next().await, Some("10.0.0.7:7001".parse().unwrap()));
+    }
+
+    // libtorrent `lsd::on_announce` answers nothing: the scheduled sends
+    // are the only traffic. An answer would go out at 0 s, before the
+    // resend at 2 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_received_announce_is_not_answered() {
+        let mut h = Harness::new();
+        let a = hash(1);
+        let mut peers = h.lsd.announce(a, Some(PORT));
+        h.receive("10.0.0.7:6771", a, 7001);
+        assert_eq!(peers.next().await, Some("10.0.0.7:7001".parse().unwrap()));
+        assert_eq!(h.until(2).await, [(a, 0), (a, 2)]);
     }
 }
