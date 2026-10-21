@@ -126,12 +126,11 @@ pub struct Observed {
 /// The state and the reason behind it, when there is one to give.
 pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
     let detail = |text: &str| Some(text.to_owned());
-    // A check shows while it runs, whatever the operator asked or holds the
-    // torrent: a paused, stopped or queued torrent rechecked is being
-    // checked (qBittorrent `TorrentImpl::updateState` decides Checking
-    // before Stopped and Queued).
-    if matches!(seen.engine, Engine::Checking) {
-        return (TorrentState::CheckingFiles, None);
+    // A move shows first: the torrent's files are on their way, whatever
+    // else the engine is doing with them (qBittorrent
+    // `TorrentImpl::updateState` decides Moving before Checking).
+    if seen.moving {
+        return (TorrentState::Moving, None);
     }
     match seen.intent {
         TorrentIntent::Paused => return (TorrentState::Paused, None),
@@ -144,6 +143,12 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         }
         TorrentIntent::Resumed => {}
     }
+    // A check shows while it runs, past whatever holds the torrent in the
+    // queue (qBittorrent `TorrentImpl::updateState` decides Checking before
+    // Queued, and only for a torrent that is not stopped).
+    if matches!(seen.engine, Engine::Checking) {
+        return (TorrentState::CheckingFiles, None);
+    }
     // A hold on the queue leaves the torrent as it was asked to be, and
     // holds it in the queue, as it does any other job; the hold says whose.
     if let Some(origin) = seen.paused_by {
@@ -154,9 +159,6 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
     }
     if !seen.has_metadata {
         return (TorrentState::FetchingMetadata, None);
-    }
-    if seen.moving {
-        return (TorrentState::Moving, None);
     }
     if seen.queued {
         return (TorrentState::Queued, None);
@@ -443,7 +445,7 @@ mod tests {
                 intent: TorrentIntent::Paused,
                 ..moving(Engine::Paused { finished: false })
             }),
-            (TorrentState::Paused, None)
+            (TorrentState::Moving, None)
         );
     }
 
@@ -470,17 +472,25 @@ mod tests {
             project(&seen(Engine::Checking)),
             (TorrentState::CheckingFiles, None)
         );
-        // A recheck shows while it runs, past what holds the torrent.
-        for held in [
-            Observed {
+        // A recheck shows while it runs, past what holds the torrent in the
+        // queue; a paused or stopped torrent being checked is still paused
+        // or stopped.
+        assert_eq!(
+            project(&Observed {
                 intent: TorrentIntent::Paused,
                 ..seen(Engine::Checking)
-            },
-            Observed {
+            }),
+            (TorrentState::Paused, None)
+        );
+        assert_eq!(
+            project(&Observed {
                 intent: TorrentIntent::Stopped,
                 complete: true,
                 ..seen(Engine::Checking)
-            },
+            }),
+            (TorrentState::Stopped, Some(GOAL_MET.to_owned()))
+        );
+        for held in [
             Observed {
                 queued: true,
                 ..seen(Engine::Checking)
