@@ -9,7 +9,14 @@
 //! for one connection at a time, so arrival order hands freed slots and each
 //! second's connects to the waiting torrents in turn.
 
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use tokio::{
     sync::{AcquireError, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -39,12 +46,32 @@ pub(crate) struct ConnectionSlots {
     slack: Arc<Semaphore>,
     connects: Mutex<ConnectWindow>,
     speed: NonZeroU32,
+    // The callers of `begin_connect` not yet let begin, each holding the
+    // slot of its connection.
+    waiting: AtomicUsize,
 }
 
-// The one-second window connects are counted in, and how many it has left.
+// The one-second window connects are counted in, and how many it has left,
+// set by the first connect that begins in it.
 struct ConnectWindow {
     start: Instant,
-    left: u32,
+    left: Option<u32>,
+}
+
+// A caller of `begin_connect`, counted while it waits.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(waiting: &'a AtomicUsize) -> Self {
+        waiting.fetch_add(1, Ordering::Relaxed);
+        Self(waiting)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// One peer connection's place under the session cap, or in the slack past
@@ -63,9 +90,10 @@ impl ConnectionSlots {
             slack: Arc::new(Semaphore::new(slack.min(Semaphore::MAX_PERMITS))),
             connects: Mutex::new(ConnectWindow {
                 start: Instant::now(),
-                left: speed.get(),
+                left: None,
             }),
             speed,
+            waiting: AtomicUsize::new(0),
         }
     }
 
@@ -117,19 +145,32 @@ impl ConnectionSlots {
         Ok(ConnectionSlot { permit })
     }
 
-    /// Returns when one more outgoing connect may begin: at most `speed`
-    /// begin in each one-second window.
+    /// Returns when one more outgoing connect may begin, for a caller that
+    /// holds the slot of its connection: at most `speed` begin in each
+    /// one-second window, and no more than half the slots free when the
+    /// window's first begins, rounded up, so that the session does not fill
+    /// every slot at once and time them out together (libtorrent
+    /// `session_impl::try_connect_more_peers`, `smooth_connects` on). The
+    /// slot of a connect yet to begin is free: libtorrent counts no
+    /// connection before its connect.
     pub(crate) async fn begin_connect(&self) {
+        let _waiting = Waiting::new(&self.waiting);
         let mut window = self.connects.lock().await;
         loop {
             let elapsed = Instant::now().duration_since(window.start);
             if elapsed >= WINDOW {
                 let whole = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
                 window.start += WINDOW * whole;
-                window.left = self.speed.get();
+                window.left = None;
             }
-            if window.left > 0 {
-                window.left -= 1;
+            let left = window.left.get_or_insert_with(|| {
+                let free = self.free() + self.waiting.load(Ordering::Relaxed);
+                self.speed
+                    .get()
+                    .min(u32::try_from(free.div_ceil(2)).unwrap_or(u32::MAX))
+            });
+            if *left > 0 {
+                *left -= 1;
                 return;
             }
             // Holding the lock: whoever waits behind it is next once this
@@ -190,7 +231,7 @@ mod tests {
         assert!(slots.try_open().is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn two_torrents_share_the_cap_and_freed_slots_alternate() {
         let slots = slots(2, 1000);
         let (granted_tx, mut granted) = mpsc::unbounded_channel();
@@ -217,6 +258,53 @@ mod tests {
         for pair in order.windows(2) {
             assert_ne!(pair[0], pair[1], "{order:?}");
         }
+    }
+
+    // libtorrent session_impl::try_connect_more_peers with smooth_connects:
+    // a tick begins at most (free slots + 1) / 2 connects.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_begins_connects_for_half_the_free_slots_rounded_up() {
+        let slots = slots(20, 30);
+        let start = Instant::now();
+        let (granted_tx, mut granted) = mpsc::unbounded_channel();
+        connect_loop(slots.clone(), 'a', granted_tx);
+
+        // 20 free: 10 begin, then the loop waits for the next second.
+        let mut open = Vec::new();
+        for _ in 0..10 {
+            open.push(granted.recv().await.unwrap());
+        }
+        assert_eq!(Instant::now(), start, "no time passed");
+        tokio::task::yield_now().await;
+        assert!(
+            granted.try_recv().is_err(),
+            "an 11th connect in the first second"
+        );
+
+        // 10 free then: 5 begin in the next.
+        let next = granted.recv().await.unwrap();
+        assert_eq!(Instant::now(), start + WINDOW);
+        open.push(next);
+        for _ in 0..4 {
+            open.push(granted.recv().await.unwrap());
+        }
+        assert_eq!(Instant::now(), start + WINDOW);
+        tokio::task::yield_now().await;
+        assert!(
+            granted.try_recv().is_err(),
+            "a 6th connect in the second second"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_free_slot_begins_one_connect() {
+        let slots = slots(2, 30);
+        let _incoming = slots.try_open().unwrap();
+        let start = Instant::now();
+        let (granted_tx, mut granted) = mpsc::unbounded_channel();
+        connect_loop(slots.clone(), 'a', granted_tx);
+        let _open = granted.recv().await.unwrap();
+        assert_eq!(Instant::now(), start, "no time passed");
     }
 
     #[tokio::test(start_paused = true)]
