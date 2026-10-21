@@ -59,6 +59,16 @@ impl SessionStatsSnapshot {
         m!(counter, rqbit_uploaded_bytes, self.counters.uploaded_bytes);
         m!(
             counter,
+            rqbit_fetched_protocol_bytes,
+            self.counters.fetched_protocol_bytes
+        );
+        m!(
+            counter,
+            rqbit_uploaded_protocol_bytes,
+            self.counters.uploaded_protocol_bytes
+        );
+        m!(
+            counter,
             rqbit_blocked_incoming,
             self.counters.blocked_incoming
         );

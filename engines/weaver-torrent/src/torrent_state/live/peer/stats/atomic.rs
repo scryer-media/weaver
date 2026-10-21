@@ -17,6 +17,11 @@ use std::{
 pub(crate) struct PeerCountersAtomic {
     pub fetched_bytes: AtomicU64,
     pub uploaded_bytes: AtomicU64,
+    /// Bytes received and sent that were not block payload: handshakes and
+    /// every other message (libtorrent `stat`, the protocol half of each
+    /// channel).
+    pub fetched_protocol_bytes: AtomicU64,
+    pub uploaded_protocol_bytes: AtomicU64,
     pub total_time_connecting_ms: AtomicU64,
     pub incoming_connections: AtomicU32,
     pub outgoing_connection_attempts: AtomicU32,

@@ -823,6 +823,11 @@ pub(crate) struct LivePeerState {
     // are outstanding.
     last_piece: Instant,
 
+    // The peer's reads wait on the download limits (libtorrent: the download
+    // channel lacks `peer_info::bw_network`), and when they last resumed.
+    waiting_for_download_quota: bool,
+    reads_resumed: Instant,
+
     // How long the peer takes to deliver a block, which sets its request timeout.
     block_time: BlockTime,
 
@@ -951,6 +956,8 @@ impl LivePeerState {
             late_cancelled_request_tolerance: 0,
             waiting_since: Instant::now(),
             last_piece: Instant::now(),
+            waiting_for_download_quota: false,
+            reads_resumed: Instant::now(),
             block_time: BlockTime::default(),
             slow_start: Some(SlowStart::new(now)),
             snubbed: false,
@@ -1177,12 +1184,28 @@ impl LivePeerState {
     /// its request timeout without delivering a block, or [`PIECE_TIMEOUT`]
     /// without delivering one or being sent a request (libtorrent
     /// `peer_connection::second_tick`, which snubs on either). None while
-    /// none are outstanding.
+    /// none are outstanding, and while its reads wait on the download limits:
+    /// a peer is held to its timeouts only while it is read, and time spent
+    /// waiting on the limits does not count against it (`second_tick` checks
+    /// both only with `bw_network` set and download quota held).
     pub fn request_deadline(&self) -> Option<Instant> {
+        if self.waiting_for_download_quota {
+            return None;
+        }
+        let read_from = |at: Instant| at.max(self.reads_resumed);
         (!self.inflight_requests.is_empty()).then(|| {
-            (self.waiting_since + self.block_time.request_timeout())
-                .min(self.last_piece + PIECE_TIMEOUT)
+            (read_from(self.waiting_since) + self.block_time.request_timeout())
+                .min(read_from(self.last_piece) + PIECE_TIMEOUT)
         })
+    }
+
+    /// The peer's reads wait on the download limits, or resume.
+    pub fn set_waiting_for_download_quota(&mut self, waiting: bool) {
+        self.waiting_for_download_quota = waiting;
+        if !waiting {
+            self.reads_resumed = Instant::now();
+        }
+        self.request_slots_changed.notify_waiters();
     }
 
     /// The peer delivered `chunk`. A block it was asked for, wanted still or

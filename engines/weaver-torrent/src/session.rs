@@ -34,6 +34,7 @@ use crate::dht::{
     Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr,
 };
 use crate::lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
+use crate::meter::Meter;
 use crate::natpmp::{NATPMP_PORT, NatPmpMapper};
 use crate::peer_protocol::Handshake;
 use crate::torrent_state::live::{
@@ -937,6 +938,8 @@ pub(crate) struct CheckedIncomingConnection {
     pub writer: BoxAsyncWrite,
     pub read_buf: ReadBuf,
     pub handshake: Handshake,
+    /// What has crossed the socket so far, the handshakes included.
+    pub meter: Meter,
 }
 
 struct InternalAddResult {
@@ -1427,7 +1430,7 @@ impl Session {
         self: Arc<Self>,
         addr: SocketAddr,
         kind: ConnectionKind,
-        mut reader: BoxAsyncReadVectored,
+        reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
         let handshake_timeout = self.peer_opts.handshake_timeout();
@@ -1446,10 +1449,13 @@ impl Session {
             bail!("incoming connection refused: {} is {why}", addr.ip());
         }
 
+        // Every byte from here on crossed the peer's socket for the torrent
+        // it greets, and is charged to it once the connection is its own.
+        let (meter, mut reader, mut writer) = Meter::wrap(reader, writer);
+
         // With encryption enabled, an encrypted connection is unwrapped here
         // and a plaintext one passed through (or refused); with it disabled
         // the halves are left as they are.
-        let mut writer = writer;
         crate::mse::upgrade_incoming(
             self.connector.encryption(),
             &mut reader,
@@ -1500,6 +1506,7 @@ impl Session {
                 kind,
                 handshake: h,
                 read_buf,
+                meter,
             },
         ))
     }
@@ -3605,6 +3612,7 @@ mod tests {
             writer,
             read_buf: crate::read_buf::ReadBuf::new(),
             handshake: crate::peer_protocol::Handshake::new(info_hash, super::Id20::new([7; 20])),
+            meter: Default::default(),
         };
         (checked, theirs)
     }

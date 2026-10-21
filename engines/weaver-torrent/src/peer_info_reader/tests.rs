@@ -197,7 +197,12 @@ impl MockPeer {
         loop {
             let msg = self
                 .buf
-                .read_message(&mut self.read, NO_TIMEOUT, None)
+                .read_message(
+                    &mut self.read,
+                    NO_TIMEOUT,
+                    None,
+                    &mut crate::read_buf::Unlimited,
+                )
                 .await
                 .ok()?;
             if let Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(piece))) = msg

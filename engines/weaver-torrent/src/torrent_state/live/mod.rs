@@ -61,7 +61,6 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -89,6 +88,7 @@ use crate::peer_protocol::{
     },
 };
 use anyhow::Context;
+use futures::FutureExt;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc::unbounded_channel};
 use tokio_util::sync::CancellationToken;
@@ -100,7 +100,7 @@ use crate::{
     connection_slots::{ConnectionSlot, ConnectionSlots},
     file_info::FileInfo,
     file_ops::{FileOps, Verdict, inconsistent_hashes},
-    limits::LimitKind,
+    limits::{Channel, LimitKind},
     peer_connection::{
         DEFAULT_CONNECT_TIMEOUT, PeerConnection, PeerConnectionHandler, PeerConnectionOptions,
         WriterRequest,
@@ -699,24 +699,7 @@ impl TorrentStateLive {
             if !queued {
                 continue;
             }
-            tokio::select! {
-                _ = tx.closed() => {
-                    continue;
-                }
-                res = self.shared.options.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
-                    res?;
-                }
-            };
-            if let Some(session) = self.shared.session.upgrade() {
-                tokio::select! {
-                    _ = tx.closed() => {
-                        continue;
-                    }
-                    res = session.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
-                        res?;
-                    }
-                }
-            }
+            // The writer pays for the block as it sends it.
             let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
         }
         Ok(())
@@ -1132,6 +1115,18 @@ impl TorrentStateLive {
         }
     }
 
+    /// The torrent's limits grant bytes of the `want` a peer asks for, and
+    /// the session's then grant what they granted (libtorrent
+    /// `peer_connection::request_bandwidth` asks every channel over the peer
+    /// for one request).
+    async fn grant_bandwidth(&self, channel: Channel, want: u64) -> u64 {
+        let granted = self.shared.options.ratelimits.request(channel, want).await;
+        match self.shared.session.upgrade() {
+            Some(session) => session.ratelimits.request(channel, granted).await,
+            None => granted,
+        }
+    }
+
     pub fn stats_snapshot(&self) -> StatsSnapshot {
         use Ordering::*;
         let downloaded_bytes = self.stats.downloaded_and_checked_bytes.load(Relaxed);
@@ -1140,6 +1135,8 @@ impl TorrentStateLive {
             downloaded_and_checked_pieces: self.stats.downloaded_and_checked_pieces.load(Relaxed),
             fetched_bytes: self.stats.fetched_bytes.load(Relaxed),
             uploaded_bytes: self.stats.uploaded_bytes.load(Relaxed),
+            fetched_protocol_bytes: self.stats.fetched_protocol_bytes.load(Relaxed),
+            uploaded_protocol_bytes: self.stats.uploaded_protocol_bytes.load(Relaxed),
             total_piece_download_ms: self.stats.total_piece_download_ms.load(Relaxed),
             peer_stats: self.peers.stats(),
         }
@@ -1878,6 +1875,49 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         }
         self.state.set_peer_live(self.addr, handshake, ckind);
         Ok(())
+    }
+
+    async fn request_bandwidth(&self, channel: Channel, bytes: u64) -> u64 {
+        let mut grant = std::pin::pin!(self.state.grant_bandwidth(channel, bytes));
+        if let Some(granted) = (&mut grant).now_or_never() {
+            return granted;
+        }
+        // While its reads wait on the limits, the peer is not held to its
+        // request and piece timeouts (libtorrent `peer_connection::second_tick`
+        // snubs and times out only a peer it reads, `bw_network`).
+        let gate = |waiting: bool| {
+            self.state
+                .peers
+                .with_live_mut(self.addr, "download quota", |live| {
+                    live.set_waiting_for_download_quota(waiting)
+                })
+        };
+        if channel == Channel::Download {
+            gate(true);
+        }
+        let granted = grant.await;
+        if channel == Channel::Download {
+            gate(false);
+        }
+        granted
+    }
+
+    fn on_protocol_bytes(&self, channel: Channel, bytes: u64) {
+        let (peer, torrent, session) = match channel {
+            Channel::Download => (
+                &self.counters.fetched_protocol_bytes,
+                &self.state.stats.fetched_protocol_bytes,
+                &self.state.session_stats.counters.fetched_protocol_bytes,
+            ),
+            Channel::Upload => (
+                &self.counters.uploaded_protocol_bytes,
+                &self.state.stats.uploaded_protocol_bytes,
+                &self.state.session_stats.counters.uploaded_protocol_bytes,
+            ),
+        };
+        for counter in [peer, torrent, session] {
+            counter.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     fn on_uploaded_bytes(&self, bytes: u32) {
@@ -2932,24 +2972,10 @@ impl PeerHandler {
                     length: chunk.size,
                 };
 
-                if !aframe!(self.wait_to_request(next)).await? {
-                    break;
-                }
-
-                self.state
-                    .shared
-                    .options
-                    .ratelimits
-                    .prepare_for_download(NonZeroU32::new(request.length).unwrap())
-                    .await?;
-
-                if let Some(session) = self.state.torrent().session.upgrade() {
-                    session
-                        .ratelimits
-                        .prepare_for_download(NonZeroU32::new(request.length).unwrap())
-                        .await?;
-                }
-
+                // The request goes out at once: the limits charge the block
+                // as it crosses the socket, not before it is asked for
+                // (libtorrent `peer_connection::send_block_requests` asks no
+                // bandwidth; `setup_receive` reads within the quota).
                 if !aframe!(self.wait_to_request(next)).await? {
                     break;
                 }

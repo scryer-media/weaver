@@ -25,7 +25,10 @@ use crate::peer_protocol::{
     },
     max_frame_len, serialize_piece_preamble,
 };
-use crate::{Error, Result, session::CheckedIncomingConnection, stream_connect::ConnectionKind};
+use crate::{
+    Error, Result, limits::Channel, meter::Meter, read_buf::ReadQuota,
+    session::CheckedIncomingConnection, stream_connect::ConnectionKind,
+};
 use futures::TryFutureExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -56,6 +59,19 @@ pub trait PeerConnectionHandler {
     ) -> anyhow::Result<()>;
     async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()>;
     fn on_uploaded_bytes(&self, bytes: u32);
+    /// Waits for the limits over the connection's `channel` to grant some of
+    /// the `bytes` it asks for, and returns how many they granted: one or
+    /// more when `bytes` is not zero. A grant pays for bytes that cross the
+    /// socket, payload and protocol alike (libtorrent
+    /// `peer_connection::request_bandwidth`). A connection under no limits
+    /// is granted all it asks for.
+    async fn request_bandwidth(&self, _channel: Channel, bytes: u64) -> u64 {
+        bytes
+    }
+    /// `bytes` that are not block payload crossed the socket on `channel`:
+    /// handshakes and every message but a piece's block (libtorrent
+    /// `stat::sent_bytes`, `received_bytes`, the protocol half).
+    fn on_protocol_bytes(&self, _channel: Channel, _bytes: u64) {}
     /// Takes `chunk` off the peer's upload queue to send it. False when a
     /// Cancel or a Choke took it off first, and the block is not sent. A
     /// handler that queues no uploads has none to take.
@@ -210,7 +226,82 @@ struct ManagePeerArgs {
     write_buf: Box<[u8]>,
     read: BoxAsyncReadVectored,
     write: BoxAsyncWrite,
+    meter: Meter,
     outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
+}
+
+/// What a connection may move one way: the bytes its limits paid for, less
+/// those that crossed the socket since it was made (libtorrent
+/// `peer_connection::m_quota`). Bytes that crossed before anything was paid,
+/// the handshakes, are a debt the next payment covers.
+struct Quota<'a, H> {
+    handler: &'a H,
+    channel: Channel,
+    meter: Meter,
+    paid: u64,
+}
+
+impl<'a, H: PeerConnectionHandler> Quota<'a, H> {
+    fn new(handler: &'a H, channel: Channel, meter: Meter) -> Self {
+        Self {
+            handler,
+            channel,
+            meter,
+            paid: 0,
+        }
+    }
+
+    fn crossed(&self) -> u64 {
+        match self.channel {
+            Channel::Download => self.meter.received(),
+            Channel::Upload => self.meter.sent(),
+        }
+    }
+
+    /// Bytes paid for and not yet moved; below zero, the debt.
+    fn held(&self) -> i128 {
+        i128::from(self.paid) - i128::from(self.crossed())
+    }
+
+    /// Asks the limits for `bytes` beyond what is held.
+    async fn pay(&mut self, bytes: u64) {
+        let want = u64::try_from(i128::from(bytes) - self.held()).unwrap_or(0);
+        self.paid += self.handler.request_bandwidth(self.channel, want).await;
+    }
+
+    /// Waits until `bytes` more may cross (libtorrent
+    /// `peer_connection::setup_send` writes only what `m_quota` covers).
+    async fn reserve(&mut self, bytes: u64) {
+        while self.held() < i128::from(bytes) {
+            self.pay(bytes).await;
+        }
+    }
+}
+
+impl<H: PeerConnectionHandler> ReadQuota for Quota<'_, H> {
+    // A read waits for a byte or more of quota, asking for what completes
+    // the frame (libtorrent `peer_connection::wanted_transfer`, the packet's
+    // bytes remaining), and takes what is held.
+    async fn admit(&mut self, need: usize, room: usize) -> usize {
+        while self.held() <= 0 {
+            self.pay(need as u64).await;
+        }
+        usize::try_from(self.held()).map_or(room, |held| held.min(room))
+    }
+}
+
+/// Writes `buf` once its bytes are paid for. The timeout runs only while the
+/// socket is written, not while the quota is waited for.
+async fn send<H: PeerConnectionHandler>(
+    quota: &mut Quota<'_, H>,
+    write: &mut BoxAsyncWrite,
+    buf: &[u8],
+    what: &'static str,
+    timeout: Duration,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    quota.reserve(buf.len() as u64).await;
+    with_timeout(what, timeout, write.write_all(buf).map_err(Error::Write)).await
 }
 
 impl<H: PeerConnectionHandler> PeerConnection<H> {
@@ -296,6 +387,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             write_buf,
             read: incoming.reader,
             write: incoming.writer,
+            meter: incoming.meter,
             outgoing_chan,
         })
         .await
@@ -321,7 +413,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
         let now = Instant::now();
-        let (ckind, mut read, write) = self
+        let (ckind, mut read, write, meter) = self
             .connector
             .connect_and_send_handshake(
                 self.addr,
@@ -370,6 +462,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 write_buf,
                 read,
                 write,
+                meter,
                 outgoing_chan,
             })
             .await
@@ -401,12 +494,22 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             mut write_buf,
             mut read,
             mut write,
+            meter,
             mut outgoing_chan,
         } = args;
 
-        use tokio::io::AsyncWriteExt;
-
         let rwtimeout = self.options.read_write_timeout();
+
+        // The handshakes, and the encryption handshake before them, crossed
+        // already: protocol bytes, and a debt each quota pays first.
+        self.handler.on_protocol_bytes(
+            Channel::Download,
+            meter.received().saturating_sub(read_buf.buffered() as u64),
+        );
+        self.handler
+            .on_protocol_bytes(Channel::Upload, meter.sent());
+        let mut down = Quota::new(&self.handler, Channel::Download, meter.clone());
+        let mut up = Quota::new(&self.handler, Channel::Upload, meter);
 
         let extended_handshake: RwLock<Option<PeerExtendedMessageIds>> = RwLock::new(None);
         let extended_handshake_ref = &extended_handshake;
@@ -422,12 +525,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             let my_extended = Message::Extended(ExtendedMessage::Handshake(my_extended));
             trace!("sending extended handshake: {:?}", &my_extended);
             let esz = my_extended.serialize(&mut *write_buf, &Default::default)?;
-            with_timeout(
+            send(
+                &mut up,
+                &mut write,
+                &write_buf[..esz],
                 "writing extended handshake",
                 rwtimeout,
-                write.write_all(&write_buf[..esz]).map_err(Error::Write),
             )
             .await?;
+            self.handler.on_protocol_bytes(Channel::Upload, esz as u64);
         }
 
         let writer = async move {
@@ -438,12 +544,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     .handler
                     .serialize_bitfield_message_to_buf(&mut *write_buf)
                     .map_err(Error::Anyhow)?;
-                with_timeout(
+                send(
+                    &mut up,
+                    &mut write,
+                    &write_buf[..len],
                     "writing bitfield",
                     rwtimeout,
-                    write.write_all(&write_buf[..len]).map_err(Error::Write),
                 )
                 .await?;
+                self.handler.on_protocol_bytes(Channel::Upload, len as u64);
                 trace!("sent bitfield");
             }
 
@@ -543,13 +652,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                 };
 
-                with_timeout(
-                    "writing",
-                    rwtimeout,
-                    write.write_all(&write_buf[..len]).map_err(Error::Write),
-                )
-                .await?;
+                send(&mut up, &mut write, &write_buf[..len], "writing", rwtimeout).await?;
 
+                let payload = uploaded_add.unwrap_or(0);
+                self.handler
+                    .on_protocol_bytes(Channel::Upload, (len - payload as usize) as u64);
                 if let Some(uploaded_add) = uploaded_add {
                     self.handler.on_uploaded_bytes(uploaded_add)
                 }
@@ -563,10 +670,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let reader = async move {
             let num_pieces = self.handler.num_pieces();
             loop {
+                let read_before = read_buf.consumed();
                 let message = read_buf
-                    .read_message(&mut read, rwtimeout, num_pieces)
+                    .read_message(&mut read, rwtimeout, num_pieces, &mut down)
                     .await?;
                 trace!("received: {:?}", &message);
+                let payload = match &message {
+                    Message::Piece(piece) => piece.len() as u64,
+                    _ => 0,
+                };
                 // libtorrent `bt_peer_connection::on_hash_request`, `on_hashes`
                 // and `on_hash_reject` disconnect a peer that does not speak v2.
                 if message.is_v2_only() && !speaks_v2 {
@@ -595,6 +707,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         .await
                         .map_err(Error::Anyhow)?;
                 }
+                self.handler.on_protocol_bytes(
+                    Channel::Download,
+                    read_buf.consumed() - read_before - payload,
+                );
             }
 
             // For type inference.
@@ -625,13 +741,21 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+    use std::{
+        io,
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
 
     use tokio::{sync::mpsc, time::Instant};
 
     use super::{
         DEFAULT_CONNECT_TIMEOUT, DEFAULT_HANDSHAKE_TIMEOUT, PeerConnection, PeerConnectionHandler,
-        PeerConnectionOptions,
+        PeerConnectionOptions, WriterRequest,
     };
     use crate::{
         Error,
@@ -640,13 +764,15 @@ mod tests {
             hash_id::{Id20, InfoHashes},
             lengths::ChunkInfo,
         },
+        limits::Channel,
+        meter::Meter,
         mse::EncryptionPolicy,
         network::{
             BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket, SocketFactory,
             StreamListener,
         },
         peer_info_reader::tests::{Dialed, halves},
-        peer_protocol::{Handshake, Message, extended::handshake::ExtendedHandshake},
+        peer_protocol::{Handshake, Message, Piece, extended::handshake::ExtendedHandshake},
         read_buf::ReadBuf,
         session::CheckedIncomingConnection,
         spawn_utils::BlockingSpawner,
@@ -843,6 +969,7 @@ mod tests {
             writer,
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            meter: Default::default(),
         };
         let (_tx, rx) = mpsc::unbounded_channel();
         let start = Instant::now();
@@ -852,6 +979,136 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(start.elapsed(), DEFAULT_HANDSHAKE_TIMEOUT);
+    }
+
+    /// Grants at most [`Self::GRANT`] bytes a request, and keeps count of
+    /// what it granted and what it was told crossed.
+    #[derive(Default)]
+    struct Ledger {
+        paid: [AtomicU64; 2],
+        protocol: [AtomicU64; 2],
+        payload: AtomicU64,
+        received: tokio::sync::watch::Sender<usize>,
+    }
+
+    impl Ledger {
+        const GRANT: u64 = 5;
+    }
+
+    fn index(channel: Channel) -> usize {
+        match channel {
+            Channel::Download => 0,
+            Channel::Upload => 1,
+        }
+    }
+
+    impl PeerConnectionHandler for &Ledger {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()> {
+            if let Message::Piece(piece) = &msg {
+                self.payload
+                    .fetch_add(piece.len() as u64, Ordering::Relaxed);
+            }
+            self.received.send_modify(|n| *n += 1);
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_bandwidth(&self, channel: Channel, bytes: u64) -> u64 {
+            let granted = bytes.min(Ledger::GRANT);
+            self.paid[index(channel)].fetch_add(granted, Ordering::Relaxed);
+            granted
+        }
+        fn on_protocol_bytes(&self, channel: Channel, bytes: u64) {
+            self.protocol[index(channel)].fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    // Every byte that crosses the socket either way, the handshakes and each
+    // message as well as a block's payload, is paid for before it crosses,
+    // and once: what the limits granted is what crossed (libtorrent
+    // `peer_connection::setup_receive`, `setup_send`, within `m_quota`).
+    // Bytes that are not payload count as protocol bytes (`stat`).
+    #[tokio::test(start_paused = true)]
+    async fn every_byte_that_crosses_is_paid_for_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ledger = Ledger::default();
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        let connection = PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            &ledger,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        );
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = halves(ours);
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer,
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            meter: meter.clone(),
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(WriterRequest::Message(Message::Have(3))).unwrap();
+        let mut received = ledger.received.subscribe();
+        let peer = async {
+            // Ours: the handshake, the extended handshake and the have.
+            let mut handshake = [0; 68];
+            theirs.read_exact(&mut handshake).await.unwrap();
+            loop {
+                let mut body = vec![0; theirs.read_u32().await.unwrap() as usize];
+                theirs.read_exact(&mut body).await.unwrap();
+                if body == [4, 0, 0, 0, 3] {
+                    break;
+                }
+            }
+            // Theirs: a have, a block of 100 bytes, a have.
+            let mut wire = vec![0; 200];
+            let block = [9; 100];
+            let mut len = 0;
+            for msg in [
+                Message::Have(1),
+                Message::Piece(Piece::from_data(0, 0, &block)),
+                Message::Have(2),
+            ] {
+                len += msg.serialize(&mut wire[len..], &Default::default).unwrap();
+            }
+            theirs.write_all(&wire[..len]).await.unwrap();
+            received.wait_for(|n| *n == 3).await.unwrap();
+            drop(tx);
+        };
+        let (result, ()) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
+        assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
+
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        assert_eq!(meter.received(), 9 + 13 + 100 + 9);
+        // And the length of the next frame, which the reader waits for.
+        assert_eq!(load(&ledger.paid[0]), meter.received() + 4);
+        assert_eq!(load(&ledger.payload), 100);
+        assert_eq!(load(&ledger.protocol[0]), meter.received() - 100);
+        assert!(meter.sent() > 68 + 9);
+        assert_eq!(load(&ledger.paid[1]), meter.sent());
+        assert_eq!(load(&ledger.protocol[1]), meter.sent());
     }
 
     #[test]
