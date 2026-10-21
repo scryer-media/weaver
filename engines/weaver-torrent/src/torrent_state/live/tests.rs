@@ -705,6 +705,106 @@ async fn a_peer_that_is_not_interested_is_choked_and_its_slot_handed_on_at_once(
     assert!(leaving_rx.is_empty());
 }
 
+impl Harness {
+    /// The peer takes piece `index`, acquiring pieces until it has it.
+    fn take(&self, peer: &PeerHandler, index: u32) {
+        peer.on_i_am_unchoked();
+        while peer
+            .acquire_next_piece()
+            .unwrap()
+            .expect("the piece is not free")
+            .get()
+            != index
+        {}
+    }
+
+    /// The peer is asked for, and sends, chunk `chunk` of piece `index`,
+    /// with its bytes flipped when `corrupt` holds.
+    async fn send(
+        &self,
+        peer: &PeerHandler,
+        (index, chunk): (u32, u32),
+        corrupt: bool,
+    ) -> anyhow::Result<()> {
+        let info = self.chunk(index, chunk);
+        self.peers
+            .with_live_mut(peer.addr, "test", |live| live.add_inflight_request(info))
+            .unwrap();
+        let start = (index * PIECE_LENGTH + chunk * CHUNK_SIZE) as usize;
+        let mut block = self.content[start..start + CHUNK_SIZE as usize].to_vec();
+        if corrupt {
+            block[0] ^= 0xff;
+        }
+        peer.on_received_piece(Piece::from_data(index, chunk * CHUNK_SIZE, &block[..]))
+            .await
+    }
+
+    fn banned(&self, peer: &PeerHandler) -> bool {
+        self.peers.is_banned(peer.addr.ip())
+    }
+}
+
+/// Whether the peer's writer was told to close the connection.
+fn told_to_disconnect(rx: &mut PeerRx) -> bool {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|r| matches!(r, WriterRequest::Disconnect(Err(_))))
+}
+
+#[tokio::test]
+async fn the_sender_of_a_bad_block_is_banned_once_the_piece_passes_and_the_others_are_not() {
+    let h = Harness::new("smart_ban_two_senders").await;
+    tokio::time::pause();
+    let (bad, mut bad_rx) = h.peer("127.0.0.1:6881");
+    let (good, mut good_rx) = h.peer("127.0.0.2:6881");
+    let (third, mut third_rx) = h.peer("127.0.0.3:6881");
+
+    // The bad peer sends the first half of piece 0, the second block of it
+    // corrupt, and chokes us; the good peer sends the rest.
+    h.take(&bad, 0);
+    h.send(&bad, (0, 0), false).await.unwrap();
+    h.send(&bad, (0, 1), true).await.unwrap();
+    bad.on_i_am_choked().unwrap();
+    h.take(&good, 0);
+    h.send(&good, (0, 2), false).await.unwrap();
+    assert!(h.send(&good, (0, 3), false).await.is_err());
+
+    // The piece failed: it is downloaded again, and neither is blamed yet.
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert!(!h.banned(&bad) && !h.banned(&good));
+
+    // A third peer sends the whole piece and it passes: the block the bad
+    // peer sent differs from the one now had.
+    h.take(&third, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&third, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.missing_chunks(0).is_empty());
+    assert!(h.banned(&bad));
+    assert!(told_to_disconnect(&mut bad_rx));
+    assert!(!h.banned(&good) && !told_to_disconnect(&mut good_rx));
+    assert!(!h.banned(&third) && !told_to_disconnect(&mut third_rx));
+
+    // The bad peer is turned away when it connects again.
+    let (tx, _rx) = unbounded_channel();
+    assert!(
+        h.peers
+            .add_incoming(
+                "127.0.0.1:50000".parse().unwrap(),
+                Id20::default(),
+                tx,
+                ConnectionKind::Tcp
+            )
+            .is_err()
+    );
+    // The records went with the pass.
+    assert!(
+        h.lock_write("test")
+            .smart_ban
+            .piece_passed(h.piece(0))
+            .is_empty()
+    );
+}
+
 mod v2 {
     //! The fetch of a v2 torrent's piece layers from peers that speak v2,
     //! and the answers a seed gives them (libtorrent `hash_picker`,

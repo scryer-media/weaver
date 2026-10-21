@@ -51,6 +51,7 @@ pub(crate) mod choker;
 mod hash_fetch;
 pub mod peer;
 pub mod peers;
+mod smart_ban;
 pub mod stats;
 #[cfg(test)]
 mod tests;
@@ -119,6 +120,7 @@ use self::{
         },
     },
     peers::{IncomingRefused, PeerStates},
+    smart_ban::SmartBan,
     stats::{atomic::AtomicStats, snapshot::StatsSnapshot},
 };
 
@@ -145,6 +147,10 @@ pub(crate) struct TorrentStateLocked {
     fatal_errors_tx: Option<tokio::sync::oneshot::Sender<anyhow::Error>>,
 
     unflushed_bitv_bytes: u64,
+
+    // Who sent the blocks of the pieces in progress, and the blocks of the
+    // pieces that failed.
+    smart_ban: SmartBan,
 }
 
 impl TorrentStateLocked {
@@ -286,6 +292,7 @@ impl TorrentStateLive {
                 file_priorities,
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
+                smart_ban: SmartBan::default(),
             }),
             files: paused.files,
             stats: AtomicStats {
@@ -955,6 +962,23 @@ impl TorrentStateLive {
     fn wants_peers(&self) -> bool {
         self.shared.options.ratelimits.get_upload_bps() != LimitKind::Closed
             || !self.is_finished_and_no_active_streams()
+    }
+
+    /// The piece did not pass its hash check: it is downloaded again.
+    fn requeue_piece(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        // Before it is queued again, so the storage has let go of the failed
+        // bytes by the time another peer is handed the piece.
+        if let Err(e) = self.files.on_piece_hash_failed(piece) {
+            debug!(
+                ?piece,
+                "file storage errored in on_piece_hash_failed(): {e:#}"
+            );
+        }
+        self.lock_write("mark_piece_broken")
+            .get_pieces_mut()?
+            .mark_piece_hash_failed(piece);
+        self.new_pieces_notify.notify_waiters();
+        Ok(())
     }
 
     fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {
@@ -2092,7 +2116,9 @@ impl PeerHandler {
                 }
             };
 
-            let full_piece_download_time = {
+            let piece_index = chunk_info.piece_index;
+            let blocks = state.lengths.chunks_per_piece(piece_index);
+            let full_piece_download = {
                 let mut g = state.lock_write("mark_chunk_downloaded");
                 let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece);
                 trace!(?piece, chunk_marking_result=?chunk_marking_result);
@@ -2100,15 +2126,22 @@ impl PeerHandler {
                 match chunk_marking_result {
                     Some(ChunkMarkingResult::Completed) => {
                         trace!("piece={} done, will write and checksum", piece.index);
+                        g.smart_ban.block_received(chunk_info, addr, blocks);
+                        let senders = g.smart_ban.take_senders(piece_index);
                         // Remove from inflight to prevent others from stealing it during hash check.
-                        g.get_pieces_mut()?.take_inflight(chunk_info.piece_index)
+                        g.get_pieces_mut()?
+                            .take_inflight(piece_index)
+                            .map(|time| (time, senders))
                     }
                     Some(ChunkMarkingResult::PreviouslyCompleted) => {
                         // TODO: we might need to send cancellations here.
                         debug!("piece={} was done by someone else, ignoring", piece.index);
                         return Ok(());
                     }
-                    Some(ChunkMarkingResult::NotCompleted) => None,
+                    Some(ChunkMarkingResult::NotCompleted) => {
+                        g.smart_ban.block_received(chunk_info, addr, blocks);
+                        None
+                    }
                     None => {
                         anyhow::bail!(
                             "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
@@ -2122,9 +2155,11 @@ impl PeerHandler {
             // It shouldn't impact perf anyway, but dropping just in case.
             drop(ppl_guard);
 
-            let full_piece_download_time = match full_piece_download_time {
-                Some(t) => t,
-                None => return Ok(()),
+            let Some((full_piece_download_time, senders)) = full_piece_download else {
+                return Ok(());
+            };
+            let read_block = |who: PeerHandle, chunk: &ChunkInfo, buf: &mut [u8]| {
+                state.file_ops().read_chunk(who, chunk, buf)
             };
 
             match state
@@ -2136,10 +2171,16 @@ impl PeerHandler {
                     return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
                 }
                 Verdict::Passed => {
-                    {
+                    let failed = {
                         let mut g = state.lock_write("mark_piece_downloaded");
                         g.get_pieces_mut()?
                             .mark_piece_hash_ok(chunk_info.piece_index);
+                        g.smart_ban.piece_passed(piece_index)
+                    };
+                    // Before the storage is told the piece is complete, while
+                    // the good bytes are still there to read back.
+                    for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
+                        state.peers.ban(sender);
                     }
 
                     // Global piece counters.
@@ -2175,26 +2216,28 @@ impl PeerHandler {
 
                     state.transmit_haves(chunk_info.piece_index);
                 }
-                Verdict::Failed | Verdict::Unknown => {
+                Verdict::Failed => {
                     warn!(
                         id = state.shared.id,
                         info_hash = ?state.shared.info_hash,
                         ?addr,
                         "checksum for piece={} did not validate. disconnecting peer.", index
                     );
-                    // Before it is queued again, so the storage has let go of the failed
-                    // bytes by the time another peer is handed the piece.
-                    if let Err(e) = state.files.on_piece_hash_failed(chunk_info.piece_index) {
-                        debug!(
-                            piece = index,
-                            "file storage errored in on_piece_hash_failed(): {e:#}"
-                        );
+                    // Before the storage lets go of the failed bytes.
+                    let blocks =
+                        smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
+                    let liars = state
+                        .lock_write("smart_ban")
+                        .smart_ban
+                        .piece_failed(piece_index, blocks);
+                    for liar in liars {
+                        state.peers.ban(liar);
                     }
-                    state
-                        .lock_write("mark_piece_broken")
-                        .get_pieces_mut()?
-                        .mark_piece_hash_failed(chunk_info.piece_index);
-                    state.new_pieces_notify.notify_waiters();
+                    state.requeue_piece(piece_index)?;
+                    anyhow::bail!("i am probably a bogus peer. dying.")
+                }
+                Verdict::Unknown => {
+                    state.requeue_piece(piece_index)?;
                     anyhow::bail!("i am probably a bogus peer. dying.")
                 }
             };
