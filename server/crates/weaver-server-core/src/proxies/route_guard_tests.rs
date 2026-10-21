@@ -73,11 +73,6 @@ const LIFTED: &[(&str, usize)] = &[
     ),
     ("server/crates/weaver-server-core/src/proxies/runtime.rs", 2),
     ("server/crates/weaver-server-core/src/speed_test/http.rs", 1),
-    // The test torrent's upload client rides the path's bridge.
-    (
-        "server/crates/weaver-server-core/src/speed_test/torrent.rs",
-        1,
-    ),
     // A leg's tracker client, and the host's lookup for a leg that hands
     // names on, as the session's own lookup would be.
     ("server/crates/weaver-server-core/src/torrents/net.rs", 2),

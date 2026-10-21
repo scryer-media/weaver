@@ -1412,8 +1412,8 @@ impl TorrentStateLive {
         }
     }
 
-    // Peer `peer` sent the whole of `piece`, which failed its hash check:
-    // whether it may be banned for that (libtorrent
+    // Peer `peer` is known to have sent bad data of `piece`, which failed
+    // its hash check: whether it may be banned for that (libtorrent
     // `peer_connection::received_invalid_data`). A web seed serves none of
     // what the piece lies in from then on and has its pieces told again,
     // and may be banned only when it is left nothing to serve
@@ -1429,6 +1429,28 @@ impl TorrentStateLive {
         let nothing_left = !have.any();
         self.peers.update_bitfield(peer, have);
         nothing_left
+    }
+
+    /// `peers` sent bad data of `piece`: each loses points and goes on
+    /// parole; one at the floor, or `known_bad`, the bad data known to be
+    /// its, when its connection lets it go for that, is banned (libtorrent
+    /// `torrent::penalize_peers`).
+    fn penalize_peers(
+        &self,
+        peers: impl IntoIterator<Item = PeerHandle>,
+        piece: ValidPieceIndex,
+        known_bad: bool,
+    ) {
+        for peer in peers {
+            let bannable = known_bad && self.received_invalid_data(peer, piece);
+            let to_ban = self
+                .peers
+                .with_peer_mut(peer, "piece_failed", |p| p.piece_failed(bannable))
+                .unwrap_or(bannable);
+            if to_ban {
+                self.peers.ban(peer);
+            }
+        }
     }
 
     // A torrent wants peers, outgoing and incoming, unless it has nothing
@@ -2669,11 +2691,14 @@ impl PeerHandler {
         }
     }
 
-    /// The peer is snubbed, and the pieces it owns that wait on it alone go
-    /// back to the queue for other peers to fetch. Its requests stay
-    /// outstanding, so a block it still sends is kept. A peer on parole is
-    /// left its pieces: it was handed only pieces no one else had started
-    /// (libtorrent `peer_connection::snub_peer` returns early on parole).
+    /// The peer is snubbed, and the newest piece it owns that waits on it
+    /// alone goes back to the queue for other peers to fetch: one a snub, so
+    /// a peer that stays overdue gives its pieces back one at a time
+    /// (libtorrent `peer_connection::snub_peer` times out one block each
+    /// `second_tick`). Its requests stay outstanding, so a block it still
+    /// sends is kept. A peer on parole is left its pieces: it was handed
+    /// only pieces no one else had started (`snub_peer` returns early on
+    /// parole).
     fn on_requests_timed_out(&self) -> crate::Result<()> {
         let on_parole = self
             .state
@@ -2686,21 +2711,21 @@ impl PeerHandler {
             .with_live_mut(self.addr, "snub", |live| {
                 live.snub();
                 if on_parole {
-                    return Ok(0);
+                    return Ok(None);
                 }
                 Ok::<_, Error>(
                     self.state
                         .lock_write("snub")
                         .get_pieces_mut()?
-                        .release_pieces_blocked_by(self.addr, |chunk| {
+                        .release_piece_blocked_by(self.addr, |chunk| {
                             live.has_inflight_request(chunk)
                         }),
                 )
             })
             .transpose()?
-            .unwrap_or(0);
-        debug!(released, on_parole, "requests timed out");
-        if released > 0 {
+            .flatten();
+        debug!(?released, on_parole, "requests timed out");
+        if released.is_some() {
             self.state.new_pieces_notify.notify_waiters();
         }
         Ok(())
@@ -3126,6 +3151,7 @@ impl PeerHandler {
                     return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
                 }
                 Verdict::Passed => {
+                    state.layer_fetch.piece_passed(piece_index);
                     let failed = state.peers.piece_passed(piece_index);
                     // Before the storage takes the piece, while the good bytes
                     // are still there to read back.
@@ -3212,23 +3238,43 @@ impl PeerHandler {
                     // Before the storage lets go of the failed bytes.
                     let blocks =
                         smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
-                    let liars = state.peers.piece_failed(piece_index, blocks);
-                    // Every peer that sent a block of it loses points and goes
-                    // on parole; one at the floor, or that sent the whole
-                    // piece when its connection lets it go for that, is
-                    // banned (libtorrent `torrent::piece_failed`,
+                    for liar in state.peers.piece_failed(piece_index, blocks) {
+                        state.peers.ban(liar);
+                    }
+                    // Checked by v2, a piece of more than one sender has its
+                    // block hashes fetched, which name the senders of its bad
+                    // blocks; until then no one is blamed (libtorrent
+                    // `torrent::piece_failed` calls `verify_block_hashes`).
+                    // Otherwise, or when one peer sent it all, every sender
+                    // is blamed, and the sole sender known to be bad
+                    // (libtorrent `torrent::piece_failed`,
                     // `torrent::penalize_peers`).
-                    let sole_sender = senders.sole_sender();
-                    for peer in senders.participants() {
-                        let bannable =
-                            sole_sender && state.received_invalid_data(peer, piece_index);
-                        let to_ban = state
-                            .peers
-                            .with_peer_mut(peer, "piece_failed", |p| p.piece_failed(bannable))
-                            .unwrap_or(bannable);
-                        if to_ban || liars.contains(&peer) {
-                            state.peers.ban(peer);
+                    let v2_request = state.metadata.v2.as_ref().and_then(|v2| {
+                        let request = hash_fetch::block_request(
+                            v2,
+                            state.lengths.default_piece_length().into(),
+                            piece_index.get(),
+                        )?;
+                        Some((request, v2.share(piece_index.get())?))
+                    });
+                    match v2_request {
+                        Some((request, share)) if !senders.sole_sender() => {
+                            let failed = hash_fetch::failed_blocks(
+                                &state.lengths,
+                                piece_index,
+                                share,
+                                &senders,
+                                read_block,
+                            );
+                            state
+                                .layer_fetch
+                                .verify_blocks(request, piece_index, failed);
                         }
+                        _ => state.penalize_peers(
+                            senders.participants(),
+                            piece_index,
+                            senders.sole_sender(),
+                        ),
                     }
                     state.requeue_piece(piece_index)?;
                 }
