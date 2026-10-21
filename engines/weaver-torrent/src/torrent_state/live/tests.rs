@@ -267,18 +267,99 @@ fn every_chunk() -> BTreeSet<(u32, u32)> {
         .collect()
 }
 
+impl Harness {
+    /// The unchoked `peer` is asked for every chunk, on the paused clock:
+    /// the first piece's four at the depth of a peer no block has come from
+    /// yet; then the first of them arrives, at once, which makes room for the
+    /// rest. Returns the piece asked for first.
+    async fn request_every_chunk(
+        &self,
+        peer: &PeerHandler,
+        task: &mut Task<'_>,
+        rx: &mut PeerRx,
+    ) -> u32 {
+        let first = next_requests(task, rx, CHUNKS_PER_PIECE as usize).await;
+        let (piece, _) = *first.first().unwrap();
+        assert_eq!(first, chunks(piece, 0..CHUNKS_PER_PIECE));
+        self.deliver(peer, (piece, 0)).await;
+        let other = 1 - piece;
+        assert_eq!(
+            next_requests(task, rx, CHUNKS_PER_PIECE as usize).await,
+            chunks(other, 0..CHUNKS_PER_PIECE)
+        );
+        piece
+    }
+}
+
+// libtorrent `peer_connection::update_desired_queue_size`: four requests
+// before any block arrives (`m_desired_queue_size`), then the blocks the
+// peer delivers in `request_queue_time` at its pace, between two and the
+// most outstanding; one while it is snubbed.
+#[tokio::test]
+async fn the_request_depth_follows_the_pace_the_peer_delivers_at() {
+    let h = Harness::new("request_depth_follows_pace").await;
+    let (slow, mut slow_rx) = h.peer("127.0.0.1:6881");
+    let (fast, mut fast_rx) = h.peer("127.0.0.2:6881");
+    tokio::time::pause();
+    let depth = |peer: &PeerHandler| {
+        let max = peer.lock_flow_control("test").request_window;
+        h.peers
+            .with_live(peer.addr, |live| live.desired_queue_size(max))
+            .unwrap()
+    };
+
+    // Before any block: four, so each peer is asked for one piece.
+    let mut slow_requester: Task<'_> = Box::pin(slow.request_chunks());
+    slow.on_i_am_unchoked();
+    let (slow_piece, _) = *next_requests(&mut slow_requester, &mut slow_rx, 4)
+        .await
+        .first()
+        .unwrap();
+    assert_eq!(depth(&slow), 4);
+    assert!(!slow.can_send_request());
+    let mut fast_requester: Task<'_> = Box::pin(fast.request_chunks());
+    fast.on_i_am_unchoked();
+    let (fast_piece, _) = *next_requests(&mut fast_requester, &mut fast_rx, 4)
+        .await
+        .first()
+        .unwrap();
+
+    // A block the moment it was asked for: every request we allow, and no
+    // more than the peer's `reqq`.
+    h.deliver(&fast, (fast_piece, 0)).await;
+    assert_eq!(depth(&fast), DEFAULT_PEER_REQUEST_WINDOW);
+    let mut hs = ExtendedHandshake::new();
+    hs.reqq = Some(5);
+    (&fast).on_extended_handshake(&hs).unwrap();
+    assert_eq!(depth(&fast), 5);
+
+    // Snubbed: one.
+    h.peers
+        .with_live_mut(fast.addr, "test", |live| live.snub())
+        .unwrap();
+    assert_eq!(depth(&fast), 1);
+
+    // A block a second: three seconds' worth.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    h.deliver(&slow, (slow_piece, 0)).await;
+    assert_eq!(depth(&slow), 3);
+
+    // A block every two seconds: one and a half, so the least, two.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    h.deliver(&slow, (slow_piece, CHUNK_SIZE)).await;
+    assert_eq!(depth(&slow), 2);
+}
+
 #[tokio::test]
 async fn a_choke_returns_every_outstanding_request_and_unchoke_asks_again() {
     let h = Harness::new("a_choke_returns_requests").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
     let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
 
     peer.on_i_am_unchoked();
-    assert_eq!(
-        next_requests(&mut requester, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
-    h.deliver(&peer, (0, 0)).await;
+    let taken = h.request_every_chunk(&peer, &mut requester, &mut rx).await;
+    let other = 1 - taken;
 
     peer.on_i_am_choked().unwrap();
 
@@ -286,16 +367,16 @@ async fn a_choke_returns_every_outstanding_request_and_unchoke_asks_again() {
     // queue for any peer, the delivered chunk kept.
     assert_eq!(h.inflight_count(&peer), 0);
     assert_eq!(h.queued_pieces(), vec![0, 1]);
-    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
-    assert_eq!(h.missing_chunks(1), vec![0, 1, 2, 3]);
+    assert_eq!(h.missing_chunks(taken), vec![1, 2, 3]);
+    assert_eq!(h.missing_chunks(other), vec![0, 1, 2, 3]);
 
     // A block the peer had already sent is let through, and not counted.
-    h.deliver(&peer, (0, CHUNK_SIZE)).await;
-    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
+    h.deliver(&peer, (taken, CHUNK_SIZE)).await;
+    assert_eq!(h.missing_chunks(taken), vec![1, 2, 3]);
 
     peer.on_i_am_unchoked();
-    let mut again = chunks(0, 1..CHUNKS_PER_PIECE);
-    again.extend(chunks(1, 0..CHUNKS_PER_PIECE));
+    let mut again = chunks(taken, 1..CHUNKS_PER_PIECE);
+    again.extend(chunks(other, 0..CHUNKS_PER_PIECE));
     assert_eq!(
         next_requests(&mut requester, &mut rx, again.len()).await,
         again
@@ -321,16 +402,16 @@ async fn an_undelivered_request_is_free_again_after_the_timeout_and_a_delivered_
     tokio::time::pause();
     let mut requester: Task<'_> = Box::pin(peer.request_chunks());
 
+    // No block has come from the peer yet: it is asked for one piece.
     peer.on_i_am_unchoked();
-    assert_eq!(
-        next_requests(&mut requester, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
+    let asked = next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await;
+    let (piece, _) = *asked.first().unwrap();
+    assert_eq!(asked, chunks(piece, 0..CHUNKS_PER_PIECE));
     drop(requester);
 
     // The first block takes 10 s, so the peer's timeout is 12 s from it.
     tokio::time::advance(Duration::from_secs(10)).await;
-    h.deliver(&peer, (0, 0)).await;
+    h.deliver(&peer, (piece, 0)).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     assert_eq!(
         h.peers
@@ -342,8 +423,7 @@ async fn an_undelivered_request_is_free_again_after_the_timeout_and_a_delivered_
     // Nothing more arrives: the watcher cancels every undelivered request
     // once the deadline passes, and not before.
     let mut watcher: Task<'_> = Box::pin(peer.time_out_requests());
-    let mut undelivered = every_chunk();
-    undelivered.remove(&(0, 0));
+    let undelivered = chunks(piece, 1..CHUNKS_PER_PIECE);
     assert_eq!(
         next_cancels(&mut watcher, &mut rx, undelivered.len()).await,
         undelivered
@@ -353,8 +433,8 @@ async fn an_undelivered_request_is_free_again_after_the_timeout_and_a_delivered_
     // The undelivered chunks are free for any peer; the delivered one stays had.
     assert_eq!(h.inflight_count(&peer), 0);
     assert_eq!(h.queued_pieces(), vec![0, 1]);
-    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
-    assert_eq!(h.missing_chunks(1), vec![0, 1, 2, 3]);
+    assert_eq!(h.missing_chunks(piece), vec![1, 2, 3]);
+    assert_eq!(h.missing_chunks(1 - piece), vec![0, 1, 2, 3]);
 }
 
 impl Harness {
@@ -371,18 +451,13 @@ async fn a_timed_out_peer_holds_one_request_until_a_block_arrives() {
     tokio::time::pause();
     let mut task: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
 
+    // No block has come from the peer yet: it is asked for one piece.
     peer.on_i_am_unchoked();
-    assert_eq!(
-        next_requests(&mut task, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
+    let first = next_requests(&mut task, &mut rx, CHUNKS_PER_PIECE as usize).await;
     assert!(!h.snubbed(&peer));
 
     // No block arrives: every request times out and the peer is snubbed.
-    assert_eq!(
-        next_cancels(&mut task, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
+    assert_eq!(next_cancels(&mut task, &mut rx, first.len()).await, first);
     assert!(h.snubbed(&peer));
 
     // Snubbed, the peer is asked for one chunk and may hold no more.
@@ -390,8 +465,8 @@ async fn a_timed_out_peer_holds_one_request_until_a_block_arrives() {
     assert_eq!(h.inflight_count(&peer), 1);
     assert!(!peer.can_send_request());
 
-    // The block it was asked for arrives: the snub is lifted and the
-    // requester fills the window with the rest.
+    // The block it was asked for arrives at once: the snub is lifted and
+    // the requester fills the deeper window with the rest.
     let delivered = *asked.first().unwrap();
     h.deliver(&peer, delivered).await;
     assert!(!h.snubbed(&peer));
@@ -730,37 +805,35 @@ async fn a_fast_peer_that_chokes_us_keeps_our_requests_until_it_rejects_one() {
     let h = Harness::new("a_fast_choke_keeps_requests").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
     h.speak_fast(&peer);
+    tokio::time::pause();
     let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
 
     peer.on_i_am_unchoked();
-    assert_eq!(
-        next_requests(&mut requester, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
+    let taken = h.request_every_chunk(&peer, &mut requester, &mut rx).await;
+    let other = 1 - taken;
     drop(requester);
 
     // The peer answers every request with its block or a Reject, so the
     // Choke leaves them all in flight, and a block still counts.
     (&peer).on_received_message(Message::Choke).await.unwrap();
-    assert_eq!(h.inflight_count(&peer), every_chunk().len());
+    assert_eq!(h.inflight_count(&peer), every_chunk().len() - 1);
     assert!(h.queued_pieces().is_empty());
-    h.deliver(&peer, (0, 0)).await;
-    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
+    h.deliver(&peer, (taken, CHUNK_SIZE)).await;
+    assert_eq!(h.missing_chunks(taken), vec![2, 3]);
 
     // One Reject gives back both pieces and every request, the delivered
-    // chunk kept.
+    // chunks kept.
     (&peer)
-        .on_received_message(Message::Reject(request(0, 1)))
+        .on_received_message(Message::Reject(request(taken, 2)))
         .await
         .unwrap();
     assert_eq!(h.inflight_count(&peer), 0);
     assert_eq!(h.queued_pieces(), vec![0, 1]);
-    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
+    assert_eq!(h.missing_chunks(taken), vec![2, 3]);
 
     // The Rejects for the rest answer requests we no longer wait for.
-    let mut rest = every_chunk();
-    rest.remove(&(0, 0));
-    rest.remove(&(0, CHUNK_SIZE));
+    let mut rest = chunks(other, 0..CHUNKS_PER_PIECE);
+    rest.insert((taken, 3 * CHUNK_SIZE));
     for (index, begin) in rest {
         (&peer)
             .on_received_message(Message::Reject(request(index, begin / CHUNK_SIZE)))
@@ -770,7 +843,7 @@ async fn a_fast_peer_that_chokes_us_keeps_our_requests_until_it_rejects_one() {
     // One more answers nothing we asked for.
     assert!(
         (&peer)
-            .on_received_message(Message::Reject(request(1, 0)))
+            .on_received_message(Message::Reject(request(other, 0)))
             .await
             .is_err()
     );
@@ -922,6 +995,7 @@ async fn a_peer_that_chokes_us_is_asked_only_for_its_allowed_fast_pieces() {
     let h = Harness::new("allowed_fast_requested").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
     h.speak_fast(&peer);
+    tokio::time::pause();
     (&peer)
         .on_received_message(Message::AllowedFast(1))
         .await
@@ -935,7 +1009,10 @@ async fn a_peer_that_chokes_us_is_asked_only_for_its_allowed_fast_pieces() {
     assert!(rx.is_empty());
     assert_eq!(h.queued_pieces(), vec![0]);
 
+    // Unchoked, and a block arrives at once, which deepens the window: the
+    // rest is asked for.
     peer.on_i_am_unchoked();
+    h.deliver(&peer, (1, 0)).await;
     assert_eq!(
         next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
         chunks(0, 0..CHUNKS_PER_PIECE)

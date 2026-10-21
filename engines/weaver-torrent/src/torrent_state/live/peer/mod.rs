@@ -58,6 +58,16 @@ const MAX_SUGGEST_PIECES: usize = 16;
 /// handshake advertises it as `reqq`.
 pub(crate) const MAX_ALLOWED_IN_REQUEST_QUEUE: u32 = 2000;
 
+// libtorrent `settings_pack::request_queue_time`: the requests outstanding to
+// a peer cover this long of its delivery.
+const REQUEST_QUEUE_TIME: Duration = Duration::from_secs(3);
+// libtorrent `min_request_queue`: the fewest requests outstanding to a peer
+// that is not snubbed.
+const MIN_REQUEST_QUEUE: usize = 2;
+// libtorrent `peer_connection::m_desired_queue_size`'s first value: the
+// requests outstanding to a peer before any block has arrived from it.
+const INITIAL_REQUEST_QUEUE: usize = 4;
+
 /// BEP 6's allowed fast set of `k` of `num_pieces` pieces for the peer at
 /// `ip` on the torrent `info_hash`, in the order it is generated; every piece
 /// when `k` is not less than their count (libtorrent
@@ -841,11 +851,25 @@ impl LivePeerState {
         self.snubbed = true;
     }
 
-    /// Whether the peer may hold another request: one while it is snubbed,
-    /// `window` otherwise.
-    pub fn can_hold_another_request(&self, window: usize) -> bool {
-        let budget = if self.snubbed { 1 } else { window };
-        self.requested_inflight_count() < budget
+    /// How many requests to keep outstanding to the peer, at most `max`
+    /// (libtorrent `peer_connection::update_desired_queue_size`): one while
+    /// it is snubbed; else the blocks it delivers in [`REQUEST_QUEUE_TIME`]
+    /// at the pace it has delivered them, at least [`MIN_REQUEST_QUEUE`];
+    /// [`INITIAL_REQUEST_QUEUE`] until a block has arrived.
+    pub fn desired_queue_size(&self, max: usize) -> usize {
+        if self.snubbed {
+            return 1;
+        }
+        self.block_time
+            .blocks_in(REQUEST_QUEUE_TIME)
+            .unwrap_or(INITIAL_REQUEST_QUEUE)
+            .max(MIN_REQUEST_QUEUE)
+            .min(max)
+    }
+
+    /// Whether the peer may hold another request, at most `max` in all.
+    pub fn can_hold_another_request(&self, max: usize) -> bool {
+        self.requested_inflight_count() < self.desired_queue_size(max)
     }
 
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
@@ -1207,6 +1231,15 @@ impl BlockTime {
             _ => self.mean_secs + 4.0 * self.deviation_secs,
         };
         Duration::from_secs_f64(secs).clamp(Self::MIN_TIMEOUT, Self::MAX_TIMEOUT)
+    }
+
+    /// How many blocks the peer delivers in `window` at its mean block time:
+    /// its download rate over `window`, in blocks. None until it has
+    /// delivered one.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn blocks_in(&self, window: Duration) -> Option<usize> {
+        // A mean of zero is a rate past any bound: the cast saturates.
+        (self.samples > 0).then(|| (window.as_secs_f64() / self.mean_secs) as usize)
     }
 }
 

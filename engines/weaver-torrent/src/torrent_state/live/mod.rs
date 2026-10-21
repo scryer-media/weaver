@@ -1289,10 +1289,17 @@ impl TorrentStateLive {
     }
 }
 
-const DEFAULT_PEER_REQUEST_WINDOW: usize = 128;
+// libtorrent `settings_pack::max_out_request_queue`: the most requests
+// outstanding to a peer, however fast it delivers.
+const DEFAULT_PEER_REQUEST_WINDOW: usize = 500;
 
 struct PeerFlowControl {
     i_am_choked: bool,
+    // The most requests outstanding to the peer: the session's limit, or
+    // the peer's `reqq` when that is lower (libtorrent
+    // `peer_connection::m_max_out_request_queue`). How many the peer is
+    // kept busy with below it follows its pace
+    // (LivePeerState::desired_queue_size).
     request_window: usize,
 }
 
@@ -1530,6 +1537,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 live.supports_holepunch = hs.m.ut_holepunch.is_some();
             });
 
+        // The peer holds at most its `reqq` requests (libtorrent
+        // `bt_peer_connection::on_extended_handshake`); our own limit stays
+        // the ceiling.
         if let Some(reqq) = hs.reqq.and_then(|reqq| usize::try_from(reqq).ok())
             && reqq > 0
         {
