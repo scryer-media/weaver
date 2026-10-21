@@ -92,6 +92,7 @@ use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
+    connection_slots::ConnectionSlot,
     file_ops::FileOps,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
@@ -373,6 +374,7 @@ impl TorrentStateLive {
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
+        slot: ConnectionSlot,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
         let (tx, rx) = unbounded_channel();
@@ -435,10 +437,14 @@ impl TorrentStateLive {
                 "[{}][addr={}]manage_incoming_peer",
                 self.shared.id, checked_peer.addr
             ),
-            aframe!(
-                self.clone()
-                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)
-            ),
+            aframe!(self.clone().task_manage_incoming_peer(
+                checked_peer,
+                counters,
+                tx,
+                rx,
+                permit,
+                slot
+            )),
         );
         Ok(AddIncomingPeerResult::Added)
     }
@@ -481,6 +487,7 @@ impl TorrentStateLive {
         tx: PeerTx,
         rx: PeerRx,
         permit: OwnedSemaphorePermit,
+        _slot: ConnectionSlot,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
             addr: checked_peer.addr,
@@ -534,6 +541,7 @@ impl TorrentStateLive {
         self: Arc<Self>,
         addr: SocketAddr,
         permit: OwnedSemaphorePermit,
+        _slot: ConnectionSlot,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -622,6 +630,7 @@ impl TorrentStateLive {
                 .session
                 .upgrade()
                 .ok_or(Error::SessionDestroyed)?;
+            let slots = session.connection_slots.clone();
 
             if session.ipv4_only && addr.is_ipv6() {
                 debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
@@ -657,11 +666,19 @@ impl TorrentStateLive {
                 continue;
             }
 
+            drop(session);
+
+            // The torrent's own cap first, so a torrent at it holds no place
+            // under the session's; then a place under the session's cap and
+            // a connect from its per-second budget, both shared with every
+            // torrent in turn.
             let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            let slot = slots.open().await?;
+            slots.begin_connect().await;
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(state.clone().task_manage_outgoing_peer(addr, permit, slot)),
             );
         }
     }

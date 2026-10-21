@@ -69,4 +69,6 @@ windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System
 # The e2e tests lift the open-file limit.
 nix = { workspace = true, features = ["resource", "uio"] }
 tempfile = { workspace = true }
+# Paused time for the connection budget's per-second tests.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
