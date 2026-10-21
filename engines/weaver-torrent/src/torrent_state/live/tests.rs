@@ -3504,3 +3504,55 @@ async fn a_finished_torrent_asks_for_a_piece_the_moment_it_is_wanted_again() {
     );
     assert_eq!(tokio::time::Instant::now(), start);
 }
+
+// libtorrent `bt_peer_connection::write_extensions` sends `p`, our listen
+// port, on a connection we made; `on_extended_handshake` takes `p` from a
+// peer, at the address it connected from (`peer_list::update_peer_port`),
+// and never the peer's word on its own address.
+#[tokio::test]
+async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
+    let opts = SessionOptions {
+        listen: Some(crate::ListenerOptions {
+            mode: crate::ListenerMode::TcpOnly,
+            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            announce_port: Some(51413),
+            ..Default::default()
+        }),
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "extended_handshake_ports",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let (incoming, _incoming_rx) = h.peer("127.0.0.1:50000");
+    let (mut outgoing, _outgoing_rx) = h.new_peer("127.0.0.2:6881");
+    outgoing.incoming = false;
+
+    let ours = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.p
+    };
+    assert_eq!(ours(&incoming), None);
+    assert_eq!(ours(&outgoing), Some(51413));
+
+    let theirs = ExtendedHandshake {
+        p: Some(7000),
+        ipv4: Some(std::net::Ipv4Addr::new(203, 0, 113, 9).into()),
+        ipv6: Some(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9).into()),
+        ..Default::default()
+    };
+    (&incoming).on_extended_handshake(&theirs).unwrap();
+    let listen: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    assert_eq!(
+        h.peers.with_peer(incoming.addr, |p| p.outgoing_address),
+        Some(Some(listen))
+    );
+    assert_eq!(
+        h.peers.pex_listed().into_keys().collect::<Vec<_>>(),
+        [listen]
+    );
+}

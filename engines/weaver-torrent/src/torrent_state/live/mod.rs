@@ -1591,16 +1591,21 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                     .task_send_pex_to_peer(self.addr, self.tx.clone()),
             );
         }
-        // Lets update outgoing Socket address for incoming connection
+        // A peer that connected to us says where it listens: at the address
+        // it connected from, on port `p`. Its own word on its address
+        // (`ipv4`, `ipv6`) is never taken (libtorrent
+        // `bt_peer_connection::on_extended_handshake`, which reads only `p`,
+        // into `peer_list::update_peer_port`). `yourip`, our address as the
+        // peer sees it, is a vote for `session_impl::set_external_address`;
+        // the session keeps no external address, so it is not read.
         if self.incoming
-            && let Some(port) = hs.port()
+            && let Some(port) = hs.port().filter(|&port| port != 0)
         {
-            let peer_ip = hs.ip_addr().unwrap_or(self.addr.ip());
-            let outgoing_addr = SocketAddr::new(peer_ip, port);
+            let listen = SocketAddr::new(self.addr.ip(), port);
             self.state
                 .peers
                 .with_peer_mut(self.addr, "update outgoing addr", |peer| {
-                    peer.outgoing_address = Some(outgoing_addr)
+                    peer.outgoing_address = Some(listen)
                 });
         }
 
@@ -1642,6 +1647,19 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         handshake.m.ut_holepunch = Some(MY_EXTENDED_UT_HOLEPUNCH);
         // We only upload (libtorrent `bt_peer_connection::write_extensions`).
         handshake.upload_only = self.state.is_upload_only().then_some(1);
+        // Where we listen, on a connection we made: a peer that reached us
+        // knows it (libtorrent `bt_peer_connection::write_extensions`, the
+        // port `session_impl::listen_port` gives: the one mapped on the
+        // gateway, else the one we listen on).
+        if !self.incoming {
+            handshake.p = self
+                .state
+                .shared
+                .session
+                .upgrade()
+                .and_then(|session| session.announce_port())
+                .map(u32::from);
+        }
 
         Ok(())
     }
