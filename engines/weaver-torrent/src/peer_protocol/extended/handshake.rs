@@ -5,8 +5,6 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::net::IpAddr;
-
 use crate::buffers::{ByteBuf, ByteBufT};
 use crate::core::compact_ip::{CompactIpAddr, CompactIpV4, CompactIpV6};
 use serde_derive::{Deserialize, Serialize};
@@ -49,16 +47,6 @@ impl ExtendedHandshake<ByteBuf<'_>> {
 
     pub fn peer_extended_messages(&self) -> PeerExtendedMessageIds {
         self.m
-    }
-
-    pub fn ip_addr(&self) -> Option<IpAddr> {
-        if let Some(ref b) = self.ipv4 {
-            return Some(b.0.into());
-        }
-        if let Some(ref b) = self.ipv6 {
-            return Some(b.0.into());
-        }
-        None
     }
 
     pub fn port(&self) -> Option<u16> {
