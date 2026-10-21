@@ -143,6 +143,8 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_limit: Option<usize>,
     /// [`AddTorrentOptions::disable_v1_hashes`](crate::AddTorrentOptions::disable_v1_hashes).
     pub disable_v1_hashes: bool,
+    /// [`AddTorrentOptions::super_seeding`](crate::AddTorrentOptions::super_seeding).
+    pub super_seeding: bool,
 }
 
 impl ManagedTorrentOptions {

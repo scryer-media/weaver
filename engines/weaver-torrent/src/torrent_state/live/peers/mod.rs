@@ -37,6 +37,7 @@ use super::peer::{
 
 pub mod availability;
 pub mod stats;
+mod super_seed;
 
 // libtorrent `max_peerlist_size`: the most peers one torrent's peer list holds.
 pub(crate) const MAX_PEERLIST_SIZE: usize = 3000;
@@ -64,6 +65,9 @@ pub(crate) struct PeerStates {
     // Wakes the connect loop when a connect candidate appears or may come due
     // sooner.
     candidates_changed: Notify,
+    // Held while a piece is handed to a peer to super-seed, so two peers
+    // are not handed one piece at once.
+    super_seeding: Mutex<()>,
 }
 
 /// What a newcomer may push out of a full peer list.
@@ -127,6 +131,7 @@ impl PeerStates {
             admission: Mutex::new(()),
             banned: Default::default(),
             candidates_changed: Notify::new(),
+            super_seeding: Mutex::new(()),
         }
     }
 

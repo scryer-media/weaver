@@ -589,6 +589,10 @@ pub(crate) struct LivePeerState {
     // choked it (libtorrent `peer_connection::m_num_invalid_requests`).
     invalid_requests: u16,
 
+    // While we super-seed, the one piece we told the peer we have
+    // (libtorrent `peer_connection::m_superseed_piece`).
+    pub super_seeded: Option<ValidPieceIndex>,
+
     // The main channel to send requests to peer.
     pub tx: PeerTx,
 
@@ -650,6 +654,7 @@ impl LivePeerState {
             request_slots_changed: Default::default(),
             upload_queue: Default::default(),
             invalid_requests: 0,
+            super_seeded: None,
             tx,
             connection_kind,
             fast: false,

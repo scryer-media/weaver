@@ -407,6 +407,12 @@ pub struct AddTorrentOptions {
     /// twice is a cost Weaver does not pay.
     #[serde(default = "v1_hashes_disabled_by_default")]
     pub disable_v1_hashes: bool,
+    /// Super-seed (BEP 16) while the torrent is a seed: peers are told of
+    /// no piece but the one each is handed, the rarest it lacks, and a peer
+    /// is handed the next once another peer reports the piece (libtorrent
+    /// `torrent_flags::super_seeding`). Off by default.
+    #[serde(default)]
+    pub super_seeding: bool,
 }
 
 const fn v1_hashes_disabled_by_default() -> bool {
@@ -436,6 +442,7 @@ impl Default for AddTorrentOptions {
             piece_priorities: None,
             identity: None,
             disable_v1_hashes: v1_hashes_disabled_by_default(),
+            super_seeding: false,
         }
     }
 }
@@ -1805,6 +1812,7 @@ impl Session {
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_v1_hashes: opts.disable_v1_hashes,
+                    super_seeding: opts.super_seeding,
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),

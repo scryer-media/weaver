@@ -233,6 +233,11 @@ pub struct TorrentStateLive {
     // it. Not on a private torrent, nor in a session without it (libtorrent
     // `ut_pex_plugin::new_connection`, `session::add_extension`).
     pex: bool,
+
+    // Whether the torrent super-seeds: asked to, and a seed when this run
+    // began (libtorrent `torrent::m_super_seeding`, turned off for a torrent
+    // that is not a seed).
+    super_seeding: bool,
 }
 
 // A block a peer asked for, on its way through the upload rate limits to the
@@ -305,6 +310,8 @@ impl TorrentStateLive {
                 lengths.default_piece_length().into(),
             ),
             pex: !session.disable_pex && !paused.metadata.info.info().private,
+            super_seeding: paused.shared.options.super_seeding
+                && have_bytes == lengths.total_length(),
         });
 
         state.spawn(
@@ -1187,7 +1194,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {
-        if !self.first_message_received.swap(true, Ordering::Relaxed) {
+        let first = !self.first_message_received.swap(true, Ordering::Relaxed);
+        if first {
             // The connection works, so the failures before it no longer count.
             self.state.peers.connection_delivered(self.addr);
             // The first message must be "bitfield", but if it's not sent,
@@ -1269,6 +1277,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 );
             }
         };
+        if first {
+            // The peer's pieces are known now: its bitfield, or none.
+            self.super_seed();
+        }
         Ok(())
     }
 
@@ -1403,7 +1415,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             return false;
         }
 
-        self.state.get_approx_have_bytes() > 0
+        // A super-seed tells of no piece but those it hands out
+        // (libtorrent `bt_peer_connection::write_bitfield`).
+        !self.state.super_seeding && self.state.get_approx_have_bytes() > 0
     }
 
     fn update_my_extended_handshake(
@@ -1654,14 +1668,20 @@ impl PeerHandler {
 
         // A request for a block that is not one, or of a piece we do not
         // have, is dropped (libtorrent `peer_connection::incoming_request`).
+        // While we super-seed, so is one for a piece other than the one
+        // the peer was handed (libtorrent `peer_connection::incoming_request`).
         let chunk_info = match self.requested_chunk(&request) {
-            Some(chunk) => self
-                .state
-                .lock_read("is_chunk_ready_to_upload")
-                .get_chunks()?
-                .is_chunk_ready_to_upload(&chunk)
-                .then_some(chunk),
-            None => None,
+            Some(chunk)
+                if !self.state.super_seeding
+                    || self.state.peers.super_seeded(self.addr, chunk.piece_index) =>
+            {
+                self.state
+                    .lock_read("is_chunk_ready_to_upload")
+                    .get_chunks()?
+                    .is_chunk_ready_to_upload(&chunk)
+                    .then_some(chunk)
+            }
+            _ => None,
         };
         let Some(chunk_info) = chunk_info else {
             return self.on_invalid_request(request);
@@ -1820,6 +1840,11 @@ impl PeerHandler {
         };
         trace!(have, "peer has piece");
         self.state.peers.peer_has(self.addr, piece);
+        if self.state.super_seeding {
+            self.state
+                .peers
+                .super_seed_spread(self.addr, piece, &self.state.lengths);
+        }
         self.on_bitfield_notify.notify_waiters();
         Ok(())
     }
@@ -1827,6 +1852,7 @@ impl PeerHandler {
     fn on_bitfield(&self, bitfield: &[u8]) -> anyhow::Result<()> {
         let bf = ingest_bitfield(bitfield, self.state.lengths.total_pieces())?;
         self.state.peers.update_bitfield(self.addr, bf);
+        self.super_seed();
         self.on_bitfield_notify.notify_waiters();
         Ok(())
     }
@@ -1846,6 +1872,14 @@ impl PeerHandler {
             .peers
             .with_live(self.addr, |live| live.fast)
             .unwrap_or(false)
+    }
+
+    /// The peer's pieces are known afresh: while we super-seed, it is
+    /// handed a piece unless it holds one it lacks.
+    fn super_seed(&self) {
+        if self.state.super_seeding {
+            self.state.peers.super_seed(self.addr, &self.state.lengths);
+        }
     }
 
     async fn wait_for_any_notify(&self, notify: &Notify, check: impl Fn() -> bool) {
