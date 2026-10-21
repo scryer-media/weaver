@@ -5,10 +5,10 @@
 //! sent the Choke or Unchoke the choker decides. Each round the interested
 //! peers are ranked, those that send us the most first; while we seed, the
 //! peers we upload to fastest, rotated round-robin once they have had their
-//! share. One slot is the optimistic one: it passes in turn to a peer that
-//! has waited, whatever it sent us, so a new peer gets the chance to show
-//! what it can do. This is the shape of libtorrent's fixed-slots choker with
-//! its round-robin seed choker.
+//! share. Some slots are optimistic: they pass in turn to the peers that
+//! have waited longest for one, whatever they sent us, so a new peer gets
+//! the chance to show what it can do. This follows libtorrent's
+//! fixed-slots choker with its round-robin seed choker.
 
 use std::{cmp::Reverse, net::SocketAddr, sync::atomic::Ordering, time::Duration};
 
@@ -24,18 +24,19 @@ use super::{
 pub(crate) const DEFAULT_UNCHOKE_SLOTS_LIMIT: usize = 8;
 // libtorrent `unchoke_interval`: how often the slots are handed out again.
 pub(crate) const UNCHOKE_INTERVAL: Duration = Duration::from_secs(15);
-// libtorrent `optimistic_unchoke_interval`: how often the optimistic slot
-// passes to another peer.
+// libtorrent `optimistic_unchoke_interval`: how often the optimistic slots
+// pass to other peers.
 pub(crate) const OPTIMISTIC_UNCHOKE_INTERVAL: Duration = Duration::from_secs(30);
-// libtorrent `num_optimistic_unchoke_slots`, at its default of one per five
-// slots and at least one: one for the default eight.
-const OPTIMISTIC_SLOTS: usize = 1;
 // libtorrent `seeding_piece_quota`: the pieces a peer is sent before it
 // yields its slot to a peer that has waited.
 const SEEDING_PIECE_QUOTA: u64 = 20;
-// libtorrent's round-robin seed choker: the least time a peer holds its slot
+// libtorrent `unchoke_compare_rr`: the least time a peer holds its slot
 // before using up its quota can end it.
 const MIN_SLOT_TIME: Duration = Duration::from_secs(60);
+// libtorrent `peer_connection::incoming_request`: how long after its Choke a
+// peer's requests are taken as already on their way; a request later than
+// that ends the connection.
+pub(crate) const CHOKED_REQUEST_GRACE: Duration = Duration::from_secs(2);
 
 /// What a peer sent us and what we sent it, in payload bytes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -72,20 +73,17 @@ struct Rank {
     // The most we uploaded to the peer in the round first. A choked peer
     // counts nothing: what still arrived after its Choke is no claim.
     uploaded: Reverse<u64>,
-    // The peer that has waited longest since we last unchoked it, one we
-    // never unchoked first.
-    last_unchoke: Option<Instant>,
+    // The peer that has waited longest since we last unchoked it first; one
+    // we never unchoked has waited since its connection went live.
+    last_unchoke: Instant,
 }
 
-/// Where a peer ranks for the optimistic slot; the lowest ranks first.
+/// Where a peer ranks for an optimistic slot; the lowest ranks first.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct OptimisticRank {
-    // The peer that has waited longest for the slot, one that never held it
+    // The peer that has waited longest for one, one that never held one
     // first.
     last_optimistic_unchoke: Option<Instant>,
-    // Then the peer that has waited longest since we last unchoked it, one
-    // we never unchoked first.
-    last_unchoke: Option<Instant>,
     // Then any of those alike, at random.
     draw: u64,
 }
@@ -93,15 +91,15 @@ struct OptimisticRank {
 pub(crate) struct Choker {
     slots: usize,
     piece_length: u64,
-    // The peer holding the optimistic slot. Every slot decision is made
+    // The peers holding the optimistic slots. Every slot decision is made
     // under this lock, so peers turning interested on several connections at
     // once never take more than `slots`.
-    optimistic: Mutex<Option<SocketAddr>>,
+    optimistic: Mutex<Vec<SocketAddr>>,
     // Rings for a round before the interval ends: a peer holding a slot gave
     // it up, or more peers are unchoked than there are slots.
     reshuffle: Notify,
-    // Rings for the optimistic slot to pass on before its interval ends: its
-    // holder gave it up, or took a regular slot.
+    // Rings for the optimistic slots to pass on before their interval ends:
+    // a holder gave its slot up, or took a regular one.
     rotation: Notify,
 }
 
@@ -112,14 +110,24 @@ impl Choker {
         Self {
             slots,
             piece_length,
-            optimistic: Mutex::new(None),
+            optimistic: Mutex::new(Vec::new()),
             reshuffle: Notify::new(),
             rotation: Notify::new(),
         }
     }
 
+    // libtorrent `num_optimistic_unchoke_slots` at its default: one slot in
+    // five and at least one, of a torrent that has any.
+    fn optimistic_slots(&self) -> usize {
+        match self.slots {
+            0 => 0,
+            slots => (slots / 5).max(1),
+        }
+    }
+
     /// The peer at `addr` said it is interested. It takes a free slot at
-    /// once; with none free it waits for a round to rank it.
+    /// once; with none free it waits for a round to rank it. A peer we
+    /// already unchoked is told so again.
     pub fn peer_interested(&self, peers: &PeerStates, addr: SocketAddr) {
         let _optimistic = self.optimistic.lock();
         let free = self.slots.saturating_sub(unchoked(peers)) > 0;
@@ -130,7 +138,9 @@ impl Choker {
                 return;
             };
             live.peer_interested = true;
-            if free {
+            if !live.is_choked() {
+                live.repeat_unchoke();
+            } else if free {
                 live.unchoke(now, uploaded);
             }
         });
@@ -140,10 +150,11 @@ impl Choker {
     /// and a slot it held is handed out again now.
     pub fn peer_not_interested(&self, peers: &PeerStates, addr: SocketAddr) {
         let mut optimistic = self.optimistic.lock();
+        let now = Instant::now();
         let held_slot = peers
             .with_live_mut(addr, "peer_not_interested", |live| {
                 live.peer_interested = false;
-                live.choke()
+                live.choke(now)
             })
             .unwrap_or(false);
         self.give_up_slot(&mut optimistic, addr, held_slot);
@@ -156,11 +167,11 @@ impl Choker {
         self.give_up_slot(&mut optimistic, addr, held_slot);
     }
 
-    // The peer at `addr` no longer holds the slot it held: the optimistic
-    // slot passes on, or the regular ones are handed out again.
-    fn give_up_slot(&self, optimistic: &mut Option<SocketAddr>, addr: SocketAddr, held: bool) {
-        if *optimistic == Some(addr) {
-            *optimistic = None;
+    // The peer at `addr` no longer holds the slot it held: an optimistic
+    // slot passes on, and the regular ones are handed out again.
+    fn give_up_slot(&self, optimistic: &mut Vec<SocketAddr>, addr: SocketAddr, held: bool) {
+        if let Some(at) = optimistic.iter().position(|a| *a == addr) {
+            optimistic.swap_remove(at);
             self.rotation.notify_one();
         }
         if held {
@@ -173,15 +184,15 @@ impl Choker {
         self.reshuffle.notified().await
     }
 
-    /// Returns once the optimistic slot is to pass on before its interval
-    /// ends.
+    /// Returns once the optimistic slots are to pass on before their
+    /// interval ends.
     pub async fn rotation_requested(&self) {
         self.rotation.notified().await
     }
 
     /// A round at `now`: the interested peers that rank highest hold the
-    /// regular slots, the optimistic slot keeps its holder, and every other
-    /// interested peer is choked.
+    /// regular slots, the optimistic slots keep their holders, and every
+    /// other interested peer is choked.
     pub fn recalculate(&self, peers: &PeerStates, now: Instant) {
         let mut optimistic = self.optimistic.lock();
         let mut ranked = Vec::new();
@@ -201,12 +212,17 @@ impl Choker {
         }
         ranked.sort_unstable();
 
-        let regular = self.slots.saturating_sub(OPTIMISTIC_SLOTS);
+        // The optimistic slots held, or all of them while none is.
+        let reserved = match optimistic.len() {
+            0 => self.optimistic_slots(),
+            held => held,
+        };
+        let regular = self.slots.saturating_sub(reserved);
         for (place, (_, addr)) in ranked.into_iter().enumerate() {
-            let holds_optimistic = *optimistic == Some(addr);
+            let holds_optimistic = optimistic.contains(&addr);
             if place < regular && holds_optimistic {
-                // Promoted to a regular slot: the optimistic one passes on.
-                *optimistic = None;
+                // Promoted to a regular slot: its optimistic one passes on.
+                optimistic.retain(|a| *a != addr);
                 self.rotation.notify_one();
             }
             peers.with_peer_mut(addr, "recalculate", |peer| {
@@ -217,18 +233,18 @@ impl Choker {
                 if place < regular {
                     live.unchoke(now, uploaded);
                 } else if !holds_optimistic {
-                    live.choke();
+                    live.choke(now);
                 }
             });
         }
     }
 
-    /// The optimistic slot passes at `now` to the interested peer that has
-    /// waited longest for it, choked or holding it already.
+    /// The optimistic slots pass at `now` to the interested peers that have
+    /// waited longest for one, choked or holding one already.
     pub fn rotate_optimistic(&self, peers: &PeerStates, now: Instant) {
         let mut optimistic = self.optimistic.lock();
-        let previous = optimistic.take();
-        let chosen = peers
+        let previous = std::mem::take(&mut *optimistic);
+        let mut candidates: Vec<_> = peers
             .states
             .iter()
             .filter_map(|entry| {
@@ -236,25 +252,25 @@ impl Choker {
                 let peer = entry.value();
                 let live = peer.get_live()?;
                 let candidate =
-                    live.peer_interested && (live.is_choked() || previous == Some(addr));
+                    live.peer_interested && (live.is_choked() || previous.contains(&addr));
                 candidate.then(|| {
                     let rank = OptimisticRank {
                         last_optimistic_unchoke: peer.last_optimistic_unchoke,
-                        last_unchoke: live.last_unchoke(),
                         draw: rand::random(),
                     };
                     (rank, addr)
                 })
             })
-            .min()
+            .collect();
+        candidates.sort_unstable();
+        let chosen: Vec<SocketAddr> = candidates
+            .into_iter()
+            .take(self.optimistic_slots())
             .map(|(_, addr)| addr)
-            // A torrent with no slots has no optimistic one either.
-            .filter(|_| self.slots > 0);
+            .collect();
 
-        if let Some(addr) = chosen
-            && chosen != previous
-        {
-            peers.with_peer_mut(addr, "rotate_optimistic", |peer| {
+        for addr in chosen.iter().filter(|a| !previous.contains(a)) {
+            peers.with_peer_mut(*addr, "rotate_optimistic", |peer| {
                 let uploaded = Transfer::of(&peer.stats.counters).uploaded;
                 let Some(live) = peer.get_live_mut() else {
                     return;
@@ -263,10 +279,8 @@ impl Choker {
                 peer.last_optimistic_unchoke = Some(now);
             });
         }
-        if let Some(addr) = previous
-            && chosen != previous
-        {
-            peers.with_live_mut(addr, "rotate_optimistic", |live| live.choke());
+        for addr in previous.iter().filter(|a| !chosen.contains(a)) {
+            peers.with_live_mut(*addr, "rotate_optimistic", |live| live.choke(now));
         }
         *optimistic = chosen;
 
@@ -281,9 +295,7 @@ impl Choker {
         let choked = live.is_choked();
         let share_used = !choked
             && live.uploaded_since_unchoke(uploaded) > self.piece_length * SEEDING_PIECE_QUOTA
-            && live
-                .last_unchoke()
-                .is_some_and(|at| now.saturating_duration_since(at) > MIN_SLOT_TIME);
+            && now.saturating_duration_since(live.last_unchoke()) > MIN_SLOT_TIME;
         Rank {
             fetched: Reverse(round.fetched),
             share_used,

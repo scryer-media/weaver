@@ -109,7 +109,7 @@ use crate::{
 };
 
 use self::{
-    choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
+    choker::{CHOKED_REQUEST_GRACE, Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     peer::{
         InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
         stats::{
@@ -1543,14 +1543,32 @@ impl PeerHandler {
             );
         }
 
-        let queued = self
+        // A peer that asks without having said it is interested is taken to
+        // have said so.
+        let interested = self
+            .state
+            .peers
+            .with_live(self.addr, |live| live.peer_interested);
+        if interested == Some(false) {
+            self.state
+                .choker
+                .peer_interested(&self.state.peers, self.addr);
+        }
+
+        let Some(queued) = self
             .state
             .peers
             .with_live_mut(self.addr, "queue_upload", |live| {
                 live.queue_upload(chunk_info)
             })
-            .unwrap_or(false);
-        if !queued {
+        else {
+            return Ok(());
+        };
+        if let Err(choked_at) = queued {
+            let since = tokio::time::Instant::now().saturating_duration_since(choked_at);
+            if since > CHOKED_REQUEST_GRACE {
+                anyhow::bail!("received {request:?} {since:?} after we choked the peer");
+            }
             trace!(?request, "ignoring a request from a peer we choke");
             return Ok(());
         }

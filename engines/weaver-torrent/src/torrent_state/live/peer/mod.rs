@@ -371,11 +371,12 @@ pub(crate) struct LivePeerState {
     // starts not interested (BEP 3); the choker records the peer's word.
     pub peer_interested: bool,
 
-    // Whether we choke the peer. It starts choked (BEP 3), and only the
-    // choker unchokes it.
-    am_choking: bool,
-    // When we last unchoked the peer, and what we had uploaded to it by then.
-    last_unchoke: Option<Instant>,
+    // When we choked the peer; None while we do not. It starts choked when
+    // the connection goes live (BEP 3), and only the choker unchokes it.
+    choked_at: Option<Instant>,
+    // When we last unchoked the peer, the time the connection went live
+    // until we do, and what we had uploaded to it by then.
+    last_unchoke: Instant,
     uploaded_at_unchoke: u64,
     // What the peer had sent us and we had sent it when the choker's current
     // round began.
@@ -432,12 +433,13 @@ impl LivePeerState {
         connection_kind: ConnectionKind,
         counters: &PeerCountersAtomic,
     ) -> Self {
+        let now = Instant::now();
         LivePeerState {
             peer_id,
             client_name: None,
             peer_interested: false,
-            am_choking: true,
-            last_unchoke: None,
+            choked_at: Some(now),
+            last_unchoke: now,
             uploaded_at_unchoke: 0,
             round_start: Transfer::of(counters),
             bitfield: BF::default(),
@@ -565,24 +567,24 @@ impl LivePeerState {
         &self.inflight_requests
     }
 
-    /// The peer asked us for `chunk`. False when we choke the peer, and the
-    /// request is ignored.
-    pub fn queue_upload(&mut self, chunk: ChunkInfo) -> bool {
-        if self.am_choking {
-            return false;
+    /// The peer asked us for `chunk`. While we choke the peer the request is
+    /// not queued, and the error is when we choked it.
+    pub fn queue_upload(&mut self, chunk: ChunkInfo) -> Result<(), Instant> {
+        if let Some(choked_at) = self.choked_at {
+            return Err(choked_at);
         }
         self.upload_queue.insert(chunk);
-        true
+        Ok(())
     }
 
     /// Whether we choke the peer.
     pub fn is_choked(&self) -> bool {
-        self.am_choking
+        self.choked_at.is_some()
     }
 
-    /// When we last unchoked the peer; None if we never did on this
-    /// connection.
-    pub fn last_unchoke(&self) -> Option<Instant> {
+    /// When we last unchoked the peer; when the connection went live if we
+    /// never did.
+    pub fn last_unchoke(&self) -> Instant {
         self.last_unchoke
     }
 
@@ -592,13 +594,14 @@ impl LivePeerState {
         uploaded.saturating_sub(self.uploaded_at_unchoke)
     }
 
-    /// Chokes the peer: a Choke goes out and every block it asked for and
-    /// was not sent is dropped (BEP 3). False when it was choked already.
-    pub(crate) fn choke(&mut self) -> bool {
-        if self.am_choking {
+    /// Chokes the peer at `now`: a Choke goes out and every block it asked
+    /// for and was not sent is dropped (BEP 3). False when it was choked
+    /// already.
+    pub(crate) fn choke(&mut self, now: Instant) -> bool {
+        if self.is_choked() {
             return false;
         }
-        self.am_choking = true;
+        self.choked_at = Some(now);
         self.upload_queue.clear();
         let _ = self.tx.send(WriterRequest::Message(Message::Choke));
         true
@@ -607,14 +610,19 @@ impl LivePeerState {
     /// Unchokes the peer at `now`, when we have uploaded `uploaded` to it in
     /// all. False when it was unchoked already.
     pub(crate) fn unchoke(&mut self, now: Instant, uploaded: u64) -> bool {
-        if !self.am_choking {
+        if !self.is_choked() {
             return false;
         }
-        self.am_choking = false;
-        self.last_unchoke = Some(now);
+        self.choked_at = None;
+        self.last_unchoke = now;
         self.uploaded_at_unchoke = uploaded;
         let _ = self.tx.send(WriterRequest::Message(Message::Unchoke));
         true
+    }
+
+    /// Tells the peer again that we do not choke it.
+    pub(crate) fn repeat_unchoke(&self) {
+        let _ = self.tx.send(WriterRequest::Message(Message::Unchoke));
     }
 
     /// Ends the choker's round for the peer, whose totals are now `totals`,

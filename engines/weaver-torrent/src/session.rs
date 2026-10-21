@@ -527,8 +527,9 @@ pub struct SessionOptions {
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
 
-    /// Peers each torrent uploads to at once, one of them on the optimistic
-    /// slot (libtorrent `unchoke_slots_limit`). Defaults to 8.
+    /// Peers each torrent uploads to at once, one in five of them and at least
+    /// one on optimistic slots (libtorrent `unchoke_slots_limit`). Defaults
+    /// to 8.
     pub unchoke_slots_limit: usize,
 
     /// Peer connections, incoming and outgoing, the session holds open at
