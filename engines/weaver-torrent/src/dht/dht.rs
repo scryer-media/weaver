@@ -6,6 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
+    collections::BTreeSet,
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
@@ -112,6 +113,9 @@ const SEARCH_BRANCHING: usize = 5;
 const SEARCH_CANDIDATES: usize = 100;
 // k: a search is complete once the k closest candidates have answered.
 const SEARCH_K: usize = 8;
+// A search that starts from fewer nodes than this is also seeded with the
+// routers (libtorrent `traversal_algorithm::start`).
+const SEARCH_MIN_SEEDS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateState {
@@ -481,14 +485,15 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
         }
     }
 
-    // One search at a time, from the closest nodes of the routing table: the
+    // One search at a time, from its `seeds`: the
     // first as soon as the torrent asks for peers, that is when the stream
     // starts, then one every DHT_ANNOUNCE_INTERVAL. Each announces us when it
     // ends (libtorrent `torrent::start_announcing` asks
     // `session_impl::prioritize_dht` for a search at once, and
     // `session_impl::on_dht_announce` gives every torrent its
     // `torrent::dht_announce` once a `dht_announce_interval`). A search due
-    // while the table is empty starts as the first node enters it.
+    // while the table is empty and no router is known starts as the first
+    // node enters the table.
     fn request_peers_forever(self: Arc<Self>, is_v4: bool) -> tokio::task::JoinHandle<()> {
         spawn::<Error>(
             debug_span!(parent: None, "get_peers", is_v4, info_hash = format!("{:?}", self.info_hash)),
@@ -498,7 +503,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                 loop {
                     let mut next_entered = std::pin::pin!(entered.notified());
                     next_entered.as_mut().enable();
-                    let seeds = self.closest_known(is_v4);
+                    let seeds = self.seeds(is_v4);
                     if seeds.is_empty() {
                         next_entered.await;
                         continue;
@@ -519,14 +524,29 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
         }
     }
 
-    fn closest_known(&self, is_v4: bool) -> Vec<(Option<Id20>, SocketAddr)> {
-        self.table(is_v4)
+    // The nodes a search starts from: the table's SEARCH_K closest, and the
+    // routers of the family when the table gives fewer than SEARCH_MIN_SEEDS
+    // (libtorrent `traversal_algorithm::start` calls `add_router_entries`,
+    // which adds every router without an id).
+    fn seeds(&self, is_v4: bool) -> Vec<(Option<Id20>, SocketAddr)> {
+        let mut seeds: Vec<_> = self
+            .table(is_v4)
             .read()
             .sorted_by_distance_from(self.info_hash, now())
             .iter()
             .map(|n| (Some(n.id()), n.addr()))
             .take(SEARCH_K)
-            .collect()
+            .collect();
+        if seeds.len() < SEARCH_MIN_SEEDS {
+            let routers = self.dht.routers.read();
+            seeds.extend(
+                routers
+                    .iter()
+                    .filter(|a| a.is_ipv4() == is_v4)
+                    .map(|a| (None, *a)),
+            );
+        }
+        seeds
     }
 }
 
@@ -629,6 +649,9 @@ pub struct DhtState {
 
     routing_table_v4: RwLock<RoutingTable>,
     routing_table_v6: RwLock<RoutingTable>,
+    // The addresses the bootstrap names resolved to: the routers a search
+    // short of nodes also asks (libtorrent `routing_table::m_router_nodes`).
+    routers: RwLock<BTreeSet<SocketAddr>>,
     listen_addr: SocketAddr,
 
     // Sending requests to the worker.
@@ -665,6 +688,7 @@ impl DhtState {
             inflight_by_transaction_id: Default::default(),
             routing_table_v4: RwLock::new(routing_table_v4),
             routing_table_v6: RwLock::new(routing_table_v6),
+            routers: RwLock::default(),
             worker_sender: sender,
             listen_addr,
             rate_limiter: make_rate_limiter(),
@@ -1111,6 +1135,9 @@ impl DhtWorker {
             .lookup_bootstrap(hostname)
             .await
             .map_err(|err| Error::lookup(hostname, err))?;
+        // libtorrent `dht_tracker::add_router_node` for each address a
+        // router's name resolves to.
+        self.dht.routers.write().extend(&addrs);
         let v4 = RecursiveRequest::find_node_for_routing_table(
             self.dht.clone(),
             self.dht.id,
@@ -2267,8 +2294,51 @@ mod tests {
         );
     }
 
-    // A search due while the routing table is empty starts as the first node
-    // enters it, not at a later look at the table.
+    // A search that starts from fewer than three nodes also asks the routers
+    // of its family; one with three does not (libtorrent
+    // `traversal_algorithm::start`, `add_router_entries`). With no node at all,
+    // the routers alone start it, at once.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_search_short_of_nodes_also_asks_the_routers() {
+        use crate::core::hash_id::Id20;
+        use std::collections::HashSet;
+
+        let router: SocketAddr = ([192, 0, 2, 1], 6881).into();
+        let router_v6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        let node = |i: u8| SocketAddr::from(([10, 0, i, 1], 6881));
+        for (nodes, routers_asked) in [(0, true), (2, true), (3, false)] {
+            let (dht, mut sent) = fixture_dht();
+            dht.routers.write().extend([router, router_v6]);
+            for i in 0..nodes {
+                dht.routing_table_v4
+                    .write()
+                    .add_node(Id20::new([i + 1; 20]), node(i));
+            }
+            let req = std::sync::Arc::new(super::RecursiveRequest::get_peers(
+                dht.clone(),
+                Id20::new([0x22; 20]),
+                Some(6881),
+                tokio::sync::mpsc::unbounded_channel().0,
+            ));
+            let start = tokio::time::Instant::now();
+            let task = req.request_peers_forever(true);
+            let mut want: HashSet<SocketAddr> = (0..nodes).map(node).collect();
+            if routers_asked {
+                want.insert(router);
+            }
+            let mut asked = HashSet::new();
+            while asked.len() < want.len() {
+                asked.insert(sent.recv().await.unwrap().addr);
+            }
+            assert!(sent.try_recv().is_err(), "{nodes} nodes");
+            assert_eq!(asked, want, "{nodes} nodes");
+            assert_eq!(tokio::time::Instant::now(), start, "{nodes} nodes");
+            task.abort();
+        }
+    }
+
+    // A search due while the routing table is empty and no router is known
+    // starts as the first node enters it, not at a later look at the table.
     #[tokio::test(start_paused = true)]
     async fn test_a_search_starts_as_the_first_node_enters_the_table() {
         use crate::core::hash_id::Id20;
