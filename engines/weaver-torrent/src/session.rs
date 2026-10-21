@@ -1710,8 +1710,7 @@ impl Session {
     // The peer at `addr` of `torrent` said it is interested: it takes one of
     // the session's upload slots when one is free.
     pub(crate) fn peer_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
-        self.choker
-            .peer_interested(&self.live_torrents(), torrent, addr);
+        self.choker.peer_interested(torrent, addr);
     }
 
     // The torrents that are live, so whose peers the session uploads to and

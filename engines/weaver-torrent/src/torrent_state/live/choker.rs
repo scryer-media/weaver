@@ -12,9 +12,14 @@
 //! libtorrent's fixed-slots choker with its round-robin seed choker
 //! (`session_impl::recalculate_unchoke_slots`,
 //! `recalculate_optimistic_unchoke_slots`).
+//!
+//! Only the rounds walk the peers. A peer's word, or its going, touches
+//! that peer alone, and the choker keeps beside the slots the connections
+//! holding one, as libtorrent keeps `num_peers_up_unchoked`.
 
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -22,6 +27,7 @@ use std::{
 
 use parking_lot::Mutex;
 use tokio::{sync::Notify, time::Instant};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     TorrentStateLive,
@@ -100,12 +106,42 @@ struct OptimisticRank {
 // A connection the choker deals with: its torrent, and the peer's address.
 type Key = (TorrentId, SocketAddr);
 
+// Who holds the slots.
+#[derive(Default)]
+struct Held {
+    // The connections we do not choke, each with its torrent's run. A
+    // connection of a run that stopped holds no slot: its peers went
+    // without a word.
+    unchoked: HashMap<Key, CancellationToken>,
+    // The connections holding the optimistic slots.
+    optimistic: Vec<Key>,
+}
+
+impl Held {
+    // The slots held: the unchoked connections of the runs still going.
+    fn count(&mut self) -> usize {
+        self.unchoked.retain(|_, run| !run.is_cancelled());
+        self.unchoked.len()
+    }
+
+    // The connection `key` of `torrent` is unchoked when `unchoked`, and
+    // holds a slot so long.
+    fn record(&mut self, key: Key, torrent: &TorrentStateLive, unchoked: bool) {
+        if unchoked {
+            self.unchoked
+                .insert(key, torrent.cancellation_token.clone());
+        } else {
+            self.unchoked.remove(&key);
+        }
+    }
+}
+
 pub(crate) struct Choker {
     slots: usize,
-    // The connections holding the optimistic slots. Every slot decision is
-    // made under this lock, so peers turning interested on several
-    // connections at once never take more than `slots`.
-    optimistic: Mutex<Vec<Key>>,
+    // Every slot decision is made under this lock, so peers turning
+    // interested on several connections at once never take more than
+    // `slots`.
+    held: Mutex<Held>,
     // Rings for a round before the interval ends: a peer holding a slot gave
     // it up, or more peers are unchoked than there are slots.
     reshuffle: Notify,
@@ -119,7 +155,7 @@ impl Choker {
     pub fn new(slots: usize) -> Self {
         Self {
             slots,
-            optimistic: Mutex::new(Vec::new()),
+            held: Mutex::new(Held::default()),
             reshuffle: Notify::new(),
             rotation: Notify::new(),
         }
@@ -135,40 +171,38 @@ impl Choker {
     }
 
     /// The peer at `addr` of `torrent` said it is interested. It takes a
-    /// slot at once when one of the session's is free, `torrents` being the
-    /// session's live torrents; with none free it waits for a round to rank
-    /// it (libtorrent `peer_connection::maybe_unchoke_this_peer`,
+    /// slot at once when one of the session's is free; with none free it
+    /// waits for a round to rank it (libtorrent
+    /// `peer_connection::maybe_unchoke_this_peer`,
     /// `session_impl::preemptive_unchoke`). A peer we already unchoked is
-    /// told so again.
-    pub fn peer_interested(
-        &self,
-        torrents: &[Arc<TorrentStateLive>],
-        torrent: &TorrentStateLive,
-        addr: SocketAddr,
-    ) {
-        let _optimistic = self.optimistic.lock();
-        let free = self.slots.saturating_sub(unchoked(torrents)) > 0;
+    /// told so again. Only this peer is touched.
+    pub fn peer_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
+        let mut held = self.held.lock();
+        let free = self.slots > held.count();
         let now = Instant::now();
-        torrent
+        let unchoked = torrent
             .peers
             .with_peer_mut(addr, "peer_interested", |peer| {
                 let uploaded = Transfer::of(&peer.stats.counters).uploaded;
-                let Some(live) = peer.get_live_mut() else {
-                    return;
-                };
+                let live = peer.get_live_mut()?;
                 live.peer_interest(true, now);
                 if !live.is_choked() {
                     live.repeat_unchoke();
                 } else if free {
                     live.unchoke(now, uploaded);
                 }
-            });
+                Some(!live.is_choked())
+            })
+            .flatten();
+        if let Some(unchoked) = unchoked {
+            held.record((torrent.shared.id, addr), torrent, unchoked);
+        }
     }
 
     /// The peer at `addr` of `torrent` said it is not interested. It is
     /// choked at once, and a slot it held is handed out again now.
     pub fn peer_not_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
-        let mut optimistic = self.optimistic.lock();
+        let mut held = self.held.lock();
         let now = Instant::now();
         let held_slot = torrent
             .peers
@@ -177,25 +211,28 @@ impl Choker {
                 live.choke(now)
             })
             .unwrap_or(false);
-        self.give_up_slot(&mut optimistic, (torrent.shared.id, addr), held_slot);
+        self.give_up_slot(&mut held, (torrent.shared.id, addr), held_slot);
     }
 
     /// The connection to the peer at `addr` of the torrent `torrent` is
     /// gone; `held_slot` when we did not choke it. Its slot is handed out
     /// again now.
     pub fn peer_gone(&self, torrent: TorrentId, addr: SocketAddr, held_slot: bool) {
-        let mut optimistic = self.optimistic.lock();
-        self.give_up_slot(&mut optimistic, (torrent, addr), held_slot);
+        let mut held = self.held.lock();
+        self.give_up_slot(&mut held, (torrent, addr), held_slot);
     }
 
     // The connection `key` no longer holds the slot it held: an optimistic
-    // slot passes on, and the regular ones are handed out again.
-    fn give_up_slot(&self, optimistic: &mut Vec<Key>, key: Key, held: bool) {
-        if let Some(at) = optimistic.iter().position(|k| *k == key) {
-            optimistic.swap_remove(at);
+    // slot passes on, and the regular ones are handed out again (libtorrent
+    // `peer_connection::choke_this_peer` and `torrent::remove_peer` call
+    // `trigger_unchoke`).
+    fn give_up_slot(&self, held: &mut Held, key: Key, held_slot: bool) {
+        held.unchoked.remove(&key);
+        if let Some(at) = held.optimistic.iter().position(|k| *k == key) {
+            held.optimistic.swap_remove(at);
             self.rotation.notify_one();
         }
-        if held {
+        if held_slot {
             self.reshuffle.notify_one();
         }
     }
@@ -214,11 +251,12 @@ impl Choker {
     /// A round at `now` over `torrents`, the session's live torrents: the
     /// interested peers that rank highest of all of them hold the regular
     /// slots, the optimistic slots keep their holders, and every other
-    /// interested peer is choked.
+    /// interested peer is choked. The round counts the slots held afresh.
     pub fn recalculate(&self, torrents: &[Arc<TorrentStateLive>], now: Instant) {
-        let mut optimistic = self.optimistic.lock();
+        let mut held = self.held.lock();
         let mut ranked = Vec::new();
         let mut held_optimistic = Vec::new();
+        let mut unchoked = Held::default();
         for (at, torrent) in torrents.iter().enumerate() {
             let piece_length = u64::from(torrent.lengths.default_piece_length());
             for mut entry in torrent.peers.states.iter_mut() {
@@ -229,7 +267,8 @@ impl Choker {
                     continue;
                 };
                 let round = live.end_round(totals);
-                if !live.is_choked() && optimistic.contains(&key) {
+                unchoked.record(key, torrent, !live.is_choked());
+                if !live.is_choked() && held.optimistic.contains(&key) {
                     held_optimistic.push(key);
                 }
                 // A peer that is not interested is choked already: it was
@@ -242,37 +281,39 @@ impl Choker {
             }
         }
         ranked.sort_unstable();
-        // An optimistic slot is held by a connection of a live torrent: one
-        // whose torrent stopped, so whose peers went without a word, holds
-        // none.
-        *optimistic = held_optimistic;
+        // A slot is held by a connection of a live torrent: one whose
+        // torrent stopped, so whose peers went without a word, holds none.
+        unchoked.optimistic = held_optimistic;
+        *held = unchoked;
 
         // The optimistic slots held, or all of them while none is.
-        let reserved = match optimistic.len() {
+        let reserved = match held.optimistic.len() {
             0 => self.optimistic_slots(),
-            held => held,
+            optimistic => optimistic,
         };
         let regular = self.slots.saturating_sub(reserved);
         for (place, (_, key, at)) in ranked.into_iter().enumerate() {
-            let holds_optimistic = optimistic.contains(&key);
+            let holds_optimistic = held.optimistic.contains(&key);
             if place < regular && holds_optimistic {
                 // Promoted to a regular slot: its optimistic one passes on.
-                optimistic.retain(|k| *k != key);
+                held.optimistic.retain(|k| *k != key);
                 self.rotation.notify_one();
             }
-            torrents[at]
+            let torrent = &torrents[at];
+            let unchoked = torrent
                 .peers
                 .with_peer_mut(key.1, "recalculate", |peer| {
                     let uploaded = Transfer::of(&peer.stats.counters).uploaded;
-                    let Some(live) = peer.get_live_mut() else {
-                        return;
-                    };
+                    let live = peer.get_live_mut()?;
                     if place < regular {
                         live.unchoke(now, uploaded);
                     } else if !holds_optimistic {
                         live.choke(now);
                     }
-                });
+                    Some(!live.is_choked())
+                })
+                .flatten();
+            held.record(key, torrent, unchoked.unwrap_or(false));
         }
     }
 
@@ -280,8 +321,8 @@ impl Choker {
     /// `torrents`, the session's live torrents, that have waited longest for
     /// one, choked or holding one already.
     pub fn rotate_optimistic(&self, torrents: &[Arc<TorrentStateLive>], now: Instant) {
-        let mut optimistic = self.optimistic.lock();
-        let previous = std::mem::take(&mut *optimistic);
+        let mut held = self.held.lock();
+        let previous = std::mem::take(&mut held.optimistic);
         let mut candidates = Vec::new();
         for (at, torrent) in torrents.iter().enumerate() {
             for entry in torrent.peers.states.iter() {
@@ -304,29 +345,32 @@ impl Choker {
         let chosen: Vec<Key> = candidates.iter().map(|(_, key, _)| *key).collect();
 
         for (_, key, at) in candidates.iter().filter(|(_, k, _)| !previous.contains(k)) {
-            torrents[*at]
+            let torrent = &torrents[*at];
+            let unchoked = torrent
                 .peers
                 .with_peer_mut(key.1, "rotate_optimistic", |peer| {
                     let uploaded = Transfer::of(&peer.stats.counters).uploaded;
-                    let Some(live) = peer.get_live_mut() else {
-                        return;
-                    };
+                    let live = peer.get_live_mut()?;
                     live.unchoke(now, uploaded);
                     peer.last_optimistic_unchoke = Some(now);
-                });
+                    Some(true)
+                })
+                .flatten();
+            held.record(*key, torrent, unchoked.unwrap_or(false));
         }
         // A previous holder that lost its slot is choked; one whose torrent
         // stopped is gone with it.
-        for (id, addr) in previous.iter().filter(|k| !chosen.contains(k)) {
-            if let Some(torrent) = torrents.iter().find(|t| t.shared.id == *id) {
+        for key in previous.iter().filter(|k| !chosen.contains(k)) {
+            if let Some(torrent) = torrents.iter().find(|t| t.shared.id == key.0) {
                 torrent
                     .peers
-                    .with_live_mut(*addr, "rotate_optimistic", |live| live.choke(now));
+                    .with_live_mut(key.1, "rotate_optimistic", |live| live.choke(now));
             }
+            held.unchoked.remove(key);
         }
-        *optimistic = chosen;
+        held.optimistic = chosen;
 
-        if unchoked(torrents) > self.slots {
+        if held.count() > self.slots {
             self.reshuffle.notify_one();
         }
     }
@@ -352,13 +396,4 @@ fn rank(
         uploaded: Reverse(if choked { 0 } else { round.uploaded }),
         last_unchoke: live.last_unchoke(),
     }
-}
-
-// The live peers of `torrents` we do not choke.
-fn unchoked(torrents: &[Arc<TorrentStateLive>]) -> usize {
-    torrents
-        .iter()
-        .flat_map(|torrent| torrent.peers.states.iter())
-        .filter(|entry| entry.value().get_live().is_some_and(|l| !l.is_choked()))
-        .count()
 }

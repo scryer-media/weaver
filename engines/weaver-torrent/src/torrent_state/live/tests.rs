@@ -1370,6 +1370,36 @@ async fn a_peer_of_one_torrent_waits_for_the_slot_a_peer_of_another_holds() {
     assert!(b.choked(&other));
 }
 
+// libtorrent `session_impl::preemptive_unchoke` counts the slots held,
+// `num_peers_up_unchoked`, and a stopped torrent's connections give theirs
+// up as they go (`torrent::remove_peer`). An interested peer of another
+// torrent takes the freed slot at once, not at the next round.
+#[tokio::test]
+async fn a_stopped_torrents_peer_gives_up_its_slot_at_once() {
+    let a = Harness::seeding_with_slots("stopped_slot_a", 1).await;
+    let b = a.sibling("stopped_slot_b", 0xc0).await;
+    let (held, mut held_rx) = b.peer("127.0.0.2:6881");
+    (&held)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Unchoke);
+
+    let session = &a._session;
+    let handle = session.get(b.shared.id.into()).unwrap();
+    session.pause(&handle).await.unwrap();
+
+    tokio::time::pause();
+    let stopped = tokio::time::Instant::now();
+    let (peer, mut rx) = a.peer("127.0.0.1:6881");
+    (&peer)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    assert_eq!(tokio::time::Instant::now(), stopped);
+}
+
 // libtorrent `session_impl::recalculate_unchoke_slots`: a round ranks the
 // peers of every torrent of the session together.
 #[tokio::test]
