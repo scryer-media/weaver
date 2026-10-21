@@ -1270,7 +1270,8 @@ impl TorrentStateLive {
         // The peer list is read before the state lock: a dying peer holds
         // its own entry while it takes the state lock, so the state lock
         // never waits on a peer entry.
-        let peers = self.peers.idle_list(tokio::time::Instant::now());
+        self.peers.close_all(tokio::time::Instant::now());
+        let peers = self.peers.idle_list();
         let mut g = self.lock_write("pause");
 
         // It should be impossible to make a fatal error after pausing.

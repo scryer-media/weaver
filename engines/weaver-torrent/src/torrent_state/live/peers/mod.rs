@@ -333,20 +333,36 @@ impl PeerStates {
         self
     }
 
-    /// The list as a pause at `now` leaves it: the [`MAX_PAUSED_PEERLIST_SIZE`] peers
-    /// on it that rank highest to keep, as they stand before their
-    /// connections close, each without its connection; the banned addresses;
+    /// Every connection on the list closes at `closed_at`, in no error, by
+    /// the one close rule ([`Peer::connection_closing`]): what it showed of
+    /// its peer is kept and its peer's wait to reconnect starts then. A
+    /// pause runs it before taking the list (libtorrent `torrent::do_pause`
+    /// disconnects every peer with `torrent_paused`, an error too mild to
+    /// mark the peer failed, through `peer_list::connection_closed`; a peer
+    /// already idle keeps the wait it had).
+    pub fn close_all(&self, closed_at: Instant) {
+        for mut e in self.states.iter_mut() {
+            if e.value().connected_out().is_some() {
+                e.value_mut().connection_closing(closed_at, false);
+            }
+        }
+    }
+
+    /// The list as the next run takes it: the [`MAX_PAUSED_PEERLIST_SIZE`]
+    /// peers on it that rank highest to keep, as they stand before their
+    /// connections end, each without its connection; the banned addresses;
     /// and the records of the peers kept. A peer cut, and a web seed, which
     /// is on no list, leaves its records behind, as it does when it leaves
-    /// the list during a run.
-    pub fn idle_list(&self, now: Instant) -> PeerList {
+    /// the list during a run. Taking the list closes no connection; see
+    /// [`Peer::idle`].
+    pub fn idle_list(&self) -> PeerList {
         let mut smart_ban = self.smart_ban.lock().clone();
         let mut ranked = Vec::new();
         for e in self.states.iter() {
             if is_web_seed(*e.key()) {
                 smart_ban.forget(*e.key());
             } else {
-                ranked.push(((erase_rank(e.value()), *e.key()), e.value().idle(now)));
+                ranked.push(((erase_rank(e.value()), *e.key()), e.value().idle()));
             }
         }
         ranked.sort_unstable_by_key(|(rank, _)| *rank);
@@ -1694,7 +1710,7 @@ mod tests {
         let _live_rx = connected_to_us(&peers, live).unwrap();
         assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
 
-        let list = peers.idle_list(Instant::now());
+        let list = peers.idle_list();
         assert_eq!(list.peers.len(), MAX_PAUSED_PEERLIST_SIZE);
         let kept = list.peers.iter().map(|p| p.addr).collect::<HashSet<_>>();
         assert!(queued.iter().all(|addr| kept.contains(addr)));
@@ -1849,11 +1865,8 @@ mod tests {
         let failed = read_back(&lengths, piece, &senders, filled(0));
         assert!(peers.piece_failed(piece, failed).is_empty());
 
-        let next = PeerStates::founded_on(
-            peers.idle_list(Instant::now()),
-            Default::default(),
-            TOTAL_PIECES as u32,
-        );
+        let next =
+            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         let failed = read_back(&lengths, piece, &senders, filled(1));
         assert_eq!(next.piece_failed(piece, failed), BTreeSet::from([sender]));
     }
@@ -1881,11 +1894,8 @@ mod tests {
             Some(connecting)
         );
 
-        let next = PeerStates::founded_on(
-            peers.idle_list(Instant::now()),
-            Default::default(),
-            TOTAL_PIECES as u32,
-        );
+        let next =
+            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         assert!(next.is_banned(banned.ip()));
         next.add_peer(banned, PeerSourceFlag::Tracker);
         assert_eq!(state_of(&next, banned), None);
@@ -1924,11 +1934,9 @@ mod tests {
         let idle_wait = peers.with_peer(idle, |p| p.reconnect_at()).unwrap();
 
         let paused_at = t0 + Duration::from_secs(10);
-        let next = PeerStates::founded_on(
-            peers.idle_list(paused_at),
-            Default::default(),
-            TOTAL_PIECES as u32,
-        );
+        peers.close_all(paused_at);
+        let next =
+            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
         assert_eq!(
             reconnect_at(connecting),
@@ -1950,11 +1958,9 @@ mod tests {
         peers.update_bitfield(seed, full_bitfield()).unwrap();
         assert_eq!(peers.with_peer(seed, |p| p.needed(true)), Some(true));
 
-        let next = PeerStates::founded_on(
-            peers.idle_list(Instant::now()),
-            Default::default(),
-            TOTAL_PIECES as u32,
-        );
+        peers.close_all(Instant::now());
+        let next =
+            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         assert_eq!(next.with_peer(seed, |p| p.needed(true)), Some(false));
         assert_eq!(next.with_peer(seed, |p| p.needed(false)), Some(true));
     }
@@ -2551,10 +2557,7 @@ mod tests {
             }
         );
         // The list a pause leaves saves the same.
-        assert_eq!(
-            peers.idle_list(Instant::now()).resume_peers().banned,
-            vec![banned.ip()]
-        );
+        assert_eq!(peers.idle_list().resume_peers().banned, vec![banned.ip()]);
     }
 
     // libtorrent `torrent::write_resume_data`: every peer we were connected
