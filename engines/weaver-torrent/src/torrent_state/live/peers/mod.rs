@@ -196,10 +196,7 @@ impl PeerStates {
     pub(crate) fn announce_have(&self, piece: ValidPieceIndex) {
         for peer in self.states.iter() {
             if let PeerState::Live(live) = peer.value().get_state()
-                && !live
-                    .bitfield
-                    .get(piece.get_usize())
-                    .is_some_and(|has| *has)
+                && !live.bitfield.get(piece.get_usize()).is_some_and(|has| *has)
             {
                 let _ = live
                     .tx
@@ -370,7 +367,10 @@ mod tests {
                 live.inflight_requests().copied().collect::<Vec<_>>()
             })
             .unwrap();
-        assert!(queued.iter().all(|req| req.piece_index == kept), "{queued:?}");
+        assert!(
+            queued.iter().all(|req| req.piece_index == kept),
+            "{queued:?}"
+        );
         assert_eq!(queued.len(), 1);
 
         let mut cancelled = Vec::new();

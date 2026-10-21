@@ -300,7 +300,9 @@ impl PieceTracker {
     /// Whether `peer` owns the in-flight `piece`. Only the owner requests a
     /// piece's chunks, so a peer whose piece was stolen stops requesting it.
     pub fn is_owned_by(&self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
-        self.inflight.get(&piece).is_some_and(|info| info.peer == peer)
+        self.inflight
+            .get(&piece)
+            .is_some_and(|info| info.peer == peer)
     }
 
     /// The chunks of `piece` its owner still has to request: those not yet

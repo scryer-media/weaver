@@ -12,11 +12,7 @@ use std::{
 };
 
 use crate::buffers::{ByteBuf, ByteBufOwned};
-use crate::core::{
-    hash_id::Id20,
-    lengths::ChunkInfo,
-    peer_id::try_decode_peer_id,
-};
+use crate::core::{hash_id::Id20, lengths::ChunkInfo, peer_id::try_decode_peer_id};
 use crate::peer_protocol::{
     Handshake, MAX_MSG_LEN, Message,
     extended::{
