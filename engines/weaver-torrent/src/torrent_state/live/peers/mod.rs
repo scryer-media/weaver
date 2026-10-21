@@ -357,14 +357,6 @@ impl PeerStates {
         .unwrap_or(false)
     }
 
-    pub fn mark_peer_interested(&self, handle: PeerHandle, is_interested: bool) -> Option<bool> {
-        self.with_live_mut(handle, "mark_peer_interested", |live| {
-            let prev = live.peer_interested;
-            live.peer_interested = is_interested;
-            prev
-        })
-    }
-
     pub fn update_bitfield(
         &self,
         handle: PeerHandle,

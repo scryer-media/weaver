@@ -47,6 +47,7 @@
 // > so don't lock them both at the same time at all, or at the worst lock them in the
 // > same order (peers one first, then the global one).
 
+pub(crate) mod choker;
 pub mod peer;
 pub mod peers;
 pub mod stats;
@@ -108,6 +109,7 @@ use crate::{
 };
 
 use self::{
+    choker::{Choker, UNCHOKE_INTERVAL},
     peer::{
         InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
         stats::{
@@ -219,6 +221,9 @@ pub struct TorrentStateLive {
     pub(crate) streams: Arc<TorrentStreams>,
 
     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<QueuedUpload>,
+
+    // Hands out the upload slots.
+    choker: Choker,
 }
 
 // A block a peer asked for, on its way through the upload rate limits to the
@@ -299,6 +304,10 @@ impl TorrentStateLive {
                 .map(|_| RwLock::new(()))
                 .collect(),
             ratelimit_upload_tx,
+            choker: Choker::new(
+                session.unchoke_slots_limit,
+                lengths.default_piece_length().into(),
+            ),
         });
 
         state.spawn(
@@ -342,7 +351,29 @@ impl TorrentStateLive {
             format!("[{}]upload_scheduler", state.shared.id),
             state.clone().task_upload_scheduler(ratelimit_upload_rx),
         );
+
+        state.spawn(
+            debug_span!(parent: state.shared.span.clone(), "choker"),
+            format!("[{}]choker", state.shared.id),
+            state.clone().task_choker(),
+        );
         Ok(state)
+    }
+
+    /// Hands the upload slots out every UNCHOKE_INTERVAL, and at once when a
+    /// peer holding one gives it up.
+    async fn task_choker(self: Arc<Self>) -> crate::Result<()> {
+        let first = tokio::time::Instant::now() + UNCHOKE_INTERVAL;
+        let mut rounds = tokio::time::interval_at(first, UNCHOKE_INTERVAL);
+        loop {
+            tokio::select! {
+                biased;
+                _ = rounds.tick() => {}
+                _ = self.choker.reshuffle_requested() => rounds.reset(),
+            }
+            self.choker
+                .recalculate(&self.peers, tokio::time::Instant::now());
+        }
     }
 
     #[track_caller]
@@ -1122,7 +1153,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 .context("on_bitfield")?,
             Message::Choke => self.on_i_am_choked().context("on_i_am_choked")?,
             Message::Unchoke => self.on_i_am_unchoked(),
-            Message::Interested => self.on_peer_interested(),
+            Message::Interested => self
+                .state
+                .choker
+                .peer_interested(&self.state.peers, self.addr),
             Message::Piece(piece) => self
                 .on_received_piece(piece)
                 .await
@@ -1319,6 +1353,9 @@ impl PeerHandler {
         match prev {
             PeerState::Connecting(_) => {}
             PeerState::Live(live) => {
+                if !live.is_choked() {
+                    self.state.choker.slot_freed();
+                }
                 let mut g = self.state.lock_write("mark_chunk_requests_canceled");
 
                 // Release all pieces owned by this peer (fixes the bug where pieces
@@ -1484,11 +1521,17 @@ impl PeerHandler {
             );
         }
 
-        self.state
+        let queued = self
+            .state
             .peers
             .with_live_mut(self.addr, "queue_upload", |live| {
                 live.queue_upload(chunk_info)
-            });
+            })
+            .unwrap_or(false);
+        if !queued {
+            trace!(?request, "ignoring a request from a peer we choke");
+            return Ok(());
+        }
         self.state
             .ratelimit_upload_tx
             .send((self.addr, self.tx.clone(), chunk_info))?;
@@ -1848,11 +1891,6 @@ impl PeerHandler {
             self.state.new_pieces_notify.notify_waiters();
         }
         Ok(taken)
-    }
-
-    fn on_peer_interested(&self) {
-        trace!("peer is interested");
-        self.state.peers.mark_peer_interested(self.addr, true);
     }
 
     fn on_i_am_unchoked(&self) {

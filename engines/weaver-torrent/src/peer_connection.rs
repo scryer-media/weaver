@@ -47,8 +47,8 @@ pub trait PeerConnectionHandler {
     async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()>;
     fn on_uploaded_bytes(&self, bytes: u32);
     /// Takes `chunk` off the peer's upload queue to send it. False when a
-    /// Cancel took it off first, and the block is not sent. A handler that
-    /// queues no uploads has none to take.
+    /// Cancel or a Choke took it off first, and the block is not sent. A
+    /// handler that queues no uploads has none to take.
     fn claim_upload(&self, _chunk: &ChunkInfo) -> bool {
         false
     }
@@ -351,15 +351,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 .await?;
                 trace!("sent bitfield");
             }
-
-            let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
-            with_timeout(
-                "writing",
-                rwtimeout,
-                write.write_all(&write_buf[..len]).map_err(Error::Write),
-            )
-            .await?;
-            trace!("sent unchoke");
 
             loop {
                 let req = match timeout(keep_alive_interval, outgoing_chan.recv()).await {

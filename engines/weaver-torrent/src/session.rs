@@ -165,6 +165,7 @@ pub struct Session {
     // Feature flags
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
+    pub(crate) unchoke_slots_limit: usize,
     client_name_and_version: String,
 }
 
@@ -526,6 +527,10 @@ pub struct SessionOptions {
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
 
+    /// Peers each torrent uploads to at once (libtorrent
+    /// `unchoke_slots_limit`). Defaults to 8.
+    pub unchoke_slots_limit: usize,
+
     /// Peer connections, incoming and outgoing, the session holds open at
     /// once across all its torrents. Outgoing connects wait for a free place;
     /// an incoming connection past it is closed. Defaults to 200.
@@ -586,6 +591,7 @@ impl Default for SessionOptions {
             allowlist_url: None,
             trackers: HashSet::new(),
             peer_limit: None,
+            unchoke_slots_limit: crate::torrent_state::live::choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
             connections_limit: DEFAULT_CONNECTIONS_LIMIT,
             connection_speed: DEFAULT_CONNECTION_SPEED,
             disable_local_service_discovery: false,
@@ -975,6 +981,7 @@ impl Session {
                         .unwrap_or(StoppedAnnounces::DEFAULT_TIMEOUT),
                 ),
                 peer_limit: opts.peer_limit,
+                unchoke_slots_limit: opts.unchoke_slots_limit,
                 client_name_and_version,
                 blocklist,
                 allowlist,

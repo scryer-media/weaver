@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
-    AddTorrent, AddTorrentOptions, Session,
+    AddTorrent, AddTorrentOptions, Session, SessionOptions,
     core::constants::CHUNK_SIZE,
     storage::StorageFactory,
     tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
@@ -31,21 +31,30 @@ struct Harness {
 impl Harness {
     /// A live torrent of two four-chunk pieces, none of them had, and no peers.
     async fn new(name: &str) -> Self {
-        Self::build(name, 0x00).await
+        Self::build(name, 0x00, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await
     }
 
     /// A live torrent of two four-chunk pieces, both had, and no peers.
     async fn seeding(name: &str) -> Self {
-        Self::build(name, 0xc0).await
+        Self::seeding_with_slots(name, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await
     }
 
-    // `have` is the bitfield of the pieces had.
-    async fn build(name: &str, have: u8) -> Self {
+    /// As [`Harness::seeding`], uploading to `slots` peers at once.
+    async fn seeding_with_slots(name: &str, slots: usize) -> Self {
+        Self::build(name, 0xc0, slots).await
+    }
+
+    // `have` is the bitfield of the pieces had, `slots` the upload slots.
+    async fn build(name: &str, have: u8, slots: usize) -> Self {
         let torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
             .await
             .unwrap();
         let out = TempDir::with_prefix(name).unwrap();
-        let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+        let opts = SessionOptions {
+            unchoke_slots_limit: slots,
+            ..isolated_session_opts(false)
+        };
+        let session = Session::new_with_opts(out.path().into(), opts)
             .await
             .unwrap();
         let have = BF::from_boxed_slice(vec![have].into_boxed_slice());
@@ -404,6 +413,8 @@ async fn a_cancel_takes_an_unsent_block_off_the_upload_queue() {
     let h = Harness::seeding("a_cancel_drops_an_upload").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
     let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
 
     for chunk in [0, 1] {
         peer.on_received_message(Message::Request(request(0, chunk)))
@@ -432,4 +443,123 @@ async fn a_cancel_takes_an_unsent_block_off_the_upload_queue() {
         .await
         .unwrap();
     assert_eq!(next_sent(&mut rx).await, Sent::Block(1, CHUNK_SIZE));
+}
+
+impl Harness {
+    /// Whether we choke the peer.
+    fn choked(&self, peer: &PeerHandler) -> bool {
+        self.peers
+            .with_live(peer.addr, |live| live.is_choked())
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn only_as_many_peers_as_there_are_upload_slots_are_unchoked() {
+    let h = Harness::seeding("only_the_slots_are_unchoked").await;
+    tokio::time::pause();
+    let slots = choker::DEFAULT_UNCHOKE_SLOTS_LIMIT;
+    let mut peers: Vec<_> = (1..=slots + 2)
+        .map(|i| h.peer(&format!("127.0.0.{i}:6881")))
+        .collect();
+    for (peer, _) in &peers {
+        peer.on_received_message(Message::Interested).await.unwrap();
+    }
+
+    // The first peers take the free slots; the rest wait, choked.
+    let (held, waiting) = peers.split_at_mut(slots);
+    for (_, rx) in held.iter_mut() {
+        assert_eq!(next_sent(rx).await, Sent::Unchoke);
+    }
+    for (peer, rx) in waiting.iter_mut() {
+        assert!(rx.is_empty());
+        assert!(h.choked(peer));
+    }
+
+    // At the round nobody has moved a byte: the peers that waited, never
+    // unchoked, take slots from peers that held one, and no more are held.
+    for (_, rx) in waiting.iter_mut() {
+        assert_eq!(next_sent(rx).await, Sent::Unchoke);
+    }
+    let mut choked = 0;
+    for (_, rx) in held.iter_mut() {
+        if !rx.is_empty() {
+            assert_eq!(next_sent(rx).await, Sent::Choke);
+            choked += 1;
+        }
+    }
+    assert_eq!(choked, waiting.len());
+    let unchoked = peers.iter().filter(|(peer, _)| !h.choked(peer)).count();
+    assert_eq!(unchoked, slots);
+}
+
+#[tokio::test]
+async fn a_peer_that_sends_us_more_takes_the_slot_of_one_that_sends_less() {
+    let h = Harness::seeding_with_slots("the_faster_peer_takes_a_slot", 2).await;
+    tokio::time::pause();
+    let (slow, mut slow_rx) = h.peer("127.0.0.1:6881");
+    let (steady, mut steady_rx) = h.peer("127.0.0.2:6881");
+    let (fast, mut fast_rx) = h.peer("127.0.0.3:6881");
+    for (peer, rx) in [(&slow, &mut slow_rx), (&steady, &mut steady_rx)] {
+        peer.on_received_message(Message::Interested).await.unwrap();
+        assert_eq!(next_sent(rx).await, Sent::Unchoke);
+    }
+    (&fast)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert!(fast_rx.is_empty());
+
+    // Over the round the fast peer sends us the most, the slow one the least.
+    for (peer, pieces) in [(&slow, 1u64), (&steady, 2), (&fast, 3)] {
+        peer.counters
+            .fetched_bytes
+            .fetch_add(pieces * u64::from(PIECE_LENGTH), Ordering::Relaxed);
+    }
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut slow_rx).await, Sent::Choke);
+    assert!(steady_rx.is_empty());
+    assert!(!h.choked(&steady));
+}
+
+#[tokio::test]
+async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
+    let h = Harness::seeding_with_slots("a_choke_drops_uploads", 1).await;
+    tokio::time::pause();
+    let (held, mut held_rx) = h.peer("127.0.0.1:6881");
+    let (other, mut other_rx) = h.peer("127.0.0.2:6881");
+    let (held, other) = (&held, &other);
+
+    held.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Unchoke);
+    for chunk in [0, 1] {
+        held.on_received_message(Message::Request(request(0, chunk)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
+
+    // The other peer sends us more over the round and takes the one slot.
+    other
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    other
+        .counters
+        .fetched_bytes
+        .fetch_add(PIECE_LENGTH.into(), Ordering::Relaxed);
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Choke);
+
+    // Both blocks were with the writer, unsent: neither goes out.
+    assert!(!held.claim_upload(&h.chunk(0, 0)));
+    assert!(!held.claim_upload(&h.chunk(0, 1)));
+
+    // What the choked peer asks for now is not queued, so never sent.
+    held.on_received_message(Message::Request(request(1, 0)))
+        .await
+        .unwrap();
+    assert!(!held.claim_upload(&h.chunk(1, 0)));
+    assert!(held_rx.is_empty());
 }

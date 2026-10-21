@@ -28,6 +28,8 @@ use crate::stream_connect::ConnectionKind;
 use crate::type_aliases::BF;
 
 use super::PeerStates;
+use super::choker::Transfer;
+use stats::atomic::PeerCountersAtomic;
 
 pub(crate) type InflightRequest = ChunkInfo;
 pub(crate) type PeerRx = UnboundedReceiver<WriterRequest>;
@@ -75,10 +77,16 @@ impl Peer {
         tx: PeerTx,
         connection_kind: ConnectionKind,
     ) -> Self {
+        let stats = stats::atomic::PeerStats::default();
         Self {
             addr,
-            state: PeerState::Live(LivePeerState::new(peer_id, tx, true, connection_kind)),
-            stats: Default::default(),
+            state: PeerState::Live(LivePeerState::new(
+                peer_id,
+                tx,
+                connection_kind,
+                &stats.counters,
+            )),
+            stats,
             outgoing_address: listen_address(addr, connection_kind),
             failcount: 0,
             last_failed: None,
@@ -315,10 +323,8 @@ impl Peer {
         }
         match self.take_state(counters) {
             PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => {
-                self.set_state(
-                    PeerState::Live(LivePeerState::new(peer_id, tx, true, connection_kind)),
-                    counters,
-                );
+                let live = LivePeerState::new(peer_id, tx, connection_kind, &self.stats.counters);
+                self.set_state(PeerState::Live(live), counters);
             }
             PeerState::Connecting(..) | PeerState::Live(..) => unreachable!(),
         }
@@ -336,10 +342,8 @@ impl Peer {
                 PeerState::Connecting(tx) => tx,
                 _ => unreachable!(),
             };
-            self.set_state(
-                PeerState::Live(LivePeerState::new(peer_id, tx, false, conn_kind)),
-                counters,
-            );
+            let live = LivePeerState::new(peer_id, tx, conn_kind, &self.stats.counters);
+            self.set_state(PeerState::Live(live), counters);
             self.get_live_mut()
         } else {
             None
@@ -358,7 +362,19 @@ pub(crate) struct LivePeerState {
 
     pub client_name: Option<String>,
 
+    // Whether the peer wants to download from us. Like every connection it
+    // starts not interested (BEP 3); the choker records the peer's word.
     pub peer_interested: bool,
+
+    // Whether we choke the peer. It starts choked (BEP 3), and only the
+    // choker unchokes it.
+    am_choking: bool,
+    // When we last unchoked the peer, and what we had uploaded to it by then.
+    last_unchoke: Option<Instant>,
+    uploaded_at_unchoke: u64,
+    // What the peer had sent us and we had sent it when the choker's current
+    // round began.
+    round_start: Transfer,
 
     // This is used to track the pieces the peer has.
     pub bitfield: BF,
@@ -393,8 +409,8 @@ pub(crate) struct LivePeerState {
     request_slots_changed: Arc<Notify>,
 
     // The blocks the peer asked us for that we have not sent yet. The writer
-    // sends a block only by taking it from here, so a Cancel that removes it
-    // first keeps it from going out.
+    // sends a block only by taking it from here, so a Cancel or a Choke that
+    // removes it first keeps it from going out.
     upload_queue: HashSet<ChunkInfo>,
 
     // The main channel to send requests to peer.
@@ -404,16 +420,21 @@ pub(crate) struct LivePeerState {
 }
 
 impl LivePeerState {
+    /// A connection that just went live, to a peer with `counters`.
     pub fn new(
         peer_id: Id20,
         tx: PeerTx,
-        initial_interested: bool,
         connection_kind: ConnectionKind,
+        counters: &PeerCountersAtomic,
     ) -> Self {
         LivePeerState {
             peer_id,
             client_name: None,
-            peer_interested: initial_interested,
+            peer_interested: false,
+            am_choking: true,
+            last_unchoke: None,
+            uploaded_at_unchoke: 0,
+            round_start: Transfer::of(counters),
             bitfield: BF::default(),
             seeder: false,
             inflight_requests: Default::default(),
@@ -539,9 +560,64 @@ impl LivePeerState {
         &self.inflight_requests
     }
 
-    /// The peer asked us for `chunk`.
-    pub fn queue_upload(&mut self, chunk: ChunkInfo) {
+    /// The peer asked us for `chunk`. False when we choke the peer, and the
+    /// request is ignored.
+    pub fn queue_upload(&mut self, chunk: ChunkInfo) -> bool {
+        if self.am_choking {
+            return false;
+        }
         self.upload_queue.insert(chunk);
+        true
+    }
+
+    /// Whether we choke the peer.
+    pub fn is_choked(&self) -> bool {
+        self.am_choking
+    }
+
+    /// When we last unchoked the peer; None if we never did on this
+    /// connection.
+    pub fn last_unchoke(&self) -> Option<Instant> {
+        self.last_unchoke
+    }
+
+    /// What we have uploaded to the peer since we last unchoked it, given
+    /// that we have uploaded `uploaded` to it in all.
+    pub fn uploaded_since_unchoke(&self, uploaded: u64) -> u64 {
+        uploaded.saturating_sub(self.uploaded_at_unchoke)
+    }
+
+    /// Chokes the peer: a Choke goes out and every block it asked for and
+    /// was not sent is dropped (BEP 3). False when it was choked already.
+    pub(crate) fn choke(&mut self) -> bool {
+        if self.am_choking {
+            return false;
+        }
+        self.am_choking = true;
+        self.upload_queue.clear();
+        let _ = self.tx.send(WriterRequest::Message(Message::Choke));
+        true
+    }
+
+    /// Unchokes the peer at `now`, when we have uploaded `uploaded` to it in
+    /// all. False when it was unchoked already.
+    pub(crate) fn unchoke(&mut self, now: Instant, uploaded: u64) -> bool {
+        if !self.am_choking {
+            return false;
+        }
+        self.am_choking = false;
+        self.last_unchoke = Some(now);
+        self.uploaded_at_unchoke = uploaded;
+        let _ = self.tx.send(WriterRequest::Message(Message::Unchoke));
+        true
+    }
+
+    /// Ends the choker's round for the peer, whose totals are now `totals`,
+    /// and starts the next. Returns what moved during the round that ended.
+    pub(crate) fn end_round(&mut self, totals: Transfer) -> Transfer {
+        let round = totals.since(self.round_start);
+        self.round_start = totals;
+        round
     }
 
     /// The peer cancelled its request for `chunk`. A block already sent is
