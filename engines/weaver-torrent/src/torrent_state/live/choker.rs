@@ -136,15 +136,34 @@ impl Choker {
         });
     }
 
+    /// The peer at `addr` said it is not interested. It is choked at once,
+    /// and a slot it held is handed out again now.
+    pub fn peer_not_interested(&self, peers: &PeerStates, addr: SocketAddr) {
+        let mut optimistic = self.optimistic.lock();
+        let held_slot = peers
+            .with_live_mut(addr, "peer_not_interested", |live| {
+                live.peer_interested = false;
+                live.choke()
+            })
+            .unwrap_or(false);
+        self.give_up_slot(&mut optimistic, addr, held_slot);
+    }
+
     /// The connection to the peer at `addr` is gone; `held_slot` when we did
     /// not choke it. Its slot is handed out again now.
     pub fn peer_gone(&self, addr: SocketAddr, held_slot: bool) {
         let mut optimistic = self.optimistic.lock();
+        self.give_up_slot(&mut optimistic, addr, held_slot);
+    }
+
+    // The peer at `addr` no longer holds the slot it held: the optimistic
+    // slot passes on, or the regular ones are handed out again.
+    fn give_up_slot(&self, optimistic: &mut Option<SocketAddr>, addr: SocketAddr, held: bool) {
         if *optimistic == Some(addr) {
             *optimistic = None;
             self.rotation.notify_one();
         }
-        if held_slot {
+        if held {
             self.reshuffle.notify_one();
         }
     }
@@ -162,7 +181,7 @@ impl Choker {
 
     /// A round at `now`: the interested peers that rank highest hold the
     /// regular slots, the optimistic slot keeps its holder, and every other
-    /// peer is choked.
+    /// interested peer is choked.
     pub fn recalculate(&self, peers: &PeerStates, now: Instant) {
         let mut optimistic = self.optimistic.lock();
         let mut ranked = Vec::new();
@@ -174,14 +193,10 @@ impl Choker {
                 continue;
             };
             let round = live.end_round(totals);
+            // A peer that is not interested is choked already: it was
+            // choked when it said so, and only an interested one is unchoked.
             if live.peer_interested {
                 ranked.push((self.rank(live, round, totals.uploaded, now), addr));
-            } else {
-                live.choke();
-                if *optimistic == Some(addr) {
-                    *optimistic = None;
-                    self.rotation.notify_one();
-                }
             }
         }
         ranked.sort_unstable();

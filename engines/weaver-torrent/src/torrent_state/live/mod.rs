@@ -1180,9 +1180,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 trace!("keepalive received");
             }
             Message::Have(h) => self.on_have(h),
-            Message::NotInterested => {
-                trace!("received \"not interested\", but we don't process it yet")
-            }
+            Message::NotInterested => self
+                .state
+                .choker
+                .peer_not_interested(&self.state.peers, self.addr),
             Message::Cancel(request) => self.on_upload_cancelled(request),
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(
                 metadata_piece_id,

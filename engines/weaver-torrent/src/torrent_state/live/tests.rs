@@ -613,3 +613,48 @@ async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
     assert!(!held.claim_upload(&h.chunk(1, 0)));
     assert!(held_rx.is_empty());
 }
+
+#[tokio::test]
+async fn a_peer_that_is_not_interested_is_choked_and_its_slot_handed_on_at_once() {
+    let h = Harness::seeding_with_slots("not_interested_chokes", 2).await;
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let (leaving, mut leaving_rx) = h.peer("127.0.0.1:6881");
+    let (holding, mut holding_rx) = h.peer("127.0.0.2:6881");
+    let (waiting, mut waiting_rx) = h.peer("127.0.0.3:6881");
+    let leaving = &leaving;
+    for (peer, rx) in [(leaving, &mut leaving_rx), (&holding, &mut holding_rx)] {
+        peer.on_received_message(Message::Interested).await.unwrap();
+        assert_eq!(next_sent(rx).await, Sent::Unchoke);
+    }
+    (&waiting)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert!(waiting_rx.is_empty());
+    leaving
+        .on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leaving_rx).await, Sent::Block(0, 0));
+
+    // The peer is choked as it says it is not interested, and its unsent
+    // block does not go out.
+    leaving
+        .on_received_message(Message::NotInterested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leaving_rx).await, Sent::Choke);
+    assert!(!leaving.claim_upload(&h.chunk(0, 0)));
+    leaving
+        .on_received_message(Message::Request(request(0, 1)))
+        .await
+        .unwrap();
+    assert!(!leaving.claim_upload(&h.chunk(0, 1)));
+
+    // The slot it gave up goes to the waiting peer without waiting for the
+    // round.
+    assert_eq!(next_sent(&mut waiting_rx).await, Sent::Unchoke);
+    assert_eq!(tokio::time::Instant::now(), start);
+    assert!(leaving_rx.is_empty());
+}
