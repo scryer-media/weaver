@@ -24,7 +24,7 @@ use crate::buffers::ByteBufOwned;
 use crate::core::hash_id::{Id20, Id32, InfoHashes};
 use crate::core::lengths::{Lengths, ValidPieceIndex};
 use crate::core::magnet::Magnet;
-use crate::core::torrent_metainfo::{TorrentMetaV1Owned, TorrentVersion};
+use crate::core::torrent_metainfo::{TorrentMetaV1Owned, TorrentVersion, WebSeed};
 use crate::peer_protocol::HashRequest;
 use crate::v2_hashes::V2Hashes;
 use anyhow::Context;
@@ -163,6 +163,9 @@ pub struct TorrentMetadata {
     pub file_infos: FileInfos,
     /// The v2 hashes of a v2 or hybrid torrent.
     pub(crate) v2: Option<V2Hashes>,
+    /// The web seeds the torrent file names; none for a magnet link, whose
+    /// metadata carries none.
+    pub web_seeds: Vec<WebSeed>,
 }
 
 impl TorrentMetadata {
@@ -196,6 +199,7 @@ impl TorrentMetadata {
             torrent_file_with_layers: OnceLock::new(),
             info_bytes,
             file_infos,
+            web_seeds: Vec::new(),
         })
     }
 
@@ -245,7 +249,16 @@ impl TorrentMetadata {
             Some(layers) => info.piece_layers(layers)?,
             None => Vec::new(),
         };
-        Self::new(info, torrent_bytes, meta.info.raw_bytes.0, layers)
+        let multi_file = info.iter_file_details().nth(1).is_some();
+        let web_seeds = crate::core::torrent_metainfo::web_seeds(
+            meta.url_list.as_ref(),
+            meta.httpseeds.as_ref(),
+            multi_file,
+        );
+        Ok(Self {
+            web_seeds,
+            ..Self::new(info, torrent_bytes, meta.info.raw_bytes.0, layers)?
+        })
     }
 
     pub fn lengths(&self) -> &Lengths {

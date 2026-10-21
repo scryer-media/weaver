@@ -94,6 +94,16 @@ pub struct TorrentMetaV1<BufType> {
         skip_serializing_if = "Option::is_none"
     )]
     pub piece_layers: Option<PieceLayers<BufType>>,
+    /// BEP 19 web seeds as written; read by [`TorrentMetaV1::web_seeds`].
+    #[serde(
+        rename = "url-list",
+        default = "none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub url_list: Option<SeedUrls<BufType>>,
+    /// BEP 17 web seeds as written; read by [`TorrentMetaV1::web_seeds`].
+    #[serde(default = "none", skip_serializing_if = "Option::is_none")]
+    pub httpseeds: Option<SeedUrls<BufType>>,
 
     /// The hash the torrent goes by: [`InfoHashes::best`].
     #[serde(skip)]
@@ -108,6 +118,219 @@ impl<BufType> TorrentMetaV1<BufType> {
             return Either::Left(self.announce_list.iter().flatten());
         }
         Either::Right(self.announce.iter())
+    }
+}
+
+impl<BufType: AsRef<[u8]>> TorrentMetaV1<BufType> {
+    /// The torrent's web seeds: each `url-list` entry, then each
+    /// `httpseeds` one, each escaped where it must be
+    /// ([`maybe_url_encode`]), and a `url-list` one ending in `/` when the
+    /// torrent has more than one file, its files then being under it
+    /// (libtorrent `load_torrent`, `parse_torrent_file`).
+    pub fn web_seeds(&self, multi_file: bool) -> Vec<WebSeed> {
+        web_seeds(self.url_list.as_ref(), self.httpseeds.as_ref(), multi_file)
+    }
+}
+
+/// [`TorrentMetaV1::web_seeds`], of the torrent's `url-list` and
+/// `httpseeds`.
+pub(crate) fn web_seeds<B: AsRef<[u8]>>(
+    url_list: Option<&SeedUrls<B>>,
+    httpseeds: Option<&SeedUrls<B>>,
+    multi_file: bool,
+) -> Vec<WebSeed> {
+    let urls = |list: Option<&SeedUrls<B>>, kind: WebSeedKind| {
+        list.map(|list| list.strings())
+            .unwrap_or_default()
+            .into_iter()
+            .map(move |url| WebSeed::new(url, kind, multi_file))
+            .collect::<Vec<_>>()
+    };
+    let mut seeds = urls(url_list, WebSeedKind::Url);
+    seeds.extend(urls(httpseeds, WebSeedKind::Http));
+    seeds
+}
+
+/// How a web seed serves the torrent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum WebSeedKind {
+    /// BEP 19 (`url-list`, a magnet link's `ws`): the torrent's files at
+    /// their paths under the URL, fetched by byte range.
+    Url,
+    /// BEP 17 (`httpseeds`): a script that serves a piece by info hash and
+    /// index.
+    Http,
+}
+
+/// A web seed: an HTTP server that has the whole torrent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WebSeed {
+    pub url: String,
+    pub kind: WebSeedKind,
+}
+
+impl WebSeed {
+    /// The seed at `url`, escaped where it must be ([`maybe_url_encode`]);
+    /// a BEP 19 one ends in `/` when the torrent has more than one file
+    /// (libtorrent `load_torrent`, and `torrent::torrent` for one added by
+    /// hand).
+    pub fn new(url: &[u8], kind: WebSeedKind, multi_file: bool) -> Self {
+        let mut url = maybe_url_encode(url);
+        if kind == WebSeedKind::Url && multi_file && !url.ends_with('/') {
+            url.push('/');
+        }
+        Self { url, kind }
+    }
+}
+
+/// Whether `b` may stand in a URL as it is: RFC 2396 unreserved and
+/// reserved characters, and `%`, but not `'` (libtorrent
+/// `unreserved_chars`, which leaves it out for the trackers that choke on
+/// it).
+fn url_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"%+;?:@=&,$/-_!.~*()".contains(&b)
+}
+
+/// `path` with every byte other than an alphanumeric or one of `/-_!.~*()`
+/// as `%` and two lowercase hex digits (libtorrent `escape_path`).
+pub(crate) fn escape_path(path: &[u8]) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path {
+        if b.is_ascii_alphanumeric() || b"/-_!.~*()".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
+            out.push(char::from_digit(u32::from(b & 15), 16).unwrap());
+        }
+    }
+    out
+}
+
+/// `url` with its path escaped ([`escape_path`]) when the path holds a byte
+/// a URL may not carry as it is, such as a space, and as written otherwise,
+/// as it is too when it does not parse (libtorrent `maybe_url_encode`).
+/// The path is all after the host and port, query included; an empty one
+/// is `/`.
+pub fn maybe_url_encode(url: &[u8]) -> String {
+    let as_written = || String::from_utf8_lossy(url).into_owned();
+    let Some(colon) = url.iter().position(|&b| b == b':') else {
+        return as_written();
+    };
+    let Some(rest) = url[colon + 1..].strip_prefix(b"//") else {
+        return as_written();
+    };
+    let authority_end = rest
+        .iter()
+        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    if !authority_parses(authority) {
+        return as_written();
+    }
+    if path.iter().all(|&b| url_safe(b)) {
+        return as_written();
+    }
+    let head = &url[..url.len() - path.len()];
+    let slash = if path.first().is_some_and(|&b| b != b'/') {
+        "/"
+    } else {
+        ""
+    };
+    format!(
+        "{}{slash}{}",
+        String::from_utf8_lossy(head),
+        escape_path(path)
+    )
+}
+
+/// Whether a URL's `[user:pass@]host[:port]` parses as libtorrent's
+/// `parse_url_components` reads it: a host of letters, digits, `-` and `.`,
+/// or a bracketed IPv6 literal, and a port of digits.
+fn authority_parses(authority: &[u8]) -> bool {
+    let host_port = match authority.iter().position(|&b| b == b'@') {
+        Some(at) if authority[..at].contains(&b':') => &authority[at + 1..],
+        _ => authority,
+    };
+    let (host, port) = match host_port.strip_prefix(b"[") {
+        Some(v6) => {
+            let Some(close) = v6.iter().position(|&b| b == b']') else {
+                return false;
+            };
+            let host = &v6[..close];
+            if !host
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b"-.:%_~".contains(&b))
+            {
+                return false;
+            }
+            (host, v6[close + 1..].strip_prefix(b":"))
+        }
+        None => {
+            let (host, port) = match host_port.iter().position(|&b| b == b':') {
+                Some(c) => (&host_port[..c], Some(&host_port[c + 1..])),
+                None => (host_port, None),
+            };
+            if !host
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b"-.".contains(&b))
+            {
+                return false;
+            }
+            (host, port)
+        }
+    };
+    !host.is_empty() && port.is_none_or(|p| !p.is_empty() && p.iter().all(u8::is_ascii_digit))
+}
+
+/// A `url-list` or `httpseeds` value, kept as written: a string, a list,
+/// or anything else, which names no seed ([`SeedUrls::strings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedUrls<Buf>(pub Buf);
+
+impl<Buf: AsRef<[u8]>> SeedUrls<Buf> {
+    /// The non-empty strings the value names, each once, in order: the value
+    /// itself when it is a string, each string of it when it is a list
+    /// (libtorrent `load_torrent`).
+    fn strings(&self) -> Vec<&[u8]> {
+        let mut out: Vec<&[u8]> = Vec::new();
+        match crate::bencode::from_bytes::<BencodeValue<ByteBuf<'_>>>(self.0.as_ref()) {
+            Ok(BencodeValue::Bytes(url)) => out.push(url.0),
+            Ok(BencodeValue::List(list)) => {
+                for url in list {
+                    if let BencodeValue::Bytes(url) = url
+                        && !out.contains(&url.0)
+                    {
+                        out.push(url.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.retain(|url| !url.is_empty());
+        out
+    }
+}
+
+impl<Buf: serde::Serialize> serde::Serialize for SeedUrls<Buf> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The bytes as they were read, without a string prefix.
+        serializer.serialize_newtype_struct(RAW_TAG, &self.0)
+    }
+}
+
+impl<'de, Buf: serde::Deserialize<'de>> serde::Deserialize<'de> for SeedUrls<Buf> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = WithRawBytes::<serde::de::IgnoredAny, Buf>::deserialize(deserializer)?;
+        Ok(SeedUrls(raw.raw_bytes))
+    }
+}
+
+impl<Buf: CloneToOwned> CloneToOwned for SeedUrls<Buf> {
+    type Target = SeedUrls<Buf::Target>;
+
+    fn clone_to_owned(&self, within_buffer: Option<&Bytes>) -> Self::Target {
+        SeedUrls(self.0.clone_to_owned(within_buffer))
     }
 }
 
@@ -966,6 +1189,8 @@ where
             publisher_url: self.publisher_url.clone_to_owned(within_buffer),
             creation_date: self.creation_date,
             piece_layers: self.piece_layers.clone_to_owned(within_buffer),
+            url_list: self.url_list.clone_to_owned(within_buffer),
+            httpseeds: self.httpseeds.clone_to_owned(within_buffer),
             info_hash: self.info_hash,
             info_hashes: self.info_hashes,
         }
@@ -1540,5 +1765,165 @@ mod tests {
             "v2_piece_layer_invalid_file_hash",
             Error::V2InvalidPieceLayer
         );
+    }
+
+    /// A torrent of one 425-byte file, or of two under `temp/foo` when
+    /// `files` holds their names, with `extra` beside its info dict.
+    fn torrent_with(files: &[&str], extra: &str) -> Vec<u8> {
+        let mut info = Vec::new();
+        if files.is_empty() {
+            info.extend_from_slice(b"d6:lengthi425e");
+        } else {
+            info.extend_from_slice(b"d5:filesl");
+            for f in files {
+                info.extend_from_slice(
+                    format!("d6:lengthi425e4:pathl3:foo{}:{f}ee", f.len()).as_bytes(),
+                );
+            }
+            info.extend_from_slice(b"e");
+        }
+        info.extend_from_slice(b"4:name4:temp12:piece lengthi16384e6:pieces20:");
+        info.extend_from_slice(&[7; 20]);
+        info.extend_from_slice(b"e");
+        let (before, after) = extra.split_at(extra.find("8:url-list").unwrap_or(extra.len()));
+        let mut t = format!("d{before}4:info").into_bytes();
+        t.extend_from_slice(&info);
+        t.extend_from_slice(after.as_bytes());
+        t.extend_from_slice(b"e");
+        t
+    }
+
+    fn seeds_of(torrent: &[u8]) -> Vec<(String, WebSeedKind)> {
+        let t = torrent_from_bytes(torrent).expect(&String::from_utf8_lossy(torrent));
+        let multi_file = t
+            .info
+            .data
+            .clone()
+            .validate()
+            .unwrap()
+            .iter_file_details()
+            .nth(1)
+            .is_some();
+        t.web_seeds(multi_file)
+            .into_iter()
+            .map(|s| (s.url, s.kind))
+            .collect()
+    }
+
+    // libtorrent test_torrent_info.cpp: url_seed, url_seed_multi,
+    // url_seed_multi_single_file, url_seed_multi_space(_nolist),
+    // duplicate_web_seeds.
+    #[test]
+    fn web_seeds_are_read_as_libtorrent_reads_them() {
+        use WebSeedKind::*;
+        let url = |s: &str| (s.to_owned(), Url);
+        let two = ["bar.txt", "var.txt"];
+        assert_eq!(
+            seeds_of(&torrent_with(&[], "8:url-listl20:http://test.com/filee")),
+            [url("http://test.com/file")]
+        );
+        // More than one file: the files are under the URL.
+        assert_eq!(
+            seeds_of(&torrent_with(&two, "8:url-listl20:http://test.com/filee")),
+            [url("http://test.com/file/")]
+        );
+        // One file in a directory is still one file: the URL names it.
+        assert_eq!(
+            seeds_of(&torrent_with(
+                &["bar.txt"],
+                "8:url-listl37:http://test.com/file/temp/foo/bar.txte"
+            )),
+            [url("http://test.com/file/temp/foo/bar.txt")]
+        );
+        // A space is escaped, in a list or as the value itself.
+        for list in [
+            "8:url-listl33:http://test.com/test file/foo bare",
+            "8:url-list33:http://test.com/test file/foo bar",
+        ] {
+            assert_eq!(
+                seeds_of(&torrent_with(&two, list)),
+                [url("http://test.com/test%20file/foo%20bar/")]
+            );
+        }
+        // Each URL once, in order.
+        assert_eq!(
+            seeds_of(&torrent_with(
+                &[],
+                "8:url-listl21:http://foobar.com/foo21:http://foobar.com/foo\
+                 24:http://foobar.com/foobar21:http://foobar.com/foo21:http://foobar.com/bare"
+            )),
+            [
+                url("http://foobar.com/foo"),
+                url("http://foobar.com/foobar"),
+                url("http://foobar.com/bar")
+            ]
+        );
+        // An empty string, and anything not a string, names no seed.
+        assert_eq!(
+            seeds_of(&torrent_with(
+                &[],
+                "8:url-listl0:i3ed1:ai1ee20:http://test.com/filee"
+            )),
+            [url("http://test.com/file")]
+        );
+        assert!(seeds_of(&torrent_with(&[], "8:url-list0:")).is_empty());
+        assert!(seeds_of(&torrent_with(&[], "8:url-listi3e")).is_empty());
+        assert!(seeds_of(&torrent_with(&[], "")).is_empty());
+        // BEP 17 seeds follow, escaped but with no slash added.
+        assert_eq!(
+            seeds_of(&torrent_with(
+                &two,
+                "9:httpseedsl21:http://test.com/s.php19:http://test.com/a be\
+                 8:url-list20:http://test.com/file"
+            )),
+            [
+                url("http://test.com/file/"),
+                ("http://test.com/s.php".to_owned(), Http),
+                ("http://test.com/a%20b".to_owned(), Http),
+            ]
+        );
+    }
+
+    // libtorrent test_string.cpp `maybe_url_encode`.
+    #[test]
+    fn a_url_is_escaped_only_where_it_must_be() {
+        for (url, escaped) in [
+            (
+                "http://test:test@abc.com/abc<>abc",
+                "http://test:test@abc.com/abc%3c%3eabc",
+            ),
+            ("http://abc.com/foo bar", "http://abc.com/foo%20bar"),
+            ("http://abc.com:80/foo bar", "http://abc.com:80/foo%20bar"),
+            (
+                "http://abc.com:8080/foo bar",
+                "http://abc.com:8080/foo%20bar",
+            ),
+            ("abc", "abc"),
+            ("http://abc.com/abc", "http://abc.com/abc"),
+            ("http://bla.com/\n", "http://bla.com/%0a"),
+            ("http://bla.com/foo%20bar", "http://bla.com/foo%20bar"),
+            (
+                "http://bla.com/foo%20bar?k=v&k2=v2",
+                "http://bla.com/foo%20bar?k=v&k2=v2",
+            ),
+            ("?&", "?&"),
+            // The query is part of the path, escaped with it.
+            ("http://abc.com/a b?k=v", "http://abc.com/a%20b%3fk%3dv"),
+            ("http://abc.com?a b", "http://abc.com/%3fa%20b"),
+            // A host that does not parse leaves it as written.
+            ("http://a_b.com/foo bar", "http://a_b.com/foo bar"),
+            ("http://[::1]:80/foo bar", "http://[::1]:80/foo%20bar"),
+        ] {
+            assert_eq!(maybe_url_encode(url.as_bytes()), escaped, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_torrents_web_seeds_are_written_back_as_read() {
+        let bytes = torrent_with(&[], "8:url-listl20:http://test.com/filee");
+        let t = torrent_from_bytes(&bytes).unwrap();
+        let mut written = Vec::new();
+        crate::bencode::bencode_serialize_to_writer(&t, &mut written).unwrap();
+        assert_eq!(written, bytes);
     }
 }

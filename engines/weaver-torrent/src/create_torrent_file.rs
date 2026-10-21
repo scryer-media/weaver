@@ -252,6 +252,8 @@ pub async fn create_torrent<'a>(
             publisher_url: None,
             creation_date: None,
             piece_layers: None,
+            url_list: None,
+            httpseeds: None,
             info_hash,
             info_hashes: InfoHashes {
                 v1: Some(info_hash),
