@@ -235,11 +235,6 @@ pub(crate) fn ingest_bitfield(payload: &[u8], total_pieces: u32) -> anyhow::Resu
 /// connected (libtorrent `compare_disconnect_peer` in `torrent.cpp`).
 pub(crate) type DisconnectRank = (bool, bool, Reverse<bool>, u64);
 
-/// Where a peer stands when a full peer list must forget one; the lowest goes
-/// first. Peers we would not connect to go before connect candidates, then the
-/// most failures in a row, then the connection that closed longest ago.
-pub(crate) type EraseRank = (bool, Reverse<u32>, Option<Instant>);
-
 #[derive(Debug)]
 pub(crate) struct Peer {
     pub addr: SocketAddr,
@@ -501,17 +496,6 @@ impl Peer {
     pub(crate) fn rejoin(&mut self, peers: &PeerStates) {
         peers.count_in(&self.state);
         self.set_state(self.idle_state(peers), peers);
-    }
-
-    /// Where the peer stands when a full list must forget one; None for a
-    /// connected peer, which is never forgotten.
-    pub(crate) fn erase_rank(&self) -> Option<EraseRank> {
-        let candidate = match self.state {
-            PeerState::Connecting(_) | PeerState::Live(_) => return None,
-            PeerState::Queued => true,
-            PeerState::Dead | PeerState::NotNeeded => false,
-        };
-        Some((candidate, Reverse(self.failcount), self.last_connected))
     }
 
     /// Where the peer's connection stands when the torrent turns peers over;
