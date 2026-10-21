@@ -20,7 +20,7 @@ use crate::{
     peer_info_reader::{self, MetadataFetch},
     spawn_utils::BlockingSpawner,
     stream_connect::StreamConnector,
-    torrent_state::live::peers::{NextCandidate, PeerStates},
+    torrent_state::live::peers::{NextCandidate, PeerList, PeerStates},
     type_aliases::PeerSourceFlag,
 };
 
@@ -32,6 +32,8 @@ pub enum ReadMetainfoResult<Rx> {
         info_bytes: ByteBufOwned,
         rx: Rx,
         seen: HashSet<SocketAddr>,
+        /// The torrent's peer list, as the metadata connections left it.
+        peers: PeerList,
     },
     ChannelClosed {
         #[allow(dead_code)]
@@ -44,7 +46,7 @@ pub async fn read_metainfo_from_peer_receiver<
 >(
     peer_id: Id20,
     info_hashes: InfoHashes,
-    initial_addrs: Vec<SocketAddr>,
+    peers: PeerList,
     addrs_stream: A,
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
@@ -82,30 +84,34 @@ pub async fn read_metainfo_from_peer_receiver<
         }
     };
 
-    match first_answer(initial_addrs, addrs_stream, read_info_guarded).await {
-        (Some((info, info_bytes)), rx, seen) => ReadMetainfoResult::Found {
+    match first_answer(peers, addrs_stream, read_info_guarded).await {
+        (Some((info, info_bytes)), rx, seen, peers) => ReadMetainfoResult::Found {
             info,
             info_bytes,
             rx,
             seen,
+            peers,
         },
-        (None, _, seen) => ReadMetainfoResult::ChannelClosed { seen },
+        (None, _, seen, _) => ReadMetainfoResult::ChannelClosed { seen },
     }
 }
 
-/// The first answer `ask` gets from a peer of `initial_addrs` or
-/// `addrs_stream`, with the stream and every address seen. A peer that does
-/// not answer is a connection that failed: it is asked again when the peer
-/// list's reconnect time for it comes, until it has failed too often, and
-/// sooner when a tracker names it again (libtorrent `peer_list`; a magnet's
-/// metadata comes from the torrent's ordinary connections). `ask` is handed
-/// the list, so the connection keeps the peer's memory there. None once the
-/// stream has ended and no peer is left to ask.
+/// The first answer `ask` gets from a peer on `list` or named by
+/// `addrs_stream`, with the stream, every address it named, and the list as
+/// the connections left it. The list is the torrent's: its peers' memory
+/// carries on into the torrent's own connections (libtorrent
+/// `torrent::set_metadata` keeps `m_peer_list`; a magnet's metadata comes
+/// from the torrent's ordinary connections). A peer that does not answer is
+/// a connection that failed: it is asked again when the list's reconnect
+/// time for it comes, until it has failed too often, and sooner when a
+/// tracker names it again (`peer_list`). `ask` is handed the list, so the
+/// connection keeps the peer's memory there. None once the stream has ended
+/// and no peer is left to ask.
 async fn first_answer<A, T, F, Fut>(
-    initial_addrs: Vec<SocketAddr>,
+    list: PeerList,
     mut addrs: A,
     ask: F,
-) -> (Option<T>, A, HashSet<SocketAddr>)
+) -> (Option<T>, A, HashSet<SocketAddr>, PeerList)
 where
     A: Stream<Item = (SocketAddr, PeerSourceFlag)> + Unpin,
     F: Fn(SocketAddr, &Arc<PeerStates>) -> Fut,
@@ -113,20 +119,19 @@ where
 {
     // No metadata yet, so no pieces to count availability over. Each answer
     // comes over a connection of its own, wherever its peer is.
-    let peers =
-        Arc::new(PeerStates::new(Default::default(), 0).allowing_multiple_connections_per_ip(true));
+    let peers = Arc::new(
+        PeerStates::founded_on(list, Default::default(), 0)
+            .allowing_multiple_connections_per_ip(true),
+    );
     let mut seen = HashSet::<SocketAddr>::new();
     let mut name = |addr, source| {
         seen.insert(addr);
         peers.add_peer(addr, source);
     };
-    for addr in initial_addrs {
-        name(addr, PeerSourceFlag::ResumeData);
-    }
 
     let mut asking = FuturesUnordered::new();
     let mut addrs_completed = false;
-    loop {
+    let found = loop {
         while let Some((addr, _, _)) = peers.connect_next(Instant::now()) {
             let answer = ask(addr, &peers);
             asking.push(async move { (addr, answer.await) });
@@ -135,12 +140,12 @@ where
             && asking.is_empty()
             && peers.next_candidate(Instant::now()) == NextCandidate::None
         {
-            return (None, addrs, seen);
+            break None;
         }
 
         tokio::select! {
             Some((addr, answer)) = asking.next(), if !asking.is_empty() => match answer {
-                Ok(found) => return (Some(found), addrs, seen),
+                Ok(found) => break Some(found),
                 Err(e) => {
                     debug!("{e:#}");
                     peers.with_peer_mut(addr, "metadata_failed", |peer| {
@@ -154,7 +159,10 @@ where
             },
             _ = peers.wait_for_candidate() => {}
         }
-    }
+    };
+    // The connections still asking end here.
+    drop(asking);
+    (found, addrs, seen, peers.idle_list())
 }
 
 #[cfg(test)]
@@ -207,13 +215,18 @@ mod tests {
         SocketAddr::from(([10, 0, 0, 1], port))
     }
 
+    /// A list with `addrs` on it, as a torrent is added with.
+    fn listing(addrs: impl IntoIterator<Item = SocketAddr>) -> PeerList {
+        PeerList::resumed(addrs, [])
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_peer_that_sent_no_metadata_is_asked_again_once_its_reconnect_time_comes() {
         let (asked, ask) = asker(1);
-        let (found, _, seen) = first_answer(vec![addr(1)], futures::stream::pending(), ask).await;
+        let (found, _, _, _) =
+            first_answer(listing([addr(1)]), futures::stream::pending(), ask).await;
 
         assert_eq!(found, Some(addr(1)));
-        assert_eq!(seen, HashSet::from([addr(1)]));
         let asked = asked.lock().unwrap();
         assert_eq!(asked.len(), 2);
         // libtorrent `peer_list`: (failcount + 1) reconnect times after the failure.
@@ -225,9 +238,9 @@ mod tests {
         let (asked, ask) = asker(1);
         let (tx, rx) = futures::channel::mpsc::unbounded();
         tx.unbounded_send((addr(2), PeerSourceFlag::Dht)).unwrap();
-        let (found, _, seen) = first_answer(vec![addr(1)], rx, ask).await;
+        let (found, _, seen, _) = first_answer(listing([addr(1)]), rx, ask).await;
 
-        assert_eq!(seen, HashSet::from([addr(1), addr(2)]));
+        assert_eq!(seen, HashSet::from([addr(2)]));
         let asked = asked.lock().unwrap();
         // The second peer is asked when it is named, before the first one's
         // reconnect time; both are asked again when theirs comes.
@@ -245,8 +258,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_metadata_once_every_peer_failed_too_often_and_no_more_are_named() {
         let (asked, ask) = asker(usize::MAX);
-        let (found, _, _) =
-            first_answer(vec![addr(1), addr(2)], futures::stream::empty(), ask).await;
+        let (found, _, _, _) =
+            first_answer(listing([addr(1), addr(2)]), futures::stream::empty(), ask).await;
 
         assert_eq!(found, None);
         let asked = asked.lock().unwrap();
@@ -274,7 +287,7 @@ mod tests {
                 v1: Some(info_hash),
                 v2: None,
             },
-            Vec::new(),
+            PeerList::default(),
             peer_rx,
             None,
             Arc::new(StreamConnector::new(Default::default()).await.unwrap()),

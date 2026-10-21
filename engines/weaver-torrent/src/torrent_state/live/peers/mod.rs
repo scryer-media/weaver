@@ -279,12 +279,8 @@ impl Drop for PeerStates {
 }
 
 impl PeerStates {
-    pub fn new(session_stats: Arc<AggregatePeerStatsAtomic>, total_pieces: u32) -> Self {
-        Self::founded_on(PeerList::default(), session_stats, total_pieces)
-    }
-
-    /// The list of a run that follows a pause, founded on the `list` the
-    /// pause left.
+    /// The list of a run, founded on the `list` the torrent was added with,
+    /// a metadata fetch wrote into, or a pause left.
     pub fn founded_on(
         list: PeerList,
         session_stats: Arc<AggregatePeerStatsAtomic>,
@@ -986,7 +982,7 @@ mod tests {
     const OUR_PORT: u16 = 6881;
 
     fn make_peer_states() -> PeerStates {
-        PeerStates::new(Default::default(), TOTAL_PIECES as u32)
+        PeerStates::founded_on(PeerList::default(), Default::default(), TOTAL_PIECES as u32)
     }
 
     // Returns the peer handle, keeping the receiving end of the peer channel alive.
