@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use weaver_torrent::{TorrentStats, TorrentStatsState, TrackerAnnounce};
+use weaver_torrent::{AnnounceErrorKind, TorrentStats, TorrentStatsState, TrackerAnnounce};
 
 use crate::jobs::JobId;
 use crate::jobs::handle::HoldTarget;
@@ -313,19 +313,34 @@ pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
     TorrentTracker {
         tier,
         url: announce.url.clone(),
-        status: match last.map(|last| last.result.is_ok()) {
-            _ if announce.in_flight => TrackerStatus::Updating,
+        // qBittorrent `TorrentImpl` reads the state off the entry's last
+        // outcome; an announce in flight is told apart by `updating`.
+        status: match last.map(|last| last.result.as_ref()) {
             None => TrackerStatus::NotContacted,
-            Some(true) => TrackerStatus::Working,
-            Some(false) => TrackerStatus::NotWorking,
+            Some(Ok(_)) => TrackerStatus::Working,
+            Some(Err(error)) => match error.kind {
+                AnnounceErrorKind::Refused => TrackerStatus::TrackerError,
+                AnnounceErrorKind::Skipped => TrackerStatus::Unreachable,
+                AnnounceErrorKind::Failed => TrackerStatus::NotWorking,
+            },
         },
+        updating: announce.in_flight,
         last_announce_ms: last.and_then(|last| ms(last.at)),
-        next_announce_ms: last.zip(accepted).and_then(|(last, accepted)| {
-            ms(last.at + accepted.interval.max(accepted.min_interval))
+        next_announce_ms: announce.next_announce.and_then(ms),
+        min_announce_ms: last
+            .zip(accepted)
+            .and_then(|(last, accepted)| ms(last.at + accepted.min_interval)),
+        // libtorrent `announce_entry::message`, the tracker's warning, else
+        // the error (qBittorrent shows one, then the other).
+        message: last.and_then(|last| match &last.result {
+            Ok(accepted) => accepted.warning.clone(),
+            Err(error) => Some(error.message.clone()),
         }),
-        message: last.and_then(|last| last.result.as_ref().err().cloned()),
         seeders: accepted.and_then(|accepted| accepted.seeders),
         leechers: accepted.and_then(|accepted| accepted.leechers),
+        downloaded: accepted.and_then(|accepted| accepted.downloaded),
+        peers: accepted.map(|accepted| accepted.peers),
+        fails: u32::from(announce.fails),
     }
 }
 
@@ -369,11 +384,16 @@ pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec
                 tier: entry.tier,
                 url: entry.url,
                 status: TrackerStatus::NotContacted,
+                updating: false,
                 last_announce_ms: None,
                 next_announce_ms: None,
+                min_announce_ms: None,
                 message: None,
                 seeders: None,
                 leechers: None,
+                downloaded: None,
+                peers: None,
+                fails: 0,
             })
             .collect()
     } else {
@@ -401,7 +421,7 @@ pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use weaver_torrent::{AnnounceOk, LastAnnounce};
+    use weaver_torrent::{AnnounceError, AnnounceOk, LastAnnounce};
 
     use super::*;
     use crate::settings::SeedingAction;
@@ -851,14 +871,24 @@ mod tests {
         assert_eq!(goal_left(Some(&policy), &counters(500, 250), 1000, 0), None);
     }
 
-    fn announce(in_flight: bool, last: Option<Result<AnnounceOk, String>>) -> TrackerAnnounce {
+    // An announce that ended at 1,000 s, and the next as the engine sets it:
+    // after the interval, or after the first retry's wait.
+    fn announce(
+        in_flight: bool,
+        last: Option<Result<AnnounceOk, AnnounceError>>,
+    ) -> TrackerAnnounce {
+        let at = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (fails, next) = match &last {
+            None => (0, None),
+            Some(Ok(ok)) => (0, Some(at + ok.interval.max(ok.min_interval))),
+            Some(Err(_)) => (1, Some(at + Duration::from_secs(17))),
+        };
         TrackerAnnounce {
             url: "http://tracker.invalid/announce".into(),
             in_flight,
-            last: last.map(|result| LastAnnounce {
-                at: UNIX_EPOCH + Duration::from_secs(1_000),
-                result,
-            }),
+            last: last.map(|result| LastAnnounce { at, result }),
+            fails,
+            next_announce: next,
         }
     }
 
@@ -868,6 +898,16 @@ mod tests {
             min_interval: Duration::from_secs(min_interval),
             seeders: Some(3),
             leechers: Some(5),
+            downloaded: Some(8),
+            peers: 2,
+            warning: None,
+        }
+    }
+
+    fn refused(kind: AnnounceErrorKind) -> AnnounceError {
+        AnnounceError {
+            kind,
+            message: "refused".into(),
         }
     }
 
@@ -878,35 +918,67 @@ mod tests {
             (never.tier, never.status, never.last_announce_ms),
             (2, TrackerStatus::NotContacted, None)
         );
+        // In flight, a tracker keeps the state of its last outcome.
+        let updating = tracker_view(0, &announce(true, None));
         assert_eq!(
-            tracker_view(0, &announce(true, None)).status,
-            TrackerStatus::Updating
+            (updating.status, updating.updating),
+            (TrackerStatus::NotContacted, true)
         );
+        let updating = tracker_view(0, &announce(true, Some(Ok(accepted(1800, 30)))));
         assert_eq!(
-            tracker_view(0, &announce(true, Some(Ok(accepted(1800, 30))))).status,
-            TrackerStatus::Updating
+            (updating.status, updating.updating),
+            (TrackerStatus::Working, true)
         );
 
         let working = tracker_view(0, &announce(false, Some(Ok(accepted(1800, 30)))));
         assert_eq!(working.status, TrackerStatus::Working);
+        assert!(!working.updating);
         assert_eq!(working.last_announce_ms, Some(1_000_000));
         assert_eq!(working.next_announce_ms, Some(2_800_000));
-        assert_eq!((working.seeders, working.leechers), (Some(3), Some(5)));
-        assert_eq!(working.message, None);
-        // The tracker's floor holds the next announce back.
+        assert_eq!(working.min_announce_ms, Some(1_030_000));
         assert_eq!(
-            tracker_view(0, &announce(false, Some(Ok(accepted(60, 120))))).next_announce_ms,
-            Some(1_120_000)
+            (
+                working.seeders,
+                working.leechers,
+                working.downloaded,
+                working.peers
+            ),
+            (Some(3), Some(5), Some(8), Some(2))
+        );
+        assert_eq!((working.message, working.fails), (None, 0));
+        // The tracker's warning is its message.
+        let warned = AnnounceOk {
+            warning: Some("slow".into()),
+            ..accepted(1800, 30)
+        };
+        assert_eq!(
+            tracker_view(0, &announce(false, Some(Ok(warned))))
+                .message
+                .as_deref(),
+            Some("slow")
         );
 
-        let failed = tracker_view(0, &announce(false, Some(Err("refused".into()))));
-        assert_eq!(failed.status, TrackerStatus::NotWorking);
-        assert_eq!(failed.message.as_deref(), Some("refused"));
-        assert_eq!(failed.last_announce_ms, Some(1_000_000));
-        assert_eq!(
-            (failed.seeders, failed.leechers, failed.next_announce_ms),
-            (None, None, None)
-        );
+        // qBittorrent TorrentImpl: tracker_failure is a tracker error,
+        // announce_skipped unreachable, anything else not working.
+        for (kind, status) in [
+            (AnnounceErrorKind::Refused, TrackerStatus::TrackerError),
+            (AnnounceErrorKind::Skipped, TrackerStatus::Unreachable),
+            (AnnounceErrorKind::Failed, TrackerStatus::NotWorking),
+        ] {
+            let failed = tracker_view(0, &announce(false, Some(Err(refused(kind)))));
+            assert_eq!(failed.status, status);
+            assert_eq!(failed.message.as_deref(), Some("refused"));
+            assert_eq!(failed.last_announce_ms, Some(1_000_000));
+            assert_eq!(
+                (
+                    failed.seeders,
+                    failed.leechers,
+                    failed.next_announce_ms,
+                    failed.fails
+                ),
+                (None, None, Some(1_017_000), 1)
+            );
+        }
     }
 
     #[test]
@@ -924,15 +996,15 @@ mod tests {
         let announces = [
             counted(Some(3), Some(9), 1800),
             counted(Some(7), None, 60),
-            announce(false, Some(Err("refused".into()))),
+            announce(false, Some(Err(refused(AnnounceErrorKind::Failed)))),
         ];
-        // The announce at 1,000 s is due again at 1,060 s.
+        // The failed announce at 1,000 s is retried at 1,017 s.
         assert_eq!(
-            swarm(&announces, 1_020_500),
+            swarm(&announces, 1_010_500),
             Swarm {
                 seeds: Some(7),
                 leechers: Some(9),
-                reannounce_seconds: Some(40),
+                reannounce_seconds: Some(7),
             }
         );
         // An announce already due is due now.
@@ -986,38 +1058,28 @@ mod tests {
         let run = [
             TrackerAnnounce {
                 url: "udp://backup.invalid:80".into(),
-                in_flight: false,
-                last: None,
+                ..Default::default()
             },
             TrackerAnnounce {
                 url: "http://tracker.invalid/".into(),
                 in_flight: true,
-                last: None,
+                ..Default::default()
             },
             TrackerAnnounce {
                 url: "http://magnet.invalid/announce".into(),
-                in_flight: false,
-                last: None,
+                ..Default::default()
             },
         ];
         let ran: Vec<_> = trackers(listed, &run)
             .into_iter()
-            .map(|tracker| (tracker.tier, tracker.url, tracker.status))
+            .map(|tracker| (tracker.tier, tracker.url, tracker.updating))
             .collect();
         assert_eq!(
             ran,
             [
-                (
-                    0,
-                    "http://magnet.invalid/announce".into(),
-                    TrackerStatus::NotContacted
-                ),
-                (0, "http://tracker.invalid/".into(), TrackerStatus::Updating),
-                (
-                    1,
-                    "udp://backup.invalid:80".into(),
-                    TrackerStatus::NotContacted
-                ),
+                (0, "http://magnet.invalid/announce".into(), false),
+                (0, "http://tracker.invalid/".into(), true),
+                (1, "udp://backup.invalid:80".into(), false),
             ]
         );
     }

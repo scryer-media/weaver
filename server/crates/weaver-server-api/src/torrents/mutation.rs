@@ -10,7 +10,7 @@ use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::torrents::service::{ActionError, AddError, AddRequest, AddSource};
 
 use super::service;
-use super::types::{SubmitTorrentInput, Torrent, TorrentFilePriorityInput};
+use super::types::{SubmitTorrentInput, Torrent, TorrentFilePriorityInput, TorrentTrackerInput};
 use crate::auth::{ControlGuard, graphql_error};
 use crate::settings::types::SeedingPolicyInput;
 
@@ -264,6 +264,78 @@ impl TorrentsMutation {
     ) -> Result<bool> {
         service(ctx)?
             .set_rate_limits(JobId(id), upload.into(), download.into())
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
+    /// Add `urls` as one tier after the torrent's last; the ones it lists
+    /// already are left out.
+    #[graphql(guard = "ControlGuard")]
+    async fn add_torrent_trackers(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        urls: Vec<String>,
+    ) -> Result<bool> {
+        service(ctx)?
+            .add_trackers(JobId(id), vec![urls])
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
+    /// List `trackers` in place of the torrent's own.
+    #[graphql(guard = "ControlGuard")]
+    async fn replace_torrent_trackers(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        trackers: Vec<TorrentTrackerInput>,
+    ) -> Result<bool> {
+        service(ctx)?
+            .replace_trackers(JobId(id), trackers.into_iter().map(Into::into).collect())
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
+    #[graphql(guard = "ControlGuard")]
+    async fn remove_torrent_trackers(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        urls: Vec<String>,
+    ) -> Result<bool> {
+        service(ctx)?
+            .remove_trackers(JobId(id), &urls)
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
+    /// Announce now, to every tracker or to `tracker` alone.
+    #[graphql(guard = "ControlGuard")]
+    async fn reannounce_torrent(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        tracker: Option<String>,
+    ) -> Result<bool> {
+        let service = service(ctx)?;
+        match tracker {
+            Some(url) => service.reannounce_tracker(JobId(id), &url).await,
+            None => service.reannounce(JobId(id)).await,
+        }
+        .map_err(action_error)?;
+        Ok(true)
+    }
+
+    /// Look the torrent up on the DHT now.
+    #[graphql(guard = "ControlGuard")]
+    async fn dht_announce_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+        service(ctx)?
+            .dht_announce(JobId(id))
             .await
             .map_err(action_error)?;
         Ok(true)

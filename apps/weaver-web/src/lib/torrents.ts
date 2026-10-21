@@ -42,7 +42,13 @@ export interface SeedingPolicyData {
   maxUploadBps: number | null;
 }
 
-export type TrackerStatus = "NOT_CONTACTED" | "UPDATING" | "WORKING" | "NOT_WORKING" | "DISABLED";
+export type TrackerStatus =
+  | "NOT_CONTACTED"
+  | "WORKING"
+  | "NOT_WORKING"
+  | "TRACKER_ERROR"
+  | "UNREACHABLE"
+  | "DISABLED";
 
 /** How eagerly a torrent file is fetched; an ignored file is not fetched. */
 export type TorrentFilePriority = "IGNORED" | "NORMAL" | "HIGH" | "MAXIMUM";
@@ -62,9 +68,13 @@ export interface TorrentTrackerData {
   tier: number;
   url: string;
   status: TrackerStatus;
+  /** An announce to it is in flight. */
+  updating: boolean;
   message: string | null;
   seeders: number | null;
   leechers: number | null;
+  /** The peers its last answer named. */
+  peers: number | null;
 }
 
 /** One connection to a peer of a torrent. */

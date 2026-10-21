@@ -541,6 +541,56 @@ fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
     })
 }
 
+// `trackers` as a torrent lists them: by tier, in the order given within a
+// tier, each URL once where it is first named (libtorrent
+// `torrent::replace_trackers`). A tracker that is no URL is left out, as a
+// session leaves it out.
+fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
+    let mut tidy: Vec<TrackerEntry> = Vec::with_capacity(trackers.len());
+    for entry in trackers {
+        let url = entry.url.trim();
+        if weaver_torrent::Url::parse(url).is_err() {
+            continue;
+        }
+        if tidy.iter().all(|known| known.url != url) {
+            tidy.push(TrackerEntry {
+                tier: entry.tier,
+                url: url.to_owned(),
+            });
+        }
+    }
+    tidy.sort_by_key(|entry| entry.tier);
+    tidy
+}
+
+// Refuse an edit naming a tracker that is no URL.
+fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
+    trackers
+        .iter()
+        .map(|tracker| tracker.url.trim())
+        .filter(|url| !url.is_empty())
+        .try_for_each(|url| {
+            weaver_torrent::Url::parse(url)
+                .map(drop)
+                .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))
+        })
+}
+
+// The tiers of `trackers`, listed by tier, as a session announces to them.
+fn tracker_tiers(trackers: &[TrackerEntry]) -> Vec<Vec<weaver_torrent::Url>> {
+    let mut tiers: Vec<(u32, Vec<weaver_torrent::Url>)> = Vec::new();
+    for entry in trackers {
+        let Ok(url) = weaver_torrent::Url::parse(&entry.url) else {
+            continue;
+        };
+        match tiers.last_mut() {
+            Some((tier, urls)) if *tier == entry.tier => urls.push(url),
+            _ => tiers.push((entry.tier, vec![url])),
+        }
+    }
+    tiers.into_iter().map(|(_, urls)| urls).collect()
+}
+
 // The hashes a duplicate of a torrent going by `hashes` would share.
 fn infohashes(hashes: InfoHashes) -> Vec<Infohash> {
     hashes
@@ -1892,7 +1942,16 @@ impl TorrentService {
         torrent.record.private = parsed.private;
         torrent.record.storage_dir = Some(dir.clone());
         torrent.record.metainfo = Some(bytes.clone());
-        let rule_id = self.rule_id(&parsed.trackers);
+        // libtorrent `torrent::set_metadata` keeps the trackers the magnet
+        // listed, edits included; the metainfo's own join after them.
+        let mut trackers = self
+            .inner
+            .db
+            .list_torrent_trackers(job_id)
+            .map_err(|error| AddError::State(state_error(error)))?;
+        trackers.extend(parsed.trackers.iter().cloned());
+        let trackers = tidy_trackers(trackers);
+        let rule_id = self.rule_id(&trackers);
         self.inner
             .db
             .set_torrent_tracker_rule(job_id, rule_id)
@@ -1908,7 +1967,7 @@ impl TorrentService {
                 &bytes,
                 parsed.private,
                 &dir,
-                &parsed.trackers,
+                &trackers,
             )
             .map_err(|error| AddError::State(state_error(error)))?;
         self.give_metainfo(torrent, &parsed);
@@ -2025,6 +2084,18 @@ impl TorrentService {
             tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
             Default::default()
         });
+        // libtorrent `torrent::read_resume_data`: the trackers the torrent
+        // lists now stand in for its metainfo's.
+        let trackers = match self.inner.db.list_torrent_trackers(job_id) {
+            Ok(trackers) => tracker_tiers(&trackers)
+                .into_iter()
+                .map(|tier| tier.into_iter().map(String::from).collect())
+                .collect(),
+            Err(error) => {
+                self.fail(job_id, state_error(error)).await;
+                return;
+            }
+        };
         let factory =
             PieceStorageFactory::new(layout, intake as Arc<dyn Pieces>, self.resident(job_id));
         let mut options = AddTorrentOptions {
@@ -2034,6 +2105,7 @@ impl TorrentService {
             storage_factory: Some(factory.boxed_factory()),
             ratelimits,
             identity: Some(identity),
+            tracker_tiers: Some(trackers),
             initial_peers: (!saved.peers.is_empty()).then_some(saved.peers),
             banned_peers: saved.banned,
             file_priorities: Some(picking.0),
@@ -2303,6 +2375,135 @@ impl TorrentService {
         self.write_peers(job_id, peers)
             .await
             .map_err(ActionError::State)
+    }
+
+    /// The torrent's trackers, each with how announcing to it went.
+    pub async fn trackers(&self, job_id: JobId) -> Result<Vec<TorrentTracker>, ActionError> {
+        self.torrent(job_id)
+            .await
+            .map(|view| view.trackers)
+            .ok_or(ActionError::NotFound(job_id))
+    }
+
+    /// Add `tiers` after the torrent's last tier, leaving out the trackers
+    /// it already lists (libtorrent `torrent::add_tracker`; qBittorrent
+    /// `TorrentImpl::addTrackers`).
+    pub async fn add_trackers(
+        &self,
+        job_id: JobId,
+        tiers: Vec<Vec<String>>,
+    ) -> Result<(), ActionError> {
+        self.edit_trackers(job_id, |mut trackers| {
+            let next = trackers
+                .iter()
+                .map(|tracker| tracker.tier + 1)
+                .max()
+                .unwrap_or(0);
+            let added = tiers.into_iter().filter(|tier| !tier.is_empty());
+            for (tier, urls) in (next..).zip(added) {
+                trackers.extend(urls.into_iter().map(|url| TrackerEntry { tier, url }));
+            }
+            Ok(trackers)
+        })
+        .await
+    }
+
+    /// List `trackers` in place of the torrent's own (libtorrent
+    /// `torrent::replace_trackers`): announces to a tracker it no longer
+    /// lists stop.
+    pub async fn replace_trackers(
+        &self,
+        job_id: JobId,
+        trackers: Vec<TrackerEntry>,
+    ) -> Result<(), ActionError> {
+        self.edit_trackers(job_id, |_| Ok(trackers)).await
+    }
+
+    /// Stop listing each of `urls` (qBittorrent `TorrentImpl::removeTrackers`).
+    pub async fn remove_trackers(&self, job_id: JobId, urls: &[String]) -> Result<(), ActionError> {
+        self.edit_trackers(job_id, |mut trackers| {
+            trackers.retain(|tracker| !urls.iter().any(|url| url.trim() == tracker.url));
+            Ok(trackers)
+        })
+        .await
+    }
+
+    // Write the trackers `edit` makes of the torrent's list and hand them
+    // to its session. The rule they match is picked again in memory only:
+    // the stored rule is not this path's to write.
+    async fn edit_trackers(
+        &self,
+        job_id: JobId,
+        edit: impl FnOnce(Vec<TrackerEntry>) -> Result<Vec<TrackerEntry>, ActionError>,
+    ) -> Result<(), ActionError> {
+        {
+            let mut live = self.inner.live.lock().await;
+            let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            let listed = self
+                .inner
+                .db
+                .list_torrent_trackers(job_id)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            let trackers = edit(listed)?;
+            tracker_urls(&trackers)?;
+            let trackers = tidy_trackers(trackers);
+            let stored = self
+                .inner
+                .db
+                .set_torrent_trackers(job_id, &trackers)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            if !stored {
+                return Err(ActionError::NotFound(job_id));
+            }
+            torrent.record.tracker_rule_id = self.rule_id(&trackers);
+            if let Some(attached) = &torrent.attached {
+                attached.handle.replace_trackers(tracker_tiers(&trackers));
+            }
+        }
+        self.apply_queue().await;
+        self.publish().await;
+        Ok(())
+    }
+
+    /// Announce to every tracker now, past the floor each set (libtorrent
+    /// `torrent_handle::force_reannounce` with `ignore_min_interval`, as
+    /// qBittorrent `TorrentImpl::forceReannounce` calls it). A stopped
+    /// torrent announces nothing.
+    pub async fn reannounce(&self, job_id: JobId) -> Result<(), ActionError> {
+        if let Some(handle) = self.handle_of(job_id).await? {
+            handle.force_reannounce(Duration::ZERO, None, true);
+        }
+        Ok(())
+    }
+
+    /// Announce to the tracker at `url` now, as [`Self::reannounce`] does to
+    /// all of them.
+    pub async fn reannounce_tracker(&self, job_id: JobId, url: &str) -> Result<(), ActionError> {
+        let handle = self.handle_of(job_id).await?;
+        let url = url.trim();
+        let listed = self
+            .inner
+            .db
+            .list_torrent_trackers(job_id)
+            .map_err(|error| ActionError::State(state_error(error)))?;
+        if listed.iter().all(|tracker| tracker.url != url) {
+            return Err(ActionError::Invalid(format!("no tracker {url}")));
+        }
+        let url = weaver_torrent::Url::parse(url)
+            .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))?;
+        if let Some(handle) = handle {
+            handle.force_reannounce(Duration::ZERO, Some(&url), true);
+        }
+        Ok(())
+    }
+
+    /// Look the torrent up on the DHT now (libtorrent
+    /// `torrent_handle::force_dht_announce`).
+    pub async fn dht_announce(&self, job_id: JobId) -> Result<(), ActionError> {
+        if let Some(handle) = self.handle_of(job_id).await? {
+            handle.force_dht_announce();
+        }
+        Ok(())
     }
 
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {

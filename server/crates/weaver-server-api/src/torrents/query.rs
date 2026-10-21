@@ -6,7 +6,7 @@ use weaver_server_core::jobs::ids::JobId;
 
 use super::mutation::action_error;
 use super::service;
-use super::types::{ScheduleSeedingGql, Torrent, TorrentPeerGql};
+use super::types::{ScheduleSeedingGql, Torrent, TorrentPeerGql, TorrentTrackerGql};
 use crate::auth::ReadGuard;
 
 #[derive(Default)]
@@ -24,6 +24,18 @@ impl TorrentsQuery {
     async fn torrent_peers(&self, ctx: &Context<'_>, id: u64) -> Result<Vec<TorrentPeerGql>> {
         Ok(service(ctx)?
             .peers(JobId(id))
+            .await
+            .map_err(action_error)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// The torrent's trackers, each with how announcing to it went.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_trackers(&self, ctx: &Context<'_>, id: u64) -> Result<Vec<TorrentTrackerGql>> {
+        Ok(service(ctx)?
+            .trackers(JobId(id))
             .await
             .map_err(action_error)?
             .into_iter()

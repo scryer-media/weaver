@@ -40,7 +40,7 @@ use weaver_server_core::torrents::service::{
 };
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TrackerStatus, status,
+    TorrentTracker, TrackerEntry, TrackerStatus, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle};
@@ -170,9 +170,14 @@ impl TorrentFacadeContext {
 
     // The torrents a `hashes` parameter names: `|`-separated, or `all`.
     async fn targets(&self, params: &Params) -> Vec<TorrentView> {
-        let wanted = params.get("hashes").unwrap_or_default();
+        self.named(params.get("hashes").unwrap_or_default()).await
+    }
+
+    // The torrents `wanted` names: `|`-separated hashes, or `all`
+    // (qBittorrent `applyToTorrents`).
+    async fn named(&self, wanted: &str) -> Vec<TorrentView> {
         let views = self.views().await;
-        if names_all(params) {
+        if wanted.trim() == "all" {
             return views;
         }
         let wanted: Vec<&str> = wanted.split('|').map(str::trim).collect();
@@ -403,7 +408,7 @@ fn need(group: &str, action: &str) -> Option<Need> {
             "add" | "delete" | "pause" | "stop" | "resume" | "start" | "setCategory"
             | "setForceStart" | "createCategory" | "setLocation" | "setShareLimits" | "topPrio"
             | "addTags" | "removeTags" | "recheck" | "reannounce" | "setUploadLimit"
-            | "setDownloadLimit",
+            | "setDownloadLimit" | "addTrackers" | "editTracker" | "removeTrackers",
         )
         | ("torrents", "filePrio" | "toggleSequentialDownload" | "toggleFirstLastPiecePrio") => {
             Need::Control
@@ -579,8 +584,12 @@ async fn handle(
             })
             .await
         }
-        // Tags are not kept; reannounce has no service action.
-        ("torrents", "addTags" | "removeTags" | "reannounce") => ok(),
+        ("torrents", "addTrackers") => add_trackers(&ctx, &params).await,
+        ("torrents", "editTracker") => edit_tracker(&ctx, &params).await,
+        ("torrents", "removeTrackers") => remove_trackers(&ctx, &params).await,
+        ("torrents", "reannounce") => reannounce(&ctx, &params).await,
+        // Tags are not kept.
+        ("torrents", "addTags" | "removeTags") => ok(),
         ("torrents", "tags") | ("log", "main") => axum::Json(json!([])).into_response(),
         ("sync", "maindata") => maindata(&ctx).await,
         ("sync", "torrentPeers") => torrent_peers(&ctx, &params).await,
@@ -996,36 +1005,262 @@ async fn file_prio(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     }
 }
 
+// qBittorrent `TrackerEndpointState`, and 0 for a row that is off.
 fn tracker_status(status: TrackerStatus) -> u8 {
     match status {
         TrackerStatus::Disabled => 0,
         TrackerStatus::NotContacted => 1,
         TrackerStatus::Working => 2,
-        TrackerStatus::Updating => 3,
         TrackerStatus::NotWorking => 4,
+        TrackerStatus::TrackerError => 5,
+        TrackerStatus::Unreachable => 6,
     }
 }
 
+// `torrents/trackers` (qBittorrent `TorrentsController::trackersAction`):
+// the DHT, PeX and LSD rows, then the torrent's trackers.
 async fn trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let Some(torrents) = &ctx.inner.torrents else {
+        return not_found();
+    };
     let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
         return not_found();
     };
-    let list: Vec<Value> = view.trackers.iter().map(tracker_json).collect();
+    let peers = match torrents.peers(view.job_id).await {
+        Ok(peers) => peers,
+        Err(ActionError::NotFound(_)) => return not_found(),
+        Err(error) => return internal(error),
+    };
+    let dht = torrents
+        .carries_dht(torrents.scope_of(view.category.as_deref()))
+        .await;
+    let mut list = sticky_trackers(
+        view.private,
+        &peers,
+        [
+            ("** [DHT] **", PeerSourceFlag::Dht, dht),
+            ("** [PeX] **", PeerSourceFlag::Pex, PEX),
+            ("** [LSD] **", PeerSourceFlag::Lsd, LSD),
+        ],
+    );
+    list.extend(view.trackers.iter().map(tracker_json));
     axum::Json(list).into_response()
 }
 
+// qBittorrent `getStickyTrackers`: a row for each source of peers, working
+// while it is on and the torrent is not private, with the seeds and leeches
+// it brought among the connected peers.
+fn sticky_trackers(
+    private: bool,
+    peers: &[PeerInfo],
+    sources: [(&str, PeerSourceFlag, bool); 3],
+) -> Vec<Value> {
+    sources
+        .into_iter()
+        .map(|(url, source, on)| {
+            let (seeds, leeches) = peers
+                .iter()
+                .filter(|peer| peer.sources.contains(source))
+                .fold((0, 0), |(seeds, leeches), peer| {
+                    if peer.flags.seed {
+                        (seeds + 1, leeches)
+                    } else {
+                        (seeds, leeches + 1)
+                    }
+                });
+            json!({
+                "url": url,
+                "tier": -1,
+                "msg": if private { "This torrent is private" } else { "" },
+                "status": if on && !private { 2 } else { 0 },
+                "num_peers": 0,
+                "num_downloaded": 0,
+                "num_seeds": seeds,
+                "num_leeches": leeches,
+            })
+        })
+        .collect()
+}
+
+// qBittorrent `getTrackers`, each time in seconds since the epoch and -1
+// for a count the tracker has not given.
 fn tracker_json(tracker: &TorrentTracker) -> Value {
     let count = |value: Option<u32>| value.map_or(-1, i64::from);
+    let seconds = |ms: Option<i64>| ms.map_or(0, |ms| ms / 1000);
     json!({
         "url": tracker.url,
-        "status": tracker_status(tracker.status),
         "tier": tracker.tier,
-        "num_peers": count(tracker.leechers.zip(tracker.seeders).map(|(l, s)| l + s)),
+        "updating": tracker.updating,
+        "status": tracker_status(tracker.status),
+        "msg": tracker.message.clone().unwrap_or_default(),
+        "num_peers": count(tracker.peers),
         "num_seeds": count(tracker.seeders),
         "num_leeches": count(tracker.leechers),
-        "num_downloaded": -1,
-        "msg": tracker.message.clone().unwrap_or_default(),
+        "num_downloaded": count(tracker.downloaded),
+        "next_announce": seconds(tracker.next_announce_ms),
+        "min_announce": seconds(tracker.min_announce_ms),
+        "endpoints": [],
     })
+}
+
+// A `|`-separated list whose parts a client may percent-encode, as
+// qBittorrent reads `urls` (`QUrl::fromPercentEncoding`).
+fn url_list(list: &str) -> Vec<String> {
+    list.split('|')
+        .filter(|part| !part.is_empty())
+        .map(percent_decoded)
+        .collect()
+}
+
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[at], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                at += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// `torrents/addTrackers` (qBittorrent `addTrackersAction`): one tracker a
+// line, each blank line starting the next tier (`parseTrackerEntries`).
+// The tiers go after each torrent's last.
+async fn add_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let (Some(hash), Some(urls)) = (params.get("hash"), params.get("urls")) else {
+        return text(StatusCode::BAD_REQUEST, "Missing parameter: hash, urls");
+    };
+    let mut tiers: Vec<Vec<String>> = vec![Vec::new()];
+    for line in urls.split('\n').map(str::trim) {
+        match tiers.last_mut() {
+            Some(tier) if !line.is_empty() => tier.push(line.to_owned()),
+            _ => tiers.push(Vec::new()),
+        }
+    }
+    each_of(ctx, ctx.named(hash).await, move |torrents, view| {
+        let tiers = tiers.clone();
+        async move { torrents.add_trackers(view.job_id, tiers).await }
+    })
+    .await
+}
+
+// `torrents/editTracker` (qBittorrent `editTrackerAction`): a new URL or
+// tier for one tracker, then an announce to every tracker.
+async fn edit_tracker(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let (Some(hash), Some(url)) = (params.get("hash"), params.get("url")) else {
+        return text(StatusCode::BAD_REQUEST, "Missing parameter: hash, url");
+    };
+    let url = url.trim();
+    let Some(torrents) = &ctx.inner.torrents else {
+        return not_found();
+    };
+    let Some(view) = ctx.by_hash(hash).await else {
+        return not_found();
+    };
+    let (new_url, new_tier) = (params.get("newUrl"), params.get("tier"));
+    if new_url.is_none() && new_tier.is_none() {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "Must specify at least one of [newUrl, tier]",
+        );
+    }
+    let new_tier = match new_tier.map(|tier| tier.trim().parse::<i64>()) {
+        None => None,
+        Some(Ok(tier @ 0..=255)) => Some(tier as u32),
+        Some(Ok(_)) => return text(StatusCode::BAD_REQUEST, "tier must be between 0 and 255"),
+        Some(Err(_)) => return text(StatusCode::BAD_REQUEST, "tier must be an integer"),
+    };
+    let new_url = new_url
+        .map(str::trim)
+        .filter(|new| *new != url)
+        .map(str::to_owned);
+    if new_url.is_none() && new_tier.is_none() {
+        return ok();
+    }
+    let mut found = false;
+    let mut entries = Vec::with_capacity(view.trackers.len());
+    for tracker in &view.trackers {
+        if new_url.as_deref() == Some(tracker.url.as_str()) {
+            return text(StatusCode::CONFLICT, "New tracker URL already exists");
+        }
+        let mut entry = TrackerEntry {
+            tier: tracker.tier,
+            url: tracker.url.clone(),
+        };
+        if tracker.url == url {
+            if new_url.is_none() && new_tier == Some(tracker.tier) {
+                return ok();
+            }
+            found = true;
+            entry.url = new_url.clone().unwrap_or(entry.url);
+            entry.tier = new_tier.unwrap_or(entry.tier);
+        }
+        entries.push(entry);
+    }
+    if !found {
+        return text(StatusCode::CONFLICT, "Tracker not found");
+    }
+    let edited = match torrents.replace_trackers(view.job_id, entries).await {
+        Ok(()) => torrents.reannounce(view.job_id).await,
+        Err(error) => Err(error),
+    };
+    // The trackers kept are the torrent's own: only the new URL can be one
+    // the service refuses.
+    match edited {
+        Ok(()) => ok(),
+        Err(ActionError::NotFound(_)) => not_found(),
+        Err(ActionError::Invalid(_)) => text(StatusCode::BAD_REQUEST, "New tracker URL is invalid"),
+        Err(error) => internal(error),
+    }
+}
+
+// `torrents/removeTrackers` (qBittorrent `removeTrackersAction`): `*`
+// names every torrent.
+async fn remove_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let (Some(hash), Some(urls)) = (params.get("hash"), params.get("urls")) else {
+        return text(StatusCode::BAD_REQUEST, "Missing parameter: hash, urls");
+    };
+    let hash = if hash.trim() == "*" { "all" } else { hash };
+    let urls = url_list(urls);
+    each_of(ctx, ctx.named(hash).await, move |torrents, view| {
+        let urls = urls.clone();
+        async move { torrents.remove_trackers(view.job_id, &urls).await }
+    })
+    .await
+}
+
+// `torrents/reannounce` (qBittorrent `reannounceAction`): the trackers
+// `urls` names, else every tracker and the DHT.
+async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let urls = url_list(params.get("urls").unwrap_or_default());
+    each_of(ctx, ctx.targets(params).await, move |torrents, view| {
+        let urls = urls.clone();
+        async move {
+            if urls.is_empty() {
+                torrents.reannounce(view.job_id).await?;
+                return torrents.dht_announce(view.job_id).await;
+            }
+            for tracker in view.trackers.iter().filter(|t| urls.contains(&t.url)) {
+                torrents
+                    .reannounce_tracker(view.job_id, &tracker.url)
+                    .await?;
+            }
+            Ok(())
+        }
+    })
+    .await
 }
 
 async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
@@ -1239,10 +1474,19 @@ where
     F: Fn(TorrentService, TorrentView) -> Fut,
     Fut: std::future::Future<Output = Result<(), ActionError>>,
 {
+    each_of(ctx, ctx.targets(params).await, action).await
+}
+
+// `action` on each of `views`, as `each` does it.
+async fn each_of<F, Fut>(ctx: &TorrentFacadeContext, views: Vec<TorrentView>, action: F) -> Response
+where
+    F: Fn(TorrentService, TorrentView) -> Fut,
+    Fut: std::future::Future<Output = Result<(), ActionError>>,
+{
     let Some(torrents) = &ctx.inner.torrents else {
         return ok();
     };
-    for view in ctx.targets(params).await {
+    for view in views {
         match action(torrents.clone(), view).await {
             Ok(()) | Err(ActionError::NotFound(_)) => {}
             Err(error @ ActionError::Invalid(_)) => {
@@ -1341,6 +1585,10 @@ async fn set_rate_limit(
     .await
 }
 
+// Peer exchange and local discovery are off on every session.
+const PEX: bool = false;
+const LSD: bool = false;
+
 // `dht` is whether any torrent route carries it: a client reads it before
 // handing over a magnet with no trackers, and the route refuses one it
 // cannot serve.
@@ -1361,8 +1609,8 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "max_active_torrents": -1,
         "listen_port": torrent.base_port,
         "upnp": torrent.upnp,
-        "pex": false,
-        "lsd": false,
+        "pex": PEX,
+        "lsd": LSD,
         "encryption": match torrent.encryption {
             TorrentEncryption::Prefer => 0,
             TorrentEncryption::Require => 1,

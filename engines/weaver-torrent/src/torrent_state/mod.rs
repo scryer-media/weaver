@@ -12,7 +12,6 @@ pub mod stats;
 mod streaming;
 pub mod utils;
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -344,10 +343,13 @@ pub struct ManagedTorrentShared {
     /// Every hash the torrent answers to and announces under.
     pub info_hashes: InfoHashes,
     pub(crate) spawner: BlockingSpawner,
-    /// Every tracker in `tracker_tiers`.
-    pub trackers: HashSet<url::Url>,
-    /// The torrent's trackers grouped into tiers (BEP 12), in announce order.
-    pub tracker_tiers: Vec<Vec<url::Url>>,
+    /// The torrent's trackers grouped into tiers (BEP 12), in announce order
+    /// (libtorrent `torrent::m_trackers`); see
+    /// [`ManagedTorrent::replace_trackers`].
+    pub(crate) tracker_tiers: parking_lot::RwLock<Vec<Vec<url::Url>>>,
+    /// Each change starts a new DHT announce of the running torrent
+    /// (libtorrent `torrent::dht_announce`).
+    pub(crate) dht_announce: tokio::sync::watch::Sender<()>,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
@@ -391,6 +393,11 @@ pub(crate) struct RunCounters {
 impl ManagedTorrentShared {
     pub(crate) fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    /// The torrent's trackers grouped into tiers (BEP 12), in announce order.
+    pub fn tracker_tiers(&self) -> Vec<Vec<url::Url>> {
+        self.tracker_tiers.read().clone()
     }
 
     pub fn identity(&self) -> Identity {
@@ -465,7 +472,7 @@ impl ManagedTorrent {
     pub fn magnet(&self) -> Magnet {
         let trackers = self
             .shared
-            .tracker_tiers
+            .tracker_tiers()
             .iter()
             .flatten()
             .map(|t| t.to_string())
@@ -930,6 +937,69 @@ impl ManagedTorrent {
         self.tracker_status()
             .map(|t| t.announces())
             .unwrap_or_default()
+    }
+
+    /// The torrent's trackers become `tiers`, each kept where first named
+    /// (libtorrent `torrent::replace_trackers`): its next run announces to
+    /// them, and a running torrent does from now on (see
+    /// [`crate::tracker::TrackerStatus::replace`]). The table of its latest
+    /// run lists them at once.
+    pub fn replace_trackers(&self, tiers: Vec<Vec<url::Url>>) {
+        let tiers = crate::tracker::tidy_tiers(tiers);
+        *self.shared.tracker_tiers.write() = tiers.clone();
+        let (Some(status), Some(session)) = (self.tracker_status(), self.shared.session.upgrade())
+        else {
+            return;
+        };
+        let private = self
+            .with_metadata(|m| m.info.info().private)
+            .unwrap_or(false);
+        status.replace(session.announce_tiers(tiers, private));
+    }
+
+    /// Adds `tiers` after the torrent's last tier, a tracker it has already
+    /// left where it is (libtorrent `torrent::add_tracker`).
+    pub fn add_trackers(&self, tiers: Vec<Vec<url::Url>>) {
+        let current = self.shared.tracker_tiers();
+        self.replace_trackers(crate::tracker::added_tiers(&current, tiers));
+    }
+
+    /// Removes `urls` from the torrent's trackers (qBittorrent
+    /// `TorrentImpl::removeTrackers`, through `replace_trackers`).
+    pub fn remove_trackers(&self, urls: &[url::Url]) {
+        let current = self.shared.tracker_tiers();
+        self.replace_trackers(crate::tracker::without_trackers(&current, urls));
+    }
+
+    /// Brings the next announce forward to `after` from now, to every
+    /// tracker or to `tracker` alone (libtorrent
+    /// `torrent_handle::force_reannounce`); see
+    /// [`crate::tracker::TrackerStatus::reannounce`]. Nothing happens unless
+    /// the torrent runs. False when `tracker` is not one of the torrent's.
+    pub fn force_reannounce(
+        &self,
+        after: Duration,
+        tracker: Option<&url::Url>,
+        ignore_min_interval: bool,
+    ) -> bool {
+        let known = tracker.is_none_or(|t| {
+            self.shared
+                .tracker_tiers
+                .read()
+                .iter()
+                .flatten()
+                .any(|u| u == t)
+        });
+        if known && let Some(status) = self.tracker_status() {
+            status.reannounce(after, tracker, ignore_min_interval);
+        }
+        known
+    }
+
+    /// Starts a new DHT announce of the running torrent under each of its
+    /// hashes (libtorrent `torrent_handle::force_dht_announce`).
+    pub fn force_dht_announce(&self) {
+        self.shared.dht_announce.send_replace(());
     }
 
     /// The announce table behind [`Self::tracker_announces`], to wait for

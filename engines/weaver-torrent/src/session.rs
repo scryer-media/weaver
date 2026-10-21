@@ -215,11 +215,18 @@ impl AnnouncePort {
 /// The peers the DHT finds for `info_hash`, announcing `port` to the nodes
 /// closest to it. The DHT search reads the port when it starts, so a new
 /// port starts a new search, which announces it (libtorrent
-/// `torrent::dht_announce` reads the port at each announce).
-fn dht_peers(dht: Dht, info_hash: Id20, mut port: ListenPort) -> BoxStream<'static, SocketAddr> {
+/// `torrent::dht_announce` reads the port at each announce), and so does
+/// each change of `announce` (libtorrent `torrent_handle::force_dht_announce`).
+fn dht_peers(
+    dht: Dht,
+    info_hash: Id20,
+    mut port: ListenPort,
+    mut announce: tokio::sync::watch::Receiver<()>,
+) -> BoxStream<'static, SocketAddr> {
     async_stream::stream! {
         loop {
             let mut peers = dht.get_peers(info_hash, *port.borrow_and_update());
+            announce.mark_unchanged();
             loop {
                 tokio::select! {
                     peer = peers.next() => match peer {
@@ -227,6 +234,7 @@ fn dht_peers(dht: Dht, info_hash: Id20, mut port: ListenPort) -> BoxStream<'stat
                         None => return,
                     },
                     Ok(()) = port.changed() => break,
+                    Ok(()) = announce.changed() => break,
                 }
             }
         }
@@ -590,6 +598,12 @@ pub struct AddTorrentOptions {
     // Custom trackers
     pub trackers: Option<Vec<String>>,
 
+    /// The torrent's trackers, in tiers, in place of those its metainfo or
+    /// magnet link names (libtorrent `add_torrent_params::trackers` and
+    /// `tracker_tiers` from resume data, which replace the .torrent's).
+    /// [`Self::trackers`] still follow them.
+    pub tracker_tiers: Option<Vec<Vec<String>>>,
+
     /// What the storage already holds, as a checkpoint of an earlier run
     /// recorded it (see [`Checkpoint`]). When set, the initial hash check
     /// does not run: its pieces are taken as have and its blocks as
@@ -656,6 +670,7 @@ impl Default for AddTorrentOptions {
             preferred_id: None,
             storage_factory: None,
             trackers: None,
+            tracker_tiers: None,
             checkpoint: None,
             piece_priorities: None,
             identity: None,
@@ -1070,6 +1085,20 @@ fn metainfo_tracker_tiers(meta: &TorrentMetaV1Owned) -> Vec<Vec<url::Url>> {
     }
 }
 
+/// The tiers the caller gave in place of the torrent's own.
+fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<url::Url>>> {
+    opts.tracker_tiers.as_ref().map(|tiers| {
+        tiers
+            .iter()
+            .map(|tier| {
+                tier.iter()
+                    .filter_map(|t| url::Url::parse(t).ok())
+                    .collect()
+            })
+            .collect()
+    })
+}
+
 /// The tiers a torrent announces to: its own tiers in order, then each of
 /// `extra` as a tier of its own, unless the torrent is private. A private
 /// torrent (BEP 27) talks only to the trackers it came with. A tracker listed
@@ -1080,16 +1109,7 @@ fn merge_tracker_tiers(
     private: bool,
 ) -> Vec<Vec<url::Url>> {
     let extra = (!private).then(|| extra.into_iter().map(|t| vec![t]));
-    let mut seen = HashSet::new();
-    own.into_iter()
-        .chain(extra.into_iter().flatten())
-        .map(|tier| {
-            tier.into_iter()
-                .filter(|t| seen.insert(t.clone()))
-                .collect::<Vec<_>>()
-        })
-        .filter(|tier| !tier.is_empty())
-        .collect()
+    crate::tracker::tidy_tiers(own.into_iter().chain(extra.into_iter().flatten()))
 }
 
 impl Session {
@@ -1982,12 +2002,14 @@ impl Session {
                         info_hashes: magnet.info_hashes(),
                         // Each tracker of a magnet link is a tier of its own.
                         tracker_tiers: merge_tracker_tiers(
-                            magnet
-                                .trackers
-                                .into_iter()
-                                .filter_map(|t| url::Url::parse(&t).ok())
-                                .map(|t| vec![t])
-                                .collect(),
+                            own_tracker_tiers(&opts).unwrap_or_else(|| {
+                                magnet
+                                    .trackers
+                                    .into_iter()
+                                    .filter_map(|t| url::Url::parse(&t).ok())
+                                    .map(|t| vec![t])
+                                    .collect()
+                            }),
                             std::iter::empty(),
                             false,
                         ),
@@ -2014,7 +2036,8 @@ impl Session {
                     };
 
                     let tracker_tiers = merge_tracker_tiers(
-                        metainfo_tracker_tiers(&torrent.meta),
+                        own_tracker_tiers(&opts)
+                            .unwrap_or_else(|| metainfo_tracker_tiers(&torrent.meta)),
                         opts.trackers
                             .iter()
                             .flatten()
@@ -2098,6 +2121,7 @@ impl Session {
             .identity
             .take()
             .unwrap_or_else(|| self.identity.clone());
+        let dht_announce = tokio::sync::watch::channel(()).0;
 
         let make_peer_rx = |private: bool| {
             self.make_peer_rx(
@@ -2108,6 +2132,7 @@ impl Session {
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
+                dht_announce.subscribe(),
             )
         };
 
@@ -2131,6 +2156,15 @@ impl Session {
                     (metadata, peer_rx, peer_list)
                 }
                 None => {
+                    if self.dht.is_none()
+                        && self.lsd.is_none()
+                        && tracker_tiers.is_empty()
+                        && opts.initial_peers.as_ref().is_none_or(Vec::is_empty)
+                    {
+                        bail!(
+                            "no known way to resolve peers (no DHT, no trackers, no initial_peers)"
+                        );
+                    }
                     // Whether the torrent is private is known only once its
                     // metadata arrives.
                     let PeerSource { peers, trackers } = make_peer_rx(false).context(
@@ -2268,8 +2302,8 @@ impl Session {
                 span,
                 info_hash,
                 info_hashes,
-                trackers: tracker_tiers.iter().flatten().cloned().collect(),
-                tracker_tiers,
+                tracker_tiers: parking_lot::RwLock::new(tracker_tiers),
+                dht_announce,
                 spawner: self.spawner.clone(),
                 peer_id: identity.peer_id,
                 storage_factory,
@@ -2463,17 +2497,18 @@ impl Session {
         self.make_peer_rx(
             t.info_hashes(),
             &t.shared().identity(),
-            t.shared().tracker_tiers.clone(),
+            t.shared().tracker_tiers(),
             announce,
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
             is_private,
+            t.shared().dht_announce.subscribe(),
         )
     }
 
     /// The tiers a torrent announces to: its own, then the session's trackers
     /// unless the torrent is private.
-    fn announce_tiers(
+    pub(crate) fn announce_tiers(
         &self,
         tracker_tiers: Vec<Vec<url::Url>>,
         is_private: bool,
@@ -2523,6 +2558,7 @@ impl Session {
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
+        dht_announce: tokio::sync::watch::Receiver<()>,
     ) -> Option<PeerSource> {
         let dht_rx = if is_private {
             None
@@ -2537,6 +2573,7 @@ impl Session {
                         } else {
                             tokio::sync::watch::channel(None).1
                         },
+                        dht_announce.clone(),
                     )
                 }))
             })
@@ -2571,27 +2608,32 @@ impl Session {
             session: self.clone(),
             torrent: Default::default(),
         };
-        let (tracker_rx, trackers) = TrackerComms::start_with_tiers(
-            info_hashes,
-            identity.clone(),
-            self.announce_tiers(tracker_tiers, is_private),
-            Box::new(tracker_rx_stats),
-            force_tracker_interval,
-            self.announce_port.subscribe(),
-            // Only a private torrent tells its trackers our addresses
-            // (libtorrent `torrent::build_tracker_request`).
-            if is_private {
-                self.own_ips.clone()
-            } else {
-                Arc::new(Vec::new)
-            },
-            self.http_clients.clone(),
-            self.reachable(),
-            self.udp_tracker_client.clone(),
-            self.stopped_announces.clone(),
-        )
-        .map(|task| (task.peers, task.status))
-        .unzip();
+        // The task runs with no tracker too, so trackers added later are
+        // announced to; a session without trackers starts none.
+        let (tracker_rx, trackers) = (!self.disable_trackers)
+            .then(|| {
+                TrackerComms::start_with_tiers(
+                    info_hashes,
+                    identity.clone(),
+                    self.announce_tiers(tracker_tiers, is_private),
+                    Box::new(tracker_rx_stats),
+                    force_tracker_interval,
+                    self.announce_port.subscribe(),
+                    // Only a private torrent tells its trackers our addresses
+                    // (libtorrent `torrent::build_tracker_request`).
+                    if is_private {
+                        self.own_ips.clone()
+                    } else {
+                        Arc::new(Vec::new)
+                    },
+                    self.http_clients.clone(),
+                    self.reachable(),
+                    self.udp_tracker_client.clone(),
+                    self.stopped_announces.clone(),
+                )
+            })
+            .map(|task| (task.peers, task.status))
+            .unzip();
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
@@ -3166,7 +3208,8 @@ mod tests {
         dht.add_node(node_addr);
         let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
         // The node is the closest there is to the hash: its own id.
-        let mut peers = super::dht_peers(dht, Id20::new(NODE_ID), listen_port);
+        let (announce, announce_rx) = tokio::sync::watch::channel(());
+        let mut peers = super::dht_peers(dht, Id20::new(NODE_ID), listen_port, announce_rx);
         let first = tokio::select! {
             _ = peers.next() => panic!("the node gave no peers"),
             port = next_announced(&node) => port,
@@ -3178,6 +3221,15 @@ mod tests {
             port = next_announced(&node) => port,
         };
         assert_eq!(second, 40001);
+
+        // A forced DHT announce (libtorrent torrent_handle::force_dht_announce)
+        // starts a new search, which announces again.
+        announce.send_replace(());
+        let third = tokio::select! {
+            _ = peers.next() => panic!("the node gave no peers"),
+            port = next_announced(&node) => port,
+        };
+        assert_eq!(third, 40001);
     }
 
     #[tokio::test]
@@ -3342,9 +3394,9 @@ mod tests {
         };
 
         let private = add("private", true).await;
-        assert_eq!(private.shared().tracker_tiers, own_tiers());
+        assert_eq!(private.shared().tracker_tiers(), own_tiers());
         assert_eq!(
-            session.announce_tiers(private.shared().tracker_tiers.clone(), true),
+            session.announce_tiers(private.shared().tracker_tiers(), true),
             own_tiers()
         );
 
@@ -3354,11 +3406,11 @@ mod tests {
             &["http://b1.test/announce"],
             &["http://added.test/announce"],
         ]);
-        assert_eq!(public.shared().tracker_tiers, with_added);
+        assert_eq!(public.shared().tracker_tiers(), with_added);
         let mut with_session = with_added;
         with_session.push(vec![url("http://session.test/announce")]);
         assert_eq!(
-            session.announce_tiers(public.shared().tracker_tiers.clone(), false),
+            session.announce_tiers(public.shared().tracker_tiers(), false),
             with_session
         );
 

@@ -440,40 +440,55 @@ fn a_trackers_status_reads_as_the_clients_number() {
         tier: 1,
         url: "http://tracker.invalid/announce".into(),
         status,
+        updating: false,
         last_announce_ms: None,
         next_announce_ms: None,
+        min_announce_ms: None,
         message: None,
         seeders: None,
         leechers: None,
+        downloaded: None,
+        peers: None,
+        fails: 0,
     };
     let numbers: Vec<Value> = [
         TrackerStatus::Disabled,
         TrackerStatus::NotContacted,
         TrackerStatus::Working,
-        TrackerStatus::Updating,
         TrackerStatus::NotWorking,
+        TrackerStatus::TrackerError,
+        TrackerStatus::Unreachable,
     ]
     .into_iter()
     .map(|status| tracker_json(&tracker(status))["status"].clone())
     .collect();
-    assert_eq!(numbers, [0, 1, 2, 3, 4]);
+    assert_eq!(numbers, [0, 1, 2, 4, 5, 6]);
 
     let working = tracker_json(&TorrentTracker {
+        updating: true,
         seeders: Some(3),
         leechers: Some(5),
+        downloaded: Some(9),
+        peers: Some(7),
+        next_announce_ms: Some(1_800_500),
+        min_announce_ms: Some(30_000),
         ..tracker(TrackerStatus::Working)
     });
     assert_eq!(
         working,
         serde_json::json!({
             "url": "http://tracker.invalid/announce",
-            "status": 2,
             "tier": 1,
-            "num_peers": 8,
+            "updating": true,
+            "status": 2,
+            "msg": "",
+            "num_peers": 7,
             "num_seeds": 3,
             "num_leeches": 5,
-            "num_downloaded": -1,
-            "msg": "",
+            "num_downloaded": 9,
+            "next_announce": 1_800,
+            "min_announce": 30,
+            "endpoints": [],
         })
     );
     let failed = tracker_json(&TorrentTracker {
@@ -886,11 +901,25 @@ async fn an_added_torrent_is_listed_with_its_paths_and_state() {
         .json();
     assert_eq!(files[0]["name"], "one.mkv");
     assert_eq!(files[0]["size"], 3000);
+    // The DHT, PeX and LSD rows; the offline rig's route carries DHT.
     let trackers = rig
         .get(&format!("/api/v2/torrents/trackers?hash={hash}"))
         .await
         .json();
-    assert_eq!(trackers, Value::Array(Vec::new()));
+    let sticky = |url: &str, status: u8| {
+        json!({
+            "url": url, "tier": -1, "msg": "", "status": status, "num_peers": 0,
+            "num_downloaded": 0, "num_seeds": 0, "num_leeches": 0,
+        })
+    };
+    assert_eq!(
+        trackers,
+        json!([
+            sticky("** [DHT] **", 2),
+            sticky("** [PeX] **", 0),
+            sticky("** [LSD] **", 0),
+        ])
+    );
     let missing = rig
         .get(&format!("/api/v2/torrents/files?hash={}", "0".repeat(40)))
         .await;
@@ -1783,7 +1812,7 @@ async fn the_stub_endpoints_answer_and_a_url_must_be_a_magnet() {
         (top.status, top.body.as_str()),
         (StatusCode::CONFLICT, "queueing is off")
     );
-    for action in ["addTags", "removeTags", "reannounce"] {
+    for action in ["addTags", "removeTags"] {
         let reply = rig
             .post(&format!("/api/v2/torrents/{action}"), "hashes=all&tags=x")
             .await;
@@ -2087,4 +2116,144 @@ async fn file_levels_and_picking_toggles_are_set_and_reported() {
     )
     .await;
     assert_eq!(picking().await, (json!(false), json!(true)));
+}
+
+// Trackers are added by tier, edited, removed and reannounced to by hash,
+// as qBittorrent's endpoints take them, and an edit naming a tracker the
+// torrent lacks or one it has already conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trackers_are_added_edited_removed_and_reannounced() {
+    let rig = rig().await;
+    let added = rig.add_file(&metainfo("one.mkv", 3000, true), &[]).await;
+    assert_eq!(added.status, StatusCode::OK);
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let listed = || async {
+        let rows = rig
+            .get(&format!("/api/v2/torrents/trackers?hash={hash}"))
+            .await
+            .json();
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["tier"].as_i64().unwrap(),
+                    row["url"].as_str().unwrap().to_owned(),
+                    row["status"].as_u64().unwrap(),
+                    row["msg"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let a = "http://a.invalid/announce";
+    let b = "udp://b.invalid:80";
+    let c = "http://c.invalid/announce";
+
+    // A blank line starts the next tier.
+    let reply = rig
+        .post(
+            "/api/v2/torrents/addTrackers",
+            &format!(
+                "hash={hash}&urls={}",
+                url_encode(&format!("{a}\n{b}\n\n{c}\n"))
+            ),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let private = "This torrent is private".to_owned();
+    let row = |tier: i64, url: &str| (tier, url.to_owned(), 1, String::new());
+    assert_eq!(
+        listed().await,
+        [
+            (-1, "** [DHT] **".into(), 0, private.clone()),
+            (-1, "** [PeX] **".into(), 0, private.clone()),
+            (-1, "** [LSD] **".into(), 0, private.clone()),
+            row(0, a),
+            row(0, b),
+            row(1, c),
+        ]
+    );
+
+    let edit = |form: String| {
+        let rig = &rig;
+        async move { rig.post("/api/v2/torrents/editTracker", &form).await }
+    };
+    let missing = edit(format!(
+        "hash={hash}&url={}&newUrl={}",
+        url_encode("http://d.invalid/announce"),
+        url_encode("http://e.invalid/announce")
+    ))
+    .await;
+    assert_eq!(
+        (missing.status, missing.body.as_str()),
+        (StatusCode::CONFLICT, "Tracker not found")
+    );
+    let taken = edit(format!(
+        "hash={hash}&url={}&newUrl={}",
+        url_encode(a),
+        url_encode(c)
+    ))
+    .await;
+    assert_eq!(
+        (taken.status, taken.body.as_str()),
+        (StatusCode::CONFLICT, "New tracker URL already exists")
+    );
+    let invalid = edit(format!("hash={hash}&url={}&newUrl=nothing", url_encode(a))).await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    let bare = edit(format!("hash={hash}&url={}", url_encode(a))).await;
+    assert_eq!(bare.status, StatusCode::BAD_REQUEST);
+    let unknown = edit(format!(
+        "hash={}&url={}&tier=2",
+        "0".repeat(40),
+        url_encode(a)
+    ))
+    .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    let moved = edit(format!(
+        "hash={hash}&url={}&newUrl={}&tier=3",
+        url_encode(a),
+        url_encode("http://d.invalid/announce")
+    ))
+    .await;
+    assert_eq!(moved.status, StatusCode::OK);
+    assert_eq!(
+        listed().await[3..],
+        [row(0, b), row(1, c), row(3, "http://d.invalid/announce")]
+    );
+
+    // `urls` parts may be percent-encoded once more.
+    let removed = rig
+        .post(
+            "/api/v2/torrents/removeTrackers",
+            &format!(
+                "hash=*&urls={}",
+                url_encode(&format!("{}|{c}", url_encode(b)))
+            ),
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::OK);
+    assert_eq!(listed().await[3..], [row(3, "http://d.invalid/announce")]);
+
+    for form in [
+        format!("hashes={hash}"),
+        "hashes=all".to_owned(),
+        format!(
+            "hashes={hash}|{}&urls={}",
+            "0".repeat(40),
+            url_encode("http://d.invalid/announce")
+        ),
+    ] {
+        let reply = rig.post("/api/v2/torrents/reannounce", &form).await;
+        assert_eq!(reply.status, StatusCode::OK, "{form}");
+    }
+
+    // A key that reads cannot change trackers.
+    let refused = rig
+        .post_as(
+            "/api/v2/torrents/removeTrackers",
+            &format!("hash={hash}&urls={}", url_encode(a)),
+            READER,
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
 }

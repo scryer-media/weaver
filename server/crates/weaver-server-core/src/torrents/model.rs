@@ -226,13 +226,20 @@ pub fn parse_file_priorities(value: &str) -> Option<Vec<FilePriority>> {
         .collect()
 }
 
+/// How announcing to a tracker last went (qBittorrent
+/// `TrackerEndpointState`, from libtorrent's announce entry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackerStatus {
     NotContacted,
-    Updating,
     Working,
+    /// Not answering, or an answer that does not parse.
     NotWorking,
+    /// The tracker gave a failure reason (libtorrent `errors::tracker_failure`).
+    TrackerError,
+    /// No address of the tracker can be reached over the session's
+    /// families (libtorrent `errors::announce_skipped`).
+    Unreachable,
     Disabled,
 }
 
@@ -249,11 +256,23 @@ pub struct TorrentTracker {
     pub tier: u32,
     pub url: String,
     pub status: TrackerStatus,
+    /// An announce to it waits for its answer.
+    pub updating: bool,
     pub last_announce_ms: Option<i64>,
     pub next_announce_ms: Option<i64>,
+    /// The earliest the tracker takes the next announce: its last answer's
+    /// floor (libtorrent `announce_endpoint::min_announce`).
+    pub min_announce_ms: Option<i64>,
+    /// The tracker's warning, or why the last announce failed.
     pub message: Option<String>,
     pub seeders: Option<u32>,
     pub leechers: Option<u32>,
+    /// Downloads the tracker has seen finish.
+    pub downloaded: Option<u32>,
+    /// Peers its last answer named.
+    pub peers: Option<u32>,
+    /// Failures in a row since it last answered.
+    pub fails: u32,
 }
 
 // The seeding ledger.

@@ -144,8 +144,9 @@ impl JsonSessionPersistenceStore {
         let st = SerializedTorrent {
             trackers: torrent
                 .shared()
-                .trackers
+                .tracker_tiers()
                 .iter()
+                .flatten()
                 .map(|u| u.to_string())
                 .collect(),
             info_hash: torrent.info_hash(),

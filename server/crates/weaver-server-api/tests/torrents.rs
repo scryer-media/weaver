@@ -829,3 +829,111 @@ async fn file_levels_and_picking_toggles_round_trip() {
         .await;
     assert_eq!(code(&out_of_range).as_deref(), Some("INVALID_INPUT"));
 }
+
+// A torrent's trackers are listed, added, replaced and removed, and a
+// reannounce or DHT announce is taken; an unknown torrent or tracker is
+// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_trackers_are_listed_and_edited() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let run = |query: String| {
+        let rig = &rig;
+        async move {
+            let response = rig.execute(&query).await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            response.data.into_json().unwrap()
+        }
+    };
+    let listed = || {
+        run(format!(
+            "{{ torrentTrackers(id: {id}) {{ tier url status updating message seeders \
+             leechers downloaded peers fails nextAnnounceMs }} }}"
+        ))
+    };
+
+    run(format!(
+        r#"mutation {{ addTorrentTrackers(id: {id}, urls: ["http://a.invalid/announce", "udp://b.invalid:80"]) }}"#
+    ))
+    .await;
+    run(format!(
+        r#"mutation {{ addTorrentTrackers(id: {id}, urls: ["http://a.invalid/announce", "http://c.invalid/announce"]) }}"#
+    ))
+    .await;
+    let trackers = listed().await;
+    let rows: Vec<(u64, &str, &str)> = trackers["torrentTrackers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tracker| {
+            (
+                tracker["tier"].as_u64().unwrap(),
+                tracker["url"].as_str().unwrap(),
+                tracker["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (0, "http://a.invalid/announce", "NOT_CONTACTED"),
+            (0, "udp://b.invalid:80", "NOT_CONTACTED"),
+            (1, "http://c.invalid/announce", "NOT_CONTACTED"),
+        ]
+    );
+    assert_eq!(trackers["torrentTrackers"][0]["updating"], false);
+    assert_eq!(trackers["torrentTrackers"][0]["fails"], 0);
+
+    run(format!(
+        r#"mutation {{ replaceTorrentTrackers(id: {id}, trackers: [{{ tier: 3, url: "http://c.invalid/announce" }}, {{ tier: 1, url: "udp://b.invalid:80" }}]) }}"#
+    ))
+    .await;
+    run(format!(
+        r#"mutation {{ removeTorrentTrackers(id: {id}, urls: ["udp://b.invalid:80"]) }}"#
+    ))
+    .await;
+    let trackers = listed().await;
+    assert_eq!(trackers["torrentTrackers"].as_array().unwrap().len(), 1);
+    assert_eq!(trackers["torrentTrackers"][0]["tier"], 3);
+    assert_eq!(
+        trackers["torrentTrackers"][0]["url"],
+        "http://c.invalid/announce"
+    );
+
+    run(format!("mutation {{ reannounceTorrent(id: {id}) }}")).await;
+    run(format!(
+        r#"mutation {{ reannounceTorrent(id: {id}, tracker: "http://c.invalid/announce") }}"#
+    ))
+    .await;
+    run(format!("mutation {{ dhtAnnounceTorrent(id: {id}) }}")).await;
+
+    let unknown = rig
+        .execute(&format!(
+            r#"mutation {{ reannounceTorrent(id: {id}, tracker: "http://d.invalid/announce") }}"#
+        ))
+        .await;
+    assert_eq!(code(&unknown).as_deref(), Some("INVALID_INPUT"));
+    let refused = rig
+        .execute(&format!(
+            r#"mutation {{ addTorrentTrackers(id: {id}, urls: ["not a tracker"]) }}"#
+        ))
+        .await;
+    assert_eq!(code(&refused).as_deref(), Some("INVALID_INPUT"));
+    for query in [
+        "{ torrentTrackers(id: 999999) { url } }",
+        r#"mutation { addTorrentTrackers(id: 999999, urls: ["http://a.invalid/"]) }"#,
+        r#"mutation { replaceTorrentTrackers(id: 999999, trackers: []) }"#,
+        r#"mutation { removeTorrentTrackers(id: 999999, urls: []) }"#,
+        "mutation { reannounceTorrent(id: 999999) }",
+        "mutation { dhtAnnounceTorrent(id: 999999) }",
+    ] {
+        let unknown = rig.execute(query).await;
+        assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"), "{query}");
+    }
+}

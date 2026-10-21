@@ -1591,9 +1591,11 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         tier
         url
         status
+        updating
         message
         seeders
         leechers
+        peers
       }
     }
   }
@@ -1642,6 +1644,32 @@ export const SET_TORRENT_UPLOAD_LIMIT_MUTATION = gql`
 export const SET_TORRENT_DOWNLOAD_LIMIT_MUTATION = gql`
   mutation SetTorrentDownloadLimit($id: Int!, $download: Int) {
     setTorrentRateLimits(id: $id, download: $download)
+  }
+`;
+
+/** Add trackers as one tier after the torrent's last. */
+export const ADD_TORRENT_TRACKERS_MUTATION = gql`
+  mutation AddTorrentTrackers($id: Int!, $urls: [String!]!) {
+    addTorrentTrackers(id: $id, urls: $urls)
+  }
+`;
+
+export const REPLACE_TORRENT_TRACKERS_MUTATION = gql`
+  mutation ReplaceTorrentTrackers($id: Int!, $trackers: [TorrentTrackerInput!]!) {
+    replaceTorrentTrackers(id: $id, trackers: $trackers)
+  }
+`;
+
+export const REMOVE_TORRENT_TRACKERS_MUTATION = gql`
+  mutation RemoveTorrentTrackers($id: Int!, $urls: [String!]!) {
+    removeTorrentTrackers(id: $id, urls: $urls)
+  }
+`;
+
+/** Announce now, to every tracker or to the one named. */
+export const REANNOUNCE_TORRENT_MUTATION = gql`
+  mutation ReannounceTorrent($id: Int!, $tracker: String) {
+    reannounceTorrent(id: $id, tracker: $tracker)
   }
 `;
 

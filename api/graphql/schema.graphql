@@ -2069,6 +2069,24 @@ type MutationRoot {
 	"""
 	setTorrentRateLimits(id: Int!, upload: Int, download: Int): Boolean!
 	"""
+	Add `urls` as one tier after the torrent's last; the ones it lists
+	already are left out.
+	"""
+	addTorrentTrackers(id: Int!, urls: [String!]!): Boolean!
+	"""
+	List `trackers` in place of the torrent's own.
+	"""
+	replaceTorrentTrackers(id: Int!, trackers: [TorrentTrackerInput!]!): Boolean!
+	removeTorrentTrackers(id: Int!, urls: [String!]!): Boolean!
+	"""
+	Announce now, to every tracker or to `tracker` alone.
+	"""
+	reannounceTorrent(id: Int!, tracker: String): Boolean!
+	"""
+	Look the torrent up on the DHT now.
+	"""
+	dhtAnnounceTorrent(id: Int!): Boolean!
+	"""
 	The torrent's own seeding policy; null returns it to its category's
 	and the global one.
 	"""
@@ -2935,6 +2953,10 @@ type QueryRoot {
 	The torrent's live peer connections, by address.
 	"""
 	torrentPeers(id: Int!): [TorrentPeer!]!
+	"""
+	The torrent's trackers, each with how announcing to it went.
+	"""
+	torrentTrackers(id: Int!): [TorrentTracker!]!
 	"""
 	The torrents the schedule's pause leaves seeding, by the tracker rule
 	that keeps them; empty while no such pause is in force.
@@ -5225,11 +5247,39 @@ type TorrentTracker {
 	tier: Int!
 	url: String!
 	status: TrackerStatus!
+	"""
+	An announce to it is in flight.
+	"""
+	updating: Boolean!
 	message: String
 	seeders: Int
 	leechers: Int
+	"""
+	The completed downloads it last counted.
+	"""
+	downloaded: Int
+	"""
+	The peers its last answer named.
+	"""
+	peers: Int
+	"""
+	Announces to it that failed in a row.
+	"""
+	fails: Int!
 	lastAnnounceMs: Int
 	nextAnnounceMs: Int
+	"""
+	The earliest the tracker takes the next announce.
+	"""
+	minAnnounceMs: Int
+}
+
+"""
+A tracker in a torrent's list, by tier.
+"""
+input TorrentTrackerInput {
+	tier: Int!
+	url: String!
 }
 
 """
@@ -5282,9 +5332,10 @@ input TrackerRuleInput {
 
 enum TrackerStatus {
 	NOT_CONTACTED
-	UPDATING
 	WORKING
 	NOT_WORKING
+	TRACKER_ERROR
+	UNREACHABLE
 	DISABLED
 }
 

@@ -61,6 +61,9 @@ pub struct TrackerComms {
     // announce to it.
     tracker_ids: Mutex<HashMap<Url, Vec<u8>>>,
     status: TrackerStatus,
+    // Wakes the announce loop when the list changed under it: trackers
+    // replaced or an announce forced.
+    poke: tokio::sync::Notify,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,7 +203,7 @@ pub(crate) fn only_reachable<A>(
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum SupportedTracker {
     Udp(Url),
     Http(Url),
@@ -260,6 +263,20 @@ struct Entry {
 }
 
 impl Entry {
+    fn new(tracker: SupportedTracker, tier: usize, now: Instant) -> Self {
+        Self {
+            tracker,
+            tier,
+            fails: 0,
+            next_announce: now,
+            min_announce: now,
+            updating: false,
+            port: None,
+            start_sent: false,
+            complete_sent: false,
+        }
+    }
+
     /// A tracker that has not failed since it last answered, or has never
     /// been asked (libtorrent `announce_infohash::is_working`).
     fn is_working(&self) -> bool {
@@ -291,6 +308,10 @@ struct TrackerList {
     entries: Vec<Entry>,
     /// A tracker accepted `completed` (libtorrent `torrent::m_complete_sent`).
     complete_sent: bool,
+    /// Trackers forced one at a time, announced to on the next turn when
+    /// they may be, whatever the walk would pick (libtorrent
+    /// `torrent::announce_tracker_now`).
+    forced: Vec<SupportedTracker>,
 }
 
 impl TrackerList {
@@ -303,23 +324,76 @@ impl TrackerList {
                 if entries.iter().any(|e| &e.tracker == tracker) {
                     continue;
                 }
-                entries.push(Entry {
-                    tracker: tracker.clone(),
-                    tier,
-                    fails: 0,
-                    next_announce: now,
-                    min_announce: now,
-                    updating: false,
-                    port: None,
-                    start_sent: false,
-                    complete_sent: false,
-                });
+                entries.push(Entry::new(tracker.clone(), tier, now));
             }
         }
         Self {
             entries,
             complete_sent: false,
+            forced: Vec::new(),
         }
+    }
+
+    /// The trackers become `tiers`, in the order given, a tracker named
+    /// twice kept where first named (libtorrent `tracker_list::replace`). A
+    /// tracker kept keeps what announcing to it has done, so it is not sent
+    /// `started` again nor let off its back-off; libtorrent starts every
+    /// entry afresh. A tracker that is gone is forgotten, with no `stopped`.
+    fn replace(&mut self, tiers: &[Vec<SupportedTracker>], now: Instant) {
+        let mut old = std::mem::take(&mut self.entries);
+        for (tier, trackers) in tiers.iter().enumerate() {
+            for tracker in trackers {
+                if self.position(tracker).is_some() {
+                    continue;
+                }
+                let entry = match old.iter().position(|e| &e.tracker == tracker) {
+                    Some(i) => Entry {
+                        tier,
+                        ..old.remove(i)
+                    },
+                    None => Entry::new(tracker.clone(), tier, now),
+                };
+                self.entries.push(entry);
+            }
+        }
+        let entries = &self.entries;
+        self.forced
+            .retain(|t| entries.iter().any(|e| &e.tracker == t));
+    }
+
+    /// Brings the next announce forward to `at` (libtorrent
+    /// `trigger_announce`): every tracker, or `tracker` alone, is due a
+    /// second after `at`, or once its `min interval` is past unless
+    /// `ignore_min_interval`, which lifts it. A tracker named alone is
+    /// announced to on its own as soon as it may be (libtorrent
+    /// `torrent::force_tracker_request` with an index); the others are
+    /// reached by the walk. False when there is no such tracker.
+    fn force(
+        &mut self,
+        at: Instant,
+        tracker: Option<&SupportedTracker>,
+        ignore_min_interval: bool,
+    ) -> bool {
+        let mut found = false;
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|e| tracker.is_none_or(|t| &e.tracker == t))
+        {
+            entry.next_announce = if ignore_min_interval {
+                entry.min_announce = at;
+                at
+            } else {
+                at.max(entry.min_announce)
+            } + Duration::from_secs(1);
+            found = true;
+        }
+        if let (true, Some(tracker)) = (found, tracker)
+            && !self.forced.contains(tracker)
+        {
+            self.forced.push(tracker.clone());
+        }
+        found
     }
 
     /// The walk of libtorrent `torrent::announce_with_tracker` with neither
@@ -356,7 +430,20 @@ impl TrackerList {
         stats: &TrackerCommsStats,
     ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
         let seed = stats.finished_during_run;
-        self.walk(|_| true, |e| e.can_announce(now, seed, port))
+        // A tracker forced alone goes now if it may, else the walk and the
+        // timer reach it (libtorrent `torrent::announce_tracker_now`); one
+        // waiting for an answer is not asked twice.
+        let forced = std::mem::take(&mut self.forced)
+            .into_iter()
+            .filter_map(|t| self.position(&t))
+            .filter(|&i| self.entries[i].can_announce(now, seed, port));
+        let mut picked: Vec<usize> = forced.collect();
+        for i in self.walk(|_| true, |e| e.can_announce(now, seed, port)) {
+            if !picked.contains(&i) {
+                picked.push(i);
+            }
+        }
+        picked
             .into_iter()
             .map(|i| {
                 let event = self.event(&self.entries[i], stats);
@@ -504,6 +591,10 @@ fn retry_delay(fails: u8, retry_interval: Duration) -> Duration {
 struct Refused {
     reason: String,
     retry_interval: Duration,
+    /// The tracker gave a `failure reason` (libtorrent
+    /// `errors::tracker_failure`), rather than an answer that does not
+    /// parse.
+    failure: bool,
 }
 
 impl std::fmt::Display for Refused {
@@ -515,11 +606,12 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 impl Refused {
-    fn new(reason: String, interval: Option<Duration>) -> anyhow::Error {
+    fn new(reason: String, interval: Option<Duration>, failure: bool) -> anyhow::Error {
         let interval = interval.unwrap_or(tracker_comms_http::DEFAULT_INTERVAL);
         anyhow::Error::new(Self {
             reason,
             retry_interval: interval.max(MIN_ANNOUNCE_INTERVAL),
+            failure,
         })
     }
 
@@ -543,6 +635,7 @@ fn read_answer(bytes: &[u8]) -> anyhow::Result<tracker_comms_http::TrackerRespon
                 error.failure_reason
             ),
             error.interval,
+            true,
         ));
     }
     crate::bencode::from_bytes_with_rest::<tracker_comms_http::TrackerResponse>(bytes)
@@ -554,6 +647,7 @@ fn read_answer(bytes: &[u8]) -> anyhow::Result<tracker_comms_http::TrackerRespon
                     e.into_kind()
                 ),
                 None,
+                false,
             )
         })
 }
@@ -613,9 +707,12 @@ struct Announced {
     min_interval: Duration,
     seeders: Option<u32>,
     leechers: Option<u32>,
+    downloaded: Option<u32>,
+    warning: Option<String>,
 }
 
-/// What a tracker answered to an announce it accepted.
+/// What a tracker answered to an announce it accepted (libtorrent
+/// `torrent::tracker_response` keeps these on the announce entry).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnnounceOk {
     pub interval: Duration,
@@ -626,6 +723,56 @@ pub struct AnnounceOk {
     pub seeders: Option<u32>,
     /// Peers still downloading, as the tracker counts them.
     pub leechers: Option<u32>,
+    /// Downloads the tracker has seen finish (`downloaded`, or a scrape's).
+    pub downloaded: Option<u32>,
+    /// Peers the answer named.
+    pub peers: u32,
+    /// The tracker's `warning message` (libtorrent `announce_entry::message`).
+    pub warning: Option<String>,
+}
+
+/// Why an announce was not accepted, as libtorrent tells them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnounceErrorKind {
+    /// The tracker gave a `failure reason` (libtorrent
+    /// `errors::tracker_failure`).
+    Refused,
+    /// No address of the tracker is of a family the session connects over
+    /// (libtorrent `errors::announce_skipped`).
+    Skipped,
+    /// Anything else: no answer, an answer that does not parse, a filtered
+    /// address.
+    Failed,
+}
+
+/// An announce that was not accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnounceError {
+    pub kind: AnnounceErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for AnnounceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<&anyhow::Error> for AnnounceError {
+    fn from(e: &anyhow::Error) -> Self {
+        let refused = e.chain().find_map(|c| c.downcast_ref::<Refused>());
+        let skipped = e
+            .chain()
+            .any(|c| c.downcast_ref::<Unreachable>() == Some(&Unreachable::Family));
+        Self {
+            kind: match (refused, skipped) {
+                (Some(r), _) if r.failure => AnnounceErrorKind::Refused,
+                (_, true) => AnnounceErrorKind::Skipped,
+                _ => AnnounceErrorKind::Failed,
+            },
+            message: format!("{e:#}"),
+        }
+    }
 }
 
 /// The outcome of the most recent regular announce to a tracker.
@@ -633,11 +780,11 @@ pub struct AnnounceOk {
 pub struct LastAnnounce {
     /// When the announce finished.
     pub at: SystemTime,
-    pub result: Result<AnnounceOk, String>,
+    pub result: Result<AnnounceOk, AnnounceError>,
 }
 
 /// One tracker of a torrent and how announcing to it is going.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrackerAnnounce {
     /// The announce URL.
     pub url: String,
@@ -645,6 +792,12 @@ pub struct TrackerAnnounce {
     pub in_flight: bool,
     /// None until the tracker has been announced to.
     pub last: Option<LastAnnounce>,
+    /// Failures in a row since it last accepted an announce (libtorrent
+    /// `announce_infohash::fails`).
+    pub fails: u8,
+    /// When it is next due, once an announce to it has ended or one was
+    /// forced (libtorrent `announce_infohash::next_announce`).
+    pub next_announce: Option<SystemTime>,
 }
 
 /// A torrent's counts as a tracker's scrape reply gave them (BEP 48). A
@@ -764,7 +917,7 @@ struct Scraper {
     info_hashes: Vec<Id20>,
     user_agent: String,
     // In table order, one per URL.
-    trackers: Vec<SupportedTracker>,
+    trackers: Mutex<Vec<SupportedTracker>>,
     http_clients: Arc<dyn HttpClients>,
     reachable: Reachable,
     udp_client: UdpTrackerClient,
@@ -852,6 +1005,36 @@ struct StatusShared {
     announces: tokio::sync::watch::Sender<Vec<TrackerAnnounce>>,
     scrapes: tokio::sync::watch::Sender<Vec<TrackerScrape>>,
     scraper: Scraper,
+    /// The announce loops of the tracker task, one per hash, while it runs.
+    runs: Mutex<Vec<std::sync::Weak<TrackerComms>>>,
+}
+
+/// One entry per tracker of `tiers` that the session can announce to, in
+/// order, a tracker named twice kept where first named.
+fn supported_tiers(tiers: Vec<Vec<Url>>) -> Vec<Vec<SupportedTracker>> {
+    tiers
+        .into_iter()
+        .map(|urls| urls.into_iter().filter_map(SupportedTracker::new).collect())
+        .filter(|tier: &Vec<SupportedTracker>| !tier.is_empty())
+        .collect()
+}
+
+fn unique<'a>(trackers: impl IntoIterator<Item = &'a SupportedTracker>) -> Vec<SupportedTracker> {
+    let mut unique: Vec<SupportedTracker> = Vec::new();
+    for tracker in trackers {
+        if !unique.contains(tracker) {
+            unique.push(tracker.clone());
+        }
+    }
+    unique
+}
+
+/// `instant` on the wall clock.
+fn wall(instant: Instant, now: Instant, at: SystemTime) -> SystemTime {
+    match instant.checked_duration_since(now) {
+        Some(ahead) => at + ahead,
+        None => at - now.duration_since(instant),
+    }
 }
 
 /// The announce table of one [`TrackerComms`]: one entry per tracker it was
@@ -878,18 +1061,12 @@ impl TrackerStatus {
         reachable: Reachable,
         udp_client: UdpTrackerClient,
     ) -> Self {
-        let mut unique: Vec<SupportedTracker> = Vec::new();
-        for tracker in trackers {
-            if !unique.contains(tracker) {
-                unique.push(tracker.clone());
-            }
-        }
+        let unique = unique(trackers);
         let announces = unique
             .iter()
             .map(|t| TrackerAnnounce {
                 url: t.url().to_string(),
-                in_flight: false,
-                last: None,
+                ..Default::default()
             })
             .collect();
         let scrapes = unique
@@ -905,12 +1082,103 @@ impl TrackerStatus {
             scraper: Scraper {
                 info_hashes,
                 user_agent: identity.user_agent.clone(),
-                trackers: unique,
+                trackers: Mutex::new(unique),
                 http_clients,
                 reachable,
                 udp_client,
             },
+            runs: Default::default(),
         }))
+    }
+
+    /// The trackers become `tiers` (libtorrent `torrent::replace_trackers`):
+    /// the table lists them in order, a tracker kept keeping its row, and a
+    /// running task announces to them from now on. An announce waiting on a
+    /// tracker that is gone is abandoned.
+    pub fn replace(&self, tiers: Vec<Vec<Url>>) {
+        let tiers = supported_tiers(tiers);
+        let trackers = unique(tiers.iter().flatten());
+        self.0.announces.send_modify(|announces| {
+            *announces = trackers
+                .iter()
+                .map(|t| {
+                    let url = t.url().as_str();
+                    announces
+                        .iter()
+                        .find(|a| a.url == url)
+                        .cloned()
+                        .unwrap_or_else(|| TrackerAnnounce {
+                            url: url.to_owned(),
+                            ..Default::default()
+                        })
+                })
+                .collect();
+        });
+        self.0.scrapes.send_modify(|scrapes| {
+            *scrapes = trackers
+                .iter()
+                .map(|t| {
+                    let url = t.url().as_str();
+                    scrapes
+                        .iter()
+                        .find(|s| s.url == url)
+                        .cloned()
+                        .unwrap_or_else(|| TrackerScrape {
+                            url: url.to_owned(),
+                            last: None,
+                        })
+                })
+                .collect();
+        });
+        *self.0.scraper.trackers.lock() = trackers;
+        for comms in self.runs() {
+            comms.list.lock().replace(&tiers, Instant::now());
+            comms.publish(Instant::now(), SystemTime::now());
+            comms.poke.notify_one();
+        }
+    }
+
+    /// Brings the next announce forward to `after` from now, to every
+    /// tracker or to `tracker` alone (libtorrent
+    /// `torrent_handle::force_reannounce`, `torrent::force_tracker_request`
+    /// and `force_tracker_request_url`). `ignore_min_interval` lifts the
+    /// trackers' `min interval`. An announce already waiting for its answer
+    /// is not sent again. Nothing happens unless the task runs (libtorrent
+    /// returns while the torrent is paused). False when `tracker` is not
+    /// one of the torrent's.
+    pub fn reannounce(
+        &self,
+        after: Duration,
+        tracker: Option<&Url>,
+        ignore_min_interval: bool,
+    ) -> bool {
+        let tracker = match tracker.map(|url| SupportedTracker::new(url.clone())) {
+            Some(None) => return false,
+            Some(Some(t)) => Some(t),
+            None => None,
+        };
+        let known = tracker.as_ref().is_none_or(|t| {
+            let url = t.url().as_str();
+            self.0.announces.borrow().iter().any(|a| a.url == url)
+        });
+        if known {
+            for comms in self.runs() {
+                let at = Instant::now() + after;
+                comms
+                    .list
+                    .lock()
+                    .force(at, tracker.as_ref(), ignore_min_interval);
+                comms.publish(Instant::now(), SystemTime::now());
+                comms.poke.notify_one();
+            }
+        }
+        known
+    }
+
+    fn runs(&self) -> Vec<Arc<TrackerComms>> {
+        let mut runs = self.0.runs.lock();
+        runs.retain(|run| run.strong_count() > 0);
+        runs.iter().filter_map(std::sync::Weak::upgrade).collect()
     }
 
     /// A snapshot of the table.
@@ -969,7 +1237,7 @@ impl TrackerStatus {
             })
             .max_by_key(|(at, _)| *at)
             .map(|(_, url)| url);
-        let trackers = &self.0.scraper.trackers;
+        let trackers = self.0.scraper.trackers.lock();
         match last_working {
             Some(url) => trackers.iter().find(|t| t.url().as_str() == url),
             None => trackers.first(),
@@ -989,10 +1257,11 @@ impl TrackerStatus {
                 else {
                     return false;
                 };
-                let before = (accepted.seeders, accepted.leechers);
+                let before = (accepted.seeders, accepted.leechers, accepted.downloaded);
                 accepted.seeders = counts.complete.or(accepted.seeders);
                 accepted.leechers = counts.incomplete.or(accepted.leechers);
-                before != (accepted.seeders, accepted.leechers)
+                accepted.downloaded = counts.downloaded.or(accepted.downloaded);
+                before != (accepted.seeders, accepted.leechers, accepted.downloaded)
             });
         }
         let last = LastScrape {
@@ -1028,7 +1297,8 @@ impl TrackerStatus {
 
 /// An announce waiting for its answer. Dropping it ends the announce in the
 /// table: with the outcome given to [`InFlight::finish`], or with none when
-/// the announce was abandoned (the tracker task was dropped).
+/// the announce was abandoned (the tracker task was dropped, or the tracker
+/// removed).
 struct InFlight<'a> {
     status: &'a TrackerStatus,
     url: String,
@@ -1036,19 +1306,8 @@ struct InFlight<'a> {
 }
 
 impl InFlight<'_> {
-    fn finish(mut self, result: &anyhow::Result<Announced>) {
-        self.last = Some(LastAnnounce {
-            at: SystemTime::now(),
-            result: match result {
-                Ok(a) => Ok(AnnounceOk {
-                    interval: a.interval,
-                    min_interval: a.min_interval,
-                    seeders: a.seeders,
-                    leechers: a.leechers,
-                }),
-                Err(e) => Err(format!("{e:#}")),
-            },
-        });
+    fn finish(mut self, last: LastAnnounce) {
+        self.last = Some(last);
     }
 }
 
@@ -1270,7 +1529,7 @@ impl TrackerComms {
         http_clients: Arc<dyn HttpClients>,
         reachable: Reachable,
         udp_client: UdpTrackerClient,
-    ) -> Option<TrackerTask> {
+    ) -> TrackerTask {
         Self::start_with_tiers(
             info_hashes,
             identity,
@@ -1307,6 +1566,9 @@ impl TrackerComms {
     /// events and failover: a hybrid under v1 and the truncated v2, a v2
     /// torrent under the truncated v2 (libtorrent
     /// `torrent::announce_with_tracker`, one announce per `protocol_version`).
+    ///
+    /// The task runs with no tracker at all, so trackers given later through
+    /// [`TrackerStatus::replace`] are announced to.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_tiers(
         info_hashes: InfoHashes,
@@ -1320,26 +1582,11 @@ impl TrackerComms {
         reachable: Reachable,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
-    ) -> Option<TrackerTask> {
-        let tiers = tiers
-            .into_iter()
-            .filter_map(|urls| {
-                let mut trackers = urls
-                    .into_iter()
-                    .filter_map(SupportedTracker::new)
-                    .collect::<Vec<_>>();
-                if trackers.is_empty() {
-                    return None;
-                }
-                trackers.shuffle(&mut rand::rng());
-                Some(trackers)
-            })
-            .collect::<Vec<_>>();
-        if tiers.is_empty() {
-            debug!(?info_hashes, "trackers list is empty");
-            return None;
+    ) -> TrackerTask {
+        let mut tiers = supported_tiers(tiers);
+        for trackers in &mut tiers {
+            trackers.shuffle(&mut rand::rng());
         }
-
         tracing::trace!(?tiers);
 
         let status = TrackerStatus::new(
@@ -1375,10 +1622,12 @@ impl TrackerComms {
                     list: Mutex::new(TrackerList::new(&tiers, Instant::now())),
                     tracker_ids: Default::default(),
                     status: status.clone(),
+                    poke: tokio::sync::Notify::new(),
                 })
             })
             .collect::<Vec<_>>();
         drop(tx);
+        *status.0.runs.lock() = comms.iter().map(Arc::downgrade).collect();
         let stop_on_drop = comms
             .iter()
             .map(|comms| StopOnDrop {
@@ -1412,10 +1661,33 @@ impl TrackerComms {
             }
         };
 
-        Some(TrackerTask {
+        TrackerTask {
             peers: s.boxed(),
             status,
-        })
+        }
+    }
+
+    /// Writes each tracker's failures and next announce to the table, `now`
+    /// being `at` on the wall clock.
+    fn publish(&self, now: Instant, at: SystemTime) {
+        let list = self.list.lock();
+        self.status.0.announces.send_if_modified(|announces| {
+            let mut modified = false;
+            for entry in &list.entries {
+                let url = entry.tracker.url().as_str();
+                let Some(row) = announces.iter_mut().find(|a| a.url == url) else {
+                    continue;
+                };
+                let asked = entry.start_sent || entry.fails > 0;
+                let next =
+                    asked.then(|| wall(entry.next_announce.max(entry.min_announce), now, at));
+                if (row.fails, row.next_announce) != (entry.fails, next) {
+                    (row.fails, row.next_announce) = (entry.fails, next);
+                    modified = true;
+                }
+            }
+            modified
+        });
     }
 
     /// Announces under this hash until dropped: whatever the tracker list
@@ -1429,12 +1701,27 @@ impl TrackerComms {
         // The announces carry the port as they go out; a tracker that heard
         // another is announced to again (see `Entry::port`).
         let mut port = self.announce_port.clone();
+        // Ends the announce to a tracker that has been removed.
+        let mut aborts: HashMap<SupportedTracker, futures::future::AbortHandle> = HashMap::new();
         loop {
+            aborts.retain(|tracker, abort| {
+                let kept = self.list.lock().position(tracker).is_some();
+                if !kept {
+                    abort.abort();
+                }
+                kept && !abort.is_aborted()
+            });
             let stats = self.stats.get();
             let current = *port.borrow_and_update();
             let due = self.list.lock().start_due(Instant::now(), current, &stats);
             for (tracker, event) in due {
-                in_flight.push(self.announce_regular(tracker, event, stats));
+                let (announce, abort) = futures::future::abortable(self.announce_regular(
+                    tracker.clone(),
+                    event,
+                    stats,
+                ));
+                aborts.insert(tracker, abort);
+                in_flight.push(announce);
             }
             let next_due = self.list.lock().next_due();
             let next_due = async {
@@ -1444,10 +1731,16 @@ impl TrackerComms {
                 }
             };
             tokio::select! {
-                Some((tracker, event, result)) = in_flight.next() => {
-                    self.on_answer(tracker, event, result).await?;
+                Some(answer) = in_flight.next() => {
+                    if let Ok((tracker, peers)) = answer {
+                        aborts.remove(&tracker);
+                        for peer in peers {
+                            self.tx.send(peer).await.context("peer stream closed")?;
+                        }
+                    }
                 }
                 _ = next_due => {}
+                _ = self.poke.notified() => {}
                 Ok(()) = port.changed() => {
                     trace!("announce port changed, announcing early");
                 }
@@ -1462,31 +1755,18 @@ impl TrackerComms {
         }
     }
 
-    /// A regular announce, recorded in the status table.
+    /// A regular announce, its outcome told to the list and recorded in the
+    /// status table; the peers it found.
     async fn announce_regular(
         &self,
         tracker: SupportedTracker,
         event: Option<TrackerRequestEvent>,
         stats: TrackerCommsStats,
-    ) -> (
-        SupportedTracker,
-        Option<TrackerRequestEvent>,
-        anyhow::Result<Announced>,
-    ) {
+    ) -> (SupportedTracker, Vec<SocketAddr>) {
         let in_flight = self.status.begin(&tracker);
         let result = self.announce(&tracker, event, &stats).await;
-        in_flight.finish(&result);
-        (tracker, event, result)
-    }
-
-    async fn on_answer(
-        &self,
-        tracker: SupportedTracker,
-        event: Option<TrackerRequestEvent>,
-        result: anyhow::Result<Announced>,
-    ) -> anyhow::Result<()> {
-        let now = Instant::now();
-        match result {
+        let (now, at) = (Instant::now(), SystemTime::now());
+        let (result, peers) = match result {
             Ok(announced) => {
                 let delay = ReannounceDelay::new(
                     announced.interval,
@@ -1495,17 +1775,27 @@ impl TrackerComms {
                 );
                 debug!(?tracker, ?delay, "tracker answered");
                 self.list.lock().on_success(&tracker, event, now, &delay);
-                for peer in announced.peers {
-                    self.tx.send(peer).await.context("peer stream closed")?;
-                }
+                let ok = AnnounceOk {
+                    interval: announced.interval,
+                    min_interval: announced.min_interval,
+                    seeders: announced.seeders,
+                    leechers: announced.leechers,
+                    downloaded: announced.downloaded,
+                    peers: u32::try_from(announced.peers.len()).unwrap_or(u32::MAX),
+                    warning: announced.warning,
+                };
+                (Ok(ok), announced.peers)
             }
             Err(e) => {
                 debug!(?tracker, "error calling tracker: {e:#}");
                 let retry_interval = Refused::retry_interval(&e);
                 self.list.lock().on_failure(&tracker, now, retry_interval);
+                (Err(AnnounceError::from(&e)), Vec::new())
             }
-        }
-        Ok(())
+        };
+        self.publish(now, at);
+        in_flight.finish(LastAnnounce { at, result });
+        (tracker, peers)
     }
 
     async fn announce(
@@ -1581,6 +1871,11 @@ impl TrackerComms {
             min_interval: response.min_interval,
             seeders: response.complete.map(saturating_u32),
             leechers: response.incomplete.map(saturating_u32),
+            downloaded: response.downloaded.map(saturating_u32),
+            warning: response
+                .warning_message
+                .as_ref()
+                .map(|m| String::from_utf8_lossy(m.as_ref()).into_owned()),
         })
     }
 
@@ -1660,6 +1955,8 @@ impl TrackerComms {
                     min_interval: UDP_MIN_INTERVAL,
                     seeders: Some(response.seeders),
                     leechers: Some(response.leechers),
+                    downloaded: None,
+                    warning: None,
                 })
             }
             Err(e) => {
@@ -1693,10 +1990,10 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{
-        AnnounceOk, AutoScrape, MIN_ANNOUNCE_INTERVAL, Reachable, ReannounceDelay, Refused,
-        ScrapeOk, StoppedAnnounces, SupportedTracker, TrackerAnnounce, TrackerComms,
-        TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape, TrackerTask,
-        UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
+        AnnounceErrorKind, AnnounceOk, AutoScrape, MIN_ANNOUNCE_INTERVAL, Reachable,
+        ReannounceDelay, Refused, ScrapeOk, StoppedAnnounces, SupportedTracker, TrackerAnnounce,
+        TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape,
+        TrackerTask, UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
         udp_tracker_to_socket_addrs,
     };
     use crate::Identity;
@@ -2069,7 +2366,8 @@ mod tests {
             .unwrap()
             .result
             .unwrap_err();
-        assert!(error.contains("sent nothing"), "{error}");
+        assert!(error.message.contains("sent nothing"), "{error}");
+        assert_eq!(error.kind, AnnounceErrorKind::Failed);
         drop(peers);
         stopped.wait_idle().await;
         token.cancel();
@@ -2128,7 +2426,6 @@ mod tests {
             udp_client,
             StoppedAnnounces::default(),
         )
-        .unwrap()
         .peers;
         let first = tokio::select! {
             _ = peers.next() => panic!("the tracker sent no peers"),
@@ -2185,7 +2482,6 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
-        .unwrap()
         .peers;
         let mut announced = Vec::new();
         while announced.len() < 2 {
@@ -2341,7 +2637,6 @@ mod tests {
             udp_client,
             StoppedAnnounces::default(),
         )
-        .unwrap()
         .peers;
         let first = tokio::select! {
             _ = peers.next() => panic!("the tracker sent no peers"),
@@ -2394,7 +2689,6 @@ mod tests {
             udp_client,
             StoppedAnnounces::default(),
         )
-        .unwrap()
         .peers;
         let first = tokio::select! {
             _ = peers.next() => panic!("the tracker sent no peers"),
@@ -2452,7 +2746,6 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
-        .unwrap()
         .peers;
 
         // Drive the peer stream while waiting for the tracker to be called.
@@ -2528,7 +2821,6 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
-        .unwrap()
         .peers;
 
         let q = answer_with_a_peer(
@@ -2575,7 +2867,6 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
-        .unwrap()
         .peers;
 
         let request = tokio::select! {
@@ -2636,7 +2927,6 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
-        .unwrap()
         .peers;
 
         // Drive the peer stream while the tracker answers with `body`.
@@ -2703,7 +2993,6 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
-        .unwrap()
         .peers;
         drop(peers);
         // Never polled, so no tracker heard `started` and none is owed `stopped`.
@@ -2744,8 +3033,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
-        )
-        .unwrap();
+        );
         (task, token)
     }
 
@@ -2768,8 +3056,7 @@ mod tests {
         // Every tracker is listed before any announce goes out.
         let never = |url: &Url| TrackerAnnounce {
             url: url.to_string(),
-            in_flight: false,
-            last: None,
+            ..Default::default()
         };
         assert_eq!(status.announces(), vec![never(&err_url), never(&ok_url)]);
 
@@ -2819,6 +3106,9 @@ mod tests {
                 min_interval: Duration::from_secs(900),
                 seeders: Some(3),
                 leechers: Some(5),
+                downloaded: None,
+                peers: 0,
+                warning: None,
             })
         );
         let error = announce_of(&announces, &err_url)
@@ -2828,7 +3118,8 @@ mod tests {
             .result
             .clone()
             .unwrap_err();
-        assert!(error.contains("nope"), "{error}");
+        assert!(error.message.contains("nope"), "{error}");
+        assert_eq!(error.kind, AnnounceErrorKind::Refused);
 
         // The table outlives the task: the outcomes stay readable.
         drop(peers);
@@ -2858,8 +3149,7 @@ mod tests {
             status.announces(),
             vec![TrackerAnnounce {
                 url: url.to_string(),
-                in_flight: false,
-                last: None,
+                ..Default::default()
             }]
         );
         // `started` was never accepted, so no `stopped` is owed.
@@ -3057,6 +3347,7 @@ mod tests {
             .unwrap()
             .result
             .unwrap_err()
+            .message
     }
 
     #[tokio::test]
@@ -3101,8 +3392,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
-        )
-        .unwrap();
+        );
 
         for url in &forged {
             let e = refusal_of(&status, &mut peers, url).await;
@@ -3233,7 +3523,6 @@ mod tests {
             udp_client,
             StoppedAnnounces::default(),
         )
-        .unwrap()
         .peers;
 
         let (conn, q) = tokio::select! {
@@ -3393,6 +3682,9 @@ mod tests {
                 min_interval: Duration::from_secs(60),
                 seeders: Some(3),
                 leechers: Some(5),
+                downloaded: None,
+                peers: 0,
+                warning: None,
             })
         );
 
@@ -3483,8 +3775,7 @@ mod tests {
             reach_but(vec![loopback], true),
             udp_client,
             stopped.clone(),
-        )
-        .unwrap();
+        );
 
         for (url, why) in &refused {
             let e = refusal_of(&status, &mut peers, url).await;
@@ -3542,8 +3833,7 @@ mod tests {
             reach_but(vec![blocked], true),
             udp_client,
             stopped.clone(),
-        )
-        .unwrap();
+        );
 
         let serve = async {
             let (conn, q) = read_announce(&tracker).await;
@@ -3602,5 +3892,235 @@ mod tests {
             matches!(found, UdpTrackerResolveResult::Two(a, b) if SocketAddr::from(a) == v4 && SocketAddr::from(b) == v6),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn replaced_trackers_keep_what_announcing_to_them_did() {
+        // libtorrent tracker_list::replace orders by tier and drops a
+        // repeated URL; a kept tracker keeps its state here.
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut list = list(&[&["a"], &["b"]], t0);
+        let stats = live(0, 90, false);
+        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+
+        list.replace(
+            &[vec![http("c"), http("a")], vec![http("a"), http("d")]],
+            t0 + s(10),
+        );
+        assert_eq!(order(&list), [http("c"), http("a"), http("d")]);
+        assert_eq!(
+            list.entries.iter().map(|e| e.tier).collect::<Vec<_>>(),
+            [0, 0, 1]
+        );
+        // a is not sent `started` again nor brought forward; c, new, is due.
+        let a = &list.entries[1];
+        assert!(a.start_sent);
+        assert_eq!(a.next_announce, t0 + ANSWERED.regular);
+        assert_eq!(
+            list.start_due(t0 + s(10), None, &stats),
+            [(http("c"), STARTED)]
+        );
+    }
+
+    #[test]
+    fn a_forced_reannounce_is_due_now_and_never_doubles_one_in_flight() {
+        // libtorrent trigger_announce and torrent::announce_tracker_now.
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut list = list(&[&["a"], &["b"]], t0);
+        let stats = live(0, 90, false);
+        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        let delay = ReannounceDelay {
+            floor: s(900),
+            regular: s(1800),
+        };
+        list.on_success(&http("a"), STARTED, t0, &delay);
+
+        // Within a's min interval, a force that respects it waits for it.
+        let t1 = t0 + s(60);
+        assert!(list.force(t1, None, false));
+        assert_eq!(list.start_due(t1, None, &stats), []);
+        assert_eq!(list.next_due(), Some(t0 + s(901)));
+        // Lifting it, a is due now, and once in flight a second force sends
+        // nothing more.
+        assert!(list.force(t1, None, true));
+        assert_eq!(list.start_due(t1, None, &stats), [(http("a"), None)]);
+        assert!(list.force(t1, None, true));
+        assert!(list.force(t1, Some(&http("a")), true));
+        assert_eq!(list.start_due(t1, None, &stats), []);
+
+        // Forced alone, b goes though a works and the walk would stop there.
+        list.on_success(&http("a"), None, t1, &delay);
+        assert!(list.force(t1, Some(&http("b")), true));
+        assert_eq!(list.start_due(t1, None, &stats), [(http("b"), STARTED)]);
+        assert!(!list.force(t1, Some(&http("x")), true));
+    }
+
+    /// Waits, driving `peers`, until the table says `done`.
+    async fn table_once(
+        status: &super::TrackerStatus,
+        peers: &mut (impl futures::Stream<Item = SocketAddr> + Unpin),
+        done: impl Fn(&[TrackerAnnounce]) -> bool,
+    ) -> Vec<TrackerAnnounce> {
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent peers"),
+            r = rx.wait_for(|a| done(a)) => { r.unwrap(); }
+        };
+        status.announces()
+    }
+
+    #[tokio::test]
+    async fn a_forced_reannounce_goes_out_now_and_the_status_follows_each_answer() {
+        // libtorrent torrent::force_tracker_request with ignore_min_interval,
+        // and torrent::tracker_response, tracker_warning and
+        // tracker_request_error for the entry's message, counts and fails.
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        macro_rules! driving {
+            ($f:expr) => {
+                tokio::select! {
+                    _ = peers.next() => panic!("the tracker sent peers"),
+                    r = $f => r,
+                }
+            };
+        }
+
+        // Answered with a warning: working, the warning its message.
+        let (conn, q) = driving!(read_announce(&listener));
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        respond(
+            conn,
+            "d8:completei4e10:downloadedi7e10:incompletei2e8:intervali1800e12:min intervali900e15:warning message4:slow5:peers0:e",
+        )
+        .await;
+        let table = table_once(&status, &mut peers, |a| a[0].last.is_some()).await;
+        let last = table[0].last.clone().unwrap();
+        let ok = last.result.clone().unwrap();
+        assert_eq!(
+            (
+                ok.seeders,
+                ok.leechers,
+                ok.downloaded,
+                ok.warning.as_deref()
+            ),
+            (Some(4), Some(2), Some(7), Some("slow"))
+        );
+        assert_eq!(table[0].fails, 0);
+        assert_eq!(
+            table[0].next_announce,
+            Some(last.at + Duration::from_secs(1800))
+        );
+
+        // Forced, it goes out now, inside the min interval, with no event;
+        // forced again while it waits, nothing more goes out.
+        assert!(status.reannounce(Duration::ZERO, None, true));
+        let (conn, q) = driving!(read_announce(&listener));
+        assert_eq!(query_param(&q, "event"), None);
+        assert!(status.announces()[0].in_flight);
+        assert!(status.reannounce(Duration::ZERO, Some(&url), true));
+
+        // Refused: not working, the reason its message, one failure.
+        respond(conn, "d14:failure reason4:nopee").await;
+        let table = table_once(&status, &mut peers, |a| a[0].fails == 1 && !a[0].in_flight).await;
+        let error = table[0].last.clone().unwrap().result.unwrap_err();
+        assert_eq!(error.kind, AnnounceErrorKind::Refused);
+        assert!(error.message.contains("nope"), "{error}");
+        assert!(table[0].next_announce.is_some());
+
+        // Forced alone, answered again: working, failures cleared.
+        assert!(status.reannounce(Duration::ZERO, Some(&url), true));
+        let (conn, _) = driving!(read_announce(&listener));
+        respond(conn, "d8:intervali1800e5:peers0:e").await;
+        let table = table_once(&status, &mut peers, |a| {
+            a[0].fails == 0 && a[0].last.as_ref().is_some_and(|l| l.result.is_ok())
+        })
+        .await;
+        assert_eq!(table[0].last.clone().unwrap().result.unwrap().warning, None);
+
+        drop(peers);
+        next_announce(&listener).await;
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn trackers_added_replaced_and_removed_change_what_is_announced() {
+        // libtorrent torrent::replace_trackers and add_tracker announce at
+        // once to the trackers the walk now picks.
+        let (a, a_url) = http_listener().await;
+        let (b, b_url) = http_listener().await;
+        let (c, c_url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(Vec::new(), &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        macro_rules! driving {
+            ($f:expr) => {
+                tokio::select! {
+                    _ = peers.next() => panic!("the tracker sent peers"),
+                    r = $f => r,
+                }
+            };
+        }
+        assert_eq!(status.announces(), []);
+
+        // Added to a task with none, a is announced to.
+        status.replace(vec![vec![a_url.clone()]]);
+        let (conn, q) = driving!(read_announce(&a));
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        respond(conn, "d8:intervali1800e5:peers0:e").await;
+        table_once(&status, &mut peers, |t| t[0].last.is_some()).await;
+
+        // b put ahead of it is announced to at once; a, kept, keeps its row.
+        status.replace(vec![vec![b_url.clone()], vec![a_url.clone()]]);
+        let urls = |t: &[TrackerAnnounce]| t.iter().map(|a| a.url.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            urls(&status.announces()),
+            [b_url.to_string(), a_url.to_string()]
+        );
+        assert!(status.announces()[1].last.is_some());
+        let (conn, q) = driving!(read_announce(&b));
+        assert_eq!(query_param(&q, "event"), Some("started"));
+
+        // c replaces b while b's announce waits: it is abandoned, and c,
+        // new, is asked.
+        status.replace(vec![vec![c_url.clone()], vec![a_url.clone()]]);
+        let closed = async {
+            let mut byte = [0u8; 1];
+            loop {
+                conn.readable().await.unwrap();
+                match conn.try_read(&mut byte) {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    read => break read.unwrap_or(0),
+                }
+            }
+        };
+        assert_eq!(driving!(closed), 0, "b's announce ended");
+        let (conn, _) = driving!(read_announce(&c));
+        assert_eq!(
+            urls(&status.announces()),
+            [c_url.to_string(), a_url.to_string()]
+        );
+        respond(conn, "d8:intervali1800e5:peers0:e").await;
+        table_once(&status, &mut peers, |t| t[0].last.is_some()).await;
+
+        // c removed, a alone is left; forced, it hears no second `started`.
+        status.replace(vec![vec![a_url.clone()]]);
+        assert_eq!(urls(&status.announces()), [a_url.to_string()]);
+        assert!(!status.reannounce(Duration::ZERO, Some(&c_url), true));
+        assert!(status.reannounce(Duration::ZERO, None, true));
+        let (conn, q) = driving!(read_announce(&a));
+        assert_eq!(query_param(&q, "event"), None);
+        respond(conn, "d8:intervali1800e5:peers0:e").await;
+
+        drop(peers);
+        next_announce(&a).await;
+        stopped.wait_idle().await;
+        drop((b, c));
+        token.cancel();
     }
 }

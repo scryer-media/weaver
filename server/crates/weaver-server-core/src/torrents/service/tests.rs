@@ -1900,9 +1900,14 @@ async fn a_trackers_status_follows_its_announces() {
     assert_eq!(
         trackers
             .iter()
-            .map(|tracker| (tracker.tier, tracker.url.as_str(), tracker.status))
+            .map(|tracker| (
+                tracker.tier,
+                tracker.url.as_str(),
+                tracker.status,
+                tracker.updating
+            ))
             .collect::<Vec<_>>(),
-        [(0, url.as_str(), TrackerStatus::Updating)]
+        [(0, url.as_str(), TrackerStatus::NotContacted, true)]
     );
 
     // The tracker stops once it has answered.
@@ -1922,8 +1927,9 @@ async fn a_trackers_status_follows_its_announces() {
     .await;
     let working = &trackers[0];
     assert_eq!(working.status, TrackerStatus::Working);
+    assert!(!working.updating);
     assert_eq!((working.seeders, working.leechers), (Some(3), Some(5)));
-    assert_eq!(working.message, None);
+    assert_eq!((working.message.as_deref(), working.fails), (None, 0));
     let at = working.last_announce_ms.unwrap();
     assert_eq!(working.next_announce_ms, Some(at + 1_800_000));
 
@@ -1973,7 +1979,7 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
 
     let mut started = heard_announce(&listener).await;
     let first = updates.next().await;
-    assert_eq!(first[0].trackers[0].status, TrackerStatus::Updating);
+    assert!(first[0].trackers[0].updating);
 
     let body = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
     let head = format!(
@@ -3055,4 +3061,185 @@ async fn file_levels_and_picking_toggles_reach_the_session_and_outlive_a_restart
     let view = again.torrent(job_id).await.unwrap();
     assert!(!view.sequential && view.first_last_piece_first);
     again.stop().await;
+}
+
+// The torrent's trackers as the service lists them: tier and URL.
+async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, String)> {
+    service
+        .trackers(job_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|tracker| (tracker.tier, tracker.url))
+        .collect()
+}
+
+// Added, replaced and removed trackers are written where the torrent's
+// trackers live, reach its session, and are what a restart starts with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tracker_edits_outlive_a_restart() {
+    let a = "http://a.invalid/announce";
+    let b = "http://b.invalid/announce";
+    let c = "udp://c.invalid:80";
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    // Paused, it announces to none of them.
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(announcing(&plain("edited", 3), a)))
+        })
+        .await
+        .unwrap();
+
+    // Added tiers go after the last; a tracker it lists is left out.
+    rig.service
+        .add_trackers(
+            job_id,
+            vec![vec![b.into(), a.into()], vec![], vec![c.into()]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_trackers(&rig.service, job_id).await,
+        [(0, a.into()), (1, b.into()), (2, c.into())]
+    );
+
+    rig.service
+        .replace_trackers(
+            job_id,
+            vec![
+                TrackerEntry {
+                    tier: 1,
+                    url: a.into(),
+                },
+                TrackerEntry {
+                    tier: 0,
+                    url: c.into(),
+                },
+                TrackerEntry {
+                    tier: 0,
+                    url: c.into(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_trackers(&rig.service, job_id).await,
+        [(0, c.into()), (1, a.into())]
+    );
+
+    rig.service
+        .remove_trackers(job_id, &[a.into()])
+        .await
+        .unwrap();
+    assert_eq!(listed_trackers(&rig.service, job_id).await, [(0, c.into())]);
+    assert_eq!(
+        handle_of(&rig.service, job_id)
+            .await
+            .shared()
+            .tracker_tiers(),
+        [vec![weaver_torrent::Url::parse(c).unwrap()]]
+    );
+
+    // An edit naming no URL changes nothing.
+    assert!(matches!(
+        rig.service
+            .add_trackers(job_id, vec![vec!["not a tracker".into()]])
+            .await,
+        Err(ActionError::Invalid(_))
+    ));
+    assert_eq!(
+        rig.service
+            .add_trackers(JobId(9_999), vec![vec![b.into()]])
+            .await,
+        Err(ActionError::NotFound(JobId(9_999)))
+    );
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(listed_trackers(&again, job_id).await, [(0, c.into())]);
+    assert_eq!(
+        handle_of(&again, job_id).await.shared().tracker_tiers(),
+        [vec![weaver_torrent::Url::parse(c).unwrap()]]
+    );
+    again.stop().await;
+}
+
+// A reannounce reaches the tracker now, long before the interval it set
+// is up, for every tracker or for the one named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reannounce_reaches_the_tracker_now() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(announcing(
+            &plain("again", 4),
+            &url,
+        ))))
+        .await
+        .unwrap();
+    let body = b"d8:completei3e10:incompletei5e8:intervali1800e12:min intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let answer = [head.as_bytes(), body].concat();
+    // The announce table once an answer other than `before` has landed.
+    let answered = |before: Option<std::time::SystemTime>| {
+        move |announces: &[TrackerAnnounce]| {
+            !announces[0].in_flight
+                && announces[0]
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.result.is_ok() && Some(last.at) != before)
+        }
+    };
+    let last_at = |service: &TorrentService| {
+        let service = service.clone();
+        async move {
+            handle_of(&service, job_id).await.tracker_announces()[0]
+                .last
+                .as_ref()
+                .map(|last| last.at)
+        }
+    };
+
+    let mut started = heard_announce(&listener).await;
+    started.write_all(&answer).await.unwrap();
+    trackers_once(&rig.service, job_id, answered(None)).await;
+    let first = last_at(&rig.service).await;
+
+    // The tracker asked for 30 minutes between announces.
+    rig.service.reannounce(job_id).await.unwrap();
+    let mut again = heard_announce(&listener).await;
+    again.write_all(&answer).await.unwrap();
+    let second = trackers_once(&rig.service, job_id, answered(first)).await;
+    assert_eq!(second[0].status, TrackerStatus::Working);
+
+    assert!(matches!(
+        rig.service
+            .reannounce_tracker(job_id, "http://other.invalid/announce")
+            .await,
+        Err(ActionError::Invalid(_))
+    ));
+    rig.service.reannounce_tracker(job_id, &url).await.unwrap();
+    let mut once_more = heard_announce(&listener).await;
+    once_more.write_all(&answer).await.unwrap();
+
+    rig.service.dht_announce(job_id).await.unwrap();
+    assert_eq!(
+        rig.service.reannounce(JobId(9_999)).await,
+        Err(ActionError::NotFound(JobId(9_999)))
+    );
+    rig.service.stop().await;
 }

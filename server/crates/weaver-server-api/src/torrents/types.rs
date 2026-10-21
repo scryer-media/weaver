@@ -5,7 +5,7 @@ use async_graphql::{Enum, InputObject, SimpleObject};
 use weaver_server_core::torrents::service::{ScheduleSeeding, SeedingSource, TorrentView};
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TorrentVersion, TrackerStatus,
+    TorrentTracker, TorrentVersion, TrackerEntry, TrackerStatus,
 };
 
 use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
@@ -63,9 +63,10 @@ impl From<TorrentVersion> for TorrentVersionGql {
 #[graphql(name = "TrackerStatus")]
 pub enum TrackerStatusGql {
     NotContacted,
-    Updating,
     Working,
     NotWorking,
+    TrackerError,
+    Unreachable,
     Disabled,
 }
 
@@ -73,9 +74,10 @@ impl From<TrackerStatus> for TrackerStatusGql {
     fn from(status: TrackerStatus) -> Self {
         match status {
             TrackerStatus::NotContacted => Self::NotContacted,
-            TrackerStatus::Updating => Self::Updating,
             TrackerStatus::Working => Self::Working,
             TrackerStatus::NotWorking => Self::NotWorking,
+            TrackerStatus::TrackerError => Self::TrackerError,
+            TrackerStatus::Unreachable => Self::Unreachable,
             TrackerStatus::Disabled => Self::Disabled,
         }
     }
@@ -178,11 +180,21 @@ pub struct TorrentTrackerGql {
     pub tier: u32,
     pub url: String,
     pub status: TrackerStatusGql,
+    /// An announce to it is in flight.
+    pub updating: bool,
     pub message: Option<String>,
     pub seeders: Option<u32>,
     pub leechers: Option<u32>,
+    /// The completed downloads it last counted.
+    pub downloaded: Option<u32>,
+    /// The peers its last answer named.
+    pub peers: Option<u32>,
+    /// Announces to it that failed in a row.
+    pub fails: u32,
     pub last_announce_ms: Option<i64>,
     pub next_announce_ms: Option<i64>,
+    /// The earliest the tracker takes the next announce.
+    pub min_announce_ms: Option<i64>,
 }
 
 impl From<TorrentTracker> for TorrentTrackerGql {
@@ -191,11 +203,33 @@ impl From<TorrentTracker> for TorrentTrackerGql {
             tier: tracker.tier,
             url: tracker.url,
             status: tracker.status.into(),
+            updating: tracker.updating,
             message: tracker.message,
             seeders: tracker.seeders,
             leechers: tracker.leechers,
+            downloaded: tracker.downloaded,
+            peers: tracker.peers,
+            fails: tracker.fails,
             last_announce_ms: tracker.last_announce_ms,
             next_announce_ms: tracker.next_announce_ms,
+            min_announce_ms: tracker.min_announce_ms,
+        }
+    }
+}
+
+/// A tracker in a torrent's list, by tier.
+#[derive(Clone, Debug, InputObject)]
+#[graphql(name = "TorrentTrackerInput")]
+pub struct TorrentTrackerInput {
+    pub tier: u32,
+    pub url: String,
+}
+
+impl From<TorrentTrackerInput> for TrackerEntry {
+    fn from(input: TorrentTrackerInput) -> Self {
+        Self {
+            tier: input.tier,
+            url: input.url,
         }
     }
 }
