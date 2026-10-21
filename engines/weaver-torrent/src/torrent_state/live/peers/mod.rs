@@ -44,6 +44,7 @@ use super::peer::{
 };
 
 pub mod availability;
+pub(crate) mod holepunch;
 pub mod stats;
 mod super_seed;
 
@@ -570,7 +571,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::torrent_state::live::peer::{MAX_FAILCOUNT, MIN_RECONNECT_TIME};
+    use crate::torrent_state::live::peer::{MAX_FAILCOUNT, MAX_PEX_PEERS, MIN_RECONNECT_TIME};
 
     const TOTAL_PIECES: usize = 8;
 
@@ -1220,5 +1221,103 @@ mod tests {
         let tcp = peer_addr(3);
         peers.add_refused_incoming(tcp, ConnectionKind::Tcp);
         assert_eq!(state_of(&peers, tcp), None);
+    }
+
+    // libtorrent `bt_peer_connection::on_holepunch`, `connect`: the peer is
+    // added or found and connected to at once (`torrent::connect_to_peer`),
+    // whatever its failures, unless it is connected or banned; holepunch
+    // mode ends with the connection.
+    #[test]
+    fn a_holepunched_peer_is_connected_to_next_whatever_its_failures() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let fresh = peer_addr(1);
+        let failed = peer_addr(2);
+        peers.add_peer(fresh);
+        peers.add_peer(failed);
+        let last = fail_out(&peers, failed, t0);
+        assert_eq!(state_of(&peers, failed), Some("dead"));
+
+        peers.holepunch(failed);
+        assert_eq!(state_of(&peers, failed), Some("queued"));
+        assert_eq!(peers.next_candidate(last), NextCandidate::Due);
+        assert_eq!(
+            peers.connect_next(last).map(|(addr, ..)| addr),
+            Some(failed)
+        );
+        assert_eq!(state_of(&peers, failed), Some("connecting"));
+
+        // The holepunched connection fails too: the peer is out again.
+        peers
+            .with_peer_mut(failed, "test", |peer| {
+                assert!(peer.holepunched());
+                peers.connection_closed(peer, Some(last), true);
+                assert!(!peer.holepunched());
+            })
+            .unwrap();
+        assert_eq!(state_of(&peers, failed), Some("dead"));
+
+        // A peer we do not know joins, due now.
+        let unknown = peer_addr(3);
+        peers.holepunch(unknown);
+        assert_eq!(state_of(&peers, unknown), Some("queued"));
+        assert_eq!(
+            peers.connect_next(last).map(|(addr, ..)| addr),
+            Some(unknown)
+        );
+
+        // A connected peer, or a banned one, is left as it is.
+        let (live, _rx) = add_live_peer(&peers, "10.0.1.1:6881");
+        peers.holepunch(live);
+        assert_eq!(state_of(&peers, live), Some("live"));
+        let banned = peer_addr(4);
+        peers.ban(banned);
+        peers.holepunch(banned);
+        assert_eq!(state_of(&peers, banned), None);
+    }
+
+    // libtorrent `ut_pex_plugin` keeps what a connection's PEX named, the
+    // added less the dropped, at most `max_pex_peers` of each family;
+    // `torrent::find_introducer` asks a connected holepunch peer whose PEX
+    // named the address.
+    #[test]
+    fn the_introducer_is_a_holepunch_peer_whose_pex_named_the_address() {
+        let peers = make_peer_states();
+        let target = peer_addr(1);
+        let (named, _named_rx) = add_live_peer(&peers, "10.0.1.1:6881");
+        let (speaks, _speaks_rx) = add_live_peer(&peers, "10.0.1.2:6881");
+        peers.with_live_mut(named, "test", |live| {
+            live.pex_named([target].into_iter(), std::iter::empty())
+        });
+        assert!(peers.introducer(target).is_none());
+
+        peers.with_live_mut(speaks, "test", |live| {
+            live.supports_holepunch = true;
+            live.pex_named([target].into_iter(), std::iter::empty());
+        });
+        assert!(peers.introducer(target).is_some());
+        peers.with_live_mut(speaks, "test", |live| {
+            live.pex_named(std::iter::empty(), [target].into_iter())
+        });
+        assert!(peers.introducer(target).is_none());
+
+        let v4 = (0..300).map(peer_addr);
+        let v6 = (0..300).map(|i| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, i], 6881)));
+        peers.with_live_mut(speaks, "test", |live| {
+            live.pex_named(v4.chain(v6), std::iter::empty());
+            let kept = |v4| {
+                (0..300)
+                    .filter(|&i| {
+                        let addr = if v4 {
+                            peer_addr(i)
+                        } else {
+                            SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16], 6881))
+                        };
+                        live.was_introduced(addr)
+                    })
+                    .count()
+            };
+            assert_eq!((kept(true), kept(false)), (MAX_PEX_PEERS, MAX_PEX_PEERS));
+        });
     }
 }

@@ -231,6 +231,8 @@ pub struct Session {
     pub peer_limit: Option<usize>,
     pub(crate) unchoke_slots_limit: usize,
     pub(crate) disable_pex: bool,
+    // Whether the session listens on uTP, and so connects over it.
+    pub(crate) utp: bool,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -1085,6 +1087,9 @@ impl Session {
                     listen_result.as_ref().and_then(|l| l.announce_port),
                 )),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
+                utp: listen_result
+                    .as_ref()
+                    .is_some_and(|l| l.utp_socket.is_some()),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
                 connector: stream_connector,

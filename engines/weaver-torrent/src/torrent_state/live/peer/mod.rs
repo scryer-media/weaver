@@ -40,6 +40,9 @@ pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
+// libtorrent `max_pex_peers`: the most peers of each address family a
+// connection's PEX messages are remembered to have named.
+pub(crate) const MAX_PEX_PEERS: usize = 200;
 
 // libtorrent `settings_pack::allowed_fast_set_size`: how many pieces a peer
 // may fetch while we choke it.
@@ -198,6 +201,13 @@ pub(crate) struct Peer {
     pub last_optimistic_unchoke: Option<Instant>,
     // What the pieces it took part in say of it.
     trust: Trust,
+    // A PEX message said the peer speaks the holepunch extension
+    // (libtorrent `torrent_peer::supports_holepunch`).
+    pub supports_holepunch: bool,
+    // A holepunch introduced us: we connect to the peer now, whatever its
+    // failures, until the connection closes (libtorrent
+    // `peer_connection::set_holepunch_mode`, `torrent::connect_to_peer`).
+    holepunch: bool,
 }
 
 impl Peer {
@@ -223,6 +233,8 @@ impl Peer {
             last_failed: None,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
+            supports_holepunch: false,
+            holepunch: false,
         }
     }
 
@@ -238,14 +250,26 @@ impl Peer {
             last_failed: None,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
+            supports_holepunch: false,
+            holepunch: false,
+        }
+    }
+
+    /// A peer a holepunch introduced us to, at `addr`. The peer list counts
+    /// it on admission.
+    pub fn new_holepunched(addr: SocketAddr) -> Self {
+        Self {
+            holepunch: true,
+            ..Self::new_with_outgoing_address(addr)
         }
     }
 
     // The state of a peer we want and are not connected to. A banned peer is
-    // no connect candidate (libtorrent `peer_list::is_connect_candidate`).
+    // no connect candidate (libtorrent `peer_list::is_connect_candidate`); a
+    // holepunched one is, whatever its failures.
     fn idle_state(&self, peers: &PeerStates) -> PeerState {
         if self.outgoing_address == Some(self.addr)
-            && self.failcount < MAX_FAILCOUNT
+            && (self.failcount < MAX_FAILCOUNT || self.holepunch)
             && !peers.is_banned(self.addr.ip())
         {
             PeerState::Queued
@@ -259,16 +283,40 @@ impl Peer {
     }
 
     /// The earliest time we may connect to the peer: `(failcount + 1)`
-    /// reconnect times after its last failure. None when it never failed.
+    /// reconnect times after its last failure. None when it never failed,
+    /// or a holepunch introduced it.
     pub(crate) fn reconnect_at(&self) -> Option<Instant> {
         let wait = MIN_RECONNECT_TIME.saturating_mul(self.failcount.saturating_add(1));
-        self.last_failed.map(|at| at + wait)
+        self.last_failed
+            .filter(|_| !self.holepunch)
+            .map(|at| at + wait)
     }
 
     /// Where the peer stands among connect candidates due together; the lowest
-    /// goes first: the fewest failures in a row, then the oldest failure.
-    pub(crate) fn connect_rank(&self) -> (u32, Option<Instant>) {
-        (self.failcount, self.last_failed)
+    /// goes first: a holepunched peer, then the fewest failures in a row,
+    /// then the oldest failure.
+    pub(crate) fn connect_rank(&self) -> (bool, u32, Option<Instant>) {
+        (!self.holepunch, self.failcount, self.last_failed)
+    }
+
+    /// Whether a holepunch introduced the peer and the connection it asked
+    /// for has not closed.
+    pub(crate) fn holepunched(&self) -> bool {
+        self.holepunch
+    }
+
+    /// A holepunch introduced the peer: unless we are connected or
+    /// connecting to it, we connect to it at `addr` next, whatever its
+    /// failures (libtorrent `bt_peer_connection::on_holepunch`, `connect`).
+    /// Returns whether it is a connect candidate now.
+    pub(crate) fn holepunch(&mut self, peers: &PeerStates) -> bool {
+        if matches!(self.state, PeerState::Connecting(_) | PeerState::Live(_)) {
+            return false;
+        }
+        self.holepunch = true;
+        self.outgoing_address = Some(self.addr);
+        self.set_state(self.idle_state(peers), peers);
+        self.is_connect_candidate()
     }
 
     /// Whether the peer is a connect candidate we may connect to at `now`.
@@ -304,6 +352,7 @@ impl Peer {
             self.failcount = self.failcount.saturating_add(1);
             self.last_failed = Some(at);
         }
+        self.holepunch = false;
         let next = if needed {
             self.idle_state(counters)
         } else {
@@ -593,6 +642,15 @@ pub(crate) struct LivePeerState {
     // (libtorrent `peer_connection::m_superseed_piece`).
     pub super_seeded: Option<ValidPieceIndex>,
 
+    // The peer's extended handshake names ut_holepunch (libtorrent
+    // `bt_peer_connection::m_holepunch_id`).
+    pub supports_holepunch: bool,
+
+    // The peers its PEX messages named and have not dropped since, at most
+    // MAX_PEX_PEERS of each address family (libtorrent `ut_pex_plugin`'s
+    // `m_peers`, `m_peers6`).
+    pex_named: HashSet<SocketAddr>,
+
     // The main channel to send requests to peer.
     pub tx: PeerTx,
 
@@ -655,6 +713,8 @@ impl LivePeerState {
             upload_queue: Default::default(),
             invalid_requests: 0,
             super_seeded: None,
+            supports_holepunch: false,
+            pex_named: HashSet::new(),
             tx,
             connection_kind,
             fast: false,
@@ -662,6 +722,35 @@ impl LivePeerState {
             allowed_fast_from_peer: Vec::new(),
             suggested: Vec::new(),
         }
+    }
+
+    /// A PEX message from the peer named `added` and dropped `dropped`
+    /// (libtorrent `ut_pex_peer_plugin::on_extended`): the dropped go, then
+    /// the added come while their family has room.
+    pub fn pex_named(
+        &mut self,
+        added: impl Iterator<Item = SocketAddr>,
+        dropped: impl Iterator<Item = SocketAddr>,
+    ) {
+        for addr in dropped {
+            self.pex_named.remove(&addr);
+        }
+        for addr in added {
+            let family = self
+                .pex_named
+                .iter()
+                .filter(|a| a.is_ipv4() == addr.is_ipv4())
+                .count();
+            if family < MAX_PEX_PEERS {
+                self.pex_named.insert(addr);
+            }
+        }
+    }
+
+    /// Whether the peer's PEX messages named `addr` and have not dropped it
+    /// (libtorrent `ut_pex_peer_store::was_introduced_by`).
+    pub fn was_introduced(&self, addr: SocketAddr) -> bool {
+        self.pex_named.contains(&addr)
     }
 
     pub fn has_full_torrent(&self, total_pieces: usize) -> bool {

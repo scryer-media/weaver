@@ -2355,3 +2355,185 @@ async fn a_torrent_that_is_not_a_seed_does_not_super_seed() {
     assert!((&peer).should_send_bitfield());
     assert_eq!(told_have(&mut rx), [] as [u32; 0]);
 }
+
+impl Harness {
+    /// A live peer at `addr` whose extended handshake names ut_holepunch
+    /// when `holepunch` holds, and the queue of what we send it.
+    fn holepunch_peer(&self, addr: &str, holepunch: bool) -> (PeerHandler, PeerRx) {
+        let (peer, rx) = self.peer(addr);
+        let mut hs = ExtendedHandshake::new();
+        hs.m.ut_holepunch = holepunch.then_some(9);
+        (&peer).on_extended_handshake(&hs).unwrap();
+        (peer, rx)
+    }
+}
+
+/// The holepunch messages we queued for the peer since last asked, draining
+/// its queue.
+fn holepunch_sent(rx: &mut PeerRx) -> Vec<UtHolepunch> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|r| match r {
+            WriterRequest::Message(Message::Extended(ExtendedMessage::UtHolepunch(m))) => Some(m),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn send_holepunch(peer: &PeerHandler, msg: UtHolepunch) {
+    peer.on_received_message(Message::Extended(ExtendedMessage::UtHolepunch(msg)))
+        .await
+        .unwrap();
+}
+
+fn sock(addr: &str) -> SocketAddr {
+    addr.parse().unwrap()
+}
+
+/// An address on 127.0.0.1 nothing listens on, so a connection to it fails.
+fn closed_port() -> SocketAddr {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+// libtorrent `bt_peer_connection::write_extensions` names ut_holepunch on
+// every connection.
+#[tokio::test]
+async fn every_connection_advertises_ut_holepunch() {
+    let h = Harness::new("holepunch_advertised").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    assert_eq!(
+        h.advertised(&peer).ut_holepunch,
+        Some(MY_EXTENDED_UT_HOLEPUNCH)
+    );
+}
+
+// libtorrent `bt_peer_connection::on_holepunch`, `rendezvous`: the sender
+// is told to connect to the target, the target to the sender.
+#[tokio::test]
+async fn a_rendezvous_tells_each_peer_to_connect_to_the_other() {
+    let h = Harness::new("holepunch_rendezvous").await;
+    let (a, mut a_rx) = h.holepunch_peer("203.0.113.1:6881", true);
+    let (_b, mut b_rx) = h.holepunch_peer("203.0.113.2:6881", true);
+    send_holepunch(&a, UtHolepunch::Rendezvous(sock("203.0.113.2:6881"))).await;
+    assert_eq!(
+        holepunch_sent(&mut a_rx),
+        [UtHolepunch::Connect(sock("203.0.113.2:6881"))]
+    );
+    assert_eq!(
+        holepunch_sent(&mut b_rx),
+        [UtHolepunch::Connect(sock("203.0.113.1:6881"))]
+    );
+}
+
+// libtorrent `bt_peer_connection::on_holepunch`, `rendezvous`: not
+// connected, no support and no self are errors back to the sender; a local
+// peer and one that is not are not introduced; and a peer that did not
+// advertise the extension is not heard.
+#[tokio::test]
+async fn a_rendezvous_that_cannot_be_made_is_refused_or_ignored() {
+    use ut_holepunch::error::{NO_SELF, NO_SUPPORT, NOT_CONNECTED};
+    let h = Harness::new("holepunch_refused").await;
+    let (a, mut a_rx) = h.holepunch_peer("203.0.113.1:6881", true);
+    let (_mute, mut mute_rx) = h.holepunch_peer("203.0.113.2:6881", false);
+    let (_local, mut local_rx) = h.holepunch_peer("192.168.1.2:6881", true);
+    let (deaf, mut deaf_rx) = h.holepunch_peer("203.0.113.3:6881", false);
+
+    for (target, code) in [
+        ("203.0.113.9:6881", NOT_CONNECTED),
+        ("203.0.113.2:6881", NO_SUPPORT),
+        ("203.0.113.1:6881", NO_SELF),
+    ] {
+        send_holepunch(&a, UtHolepunch::Rendezvous(sock(target))).await;
+        assert_eq!(
+            holepunch_sent(&mut a_rx),
+            [UtHolepunch::Error(sock(target), code)]
+        );
+    }
+    send_holepunch(&a, UtHolepunch::Rendezvous(sock("192.168.1.2:6881"))).await;
+    assert_eq!(holepunch_sent(&mut a_rx), []);
+    assert_eq!(holepunch_sent(&mut local_rx), []);
+    assert_eq!(holepunch_sent(&mut mute_rx), []);
+
+    send_holepunch(&deaf, UtHolepunch::Rendezvous(sock("203.0.113.1:6881"))).await;
+    assert_eq!(holepunch_sent(&mut deaf_rx), []);
+    assert_eq!(holepunch_sent(&mut a_rx), []);
+}
+
+// libtorrent `bt_peer_connection::on_holepunch`, `connect`: we connect to
+// the peer over uTP, so a session without uTP takes no connect; a local
+// address is taken only from a local peer.
+#[tokio::test]
+async fn a_connect_admits_the_peer_only_over_utp_and_a_local_one_only_from_a_local_peer() {
+    let target = closed_port();
+    let without = Harness::new("holepunch_connect_no_utp").await;
+    let (from, _rx) = without.holepunch_peer("127.0.0.1:6881", true);
+    send_holepunch(&from, UtHolepunch::Connect(target)).await;
+    assert!(!without.knows(&target.to_string()));
+
+    let opts = SessionOptions {
+        listen: Some(crate::ListenerOptions {
+            mode: crate::ListenerMode::UtpOnly,
+            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            ..Default::default()
+        }),
+        ..isolated_session_opts(false)
+    };
+    let with = Harness::build_on(
+        "holepunch_connect_utp",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let (remote, _remote_rx) = with.holepunch_peer("203.0.113.1:6881", true);
+    send_holepunch(&remote, UtHolepunch::Connect(target)).await;
+    assert!(!with.knows(&target.to_string()));
+
+    let (from, _rx) = with.holepunch_peer("127.0.0.1:6881", true);
+    send_holepunch(&from, UtHolepunch::Connect(target)).await;
+    assert!(with.knows(&target.to_string()));
+}
+
+/// A PEX message naming `addr` with `flags`.
+fn pex_flagged(addr: SocketAddr, flags: u8) -> Vec<u8> {
+    let SocketAddr::V4(v4) = addr else {
+        panic!("an IPv4 address")
+    };
+    let mut b = b"d5:added6:".to_vec();
+    b.extend_from_slice(&v4.ip().octets());
+    b.extend_from_slice(&v4.port().to_be_bytes());
+    b.extend_from_slice(b"7:added.f1:");
+    b.push(flags);
+    b.push(b'e');
+    b
+}
+
+// libtorrent `peer_connection::connect_failed`: a failed connection to a
+// peer PEX flagged as speaking the holepunch extension sends a rendezvous
+// for it to `torrent::find_introducer`, a holepunch peer whose PEX named it.
+#[tokio::test]
+async fn a_failed_connection_asks_the_peer_whose_pex_named_it_to_introduce_us() {
+    let h = Harness::new("holepunch_introducer").await;
+    let (introducer, mut rx) = h.holepunch_peer("127.0.0.1:6881", true);
+    let target = closed_port();
+    let msg = pex_flagged(target, peers::holepunch::PEX_HOLEPUNCH);
+    let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&msg).unwrap();
+    // The PEX is taken in before the connect loop runs: the test runs on
+    // one thread and yields only below.
+    (&introducer)
+        .on_received_message(Message::Extended(ExtendedMessage::UtPex(msg)))
+        .await
+        .unwrap();
+    assert!(h.knows(&target.to_string()));
+
+    // The connect loop connects to the target, which refuses.
+    let sent = loop {
+        match rx.recv().await.unwrap() {
+            WriterRequest::Message(Message::Extended(ExtendedMessage::UtHolepunch(m))) => break m,
+            _ => continue,
+        }
+    };
+    assert_eq!(sent, UtHolepunch::Rendezvous(target));
+}

@@ -78,10 +78,11 @@ use crate::core::{
     torrent_metainfo::ValidatedTorrentMetaV1Info,
 };
 use crate::peer_protocol::{
-    Handshake, Message, Piece, Request,
+    Handshake, MY_EXTENDED_UT_HOLEPUNCH, Message, Piece, Request,
     extended::{
         self, ExtendedMessage,
         handshake::ExtendedHandshake,
+        ut_holepunch::{self, UtHolepunch},
         ut_metadata::{UtMetadata, UtMetadataData},
         ut_pex::UtPex,
     },
@@ -121,7 +122,7 @@ use self::{
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
         },
     },
-    peers::{IncomingRefused, PeerStates},
+    peers::{IncomingRefused, PeerStates, holepunch::is_local},
     smart_ban::SmartBan,
     stats::{atomic::AtomicStats, snapshot::StatsSnapshot},
     web_seed::{SeedLink, WEB_SEED_TICK, WebSeedConnection},
@@ -242,6 +243,9 @@ pub struct TorrentStateLive {
     super_seeding: bool,
     // The torrent's files as its web seeds serve them.
     web_layout: web_seed::Layout,
+
+    // Whether the session connects over uTP, which a holepunch needs.
+    utp: bool,
 }
 
 // A block a peer asked for, on its way through the upload rate limits to the
@@ -317,6 +321,7 @@ impl TorrentStateLive {
             super_seeding: paused.shared.options.super_seeding
                 && have_bytes == lengths.total_length(),
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
+            utp: session.utp,
         });
 
         state.spawn(
@@ -952,6 +957,14 @@ impl TorrentStateLive {
         }
     }
 
+    /// A holepunch asks us to connect to `addr`: over uTP, so only when we
+    /// speak it (libtorrent `bt_peer_connection::on_holepunch`, `connect`).
+    fn holepunch(&self, addr: SocketAddr) {
+        if self.utp && self.may_connect_to(addr) {
+            self.peers.holepunch(addr);
+        }
+    }
+
     pub fn stats_snapshot(&self) -> StatsSnapshot {
         use Ordering::*;
         let downloaded_bytes = self.stats.downloaded_and_checked_bytes.load(Relaxed);
@@ -1392,6 +1405,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                         })?;
                 }
             }
+            Message::Extended(ExtendedMessage::UtHolepunch(msg)) => self.on_holepunch(msg),
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.pex {
                     self.on_pex_message(pex);
@@ -1490,6 +1504,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                     live.client_name = Some(client_name);
                 });
         }
+        self.state
+            .peers
+            .with_live_mut(self.addr, "update peer holepunch support", |live| {
+                live.supports_holepunch = hs.m.ut_holepunch.is_some();
+            });
 
         if let Some(reqq) = hs.reqq.and_then(|reqq| usize::try_from(reqq).ok())
             && reqq > 0
@@ -1566,6 +1585,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             handshake.metadata_size = Some(len);
         }
         handshake.m.ut_pex = handshake.m.ut_pex.filter(|_| self.state.pex);
+        // Every connection speaks it; we act on `connect` only over uTP
+        // (libtorrent `bt_peer_connection::write_extensions`).
+        handshake.m.ut_holepunch = Some(MY_EXTENDED_UT_HOLEPUNCH);
 
         Ok(())
     }
@@ -1610,6 +1632,71 @@ impl PeerHandler {
         }
         self.send_dht_port();
     }
+
+    /// A holepunch message (BEP 55), from a peer that advertised the
+    /// extension; from one that did not it is ignored (libtorrent
+    /// `bt_peer_connection::on_holepunch`).
+    fn on_holepunch(&self, msg: UtHolepunch) {
+        let supported = self
+            .state
+            .peers
+            .with_live(self.addr, |live| live.supports_holepunch)
+            .unwrap_or(false);
+        if !supported {
+            debug!(
+                ?msg,
+                "holepunch message from a peer that did not advertise it, ignoring"
+            );
+            return;
+        }
+        match msg {
+            UtHolepunch::Rendezvous(target) => self.on_rendezvous(target),
+            // A local address is taken only from a local peer.
+            UtHolepunch::Connect(addr) => {
+                if !is_local(addr.ip()) || is_local(self.addr.ip()) {
+                    self.state.holepunch(addr);
+                }
+            }
+            UtHolepunch::Error(addr, code) => {
+                debug!(?addr, code, "the peer could not introduce us");
+            }
+        }
+    }
+
+    /// The peer asks us to introduce it to the peer at `target`: when we are
+    /// connected to that peer and it speaks the extension, each is told to
+    /// connect to the other; else the peer is told why not. A local peer and
+    /// one that is not are never introduced (libtorrent
+    /// `bt_peer_connection::on_holepunch`, `rendezvous`).
+    fn on_rendezvous(&self, target: SocketAddr) {
+        let send = |tx: &PeerTx, msg: UtHolepunch| {
+            let _ = tx.send(WriterRequest::Message(Message::Extended(
+                ExtendedMessage::UtHolepunch(msg),
+            )));
+        };
+        let found = self
+            .state
+            .peers
+            .with_live(target, |live| (live.supports_holepunch, live.tx.clone()));
+        let refused = match &found {
+            None => Some(ut_holepunch::error::NOT_CONNECTED),
+            Some((false, _)) => Some(ut_holepunch::error::NO_SUPPORT),
+            Some(_) if target == self.addr => Some(ut_holepunch::error::NO_SELF),
+            Some(_) => None,
+        };
+        if let Some(code) = refused {
+            send(&self.tx, UtHolepunch::Error(target, code));
+            return;
+        }
+        if is_local(target.ip()) != is_local(self.addr.ip()) {
+            debug!(?target, "not introducing a local peer to one that is not");
+            return;
+        }
+        if let Some((_, target_tx)) = found {
+            send(&self.tx, UtHolepunch::Connect(target));
+            send(&target_tx, UtHolepunch::Connect(self.addr));
+        }
+    }
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
         let peers = &self.state.peers;
         let handle = self.addr;
@@ -1625,6 +1712,13 @@ impl PeerHandler {
                 return Ok(());
             }
         };
+        // A connection to a peer that speaks the holepunch extension failed,
+        // and no holepunch asked for it: a peer that can introduce us is
+        // asked to (libtorrent `peer_connection::connect_failed`).
+        let rendezvous = matches!(pe.value().get_state(), PeerState::Connecting(_))
+            && error.is_some()
+            && pe.value().supports_holepunch
+            && !pe.value().holepunched();
         let prev = pe.value_mut().take_state(peers);
         self.state.layer_fetch.forget(handle);
 
@@ -1692,6 +1786,11 @@ impl PeerHandler {
         peers.connection_closed(pe.value_mut(), failed_at, needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
         drop(pe);
+        if rendezvous && let Some(introducer) = peers.introducer(handle) {
+            let _ = introducer.send(WriterRequest::Message(Message::Extended(
+                ExtendedMessage::UtHolepunch(UtHolepunch::Rendezvous(handle)),
+            )));
+        }
         if let Some(held_slot) = held_slot {
             self.state.choker.peer_gone(handle, held_slot);
         }
@@ -2683,7 +2782,17 @@ impl PeerHandler {
         // A dropped peer is one the sender lost; only the added ones are news.
         for peer in msg.added_peers() {
             self.state.add_peer(peer.addr);
+            self.state.peers.pex_flags(peer.addr, peer.flags);
         }
+        // What the sender named, so it can introduce us to those peers.
+        self.state
+            .peers
+            .with_live_mut(self.addr, "pex_named", |live| {
+                live.pex_named(
+                    msg.added_peers().map(|p| p.addr),
+                    msg.dropped_peers().map(|p| p.addr),
+                )
+            });
     }
 
     fn is_choked(&self) -> bool {
