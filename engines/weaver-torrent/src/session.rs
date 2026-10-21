@@ -27,7 +27,7 @@ use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
     spawn_utils::spawn_with_cancel,
-    torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info},
+    torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
 };
 use crate::dht::{
     Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr,
@@ -35,6 +35,7 @@ use crate::dht::{
 use crate::lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
 use crate::natpmp::{NATPMP_PORT, NatPmpMapper};
 use crate::peer_protocol::Handshake;
+use crate::torrent_state::live::web_seed::WebSeeds;
 use crate::tracker::{AutoScrape, StoppedAnnounces, TrackerComms, UdpTrackerClient};
 use crate::upnp::{
     PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, UpnpPortForwarder,
@@ -192,7 +193,7 @@ pub struct Session {
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
-    reqwest_client: reqwest::Client,
+    pub(crate) reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
     stopped_announces: StoppedAnnounces,
@@ -366,6 +367,11 @@ pub struct AddTorrentOptions {
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
+    /// Web seeds beside those the torrent names; a magnet link's `ws` join
+    /// them (libtorrent `add_torrent_params::url_seeds`).
+    #[serde(default)]
+    pub web_seeds: Vec<WebSeed>,
+
     /// Max concurrent connected peers.
     pub peer_limit: Option<usize>,
 
@@ -434,6 +440,7 @@ impl Default for AddTorrentOptions {
             disable_trackers: false,
             ratelimits: LimitsConfig::default(),
             initial_peers: None,
+            web_seeds: Vec::new(),
             peer_limit: None,
             preferred_id: None,
             storage_factory: None,
@@ -1515,6 +1522,11 @@ impl Session {
                     opts.initial_peers
                         .get_or_insert_default()
                         .extend(magnet.peers.iter().copied());
+                    opts.web_seeds
+                        .extend(magnet.web_seeds.iter().map(|url| WebSeed {
+                            url: url.clone(),
+                            kind: WebSeedKind::Url,
+                        }));
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
                         if opts.only_files.is_none() {
@@ -1820,6 +1832,7 @@ impl Session {
                 client_name_and_version: identity.version.clone(),
                 user_agent: identity.user_agent.clone(),
                 last_run: Default::default(),
+                web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
             });
 
             let initializing = Arc::new(TorrentStateInitializing::new(

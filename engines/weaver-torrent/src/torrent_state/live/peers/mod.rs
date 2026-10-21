@@ -8,13 +8,19 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use crate::core::{hash_id::Id20, lengths::ValidPieceIndex};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
-use tokio::{sync::Notify, time::Instant};
+use tokio::{
+    sync::{Notify, mpsc::unbounded_channel},
+    time::Instant,
+};
 use tracing::warn;
 
 use crate::{
@@ -29,6 +35,8 @@ use self::{
     availability::Availability,
     stats::{AggregatePeerStats, AggregatePeerStatsAtomic},
 };
+
+use super::web_seed::is_web_seed;
 
 use super::peer::{
     EraseRank, IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx,
@@ -68,6 +76,10 @@ pub(crate) struct PeerStates {
     // Held while a piece is handed to a peer to super-seed, so two peers
     // are not handed one piece at once.
     super_seeding: Mutex<()>,
+    // How many of `states` are web seeds, which are not on the peer list:
+    // libtorrent keeps a web seed's peer in its `web_seed_t`, so it counts
+    // against no `max_peerlist_size`.
+    web_seeds: AtomicUsize,
 }
 
 /// What a newcomer may push out of a full peer list.
@@ -132,6 +144,7 @@ impl PeerStates {
             banned: Default::default(),
             candidates_changed: Notify::new(),
             super_seeding: Mutex::new(()),
+            web_seeds: AtomicUsize::new(0),
         }
     }
 
@@ -250,7 +263,7 @@ impl PeerStates {
         let Some(peer) = newcomer() else {
             return Admitted::Refused;
         };
-        if self.states.len() >= MAX_PEERLIST_SIZE && !self.erase_one(displace) {
+        if self.listed() >= MAX_PEERLIST_SIZE && !self.erase_one(displace) {
             return Admitted::Refused;
         }
         self.count_in(peer.get_state());
@@ -262,12 +275,50 @@ impl PeerStates {
         Admitted::New(counters)
     }
 
-    // Forgets the lowest-ranked peer `displace` allows. Connected peers are
-    // never forgotten.
+    // The peers on the peer list: every one but the web seeds.
+    fn listed(&self) -> usize {
+        self.states.len() - self.web_seeds.load(Ordering::Relaxed)
+    }
+
+    /// A connection to web seed `handle` begins: the seed joins the table,
+    /// off the peer list, and is connecting. None while its address is
+    /// banned or a connection to it is open.
+    pub fn admit_web_seed(&self, handle: PeerHandle) -> Option<(PeerRx, PeerTx)> {
+        let _admission = self.admission.lock();
+        if self.is_banned(handle.ip()) {
+            return None;
+        }
+        let (tx, rx) = unbounded_channel();
+        let connecting = PeerState::Connecting(tx.clone());
+        if let Some(known) = self.with_peer_mut(handle, "admit_web_seed", |peer| {
+            if matches!(
+                peer.get_state(),
+                PeerState::Connecting(_) | PeerState::Live(_)
+            ) {
+                return false;
+            }
+            peer.set_state(connecting, self);
+            true
+        }) {
+            return known.then_some((rx, tx));
+        }
+        // Not where it listens: a web seed is never a connect candidate.
+        let mut peer = Peer::new_with_outgoing_address(handle);
+        peer.outgoing_address = None;
+        self.count_in(peer.get_state());
+        peer.set_state(PeerState::Connecting(tx.clone()), self);
+        self.web_seeds.fetch_add(1, Ordering::Relaxed);
+        self.states.insert(handle, peer);
+        Some((rx, tx))
+    }
+
+    // Forgets the lowest-ranked peer `displace` allows. Connected peers and
+    // web seeds, which are on no peer list, are never forgotten.
     fn erase_one(&self, displace: Displace) -> bool {
         let victim = self
             .states
             .iter()
+            .filter(|e| !is_web_seed(*e.key()))
             .filter_map(|e| Some((e.value().erase_rank()?, *e.key())))
             .filter(|(rank, _)| displace.allows(rank))
             .min();
@@ -395,6 +446,9 @@ impl PeerStates {
 
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
         let p = self.states.remove(&handle).map(|r| r.1)?;
+        if is_web_seed(handle) {
+            self.web_seeds.fetch_sub(1, Ordering::Relaxed);
+        }
         self.count_out(p.get_state());
         Some(p)
     }

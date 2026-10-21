@@ -349,6 +349,9 @@ pub struct ManagedTorrentShared {
     /// Counters of the most recent live run, recorded as the run ends, so a
     /// `stopped` tracker announce made after it ended reports them.
     pub(crate) last_run: parking_lot::Mutex<Option<RunCounters>>,
+
+    /// The torrent's web seeds, kept across its runs.
+    pub(crate) web_seeds: Arc<live::web_seed::WebSeeds>,
 }
 
 /// Transfer counters of one live run of a torrent, as its tracker announces

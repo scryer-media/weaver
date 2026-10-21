@@ -55,6 +55,7 @@ mod smart_ban;
 pub mod stats;
 #[cfg(test)]
 mod tests;
+pub(crate) mod web_seed;
 
 use std::{
     borrow::Cow,
@@ -123,6 +124,7 @@ use self::{
     peers::{IncomingRefused, PeerStates},
     smart_ban::SmartBan,
     stats::{atomic::AtomicStats, snapshot::StatsSnapshot},
+    web_seed::{SeedLink, WEB_SEED_TICK, WebSeedConnection},
 };
 
 use super::{
@@ -238,6 +240,8 @@ pub struct TorrentStateLive {
     // began (libtorrent `torrent::m_super_seeding`, turned off for a torrent
     // that is not a seed).
     super_seeding: bool,
+    // The torrent's files as its web seeds serve them.
+    web_layout: web_seed::Layout,
 }
 
 // A block a peer asked for, on its way through the upload rate limits to the
@@ -312,6 +316,7 @@ impl TorrentStateLive {
             pex: !session.disable_pex && !paused.metadata.info.info().private,
             super_seeding: paused.shared.options.super_seeding
                 && have_bytes == lengths.total_length(),
+            web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
         });
 
         state.spawn(
@@ -361,7 +366,134 @@ impl TorrentStateLive {
             format!("[{}]choker", state.shared.id),
             state.clone().task_choker(),
         );
+
+        state.spawn(
+            debug_span!(parent: state.shared.span.clone(), "web_seeds"),
+            format!("[{}]web_seeds", state.shared.id),
+            state.clone().task_web_seeds(),
+        );
         Ok(state)
+    }
+
+    /// Connects to the web seeds that are due every WEB_SEED_TICK, and as
+    /// soon as one may have become due (libtorrent `torrent::second_tick`,
+    /// `maybe_connect_web_seeds`).
+    async fn task_web_seeds(self: Arc<Self>) -> crate::Result<()> {
+        let mut tick = tokio::time::interval(WEB_SEED_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = self.shared.web_seeds.changed() => {}
+            }
+            self.maybe_connect_web_seeds()?;
+        }
+    }
+
+    /// Connects to the web seeds that are due, while the torrent misses a
+    /// piece and has a connection to spare under its own cap and the
+    /// session's. A web seed is not on the peer list and takes no connect
+    /// from the per-second budget, which paces the peer list's connects
+    /// only (libtorrent `torrent::maybe_connect_web_seeds`,
+    /// `session_impl::try_connect_more_peers`).
+    fn maybe_connect_web_seeds(self: &Arc<Self>) -> crate::Result<()> {
+        if self.is_finished_and_no_active_streams() {
+            return Ok(());
+        }
+        let session = self
+            .shared
+            .session
+            .upgrade()
+            .ok_or(Error::SessionDestroyed)?;
+        let registry = &self.shared.web_seeds;
+        let due = registry.due(
+            tokio::time::Instant::now(),
+            |handle| self.peers.is_banned(handle.ip()),
+            |missing| self.web_layout.bitfield(missing).contains(&true),
+        );
+        for due in due {
+            // The IP filter: a seed it blocks is tried again later.
+            if due.endpoint.is_some_and(|e| !self.may_connect_to(e)) {
+                continue;
+            }
+            let Ok(permit) = self.peer_semaphore.clone().try_acquire_owned() else {
+                return Ok(());
+            };
+            let Some(slot) = session.connection_slots.try_open() else {
+                return Ok(());
+            };
+            let Some(link) = registry.link(due.id) else {
+                continue;
+            };
+            let Some((rx, tx)) = self.peers.admit_web_seed(link.handle()) else {
+                continue;
+            };
+            let client = session.reqwest_client.clone();
+            self.spawn(
+                debug_span!(parent: self.shared.span.clone(), "web_seed", seed = ?link.handle()),
+                format!(
+                    "[{}][web_seed={}]manage_web_seed",
+                    self.shared.id,
+                    link.handle()
+                ),
+                aframe!(
+                    self.clone()
+                        .task_manage_web_seed(link, client, rx, tx, permit, slot)
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// The life of one connection to a web seed: the requester asks it for
+    /// blocks as it asks any peer.
+    async fn task_manage_web_seed(
+        self: Arc<Self>,
+        link: SeedLink,
+        client: reqwest::Client,
+        rx: PeerRx,
+        tx: PeerTx,
+        permit: OwnedSemaphorePermit,
+        _slot: ConnectionSlot,
+    ) -> crate::Result<()> {
+        let addr = link.handle();
+        let counters = self
+            .peers
+            .with_peer(addr, |p| p.stats.counters.clone())
+            .ok_or(Error::BugPeerNotFound)?;
+        let handler = PeerHandler {
+            addr,
+            incoming: false,
+            on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
+            flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
+            state: self.clone(),
+            tx,
+            counters,
+            first_message_received: AtomicBool::new(false),
+            cancel_token: self.cancellation_token.child_token(),
+            client_name_and_version: self.shared.client_name_and_version().to_owned(),
+        };
+        let _token_guard = handler.cancel_token.clone().drop_guard();
+        handler
+            .counters
+            .outgoing_connection_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let connection = WebSeedConnection::new(client, &self.web_layout, &link);
+        let res = tokio::select! {
+            r = handler.task_peer_chunk_requester() => r,
+            r = connection.run(&handler, rx) => r,
+        };
+        match res {
+            Ok(()) => handler.on_peer_died(None)?,
+            Err(e) => {
+                debug!("web seed connection failed: {e:#}");
+                link.failed();
+                handler.on_peer_died(Some(e))?;
+            }
+        }
+        drop(permit);
+        Ok(())
     }
 
     /// Hands the upload slots out every UNCHOKE_INTERVAL and passes the
@@ -1012,6 +1144,9 @@ impl TorrentStateLive {
                 // There is not point being connected to peers that have all the torrent, when
                 // we don't need anything from them, and they don't need anything from us.
                 self.disconnect_all_peers_that_have_full_torrent();
+                // Nor to a web seed, which only uploads (libtorrent
+                // `torrent::finished`).
+                self.shared.web_seeds.disconnect_all();
             }
         }
         Ok(())
