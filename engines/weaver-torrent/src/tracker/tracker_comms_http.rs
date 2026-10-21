@@ -55,6 +55,8 @@ pub struct TrackerRequest<'a> {
 pub struct TrackerError<'a> {
     #[serde(rename = "failure reason", borrow)]
     pub failure_reason: ByteBuf<'a>,
+    /// How long until the tracker may be asked again, when it says.
+    pub interval: Option<u64>,
 }
 
 pub enum Peers<'a, AddrType> {
