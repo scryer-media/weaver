@@ -11,6 +11,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv6Addr, SocketAddr},
+    num::IntErrorKind,
     sync::Arc,
     time::Duration,
 };
@@ -62,6 +63,13 @@ const URLSEED_MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 const URLSEED_PIPELINE_SIZE: usize = 5;
 /// How long a BEP 17 seed that answered 503 with no usable wait is left.
 const HTTPSEED_DEFAULT_RETRY: Duration = Duration::from_secs(60);
+/// The longest wait a seed may ask for, in seconds: libtorrent holds it in
+/// a `seconds32` (`http_parser::header_duration`).
+const MAX_RETRY_WAIT_SECS: u64 = i32::MAX as u64;
+/// The most of a BEP 17 503 body read. The body is a count of seconds, so
+/// anything longer is not one; the cap keeps a seed from making us hold
+/// whatever it sends.
+const MAX_UNAVAILABLE_BODY: usize = 64 * 1024;
 /// Blocks read and not yet handed to the torrent, per connection.
 const BLOCKS_BUFFERED: usize = 64;
 
@@ -805,16 +813,15 @@ impl<'a> WebSeedConnection<'a> {
         let status = response.status();
         if status == StatusCode::SERVICE_UNAVAILABLE {
             // The body is how many seconds to wait.
-            let body = tokio::time::timeout(URLSEED_TIMEOUT, response.text())
-                .await
-                .context("timed out")?
-                .unwrap_or_default();
-            let wait = body
-                .trim()
-                .parse::<u64>()
+            let body =
+                tokio::time::timeout(URLSEED_TIMEOUT, read_capped(response, MAX_UNAVAILABLE_BODY))
+                    .await
+                    .context("timed out")?
+                    .unwrap_or_default();
+            let wait = std::str::from_utf8(&body)
                 .ok()
-                .filter(|s| *s > 0)
-                .map_or(HTTPSEED_DEFAULT_RETRY, Duration::from_secs);
+                .and_then(wait_seconds)
+                .unwrap_or(HTTPSEED_DEFAULT_RETRY);
             self.link.retry_after(Some(wait));
             return Err(anyhow!("{url}: {status}").into());
         }
@@ -869,18 +876,31 @@ fn is_ok_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 200 | 206 | 300..=399)
 }
 
-// libtorrent `http_parser::header_duration`: seconds, none unless above 0.
 fn retry_after(response: &reqwest::Response) -> Option<Duration> {
-    response
-        .headers()
-        .get(header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|s| *s > 0)
-        .map(Duration::from_secs)
+    wait_seconds(response.headers().get(header::RETRY_AFTER)?.to_str().ok()?)
+}
+
+// libtorrent `http_parser::header_duration`: seconds, none unless above 0,
+// at most what a `seconds32` holds.
+fn wait_seconds(text: &str) -> Option<Duration> {
+    let secs = match text.trim().parse::<u64>() {
+        Ok(secs) => secs,
+        Err(e) if *e.kind() == IntErrorKind::PosOverflow => u64::MAX,
+        Err(_) => return None,
+    };
+    (secs > 0).then(|| Duration::from_secs(secs.min(MAX_RETRY_WAIT_SECS)))
+}
+
+/// The body, refused once it passes `cap` bytes.
+async fn read_capped(mut response: reqwest::Response, cap: usize) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > cap - body.len() {
+            anyhow::bail!("the body is longer than {cap} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 // The range a 206 answers, end exclusive: `bytes first-last/length`.
@@ -1340,6 +1360,7 @@ mod tests {
         for reply in [
             Reply::status(404),
             Reply::status(500).header("Retry-After", "5"),
+            Reply::status(500).header("Retry-After", "-5"),
         ] {
             let reply = Mutex::new(Some(reply));
             let server = Server::start(move |_| reply.lock().take().unwrap());
@@ -1359,6 +1380,33 @@ mod tests {
             // The only file is lost: the seed has nothing to give.
             let missing = entry(&seeds, |e| e.missing_files.clone());
             assert!(!layout.bitfield(&missing).contains(&true));
+        }
+    }
+
+    // A Retry-After past what libtorrent's `seconds32` holds is held to it,
+    // rather than overflowing the instant it is added to.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_past_seconds32_waits_the_longest_seconds32() {
+        for value in [
+            "2147483648",
+            "18446744073709551615",
+            "99999999999999999999999",
+        ] {
+            let server = Server::start(move |_| Reply::status(503).header("Retry-After", value));
+            let (seeds, link) = one_seed(server.url("/f"), WebSeedKind::Url);
+            let layout = super::tests::layout(&[("f", 100, false)]);
+            let conn = WebSeedConnection::new(client(), &layout, &link);
+            assert!(
+                drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
+                    .await
+                    .is_err()
+            );
+            link.failed();
+            assert_eq!(
+                entry(&seeds, |e| e.retry),
+                Some(Instant::now() + Duration::from_secs(MAX_RETRY_WAIT_SECS)),
+                "{value}"
+            );
         }
     }
 
@@ -1523,8 +1571,18 @@ mod tests {
         drop(link);
         assert_eq!(seeds.list().len(), 1);
 
-        for (body, wait) in [("90", 90), ("0", 60), ("soon", 60)] {
-            let server = Server::start(move |_| Reply::status(503).body(body));
+        for (body, wait) in [
+            ("90".to_owned(), 90),
+            ("0".to_owned(), 60),
+            ("soon".to_owned(), 60),
+            // A wait past what a seconds32 holds is held to it.
+            ("2147483648".to_owned(), MAX_RETRY_WAIT_SECS),
+            ("99999999999999999999999".to_owned(), MAX_RETRY_WAIT_SECS),
+            // The body is read to MAX_UNAVAILABLE_BODY and no further.
+            (" ".repeat(MAX_UNAVAILABLE_BODY - 2) + "90", 90),
+            (" ".repeat(MAX_UNAVAILABLE_BODY - 1) + "90", 60),
+        ] {
+            let server = Server::start(move |_| Reply::status(503).body(body.clone()));
             let (seeds, link) = one_seed(server.url("/s.php"), WebSeedKind::Http);
             let conn = WebSeedConnection::new(client(), &layout, &link);
             assert!(

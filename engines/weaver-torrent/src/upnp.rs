@@ -90,11 +90,27 @@ const MAX_GATEWAYS: usize = 50;
 const DESCRIPTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// libtorrent `update_map`: a SOAP call may take this long.
 const SOAP_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most of a description or SOAP answer read: libtorrent reads each
+/// into a buffer of `default_max_bottled_buffer_size` and fails the call
+/// past it (`http_connection::on_read`, `file_too_large`).
+const MAX_RESPONSE_BODY: usize = 2 * 1024 * 1024;
 /// libtorrent `update_map`: a mapping that failed this often is given up.
 const MAX_FAILCOUNT: u32 = 5;
 /// libtorrent `on_upnp_map_response`: errors 718 and 501 pick another
 /// external port this many times.
 const MAX_PORT_CONFLICTS: u32 = 4;
+
+/// The body as text, refused once it passes MAX_RESPONSE_BODY.
+async fn read_body(mut response: reqwest::Response) -> anyhow::Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > MAX_RESPONSE_BODY - body.len() {
+            bail!("the body is longer than {MAX_RESPONSE_BODY} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
 
 pub fn make_ssdp_search_request(kind: &str) -> String {
     format!(
@@ -534,8 +550,7 @@ impl UpnpPortForwarder {
             .await
             .with_context(|| format!("error sending {action}"))?;
         let status = response.status();
-        let text = response
-            .text()
+        let text = read_body(response)
             .await
             .with_context(|| format!("error reading the {action} response"))?;
         trace!(%status, text, action, "SOAP response");
@@ -556,8 +571,7 @@ impl UpnpPortForwarder {
         if response.status() != StatusCode::OK {
             bail!("device description answered {}", response.status());
         }
-        let text = response
-            .text()
+        let text = read_body(response)
             .await
             .context("failed to read the device description")?;
         trace!(location = %found.location, text, "device description");
@@ -856,8 +870,8 @@ pub(crate) mod tests {
     use url::Url;
 
     use super::{
-        Device, DeviceList, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
-        RootDesc, Service, ServiceList, UpnpDiscoverResponse, UpnpPortForwarder,
+        Device, DeviceList, MAX_RESPONSE_BODY, PortMapRequest, PortMapped, PortmapProtocol,
+        PortmapTransport, RootDesc, Service, ServiceList, UpnpDiscoverResponse, UpnpPortForwarder,
         UpnpPortForwarderOptions, parse_upnp_discover_response, xml_element_text,
     };
 
@@ -1442,5 +1456,52 @@ pub(crate) mod tests {
             format!("{err:#}").contains("is not on the device"),
             "{err:#}"
         );
+    }
+    // A description or SOAP answer is read to MAX_RESPONSE_BODY and no
+    // further (libtorrent `http_connection::on_read`).
+    #[tokio::test(start_paused = true)]
+    async fn a_description_or_soap_answer_past_the_cap_is_refused() {
+        let _hold = hold_clock();
+        let description = |extra: usize| {
+            move |_| {
+                let xml = gateway_description(
+                    "InternetGatewayDevice:1",
+                    "urn:schemas-upnp-org:service:WANIPConnection:1",
+                    "",
+                );
+                let pad = MAX_RESPONSE_BODY - xml.len() + extra;
+                xml + &" ".repeat(pad)
+            }
+        };
+        let answer = |extra: usize| -> Answer {
+            Arc::new(move |_: &SoapCall| {
+                let (status, body) = external_ip_answer();
+                let pad = MAX_RESPONSE_BODY - body.len() + extra;
+                (status, body + &" ".repeat(pad))
+            })
+        };
+        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, None).unwrap();
+        let open = |location| {
+            let found = UpnpDiscoverResponse {
+                received_from: "127.0.0.1:1900".parse().unwrap(),
+                location,
+            };
+            let forwarder = &forwarder;
+            async move { forwarder.open_gateway(&found).await }
+        };
+
+        let (location, _calls) = mock_gateway(description(0), answer(0)).await;
+        let gateway = open(location).await.unwrap();
+        assert_eq!(gateway.external_ip, Some("203.0.113.7".parse().unwrap()));
+
+        // An answer one byte past the cap is no answer: the gateway still
+        // maps ports, without saying its address.
+        let (location, _calls) = mock_gateway(description(0), answer(1)).await;
+        let gateway = open(location).await.unwrap();
+        assert_eq!(gateway.external_ip, None);
+
+        let (location, _calls) = mock_gateway(description(1), answer(0)).await;
+        let err = open(location).await.err().unwrap();
+        assert!(format!("{err:#}").contains("longer than"), "{err:#}");
     }
 }
