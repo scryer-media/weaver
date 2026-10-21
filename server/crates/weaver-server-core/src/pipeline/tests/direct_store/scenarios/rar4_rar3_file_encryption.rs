@@ -1500,16 +1500,34 @@ async fn supplied_passwords_reach_the_gate_and_finalize_and_survive_a_restart() 
         expected_owned
     );
 
-    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
-    let set = pipeline
-        .direct_store
-        .set(job_id, 0)
-        .expect("the job must carry its direct set");
-    assert!(set.router.wants_header_password());
-    assert_eq!(
-        set.router.header_candidate_sources(),
-        expected.map(|(label, _)| label)
-    );
+    let engine = pipeline.job_engine(job_id);
+    match engine {
+        // The payload article only: the `-hp` ring holds every offer, by
+        // label, until the type-4 record is read.
+        crate::pipeline::graph::Engine::Classic => {
+            submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+            let set = pipeline
+                .direct_store
+                .set(job_id, 0)
+                .expect("the job must carry its direct set");
+            assert!(set.router.wants_header_password());
+            assert_eq!(
+                set.router.header_candidate_sources(),
+                expected.map(|(label, _)| label)
+            );
+        }
+        // The volume's head: the store asks for the header password there,
+        // is offered the list in turn, refutes each by its check and is
+        // left asking. The graph carries the values without their labels.
+        crate::pipeline::graph::Engine::Graph => {
+            submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+            let offered: Vec<usize> = pipeline.graph_jobs[&job_id]
+                .passwords_offered()
+                .into_values()
+                .collect();
+            assert_eq!(offered, [expected.len()], "every candidate, once");
+        }
+    }
 
     pipeline.db.flush_write_queue().await.unwrap();
     // The restarted server holds the key the row was sealed with.
@@ -1556,6 +1574,16 @@ async fn supplied_passwords_reach_the_gate_and_finalize_and_survive_a_restart() 
     let harvest = restored.archive_password_candidates_for_job(job_id);
     assert!(harvest.complete);
     assert_eq!(labelled(&harvest.candidates), expected_owned);
+    // The job comes back on its stamped engine. A graph job's checkpoint
+    // keeps where the store's offers stood, and the restore takes up there.
+    assert_eq!(restored.job_engine(job_id), engine);
+    if engine == crate::pipeline::graph::Engine::Graph {
+        let offered: Vec<usize> = restored.graph_jobs[&job_id]
+            .passwords_offered()
+            .into_values()
+            .collect();
+        assert_eq!(offered, [expected.len()], "the restore resumes the offers");
+    }
 }
 
 // A long global list reaches the ring whole, in priority order: the direct
