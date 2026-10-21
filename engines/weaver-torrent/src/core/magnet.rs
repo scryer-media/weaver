@@ -5,7 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::str::FromStr;
+use std::{net::SocketAddr, str::FromStr};
 
 use anyhow::Context;
 
@@ -16,6 +16,8 @@ pub struct Magnet {
     id20: Option<Id20>,
     id32: Option<Id32>,
     pub trackers: Vec<String>,
+    /// The peers the link names (`x.pe`), to connect to as any other.
+    pub peers: Vec<SocketAddr>,
     pub name: Option<String>,
     select_only: Option<Vec<usize>>,
 }
@@ -54,6 +56,7 @@ impl Magnet {
             id20: info_hashes.v1,
             id32: info_hashes.v2,
             trackers,
+            peers: Vec::new(),
             name,
             select_only: None,
         }
@@ -64,6 +67,7 @@ impl Magnet {
             id20: Some(id20),
             id32: None,
             trackers,
+            peers: Vec::new(),
             name: None,
             select_only,
         }
@@ -82,6 +86,7 @@ impl Magnet {
             id20,
             id32,
             trackers,
+            peers: Vec::new(),
             name: None,
             select_only,
         })
@@ -97,6 +102,7 @@ impl Magnet {
                 id32: None,
                 name: None,
                 trackers: vec![],
+                peers: vec![],
                 select_only: None,
             });
         }
@@ -109,6 +115,7 @@ impl Magnet {
         let mut id32: Option<Id32> = None;
         let mut name: Option<String> = None;
         let mut trackers = Vec::<String>::new();
+        let mut peers = Vec::<SocketAddr>::new();
         let mut files = Vec::<usize>::new();
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
@@ -128,6 +135,9 @@ impl Magnet {
                     // Any other xt names nothing a torrent is found by.
                 }
                 "tr" => trackers.push(value.into()),
+                // An address and port; one that is not is passed over
+                // (libtorrent `parse_magnet_uri`, `parse_endpoint`).
+                "x.pe" => peers.extend(SocketAddr::from_str(value.trim()).ok()),
                 "dn" if !value.is_empty() => name = Some(value.into_owned()),
                 "dn" => {}
                 "so" => {
@@ -160,6 +170,7 @@ impl Magnet {
                 id20,
                 id32,
                 trackers,
+                peers,
                 name,
                 select_only: if files.is_empty() { None } else { Some(files) },
             }),
@@ -189,7 +200,8 @@ impl std::fmt::Display for Escaped<'_> {
 }
 
 /// The link in libtorrent's order (`make_magnet_uri`): btih, btmh, dn,
-/// then each tr; a file selection, which libtorrent does not write, last.
+/// then each tr and each x.pe; a file selection, which libtorrent does not
+/// write, last.
 impl std::fmt::Display for Magnet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "magnet:")?;
@@ -220,6 +232,10 @@ impl std::fmt::Display for Magnet {
         for tracker in self.trackers.iter() {
             write_ampersand(f)?;
             write!(f, "tr={}", Escaped(tracker))?;
+        }
+        for peer in self.peers.iter() {
+            write_ampersand(f)?;
+            write!(f, "x.pe={peer}")?;
         }
         if let Some(select_only) = &self.select_only
             && !select_only.is_empty()
@@ -363,5 +379,23 @@ mod tests {
         );
         assert_eq!(m.name.as_deref(), Some("a b"));
         assert_eq!(m.trackers, vec!["udp://foo.bar/announce"]);
+    }
+
+    // libtorrent test_magnet.cpp `parse_peer`, and the endpoints
+    // `parse_endpoint` refuses.
+    #[test]
+    fn a_links_peers_are_read_and_written_and_a_bad_one_passed_over() {
+        let cd20 = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let m = Magnet::parse(&format!(
+            "magnet:?xt=urn:btih:{cd20}&dn=foo&x.pe=127.0.0.1:43&x.pe=<invalid1>\
+             &x.pe=<invalid2>:100&x.pe=[::1]:45&x.pe=127.0.0.1:&x.pe=[::1"
+        ))
+        .unwrap();
+        let peers: Vec<_> = m.peers.iter().map(|p| p.to_string()).collect();
+        assert_eq!(peers, ["127.0.0.1:43", "[::1]:45"]);
+        assert_eq!(
+            m.to_string(),
+            format!("magnet:?xt=urn:btih:{cd20}&dn=foo&x.pe=127.0.0.1:43&x.pe=[::1]:45")
+        );
     }
 }

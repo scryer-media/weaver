@@ -1372,6 +1372,11 @@ impl Session {
                 {
                     let magnet = Magnet::parse(&magnet)
                         .context("provided path is not a valid magnet URL")?;
+                    // The link's peers join those the caller named
+                    // (libtorrent `add_torrent_params::peers`).
+                    opts.initial_peers
+                        .get_or_insert_default()
+                        .extend(magnet.peers.iter().copied());
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
                         if opts.only_files.is_none() {
@@ -2748,5 +2753,63 @@ mod tests {
         let _ = stream.read_to_end(&mut rest).await;
 
         session.stop().await;
+    }
+
+    /// A magnet's `x.pe` peers are the torrent's initial peers: with no DHT,
+    /// trackers or other peers, the link's peer alone supplies the metadata
+    /// and the content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_magnets_peer_supplies_its_metadata_and_content() -> anyhow::Result<()> {
+        use crate::{
+            core::{magnet::Magnet, torrent_metainfo},
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+        };
+        use anyhow::Context;
+
+        let t = TestTorrent::new("test_magnet_x_pe", 3 * 16384 + 100, 16384).await?;
+        let seeder =
+            Session::new_with_opts(t.dir.path().into(), isolated_session_opts(true)).await?;
+        seeder
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    output_folder: Some(t.dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?
+            .wait_until_completed()
+            .await?;
+        let seeder_addr = seeder.listen_addr().context("seeder is not listening")?;
+
+        let mut magnet = Magnet::of(
+            torrent_metainfo::torrent_from_bytes(&t.torrent)?.info_hashes,
+            None,
+            Vec::new(),
+        );
+        magnet.peers.push(seeder_addr);
+        let out = TempDir::with_prefix("test_magnet_x_pe_out")?;
+        let downloader =
+            Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+        let storage = MemoryStorageFactory::default();
+        downloader
+            .add_torrent(
+                AddTorrent::from_url(magnet.to_string()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(storage.clone_box()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?
+            .wait_until_completed()
+            .await?;
+        assert!(storage.log.file_contents(0) == t.content, "content differs");
+        Ok(())
     }
 }
