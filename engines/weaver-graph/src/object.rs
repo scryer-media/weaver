@@ -240,6 +240,20 @@ pub trait Standing {
     // A range of my volumes was lost and nothing vouched for it: what
     // `volume_lost` told just before.
     fn lost(&self) -> bool;
+
+    // The members beside my volumes that no object owns, as a claim reads
+    // them: what I can say of them is mine to say.
+    fn beside(&self) -> Vec<Beside<'_>>;
+}
+
+// A member no object owns, as the namespace holds it: its name, its first
+// bytes and its length once known, and what an object that gave it back
+// parsed of it.
+pub struct Beside<'a> {
+    pub name: &'a str,
+    pub front: &'a [u8],
+    pub length: Option<u64>,
+    pub carried: Option<&'a Carried>,
 }
 
 // Send and Sync because a job's tree lives in the pipeline, which runs on a
@@ -384,6 +398,10 @@ pub trait Object: Send + Sync {
 
     // My volume's member has another name now: a recovery set named it.
     fn renamed(&mut self, _volume: VolumeIndex, _name: &str) {}
+
+    // My set was refused, whoever said why: I read nothing more, and what I
+    // claim after goes where the set went.
+    fn refused(&mut self) {}
 
     // Whether I can use a volume only once every volume before it has been
     // read: an engine or a stream, which have no map to seek by.

@@ -1108,8 +1108,9 @@ impl Tree {
     // make again. Its owner hears the name and is offered every member
     // beside it that no object owns, which the name may now place after
     // it; a member no object owns is asked again who owns it, as a new
-    // member is. No owner loses a member here: only one with no owner is
-    // offered.
+    // member is. An owner its bytes founded then takes what the name now
+    // places from a sibling founded by names alone, as it does when it is
+    // founded. No other owner loses a member here.
     fn renamed(
         &mut self,
         node: NodeId,
@@ -1154,6 +1155,9 @@ impl Tree {
             if self.unowned(node, member) {
                 self.offer(node, member, &front, &[child], effects);
             }
+        }
+        if !self.founded_by_name(child) {
+            self.take_named(node, child, effects);
         }
     }
 
@@ -1786,19 +1790,25 @@ impl Tree {
                 None => self.join(node, member, (*child, volume), (&name, prefix), effects),
                 // A volume of a refused set is refused with it. The object
                 // never held any of it, so it is a leaf already, and settled.
+                // It hears the volume as any object does, so what it claims
+                // next is claimed beside it.
                 Some(why) => {
-                    if let Some(binding) = self
-                        .nodes
-                        .get_mut(child)
-                        .and_then(|found| found.binding.as_mut())
-                    {
-                        binding.volumes.insert(volume, member);
+                    let carried = self.given.remove(&(node, member));
+                    if let Some(found) = self.nodes.get_mut(child) {
+                        if let Some(binding) = found.binding.as_mut() {
+                            binding.volumes.insert(volume, member);
+                        }
+                        if let Some(object) = found.object.as_mut() {
+                            match carried {
+                                Some(carried) => object.adopt(volume, &name, carried),
+                                None => object.bound(volume, &name, prefix, length),
+                            }
+                        }
                     }
                     if let Some(found) = self.nodes.get_mut(&node) {
                         found.undecided.remove(&member);
                     }
                     self.retired.insert((node, member), None);
-                    self.given.remove(&(node, member));
                     effects.push(Effect::Refused { node, member, why });
                 }
             }
@@ -2260,14 +2270,22 @@ impl Tree {
                 },
             });
         }
-        match engine {
-            Some(engine) => self.offer_unowned(parent, engine, effects),
+        // What no object owns beside the set is offered to what holds it
+        // now: the engine, or the refused set, which claims the rest of
+        // itself so the rest goes where the set went.
+        let holder = match engine {
+            Some(engine) => engine,
             None => {
                 if let Some(found) = self.nodes.get_mut(&node) {
                     found.refused = Some(why);
+                    if let Some(object) = found.object.as_mut() {
+                        object.refused();
+                    }
                 }
+                node
             }
-        }
+        };
+        self.offer_unowned(parent, holder, effects);
     }
 
     fn retire(&mut self, node: NodeId) {

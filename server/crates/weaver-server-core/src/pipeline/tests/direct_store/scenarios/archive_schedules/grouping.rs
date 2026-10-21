@@ -889,6 +889,20 @@ impl Binding {
 }
 
 impl Cell {
+    // Whether the post orders a middle volume by more than the volumes held
+    // beside it: names that number it, a recovery set that gives it its
+    // real name, or a header in its front that numbers it. A 7z piece after
+    // the first has no header, and a RAR4 volume numbers itself only in its
+    // end record.
+    pub(super) fn orders_middles(self) -> bool {
+        self.naming.names_place()
+            || matches!(
+                self.binding,
+                Binding::Par2RealFirst | Binding::Par2RealLast | Binding::LegacyReal
+            )
+            || self.container.headers_chain()
+    }
+
     // Whether the cell's post can be driven through `interruption`: a
     // withheld volume has to be one the post carries and leaving it out has
     // to withhold something.

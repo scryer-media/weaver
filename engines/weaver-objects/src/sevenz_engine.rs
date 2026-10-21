@@ -9,17 +9,18 @@ pub mod naming;
 mod run;
 
 #[cfg(test)]
-use weaver_graph::{ByteRange, Emit, Engine, MemberId, Object, Placement, VolumeIndex};
-use weaver_graph::{Extraction, Kind};
+use weaver_graph::{ByteRange, Emit, Engine, MemberId, Object, Placement};
+use weaver_graph::{Extraction, Kind, VolumeIndex};
 
 use std::collections::BTreeMap;
 
-use crate::engine::{EngineObject, Format};
+use crate::engine::{EngineObject, Format, Holding, Placed};
 
 pub struct SevenZip;
 
 // A front states a place only as the first piece's signature header, which
-// measures the container: the one place it is.
+// measures the container: the one place it is. Every other piece is placed
+// by its name, else by its length.
 impl Format for SevenZip {
     const KIND: Kind = Kind::SevenZipEngine;
     type Name = naming::VolumeName;
@@ -41,13 +42,20 @@ impl Format for SevenZip {
         index != 0
     }
 
-    fn place(bound: &BTreeMap<u32, Option<&u64>>, front: &u64) -> Option<u32> {
-        bound
-            .get(&0)
-            .copied()
-            .flatten()
-            .is_some_and(|first| first == front)
-            .then_some(0)
+    // A piece with no front of its own is placed by its length, as the
+    // store places it, among the places the first piece measures.
+    fn place(
+        bound: &BTreeMap<u32, Holding<'_, u64>>,
+        front: Option<&u64>,
+        length: Option<u64>,
+    ) -> Option<Placed> {
+        let first = bound.get(&0)?;
+        match front {
+            Some(front) => (first.front == Some(front)).then_some(Placed::At(VolumeIndex(0))),
+            None => crate::sevenz_store::fits(first.length?, *first.front?, length?, |at| {
+                !bound.contains_key(&at.0)
+            }),
+        }
     }
 
     fn run(password: Option<String>) -> Box<dyn Extraction> {

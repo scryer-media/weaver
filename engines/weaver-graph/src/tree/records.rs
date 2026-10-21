@@ -156,6 +156,12 @@ impl Tree {
             return Err(refuse("a live node has refused its volumes"));
         }
         node.refused = record.reason;
+        // A refused object hears it again, as it heard it when it was.
+        if node.refused.is_some()
+            && let Some(object) = node.object.as_mut()
+        {
+            object.refused();
+        }
         for member in &record.members {
             if node.namespace.get(member.member).is_some() {
                 return Err(refuse("a member appears twice"));

@@ -488,8 +488,9 @@ impl Object for RarStore {
 
     // Nothing more will arrive. A set whose first volume never came has
     // lost its first bytes: no header says what any volume after it holds.
-    // Otherwise a member still damaged, a password still asked for, or a
-    // member named and never placed leaves the set unread.
+    // Otherwise a member still damaged, a password still asked for, a
+    // volume beside the set that nothing orders, or a member named and
+    // never placed leaves the set unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         if self.gone {
             return;
@@ -499,6 +500,7 @@ impl Object for RarStore {
             true => Some(Why::FirstBytesLost),
             false => crate::quiet::damaged(standing)
                 .or_else(|| self.shut())
+                .or_else(|| crate::quiet::unordered(standing, |beside| self.placed(beside)))
                 .or_else(|| crate::quiet::unplaced(standing)),
         };
         if let Some(why) = why {
@@ -613,7 +615,8 @@ impl Object for RarStore {
         first_bytes: &[u8],
         _length: Option<u64>,
     ) -> Option<VolumeIndex> {
-        self.claim_volume(name, first_bytes)
+        self.claim_volume(name, first_bytes)?
+            .claimed(self.gone, self.past())
     }
 
     // What was read of the volume goes with it, unless it is more than a
@@ -628,7 +631,8 @@ impl Object for RarStore {
     }
 
     fn reclaim(&mut self, name: &str, carried: &weaver_graph::Carried) -> Option<VolumeIndex> {
-        self.reclaim_volume(name, &carried.downcast_ref::<Given>()?.volume)
+        self.reclaim_volume(name, &carried.downcast_ref::<Given>()?.volume)?
+            .claimed(self.gone, self.past())
     }
 
     // The volume as its giver read it: its headers walked, its bytes kept,
@@ -655,5 +659,9 @@ impl Object for RarStore {
         if let Some(found) = self.volumes.get_mut(&volume) {
             found.name = Some(name.to_owned());
         }
+    }
+
+    fn refused(&mut self) {
+        self.gone = true;
     }
 }

@@ -64,6 +64,7 @@ enum WhyMirror {
     Unsupported,
     Unmapped,
     TooDeep,
+    OrderUnknown,
 }
 through!(Why, WhyMirror);
 

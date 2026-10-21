@@ -10,7 +10,7 @@
 
 use super::{Builder, Effect, NodeId, Tree};
 use crate::member::MemberId;
-use crate::object::Standing;
+use crate::object::{Beside, Standing};
 use crate::recovery::RepairOutcome;
 use crate::volume::{ByteRange, VolumeIndex};
 
@@ -165,5 +165,25 @@ impl Standing for Stood<'_> {
 
     fn lost(&self) -> bool {
         !self.tree.lost(self.node).is_empty()
+    }
+
+    fn beside(&self) -> Vec<Beside<'_>> {
+        let tree = self.tree;
+        let Some((parent, _)) = tree.volumes(self.node) else {
+            return Vec::new();
+        };
+        let Some(namespace) = tree.namespace(parent) else {
+            return Vec::new();
+        };
+        namespace
+            .members()
+            .filter(|member| tree.unowned(parent, member.id))
+            .map(|member| Beside {
+                name: &member.name,
+                front: namespace.first_bytes(member.id),
+                length: member.length,
+                carried: tree.given.get(&(parent, member.id)),
+            })
+            .collect()
     }
 }

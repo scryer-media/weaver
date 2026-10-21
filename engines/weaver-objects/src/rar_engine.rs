@@ -17,7 +17,7 @@ use weaver_graph::{ByteRange, Emit, Engine, Object, Placement};
 use unrar_rs::{KdfCache, RarVolumeFacts};
 use weaver_graph::{Extraction, Kind, VolumeIndex};
 
-use crate::engine::{EngineObject, Format};
+use crate::engine::{EngineObject, Format, Holding, Placed};
 use crate::rar_store::claim::{self, Held};
 
 pub struct Rar;
@@ -48,20 +48,21 @@ impl Format for Rar {
     // A front states nothing of whether a volume follows it: that is in the
     // end record, past the front of all but the smallest volume.
     fn place(
-        bound: &BTreeMap<u32, Option<&RarVolumeFacts>>,
-        front: &RarVolumeFacts,
-    ) -> Option<u32> {
+        bound: &BTreeMap<u32, Holding<'_, RarVolumeFacts>>,
+        front: Option<&RarVolumeFacts>,
+        _length: Option<u64>,
+    ) -> Option<Placed> {
         let held = bound
             .iter()
-            .map(|(index, facts)| {
+            .map(|(index, holding)| {
                 let held = Held {
-                    facts: *facts,
+                    facts: holding.front,
                     successor: None,
                 };
                 (*index, held)
             })
             .collect();
-        claim::place(front, &held)
+        claim::place(front?, &held)
     }
 
     fn run(password: Option<String>) -> Box<dyn Extraction> {

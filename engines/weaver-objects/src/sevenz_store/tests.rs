@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
-use weaver_graph::{ByteRange, Emit, Provenance, Pull, RecoveryKind, VolumeIndex, Why};
+use weaver_graph::{ByteRange, Emit, Object, Provenance, Pull, RecoveryKind, VolumeIndex, Why};
 
 use super::SevenZipStore;
 use crate::keys::Keys;
-use crate::testing::payload;
+use crate::testing::{Quiet, payload};
 use owner::Owner;
 
 const PASSWORD: &str = "a-test-passphrase";
@@ -185,6 +185,84 @@ fn a_split_set_streams_with_its_volumes_out_of_order() {
         .flat_map(|volume| owner.posted(volume).unwrap())
         .collect();
     assert_eq!(rebuilt, bytes);
+}
+
+// Four pieces under names that number none of them, as the store holds
+// the first and the last: every piece but the last is as long as the
+// first, so either middle piece fits either middle place.
+fn unnamed_middles() -> (SevenZipStore, Vec<(&'static str, Vec<u8>)>) {
+    let bytes = archive(copy(), false);
+    let names = [
+        "e93a07c1d25b4f68a0c3e1f7b9d24c85",
+        "1b7f3d9e05a24c6f8e1d0b3a7c9f2e64",
+        "c40e8b2f6a1d4973b5e0f2c8d16a9b37",
+        "7a2c5e9f0b3d4e81a6f9c2b07d4e1f58",
+    ];
+    let pieces: Vec<_> = names
+        .into_iter()
+        .zip(split(&bytes, 4))
+        .map(|(name, (_, piece))| (name, piece))
+        .collect();
+    assert_eq!(pieces.len(), 4);
+    assert!(pieces[3].1.len() < pieces[0].1.len());
+    let mut object = store();
+    for volume in [0, 3] {
+        let (name, piece) = &pieces[volume];
+        let (front, length) = (&piece[..32], Some(piece.len() as u64));
+        if volume > 0 {
+            assert_eq!(
+                object.claim(name, front, length),
+                Some(VolumeIndex(volume as u32))
+            );
+        }
+        object.bound(VolumeIndex(volume as u32), name, front, length);
+    }
+    (object, pieces)
+}
+
+// No name or header says which middle piece comes first: the store claims
+// neither while the set stands, refuses the set for them once the job is
+// quiet, and the refused set takes them past every place it has, so they
+// go where the set went.
+#[test]
+fn two_middle_pieces_nothing_orders_refuse_the_set_at_quiet() {
+    let (mut object, pieces) = unnamed_middles();
+    let middles: Vec<_> = pieces[1..3]
+        .iter()
+        .map(|(name, piece)| (*name, &piece[..32], piece.len() as u64))
+        .collect();
+    for (name, front, length) in &middles {
+        assert_eq!(object.claim(name, front, Some(*length)), None);
+    }
+    let mut out = Vec::new();
+    object.quiet(&Quiet(middles.clone()), &mut out);
+    assert_eq!(out, vec![Emit::Refuse(Why::OrderUnknown)]);
+    let (name, front, length) = middles[0];
+    assert_eq!(
+        object.claim(name, front, Some(length)),
+        Some(VolumeIndex(4))
+    );
+}
+
+// A recovery set that gives the pieces their real names orders them: once
+// the first piece carries its own, each middle piece takes the place its
+// number gives, and nothing is left beside the set to refuse it for.
+#[test]
+fn a_piece_a_recovery_set_names_takes_the_place_its_number_gives() {
+    let (mut object, pieces) = unnamed_middles();
+    object.renamed(VolumeIndex(0), "alpha.7z.001");
+    for (volume, name) in [(2, "alpha.7z.003"), (1, "alpha.7z.002")] {
+        let piece = &pieces[volume].1;
+        let (front, length) = (&piece[..32], Some(piece.len() as u64));
+        assert_eq!(
+            object.claim(name, front, length),
+            Some(VolumeIndex(volume as u32))
+        );
+        object.bound(VolumeIndex(volume as u32), name, front, length);
+    }
+    let mut out = Vec::new();
+    object.quiet(&Quiet(Vec::new()), &mut out);
+    assert!(!out.contains(&Emit::Refuse(Why::OrderUnknown)), "{out:?}");
 }
 
 #[test]

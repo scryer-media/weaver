@@ -12,10 +12,38 @@ use std::path::Path;
 
 use weaver_graph::recovery::MemberAccess;
 use weaver_graph::{
-    ByteRange, Delivery, MemberId, Namespace, Object, ObjectId, Provenance, Segment, VolumeIndex,
+    Beside, ByteRange, Delivery, MemberId, Namespace, Object, ObjectId, Provenance, Segment,
+    Standing, VolumeIndex,
 };
 
 use crate::grid::crc32;
+
+// A quiet job's record of an object whose members all stand whole and
+// placed, beside members no object owns: each by name, front and length.
+pub(crate) struct Quiet<'a>(pub(crate) Vec<(&'a str, &'a [u8], u64)>);
+
+impl Standing for Quiet<'_> {
+    fn damaged(&self) -> bool {
+        false
+    }
+    fn unplaced(&self) -> bool {
+        false
+    }
+    fn lost(&self) -> bool {
+        false
+    }
+    fn beside(&self) -> Vec<Beside<'_>> {
+        self.0
+            .iter()
+            .map(|(name, front, length)| Beside {
+                name,
+                front,
+                length: Some(*length),
+                carried: None,
+            })
+            .collect()
+    }
+}
 
 // Deterministic bytes, distinct per seed.
 pub(crate) fn payload(seed: u64, len: usize) -> Vec<u8> {

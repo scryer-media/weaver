@@ -124,7 +124,11 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
                 .is_none_or(|(mask, _)| !fixture.uncovered_loss(mask));
         let left = left(cell, &fixture, recovers, interruption);
         let password = fixture.spec.password.as_deref();
-        let deliverable = if !opens {
+        // Every 7z piece but the last is as long as the first, so a set
+        // with more than one middle piece has pieces only a name orders.
+        let (count, _) = cell.naming.layout();
+        let unordered = cell.container.is_sevenz() && count > 3 && !cell.orders_middles();
+        let deliverable = if !opens || unordered {
             BTreeSet::new()
         } else if mended && left.iter().all(Option::is_some) {
             members.keys().cloned().collect()

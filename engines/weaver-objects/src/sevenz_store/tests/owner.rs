@@ -226,6 +226,9 @@ impl Owner {
             fn lost(&self) -> bool {
                 false
             }
+            fn beside(&self) -> Vec<weaver_graph::Beside<'_>> {
+                Vec::new()
+            }
         }
         let mut out = Vec::new();
         self.object.quiet(&Whole, &mut out);

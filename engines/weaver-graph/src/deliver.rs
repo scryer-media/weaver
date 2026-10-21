@@ -102,6 +102,9 @@ pub enum Why {
     // never placed every member it named: its map never came, or never
     // closed what it announced.
     Unmapped,
+    // A volume the set needs is in, and nothing states where in the set it
+    // goes: more than one free place fits it and no name or header chooses.
+    OrderUnknown,
     // The object would sit deeper than a job's namespaces may nest. What
     // the member holds is the container, delivered as it is.
     TooDeep,
@@ -114,7 +117,11 @@ impl Why {
     // output as they stand.
     pub fn withholds(self) -> bool {
         match self {
-            Why::Encrypted | Why::EncryptedHeader | Why::Compressed | Why::Unmapped => true,
+            Why::Encrypted
+            | Why::EncryptedHeader
+            | Why::Compressed
+            | Why::Unmapped
+            | Why::OrderUnknown => true,
             Why::TailUnreachable
             | Why::UnboundedEntry
             | Why::NotAFile
@@ -143,6 +150,7 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unmapped
+            | Why::OrderUnknown
             | Why::TooDeep => false,
         }
     }
@@ -205,6 +213,7 @@ mod tests {
             Why::EncryptedHeader,
             Why::Compressed,
             Why::Unmapped,
+            Why::OrderUnknown,
         ];
         let delivered = [
             Why::TailUnreachable,

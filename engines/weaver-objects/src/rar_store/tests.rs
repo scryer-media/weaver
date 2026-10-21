@@ -14,7 +14,8 @@ use weaver_graph::{ByteRange, Emit, Object, Provenance, RecoveryKind, VolumeInde
 
 use super::RarStore;
 use crate::keys::{CAPACITY, Keys};
-use crate::testing::payload;
+use crate::quiet::Placed;
+use crate::testing::{Quiet, payload};
 use owner::Owner;
 use writer::{Item, Options, Version, write};
 
@@ -291,6 +292,40 @@ fn a_nameless_volume_posted_again_is_the_held_volume_its_neighbours_link_it_to()
         object.claim("d00d", &volumes[1], None),
         Some(VolumeIndex(1))
     );
+}
+
+// One member spans every volume of a nameless RAR4 set, so each middle
+// volume's front links it to every other and states no number: beside the
+// first and the last, either middle volume fits either middle place. The
+// store claims neither while the set stands, refuses the set for them once
+// the job is quiet, and the refused set takes them past every volume it
+// holds.
+#[test]
+fn two_adjacent_nameless_volumes_both_fitting_refuse_the_set_at_quiet() {
+    let volumes = write(
+        &[Item::File("feature.bin", payload(5, 23_000))],
+        &split(Version::Rar4),
+    );
+    assert_eq!(volumes.len(), 4);
+    let name = |index: usize| format!("{:x}3c9e1f", index * 7 + 11);
+    let front = |index: usize| volumes[index][..4096].to_vec();
+    let mut object = store();
+    object.bound(VolumeIndex(0), &name(0), &front(0), None);
+    object.bound(VolumeIndex(3), &name(3), &volumes[3], None);
+    let middles: Vec<(String, Vec<u8>)> = [1, 2].map(|index| (name(index), front(index))).into();
+    for (name, front) in &middles {
+        assert_eq!(object.claim_volume(name, front), Some(Placed::Unordered));
+        assert_eq!(object.claim(name, front, None), None);
+    }
+    let beside = middles
+        .iter()
+        .map(|(name, front)| (name.as_str(), front.as_slice(), 6_000))
+        .collect();
+    let mut out = Vec::new();
+    object.quiet(&Quiet(beside), &mut out);
+    assert_eq!(out, vec![Emit::Refuse(Why::OrderUnknown)]);
+    let (name, front) = &middles[0];
+    assert_eq!(object.claim(name, front, None), Some(VolumeIndex(4)));
 }
 
 #[test]

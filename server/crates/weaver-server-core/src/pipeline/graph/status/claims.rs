@@ -364,6 +364,7 @@ fn withheld_because(why: Why) -> &'static str {
         Why::Encrypted | Why::EncryptedHeader => "needs a password and none was given",
         Why::Compressed => "is compressed and no engine reads it",
         Why::Unmapped => "never placed every member it named",
+        Why::OrderUnknown => "is a piece of a set nothing puts in order",
         _ => "was refused",
     }
 }
