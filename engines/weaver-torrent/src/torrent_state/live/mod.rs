@@ -986,11 +986,17 @@ impl TorrentStateLive {
         }
     }
 
+    /// Resolves once the torrent is finished. The wait is taken before the
+    /// check, so a finish between the two still wakes it (libtorrent
+    /// `alert_manager::wait_for_alert` checks the queue and waits under the
+    /// one lock `maybe_notify` signals under).
     pub async fn wait_until_completed(&self) {
+        let mut finished = std::pin::pin!(self.finished_notify.notified());
+        finished.as_mut().enable();
         if self.is_finished() {
             return;
         }
-        self.finished_notify.notified().await;
+        finished.await;
     }
 
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {

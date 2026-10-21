@@ -3590,3 +3590,21 @@ async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
         [listen]
     );
 }
+
+// wait_until_completed takes its wait before it checks: a finish rung
+// between the check and the await wakes it, where a wait taken after the
+// ring sleeps on (tokio `Notify::notify_waiters` wakes only the waits taken
+// by then). The window lies inside one poll, so the ring is put there by
+// hand on the torrent's own notify.
+#[tokio::test(start_paused = true)]
+async fn a_finish_between_the_check_and_the_wait_is_not_lost() {
+    use futures::FutureExt;
+    let h = Harness::new("finish-between").await;
+    let mut taken = std::pin::pin!(h.finished_notify.notified());
+    taken.as_mut().enable();
+    assert!(!h.is_finished());
+    h.finished_notify.notify_waiters();
+    let after = h.finished_notify.notified();
+    assert!(taken.now_or_never().is_some());
+    assert!(after.now_or_never().is_none());
+}
