@@ -206,11 +206,13 @@ lto = "thin"
 codegen-units = 16
 debug-assertions = true
 
+# Tests run without debug assertions: the suite proves behaviour, and the
+# assertions cost build and run time on every nextest run, in CI and locally.
 [profile.test]
 debug = 0
 split-debuginfo = "off"
 incremental = false
-debug-assertions = true
+debug-assertions = false
 overflow-checks = true
 
 # Keep test harnesses cheap to build while optimising the codec, checksum and
@@ -261,7 +263,7 @@ opt-level = 3
 [profile.matrix]
 inherits = "test"
 opt-level = 3
-debug-assertions = true
+debug-assertions = false
 overflow-checks = true
 
 # Rarpar crates normally use crates.io; the PAR2 revision above is a temporary
