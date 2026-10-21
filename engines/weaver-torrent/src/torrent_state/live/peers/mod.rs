@@ -6,7 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
@@ -36,6 +36,7 @@ use self::{
     stats::{AggregatePeerStats, AggregatePeerStatsAtomic},
 };
 
+use super::smart_ban::{SentBlock, SmartBan};
 use super::web_seed::is_web_seed;
 
 use super::peer::{
@@ -82,6 +83,11 @@ pub(crate) struct PeerStates {
     // Whether peers at one address may each have a connection (libtorrent
     // `allow_multiple_connections_per_ip`, off by default).
     allow_multiple_connections_per_ip: bool,
+    // What the peers sent of the pieces that failed. A record names a peer
+    // on the list: it leaves with the peer (libtorrent `torrent::peers_erased`
+    // tells `smart_ban_plugin::on_erase_peers`), and goes with the list
+    // (`on_clear_peers`). Never taken while an entry of `states` is held.
+    smart_ban: Mutex<SmartBan>,
 }
 
 /// The peer list as a pause leaves it: every peer on it, idle, and the
@@ -168,6 +174,7 @@ impl PeerStates {
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
             allow_multiple_connections_per_ip: false,
+            smart_ban: Mutex::default(),
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
@@ -468,11 +475,45 @@ impl PeerStates {
             .remove_if(&addr, |_, peer| peer.erase_rank().is_some())
         {
             Some((_, peer)) => {
-                peer.destroy(self);
+                self.erased(addr, &peer);
                 true
             }
             None => false,
         }
+    }
+
+    // `peer`, at `handle`, left the table: what was counted of it, and the
+    // records of what it sent, go with it.
+    fn erased(&self, handle: PeerHandle, peer: &Peer) {
+        if is_web_seed(handle) {
+            self.web_seeds.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.count_out(peer.get_state());
+        self.smart_ban.lock().forget(handle);
+    }
+
+    /// Piece `piece` failed its hash check and `blocks` are its blocks as
+    /// read back: those of senders on the list are remembered. Returns the
+    /// senders that had sent a block of it before with other bytes; see
+    /// [`SmartBan::piece_failed`]. A sender no longer on the list blames
+    /// nobody (libtorrent `smart_ban_plugin::on_read_failed_block`: "there
+    /// is no peer with this address anymore").
+    pub fn piece_failed(
+        &self,
+        piece: ValidPieceIndex,
+        blocks: Vec<SentBlock>,
+    ) -> BTreeSet<PeerHandle> {
+        let mut smart_ban = self.smart_ban.lock();
+        let known = blocks
+            .into_iter()
+            .filter(|b| self.states.contains_key(&b.sender()));
+        smart_ban.piece_failed(piece, known)
+    }
+
+    /// Piece `piece` passed its hash check: the records of its failures,
+    /// which leave with it; see [`SmartBan::piece_passed`].
+    pub fn piece_passed(&self, piece: ValidPieceIndex) -> Vec<SentBlock> {
+        self.smart_ban.lock().piece_passed(piece)
     }
 
     /// When the connect loop may next connect to someone.
@@ -608,10 +649,7 @@ impl PeerStates {
 
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
         let p = self.states.remove(&handle).map(|r| r.1)?;
-        if is_web_seed(handle) {
-            self.web_seeds.fetch_sub(1, Ordering::Relaxed);
-        }
-        self.count_out(p.get_state());
+        self.erased(handle, &p);
         Some(p)
     }
 
@@ -1309,6 +1347,74 @@ mod tests {
         assert_eq!(state_of(&peers, second), None);
         assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
         assert_eq!(peers.stats().live as usize, MAX_PEERLIST_SIZE);
+    }
+
+    // libtorrent `torrent::peers_erased` tells `smart_ban_plugin::on_erase_peers`
+    // when entries leave the peer list, not when a connection closes; and
+    // `on_read_failed_block` records nothing of a peer the list does not
+    // know.
+    #[test]
+    fn the_smart_ban_records_of_a_peer_leave_the_list_with_it_and_outlive_its_connection() {
+        use crate::core::{
+            constants::CHUNK_SIZE,
+            lengths::{ChunkInfo, Lengths},
+        };
+        use crate::piece_tracker::Senders;
+        use crate::torrent_state::live::smart_ban::read_back;
+
+        let lengths = Lengths::new(u64::from(CHUNK_SIZE) * 4, CHUNK_SIZE * 4).unwrap();
+        let piece = lengths.validate_piece_index(0).unwrap();
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let (closed, mut closed_rx) = add_live_peer(&peers, "10.1.0.1:6881");
+        let (erased, dropped, stranger) = (peer_addr(1), peer_addr(2), peer_addr(3));
+        for addr in [erased, dropped] {
+            peers.add_peer(addr);
+        }
+        let senders: Senders = [closed, erased, dropped, stranger]
+            .map(Some)
+            .into_iter()
+            .collect();
+        let zeros = |_, _: &ChunkInfo, buf: &mut [u8]| {
+            buf.fill(0);
+            Ok(())
+        };
+        let senders_recorded = |records: Vec<SentBlock>| {
+            records
+                .iter()
+                .map(SentBlock::sender)
+                .collect::<BTreeSet<_>>()
+        };
+
+        let failed = read_back(&lengths, piece, &senders, zeros);
+        assert!(peers.piece_failed(piece, failed).is_empty());
+
+        // The connection closes: the peer stays on the list.
+        peers
+            .with_peer_mut(closed, "test", |peer| {
+                peer.take_state(&peers);
+                peers.connection_closed(peer, t0, false, true);
+            })
+            .unwrap();
+        while closed_rx.try_recv().is_ok() {}
+        // One peer is dropped, another pushed out of the full list.
+        peers.drop_peer(dropped).unwrap();
+        fail_out(&peers, erased, t0);
+        for i in 4.. {
+            if peers.listed() == MAX_PEERLIST_SIZE {
+                break;
+            }
+            peers.add_peer(peer_addr(i));
+        }
+        peers.add_peer(peer_addr(MAX_PEERLIST_SIZE + 4));
+        assert_eq!(state_of(&peers, erased), None);
+
+        let failed = read_back(&lengths, piece, &senders, zeros);
+        assert!(peers.piece_failed(piece, failed).is_empty());
+        assert_eq!(
+            senders_recorded(peers.piece_passed(piece)),
+            BTreeSet::from([closed])
+        );
     }
 
     // libtorrent `torrent::do_pause` disconnects every peer and keeps

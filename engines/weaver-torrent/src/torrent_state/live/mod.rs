@@ -122,7 +122,6 @@ use self::{
         },
     },
     peers::{IncomingRefused, PeerStates, holepunch::is_local},
-    smart_ban::SmartBan,
     stats::{atomic::AtomicStats, snapshot::StatsSnapshot},
     web_seed::{SeedLink, WEB_SEED_TICK, WebSeedConnection},
 };
@@ -143,9 +142,6 @@ pub(crate) struct TorrentStateLocked {
     fatal_errors_tx: Option<tokio::sync::oneshot::Sender<anyhow::Error>>,
 
     unflushed_bitv_bytes: u64,
-
-    // The blocks of the pieces that failed, with their senders.
-    smart_ban: SmartBan,
 }
 
 impl TorrentStateLocked {
@@ -308,7 +304,6 @@ impl TorrentStateLive {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
-                smart_ban: SmartBan::default(),
             }),
             files: paused.files,
             stats: AtomicStats {
@@ -2789,10 +2784,7 @@ impl PeerHandler {
                     return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
                 }
                 Verdict::Passed => {
-                    let failed = state
-                        .lock_write("smart_ban")
-                        .smart_ban
-                        .piece_passed(piece_index);
+                    let failed = state.peers.piece_passed(piece_index);
                     // Before the storage takes the piece, while the good bytes
                     // are still there to read back.
                     for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
@@ -2875,10 +2867,7 @@ impl PeerHandler {
                     // Before the storage lets go of the failed bytes.
                     let blocks =
                         smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
-                    let liars = state
-                        .lock_write("smart_ban")
-                        .smart_ban
-                        .piece_failed(piece_index, blocks);
+                    let liars = state.peers.piece_failed(piece_index, blocks);
                     // Every peer that sent a block of it loses points and goes
                     // on parole; one at the floor, or that sent the whole
                     // piece, is banned (libtorrent `torrent::piece_failed`,

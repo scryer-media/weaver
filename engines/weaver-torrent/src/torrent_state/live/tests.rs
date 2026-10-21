@@ -1619,12 +1619,7 @@ async fn the_sender_of_a_bad_block_is_banned_once_the_piece_passes_and_the_other
     // The bad peer is turned away when it connects again.
     assert!(h.refused("127.0.0.1:50000"));
     // The records went with the pass.
-    assert!(
-        h.lock_write("test")
-            .smart_ban
-            .piece_passed(h.piece(0))
-            .is_empty()
-    );
+    assert!(h.peers.piece_passed(h.piece(0)).is_empty());
 }
 
 #[tokio::test]

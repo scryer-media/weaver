@@ -34,6 +34,14 @@ pub(crate) struct SentBlock {
     digest: Digest,
 }
 
+impl SentBlock {
+    pub fn sender(&self) -> PeerHandle {
+        self.sender
+    }
+}
+
+/// The records of the peer list's peers: each names a peer on the list, and
+/// leaves with it.
 #[derive(Debug, Default)]
 pub(crate) struct SmartBan {
     // Every block of each piece that failed and has not passed since, one
@@ -72,6 +80,17 @@ impl SmartBan {
     /// `smart_ban_plugin::on_piece_pass`).
     pub fn piece_passed(&mut self, piece: ValidPieceIndex) -> Vec<SentBlock> {
         self.failed.remove(&piece).unwrap_or_default()
+    }
+
+    /// `peer` left the peer list: what it sent goes with it, and blames
+    /// nobody (libtorrent `smart_ban_plugin::on_erase_peers`, called from
+    /// `torrent::peers_erased`). A closed connection is no leaving: the
+    /// peer stays on the list, and so do its records.
+    pub fn forget(&mut self, peer: PeerHandle) {
+        self.failed.retain(|_, records| {
+            records.retain(|r| r.sender != peer);
+            !records.is_empty()
+        });
     }
 }
 
@@ -250,6 +269,42 @@ mod tests {
             senders_of_bad_blocks(&records, Storage::good().read()),
             BTreeSet::from([a, b])
         );
+    }
+
+    #[test]
+    fn a_forgotten_sender_is_named_neither_at_the_failure_nor_at_the_pass() {
+        let mut smart_ban = SmartBan::default();
+        let (a, b) = (peer(1), peer(2));
+        let senders = deliver([a, a, b, b]);
+        let failed = read_back(
+            &lengths(),
+            piece(),
+            &senders,
+            Storage::with_bad_block(0).read(),
+        );
+        assert!(smart_ban.piece_failed(piece(), failed).is_empty());
+
+        smart_ban.forget(a);
+
+        // a sends its blocks again with other bytes: it is a stranger now.
+        let failed = read_back(
+            &lengths(),
+            piece(),
+            &senders,
+            Storage::with_bad_block(1).read(),
+        );
+        assert!(smart_ban.piece_failed(piece(), failed).is_empty());
+        smart_ban.forget(a);
+        let records = smart_ban.piece_passed(piece());
+        assert!(records.iter().all(|r| r.sender() == b));
+        assert!(senders_of_bad_blocks(&records, Storage::good().read()).is_empty());
+
+        // The last sender of a piece forgotten, the piece goes too.
+        let failed = read_back(&lengths(), piece(), &senders, Storage::good().read());
+        smart_ban.piece_failed(piece(), failed);
+        smart_ban.forget(a);
+        smart_ban.forget(b);
+        assert!(smart_ban.failed.is_empty());
     }
 
     #[test]
