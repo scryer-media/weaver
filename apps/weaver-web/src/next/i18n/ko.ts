@@ -1842,6 +1842,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.createdOn": "생성 시각",
   "next.torrent.private": "비공개",
   "next.torrent.infoHashV1": "정보 해시 v1",
+  "next.torrent.infoHashV2": "정보 해시 v2",
   "next.torrent.savePath": "저장 경로",
   "next.torrent.comment": "설명",
   "next.torrent.overrideSeeding": "시딩 재정의",

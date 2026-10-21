@@ -953,3 +953,20 @@ kind = "sql"
 file = "migrations/0077_torrent_metadata/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 78
+description = "a torrent's v2 hash is unique wherever it is known"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0078_torrent_infohash_v2/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0078_torrent_infohash_v2/postgres.sql"
+engine = "postgres"
+scope = "all"

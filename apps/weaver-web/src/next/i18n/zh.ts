@@ -1842,6 +1842,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.createdOn": "创建时间",
   "next.torrent.private": "私有",
   "next.torrent.infoHashV1": "信息哈希 v1",
+  "next.torrent.infoHashV2": "信息哈希 v2",
   "next.torrent.savePath": "保存路径",
   "next.torrent.comment": "注释",
   "next.torrent.overrideSeeding": "覆盖做种",

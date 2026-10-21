@@ -1842,6 +1842,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.createdOn": "作成日時",
   "next.torrent.private": "プライベート",
   "next.torrent.infoHashV1": "情報ハッシュ v1",
+  "next.torrent.infoHashV2": "情報ハッシュ v2",
   "next.torrent.savePath": "保存先",
   "next.torrent.comment": "コメント",
   "next.torrent.overrideSeeding": "シード設定を上書き",

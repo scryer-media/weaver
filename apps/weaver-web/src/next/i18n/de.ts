@@ -1842,6 +1842,7 @@ export const nextDe: LocaleDictionary = {
   "next.torrent.createdOn": "Erstellt am",
   "next.torrent.private": "Privat",
   "next.torrent.infoHashV1": "Info-Hash v1",
+  "next.torrent.infoHashV2": "Info-Hash v2",
   "next.torrent.savePath": "Speicherpfad",
   "next.torrent.comment": "Kommentar",
   "next.torrent.overrideSeeding": "Seeding überschreiben",

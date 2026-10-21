@@ -1511,6 +1511,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       id
       name
       infohash
+      infohashV2
       state
       detail
       category

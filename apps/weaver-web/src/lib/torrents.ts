@@ -74,6 +74,7 @@ export interface TorrentSummaryData {
 export interface TorrentData extends TorrentSummaryData {
   name: string;
   infohash: string;
+  infohashV2: string | null;
   detail: string | null;
   category: string | null;
   private: boolean;

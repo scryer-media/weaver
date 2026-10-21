@@ -417,6 +417,10 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         job_id: JobId(7),
         name: "set".into(),
         infohash: String::new(),
+        infohash_v1: None,
+        infohash_v2: None,
+        version: None,
+        magnet: String::new(),
         source: TorrentSource::Metainfo,
         state: TorrentState::Downloading,
         detail: None,
@@ -544,6 +548,81 @@ async fn a_magnet_is_refused_without_a_network_to_fetch_it_on() {
         Err(AddError::NoNetwork(_))
     ));
     assert!(rig.db.list_torrents().unwrap().is_empty());
+}
+
+const V2_ONLY: &[u8] = include_bytes!(concat!(
+    std::env!("CARGO_MANIFEST_DIR"),
+    "/../../../engines/weaver-torrent/resources/test/libtorrent/v2_only.torrent"
+));
+const V2_HYBRID: &[u8] = include_bytes!(concat!(
+    std::env!("CARGO_MANIFEST_DIR"),
+    "/../../../engines/weaver-torrent/resources/test/libtorrent/v2_hybrid.torrent"
+));
+
+// A v2 or hybrid torrent is one job, found by either of its hashes, whether
+// it arrives as metainfo or as a magnet naming one hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_torrent_is_added_and_found_by_either_hash() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+
+    let v2_only = rig
+        .service
+        .add(request(AddSource::Metainfo(V2_ONLY.to_vec())))
+        .await
+        .unwrap();
+    let stored = rig.db.get_torrent(v2_only).unwrap().unwrap();
+    assert_eq!(stored.infohash_v1, None);
+    let v2 = Id32::new(stored.infohash_v2.unwrap()).as_string();
+    let view = rig.service.torrent(v2_only).await.unwrap();
+    assert_eq!(view.version, Some(TorrentVersion::V2));
+    assert_eq!(view.infohash_v1, None);
+    assert_eq!(view.infohash_v2.as_deref(), Some(v2.as_str()));
+    assert_eq!(view.infohash, v2[..40]);
+    assert_eq!(
+        rig.service
+            .add(request(AddSource::Metainfo(V2_ONLY.to_vec())))
+            .await,
+        Err(AddError::Duplicate(v2_only))
+    );
+
+    let hybrid = rig
+        .service
+        .add(request(AddSource::Metainfo(V2_HYBRID.to_vec())))
+        .await
+        .unwrap();
+    let stored = rig.db.get_torrent(hybrid).unwrap().unwrap();
+    let v1 = Id20::new(stored.infohash_v1.unwrap()).as_string();
+    let v2 = Id32::new(stored.infohash_v2.unwrap()).as_string();
+    let view = rig.service.torrent(hybrid).await.unwrap();
+    assert_eq!(view.version, Some(TorrentVersion::Hybrid));
+    assert_eq!(view.infohash, v1);
+    assert!(view.magnet.contains(&format!("urn:btih:{v1}")));
+    assert!(view.magnet.contains(&format!("urn:btmh:1220{v2}")));
+    let tracker = "&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce";
+    for xt in [format!("urn:btih:{v1}"), format!("urn:btmh:1220{v2}")] {
+        assert_eq!(
+            rig.service
+                .add(request(AddSource::Magnet(format!(
+                    "magnet:?xt={xt}{tracker}"
+                ))))
+                .await,
+            Err(AddError::Duplicate(hybrid))
+        );
+    }
+
+    // A magnet naming only a v2 hash waits for its metainfo with that hash.
+    let fresh = "ab".repeat(32);
+    let magnet = rig
+        .service
+        .add(request(AddSource::Magnet(format!(
+            "magnet:?xt=urn:btmh:1220{fresh}{tracker}"
+        ))))
+        .await
+        .unwrap();
+    let stored = rig.db.get_torrent(magnet).unwrap().unwrap();
+    assert_eq!(stored.infohash_v1, None);
+    assert_eq!(stored.infohash_v2, Some([0xab; 32]));
 }
 
 // The attributes a torrent is added with stay with its job, from the queue

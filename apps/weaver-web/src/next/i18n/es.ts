@@ -1842,6 +1842,7 @@ export const nextEs: LocaleDictionary = {
   "next.torrent.createdOn": "Creado el",
   "next.torrent.private": "Privado",
   "next.torrent.infoHashV1": "Hash de información v1",
+  "next.torrent.infoHashV2": "Hash de información v2",
   "next.torrent.savePath": "Ruta de guardado",
   "next.torrent.comment": "Comentario",
   "next.torrent.overrideSeeding": "Anular siembra",

@@ -4828,7 +4828,15 @@ enum TimelineStage {
 type Torrent {
 	id: Int!
 	name: String!
+	"""
+	Its v1 hash; empty when it has none.
+	"""
 	infohash: String!
+	infohashV2: String
+	"""
+	Which hashes verify its pieces, once its metainfo is in hand.
+	"""
+	version: TorrentVersion
 	state: TorrentState!
 	"""
 	Why the torrent is in its state, when there is a reason to give.
@@ -4996,6 +5004,15 @@ type TorrentTracker {
 	leechers: Int
 	lastAnnounceMs: Int
 	nextAnnounceMs: Int
+}
+
+"""
+Which hashes verify a torrent's pieces.
+"""
+enum TorrentVersion {
+	V1
+	V2
+	HYBRID
 }
 
 """

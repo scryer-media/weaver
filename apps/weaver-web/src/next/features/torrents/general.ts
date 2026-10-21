@@ -62,6 +62,7 @@ export function informationFields(t: Translate, torrent: TorrentData): TorrentFi
     { label: t("next.torrent.route"), value: text(torrent.route) },
     { label: t("next.torrents.unpack"), value: t(torrent.unpack ? "next.common.on" : "next.common.off") },
     { label: t("next.torrent.infoHashV1"), value: text(torrent.infohash), wide: true },
+    { label: t("next.torrent.infoHashV2"), value: text(torrent.infohashV2), wide: true },
     { label: t("next.torrent.savePath"), value: text(torrent.savePath), wide: true },
     { label: t("next.torrent.comment"), value: text(torrent.comment), wide: true },
   ];
