@@ -27,6 +27,7 @@ pub(crate) const DEFAULT_CONNECTION_SPEED: NonZeroU32 = NonZeroU32::new(30).unwr
 const WINDOW: Duration = Duration::from_secs(1);
 
 pub(crate) struct ConnectionSlots {
+    limit: usize,
     open: Arc<Semaphore>,
     connects: Mutex<ConnectWindow>,
     speed: NonZeroU32,
@@ -46,8 +47,10 @@ pub(crate) struct ConnectionSlot {
 
 impl ConnectionSlots {
     pub(crate) fn new(limit: usize, speed: NonZeroU32) -> Self {
+        let limit = limit.min(Semaphore::MAX_PERMITS);
         Self {
-            open: Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))),
+            limit,
+            open: Arc::new(Semaphore::new(limit)),
             connects: Mutex::new(ConnectWindow {
                 start: Instant::now(),
                 left: speed.get(),
@@ -67,6 +70,18 @@ impl ConnectionSlots {
     /// `connections_limit` less `session_impl::num_connections`).
     pub(crate) fn free(&self) -> usize {
         self.open.available_permits()
+    }
+
+    /// The most connections the session may hold (libtorrent
+    /// `connections_limit`).
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// How many connections the session holds (libtorrent
+    /// `session_impl::num_connections`).
+    pub(crate) fn in_use(&self) -> usize {
+        self.limit - self.free()
     }
 
     /// A place for an outgoing connection, once one is free.

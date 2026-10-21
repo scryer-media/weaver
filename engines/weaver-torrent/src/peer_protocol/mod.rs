@@ -453,6 +453,8 @@ pub enum SerializeError {
     NeedPex,
     #[error("the peer does not speak ut_holepunch")]
     NeedHolepunch,
+    #[error("the peer takes no upload_only")]
+    NeedUploadOnly,
 }
 
 impl From<std::io::Error> for SerializeError {

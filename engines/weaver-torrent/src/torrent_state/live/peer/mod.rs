@@ -223,9 +223,15 @@ pub(crate) fn ingest_bitfield(payload: &[u8], total_pieces: u32) -> anyhow::Resu
     Ok(bitfield)
 }
 
+/// Where a connected peer stands when the torrent turns peers over; the
+/// lowest is disconnected first: one we are not interested in, then one that
+/// is no seed, then one on parole, then the least payload it sent per second
+/// connected (libtorrent `compare_disconnect_peer` in `torrent.cpp`).
+pub(crate) type DisconnectRank = (bool, bool, Reverse<bool>, u64);
+
 /// Where a peer stands when a full peer list must forget one; the lowest goes
 /// first. Peers we would not connect to go before connect candidates, then the
-/// most failures in a row, then the oldest failure.
+/// most failures in a row, then the connection that closed longest ago.
 pub(crate) type EraseRank = (bool, Reverse<u32>, Option<Instant>);
 
 #[derive(Debug)]
@@ -238,8 +244,9 @@ pub(crate) struct Peer {
     pub outgoing_address: Option<SocketAddr>,
     // Connections that failed in a row; one that delivers data clears it.
     failcount: u32,
-    // When the last of those failures happened.
-    last_failed: Option<Instant>,
+    // When its last connection closed, failed or not (libtorrent
+    // `torrent_peer::last_connected`, set in `peer_list::connection_closed`).
+    last_connected: Option<Instant>,
     // When the choker last gave the peer the optimistic slot, on any
     // connection to it.
     pub last_optimistic_unchoke: Option<Instant>,
@@ -270,11 +277,12 @@ impl Peer {
                 tx,
                 connection_kind,
                 &stats.counters,
+                false,
             )),
             stats,
             outgoing_address: listen_address(addr, connection_kind),
             failcount: 0,
-            last_failed: None,
+            last_connected: None,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
             supports_holepunch: false,
@@ -291,7 +299,7 @@ impl Peer {
             stats: Default::default(),
             state: Default::default(),
             failcount: 0,
-            last_failed: None,
+            last_connected: None,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
             supports_holepunch: false,
@@ -327,20 +335,21 @@ impl Peer {
     }
 
     /// The earliest time we may connect to the peer: `(failcount + 1)`
-    /// reconnect times after its last failure. None when it never failed,
-    /// or a holepunch introduced it.
+    /// reconnect times after its last connection closed (libtorrent
+    /// `peer_list::find_connect_candidates`). None when we never connected
+    /// to it, or a holepunch introduced it.
     pub(crate) fn reconnect_at(&self) -> Option<Instant> {
         let wait = MIN_RECONNECT_TIME.saturating_mul(self.failcount.saturating_add(1));
-        self.last_failed
+        self.last_connected
             .filter(|_| !self.holepunch)
             .map(|at| at + wait)
     }
 
     /// Where the peer stands among connect candidates due together; the lowest
     /// goes first: a holepunched peer, then the fewest failures in a row,
-    /// then the oldest failure.
+    /// then the connection that closed longest ago.
     pub(crate) fn connect_rank(&self) -> (bool, u32, Option<Instant>) {
-        (!self.holepunch, self.failcount, self.last_failed)
+        (!self.holepunch, self.failcount, self.last_connected)
     }
 
     /// Whether a holepunch introduced the peer and the connection it asked
@@ -395,18 +404,20 @@ impl Peer {
         self.failcount = 0;
     }
 
-    /// Settles the peer after its connection closed. `failed_at` is set when
-    /// the connection ended in an error; `needed` says whether we still want
-    /// the peer.
+    /// Settles the peer after its connection closed at `closed_at`, in an
+    /// error when `failed`; `needed` says whether we still want the peer.
+    /// Every close starts the wait to reconnect, and a failure lengthens it
+    /// (libtorrent `peer_list::connection_closed`).
     pub(crate) fn connection_closed(
         &mut self,
-        failed_at: Option<Instant>,
+        closed_at: Instant,
+        failed: bool,
         needed: bool,
         counters: &PeerStates,
     ) {
-        if let Some(at) = failed_at {
+        self.last_connected = Some(closed_at);
+        if failed {
             self.failcount = self.failcount.saturating_add(1);
-            self.last_failed = Some(at);
         }
         self.holepunch = false;
         let next = if needed {
@@ -471,7 +482,7 @@ impl Peer {
             stats: Default::default(),
             outgoing_address: self.outgoing_address,
             failcount: self.failcount,
-            last_failed: self.last_failed,
+            last_connected: self.last_connected,
             last_optimistic_unchoke: self.last_optimistic_unchoke,
             trust: self.trust,
             supports_holepunch: self.supports_holepunch,
@@ -494,7 +505,50 @@ impl Peer {
             PeerState::Queued => true,
             PeerState::Dead | PeerState::NotNeeded => false,
         };
-        Some((candidate, Reverse(self.failcount), self.last_failed))
+        Some((candidate, Reverse(self.failcount), self.last_connected))
+    }
+
+    /// Where the peer's connection stands when the torrent turns peers over;
+    /// the lowest goes first. None when it has no connection.
+    pub(crate) fn disconnect_rank(&self, now: Instant) -> Option<DisconnectRank> {
+        let parole = Reverse(self.trust.on_parole());
+        Some(match &self.state {
+            PeerState::Connecting(_) => (false, false, parole, 0),
+            PeerState::Live(live) => {
+                let fetched = Transfer::of(&self.stats.counters)
+                    .fetched
+                    .saturating_sub(live.fetched_at_live);
+                let seconds = now.saturating_duration_since(live.live_since).as_secs();
+                (
+                    live.interesting,
+                    live.seeder,
+                    parole,
+                    fetched / (seconds + 1),
+                )
+            }
+            PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => return None,
+        })
+    }
+
+    /// Asks the peer's connection, if it has one, to close. The close is no
+    /// failure.
+    pub(crate) fn disconnect(&self) {
+        let tx = match &self.state {
+            PeerState::Connecting(tx) => tx,
+            PeerState::Live(live) => &live.tx,
+            PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => return,
+        };
+        let _ = tx.send(WriterRequest::Disconnect(Ok(())));
+    }
+
+    /// Whether we made the peer's connection, open or opening; None when it
+    /// has none.
+    pub(crate) fn connected_out(&self) -> Option<bool> {
+        match &self.state {
+            PeerState::Connecting(_) => Some(true),
+            PeerState::Live(live) => Some(live.outgoing),
+            PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => None,
+        }
     }
 }
 
@@ -607,7 +661,8 @@ impl Peer {
         }
         match self.take_state(counters) {
             PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => {
-                let live = LivePeerState::new(peer_id, tx, connection_kind, &self.stats.counters);
+                let live =
+                    LivePeerState::new(peer_id, tx, connection_kind, &self.stats.counters, false);
                 self.set_state(PeerState::Live(live), counters);
             }
             PeerState::Connecting(..) | PeerState::Live(..) => unreachable!(),
@@ -626,7 +681,7 @@ impl Peer {
                 PeerState::Connecting(tx) => tx,
                 _ => unreachable!(),
             };
-            let live = LivePeerState::new(peer_id, tx, conn_kind, &self.stats.counters);
+            let live = LivePeerState::new(peer_id, tx, conn_kind, &self.stats.counters, true);
             self.set_state(PeerState::Live(live), counters);
             self.get_live_mut()
         } else {
@@ -674,6 +729,14 @@ pub(crate) struct LivePeerState {
     // What the peer had sent us and we had sent it when the choker's current
     // round began.
     round_start: Transfer,
+    // When the connection went live, and what the peer had sent us by then
+    // (libtorrent `peer_connection::m_connect`, and the start of its
+    // `total_payload_download`).
+    live_since: Instant,
+    fetched_at_live: u64,
+    // Whether we made the connection (libtorrent
+    // `peer_connection::is_outgoing`).
+    outgoing: bool,
 
     // This is used to track the pieces the peer has.
     pub bitfield: BF,
@@ -723,6 +786,10 @@ pub(crate) struct LivePeerState {
     // The peer's extended handshake names ut_holepunch (libtorrent
     // `bt_peer_connection::m_holepunch_id`).
     pub supports_holepunch: bool,
+
+    // The peer's extended handshake names upload_only (libtorrent
+    // `bt_peer_connection::m_upload_only_id`).
+    pub supports_upload_only: bool,
 
     // The peers its PEX messages named and have not dropped since, at most
     // MAX_PEX_PEERS of each address family (libtorrent `ut_pex_plugin`'s
@@ -776,14 +843,17 @@ pub(crate) enum Refused {
 }
 
 impl LivePeerState {
-    /// A connection that just went live, to a peer with `counters`.
+    /// A connection that just went live, to a peer with `counters`; we made
+    /// it when `outgoing`.
     pub fn new(
         peer_id: Id20,
         tx: PeerTx,
         connection_kind: ConnectionKind,
         counters: &PeerCountersAtomic,
+        outgoing: bool,
     ) -> Self {
         let now = Instant::now();
+        let transfer = Transfer::of(counters);
         LivePeerState {
             peer_id,
             client_name: None,
@@ -795,7 +865,10 @@ impl LivePeerState {
             choked_at: Some(now),
             last_unchoke: now,
             uploaded_at_unchoke: 0,
-            round_start: Transfer::of(counters),
+            round_start: transfer,
+            live_since: now,
+            fetched_at_live: transfer.fetched,
+            outgoing,
             bitfield: BF::default(),
             seeder: false,
             inflight_requests: Default::default(),
@@ -808,6 +881,7 @@ impl LivePeerState {
             invalid_requests: 0,
             super_seeded: None,
             supports_holepunch: false,
+            supports_upload_only: false,
             pex_named: HashSet::new(),
             pex_arrivals: [None; PEX_FLOOD_MESSAGES],
             dht_port: None,
@@ -1387,7 +1461,8 @@ mod tests {
         let piece = |i| lengths.validate_piece_index(i).unwrap();
         let (tx, _rx) = unbounded_channel();
         let counters = stats::atomic::PeerStats::default().counters;
-        let mut live = LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters);
+        let mut live =
+            LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters, true);
 
         for i in 0..17 {
             live.suggest(piece(i));
@@ -1410,7 +1485,8 @@ mod tests {
             .unwrap();
         let (tx, _rx) = unbounded_channel();
         let counters = stats::atomic::PeerStats::default().counters;
-        let mut live = LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters);
+        let mut live =
+            LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters, true);
         let start = Instant::now();
         let minute = start + NO_REQUEST_TIMEOUT;
         let past = |t: Instant| t + Duration::from_secs(1);
@@ -1447,7 +1523,8 @@ mod tests {
     async fn mutually_uninterested_peers_time_out_after_ten_minutes_when_slots_run_short() {
         let (tx, _rx) = unbounded_channel();
         let counters = stats::atomic::PeerStats::default().counters;
-        let mut live = LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters);
+        let mut live =
+            LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters, true);
         let start = Instant::now();
         let secs = |s| start + Duration::from_secs(s);
         let ten = INACTIVITY_TIMEOUT.as_secs();

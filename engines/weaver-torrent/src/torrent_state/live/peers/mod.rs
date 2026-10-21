@@ -25,7 +25,7 @@ use tracing::warn;
 
 use crate::{
     peer_connection::WriterRequest,
-    peer_protocol::Message,
+    peer_protocol::{Message, extended::ExtendedMessage},
     stream_connect::ConnectionKind,
     torrent_state::utils::{TimedExistence, atomic_inc},
     type_aliases::{BF, PeerHandle},
@@ -79,6 +79,9 @@ pub(crate) struct PeerStates {
     // libtorrent keeps a web seed's peer in its `web_seed_t`, so it counts
     // against no `max_peerlist_size`.
     web_seeds: AtomicUsize,
+    // Whether peers at one address may each have a connection (libtorrent
+    // `allow_multiple_connections_per_ip`, off by default).
+    allow_multiple_connections_per_ip: bool,
 }
 
 /// The peer list as a pause leaves it: every peer on it, idle, and the
@@ -115,6 +118,7 @@ enum Admitted<R> {
     New(Arc<PeerCountersAtomic>),
     Refused,
     Banned,
+    Duplicate,
 }
 
 /// When the connect loop may next connect to someone.
@@ -163,12 +167,20 @@ impl PeerStates {
             candidates_changed: Notify::new(),
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
+            allow_multiple_connections_per_ip: false,
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
             peers.states.insert(peer.addr, peer);
         }
         peers
+    }
+
+    /// The list, letting peers at one address each have a connection when
+    /// `allow`.
+    pub fn allowing_multiple_connections_per_ip(mut self, allow: bool) -> Self {
+        self.allow_multiple_connections_per_ip = allow;
+        self
     }
 
     /// The list as a pause leaves it: every peer on it, without its
@@ -216,6 +228,7 @@ impl PeerStates {
         self.admit(
             addr,
             Displace::NonCandidates,
+            None,
             |peer| peer.rediscovered(self),
             || Some(Peer::new_with_outgoing_address(addr)),
         );
@@ -229,6 +242,7 @@ impl PeerStates {
         self.admit(
             addr,
             Displace::NonCandidates,
+            None,
             |peer| {
                 atomic_inc(&peer.stats.counters.incoming_connections);
                 peer.rediscovered(self);
@@ -244,17 +258,20 @@ impl PeerStates {
         self.candidates_changed.notify_one();
     }
 
-    /// A peer connected to us and holds a slot. Returns its counters.
+    /// A peer connected to us, on our listen port `our_port`, and holds a
+    /// slot. Returns its counters.
     pub fn add_incoming(
         &self,
         addr: SocketAddr,
         peer_id: Id20,
         tx: PeerTx,
         kind: ConnectionKind,
+        our_port: u16,
     ) -> Result<Arc<PeerCountersAtomic>, IncomingRefused> {
         let admitted = self.admit(
             addr,
             Displace::AnyIdle,
+            Some(our_port),
             |peer| {
                 peer.incoming_connection(peer_id, tx.clone(), self, kind)
                     .map(|()| peer.stats.counters.clone())
@@ -270,7 +287,7 @@ impl PeerStates {
         );
         match admitted {
             Admitted::Known(Ok(counters)) | Admitted::New(counters) => Ok(counters),
-            Admitted::Known(Err(IncomingConnectionResult::AlreadyActive)) => {
+            Admitted::Known(Err(IncomingConnectionResult::AlreadyActive)) | Admitted::Duplicate => {
                 Err(IncomingRefused::AlreadyActive)
             }
             Admitted::Refused => Err(IncomingRefused::ListFull),
@@ -279,20 +296,28 @@ impl PeerStates {
     }
 
     // The one way into the list. A peer at a banned address is turned away
-    // (libtorrent `peer_list::new_connection`, `peer_list::add_peer`). A known
-    // peer is handed to `known`. A newcomer from `newcomer` joins, first
-    // pushing out the peer that ranks lowest when the list is full; it is
-    // refused when nobody `displace` allows is there.
+    // (libtorrent `peer_list::new_connection`, `peer_list::add_peer`). A
+    // connection that came to `our_port` first settles who keeps the one
+    // connection to its address. A known peer is handed to `known`. A
+    // newcomer from `newcomer` joins, first pushing out the peer that ranks
+    // lowest when the list is full; it is refused when nobody `displace`
+    // allows is there.
     fn admit<R>(
         &self,
         addr: SocketAddr,
         displace: Displace,
+        our_port: Option<u16>,
         known: impl FnOnce(&mut Peer) -> R,
         newcomer: impl FnOnce() -> Option<Peer>,
     ) -> Admitted<R> {
         let _admission = self.admission.lock();
         if self.is_banned(addr.ip()) {
             return Admitted::Banned;
+        }
+        if let Some(our_port) = our_port
+            && !self.keeps_incoming(addr, our_port)
+        {
+            return Admitted::Duplicate;
         }
         if let Some(r) = self.with_peer_mut(addr, "admit", known) {
             return Admitted::Known(r);
@@ -310,6 +335,82 @@ impl PeerStates {
         let counters = peer.stats.counters.clone();
         self.states.insert(addr, peer);
         Admitted::New(counters)
+    }
+
+    // One connection per address (libtorrent `allow_multiple_connections_per_ip`
+    // off, `peer_list::new_connection`). Whether a connection that came from
+    // `addr` to `our_port` stays, against one to another port at its address.
+    // When it reached us both times, the first stays. When we made the other
+    // one, both ends keep the connection made by the end with the lower
+    // listen port, so both drop the same one; a tie is settled by chance.
+    // The connection that loses is closed, which is no failure.
+    fn keeps_incoming(&self, addr: SocketAddr, our_port: u16) -> bool {
+        let other = self
+            .connections()
+            .into_iter()
+            .find(|(other, _)| other.ip() == addr.ip() && *other != addr);
+        let Some((other, outgoing)) = other else {
+            return true;
+        };
+        let keep = outgoing
+            && match our_port.cmp(&other.port()) {
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => rand::random(),
+            };
+        if keep {
+            self.with_peer(other, Peer::disconnect);
+        }
+        keep
+    }
+
+    // The addresses a peer on the list has a connection, open or opening,
+    // at. No other peer there is connected to (libtorrent's peer list holds
+    // one entry per address, and an entry with a connection is no connect
+    // candidate).
+    fn connected_ips(&self) -> HashSet<IpAddr> {
+        self.connections()
+            .into_iter()
+            .map(|(addr, _)| addr.ip())
+            .collect()
+    }
+
+    // The peers on the list with a connection, open or opening, each with
+    // whether we made it. None when peers at one address may each have one:
+    // no connection then stands in another's way.
+    fn connections(&self) -> Vec<(SocketAddr, bool)> {
+        if self.allow_multiple_connections_per_ip {
+            return Vec::new();
+        }
+        self.states
+            .iter()
+            .filter(|e| !is_web_seed(*e.key()))
+            .filter_map(|e| Some((*e.key(), e.value().connected_out()?)))
+            .collect()
+    }
+
+    /// How many peers we could connect to (libtorrent
+    /// `peer_list::num_connect_candidates`).
+    pub fn connect_candidates(&self) -> usize {
+        let connected = self.connected_ips();
+        self.states
+            .iter()
+            .filter(|e| e.value().is_connect_candidate() && !connected.contains(&e.key().ip()))
+            .count()
+    }
+
+    /// Closes the connections of the `n` peers that rank lowest to keep
+    /// (libtorrent `torrent::disconnect_peers`); see [`Peer::disconnect_rank`].
+    pub fn disconnect_lowest(&self, n: usize, now: Instant) {
+        let mut ranked = self
+            .states
+            .iter()
+            .filter_map(|e| Some((e.value().disconnect_rank(now)?, *e.key())))
+            .collect::<Vec<_>>();
+        ranked.sort_unstable();
+        for (_, addr) in ranked.into_iter().take(n) {
+            self.with_peer(addr, Peer::disconnect);
+        }
     }
 
     // The peers on the peer list: every one but the web seeds.
@@ -376,10 +477,11 @@ impl PeerStates {
 
     /// When the connect loop may next connect to someone.
     pub fn next_candidate(&self, now: Instant) -> NextCandidate {
+        let connected = self.connected_ips();
         let mut next = NextCandidate::None;
         for e in self.states.iter() {
             let peer = e.value();
-            if !peer.is_connect_candidate() {
+            if !peer.is_connect_candidate() || connected.contains(&e.key().ip()) {
                 continue;
             }
             match peer.reconnect_at() {
@@ -416,12 +518,15 @@ impl PeerStates {
     }
 
     /// Starts connecting to the connect candidate due at `now` that failed
-    /// least, then longest ago.
+    /// least, then longest ago, at an address no connection is at. Under the
+    /// admission lock, so none comes from there meanwhile.
     pub fn connect_next(&self, now: Instant) -> Option<(PeerHandle, PeerRx, PeerTx)> {
+        let _admission = self.admission.lock();
+        let connected = self.connected_ips();
         let (_, addr) = self
             .states
             .iter()
-            .filter(|e| e.value().is_due(now))
+            .filter(|e| e.value().is_due(now) && !connected.contains(&e.key().ip()))
             .map(|e| (e.value().connect_rank(), *e.key()))
             .min()?;
         let (rx, tx) = self
@@ -431,11 +536,16 @@ impl PeerStates {
     }
 
     /// Settles a peer whose connection closed; see [`Peer::connection_closed`].
-    pub fn connection_closed(&self, peer: &mut Peer, failed_at: Option<Instant>, needed: bool) {
-        peer.connection_closed(failed_at, needed, self);
-        if peer.is_connect_candidate() {
-            self.candidates_changed.notify_one();
-        }
+    /// The peer, or another at its address, may be a connect candidate now.
+    pub fn connection_closed(
+        &self,
+        peer: &mut Peer,
+        closed_at: Instant,
+        failed: bool,
+        needed: bool,
+    ) {
+        peer.connection_closed(closed_at, failed, needed, self);
+        self.candidates_changed.notify_one();
     }
 
     /// The peer's connection completed its handshake and carried a message.
@@ -615,6 +725,20 @@ impl PeerStates {
             }
         }
     }
+
+    /// Tells every live peer that takes upload_only whether we only upload
+    /// now (libtorrent `torrent::send_upload_only`).
+    pub(crate) fn send_upload_only(&self, enabled: bool) {
+        for peer in self.states.iter() {
+            if let PeerState::Live(live) = peer.value().get_state()
+                && live.supports_upload_only
+            {
+                let _ = live.tx.send(WriterRequest::Message(Message::Extended(
+                    ExtendedMessage::UploadOnly(enabled),
+                )));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -635,6 +759,9 @@ mod tests {
         BF::from_boxed_slice(vec![0u8; 1].into_boxed_slice())
     }
 
+    // The port the tests' incoming connections come to.
+    const OUR_PORT: u16 = 6881;
+
     fn make_peer_states() -> PeerStates {
         PeerStates::new(Default::default(), TOTAL_PIECES as u32)
     }
@@ -644,7 +771,7 @@ mod tests {
         let addr: SocketAddr = addr.parse().unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         peers
-            .add_incoming(addr, Id20::default(), tx, ConnectionKind::Tcp)
+            .add_incoming(addr, Id20::default(), tx, ConnectionKind::Tcp, OUR_PORT)
             .unwrap();
         (addr, rx)
     }
@@ -708,7 +835,7 @@ mod tests {
     fn seeders_are_counted_per_peer() {
         let peers = make_peer_states();
         let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
-        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.1:1235");
+        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.2:1235");
 
         peers.update_bitfield(a, full_bitfield()).unwrap();
         peers.update_bitfield(b, empty_bitfield()).unwrap();
@@ -733,7 +860,7 @@ mod tests {
 
         let peers = make_peer_states();
         let (victim, mut victim_rx) = add_live_peer(&peers, "127.0.0.1:1234");
-        let (thief, _thief_rx) = add_live_peer(&peers, "127.0.0.1:1235");
+        let (thief, _thief_rx) = add_live_peer(&peers, "127.0.0.2:1235");
 
         peers
             .with_live_mut(victim, "test", |live| {
@@ -788,7 +915,7 @@ mod tests {
     fn availability_counts_every_live_peers_bitfield() {
         let peers = make_peer_states();
         let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
-        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.1:1235");
+        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.2:1235");
         assert_eq!(availability(&peers), [0; TOTAL_PIECES]);
 
         peers.update_bitfield(a, full_bitfield()).unwrap();
@@ -834,7 +961,7 @@ mod tests {
     fn a_closed_connection_takes_its_bitfield_back_once() {
         let peers = make_peer_states();
         let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
-        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.1:1235");
+        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.2:1235");
         peers.update_bitfield(a, bitfield_of(&[0, 1])).unwrap();
         peers.update_bitfield(b, bitfield_of(&[1])).unwrap();
         peers.peer_has(a, piece(TOTAL_PIECES as u32, 7)).unwrap();
@@ -844,13 +971,15 @@ mod tests {
         peers
             .with_peer_mut(a, "test", |peer| {
                 peer.take_state(&peers);
-                peers.connection_closed(peer, None, true);
+                peers.connection_closed(peer, Instant::now(), false, true);
             })
             .unwrap();
         assert_eq!(availability(&peers), [0, 1, 0, 0, 0, 0, 0, 0]);
 
         peers
-            .with_peer_mut(a, "test", |peer| peers.connection_closed(peer, None, true))
+            .with_peer_mut(a, "test", |peer| {
+                peers.connection_closed(peer, Instant::now(), false, true)
+            })
             .unwrap();
         assert_eq!(availability(&peers), [0, 1, 0, 0, 0, 0, 0, 0]);
     }
@@ -859,7 +988,7 @@ mod tests {
     fn a_peer_let_go_or_dropped_takes_its_bitfield_back() {
         let peers = make_peer_states();
         let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
-        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.1:1235");
+        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.2:1235");
         peers.update_bitfield(a, full_bitfield()).unwrap();
         peers.update_bitfield(b, bitfield_of(&[4])).unwrap();
 
@@ -894,8 +1023,8 @@ mod tests {
     fn a_completed_piece_is_announced_to_every_live_peer_that_lacks_it() {
         let peers = make_peer_states();
         let (_silent, mut silent_rx) = add_live_peer(&peers, "127.0.0.1:1234");
-        let (seeder, mut seeder_rx) = add_live_peer(&peers, "127.0.0.1:1235");
-        let (leecher, mut leecher_rx) = add_live_peer(&peers, "127.0.0.1:1236");
+        let (seeder, mut seeder_rx) = add_live_peer(&peers, "127.0.0.2:1235");
+        let (leecher, mut leecher_rx) = add_live_peer(&peers, "127.0.0.3:1236");
         peers.update_bitfield(seeder, full_bitfield()).unwrap();
         peers.update_bitfield(leecher, empty_bitfield()).unwrap();
 
@@ -936,7 +1065,7 @@ mod tests {
         peers
             .with_peer_mut(addr, "test", |peer| {
                 peer.connect_if_due(at, peers).expect("a due candidate");
-                peers.connection_closed(peer, Some(at), true);
+                peers.connection_closed(peer, at, true, true);
             })
             .unwrap();
     }
@@ -1043,7 +1172,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         peers
-            .add_incoming(a, Id20::default(), tx, ConnectionKind::Tcp)
+            .add_incoming(a, Id20::default(), tx, ConnectionKind::Tcp, OUR_PORT)
             .unwrap();
         assert_eq!(state_of(&peers, a), Some("live"));
     }
@@ -1070,7 +1199,7 @@ mod tests {
         let t3 = t2 + Duration::from_secs(600);
         peers
             .with_peer_mut(a, "test", |peer| {
-                peers.connection_closed(peer, Some(t3), true)
+                peers.connection_closed(peer, t3, true, true)
             })
             .unwrap();
         assert_eq!(state_of(&peers, a), Some("queued"));
@@ -1089,15 +1218,20 @@ mod tests {
         peers
             .with_peer_mut(a, "test", |peer| {
                 peer.connect_if_due(t0, &peers).unwrap();
-                peers.connection_closed(peer, None, false);
+                peers.connection_closed(peer, t0, false, false);
             })
             .unwrap();
         assert_eq!(state_of(&peers, a), Some("not needed"));
         assert_eq!(peers.next_candidate(t0), NextCandidate::None);
 
+        // Wanted again, it waits one reconnect time from the close, as a
+        // peer that never failed does.
         peers.requeue_not_needed();
         assert_eq!(state_of(&peers, a), Some("queued"));
-        assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
+        assert_eq!(
+            peers.next_candidate(t0),
+            NextCandidate::At(t0 + reconnect_wait(0))
+        );
     }
 
     #[test]
@@ -1117,7 +1251,7 @@ mod tests {
             .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         peers
-            .add_incoming(live, Id20::default(), tx, ConnectionKind::Tcp)
+            .add_incoming(live, Id20::default(), tx, ConnectionKind::Tcp, OUR_PORT)
             .unwrap();
         for i in 4..MAX_PEERLIST_SIZE {
             peers.add_peer(peer_addr(i));
@@ -1151,7 +1285,13 @@ mod tests {
         for i in 0..MAX_PEERLIST_SIZE - 1 {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             peers
-                .add_incoming(peer_addr(i), Id20::default(), tx, ConnectionKind::Tcp)
+                .add_incoming(
+                    peer_addr(i),
+                    Id20::default(),
+                    tx,
+                    ConnectionKind::Tcp,
+                    OUR_PORT,
+                )
                 .unwrap();
             channels.push(rx);
         }
@@ -1162,7 +1302,7 @@ mod tests {
         let first = peer_addr(MAX_PEERLIST_SIZE);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         peers
-            .add_incoming(first, Id20::default(), tx, ConnectionKind::Tcp)
+            .add_incoming(first, Id20::default(), tx, ConnectionKind::Tcp, OUR_PORT)
             .unwrap();
         assert_eq!(state_of(&peers, candidate), None);
         assert_eq!(state_of(&peers, first), Some("live"));
@@ -1172,7 +1312,7 @@ mod tests {
         let second = peer_addr(MAX_PEERLIST_SIZE + 1);
         assert_eq!(
             peers
-                .add_incoming(second, Id20::default(), tx, ConnectionKind::Tcp)
+                .add_incoming(second, Id20::default(), tx, ConnectionKind::Tcp, OUR_PORT)
                 .unwrap_err(),
             IncomingRefused::ListFull
         );
@@ -1251,7 +1391,7 @@ mod tests {
         peers
             .with_peer_mut(live, "test", |peer| {
                 peer.take_state(&peers);
-                peers.connection_closed(peer, Some(t0), true);
+                peers.connection_closed(peer, t0, true, true);
             })
             .unwrap();
         assert_eq!(state_of(&peers, live), Some("dead"));
@@ -1267,7 +1407,7 @@ mod tests {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             assert_eq!(
                 peers
-                    .add_incoming(addr, Id20::default(), tx, ConnectionKind::Tcp)
+                    .add_incoming(addr, Id20::default(), tx, ConnectionKind::Tcp, OUR_PORT)
                     .unwrap_err(),
                 IncomingRefused::Banned
             );
@@ -1346,7 +1486,7 @@ mod tests {
             .with_peer_mut(failed, "test", |peer| {
                 assert!(peer.holepunched());
                 assert_eq!(peer.transports(), Transports::Utp);
-                peers.connection_closed(peer, Some(last), true);
+                peers.connection_closed(peer, last, true, true);
                 assert!(!peer.holepunched());
                 assert_eq!(peer.transports(), Transports::Any);
             })
@@ -1421,5 +1561,149 @@ mod tests {
             };
             assert_eq!((kept(true), kept(false)), (MAX_PEX_PEERS, MAX_PEX_PEERS));
         });
+    }
+
+    fn incoming(
+        peers: &PeerStates,
+        addr: SocketAddr,
+        our_port: u16,
+    ) -> Result<PeerRx, IncomingRefused> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        peers
+            .add_incoming(addr, Id20::default(), tx, ConnectionKind::Tcp, our_port)
+            .map(|_| rx)
+    }
+
+    fn told_to_close(rx: &mut PeerRx) -> bool {
+        matches!(rx.try_recv(), Ok(WriterRequest::Disconnect(Ok(()))))
+    }
+
+    // libtorrent `peer_list::new_connection`: a peer we are connecting to
+    // connects to us too. Both ends keep the connection made by the end
+    // with the lower listen port; the other is closed.
+    #[test]
+    fn a_connection_from_a_peer_we_dial_is_settled_by_listen_port() {
+        let peers = make_peer_states();
+        let dialed = peer_addr(1);
+        peers.add_peer(dialed);
+        let (_, mut dialing, _) = peers.connect_next(Instant::now()).unwrap();
+
+        // Our port is the lower: our connection stays, theirs is refused.
+        let from = at_port(dialed, 50000);
+        assert_eq!(
+            incoming(&peers, from, 6000).unwrap_err(),
+            IncomingRefused::AlreadyActive
+        );
+        assert!(dialing.try_recv().is_err());
+
+        // Theirs is the lower: their connection stays, ours is closed.
+        assert!(incoming(&peers, from, 7000).is_ok());
+        assert!(told_to_close(&mut dialing));
+    }
+
+    // libtorrent `peer_list::new_connection`: when a peer connected to us
+    // already, a second connection from its address is dropped.
+    #[test]
+    fn a_second_connection_from_an_address_that_reached_us_is_refused() {
+        let peers = make_peer_states();
+        let mut first = incoming(&peers, at_port(peer_addr(1), 50000), OUR_PORT).unwrap();
+        assert_eq!(
+            incoming(&peers, at_port(peer_addr(1), 50001), OUR_PORT).unwrap_err(),
+            IncomingRefused::AlreadyActive
+        );
+        assert!(first.try_recv().is_err());
+        assert!(incoming(&peers, at_port(peer_addr(2), 50001), OUR_PORT).is_ok());
+    }
+
+    // libtorrent's peer list holds one entry per address, and one with a
+    // connection is no connect candidate: a peer at an address a connection
+    // is at waits for it to close.
+    #[test]
+    fn a_peer_at_a_connected_address_is_dialed_once_the_connection_closes() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let listening = peer_addr(1);
+        peers.add_peer(listening);
+        peers.add_peer(peer_addr(2));
+        let from = at_port(listening, 50000);
+        let _rx = incoming(&peers, from, OUR_PORT).unwrap();
+        assert_eq!(peers.connect_candidates(), 1);
+        assert_eq!(
+            peers.connect_next(t0).map(|(addr, ..)| addr),
+            Some(peer_addr(2))
+        );
+        assert!(peers.connect_next(t0).is_none());
+        assert_eq!(peers.next_candidate(t0), NextCandidate::None);
+
+        peers
+            .with_peer_mut(from, "test", |peer| {
+                peer.take_state(&peers);
+                peers.connection_closed(peer, t0, false, true);
+            })
+            .unwrap();
+        assert_eq!(peers.connect_candidates(), 1);
+        assert_eq!(
+            peers.connect_next(t0).map(|(addr, ..)| addr),
+            Some(listening)
+        );
+    }
+
+    // libtorrent `allow_multiple_connections_per_ip`: when it is on, peers
+    // at one address each have a connection.
+    #[test]
+    fn a_list_allowing_multiple_connections_per_ip_dials_each_peer() {
+        let peers = make_peer_states().allowing_multiple_connections_per_ip(true);
+        let t0 = Instant::now();
+        let a = peer_addr(1);
+        peers.add_peer(a);
+        peers.add_peer(at_port(a, 6882));
+        let _rx = incoming(&peers, at_port(a, 50000), OUR_PORT).unwrap();
+        assert!(incoming(&peers, at_port(a, 50001), OUR_PORT).is_ok());
+        assert!(peers.connect_next(t0).is_some());
+        assert!(peers.connect_next(t0).is_some());
+    }
+
+    // libtorrent `torrent::disconnect_peers` with `compare_disconnect_peer`:
+    // a peer we are not interested in goes first, then one that is no seed,
+    // then one on parole, then the one that sent least per second connected.
+    #[test]
+    fn turnover_closes_the_connections_worth_least_first() {
+        let peers = make_peer_states();
+        let now = Instant::now();
+        let mut rxs = Vec::new();
+        let mut addrs = Vec::new();
+        for i in 1..=5 {
+            let (addr, rx) = add_live_peer(&peers, &format!("10.0.0.{i}:6881"));
+            addrs.push(addr);
+            rxs.push(rx);
+        }
+        let [seed, uninteresting, fast, slow, on_parole] = addrs[..] else {
+            unreachable!()
+        };
+        for addr in [seed, fast, slow, on_parole] {
+            peers.with_live_mut(addr, "test", |live| live.interest(true, now));
+        }
+        peers.update_bitfield(seed, full_bitfield()).unwrap();
+        for (addr, fetched) in [(fast, 1000), (slow, 10), (on_parole, 1000)] {
+            peers.with_peer(addr, |peer| {
+                peer.stats
+                    .counters
+                    .fetched_bytes
+                    .fetch_add(fetched, Ordering::Relaxed)
+            });
+        }
+        peers.with_peer_mut(on_parole, "test", |peer| peer.piece_failed(false));
+
+        let order = [uninteresting, on_parole, slow, fast, seed];
+        for n in 1..=order.len() {
+            peers.disconnect_lowest(n, now);
+            for (addr, rx) in addrs.iter().zip(rxs.iter_mut()) {
+                assert_eq!(
+                    told_to_close(rx),
+                    order[..n].contains(addr),
+                    "{addr} of {n}"
+                );
+            }
+        }
     }
 }

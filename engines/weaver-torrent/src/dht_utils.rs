@@ -105,7 +105,9 @@ where
     F: Fn(SocketAddr) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    let peers = PeerStates::new(Default::default());
+    // No metadata yet, so no pieces to count availability over. Each answer
+    // comes over a connection of its own, wherever its peer is.
+    let peers = PeerStates::new(Default::default(), 0).allowing_multiple_connections_per_ip(true);
     let mut seen = HashSet::<SocketAddr>::new();
     let mut name = |addr| {
         seen.insert(addr);
@@ -135,7 +137,7 @@ where
                 Err(e) => {
                     debug!("{e:#}");
                     peers.with_peer_mut(addr, "metadata_failed", |peer| {
-                        peers.connection_closed(peer, Some(Instant::now()), true)
+                        peers.connection_closed(peer, Instant::now(), true, true)
                     });
                 }
             },

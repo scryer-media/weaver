@@ -142,7 +142,7 @@ impl Harness {
         let counters = self
             .live
             .peers
-            .add_incoming(addr, Id20::default(), tx.clone(), ConnectionKind::Tcp)
+            .add_incoming(addr, Id20::default(), tx.clone(), ConnectionKind::Tcp, 6881)
             .unwrap();
         let handler = PeerHandler {
             addr,
@@ -1399,6 +1399,7 @@ impl Harness {
                 Id20::default(),
                 tx,
                 ConnectionKind::Tcp,
+                6881,
             )
             .is_err()
     }
@@ -2446,7 +2447,7 @@ async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
     let ours = h._session.get_dht().unwrap().clone();
     let our_port = ours.listen_addr().port();
 
-    let (bit, mut bit_rx) = h.peer("127.0.0.1:6881");
+    let (bit, mut bit_rx) = h.peer("127.0.0.2:6881");
     assert_eq!((&bit).dht_port(), Some(our_port));
     (&bit)
         .on_handshake(handshake(true), ConnectionKind::Tcp, false)
@@ -2537,15 +2538,15 @@ async fn a_super_seed_sends_no_bitfield_and_hands_each_peer_the_rarest_piece_non
     assert_eq!(told_have(&mut s_rx), [1]);
 
     // Piece 0 is held by one peer, piece 1 handed to one: piece 2.
-    let (_p, mut p_rx) = h.peer_with("127.0.0.1:6882", &[]).await;
+    let (_p, mut p_rx) = h.peer_with("127.0.0.2:6882", &[]).await;
     assert_eq!(told_have(&mut p_rx), [2]);
 
     // Every piece is held or handed: one that is not handed comes first.
-    let (_q, mut q_rx) = h.peer_with("127.0.0.1:6883", &[]).await;
+    let (_q, mut q_rx) = h.peer_with("127.0.0.3:6883", &[]).await;
     assert_eq!(told_have(&mut q_rx), [0]);
 
     // A peer that lacks nothing is handed nothing.
-    let (_seed, mut seed_rx) = h.peer_with("127.0.0.1:6884", &[0, 1, 2]).await;
+    let (_seed, mut seed_rx) = h.peer_with("127.0.0.4:6884", &[0, 1, 2]).await;
     assert_eq!(told_have(&mut seed_rx), [] as [u32; 0]);
 }
 
@@ -2578,7 +2579,7 @@ async fn a_super_seeded_peer_is_served_only_the_piece_it_was_handed() {
 async fn the_next_piece_goes_out_once_another_peer_reports_the_handed_one() {
     let h = Harness::super_seeding("super_seed_spread", 3, 0xe0).await;
     let (a, mut a_rx) = h.peer_with("127.0.0.1:6881", &[]).await;
-    let (b, mut b_rx) = h.peer_with("127.0.0.1:6882", &[]).await;
+    let (b, mut b_rx) = h.peer_with("127.0.0.2:6882", &[]).await;
     assert_eq!(told_have(&mut a_rx), [0]);
     assert_eq!(told_have(&mut b_rx), [1]);
 
@@ -2771,7 +2772,9 @@ fn pex_flagged(addr: SocketAddr, flags: u8) -> Vec<u8> {
 #[tokio::test]
 async fn a_failed_connection_asks_the_peer_whose_pex_named_it_to_introduce_us() {
     let h = Harness::new("holepunch_introducer").await;
-    let (introducer, mut rx) = h.holepunch_peer("127.0.0.1:6881", true);
+    // On another host than the target: no connection to its address stands
+    // in the way of the connect.
+    let (introducer, mut rx) = h.holepunch_peer("127.0.0.2:6881", true);
     let target = closed_port();
     let msg = pex_flagged(target, extended::ut_pex::PEX_HOLEPUNCH);
     let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&msg).unwrap();
@@ -2813,7 +2816,7 @@ async fn our_pex_message_lists_each_connected_peer_where_it_listens_flagged_for_
     let utp = |addr: &str| {
         let (tx, rx) = unbounded_channel();
         h.peers
-            .add_incoming(sock(addr), Id20::default(), tx, ConnectionKind::Utp)
+            .add_incoming(sock(addr), Id20::default(), tx, ConnectionKind::Utp, 6881)
             .unwrap();
         rx
     };
@@ -2956,4 +2959,143 @@ async fn peers_that_want_nothing_of_each_other_part_after_ten_minutes_when_conne
 
     peer.time_out_idle().await.unwrap();
     assert!(tokio::time::Instant::now().duration_since(uninterested) > peer::INACTIVITY_TIMEOUT);
+}
+
+// libtorrent `bt_peer_connection::write_extensions` says upload_only in the
+// extended handshake of a torrent that only uploads, and `torrent::finished`
+// tells each peer whose handshake named upload_only once it does
+// (`torrent::send_upload_only`).
+#[tokio::test]
+async fn a_finished_torrent_tells_the_peers_that_take_upload_only() {
+    let h = Harness::new("upload_only").await;
+    let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
+    let (takes, mut takes_rx) = h.peer_with("127.0.0.2:6881", &[]).await;
+    let (deaf, mut deaf_rx) = h.peer_with("127.0.0.3:6881", &[]).await;
+    let mut names_it = ExtendedHandshake::new();
+    names_it.m.upload_only = Some(3);
+    (&takes).on_extended_handshake(&names_it).unwrap();
+    (&deaf)
+        .on_extended_handshake(&ExtendedHandshake::new())
+        .unwrap();
+    let says = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.upload_only
+    };
+    assert_eq!(says(&takes), None);
+
+    let mut requester: Task<'_> = Box::pin(seed.task_peer_chunk_requester());
+    seed.on_i_am_unchoked();
+    let requests = next_requests(&mut requester, &mut seed_rx, every_chunk().len()).await;
+    drop(requester);
+    for request in requests {
+        h.deliver(&seed, request).await;
+    }
+
+    let upload_only = |sent: &WriterRequest| match sent {
+        WriterRequest::Message(Message::Extended(ExtendedMessage::UploadOnly(enabled))) => {
+            Some(*enabled)
+        }
+        _ => None,
+    };
+    loop {
+        let sent = takes_rx
+            .recv()
+            .await
+            .expect("the peer's writer queue closed");
+        if let Some(enabled) = upload_only(&sent) {
+            assert!(enabled);
+            break;
+        }
+    }
+    // Every peer was told at once, so the one that named no id would have
+    // been sent it by now.
+    while let Ok(sent) = deaf_rx.try_recv() {
+        assert_eq!(upload_only(&sent), None);
+    }
+    assert_eq!(says(&takes), Some(1));
+}
+
+// libtorrent `peer_list::connection_closed`: only a connection that failed
+// counts against the peer; one we asked to close did not fail.
+#[tokio::test]
+async fn a_connection_we_asked_to_close_counts_no_failure() {
+    let h = Harness::new("asked_to_close").await;
+    let mut failcounts = Vec::new();
+    for (addr, error) in [
+        ("127.0.0.1:6881", crate::Error::Disconnect),
+        ("127.0.0.2:6881", crate::Error::TestDisconnect),
+    ] {
+        let (peer, _rx) = h.peer(addr);
+        let counters = peer.counters.clone();
+        peer.on_peer_died(Some(error)).unwrap();
+        let failcount = h
+            .peers
+            .with_peer(sock(addr), |p| p.connect_rank().1)
+            .unwrap();
+        failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
+    }
+    assert_eq!(failcounts, [(0, 0), (1, 1)]);
+}
+
+/// A torrent of at most `peer_limit` connections in a session of at most
+/// `connections_limit`.
+async fn turnover_harness(name: &str, peer_limit: usize, connections_limit: usize) -> Harness {
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        peer_limit: Some(peer_limit),
+        ..Default::default()
+    };
+    let opts = SessionOptions {
+        connections_limit,
+        ..isolated_session_opts(false)
+    };
+    Harness::build_added(name, PIECES, 0x00, opts, add).await
+}
+
+// libtorrent `session_impl::second_tick`: below the session's cutoff, a
+// torrent holding 90% of its own connections turns 4% of them over, at
+// least one, and no more than it has connect candidates to replace them;
+// the one it would keep least goes (`torrent::disconnect_peers`).
+#[tokio::test]
+async fn a_torrent_at_its_connection_cutoff_turns_its_least_worth_peer_over() {
+    let h = turnover_harness("turnover_torrent", 10, 200).await;
+    let _held = h.peer_semaphore.clone().try_acquire_many_owned(9).unwrap();
+    let (kept, mut kept_rx) = h.peer("127.0.0.1:6881");
+    let (_least, mut least_rx) = h.peer("127.0.0.2:6881");
+    h.peers.with_live_mut(kept.addr, "test", |live| {
+        live.interest(true, tokio::time::Instant::now())
+    });
+    let closed = |rx: &mut PeerRx| {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|r| matches!(r, WriterRequest::Disconnect(Ok(()))))
+    };
+
+    // Nobody to take its place: nobody goes.
+    h._session.turn_peers_over();
+    assert!(!closed(&mut least_rx));
+
+    h.peers.add_peer(sock("203.0.113.1:6881"));
+    h._session.turn_peers_over();
+    assert!(closed(&mut least_rx));
+    assert!(!closed(&mut kept_rx));
+}
+
+// libtorrent `session_impl::second_tick`: when the session holds 90% of its
+// connections, the torrent with the most turns peers over, however far
+// below its own cap.
+#[tokio::test]
+async fn a_session_at_its_connection_cutoff_turns_over_the_busiest_torrents_peers() {
+    let h = turnover_harness("turnover_session", 128, 10).await;
+    let _held: Vec<_> = (0..9)
+        .map(|_| h._session.connection_slots.try_open().unwrap())
+        .collect();
+    let (_peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.peers.add_peer(sock("203.0.113.1:6881"));
+
+    h._session.turn_peers_over();
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|r| matches!(r, WriterRequest::Disconnect(Ok(()))))
+    );
 }

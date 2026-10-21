@@ -96,6 +96,15 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
 
+// How often the session turns peers over (libtorrent
+// `peer_turnover_interval`), and when it first does after it starts
+// (`session_impl::m_disconnect_time_scaler`).
+const PEER_TURNOVER_INTERVAL: Duration = Duration::from_secs(300);
+const FIRST_PEER_TURNOVER: Duration = Duration::from_secs(90);
+// The share of a connection cap, in percent, at which peers are turned over
+// (libtorrent `peer_turnover_cutoff`).
+const PEER_TURNOVER_CUTOFF: usize = 90;
+
 struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
     torrent_bytes: Bytes,
@@ -257,6 +266,7 @@ pub struct Session {
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub(crate) connection_slots: Arc<ConnectionSlots>,
+    pub(crate) allow_multiple_connections_per_ip: bool,
     pub ratelimits: Limits,
 
     pub blocklist: IpRanges,
@@ -733,6 +743,11 @@ pub struct SessionOptions {
     /// Message stream encryption for peer connections, outgoing and incoming.
     /// Defaults to [`EncryptionPolicy::Disabled`](crate::EncryptionPolicy::Disabled).
     pub encryption: crate::mse::EncryptionPolicy,
+
+    /// Whether peers at one address may each hold a connection to a torrent
+    /// (libtorrent `allow_multiple_connections_per_ip`). Off by default: one
+    /// connection per address.
+    pub allow_multiple_connections_per_ip: bool,
 }
 
 impl Default for SessionOptions {
@@ -766,6 +781,7 @@ impl Default for SessionOptions {
             socket_factory: None,
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
+            allow_multiple_connections_per_ip: false,
         }
     }
 }
@@ -1160,6 +1176,7 @@ impl Session {
                 peer_limit: opts.peer_limit,
                 unchoke_slots_limit: opts.unchoke_slots_limit,
                 disable_pex: opts.disable_pex,
+                allow_multiple_connections_per_ip: opts.allow_multiple_connections_per_ip,
                 blocklist,
                 allowlist,
                 lsd,
@@ -1268,6 +1285,7 @@ impl Session {
             }
 
             session.start_speed_estimator_updater();
+            session.start_peer_turnover();
 
             Ok(session)
         }
@@ -1540,6 +1558,55 @@ impl Session {
         self.cancellation_token.cancel();
         self.tasks.close();
         self.tasks.wait().await;
+    }
+
+    fn start_peer_turnover(self: &Arc<Self>) {
+        let session = Arc::downgrade(self);
+        self.spawn(
+            debug_span!(parent: self.rs(), "peer_turnover"),
+            "peer_turnover",
+            async move {
+                let mut tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + FIRST_PEER_TURNOVER,
+                    PEER_TURNOVER_INTERVAL,
+                );
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    session
+                        .upgrade()
+                        .context("session is dead")?
+                        .turn_peers_over();
+                }
+            },
+        )
+    }
+
+    // Makes room for connect candidates when connections run short
+    // (libtorrent `session_impl::second_tick`). When the session holds
+    // PEER_TURNOVER_CUTOFF percent of its cap, the torrent with the most
+    // connections turns some over; otherwise each torrent holding that share
+    // of its own cap does. Under a cap of 6 it would be too disruptive, and
+    // nothing is turned over.
+    pub(crate) fn turn_peers_over(&self) {
+        let limit = self.connection_slots.limit();
+        if limit < 6 {
+            return;
+        }
+        let torrents = self
+            .with_torrents(|torrents| torrents.filter_map(|(_, t)| t.live()).collect::<Vec<_>>());
+        if self.connection_slots.in_use() >= limit * PEER_TURNOVER_CUTOFF / 100 {
+            if let Some(most) = torrents.iter().max_by_key(|t| t.connections().0) {
+                most.turn_peers_over();
+            }
+            return;
+        }
+        for torrent in &torrents {
+            let (held, max) = torrent.connections();
+            if max >= 6 && held >= max * PEER_TURNOVER_CUTOFF / 100 {
+                torrent.turn_peers_over();
+            }
+        }
     }
 
     /// Run a callback given the currently managed torrents.
@@ -3069,6 +3136,8 @@ mod tests {
                     listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                     ..Default::default()
                 }),
+                // A test greets the seed from this host more than once.
+                allow_multiple_connections_per_ip: true,
                 ..Default::default()
             },
         )

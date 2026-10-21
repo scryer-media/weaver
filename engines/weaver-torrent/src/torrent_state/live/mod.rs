@@ -186,6 +186,10 @@ impl TorrentStateLocked {
 
 const FLUSH_BITV_EVERY_BYTES: u64 = 16 * 1024 * 1024;
 
+// The share of its connections, in percent, a torrent closes when it turns
+// peers over (libtorrent `peer_turnover`).
+const PEER_TURNOVER: usize = 4;
+
 pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
@@ -212,6 +216,9 @@ pub struct TorrentStateLive {
 
     // Limits how many active (occupying network resources) peers there are at a moment in time.
     peer_semaphore: Arc<Semaphore>,
+    // The semaphore's permits: the most connections the torrent holds
+    // (libtorrent `torrent::max_connections`).
+    peer_limit: usize,
 
     finished_notify: Notify,
     new_pieces_notify: Arc<Notify>,
@@ -241,6 +248,9 @@ pub struct TorrentStateLive {
     // began (libtorrent `torrent::m_super_seeding`, turned off for a torrent
     // that is not a seed).
     super_seeding: bool,
+    // Whether the peers were last told we only upload (libtorrent tells
+    // them on each change, `torrent::send_upload_only`).
+    told_upload_only: AtomicBool,
     // The torrent's files as its web seeds serve them.
     web_layout: web_seed::Layout,
 
@@ -278,6 +288,9 @@ impl TorrentStateLive {
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let finished_at_start = paused.chunk_tracker.get_hns().finished();
         let lengths = *paused.chunk_tracker.get_lengths();
+        let super_seeding =
+            paused.shared.options.super_seeding && have_bytes == lengths.total_length();
+        let peer_limit = paused.shared.options.peer_limit.unwrap_or(128);
 
         let (ratelimit_upload_tx, ratelimit_upload_rx) = unbounded_channel::<QueuedUpload>();
 
@@ -288,7 +301,8 @@ impl TorrentStateLive {
                 paused.peers,
                 session_stats.peers.clone(),
                 lengths.total_pieces(),
-            ),
+            )
+            .allowing_multiple_connections_per_ip(session.allow_multiple_connections_per_ip),
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 fatal_errors_tx: Some(fatal_errors_tx),
@@ -301,9 +315,8 @@ impl TorrentStateLive {
                 ..Default::default()
             },
             lengths,
-            peer_semaphore: Arc::new(Semaphore::new(
-                paused.shared.options.peer_limit.unwrap_or(128),
-            )),
+            peer_semaphore: Arc::new(Semaphore::new(peer_limit)),
+            peer_limit,
             new_pieces_notify: Arc::new(Notify::new()),
             layer_fetch: hash_fetch::LayerFetch::new(paused.metadata.v2.as_ref()),
             finished_notify: Notify::new(),
@@ -322,8 +335,9 @@ impl TorrentStateLive {
                 lengths.default_piece_length().into(),
             ),
             pex: !session.disable_pex && !paused.metadata.info.info().private,
-            super_seeding: paused.shared.options.super_seeding
-                && have_bytes == lengths.total_length(),
+            super_seeding,
+            // What a handshake of this run's first connections says.
+            told_upload_only: AtomicBool::new(finished_at_start && !super_seeding),
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
             utp: session.utp,
         });
@@ -578,11 +592,19 @@ impl TorrentStateLive {
             }
         };
 
+        // The port the connection came to: the one we listen on.
+        let our_port = self
+            .shared
+            .session
+            .upgrade()
+            .and_then(|s| s.listen_addr())
+            .map_or(0, |a| a.port());
         let counters = match self.peers.add_incoming(
             checked_peer.addr,
             checked_peer.handshake.peer_id,
             tx.clone(),
             checked_peer.kind,
+            our_port,
         ) {
             Ok(counters) => counters,
             Err(IncomingRefused::AlreadyActive) => {
@@ -1056,6 +1078,7 @@ impl TorrentStateLive {
         // With the state lock released. A dying peer holds its shard of the peer table
         // while it asks whether the torrent is finished (on_peer_died), so touching the
         // table under the state lock is the reverse order, and the two deadlock.
+        self.update_upload_only();
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
         }
@@ -1072,10 +1095,29 @@ impl TorrentStateLive {
             .set_piece_priorities(priorities);
         // Wanting a skipped piece again may make peers we let go useful. With the
         // state lock released, for the reason given in update_only_files().
+        self.update_upload_only();
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
         }
         Ok(())
+    }
+
+    // Tells the peers that take upload_only when whether we only upload
+    // changed: we finished, or want pieces again (libtorrent
+    // `torrent::send_upload_only`, from `finished` and `resume_download`).
+    fn update_upload_only(&self) {
+        let upload_only = self.is_upload_only();
+        if self.told_upload_only.swap(upload_only, Ordering::Relaxed) != upload_only {
+            self.peers.send_upload_only(upload_only);
+        }
+    }
+
+    // We only upload the torrent: it has every piece it wants, and no
+    // stream wants more; a super-seed never says so, as a peer may take it
+    // to have one piece and leave (libtorrent `torrent::is_upload_only`,
+    // `bt_peer_connection::write_extensions`).
+    fn is_upload_only(&self) -> bool {
+        !self.super_seeding && self.is_finished_and_no_active_streams()
     }
 
     // If we have all selected pieces but not necessarily all pieces.
@@ -1106,6 +1148,27 @@ impl TorrentStateLive {
             && !self.has_active_streams_unfinished_files(
                 &self.lock_read("is_finished_and_dont_need_peers"),
             )
+    }
+
+    /// The connections the torrent holds, open or opening (libtorrent
+    /// `torrent::num_peers`), and the most it may.
+    pub(crate) fn connections(&self) -> (usize, usize) {
+        let held = self
+            .peer_limit
+            .saturating_sub(self.peer_semaphore.available_permits());
+        (held, self.peer_limit)
+    }
+
+    /// Closes PEER_TURNOVER percent of the torrent's connections, at least
+    /// one, and no more than there are connect candidates to take their
+    /// place, those it would keep least first (libtorrent
+    /// `session_impl::second_tick`, `torrent::disconnect_peers`).
+    pub(crate) fn turn_peers_over(&self) {
+        let (held, _) = self.connections();
+        let n = (held * PEER_TURNOVER / 100)
+            .max(1)
+            .min(self.peers.connect_candidates());
+        self.peers.disconnect_lowest(n, tokio::time::Instant::now());
     }
 
     // A torrent wants peers, outgoing and incoming, unless it has nothing
@@ -1168,6 +1231,9 @@ impl TorrentStateLive {
                 // Nor to a web seed, which only uploads (libtorrent
                 // `torrent::finished`).
                 self.shared.web_seeds.disconnect_all();
+                // The peers left are told we only upload now (libtorrent
+                // `torrent::finished`).
+                self.update_upload_only();
             }
         }
         Ok(())
@@ -1513,6 +1579,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .peers
             .with_live_mut(self.addr, "update peer holepunch support", |live| {
                 live.supports_holepunch = hs.m.ut_holepunch.is_some();
+                live.supports_upload_only = hs.m.upload_only.is_some();
             });
 
         // The peer holds at most its `reqq` requests (libtorrent
@@ -1599,6 +1666,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // Every connection speaks it; we act on `connect` only over uTP
         // (libtorrent `bt_peer_connection::write_extensions`).
         handshake.m.ut_holepunch = Some(MY_EXTENDED_UT_HOLEPUNCH);
+        // We only upload (libtorrent `bt_peer_connection::write_extensions`).
+        handshake.upload_only = self.state.is_upload_only().then_some(1);
 
         Ok(())
     }
@@ -1729,11 +1798,16 @@ impl PeerHandler {
                 return Ok(());
             }
         };
+        // A connection we asked to close did not fail (libtorrent
+        // `peer_connection::failed`).
+        let failed = error
+            .as_ref()
+            .is_some_and(|e| !matches!(e, crate::Error::Disconnect));
         // A connection to a peer that speaks the holepunch extension failed,
         // and no holepunch asked for it: a peer that can introduce us is
         // asked to (libtorrent `peer_connection::connect_failed`).
         let rendezvous = matches!(pe.value().get_state(), PeerState::Connecting(_))
-            && error.is_some()
+            && failed
             && pe.value().supports_holepunch
             && !pe.value().holepunched();
         let prev = pe.value_mut().take_state(peers);
@@ -1794,13 +1868,14 @@ impl PeerHandler {
         };
 
         // A connection that ended in an error counts against the peer; one we
-        // closed ourselves does not, and leaves a peer we no longer need.
-        let failed_at = error.map(|_| {
+        // closed ourselves does not. Either way the peer stays a connect
+        // candidate while we want pieces (libtorrent
+        // `peer_list::connection_closed`).
+        if failed {
             self.counters.errors.fetch_add(1, Ordering::Relaxed);
-            tokio::time::Instant::now()
-        });
-        let needed = failed_at.is_some() && !self.state.is_finished_and_no_active_streams();
-        peers.connection_closed(pe.value_mut(), failed_at, needed);
+        }
+        let needed = !self.state.is_finished_and_no_active_streams();
+        peers.connection_closed(pe.value_mut(), tokio::time::Instant::now(), failed, needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
         drop(pe);
         if rendezvous && let Some(introducer) = peers.introducer(handle) {

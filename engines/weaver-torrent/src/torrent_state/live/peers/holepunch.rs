@@ -21,6 +21,7 @@ impl PeerStates {
         self.admit(
             addr,
             Displace::NonCandidates,
+            None,
             |peer| peer.holepunch(self),
             || Some(Peer::new_holepunched(addr)),
         );
