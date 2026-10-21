@@ -226,10 +226,10 @@ pub type Carried = Box<dyn std::any::Any + Send + Sync>;
 // job is quiet. Read only: the record stays the tree's, and the object
 // rules on it.
 pub trait Standing {
-    // A member of mine still holds damage that nothing vouched for: no
-    // recovery object covering it, or covering what my volumes came out of,
-    // found it whole or made it so, and it is no volume an object below
-    // gave back, whose damage that object ruled on.
+    // A member of mine still holds damage that nothing ruled on: no
+    // recovery object covering it ruled on it, none covering what my
+    // volumes came out of found them whole or made them so, and it is no
+    // volume an object below gave back, whose damage that object ruled on.
     fn damaged(&self) -> bool;
 
     // I named no member, or a member I named is not placed: it never

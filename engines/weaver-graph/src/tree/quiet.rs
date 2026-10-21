@@ -98,7 +98,15 @@ impl Tree {
     fn vouched_above(&self, node: NodeId) -> bool {
         let mut at = node;
         while let Some((parent, volumes)) = self.volumes(at) {
-            if volumes.values().any(|member| self.vouched(parent, *member)) {
+            let vouched = |member: &MemberId| {
+                self.ruled(parent, *member, |outcome| {
+                    matches!(
+                        outcome,
+                        RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+                    )
+                })
+            };
+            if volumes.values().any(vouched) {
                 return true;
             }
             at = parent;
@@ -106,16 +114,17 @@ impl Tree {
         false
     }
 
-    // A recovery object of the namespace covers the member and found it
-    // whole or made it so.
-    fn vouched(&self, node: NodeId, member: MemberId) -> bool {
+    // A recovery object of the namespace covers the member and ruled on it
+    // as `ruling` asks.
+    fn ruled(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        ruling: impl Fn(RepairOutcome) -> bool,
+    ) -> bool {
         self.recovery_nodes(node).into_iter().any(|recovery_node| {
             self.recovery(recovery_node).is_some_and(|recovery| {
-                recovery.covers(member)
-                    && matches!(
-                        recovery.outcome(),
-                        Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
-                    )
+                recovery.covers(member) && recovery.outcome().is_some_and(&ruling)
             })
         })
     }
@@ -129,7 +138,10 @@ struct Stood<'a> {
 
 impl Standing for Stood<'_> {
     // A repair above rebuilt the bytes below, though the damage an object
-    // marked on what it read before is still recorded.
+    // marked on what it read before is still recorded. A member's damage a
+    // recovery object covering it ruled on is that object's to judge: a
+    // repair that failed leaves the member short, not the object that
+    // wrote it.
     fn damaged(&self) -> bool {
         let (tree, node) = (self.tree, self.node);
         let Some(namespace) = tree.namespace(node) else {
@@ -141,7 +153,7 @@ impl Standing for Stood<'_> {
                     && member.coverage.damaged_ranges().next().is_some()
                     && !tree.retired.contains_key(&(node, member.id))
                     && !tree.given_back(node, member.id)
-                    && !tree.vouched(node, member.id)
+                    && !tree.ruled(node, member.id, |outcome| outcome != RepairOutcome::Waiting)
             })
     }
 

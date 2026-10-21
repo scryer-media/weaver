@@ -166,6 +166,62 @@ async fn an_enciphered_rar_and_an_aes_7z_two_deep_are_repaired_by_the_set_beside
     assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
 }
 
+// Two sets two deep: `ember.bin` under one recovery block with two of its
+// articles damaged, `quill.bin` under two with one; an article two deep
+// spans two slices of its member. The short set's file is listed
+// unrepaired, the other is rebuilt, and the job is Partial for a Repair
+// failure. Classic fails unpacking the outer container.
+#[tokio::test]
+async fn two_sets_two_deep_one_short_of_blocks_end_partial_with_the_other_sets_file_whole_under_graph()
+ {
+    let ember = payload(6 * ARTICLE + 5, 93);
+    let quill = payload(5 * ARTICLE + 3, 94);
+    let mut entries: Vec<(String, Vec<u8>)> = vec![("ember.bin".into(), ember.clone())];
+    entries.extend(
+        par2_set("ember", &[("ember.bin", ember.as_slice())], 1)
+            .into_iter()
+            .map(|post| (post.name, post.bytes)),
+    );
+    entries.push(("quill.bin".into(), quill.clone()));
+    entries.extend(
+        par2_set("quill", &[("quill.bin", quill.as_slice())], 2)
+            .into_iter()
+            .map(|post| (post.name, post.bytes)),
+    );
+    let named: Vec<(&str, Vec<u8>)> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    let outer = two_deep(&named);
+    let short = articles_inside(&outer, &ember);
+    let whole = articles_inside(&outer, &quill);
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)])
+        .damaged(0, short[0])
+        .damaged(0, short[2])
+        .damaged(0, whole[1]);
+    let (classic, graph) = run_both(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(
+        graph.failure_kind,
+        Some(HistoryFailureKind::Repair),
+        "{:?}",
+        graph.graph().delivery
+    );
+    assert!(
+        graph.files[&delivered("quill.bin")] == quill,
+        "quill.bin rebuilt"
+    );
+    assert_eq!(graph.graph().delivery.unrepaired, ["ember.bin"]);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
+    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
+}
+
 // A zstd of zeros two deep inflates past the ratio: the job fails at
 // extraction naming the ratio, as it does with the stream at the root.
 #[tokio::test]
