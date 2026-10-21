@@ -28,6 +28,7 @@ use crate::{
         hash_id::{Id20, InfoHashes},
     },
     dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
+    mse::EncryptionPolicy,
     network::{
         AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
         DatagramSocket, SocketFactory, StreamListener,
@@ -45,6 +46,7 @@ use crate::{
     sha1w::{ISha1, Sha1},
     spawn_utils::BlockingSpawner,
     stream_connect::{StreamConnector, StreamConnectorArgs},
+    torrent_state::live::peers::PeerStates,
 };
 
 /// The mock peers wait on us, never on the clock.
@@ -101,6 +103,11 @@ pub(super) async fn connector() -> (
     .await
     .unwrap();
     (Arc::new(connector), rx)
+}
+
+/// A peer list the fetches' peers are not on, so nothing is remembered.
+fn no_peers() -> Arc<PeerStates> {
+    Arc::new(PeerStates::new(Default::default(), 0))
 }
 
 pub(super) fn addr(port: u16) -> SocketAddr {
@@ -226,6 +233,7 @@ async fn fetch_from(
     };
     read_metainfo_from_peer(
         addr,
+        no_peers(),
         Id20::new([1; 20]),
         MetadataFetch::new(hashes),
         Some(options),
@@ -293,6 +301,7 @@ fn handler(fetch: &Arc<MetadataFetch>) -> (Handler, mpsc::UnboundedReceiver<Writ
     let (writer_tx, writer_rx) = mpsc::unbounded_channel();
     let handler = Handler {
         addr: addr(1),
+        peers: no_peers(),
         fetch: fetch.clone(),
         writer_tx,
         result_tx: Mutex::new(None),
@@ -425,6 +434,65 @@ async fn two_peers_send_the_metadata_between_them() {
     }
 }
 
+// libtorrent: metadata comes over the torrent's ordinary connections, so
+// `torrent_peer::pe_support` decides their handshake too
+// (`bt_peer_connection::on_connected`). Where encryption is preferred, a
+// peer that speaks only plaintext refuses the encrypted handshake; the next
+// connection, made at once (`peer_connection::fast_reconnect`), sends the
+// plaintext one and gets the metadata.
+#[tokio::test(start_paused = true)]
+async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_once() {
+    let (metadata, hashes) = metadata(10);
+    let (tx, mut dials) = mpsc::unbounded_channel();
+    let connector = StreamConnector::new(StreamConnectorArgs {
+        enable_tcp: true,
+        socket_factory: Some(Arc::new(Dialed(tx))),
+        encryption: EncryptionPolicy::Prefer,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let connector = Arc::new(connector);
+    let peer = async {
+        let (_, stream) = dials.recv().await.unwrap();
+        let refused = Instant::now();
+        let (mut read, write) = halves(stream);
+        let greeting = ReadBuf::new().read_handshake(&mut read, NO_TIMEOUT).await;
+        assert!(
+            greeting.is_err(),
+            "the encrypted handshake is no BitTorrent one"
+        );
+        drop((read, write));
+
+        let (_, stream) = dials.recv().await.unwrap();
+        assert_eq!(Instant::now(), refused);
+        let mut peer = MockPeer::greet(stream, hashes).await;
+        peer.send_extended_handshake(metadata.len() as u32).await;
+        let piece = peer.next_request().await.unwrap();
+        peer.send_piece(&metadata, piece).await;
+        peer
+    };
+    let fetch = read_metainfo_from_peer_receiver(
+        Id20::new([1; 20]),
+        hashes,
+        vec![addr(1)],
+        futures::stream::pending(),
+        None,
+        connector.clone(),
+        "test".to_owned(),
+    );
+
+    let (found, _peer) = tokio::join!(fetch, peer);
+    match found {
+        ReadMetainfoResult::Found { info_bytes, .. } => {
+            assert_eq!(info_bytes.as_ref(), metadata.as_ref())
+        }
+        ReadMetainfoResult::ChannelClosed { .. } => panic!("no metadata"),
+    }
+    let stats = connector.stats().encryption.snapshot();
+    assert_eq!((stats.failures, stats.plaintext), (1, 1));
+}
+
 type Found = oneshot::Receiver<Result<TorrentAndInfoBytes, crate::bencode::DeserializeError>>;
 
 /// A reader for `info`'s metadata past the extended handshake of a peer
@@ -438,6 +506,7 @@ fn reader(info: &Bytes) -> (Handler, mpsc::UnboundedReceiver<WriterRequest>, Fou
     tokio::spawn(async move { sender.send(&request_tx).await });
     let handler = Handler {
         addr: addr(1),
+        peers: no_peers(),
         fetch: MetadataFetch::new(hashes_of(info)),
         writer_tx,
         result_tx: Mutex::new(Some(result_tx)),

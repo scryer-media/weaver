@@ -89,7 +89,7 @@ impl Harness {
         let session = Session::new_with_opts(out.path().into(), opts)
             .await
             .unwrap();
-        Self::added_to(session, out, name, pieces, have, add).await
+        Self::added_to(session, out, name, pieces, &[have], add).await
     }
 
     /// Another live torrent of the harness's session, of the harness's
@@ -100,7 +100,22 @@ impl Harness {
             ..Default::default()
         };
         let out = TempDir::with_prefix(name).unwrap();
-        Self::added_to(self._session.clone(), out, name, PIECES, have, add).await
+        Self::added_to(self._session.clone(), out, name, PIECES, &[have], add).await
+    }
+
+    /// A live torrent of `bytes` eight times four-chunk pieces, all had, and
+    /// no peers.
+    async fn seeding_bytes(name: &str, bytes: usize) -> Self {
+        let add = AddTorrentOptions {
+            storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+            ..Default::default()
+        };
+        let out = TempDir::with_prefix(name).unwrap();
+        let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+            .await
+            .unwrap();
+        let pieces = 8 * bytes as u32;
+        Self::added_to(session, out, name, pieces, &vec![0xff; bytes], add).await
     }
 
     /// A live torrent of `pieces` four-chunk pieces, `have` the bitfield of
@@ -110,18 +125,30 @@ impl Harness {
         out: TempDir,
         name: &str,
         pieces: u32,
-        have: u8,
+        have: &[u8],
         add: AddTorrentOptions,
     ) -> Self {
         let torrent = TestTorrent::new(name, (pieces * PIECE_LENGTH) as usize, PIECE_LENGTH)
             .await
             .unwrap();
-        let have = BF::from_boxed_slice(vec![have].into_boxed_slice());
+        let have = BF::from_boxed_slice(have.into());
+        Self::adding(session, out, torrent, crate::Checkpoint::pieces(have), add).await
+    }
+
+    /// `torrent`, live, started from `checkpoint`, added to `session` with
+    /// `add`.
+    async fn adding(
+        session: Arc<Session>,
+        out: TempDir,
+        torrent: TestTorrent,
+        checkpoint: crate::Checkpoint,
+        add: AddTorrentOptions,
+    ) -> Self {
         let handle = session
             .add_torrent(
                 AddTorrent::from_bytes(torrent.torrent.clone()),
                 Some(AddTorrentOptions {
-                    initial_have: Some(have),
+                    checkpoint: Some(checkpoint),
                     ..add
                 }),
             )
@@ -137,6 +164,32 @@ impl Harness {
             _torrent: Some(torrent),
             _out: out,
         }
+    }
+
+    /// The torrent's handle in its session.
+    fn handle(&self) -> crate::torrent_state::ManagedTorrentHandle {
+        self._session
+            .get(crate::api::TorrentIdOrHash::Id(self.live.shared.id))
+            .unwrap()
+    }
+
+    /// The torrent taken out of its session, its files left, and added
+    /// again with `add`, started from `checkpoint`, as a restart does.
+    async fn restarted(self, checkpoint: crate::Checkpoint, add: AddTorrentOptions) -> Self {
+        let Self {
+            live,
+            _session: session,
+            _torrent: torrent,
+            _out: out,
+            ..
+        } = self;
+        let id = live.shared.id;
+        drop(live);
+        session
+            .delete(crate::api::TorrentIdOrHash::Id(id), false)
+            .await
+            .unwrap();
+        Self::adding(session, out, torrent.unwrap(), checkpoint, add).await
     }
 
     /// A live peer at `addr` with every piece, and the queue of what we send it.
@@ -1219,17 +1272,18 @@ async fn a_cancel_takes_an_unsent_block_off_the_upload_queue() {
             .unwrap();
     }
     assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
-    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, CHUNK_SIZE));
 
-    // Both blocks are with the writer, unsent: the cancelled one is not sent.
+    // The first block is with the writer, unsent: cancelled, it is not
+    // sent, and the writer is handed the next.
     peer.on_received_message(Message::Cancel(request(0, 0)))
         .await
         .unwrap();
     assert!(!peer.claim_upload(&h.chunk(0, 0)));
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, CHUNK_SIZE));
     assert!(peer.claim_upload(&h.chunk(0, 1)));
 
-    // A block cancelled before the rate limits let it through never reaches
-    // the writer: the next one does.
+    // A block cancelled before its turn never reaches the writer: the next
+    // one does.
     peer.on_received_message(Message::Request(request(1, 0)))
         .await
         .unwrap();
@@ -1273,6 +1327,55 @@ async fn a_cancel_of_an_unsent_block_is_answered_with_a_reject_on_a_fast_connect
     assert!(rx.is_empty());
 }
 
+// libtorrent `peer_connection::fill_send_buffer`: each peer is served from
+// its own send buffer, held to its watermark, so however many blocks one
+// peer asked for, the next peer waits one block of it.
+#[tokio::test]
+async fn a_deep_upload_queue_on_one_peer_never_holds_up_the_next() {
+    // 32 pieces of four blocks, all had.
+    let h = Harness::seeding_bytes("upload_turns", 4).await;
+    let (deep, mut deep_rx) = h.peer("127.0.0.1:6881");
+    let (light, mut light_rx) = h.peer("127.0.0.2:6881");
+    let (deep, light) = (&deep, &light);
+    for (peer, rx) in [(deep, &mut deep_rx), (light, &mut light_rx)] {
+        peer.on_received_message(Message::Interested).await.unwrap();
+        assert_eq!(next_sent(rx).await, Sent::Unchoke);
+    }
+
+    // The deep peer asks for 100 blocks, then the light peer for one.
+    let asked: Vec<(u32, u32)> = (0..100)
+        .map(|n| (n / CHUNKS_PER_PIECE, n % CHUNKS_PER_PIECE))
+        .collect();
+    for &(index, chunk) in &asked {
+        deep.on_received_message(Message::Request(request(index, chunk)))
+            .await
+            .unwrap();
+    }
+    light
+        .on_received_message(Message::Request(request(31, 0)))
+        .await
+        .unwrap();
+
+    // One round hands each peer one block: the light peer's goes out
+    // alongside the deep peer's first, and the deep peer gets no second
+    // until its writer takes the first.
+    assert_eq!(next_sent(&mut light_rx).await, Sent::Block(31, 0));
+    assert_eq!(next_sent(&mut deep_rx).await, Sent::Block(0, 0));
+    assert!(deep_rx.is_empty());
+
+    // The writer takes each in turn, and the rest follow in the order asked.
+    for (n, &(index, chunk)) in asked.iter().enumerate() {
+        if n > 0 {
+            assert_eq!(
+                next_sent(&mut deep_rx).await,
+                Sent::Block(index, chunk * CHUNK_SIZE)
+            );
+        }
+        assert!(deep.claim_upload(&h.chunk(index, chunk)));
+    }
+    assert!(deep_rx.is_empty());
+}
+
 #[tokio::test]
 async fn a_fast_peer_we_choke_is_sent_a_reject_for_every_block_it_will_not_get() {
     let h = Harness::seeding_with_slots("a_fast_choke_rejects", 1).await;
@@ -1289,8 +1392,8 @@ async fn a_fast_peer_we_choke_is_sent_a_reject_for_every_block_it_will_not_get()
             .await
             .unwrap();
     }
+    // The first is with the writer, the second waits for it.
     assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
-    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
 
     // The slot passes to the other peer. The Choke goes first, then a Reject
     // for each unsent block.
@@ -1427,8 +1530,8 @@ async fn a_fast_peer_we_choke_is_still_served_its_allowed_fast_pieces() {
             .await
             .unwrap();
     }
+    // Piece 0's block is with the writer, piece 1's waits for it.
     assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(0, 0));
-    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(1, 0));
 
     // The slot passes to the other peer: the Choke rejects the unsent block
     // of piece 1 and keeps piece 0's.
@@ -1922,7 +2025,6 @@ async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
             .unwrap();
     }
     assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
-    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
 
     // The one slot is the optimistic one: at the first round it passes to
     // the other peer, which never held it.
@@ -1933,7 +2035,8 @@ async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
     assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
     assert_eq!(next_sent(&mut held_rx).await, Sent::Choke);
 
-    // Both blocks were with the writer, unsent: neither goes out.
+    // One block was with the writer and one waited for it, both unsent:
+    // neither goes out.
     assert!(!held.claim_upload(&h.chunk(0, 0)));
     assert!(!held.claim_upload(&h.chunk(0, 1)));
 
@@ -2252,7 +2355,7 @@ mod v2 {
                     AddTorrent::from_bytes(torrent.torrent_bytes()),
                     Some(AddTorrentOptions {
                         storage_factory: Some(MemoryStorageFactory::default().clone_box()),
-                        initial_have: Some(have),
+                        checkpoint: Some(crate::Checkpoint::pieces(have)),
                         ..Default::default()
                     }),
                 )
@@ -2726,6 +2829,8 @@ async fn a_request_for_any_block_inside_a_had_piece_is_served() {
         peer.on_received_message(Message::Request(r)).await.unwrap();
     }
     assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 1));
+    let unaligned = h.lengths.requested_block(h.piece(0), 1, 100).unwrap();
+    assert!(peer.claim_upload(&unaligned));
     assert_eq!(next_sent(&mut rx).await, Sent::Block(1, PIECE_LENGTH - 10));
 }
 
@@ -2746,7 +2851,7 @@ async fn a_request_past_the_queue_limit_is_rejected_and_reqq_advertises_the_limi
     assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
 
     // Distinct one-byte blocks of piece 0, every one a block a peer may ask
-    // for; the writer sends none, so all stay queued.
+    // for; the writer takes none, so all stay unsent.
     let byte = |begin| Request {
         index: 0,
         begin,
@@ -2780,13 +2885,16 @@ async fn a_request_past_the_queue_limit_is_rejected_and_reqq_advertises_the_limi
         .await
         .unwrap();
 
-    // Everything queued for the writer up to that last block: each block
-    // once, the first Reject the one past the limit.
+    // Everything queued for the writer up to that last block, the writer
+    // taking each in turn: each block once, the first Reject the one past
+    // the limit.
     let mut blocks = Vec::new();
     let mut rejects = Vec::new();
     loop {
         match next_sent(&mut rx).await {
             Sent::Block(0, begin) => {
+                let block = h.lengths.requested_block(h.piece(0), begin, 1).unwrap();
+                assert!(peer.claim_upload(&block));
                 blocks.push(begin);
                 if begin == past.begin {
                     break;
@@ -2916,16 +3024,33 @@ async fn choking_a_peer_starts_its_count_of_unservable_requests_again() {
     assert_eq!(next_sent(&mut rx).await, Sent::Choke);
 }
 
-/// A memory storage that refuses the next `refusals` pieces it is handed.
+/// A memory storage that refuses the next `refusals` pieces it is handed,
+/// then the next `no_room` for want of space, and the next `no_room_writes`
+/// block writes for want of space.
 #[derive(Clone, Default)]
 struct RefusingStorageFactory {
     inner: MemoryStorageFactory,
     refusals: Arc<AtomicU32>,
+    no_room: Arc<AtomicU32>,
+    no_room_writes: Arc<AtomicU32>,
 }
 
 struct RefusingStorage {
     inner: Box<dyn TorrentStorage>,
     refusals: Arc<AtomicU32>,
+    no_room: Arc<AtomicU32>,
+    no_room_writes: Arc<AtomicU32>,
+}
+
+/// Whether `count` was above zero, taking one off it when it was.
+fn take_one(count: &AtomicU32) -> bool {
+    count
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+fn no_room() -> anyhow::Error {
+    anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull)).context("writing")
 }
 
 impl StorageFactory for RefusingStorageFactory {
@@ -2939,6 +3064,8 @@ impl StorageFactory for RefusingStorageFactory {
         Ok(RefusingStorage {
             inner: Box::new(self.inner.create(shared, metadata)?),
             refusals: self.refusals.clone(),
+            no_room: self.no_room.clone(),
+            no_room_writes: self.no_room_writes.clone(),
         })
     }
 
@@ -2961,6 +3088,9 @@ impl TorrentStorage for RefusingStorage {
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        if take_one(&self.no_room_writes) {
+            return Err(no_room());
+        }
         self.inner.pwrite_all(file_id, offset, buf)
     }
 
@@ -2980,15 +3110,16 @@ impl TorrentStorage for RefusingStorage {
         Ok(Box::new(RefusingStorage {
             inner: self.inner.take()?,
             refusals: self.refusals.clone(),
+            no_room: self.no_room.clone(),
+            no_room_writes: self.no_room_writes.clone(),
         }))
     }
 
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
-        let refuse = self
-            .refusals
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
-        anyhow::ensure!(!refuse, "no room for piece {piece:?}");
+        anyhow::ensure!(!take_one(&self.refusals), "refused piece {piece:?}");
+        if take_one(&self.no_room) {
+            return Err(no_room());
+        }
         self.inner.on_piece_completed(piece)
     }
 }
@@ -3039,6 +3170,148 @@ async fn a_piece_the_storage_refuses_is_not_had_and_is_downloaded_again() {
     assert!(h.have(0));
     assert_eq!(h.trust(&peer), (1, 0, false));
     assert_eq!(storage.inner.log.completed_pieces(), vec![0]);
+}
+
+impl Harness {
+    /// A peer at `addr` with the pieces `pieces`, whose handshake names
+    /// upload_only.
+    async fn peer_taking_upload_only(&self, addr: &str, pieces: &[u32]) -> (PeerHandler, PeerRx) {
+        let (peer, rx) = self.peer_with(addr, pieces).await;
+        let mut names_it = ExtendedHandshake::new();
+        names_it.m.upload_only = Some(3);
+        (&peer).on_extended_handshake(&names_it).unwrap();
+        (peer, rx)
+    }
+}
+
+/// The messages queued for the peer, draining its queue.
+fn messages_sent(rx: &mut PeerRx) -> Vec<Message<'static>> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|r| match r {
+            WriterRequest::Message(msg) => Some(msg),
+            _ => None,
+        })
+        .collect()
+}
+
+// libtorrent `torrent::handle_disk_error`: a write that finds no room puts
+// the torrent in upload mode, where `torrent::set_upload_mode` cancels every
+// request (`peer_connection::cancel_all_requests`) and tells the peers it
+// only uploads (`send_upload_only`); `do_update_interest` is interested in
+// no peer and `send_block_requests` asks for nothing, while a request is
+// served as ever (`incoming_request` does not read upload mode). Once it
+// lasted `optimistic_disk_retry`, `torrent::second_tick` leaves it, and the
+// torrent asks again.
+#[tokio::test]
+async fn a_full_disk_puts_the_torrent_in_upload_mode_and_it_keeps_seeding() {
+    let storage = RefusingStorageFactory::default();
+    storage.no_room.store(1, Ordering::SeqCst);
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        ..Default::default()
+    };
+    // Three pieces, the last had.
+    let h = Harness::build_added("full_disk", 3, 0x20, isolated_session_opts(false), add).await;
+    tokio::time::pause();
+    let (fetcher, _fetcher_rx) = h.peer_with("127.0.0.1:6881", &[0]).await;
+    let (asked, mut asked_rx) = h.peer_taking_upload_only("127.0.0.2:6881", &[1]).await;
+    let (leecher, mut leecher_rx) = h.peer_with("127.0.0.3:6881", &[]).await;
+    let leecher = &leecher;
+
+    // `asked` is asked for all of piece 1.
+    let mut requester: Task<'_> = Box::pin(asked.request_chunks());
+    asked.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut asked_rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(1, 0..CHUNKS_PER_PIECE)
+    );
+
+    // The fetcher sends piece 0, which the storage has no room for.
+    h.take(&fetcher, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&fetcher, (0, chunk), false).await.unwrap();
+    }
+    let entered = tokio::time::Instant::now();
+    assert!(h.upload_mode());
+    assert!(!h.have(0));
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+    assert_eq!(h.inflight_count(&asked), 0);
+    let mut told = messages_sent(&mut asked_rx);
+    assert!(matches!(
+        told.pop(),
+        Some(Message::Extended(ExtendedMessage::UploadOnly(true)))
+    ));
+    let cancelled: BTreeSet<(u32, u32)> = told
+        .into_iter()
+        .map(|msg| match msg {
+            Message::Cancel(r) => (r.index, r.begin),
+            other => panic!("expected a cancel, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(cancelled, chunks(1, 0..CHUNKS_PER_PIECE));
+    assert_eq!(asked.acquire_next_piece().unwrap(), None);
+
+    // The piece it has is served.
+    leecher
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leecher_rx).await, Sent::Unchoke);
+    leecher
+        .on_received_message(Message::Request(request(2, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leecher_rx).await, Sent::Block(2, 0));
+
+    // The requester finds us interested in nothing; once upload mode ends,
+    // the peers are told, and the requester is interested and asks again.
+    assert!(matches!(
+        next_message(&mut requester, &mut asked_rx).await,
+        Message::NotInterested
+    ));
+    assert!(matches!(
+        next_message(&mut requester, &mut asked_rx).await,
+        Message::Extended(ExtendedMessage::UploadOnly(false))
+    ));
+    assert!(tokio::time::Instant::now().duration_since(entered) >= OPTIMISTIC_DISK_RETRY);
+    assert!(!h.upload_mode());
+    // Two at first: telling the peer we were not interested ended its slow
+    // start, and no block came to pace it by
+    // (`peer_connection::send_not_interested`).
+    assert_eq!(
+        next_requests(&mut requester, &mut asked_rx, 2).await,
+        chunks(1, 0..2)
+    );
+}
+
+// libtorrent `peer_connection::on_disk_write_complete`: a block whose write
+// failed is no longer being written (`piece_picker::write_failed`), and one
+// that found no room puts the torrent in upload mode
+// (`torrent::handle_disk_error`); a later copy of the block is written.
+#[tokio::test]
+async fn a_block_write_that_finds_no_room_is_fetched_again_after_upload_mode() {
+    let storage = RefusingStorageFactory::default();
+    storage.no_room_writes.store(1, Ordering::SeqCst);
+    let h = Harness::build_on(
+        "full_disk_write",
+        0x00,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    tokio::time::pause();
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.take(&peer, 0);
+    h.send(&peer, (0, 0), false).await.unwrap();
+    assert!(h.upload_mode());
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+
+    h.wait_for_upload_mode(false).await;
+    h.take(&peer, 0);
+    h.send(&peer, (0, 0), false).await.unwrap();
+    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
 }
 
 // A piece is counted into every file with bytes in it, an empty file among
@@ -3417,6 +3690,7 @@ async fn a_super_seeded_peer_is_served_only_the_pieces_it_was_handed() {
             .await
             .unwrap();
         assert_eq!(next_sent(&mut rx).await, Sent::Block(piece, 0));
+        assert!(peer.claim_upload(&h.chunk(piece, 0)));
     }
 }
 
@@ -4137,6 +4411,7 @@ impl Harness {
             writer,
             read_buf: crate::read_buf::ReadBuf::new(),
             handshake: Handshake::new(self.shared.info_hash, Id20::new([7; 20])),
+            encrypted: false,
             meter: Default::default(),
         };
         let slot = self._session.connection_slots.try_accept().unwrap();
@@ -4242,6 +4517,38 @@ async fn an_incoming_connection_at_the_cap_that_ranks_no_higher_is_refused() {
     assert!(!asked_to_close(&mut b_rx));
     assert!(!h.holds_place("192.0.2.1:6881"));
     assert_eq!(h.connections(), (2, 2));
+}
+
+// libtorrent `bt_peer_connection::init_bt_handshake` marks a connection
+// encrypted whichever side opened it, and `ut_pex_plugin::tick` flags a peer
+// by it (`supports_encryption()`): an incoming connection the listener took
+// encrypted is advertised encrypted, a plaintext one is not.
+#[tokio::test]
+async fn an_incoming_encrypted_connection_is_advertised_encrypted_in_our_pex() {
+    use crate::peer_protocol::extended::ut_pex::PEX_ENCRYPTION;
+    use tokio::io::AsyncReadExt;
+    let h = turnover_harness("incoming_pex_encryption", 10, 200).await;
+    tokio::time::pause();
+    let mut ends = Vec::new();
+    for (addr, encrypted) in [("192.0.2.1:6881", true), ("192.0.2.2:6881", false)] {
+        let (mut checked, slot, mut theirs) = h.incoming(addr);
+        checked.encrypted = encrypted;
+        let added = h.live.add_incoming_peer(checked, slot).unwrap();
+        assert!(matches!(added, AddIncomingPeerResult::Added));
+        // Our handshake and the first byte after it, which is written once
+        // the connection has told the torrent how the peer greeted.
+        let mut written = [0; 69];
+        theirs.read_exact(&mut written).await.unwrap();
+        ends.push(theirs);
+    }
+
+    let flags = |addr| {
+        h.peers
+            .with_live(sock(addr), |live| live.advertised_pex_flags())
+            .unwrap()
+    };
+    assert_eq!(flags("192.0.2.1:6881") & PEX_ENCRYPTION, PEX_ENCRYPTION);
+    assert_eq!(flags("192.0.2.2:6881") & PEX_ENCRYPTION, 0);
 }
 
 /// Every dial reaches the test as [`Dialed`](crate::peer_info_reader::tests::Dialed)
@@ -4967,7 +5274,7 @@ impl Harness {
                 AddTorrent::from_bytes(torrent.torrent_bytes()),
                 Some(AddTorrentOptions {
                     storage_factory: Some(MemoryStorageFactory::default().clone_box()),
-                    initial_have: Some(have),
+                    checkpoint: Some(crate::Checkpoint::pieces(have)),
                     ..Default::default()
                 }),
             )
@@ -5109,4 +5416,144 @@ async fn the_web_seed_of_a_single_file_torrent_that_fails_a_piece_is_banned() {
         |lacks| h.web_layout.bitfield(lacks).any(),
     );
     assert!(due.is_empty());
+}
+
+// libtorrent `torrent::write_resume_data` records the finished blocks of each
+// downloading piece (`unfinished_pieces`), and `torrent::read_resume_data`
+// marks them finished again (`piece_picker::mark_as_finished`): a restarted
+// torrent asks for none of them, and the piece's hash is checked once the
+// rest arrive.
+#[tokio::test]
+async fn a_checkpoint_keeps_the_written_blocks_of_a_piece_across_a_restart() {
+    let storage = MemoryStorageFactory::default();
+    let add = || AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        ..Default::default()
+    };
+    // Piece 1 had: piece 0 is the one fetched.
+    let h = Harness::build_added(
+        "checkpoint_keeps_written_blocks",
+        PIECES,
+        0x40,
+        isolated_session_opts(false),
+        add(),
+    )
+    .await;
+    tokio::time::pause();
+    {
+        let (peer, mut rx) = h.peer("127.0.0.1:6881");
+        let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+        peer.on_i_am_unchoked();
+        assert_eq!(
+            next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+            chunks(0, 0..CHUNKS_PER_PIECE)
+        );
+        h.deliver(&peer, (0, 0)).await;
+        h.deliver(&peer, (0, CHUNK_SIZE)).await;
+    }
+
+    let checkpoint = h.handle().checkpoint().unwrap();
+    assert_eq!(checkpoint.have.as_raw_slice(), &[0x40]);
+    let blocks = checkpoint.blocks.as_ref().unwrap();
+    assert_eq!(
+        blocks.iter_ones().collect::<Vec<_>>(),
+        [0, 1, 4, 5, 6, 7],
+        "the two blocks written of piece 0, and every block of piece 1"
+    );
+    assert_eq!(storage.log.written_pieces(), [0, 0]);
+
+    let h = h.restarted(checkpoint, add()).await;
+    assert_eq!(h.missing_chunks(0), [2, 3]);
+    let (peer, mut rx) = h.peer("127.0.0.2:6881");
+    let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+    peer.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, 2).await,
+        chunks(0, 2..CHUNKS_PER_PIECE)
+    );
+    assert_eq!(h.inflight_count(&peer), 2);
+    h.deliver(&peer, (0, 2 * CHUNK_SIZE)).await;
+    h.deliver(&peer, (0, 3 * CHUNK_SIZE)).await;
+
+    assert!(
+        h.lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .is_piece_have(h.piece(0))
+    );
+    assert_eq!(storage.log.completed_pieces(), [0]);
+    assert_eq!(
+        storage.log.written_pieces(),
+        [0, 0, 0, 0],
+        "no block was fetched twice"
+    );
+}
+
+// libtorrent `torrent::write_resume_data` saves the peers and the bans, and
+// `torrent::read_resume_data` takes them back: each peer through
+// `torrent::add_peer` as `peer_info::resume_data`, each ban through
+// `peer_list::ban_peer`. A restarted torrent gets its saved peers as its
+// initial peers and its saved bans as its banned addresses.
+#[tokio::test]
+async fn saved_peers_and_bans_come_back_as_initial_peers_and_bans() {
+    use futures::StreamExt;
+
+    let h = Harness::seeding("saved_peers_come_back").await;
+    // Connected to us over uTP: we can connect back to where it is.
+    let connectable: SocketAddr = "127.0.0.3:6881".parse().unwrap();
+    let (tx, _rx) = unbounded_channel();
+    h.peers
+        .add_incoming(connectable, Id20::default(), tx, ConnectionKind::Utp, 6881)
+        .unwrap();
+    let banned: SocketAddr = "127.0.0.4:6881".parse().unwrap();
+    h.peers.ban(banned);
+    let saved = h.handle().resume_peers().unwrap();
+    assert_eq!(
+        saved,
+        crate::ResumePeers {
+            peers: vec![connectable],
+            banned: vec![banned.ip()],
+        }
+    );
+
+    // Restarted paused, so no peer is connected to.
+    let session = h._session.clone();
+    let bytes = h._torrent.as_ref().unwrap().torrent.clone();
+    session
+        .delete(crate::api::TorrentIdOrHash::Id(h.shared.id), false)
+        .await
+        .unwrap();
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(bytes),
+            Some(AddTorrentOptions {
+                paused: true,
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                checkpoint: Some(crate::Checkpoint::pieces(BF::from_boxed_slice(
+                    vec![0xc0].into_boxed_slice(),
+                ))),
+                initial_peers: Some(saved.peers.clone()),
+                banned_peers: saved.banned.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    let named: Vec<_> = session
+        .make_peer_rx_managed_torrent(&handle, false)
+        .unwrap()
+        .take(saved.peers.len())
+        .collect()
+        .await;
+    assert_eq!(named, [(connectable, PeerSourceFlag::ResumeData)]);
+    // Saved again before it runs, the torrent keeps both.
+    assert_eq!(handle.resume_peers().unwrap(), saved);
+    let paused_list = handle.with_state(|s| match s {
+        crate::ManagedTorrentState::Paused(p) => p.peers.resume_peers(),
+        _ => panic!("the restarted torrent is not paused"),
+    });
+    assert_eq!(paused_list, saved);
 }

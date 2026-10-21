@@ -89,15 +89,15 @@ gen_stats!(PerFamilyAtomic PerFamilySnapshot, [], [
     v4 SingleStatAtomic SingleStatSnapshot,
     v6 SingleStatAtomic SingleStatSnapshot
 ]);
-// Outgoing encrypted handshakes: how many were tried, how many ended in a
-// fully encrypted or header-only stream, how many failed, and how many of
-// those failures were retried in plaintext.
+// Outgoing handshakes: how many encrypted ones were tried, how many of
+// those ended in a fully encrypted or header-only stream, how many failed,
+// and how many plaintext ones were sent.
 gen_stats!(EncryptionStatsAtomic EncryptionStatsSnapshot, [
     attempts u64,
     rc4 u64,
     header_only u64,
     failures u64,
-    plaintext_fallbacks u64
+    plaintext u64
 ], []);
 gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
     tcp PerFamilyAtomic PerFamilySnapshot,
@@ -144,73 +144,73 @@ impl StreamConnector {
     }
 
     /// Connect to a peer over `transports` and send it our BitTorrent
-    /// `handshake`, through the encrypted handshake when the policy asks for
-    /// it. The returned halves carry the peer's reply, and the meter counts
-    /// every byte they move, the encryption handshake and ours included.
+    /// `handshake`, inside the encrypted handshake when the policy says so.
+    /// Under [`EncryptionPolicy::Prefer`] `encrypt` says which, asked once the
+    /// transport is open (libtorrent `bt_peer_connection::on_connected`
+    /// chooses there, so a peer we never reach is never asked). An encrypted
+    /// handshake that fails ends the connection: the next one to the peer
+    /// tries what `encrypt` says then. The returned halves carry the peer's
+    /// reply, the meter counts every byte they move, the encryption handshake
+    /// and ours included, and the flag says whether the encrypted handshake
+    /// was used.
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_and_send_handshake(
         &self,
         addr: SocketAddr,
         transports: Transports,
         info_hash: &Id20,
         handshake: &[u8],
+        encrypt: impl FnOnce() -> bool,
         connect_timeout: Duration,
         rw_timeout: Duration,
-    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite, Meter)> {
-        let connect = || async {
-            let (kind, r, w) = with_timeout(
-                "connecting",
-                connect_timeout,
-                self.connect(addr, transports),
-            )
-            .await?;
-            let (meter, r, w) = Meter::wrap(r, w);
-            Ok::<_, Error>((kind, r, w, meter))
+    ) -> Result<(
+        ConnectionKind,
+        BoxAsyncReadVectored,
+        BoxAsyncWrite,
+        Meter,
+        bool,
+    )> {
+        let (kind, r, w) = with_timeout(
+            "connecting",
+            connect_timeout,
+            self.connect(addr, transports),
+        )
+        .await?;
+        let (meter, r, mut w) = Meter::wrap(r, w);
+
+        let stats = &self.stats.encryption;
+        let encrypted = match self.encryption {
+            EncryptionPolicy::Disabled => false,
+            EncryptionPolicy::Prefer => encrypt(),
+            EncryptionPolicy::Require => true,
         };
-        let send_plaintext = |kind, r, mut w: BoxAsyncWrite, meter| async move {
+        if !encrypted {
+            stats.plaintext(1);
             with_timeout(
                 "writing",
                 rw_timeout,
                 w.write_all(handshake).map_err(Error::WriteHandshake),
             )
             .await?;
-            Ok((kind, r, w, meter))
-        };
-
-        if self.encryption == EncryptionPolicy::Disabled {
-            let (kind, r, w, meter) = connect().await?;
-            return send_plaintext(kind, r, w, meter).await;
+            return Ok((kind, r, w, meter, false));
         }
 
-        let stats = &self.stats.encryption;
-        let (kind, r, w, meter) = connect().await?;
         stats.attempts(1);
         let offer = mse::outgoing_offer(self.encryption);
-        let encrypted = with_timeout("encryption handshake", rw_timeout, async {
+        let established = with_timeout("encryption handshake", rw_timeout, async {
             Ok(mse::initiate(r, w, info_hash, offer, handshake).await?)
         })
-        .await;
-        let err = match encrypted {
-            Ok(e) => {
-                if e.method == mse::CRYPTO_RC4 {
-                    stats.rc4(1);
-                } else {
-                    stats.header_only(1);
-                }
-                return Ok((kind, e.reader, e.writer, meter));
-            }
-            Err(e) => e,
-        };
-        stats.failures(1);
-        if self.encryption == EncryptionPolicy::Require {
-            return Err(err);
+        .await
+        .inspect_err(|e| {
+            stats.failures(1);
+            debug!(?addr, "encrypted handshake failed: {e:#}");
+        })?;
+        if established.method == mse::CRYPTO_RC4 {
+            stats.rc4(1);
+        } else {
+            stats.header_only(1);
         }
-        debug!(
-            ?addr,
-            "encrypted handshake failed, retrying in plaintext: {err:#}"
-        );
-        stats.plaintext_fallbacks(1);
-        let (kind, r, w, meter) = connect().await?;
-        send_plaintext(kind, r, w, meter).await
+        Ok((kind, established.reader, established.writer, meter, true))
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {
@@ -391,6 +391,7 @@ mod tests {
     use librqbit_utp::UtpSocketUdp;
 
     use super::*;
+    use crate::peer_info_reader::tests::Dialed;
 
     /// A connector that may use TCP, and uTP when `utp` holds.
     async fn connector(utp: bool) -> StreamConnector {
@@ -448,5 +449,115 @@ mod tests {
             .await;
         assert!(matches!(res, Err(Error::ConnectDisabled)));
         assert_eq!(tcp_attempts(&connector), 0);
+    }
+
+    const HANDSHAKE: &[u8] = b"\x13BitTorrent protocol, and the rest";
+
+    /// A connector under `encryption` whose dials reach the test as the far
+    /// end of an in-memory stream.
+    async fn dialing(
+        encryption: EncryptionPolicy,
+    ) -> (
+        StreamConnector,
+        tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, tokio::io::DuplexStream)>,
+    ) {
+        let (tx, dialed) = tokio::sync::mpsc::unbounded_channel();
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            enable_tcp: true,
+            socket_factory: Some(Arc::new(Dialed(tx))),
+            encryption,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        (connector, dialed)
+    }
+
+    async fn send_handshake(
+        connector: &StreamConnector,
+        encrypt: impl FnOnce() -> bool,
+    ) -> Result<bool> {
+        connector
+            .connect_and_send_handshake(
+                (Ipv4Addr::LOCALHOST, 6881).into(),
+                Transports::Any,
+                &Id20::new([7; 20]),
+                HANDSHAKE,
+                encrypt,
+                Duration::MAX,
+                Duration::MAX,
+            )
+            .await
+            .map(|(.., encrypted)| encrypted)
+    }
+
+    // libtorrent `bt_peer_connection::on_connected`: where encryption is
+    // preferred, the peer's `pe_support` says which handshake the
+    // connection sends, plaintext here, over the one connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_preferring_connection_sends_the_handshake_it_is_told_to() {
+        use tokio::io::AsyncReadExt;
+        let (connector, mut dialed) = dialing(EncryptionPolicy::Prefer).await;
+        let encrypted = send_handshake(&connector, || false).await.unwrap();
+        assert!(!encrypted);
+        let (_, mut theirs) = dialed.recv().await.unwrap();
+        let mut got = vec![0u8; HANDSHAKE.len()];
+        theirs.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, HANDSHAKE);
+        assert!(dialed.try_recv().is_err());
+        let stats = connector.stats().encryption.snapshot();
+        assert_eq!((stats.plaintext, stats.attempts), (1, 0), "{stats:?}");
+    }
+
+    // libtorrent `bt_peer_connection::on_connected`: an encrypted handshake
+    // the peer refuses ends the connection; the next connection, not this
+    // one, tries plaintext.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_encrypted_handshake_ends_the_connection_and_opens_no_other() {
+        let (connector, mut dialed) = dialing(EncryptionPolicy::Prefer).await;
+        let refuse = async {
+            let (_, theirs) = dialed.recv().await.unwrap();
+            drop(theirs);
+        };
+        let (sent, ()) = tokio::join!(send_handshake(&connector, || true), refuse);
+        assert!(matches!(sent, Err(Error::Mse(_))), "{sent:?}");
+        assert!(dialed.try_recv().is_err());
+        assert_eq!(tcp_attempts(&connector), 1);
+        let stats = connector.stats().encryption.snapshot();
+        assert_eq!(
+            (stats.attempts, stats.failures, stats.plaintext),
+            (1, 1, 0),
+            "{stats:?}"
+        );
+    }
+
+    // libtorrent `bt_peer_connection::on_connected` reads `pe_support`
+    // only under `pe_enabled`: `pe_forced` sends the encrypted handshake
+    // and `pe_disabled` the plaintext one, whatever the peer showed.
+    #[tokio::test(start_paused = true)]
+    async fn require_and_disabled_never_ask_which_handshake() {
+        let asked = || panic!("asked which handshake");
+        let (connector, mut dialed) = dialing(EncryptionPolicy::Require).await;
+        let refuse = async {
+            let (_, theirs) = dialed.recv().await.unwrap();
+            drop(theirs);
+        };
+        let (sent, ()) = tokio::join!(send_handshake(&connector, asked), refuse);
+        assert!(matches!(sent, Err(Error::Mse(_))), "{sent:?}");
+        assert_eq!(connector.stats().encryption.snapshot().attempts, 1);
+
+        let (connector, _dialed) = dialing(EncryptionPolicy::Disabled).await;
+        assert!(!send_handshake(&connector, asked).await.unwrap());
+        assert_eq!(connector.stats().encryption.snapshot().plaintext, 1);
+    }
+
+    // libtorrent `bt_peer_connection::on_connected` runs once the transport
+    // is open: a peer we never reach is never asked, so its memory stays.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_never_reached_is_never_asked() {
+        let (connector, dialed) = dialing(EncryptionPolicy::Prefer).await;
+        drop(dialed);
+        let sent = send_handshake(&connector, || panic!("asked which handshake")).await;
+        assert!(matches!(sent, Err(Error::TcpConnect(_))), "{sent:?}");
     }
 }

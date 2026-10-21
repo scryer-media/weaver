@@ -19,6 +19,9 @@ pub struct LiveStats {
     pub download_speed: Speed,
     pub upload_speed: Speed,
     pub time_remaining: Option<DurationWithHumanReadable>,
+    /// A write found no room: the torrent fetches nothing and keeps seeding
+    /// (libtorrent `torrent_status::upload_mode`).
+    pub upload_mode: bool,
 }
 
 impl std::fmt::Display for LiveStats {
@@ -46,6 +49,7 @@ impl From<&TorrentStateLive> for LiveStats {
             time_remaining: down_estimator
                 .time_remaining()
                 .map(DurationWithHumanReadable),
+            upload_mode: live.upload_mode(),
         }
     }
 }

@@ -79,11 +79,10 @@ use crate::{
     torrent_state::{
         AddIncomingPeerResult, ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions,
         ManagedTorrentState, TorrentMetadata, TorrentStateLive,
-        initializing::{TorrentStateInitializing, normalize_initial_have},
+        initializing::{Checkpoint, TorrentStateInitializing, normalize_checkpoint},
+        live::peers::PeerList,
     },
-    type_aliases::{
-        BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream,
-    },
+    type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream},
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -516,6 +515,12 @@ pub struct AddTorrentOptions {
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
+    /// Addresses banned from the start, as a restart saved them (libtorrent
+    /// `add_torrent_params::banned_peers`): no peer at one joins the peer
+    /// list. See [`ManagedTorrent::resume_peers`].
+    #[serde(default)]
+    pub banned_peers: Vec<IpAddr>,
+
     /// Web seeds beside those the torrent names; a magnet link's `ws` join
     /// them (libtorrent `add_torrent_params::url_seeds`).
     #[serde(default)]
@@ -533,17 +538,16 @@ pub struct AddTorrentOptions {
     // Custom trackers
     pub trackers: Option<Vec<String>>,
 
-    /// The pieces the storage already holds and that the caller has already
-    /// verified, as a BEP 3 bitfield: bit 0 (the high bit of the first byte)
-    /// is piece 0. When set, the initial hash check does not run: these pieces
-    /// are taken as have and every other piece as missing, and none of them is
-    /// read back from the storage. It also takes precedence over any fastresume
-    /// bitfield.
-    ///
-    /// Its length is either the piece count, or the piece count rounded up to
-    /// whole bytes with the spare bits clear; anything else is refused.
+    /// What the storage already holds, as a checkpoint of an earlier run
+    /// recorded it (see [`Checkpoint`]). When set, the initial hash check
+    /// does not run: its pieces are taken as have and its blocks as
+    /// written, every other piece and block as missing, and none is read
+    /// back from the storage but a piece every block of which was written
+    /// and that is not had, whose hash is checked. It also takes precedence
+    /// over any fastresume bitfield. A bitfield of the wrong length is
+    /// refused.
     #[serde(skip)]
-    pub initial_have: Option<BF>,
+    pub checkpoint: Option<Checkpoint>,
 
     /// The initial fetch priority of the given pieces, by piece index; every
     /// other piece is Normal. See [`PiecePriority`] and
@@ -589,12 +593,13 @@ impl Default for AddTorrentOptions {
             disable_trackers: false,
             ratelimits: LimitsConfig::default(),
             initial_peers: None,
+            banned_peers: Vec::new(),
             web_seeds: Vec::new(),
             peer_limit: None,
             preferred_id: None,
             storage_factory: None,
             trackers: None,
-            initial_have: None,
+            checkpoint: None,
             piece_priorities: None,
             identity: None,
             disable_v1_hashes: v1_hashes_disabled_by_default(),
@@ -938,6 +943,9 @@ pub(crate) struct CheckedIncomingConnection {
     pub writer: BoxAsyncWrite,
     pub read_buf: ReadBuf,
     pub handshake: Handshake,
+    /// The peer opened with the encryption handshake (libtorrent
+    /// `bt_peer_connection::m_encrypted`, header-only included).
+    pub encrypted: bool,
     /// What has crossed the socket so far, the handshakes included.
     pub meter: Meter,
 }
@@ -1455,8 +1463,9 @@ impl Session {
 
         // With encryption enabled, an encrypted connection is unwrapped here
         // and a plaintext one passed through (or refused); with it disabled
-        // the halves are left as they are.
-        crate::mse::upgrade_incoming(
+        // the halves are left as they are. A method is settled only when the
+        // encryption handshake ran.
+        let method = crate::mse::upgrade_incoming(
             self.connector.encryption(),
             &mut reader,
             &mut writer,
@@ -1506,6 +1515,7 @@ impl Session {
                 kind,
                 handshake: h,
                 read_buf,
+                encrypted: method != 0,
                 meter,
             },
         ))
@@ -2078,10 +2088,10 @@ impl Session {
             opts.list_only,
         )?;
 
-        let initial_have = opts
-            .initial_have
+        let checkpoint = opts
+            .checkpoint
             .take()
-            .map(|have| normalize_initial_have(have, metadata.info.lengths()))
+            .map(|checkpoint| normalize_checkpoint(checkpoint, metadata.info.lengths()))
             .transpose()?;
 
         let piece_priorities = match opts.piece_priorities.take() {
@@ -2188,8 +2198,12 @@ impl Session {
                 self.spawner
                     .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
                 false,
-                initial_have,
+                checkpoint,
                 piece_priorities.clone(),
+                PeerList::resumed(
+                    opts.initial_peers.iter().flatten().copied(),
+                    opts.banned_peers.iter().copied(),
+                ),
             ));
             let handle = Arc::new(ManagedTorrent {
                 locked: RwLock::new(ManagedTorrentLocked {
@@ -2515,6 +2529,24 @@ impl Session {
         Ok(())
     }
 
+    /// Forget every piece of the torrent and check them all again, trusting
+    /// no checkpoint or saved state (libtorrent `torrent::force_recheck`).
+    /// A running torrent runs again once checked; a paused one stays paused.
+    /// Nothing happens while it is being checked already.
+    pub async fn force_recheck(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+    ) -> anyhow::Result<()> {
+        handle.recheck()?;
+        let paused = handle.is_paused();
+        let peer_rx = if paused {
+            None
+        } else {
+            self.peer_source_managed_torrent(handle, true)
+        };
+        handle.start(peer_rx, paused)
+    }
+
     pub async fn update_only_files(
         self: &Arc<Self>,
         handle: &ManagedTorrentHandle,
@@ -2750,7 +2782,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         // as a seed (libtorrent `torrent::bytes_left`). Once the pieces are
         // gone with the torrent, what its run recorded as it ended.
         let left_bytes = mt
-            .with_chunk_tracker(|c| c.get_lengths().total_length() - c.get_hns().have_bytes)
+            .with_chunk_tracker(|c| c.bytes_left())
             .ok()
             .or(last_run.map(|r| r.left_bytes));
         crate::tracker::TrackerCommsStats {
@@ -3521,10 +3553,15 @@ mod tests {
         assert!(!stats.finished_during_run);
         assert!(info.wait_until_completed().now_or_never().is_none());
 
-        // Paused, the pieces still say what the torrent lacks.
+        // Paused, the pieces still say what the torrent lacks, and so does
+        // what the run recorded as it ended.
         session.pause(&handle).await.unwrap();
         let (_, stats) = tracker_stats(&session, &handle);
         assert_eq!(stats.left_bytes, Some(PIECE as u64));
+        assert_eq!(
+            handle.shared().last_run.lock().map(|run| run.left_bytes),
+            Some(PIECE as u64)
+        );
         session.stop().await;
     }
 
@@ -3612,6 +3649,7 @@ mod tests {
             writer,
             read_buf: crate::read_buf::ReadBuf::new(),
             handshake: crate::peer_protocol::Handshake::new(info_hash, super::Id20::new([7; 20])),
+            encrypted: false,
             meter: Default::default(),
         };
         (checked, theirs)

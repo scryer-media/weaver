@@ -34,7 +34,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 79;
+const CURRENT_SCHEMA_VERSION: i64 = 80;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1560,6 +1560,51 @@ mod tests {
                 .unwrap(),
             Some(crate::pipeline::graph::Engine::Classic)
         );
+    }
+
+    // Migration 78 gives each torrent its saved peers and bans: a fresh
+    // database has them, and an existing torrent starts with none.
+    #[tokio::test]
+    async fn sqlite_migration_78_gives_torrents_saved_peers_and_bans() {
+        let columns = ["peers", "banned_peers"];
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+
+        let fresh = open_test_pool(&temp.path().join("fresh.db")).await;
+        replay_catalog_into_fresh_db(&fresh, &catalog, &payload, None, true)
+            .await
+            .unwrap();
+        assert_eq!(pragma_column_count(&fresh, "torrents", &columns).await, 2);
+        fresh.close().await;
+
+        let db_path = temp.path().join("pre-torrent-peers.db");
+        let pool = open_test_pool(&db_path).await;
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(77), true)
+            .await
+            .unwrap();
+        assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
+        sqlx::query(
+            "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
+             VALUES (7, ?, 'saved', 'magnet', 1, 'queued')",
+        )
+        .bind(vec![7_u8; 20])
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 2);
+        let row: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT name, peers, banned_peers FROM torrents WHERE job_id = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("saved".to_string(), None, None));
+        pool.close().await;
     }
 
     // Migration 73 keeps each tracker's place in the announce list and drops

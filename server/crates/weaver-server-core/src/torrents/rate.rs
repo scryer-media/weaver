@@ -120,10 +120,10 @@ pub fn session_rates(rate: Option<u64>, used: &[u64]) -> Vec<Option<u64>> {
 /// limit, and zero closes that direction: nothing moves until the rate opens
 /// again.
 ///
-/// The session's limiters are read on every block requested and sent, so a
-/// rate is live on the session as it is: nothing is rebuilt or reattached,
-/// and a limiter is replaced only when its rate changes, since replacing it
-/// starts a fresh burst.
+/// The session's limits are paid on every byte that crosses a peer's
+/// socket, so a rate is live on the session as it is: nothing is rebuilt or
+/// reattached, and a limit is set only when its rate changes; a change
+/// applies to the peers already waiting on it.
 pub fn apply_torrent_rates(session: &Session, rates: TorrentRates) {
     let limits = &session.ratelimits;
     let download = limit(rates.download);

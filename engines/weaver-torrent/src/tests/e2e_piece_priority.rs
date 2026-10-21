@@ -73,7 +73,7 @@ async fn fetch_two_missing(
             AddTorrent::from_bytes(t.torrent.clone()),
             Some(AddTorrentOptions {
                 storage_factory: Some(storage.clone_box()),
-                initial_have: Some(have),
+                checkpoint: Some(crate::Checkpoint::pieces(have)),
                 initial_peers: Some(vec![seeder_addr]),
                 piece_priorities,
                 ..Default::default()
@@ -124,7 +124,9 @@ async fn test_piece_priorities_out_of_range_are_refused() -> anyhow::Result<()> 
             AddTorrent::from_bytes(t.torrent.clone()),
             Some(AddTorrentOptions {
                 storage_factory: Some(storage.clone_box()),
-                initial_have: Some(BF::from_boxed_slice(vec![0xffu8].into_boxed_slice())),
+                checkpoint: Some(crate::Checkpoint::pieces(BF::from_boxed_slice(
+                    vec![0xffu8].into_boxed_slice(),
+                ))),
                 piece_priorities: Some(vec![(OUT_OF_RANGE, PiecePriority::High)]),
                 ..Default::default()
             }),
@@ -137,7 +139,9 @@ async fn test_piece_priorities_out_of_range_are_refused() -> anyhow::Result<()> 
             AddTorrent::from_bytes(t.torrent.clone()),
             Some(AddTorrentOptions {
                 storage_factory: Some(storage.clone_box()),
-                initial_have: Some(BF::from_boxed_slice(vec![0xffu8].into_boxed_slice())),
+                checkpoint: Some(crate::Checkpoint::pieces(BF::from_boxed_slice(
+                    vec![0xffu8].into_boxed_slice(),
+                ))),
                 piece_priorities: Some(vec![(1, PiecePriority::Low)]),
                 ..Default::default()
             }),

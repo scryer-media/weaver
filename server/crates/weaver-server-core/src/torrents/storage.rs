@@ -389,8 +389,7 @@ impl TorrentStorage for PieceStorage {
 
     // The piece's shares go to the job, and only then does the piece stop
     // being read from memory, so no read finds it in neither place. Its room
-    // is given back first: the job, or the intake holding it, counts the
-    // bytes from here.
+    // is given back first: the job counts the bytes from here.
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let index = piece.get();
         let (held, released) = {

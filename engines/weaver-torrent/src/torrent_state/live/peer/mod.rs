@@ -8,7 +8,7 @@
 pub mod stats;
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +25,9 @@ use tokio::sync::{
 use tokio::time::Instant;
 
 use crate::peer_connection::WriterRequest;
-use crate::peer_protocol::extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo};
+use crate::peer_protocol::extended::ut_pex::{
+    PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo,
+};
 use crate::stream_connect::{ConnectionKind, Transports};
 use crate::type_aliases::{BF, PeerSourceFlag};
 
@@ -42,6 +44,10 @@ pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
+// libtorrent `peer_connection::fast_reconnect`: the most connections to one
+// peer that may follow a failed encrypted handshake at once, without the
+// wait to reconnect.
+const MAX_FAST_RECONNECTS: u8 = 2;
 // libtorrent `peer_connection::second_tick`: each failure in a row gives the
 // next connection to the peer this much longer to open.
 const CONNECT_TIMEOUT_PER_FAILURE: Duration = Duration::from_secs(3);
@@ -270,6 +276,18 @@ pub(crate) struct Peer {
     // When its last connection closed, failed or not (libtorrent
     // `torrent_peer::last_connected`, set in `peer_list::connection_closed`).
     last_connected: Option<Instant>,
+    // Whether the next connection we make to the peer tries the encrypted
+    // handshake where encryption is preferred: the method the peer last
+    // completed one with, encrypted until it has (libtorrent
+    // `torrent_peer::pe_support`).
+    encrypt: bool,
+    // The connections to the peer that followed a failed encrypted
+    // handshake at once (libtorrent `torrent_peer::fast_reconnects`).
+    fast_reconnects: u8,
+    // The connection being made tries the encrypted handshake, and the
+    // next follows at once if it does not complete it (libtorrent
+    // `peer_connection::m_fast_reconnect`).
+    fast_reconnect: bool,
     // When the choker last gave the peer the optimistic slot, on any
     // connection to it.
     pub last_optimistic_unchoke: Option<Instant>,
@@ -307,6 +325,9 @@ impl Peer {
             failcount: 0,
             upload_only: false,
             last_connected: None,
+            encrypt: true,
+            fast_reconnects: 0,
+            fast_reconnect: false,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
             supports_holepunch: false,
@@ -325,6 +346,9 @@ impl Peer {
             failcount: 0,
             upload_only: false,
             last_connected: None,
+            encrypt: true,
+            fast_reconnects: 0,
+            fast_reconnect: false,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
             supports_holepunch: false,
@@ -475,10 +499,56 @@ impl Peer {
         self.failcount = 0;
     }
 
+    /// Whether the connection we are making to the peer, its transport just
+    /// open where encryption is preferred, tries the encrypted handshake.
+    /// The next tries the other method unless this one completes its
+    /// handshake, and follows at once when an encrypted one does not, at
+    /// most [`MAX_FAST_RECONNECTS`] times (libtorrent
+    /// `bt_peer_connection::on_connected`, `peer_connection::fast_reconnect`).
+    pub(crate) fn encrypt_outgoing(&mut self) -> bool {
+        let encrypt = self.encrypt;
+        self.encrypt = !encrypt;
+        self.fast_reconnect = encrypt && self.fast_reconnects < MAX_FAST_RECONNECTS;
+        encrypt
+    }
+
+    /// A PEX message named the peer with `flags`: one that speaks the
+    /// holepunch extension is marked so (libtorrent `peer_list::insert_peer`,
+    /// `update_peer`), and one the sender is connected to encrypted is
+    /// tried encrypted next (`insert_peer`; a known peer too, as ours start
+    /// at encrypted).
+    pub(crate) fn pex_flags(&mut self, flags: u8) {
+        if flags & PEX_HOLEPUNCH != 0 {
+            self.supports_holepunch = true;
+        }
+        if flags & PEX_ENCRYPTION != 0 {
+            self.encrypt = true;
+        }
+    }
+
+    /// The peer's connection completed its handshake, the encrypted one
+    /// when `encrypted`, and says so in our PEX (libtorrent
+    /// `bt_peer_connection::init_bt_handshake` sets `m_encrypted` either
+    /// way round). One we made makes the next we make try that method again
+    /// (`init_bt_handshake` and `on_receive_impl` write `pe_support` only
+    /// when `is_outgoing()`).
+    pub(crate) fn handshake_encryption(&mut self, encrypted: bool) {
+        if self.connected_out() == Some(true) {
+            self.encrypt = encrypted;
+            self.fast_reconnect = false;
+        }
+        if let Some(live) = self.get_live_mut() {
+            live.encrypted = encrypted;
+        }
+    }
+
     /// Settles the peer after its connection closed at `closed_at`, in an
     /// error when `failed`; `needed` says whether we still want the peer.
     /// Every close starts the wait to reconnect, and a failure lengthens it
-    /// (libtorrent `peer_list::connection_closed`).
+    /// (libtorrent `peer_list::connection_closed`), but for an encrypted
+    /// handshake that did not complete: its close is dated back by the
+    /// longest wait a candidate has, so the next connection is due at once
+    /// (libtorrent `peer_connection::fast_reconnect`).
     pub(crate) fn connection_closed(
         &mut self,
         closed_at: Instant,
@@ -486,7 +556,12 @@ impl Peer {
         needed: bool,
         counters: &PeerStates,
     ) {
-        self.last_connected = Some(closed_at);
+        self.last_connected = if std::mem::take(&mut self.fast_reconnect) {
+            self.fast_reconnects += 1;
+            closed_at.checked_sub(MIN_RECONNECT_TIME * MAX_FAILCOUNT)
+        } else {
+            Some(closed_at)
+        };
         if failed {
             self.failcount = self.failcount.saturating_add(1);
         }
@@ -555,6 +630,9 @@ impl Peer {
             failcount: self.failcount,
             upload_only: self.upload_only,
             last_connected: self.last_connected,
+            encrypt: self.encrypt,
+            fast_reconnects: self.fast_reconnects,
+            fast_reconnect: false,
             last_optimistic_unchoke: self.last_optimistic_unchoke,
             trust: self.trust,
             supports_holepunch: self.supports_holepunch,
@@ -841,10 +919,14 @@ pub(crate) struct LivePeerState {
 
     request_slots_changed: Arc<Notify>,
 
-    // The blocks the peer asked us for that we have not sent yet. The writer
-    // sends a block only by taking it from here, so a Cancel or a Choke that
-    // removes it first keeps it from going out.
-    upload_queue: HashSet<ChunkInfo>,
+    // The blocks the peer asked us for and that are not handed to the
+    // writer yet, in the order asked (libtorrent `m_requests`).
+    upload_queue: VecDeque<ChunkInfo>,
+    // The block handed to the writer and not yet taken by it: the peer's
+    // send buffer, one block deep (libtorrent `send_buffer_low_watermark`).
+    // The writer sends a block only by taking it from here, so a Cancel or
+    // a Choke that drops it first keeps it from going out.
+    upload_handed: Option<ChunkInfo>,
 
     // The requests the peer sent that we could not serve since we last
     // choked it (libtorrent `peer_connection::m_num_invalid_requests`).
@@ -908,6 +990,10 @@ pub(crate) struct LivePeerState {
     // The pieces the peer suggested, the latest first (libtorrent
     // `m_suggested_pieces`).
     pub suggested: Vec<ValidPieceIndex>,
+
+    // The connection completed the encrypted handshake (libtorrent
+    // `bt_peer_connection::supports_encryption`, `m_encrypted`).
+    pub encrypted: bool,
 }
 
 /// Why a request the peer sent us is not queued.
@@ -963,6 +1049,7 @@ impl LivePeerState {
             snubbed: false,
             request_slots_changed: Default::default(),
             upload_queue: Default::default(),
+            upload_handed: None,
             invalid_requests: 0,
             super_seeded: [None; 2],
             supports_holepunch: false,
@@ -978,6 +1065,7 @@ impl LivePeerState {
             allowed_fast_to_peer: None,
             allowed_fast_from_peer: Vec::new(),
             suggested: Vec::new(),
+            encrypted: false,
         }
     }
 
@@ -1028,12 +1116,14 @@ impl LivePeerState {
             .collect()
     }
 
-    /// What our PEX messages say of the peer: a seed, connected over uTP,
-    /// speaking the holepunch extension (libtorrent `ut_pex_plugin::tick`).
-    /// Encryption is not flagged: the peer's state does not hold whether its
-    /// connection is encrypted.
+    /// What our PEX messages say of the peer: connected encrypted, a seed,
+    /// connected over uTP, speaking the holepunch extension (libtorrent
+    /// `ut_pex_plugin::tick`).
     pub fn advertised_pex_flags(&self) -> u8 {
         let mut flags = 0;
+        if self.encrypted {
+            flags |= PEX_ENCRYPTION;
+        }
         if self.seeder {
             flags |= PEX_SEED;
         }
@@ -1316,6 +1406,19 @@ impl LivePeerState {
         taken
     }
 
+    /// Stops waiting for every request outstanding to the peer, and tells
+    /// it so. A block the peer already had on its way is let through as
+    /// late (libtorrent `peer_connection::cancel_all_requests`).
+    pub fn cancel_all_requests(&mut self) {
+        for request in self.take_inflight_requests() {
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::Cancel(wire_request(
+                    &request,
+                ))));
+        }
+    }
+
     pub fn inflight_requests(&self) -> impl Iterator<Item = &InflightRequest> {
         self.inflight_requests.iter()
     }
@@ -1330,12 +1433,18 @@ impl LivePeerState {
     /// queued blocks, any other is refused. While we choke the peer only a
     /// block of a piece it may fetch is queued, until it has asked for three
     /// times the piece's blocks; any other is refused. A refused block gets a
-    /// Reject on a fast connection.
-    pub fn queue_upload(&mut self, chunk: ChunkInfo, chunks_per_piece: u32) -> Result<(), Refused> {
-        if self.upload_queue.contains(&chunk) {
+    /// Reject on a fast connection. True when the block makes the peer
+    /// [ready to be handed one](Self::hand_upload), which it was not.
+    pub fn queue_upload(
+        &mut self,
+        chunk: ChunkInfo,
+        chunks_per_piece: u32,
+    ) -> Result<bool, Refused> {
+        if self.upload_handed == Some(chunk) || self.upload_queue.contains(&chunk) {
             return Err(Refused::Queued);
         }
-        if self.upload_queue.len() >= MAX_ALLOWED_IN_REQUEST_QUEUE as usize {
+        let unsent = self.upload_queue.len() + usize::from(self.upload_handed.is_some());
+        if unsent >= MAX_ALLOWED_IN_REQUEST_QUEUE as usize {
             self.reject(&chunk);
             return Err(Refused::QueueFull);
         }
@@ -1356,9 +1465,30 @@ impl LivePeerState {
             (_, Some(asked)) => *asked += 1,
             (None, None) => {}
         }
-        self.upload_queue.insert(chunk);
+        let was_ready = self.ready_to_hand();
+        self.upload_queue.push_back(chunk);
         self.last_upload = Instant::now();
-        Ok(())
+        Ok(!was_ready && self.ready_to_hand())
+    }
+
+    /// Whether the writer has room for a block and the peer asked for one:
+    /// the upload scheduler owes the peer a turn.
+    pub(crate) fn ready_to_hand(&self) -> bool {
+        self.upload_handed.is_none() && !self.upload_queue.is_empty()
+    }
+
+    /// The peer's turn with the upload scheduler: the block it asked for
+    /// first goes to the writer when the writer holds none of the peer's
+    /// already (libtorrent `peer_connection::fill_send_buffer`, the send
+    /// buffer held to one block). The block handed, if any.
+    pub(crate) fn hand_upload(&mut self) -> Option<ChunkInfo> {
+        if self.upload_handed.is_some() {
+            return None;
+        }
+        let chunk = self.upload_queue.pop_front()?;
+        self.upload_handed = Some(chunk);
+        let _ = self.tx.send(WriterRequest::ReadChunkRequest(chunk));
+        Some(chunk)
     }
 
     /// The peer sent a request we cannot serve, which is dropped; with
@@ -1459,11 +1589,15 @@ impl LivePeerState {
         self.choked_at = Some(now);
         self.invalid_requests = 0;
         let _ = self.tx.send(WriterRequest::Message(Message::Choke));
-        let (kept, dropped): (HashSet<_>, HashSet<_>) = std::mem::take(&mut self.upload_queue)
+        let handed = match self.upload_handed {
+            Some(chunk) if !self.allows_fast(chunk.piece_index) => self.upload_handed.take(),
+            _ => None,
+        };
+        let (kept, dropped): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.upload_queue)
             .into_iter()
             .partition(|chunk| self.allows_fast(chunk.piece_index));
         self.upload_queue = kept;
-        for chunk in dropped {
+        for chunk in handed.into_iter().chain(dropped) {
             self.reject(&chunk);
         }
         true
@@ -1506,25 +1640,27 @@ impl LivePeerState {
         round
     }
 
-    /// The peer cancelled its request for `chunk`. A block already sent is
-    /// not in the queue, and stays sent; one still queued is dropped, with a
-    /// Reject on a fast connection (libtorrent
+    /// The peer cancelled its request for `chunk`. A block the writer took
+    /// already stays sent; one queued or handed and not taken is dropped,
+    /// with a Reject on a fast connection (libtorrent
     /// `peer_connection::incoming_cancel`).
     pub fn cancel_upload(&mut self, chunk: &ChunkInfo) {
-        if self.upload_queue.remove(chunk) {
+        let handed = self.upload_handed.take_if(|handed| handed == chunk);
+        let queued = self.upload_queue.iter().position(|queued| queued == chunk);
+        let queued = queued.and_then(|at| self.upload_queue.remove(at));
+        if handed.or(queued).is_some() {
             self.reject(chunk);
         }
     }
 
-    /// Whether the peer still wants `chunk` and has not been sent it.
-    pub fn is_upload_queued(&self, chunk: &ChunkInfo) -> bool {
-        self.upload_queue.contains(chunk)
-    }
-
-    /// Takes `chunk` off the queue to send it. False when it is no longer
-    /// there, and it is not sent.
+    /// The writer takes the handed `chunk` to send it. False when a Cancel or
+    /// a Choke dropped it first, and it is not sent. Either way the writer
+    /// has room for the peer's next block.
     pub fn claim_upload(&mut self, chunk: &ChunkInfo) -> bool {
-        let claimed = self.upload_queue.remove(chunk);
+        let claimed = self
+            .upload_handed
+            .take_if(|handed| handed == chunk)
+            .is_some();
         if claimed {
             self.last_upload = Instant::now();
         }
@@ -1582,6 +1718,7 @@ impl LivePeerState {
             && self.peer_interested
             && !self.is_choked()
             && self.upload_queue.is_empty()
+            && self.upload_handed.is_none()
             && now.saturating_duration_since(served) > NO_REQUEST_TIMEOUT
         {
             return Some(TimedOut::NoRequest);
@@ -1862,6 +1999,8 @@ mod tests {
         // the minute runs from then.
         tokio::time::advance(Duration::from_secs(30)).await;
         assert!(live.queue_upload(chunk, 1).is_ok());
+        assert_eq!(live.timed_out(past(past(minute)), true, false), None);
+        assert_eq!(live.hand_upload(), Some(chunk));
         assert_eq!(live.timed_out(past(past(minute)), true, false), None);
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(live.claim_upload(&chunk));

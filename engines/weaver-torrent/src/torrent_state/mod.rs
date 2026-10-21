@@ -368,7 +368,8 @@ pub(crate) struct RunCounters {
     pub corrupt_bytes: u64,
     /// Bytes of the blocks received during the run and not used.
     pub redundant_bytes: u64,
-    /// Bytes of the selected pieces still missing.
+    /// What the whole torrent still lacked as the run ended
+    /// (`ChunkTracker::bytes_left`).
     pub left_bytes: u64,
 }
 
@@ -579,6 +580,31 @@ impl ManagedTorrent {
         }
     }
 
+    /// What the torrent has written of its data, for a later run to start
+    /// from (libtorrent `torrent::write_resume_data`); None while it is
+    /// checked or stopped by an error.
+    pub fn checkpoint(&self) -> Option<initializing::Checkpoint> {
+        match &self.locked.read().state {
+            ManagedTorrentState::Paused(p) => Some(
+                p.chunk_tracker
+                    .checkpoint(&*p.files, p.metadata.file_infos.len()),
+            ),
+            ManagedTorrentState::Live(l) => l.checkpoint().ok(),
+            _ => None,
+        }
+    }
+
+    /// The peers and bans a restart is to begin with (libtorrent
+    /// `torrent::write_resume_data`); None while it is stopped by an error.
+    pub fn resume_peers(&self) -> Option<live::peers::ResumePeers> {
+        self.with_state(|s| match s {
+            ManagedTorrentState::Initializing(init) => Some(init.resume_peers()),
+            ManagedTorrentState::Paused(paused) => Some(paused.peers.resume_peers()),
+            ManagedTorrentState::Live(live) => Some(live.resume_peers()),
+            ManagedTorrentState::Error(_) | ManagedTorrentState::None => None,
+        })
+    }
+
     /// Get the live state if the torrent is live.
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();
@@ -735,20 +761,9 @@ impl ManagedTorrent {
                     Ok(())
                 }
                 ManagedTorrentState::Error(_) => {
-                    let metadata = t.metadata.load_full().expect("TODO");
-                    let initializing = Arc::new(TorrentStateInitializing::new(
-                        t.shared.clone(),
-                        metadata.clone(),
-                        g.only_files.clone(),
-                        t.shared
-                            .storage_factory
-                            .create_and_init(t.shared(), &metadata)?,
-                        true,
-                        // After an error the data is no longer vouched for: check it.
-                        None,
-                        g.piece_priorities.clone(),
-                    ));
-                    g.state = ManagedTorrentState::Initializing(initializing.clone());
+                    // After an error the data is no longer vouched for: check it.
+                    let initializing = t.checking_everything(&g, Default::default())?;
+                    g.state = ManagedTorrentState::Initializing(initializing);
                     t.state_change_notify.notify_waiters();
 
                     // Recurse.
@@ -828,6 +843,54 @@ impl ManagedTorrent {
             },
         );
         Some(token.drop_guard())
+    }
+
+    // A run that checks every piece and trusts nothing saved, on files
+    // opened again, founded on `peers`: the restart after an error, and a
+    // forced recheck.
+    fn checking_everything(
+        &self,
+        g: &ManagedTorrentLocked,
+        peers: live::peers::PeerList,
+    ) -> anyhow::Result<Arc<TorrentStateInitializing>> {
+        let metadata = self
+            .metadata
+            .load_full()
+            .context("the torrent has no metadata to check")?;
+        let files = self
+            .shared
+            .storage_factory
+            .create_and_init(self.shared(), &metadata)?;
+        Ok(Arc::new(TorrentStateInitializing::new(
+            self.shared.clone(),
+            metadata,
+            g.only_files.clone(),
+            files,
+            true,
+            None,
+            g.piece_priorities.clone(),
+            peers,
+        )))
+    }
+
+    /// Forget every piece and check them all again, trusting no checkpoint
+    /// or saved state (libtorrent `torrent::force_recheck`): the connections
+    /// close, the announces stop, the peer list stays, and the files are
+    /// opened again. Nothing happens while the torrent is being checked
+    /// already. The check runs on the next [`Self::start`].
+    pub(crate) fn recheck(&self) -> anyhow::Result<()> {
+        let mut g = self.locked.write();
+        let peers = match &g.state {
+            ManagedTorrentState::Initializing(_) => return Ok(()),
+            ManagedTorrentState::Live(live) => live.pause()?.peers,
+            ManagedTorrentState::Paused(_) => g.state.take().assert_paused().peers,
+            ManagedTorrentState::Error(_) => Default::default(),
+            ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
+        };
+        g.auto_scrape = None;
+        g.state = ManagedTorrentState::Initializing(self.checking_everything(&g, peers)?);
+        self.state_change_notify.notify_waiters();
+        Ok(())
     }
 
     /// Pause the torrent if it's live.

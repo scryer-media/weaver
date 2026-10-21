@@ -1077,10 +1077,12 @@ async fn seeder(dir: &std::path::Path, metainfo: &[u8], files: &[(&str, &[u8])])
     session
 }
 
-// A full disk holds what the torrent fetched and selects nothing more; once
-// the disk has room the tick lets it down and the torrent completes.
+// A full disk puts the session in upload mode: the torrent shows the disk as
+// full and the file selection stays as it was (libtorrent
+// `torrent::handle_disk_error` enters upload mode and leaves the file
+// priorities alone).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_full_disk_holds_the_torrent_until_there_is_room() {
+async fn a_full_disk_leaves_the_selection_as_it_was() {
     use crate::operations::disk::{Capacity, CapacityReading};
     use crate::torrents::net::{LegKind, LegSockets};
     use crate::torrents::status::DISK_FULL;
@@ -1096,18 +1098,16 @@ async fn a_full_disk_holds_the_torrent_until_there_is_room() {
     };
     let bytes = announcing(&plain, &tracker(peer).await);
 
-    let sampled_at = std::time::Instant::now();
-    let reading = Arc::new(Mutex::new(CapacityReading {
+    let reading = CapacityReading {
         available_bytes: 0,
         total_bytes: 1 << 30,
-        sampled_at,
+        sampled_at: std::time::Instant::now(),
         stale: false,
-    }));
-    let read = Arc::clone(&reading);
+    };
     let mut limits = ExtractionLimits::unbounded();
     limits.min_free_bytes = 100;
     let env = JobEnv {
-        free_disk: CapacityReader::from_fn(move || Capacity::Known(*read.lock().unwrap())),
+        free_disk: CapacityReader::from_fn(move || Capacity::Known(reading)),
         limits: Arc::new(limits),
         ..JobEnv::unbounded()
     };
@@ -1127,7 +1127,6 @@ async fn a_full_disk_holds_the_torrent_until_there_is_room() {
     let handle = queue();
     let queue = handle.state().clone();
     rig.service.publish_to(handle);
-    let mut changes = queue.subscribe_job_changes();
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
@@ -1135,18 +1134,11 @@ async fn a_full_disk_holds_the_torrent_until_there_is_room() {
         .await
         .unwrap();
 
-    // The first piece finds no room and is held, and nothing more is
-    // selected.
-    loop {
-        changes.borrow_and_update();
-        {
-            let live = rig.service.inner.live.lock().await;
-            if live[&job_id].holding() && live[&job_id].applied == Some(Vec::new()) {
-                break;
-            }
-        }
-        changes.changed().await.unwrap();
-    }
+    // The first piece finds no room and the session enters upload mode.
+    let torrent = handle_of(&rig.service, job_id).await;
+    torrent.wait_until_initialized().await.unwrap();
+    torrent.live().unwrap().wait_for_upload_mode(true).await;
+
     rig.service.tick().await;
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
@@ -1154,7 +1146,7 @@ async fn a_full_disk_holds_the_torrent_until_there_is_room() {
     assert_eq!(view.completed_at_ms, None);
     assert_eq!(
         rig.service.inner.live.lock().await[&job_id].applied,
-        Some(Vec::new())
+        Some(vec![0])
     );
     let warnings = rig.service.warnings().await;
     assert_eq!(warnings.len(), 1);
@@ -1168,33 +1160,6 @@ async fn a_full_disk_holds_the_torrent_until_there_is_room() {
             .as_deref(),
         Some(DISK_FULL)
     );
-
-    // Room again: the tick lets the held pieces down and the torrent goes on.
-    {
-        let mut now = reading.lock().unwrap();
-        now.available_bytes = 1 << 30;
-        now.sampled_at = sampled_at + std::time::Duration::from_secs(1);
-    }
-    rig.service.tick().await;
-    assert!(rig.service.warnings().await.is_empty());
-    loop {
-        changes.borrow_and_update();
-        if rig
-            .service
-            .torrent(job_id)
-            .await
-            .unwrap()
-            .completed_at_ms
-            .is_some()
-        {
-            break;
-        }
-        changes.changed().await.unwrap();
-    }
-    rig.service.tick().await;
-    let view = rig.service.torrent(job_id).await.unwrap();
-    assert_eq!(view.have_bytes, data.len() as u64);
-    assert_ne!(view.detail.as_deref(), Some(DISK_FULL));
     rig.service.stop().await;
     seeding.stop().await;
 }
@@ -1209,11 +1174,36 @@ fn a_checking_torrent_keeps_the_checkpoints_bytes() {
     let live = Engine::Live {
         finished: false,
         peers: 0,
+        upload_mode: false,
     };
     take_file_have(&mut have, &live, &[]);
     assert_eq!(have, [1000, 2500]);
     take_file_have(&mut have, &live, &[1024, 2500]);
     assert_eq!(have, [1024, 2500]);
+}
+
+// The bytes in hand over the torrent's total leave padding out, as the total
+// and the session's progress do.
+#[test]
+fn padding_in_hand_is_not_progress() {
+    use crate::pipeline::graph::root::pieces::PieceFile;
+
+    let file = |name: &str, length, padding| PieceFile {
+        name: name.to_owned(),
+        length,
+        padding,
+    };
+    let layout = PieceLayout::new(
+        16,
+        vec![
+            file("a", 10, false),
+            file(".pad/6", 6, true),
+            file("b", 16, false),
+        ],
+    )
+    .unwrap();
+    assert_eq!(on_disk(Some(&layout), &[10, 6, 4]), 14);
+    assert_eq!(on_disk(None, &[]), 0);
 }
 
 // Turning torrents off closes their sessions and stops each torrent, and
@@ -2283,4 +2273,47 @@ async fn a_torrent_keeps_the_unpack_in_force_once_its_job_is_built() {
     assert_eq!(kept(off), Some(false));
     assert!(rig.service.torrent(inherits).await.unwrap().unpack);
     assert!(!rig.service.torrent(off).await.unwrap().unpack);
+}
+
+// libtorrent `torrent::write_resume_data` and `read_resume_data`: the peers
+// and bans a torrent saved come back when it next starts, before it runs,
+// and it saves them again as it stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
+    use weaver_torrent::ResumePeers;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        handle_of(&rig.service, job_id).await.resume_peers(),
+        Some(ResumePeers::default())
+    );
+    rig.service.stop().await;
+    assert_eq!(
+        rig.db.torrent_peers(job_id).unwrap(),
+        ResumePeers::default()
+    );
+    let saved = ResumePeers {
+        peers: vec!["127.0.0.2:6881".parse().unwrap()],
+        banned: vec!["127.0.0.3".parse().unwrap()],
+    };
+    assert!(rig.db.save_torrent_peers(job_id, &saved).unwrap());
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(
+        handle_of(&again, job_id).await.resume_peers(),
+        Some(saved.clone())
+    );
+    again.stop().await;
+    assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
 }

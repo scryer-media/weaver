@@ -36,12 +36,30 @@ use std::{
     io::IoSlice,
     path::Path,
     sync::Arc,
+    time::SystemTime,
 };
 
 use crate::core::lengths::ValidPieceIndex;
 use tokio::sync::Notify;
 
 use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
+
+/// Whether a write failed in a way later writes likely will too while reads
+/// still work: no space, a quota, a read-only or forbidding file system, a
+/// file past its size limit. The torrent stops downloading and keeps seeding
+/// (libtorrent `torrent::handle_disk_error` enters upload mode on these write
+/// errors).
+pub fn write_refused(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                StorageFull | QuotaExceeded | ReadOnlyFilesystem | PermissionDenied | FileTooLarge
+            )
+        })
+    })
+}
 
 pub trait StorageFactory: Send + Sync + Any {
     type Storage: TorrentStorage;
@@ -129,6 +147,16 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
     }
 }
 
+/// What a file of the storage is from outside: its length and when it was
+/// last written. A checkpoint records each file's, and the next run trusts
+/// the checkpoint only while every file's is the same (libtorrent 1.x
+/// `file_sizes` in the resume data, which `verify_resume_data` compared).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub len: u64,
+    pub modified: SystemTime,
+}
+
 pub trait TorrentStorage: Send + Sync {
     // Create/open files etc.
     fn init(
@@ -193,6 +221,12 @@ pub trait TorrentStorage: Send + Sync {
     fn reserve_piece(&self, _piece_index: ValidPieceIndex, _room: &Arc<Notify>) -> bool {
         true
     }
+
+    /// The stamp of file `file_id`, or None when the storage keeps no file
+    /// for it. Default implementation keeps no files.
+    fn stamp(&self, _file_id: usize) -> anyhow::Result<Option<FileStamp>> {
+        Ok(None)
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -247,6 +281,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn reserve_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {
         (**self).reserve_piece(piece_id, room)
+    }
+
+    fn stamp(&self, file_id: usize) -> anyhow::Result<Option<FileStamp>> {
+        (**self).stamp(file_id)
     }
 }
 

@@ -44,6 +44,18 @@ use crate::{
 
 pub trait PeerConnectionHandler {
     fn on_connected(&self, _connection_time: Duration) {}
+    /// Whether the outgoing connection, its transport just open, tries the
+    /// encrypted handshake where encryption is preferred; asked once per
+    /// connection (libtorrent `bt_peer_connection::on_connected`, by
+    /// `torrent_peer::pe_support`). A handler that remembers nothing of the
+    /// peer tries it.
+    fn encrypt_outgoing(&self) -> bool {
+        true
+    }
+    /// The connection, whichever side opened it, completed its handshake,
+    /// the encrypted one when `encrypted` holds; told right after
+    /// [`Self::on_handshake`].
+    fn on_handshake_encryption(&self, _encrypted: bool) {}
     fn should_send_bitfield(&self) -> bool;
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
     /// `speaks_v2`: the peer speaks BEP 52, so it may exchange hashes.
@@ -68,13 +80,17 @@ pub trait PeerConnectionHandler {
     async fn request_bandwidth(&self, _channel: Channel, bytes: u64) -> u64 {
         bytes
     }
+    /// `bytes` granted that will not cross the socket: the connection ended
+    /// holding them.
+    fn return_bandwidth(&self, _channel: Channel, _bytes: u64) {}
     /// `bytes` that are not block payload crossed the socket on `channel`:
     /// handshakes and every message but a piece's block (libtorrent
     /// `stat::sent_bytes`, `received_bytes`, the protocol half).
     fn on_protocol_bytes(&self, _channel: Channel, _bytes: u64) {}
-    /// Takes `chunk` off the peer's upload queue to send it. False when a
-    /// Cancel or a Choke took it off first, and the block is not sent. A
-    /// handler that queues no uploads has none to take.
+    /// Takes the block `chunk` the writer was handed, to send it, which
+    /// makes room for the peer's next. False when a Cancel or a Choke
+    /// dropped it first, and the block is not sent. A handler that queues
+    /// no uploads has none to take.
     fn claim_upload(&self, _chunk: &ChunkInfo) -> bool {
         false
     }
@@ -234,7 +250,7 @@ struct ManagePeerArgs {
 /// those that crossed the socket since it was made (libtorrent
 /// `peer_connection::m_quota`). Bytes that crossed before anything was paid,
 /// the handshakes, are a debt the next payment covers.
-struct Quota<'a, H> {
+struct Quota<'a, H: PeerConnectionHandler> {
     handler: &'a H,
     channel: Channel,
     meter: Meter,
@@ -274,6 +290,16 @@ impl<'a, H: PeerConnectionHandler> Quota<'a, H> {
     async fn reserve(&mut self, bytes: u64) {
         while self.held() < i128::from(bytes) {
             self.pay(bytes).await;
+        }
+    }
+}
+
+// A connection that ends holding quota gives it back, so its limits are
+// paid for the bytes that crossed and no more.
+impl<H: PeerConnectionHandler> Drop for Quota<'_, H> {
+    fn drop(&mut self) {
+        if let Ok(held @ 1..) = u64::try_from(self.held()) {
+            self.handler.return_bandwidth(self.channel, held);
         }
     }
 }
@@ -378,6 +404,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         self.handler
             .on_handshake(incoming.handshake, incoming.kind, speaks_v2)
             .map_err(Error::Anyhow)?;
+        self.handler.on_handshake_encryption(incoming.encrypted);
 
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
@@ -413,13 +440,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
         let now = Instant::now();
-        let (ckind, mut read, write, meter) = self
+        let (ckind, mut read, write, meter, encrypted) = self
             .connector
             .connect_and_send_handshake(
                 self.addr,
                 self.transports,
                 &greeting,
                 &write_buf[..hsz],
+                || self.handler.encrypt_outgoing(),
                 connect_timeout,
                 handshake_timeout,
             )
@@ -453,6 +481,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.handler
                 .on_handshake(h, ckind, speaks_v2)
                 .map_err(Error::Anyhow)?;
+            // The peer answered, so the method this connection tried works
+            // with it (libtorrent `bt_peer_connection::on_receive_impl`).
+            self.handler.on_handshake_encryption(encrypted);
 
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
@@ -969,6 +1000,7 @@ mod tests {
             writer,
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encrypted: false,
             meter: Default::default(),
         };
         let (_tx, rx) = mpsc::unbounded_channel();
@@ -982,7 +1014,7 @@ mod tests {
     }
 
     /// Grants at most [`Self::GRANT`] bytes a request, and keeps count of
-    /// what it granted and what it was told crossed.
+    /// what it granted and did not have back, and what it was told crossed.
     #[derive(Default)]
     struct Ledger {
         paid: [AtomicU64; 2],
@@ -1032,6 +1064,9 @@ mod tests {
             self.paid[index(channel)].fetch_add(granted, Ordering::Relaxed);
             granted
         }
+        fn return_bandwidth(&self, channel: Channel, bytes: u64) {
+            self.paid[index(channel)].fetch_sub(bytes, Ordering::Relaxed);
+        }
         fn on_protocol_bytes(&self, channel: Channel, bytes: u64) {
             self.protocol[index(channel)].fetch_add(bytes, Ordering::Relaxed);
         }
@@ -1066,6 +1101,7 @@ mod tests {
             writer,
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encrypted: false,
             meter: meter.clone(),
         };
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1102,8 +1138,9 @@ mod tests {
 
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         assert_eq!(meter.received(), 9 + 13 + 100 + 9);
-        // And the length of the next frame, which the reader waits for.
-        assert_eq!(load(&ledger.paid[0]), meter.received() + 4);
+        // The length of the next frame, which the reader waited for, was
+        // given back when the connection ended.
+        assert_eq!(load(&ledger.paid[0]), meter.received());
         assert_eq!(load(&ledger.payload), 100);
         assert_eq!(load(&ledger.protocol[0]), meter.received() - 100);
         assert!(meter.sent() > 68 + 9);

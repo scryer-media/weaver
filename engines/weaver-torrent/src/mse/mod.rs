@@ -51,8 +51,10 @@ pub enum EncryptionPolicy {
     /// Plain BitTorrent connections only; incoming encrypted handshakes are dropped.
     #[default]
     Disabled,
-    /// Outgoing: offer encryption, and if the encrypted handshake fails, retry
-    /// the peer once in plaintext. Incoming: accept encrypted and plaintext.
+    /// Outgoing: each connection to a peer tries the handshake the peer last
+    /// completed one with, encrypted until it has; one that fails makes the
+    /// next connection try the other. Incoming: accept encrypted and
+    /// plaintext.
     Prefer,
     /// Every connection is RC4-encrypted; plaintext is never sent or accepted.
     Require,

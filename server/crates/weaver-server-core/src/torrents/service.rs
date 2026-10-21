@@ -17,8 +17,8 @@ use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::core::{Id20, Id32, InfoHashes};
 use weaver_torrent::limits::{LimitKind, LimitsConfig};
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Identity, Magnet, ManagedTorrent, Session,
-    TorrentVersion, TrackerAnnounce, torrent_from_bytes,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
+    ManagedTorrent, Session, TorrentVersion, TrackerAnnounce, torrent_from_bytes,
 };
 
 use crate::SchedulerError;
@@ -723,8 +723,16 @@ impl Live {
         })
     }
 
-    fn holding(&self) -> bool {
-        self.intake.as_ref().is_some_and(|intake| intake.holding())
+    // A write found no room: the session fetches nothing for the torrent
+    // and keeps seeding it, as it last reported.
+    fn upload_mode(&self) -> bool {
+        matches!(
+            self.engine,
+            Engine::Live {
+                upload_mode: true,
+                ..
+            }
+        )
     }
 
     // The pieces, and how many of them the job holds verified.
@@ -816,7 +824,6 @@ impl Live {
             paused_by: self.paused_by,
             failed: self.refusal(),
             held: self.held.clone(),
-            disk_full: self.holding(),
         }
     }
 }
@@ -1159,6 +1166,19 @@ impl TorrentService {
             task.abort();
         }
         self.stop_tick();
+        let attached: Vec<(JobId, Arc<ManagedTorrent>)> = self
+            .inner
+            .live
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(job_id, torrent)| {
+                Some((*job_id, torrent.attached.as_ref()?.handle.clone()))
+            })
+            .collect();
+        for (job_id, handle) in attached {
+            self.save_peers(job_id, &handle).await;
+        }
         self.inner.sessions.stop_all().await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
@@ -1254,7 +1274,7 @@ impl TorrentService {
 
     // What the jobs that spoke did: a write the job could not take fails
     // its torrent, a refusal found while unpacking stops it, and a job that
-    // is done completes it. A held piece stops the selection at once.
+    // is done completes it.
     async fn settle(&self) {
         let dirty = self.inner.signal.take();
         for job_id in dirty {
@@ -1286,16 +1306,44 @@ impl TorrentService {
         self.publish().await;
     }
 
-    // Write the checkpoints of `jobs`.
+    // Write the checkpoints of `jobs`, and beside each the peers and bans of
+    // its torrent while it is in a session.
     async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
-        let jobs: Vec<(JobId, Arc<TorrentJob>)> = {
+        type Saved = (JobId, Arc<TorrentJob>, Option<Arc<ManagedTorrent>>);
+        let jobs: Vec<Saved> = {
             let live = self.inner.live.lock().await;
             jobs.into_iter()
-                .filter_map(|job_id| Some((job_id, live.get(&job_id)?.job.clone()?)))
+                .filter_map(|job_id| {
+                    let torrent = live.get(&job_id)?;
+                    let handle = torrent.attached.as_ref().map(|a| a.handle.clone());
+                    Some((job_id, torrent.job.clone()?, handle))
+                })
                 .collect()
         };
-        for (job_id, job) in jobs {
+        for (job_id, job, handle) in jobs {
             self.save_checkpoint(job_id, &job).await;
+            if let Some(handle) = handle {
+                self.save_peers(job_id, &handle).await;
+            }
+        }
+    }
+
+    // Write the peers and bans the torrent begins its next start with
+    // (libtorrent `torrent::write_resume_data`). A torrent stopped by an
+    // error keeps those last written.
+    async fn save_peers(&self, job_id: JobId, handle: &ManagedTorrent) {
+        let Some(peers) = handle.resume_peers() else {
+            return;
+        };
+        let db = self.inner.db.clone();
+        match tokio::task::spawn_blocking(move || db.save_torrent_peers(job_id, &peers)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not save a torrent's peers");
+            }
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not save a torrent's peers");
+            }
         }
     }
 
@@ -1413,7 +1461,6 @@ impl TorrentService {
         let intake = Arc::new(Intake::new(
             Arc::clone(&job) as Arc<dyn Pieces>,
             Room::new(Arc::clone(&env.limits), env.free_disk.clone()),
-            self.resident(job_id),
             Box::new(move |heard| signal.heard(job_id, heard)),
         ));
         (job, intake)
@@ -1881,6 +1928,12 @@ impl TorrentService {
                 return;
             }
         };
+        // libtorrent `torrent::read_resume_data`: the saved peers are known
+        // from the start and the saved bans hold.
+        let saved = self.inner.db.torrent_peers(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
+            Default::default()
+        });
         let factory =
             PieceStorageFactory::new(layout, intake as Arc<dyn Pieces>, self.resident(job_id));
         let mut options = AddTorrentOptions {
@@ -1893,6 +1946,8 @@ impl TorrentService {
                 download_bps: LimitKind::Unlimited,
             },
             identity: Some(identity),
+            initial_peers: (!saved.peers.is_empty()).then_some(saved.peers),
+            banned_peers: saved.banned,
             ..Default::default()
         };
         apply_initial_have(&mut options, have);
@@ -1950,6 +2005,7 @@ impl TorrentService {
             self.save_checkpoint(job_id, job).await;
         }
         if let Some(attached) = torrent.attached.take() {
+            self.save_peers(job_id, &attached.handle).await;
             let id = TorrentIdOrHash::Id(attached.handle.id());
             if let Err(error) = attached.session.delete(id, false).await {
                 tracing::debug!(error = %error, "a torrent was already gone from its session");
@@ -2348,7 +2404,6 @@ impl TorrentService {
             elapsed
         };
         self.follow_routes().await;
-        self.retry_holds().await;
         self.read(now, elapsed_s).await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
@@ -2410,23 +2465,6 @@ impl TorrentService {
         }
         for job_id in unresolved {
             self.resolve(job_id).await;
-        }
-    }
-
-    async fn retry_holds(&self) {
-        let intakes: Vec<(JobId, Arc<Intake>)> = self
-            .inner
-            .live
-            .lock()
-            .await
-            .values()
-            .filter_map(|torrent| Some((torrent.record.job_id, torrent.intake.clone()?)))
-            .filter(|(_, intake)| intake.holding())
-            .collect();
-        for (job_id, intake) in intakes {
-            if let Err(error) = tokio::task::spawn_blocking(move || intake.retry()).await {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's held pieces were not retried");
-            }
         }
     }
 
@@ -2518,26 +2556,18 @@ impl TorrentService {
         }
     }
 
-    // The files the job wants now, or none while the disk is full.
+    // The files the job wants now. A full disk leaves them as they are: the
+    // session stops fetching in upload mode, not by a narrower selection.
     async fn apply_selection(&self) {
         let mut live = self.inner.live.lock().await;
         for torrent in live.values_mut() {
             let (Some(attached), Some(job)) = (&torrent.attached, &torrent.job) else {
                 continue;
             };
-            let holding = torrent
-                .intake
-                .as_ref()
-                .is_some_and(|intake| intake.holding());
-            let wanted = if holding {
-                Vec::new()
-            } else {
-                let selection = job.with(|job| job.selection());
-                if selection.is_empty() {
-                    continue;
-                }
-                selection
-            };
+            let wanted = job.with(|job| job.selection());
+            if wanted.is_empty() {
+                continue;
+            }
             if torrent.applied.as_ref() == Some(&wanted) {
                 continue;
             }
@@ -2597,7 +2627,7 @@ impl TorrentService {
         let live = self.inner.live.lock().await;
         let waiting: Vec<&str> = live
             .values()
-            .filter(|torrent| torrent.holding())
+            .filter(|torrent| torrent.upload_mode())
             .map(|torrent| torrent.record.name.as_str())
             .collect();
         if waiting.is_empty() {
@@ -2615,7 +2645,7 @@ impl TorrentService {
         let counters = &reading.counters;
         let record = &torrent.record;
         let total = torrent.total;
-        let have: u64 = reading.file_have.iter().sum();
+        let have = on_disk(torrent.layout.as_deref(), &reading.file_have);
         let rules = self.rules();
         let policy = settings.policy(record, &rules);
         let swarm = status::swarm(&torrent.announces(), now);
@@ -2791,12 +2821,15 @@ fn top_priority(value: &str) -> bool {
     numeric_priority(value) >= numeric_priority("HIGH")
 }
 
-// The pieces the session starts from, so it does not check the files.
+// The checkpoint the session starts from, so it does not check the files:
+// the pieces the job has, and no block of any other. The storage keeps a
+// piece's blocks in memory until the piece verifies, so no block of a piece
+// not had is ever written to the job's files.
 fn apply_initial_have(
     options: &mut AddTorrentOptions,
     have: bitvec::boxed::BitBox<u8, bitvec::order::Msb0>,
 ) {
-    options.initial_have = Some(have);
+    options.checkpoint = Some(Checkpoint::pieces(have));
 }
 
 // Why a session refusal leaves a torrent without one.
@@ -2866,9 +2899,23 @@ fn downloading(view: &TorrentView, now_ms: i64) -> Option<JobPhaseProgress> {
     })
 }
 
+// The bytes in hand of the files that go to disk: the progress over the
+// torrent's total, which leaves padding out as the session's own does
+// (libtorrent `file_progress::total_on_disk`).
+fn on_disk(layout: Option<&PieceLayout>, file_have: &[u64]) -> u64 {
+    layout.map_or(0, |layout| {
+        layout
+            .files()
+            .zip(file_have)
+            .filter(|(file, _)| !file.padding)
+            .map(|(_, have)| have)
+            .sum()
+    })
+}
+
 // Every file's bytes in hand. The session's progress counts only the files
-// selected now, and the selection narrows as files finish or while the disk
-// is full. While the session checks the files, the checkpoint's figure stands.
+// selected now, and the selection narrows as files finish. While the session
+// checks the files, the checkpoint's figure stands.
 fn take_file_have(kept: &mut Vec<u64>, engine: &Engine, reported: &[u64]) {
     if *engine != Engine::Checking && !reported.is_empty() {
         kept.clear();

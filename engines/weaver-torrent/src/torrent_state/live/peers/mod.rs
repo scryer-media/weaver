@@ -131,6 +131,101 @@ pub(crate) struct PeerList {
     smart_ban: SmartBan,
 }
 
+impl PeerList {
+    /// The list a torrent is added with: a connect candidate at each of
+    /// `peers` not at a banned address, and `banned` banned (libtorrent
+    /// `torrent::read_resume_data`, which adds each of `peers` with
+    /// `peer_list::add_peer` and bans each of `banned_peers` with
+    /// `peer_list::ban_peer`). The peers are on the list before the torrent
+    /// first runs, so a restart saves them again until it does.
+    pub fn resumed(
+        peers: impl IntoIterator<Item = SocketAddr>,
+        banned: impl IntoIterator<Item = IpAddr>,
+    ) -> Self {
+        let banned: HashSet<IpAddr> = banned.into_iter().collect();
+        let mut seen = HashSet::new();
+        let peers = peers
+            .into_iter()
+            .filter(|addr| !banned.contains(&addr.ip()) && seen.insert(*addr))
+            .map(Peer::new_with_outgoing_address)
+            .collect();
+        Self {
+            peers,
+            banned,
+            ..Default::default()
+        }
+    }
+
+    /// The peers and bans a restart is to begin with; see [`ResumePeers`].
+    pub fn resume_peers(&self) -> ResumePeers {
+        ResumePeers::of(self.peers.iter().map(resume_entry), &self.banned)
+    }
+}
+
+// libtorrent `torrent::write_resume_data`: the peers we were never connected
+// to fill the saved list up to this many.
+pub(crate) const RESUME_PEERS: usize = 100;
+
+/// The peers and bans a restart begins with (libtorrent
+/// `add_torrent_params::peers` and `banned_peers`, which
+/// `torrent::write_resume_data` writes). The peers come back as the
+/// torrent's initial peers, the bans as its banned addresses
+/// (`AddTorrentOptions::initial_peers` and `banned_peers`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResumePeers {
+    /// Where to connect to each peer, those we were connected to first.
+    pub peers: Vec<SocketAddr>,
+    /// The banned addresses, in order.
+    pub banned: Vec<IpAddr>,
+}
+
+// What a saved list needs of a peer: its address, where we can connect to
+// it when we can, and whether we were ever connected to it, or None when it
+// is not to be saved: we cannot connect to it (not `connectable`), its last
+// connection failed (`failcount`), or it sent bad data (`trust_points`
+// below zero).
+fn resume_entry(peer: &Peer) -> (IpAddr, Option<(SocketAddr, bool)>) {
+    let (_, failcount, (_, last_connected)) = peer.connect_rank();
+    let saved = peer
+        .outgoing_address
+        .filter(|_| failcount == 0 && peer.trust().points() >= 0)
+        .map(|addr| {
+            (
+                addr,
+                last_connected.is_some() || peer.connected_out().is_some(),
+            )
+        });
+    (peer.addr.ip(), saved)
+}
+
+impl ResumePeers {
+    // libtorrent `torrent::write_resume_data`: a peer at a banned address is
+    // saved as its ban; every other peer to be saved that we were connected
+    // to is; and of those we never were, the first [`RESUME_PEERS`], at
+    // random, until that many are saved in all.
+    fn of(
+        entries: impl Iterator<Item = (IpAddr, Option<(SocketAddr, bool)>)>,
+        banned: &HashSet<IpAddr>,
+    ) -> Self {
+        let mut peers = Vec::new();
+        let mut never = Vec::new();
+        for (ip, saved) in entries {
+            match saved {
+                _ if banned.contains(&ip) => {}
+                Some((addr, true)) => peers.push(addr),
+                Some((addr, false)) if never.len() < RESUME_PEERS => never.push(addr),
+                Some(_) | None => {}
+            }
+        }
+        rand::seq::SliceRandom::shuffle(never.as_mut_slice(), &mut rand::rng());
+        let room = RESUME_PEERS.saturating_sub(peers.len());
+        peers.extend(never.into_iter().take(room));
+        let mut banned: Vec<IpAddr> = banned.iter().copied().collect();
+        banned.sort_unstable();
+        Self { peers, banned }
+    }
+}
+
 /// Whom the list may forget to make room (libtorrent `peer_list::erase_peers`
 /// and its `force_erase` flag). A connected peer is never forgotten.
 #[derive(Clone, Copy)]
@@ -251,6 +346,18 @@ impl PeerStates {
         }
     }
 
+    /// The peers and bans a restart is to begin with; see [`ResumePeers`].
+    /// A web seed is on no list, and is not saved.
+    pub fn resume_peers(&self) -> ResumePeers {
+        let entries: Vec<_> = self
+            .states
+            .iter()
+            .filter(|e| !is_web_seed(*e.key()))
+            .map(|e| resume_entry(e.value()))
+            .collect();
+        ResumePeers::of(entries.into_iter(), &self.banned.read())
+    }
+
     /// Whether peers at `ip` are banned.
     pub fn is_banned(&self, ip: IpAddr) -> bool {
         self.banned.read().contains(&ip)
@@ -287,6 +394,28 @@ impl PeerStates {
             || Some(Peer::new_with_outgoing_address(addr)),
         );
         self.candidates_changed.notify_one();
+    }
+
+    /// A PEX message named the peer at `addr` with `flags`; see
+    /// [`Peer::pex_flags`].
+    pub fn pex_flags(&self, addr: SocketAddr, flags: u8) {
+        self.with_peer_mut(addr, "pex_flags", |peer| peer.pex_flags(flags));
+    }
+
+    /// Whether the connection being made to the peer at `addr` tries the
+    /// encrypted handshake; see [`Peer::encrypt_outgoing`]. Every connection
+    /// to the peer asks here, whether it fetches metadata or pieces.
+    pub fn encrypt_outgoing(&self, addr: SocketAddr) -> bool {
+        self.with_peer_mut(addr, "encrypt_outgoing", |peer| peer.encrypt_outgoing())
+            .unwrap_or(true)
+    }
+
+    /// The connection of the peer at `addr` completed its handshake; see
+    /// [`Peer::handshake_encryption`].
+    pub fn handshake_encryption(&self, addr: SocketAddr, encrypted: bool) {
+        self.with_peer_mut(addr, "handshake_encryption", |peer| {
+            peer.handshake_encryption(encrypted)
+        });
     }
 
     /// A peer connected to us while every slot was taken. The connection goes,
@@ -2087,5 +2216,293 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// How an outgoing connection in [`attempt_at`] ends.
+    #[derive(Clone, Copy)]
+    enum Ends {
+        /// Its handshake completes, and we close it later.
+        Completed,
+        /// Its handshake does not complete: the peer refuses it.
+        Failed,
+        /// We close it before its handshake completes.
+        Closed,
+    }
+
+    // Connects to `addr`, due at `at`, where encryption is preferred: asks
+    // which handshake the connection tries, which ends as `ends` says, at
+    // `at`. Returns whether it tried the encrypted handshake.
+    fn attempt_at(peers: &PeerStates, addr: SocketAddr, at: Instant, ends: Ends) -> bool {
+        peers
+            .with_peer_mut(addr, "test", |peer| {
+                peer.connect_if_due(at, peers).expect("a due candidate");
+                let encrypted = peer.encrypt_outgoing();
+                if let Ends::Completed = ends {
+                    peer.connecting_to_live(Id20::default(), peers, ConnectionKind::Tcp);
+                    peer.handshake_encryption(encrypted);
+                }
+                peers.connection_closed(peer, at, matches!(ends, Ends::Failed), true);
+                encrypted
+            })
+            .unwrap()
+    }
+
+    // When the peer is due again after a connection closed at `at`.
+    fn due_after(peers: &PeerStates, at: Instant) -> Instant {
+        match peers.next_candidate(at) {
+            NextCandidate::Due => at,
+            NextCandidate::At(due) => due,
+            NextCandidate::None => panic!("no candidate"),
+        }
+    }
+
+    // libtorrent `bt_peer_connection::on_connected` and
+    // `peer_connection::fast_reconnect`: an encrypted handshake that fails
+    // leaves `pe_support` pointing at plaintext, and the next connection
+    // tries it at once, not held by the wait to reconnect. A plaintext one
+    // that fails waits as any failure does, and points back at encryption.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_encrypted_handshake_is_followed_at_once_by_a_plaintext_one() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        let t0 = Instant::now();
+
+        assert!(attempt_at(&peers, a, t0, Ends::Failed));
+        assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
+        assert!(!attempt_at(&peers, a, t0, Ends::Failed));
+        assert_eq!(
+            peers.next_candidate(t0),
+            NextCandidate::At(t0 + reconnect_wait(2))
+        );
+        assert!(attempt_at(
+            &peers,
+            a,
+            t0 + reconnect_wait(2),
+            Ends::Completed
+        ));
+    }
+
+    // libtorrent `bt_peer_connection::on_receive_impl` and
+    // `init_bt_handshake` set `pe_support` to the method that completed:
+    // the next connection tries it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_is_tried_again_with_the_handshake_it_last_completed() {
+        let peers = make_peer_states();
+        let (plain, encrypted) = (peer_addr(1), peer_addr(2));
+        let t0 = Instant::now();
+
+        peers.add_peer(plain, PeerSourceFlag::Tracker);
+        assert!(attempt_at(&peers, plain, t0, Ends::Failed));
+        assert!(!attempt_at(&peers, plain, t0, Ends::Completed));
+        let t1 = due_after(&peers, t0);
+        assert!(t1 > t0);
+        assert!(!attempt_at(&peers, plain, t1, Ends::Completed));
+
+        peers.add_peer(encrypted, PeerSourceFlag::Tracker);
+        assert!(attempt_at(&peers, encrypted, t1, Ends::Completed));
+        assert!(attempt_at(
+            &peers,
+            encrypted,
+            t1 + MIN_RECONNECT_TIME,
+            Ends::Completed
+        ));
+    }
+
+    // libtorrent `peer_connection::fast_reconnect` takes effect while
+    // `torrent_peer::fast_reconnects` is under two: a third encrypted
+    // handshake that does not complete waits like any other close.
+    #[tokio::test(start_paused = true)]
+    async fn only_two_connections_follow_an_encrypted_handshake_at_once() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        let mut at = Instant::now();
+        for at_once in [true, true, false] {
+            assert!(attempt_at(&peers, a, at, Ends::Closed));
+            let due = due_after(&peers, at);
+            assert_eq!(due == at, at_once, "{due:?} after {at:?}");
+            at = due;
+            // The plaintext one in between, closed too, waits.
+            assert!(!attempt_at(&peers, a, at, Ends::Closed));
+            assert_eq!(due_after(&peers, at), at + MIN_RECONNECT_TIME);
+            at += MIN_RECONNECT_TIME;
+        }
+    }
+
+    // libtorrent `bt_peer_connection::on_connected` reads and flips
+    // `pe_support` under `pe_enabled` alone: where encryption is required
+    // nothing asks, so a failed connection neither toggles the peer's
+    // method nor is followed at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_asks_nothing_toggles_nothing() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        let t0 = Instant::now();
+        fail_at(&peers, a, t0);
+        fail_at(&peers, a, t0 + reconnect_wait(1));
+        assert_eq!(
+            peers.next_candidate(t0 + reconnect_wait(1)),
+            NextCandidate::At(t0 + reconnect_wait(1) + reconnect_wait(2))
+        );
+        let tried = peers.with_peer_mut(a, "test", |peer| peer.encrypt_outgoing());
+        assert_eq!(tried, Some(true));
+    }
+
+    // libtorrent `peer_list::insert_peer` sets `pe_support` on a PEX
+    // `pex_encryption` flag, and never clears it on a naming without one:
+    // a peer remembered as plaintext is tried encrypted again.
+    #[tokio::test(start_paused = true)]
+    async fn a_pex_naming_with_the_encryption_flag_points_a_peer_back_at_encryption() {
+        use crate::peer_protocol::extended::ut_pex::{PEX_ENCRYPTION, PEX_SEED};
+        let peers = make_peer_states();
+        let (named, unflagged) = (peer_addr(1), peer_addr(2));
+        let t0 = Instant::now();
+        for addr in [named, unflagged] {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+            assert!(attempt_at(&peers, addr, t0, Ends::Failed));
+            assert!(!attempt_at(&peers, addr, t0, Ends::Completed));
+        }
+
+        peers.pex_flags(named, PEX_ENCRYPTION);
+        peers.pex_flags(unflagged, PEX_SEED);
+        let t1 = due_after(&peers, t0);
+        assert!(attempt_at(&peers, named, t1, Ends::Completed));
+        assert!(!attempt_at(&peers, unflagged, t1, Ends::Completed));
+    }
+
+    // libtorrent `ut_pex_plugin::tick` flags `pex_encryption` for a peer
+    // whose connection is encrypted (`bt_peer_connection::supports_encryption`).
+    #[tokio::test(start_paused = true)]
+    async fn our_pex_flags_a_peer_whose_connection_is_encrypted() {
+        use crate::peer_protocol::extended::ut_pex::PEX_ENCRYPTION;
+        let peers = make_peer_states();
+        let (encrypted, plain) = (peer_addr(1), peer_addr(2));
+        let now = Instant::now();
+        for (addr, encrypt) in [(encrypted, true), (plain, false)] {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+            peers.with_peer_mut(addr, "test", |peer| {
+                peer.connect_if_due(now, &peers).expect("a due candidate");
+                peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
+                peer.handshake_encryption(encrypt);
+            });
+        }
+
+        let listed = peers.pex_listed();
+        assert_eq!(listed[&encrypted] & PEX_ENCRYPTION, PEX_ENCRYPTION);
+        assert_eq!(listed[&plain] & PEX_ENCRYPTION, 0);
+    }
+
+    // libtorrent `bt_peer_connection::init_bt_handshake` marks a connection
+    // encrypted whichever side opened it; both writes of `pe_support`
+    // (`init_bt_handshake`, `on_receive_impl`) are `is_outgoing()`, so a
+    // handshake the peer opened leaves which one ours try alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_the_peer_opened_leaves_which_one_ours_try_alone() {
+        use crate::peer_protocol::extended::ut_pex::PEX_ENCRYPTION;
+        let peers = make_peer_states();
+        let mut ends = Vec::new();
+        for (addr, encrypted, flag) in [
+            ("10.0.0.1:6881", true, PEX_ENCRYPTION),
+            ("10.0.0.2:6881", false, 0),
+        ] {
+            let (addr, rx) = add_live_peer(&peers, addr);
+            ends.push(rx);
+            peers.handshake_encryption(addr, encrypted);
+            let advertised = peers.with_live(addr, |live| live.advertised_pex_flags());
+            assert_eq!(advertised.unwrap() & PEX_ENCRYPTION, flag);
+
+            peers.with_peer_mut(addr, "test", |peer| {
+                peers.connection_closed(peer, Instant::now(), false, true)
+            });
+            assert!(peers.encrypt_outgoing(addr), "{addr}");
+        }
+    }
+
+    // libtorrent `torrent::write_resume_data`: the saved list holds the
+    // peers we can connect to that did not fail their last connection and
+    // sent no bad data, those we were connected to first; a peer at a
+    // banned address is saved as its ban.
+    #[test]
+    fn the_saved_peers_are_the_connectable_trusted_ones_those_connected_to_first() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let connecting = peer_addr(1);
+        peers.add_peer(connecting, PeerSourceFlag::Tracker);
+        let (_, _connecting_rx, _connecting_tx) = peers.connect_next(t0).unwrap();
+        let never = peer_addr(2);
+        peers.add_peer(never, PeerSourceFlag::Tracker);
+        let failed = peer_addr(3);
+        peers.add_peer(failed, PeerSourceFlag::Tracker);
+        fail_at(&peers, failed, t0);
+        let distrusted = peer_addr(4);
+        peers.add_peer(distrusted, PeerSourceFlag::Tracker);
+        peers
+            .with_peer_mut(distrusted, "test", |p| p.piece_failed(false))
+            .unwrap();
+        // Connected to us: we know no address to connect to it at.
+        let (_, _incoming_rx) = add_live_peer(&peers, "10.0.0.5:50000");
+        let banned = peer_addr(6);
+        peers.add_peer(banned, PeerSourceFlag::Tracker);
+        peers.ban(banned);
+
+        assert_eq!(
+            peers.resume_peers(),
+            ResumePeers {
+                peers: vec![connecting, never],
+                banned: vec![banned.ip()],
+            }
+        );
+        // The list a pause leaves saves the same.
+        assert_eq!(peers.idle_list().resume_peers().banned, vec![banned.ip()]);
+    }
+
+    // libtorrent `torrent::write_resume_data`: every peer we were connected
+    // to is saved, and those we never were fill the list to a hundred.
+    #[test]
+    fn peers_never_connected_to_fill_the_saved_list_to_a_hundred() {
+        let peers = make_peer_states();
+        let connecting = peer_addr(0);
+        peers.add_peer(connecting, PeerSourceFlag::Tracker);
+        let (_, _rx, _tx) = peers.connect_next(Instant::now()).unwrap();
+        for i in 1..=150 {
+            peers.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
+        }
+        let saved = peers.resume_peers().peers;
+        assert_eq!(saved.len(), RESUME_PEERS);
+        assert_eq!(saved[0], connecting);
+        let distinct: HashSet<_> = saved.iter().collect();
+        assert_eq!(distinct.len(), RESUME_PEERS);
+    }
+
+    // libtorrent `torrent::read_resume_data` bans each saved address with
+    // `peer_list::ban_peer`: the list a restart is founded on refuses a peer
+    // there on any port, named or connecting to us.
+    #[test]
+    fn a_saved_ban_refuses_the_peer() {
+        let banned = peer_addr(1);
+        let peers = PeerStates::founded_on(
+            PeerList::resumed([], [banned.ip()]),
+            Default::default(),
+            TOTAL_PIECES as u32,
+        );
+        assert!(peers.is_banned(banned.ip()));
+        peers.add_peer(banned, PeerSourceFlag::ResumeData);
+        assert_eq!(state_of(&peers, banned), None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            peers
+                .add_incoming(
+                    at_port(banned, 50000),
+                    Id20::default(),
+                    tx,
+                    ConnectionKind::Tcp,
+                    OUR_PORT
+                )
+                .err(),
+            Some(IncomingRefused::Banned)
+        );
+        assert_eq!(peers.resume_peers().banned, vec![banned.ip()]);
     }
 }

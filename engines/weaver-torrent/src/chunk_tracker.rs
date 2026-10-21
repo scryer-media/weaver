@@ -18,12 +18,18 @@ use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
     piece_priority::PiecePriority,
+    storage::TorrentStorage,
+    torrent_state::initializing::Checkpoint,
     type_aliases::{BF, BS, FileInfos},
 };
 
 struct PieceSelection {
-    // The pieces of the selected files, whatever their priority.
-    files_selected: BF,
+    // How many bytes of each piece lie in the selected files, padding left
+    // out, whatever the piece's priority: what of the piece is wanted while
+    // the piece is (libtorrent counts a wanted piece less its pad bytes,
+    // `calc_bytes` over `piece_picker::want`; the part of a boundary piece an
+    // unselected file holds is left out here too).
+    file_bytes: Box<[u32]>,
 
     // The fetch priority of each piece, and how many pieces are at each level.
     priorities: Vec<PiecePriority>,
@@ -296,8 +302,8 @@ pub struct ChunkTracker {
     have: BoxBitV,
     have_count: u32,
 
-    // The pieces that are wanted: those of the selected files, less the ones whose
-    // priority is Skip. This doesn't change unless update_only_files or
+    // The pieces that are wanted: those with bytes in the selected files, less the
+    // ones whose priority is Skip. This doesn't change unless update_only_files or
     // set_piece_priorities was called.
     selected: BF,
 
@@ -315,26 +321,37 @@ pub struct ChunkTracker {
     hns: HaveNeededSelected,
 }
 
+/// What the torrent has and wants, kept in step with the pieces had and
+/// wanted. Every reader of finished, progress and what is left reads it here.
 #[derive(Default, Debug, PartialEq, Eq, Clone, Copy)]
 pub struct HaveNeededSelected {
-    // How many bytes we have downloaded and verified.
+    // How many bytes of pieces we have downloaded and verified.
     pub have_bytes: u64,
-    // How many bytes do we need to download for selected to be
-    // a subset of have.
+    // How many bytes of wanted pieces we still lack, whole pieces.
     pub needed_bytes: u64,
-    // How many bytes the user selected (by picking files).
-    pub selected_bytes: u64,
+    // The bytes of the selected files in the wanted pieces, without padding:
+    // the progress total (libtorrent `torrent_status::total_wanted`).
+    pub wanted_bytes: u64,
+    // Of those, the ones in pieces we have (libtorrent
+    // `torrent_status::total_wanted_done`).
+    pub wanted_done_bytes: u64,
 }
 
 impl HaveNeededSelected {
     pub const fn progress(&self) -> u64 {
-        self.selected_bytes - self.needed_bytes
+        self.wanted_done_bytes
     }
 
     pub const fn total(&self) -> u64 {
-        self.selected_bytes
+        self.wanted_bytes
     }
 
+    /// The wanted bytes still missing.
+    pub const fn remaining(&self) -> u64 {
+        self.wanted_bytes - self.wanted_done_bytes
+    }
+
+    /// Every wanted piece is had (libtorrent `piece_picker::is_finished`).
     pub const fn finished(&self) -> bool {
         self.needed_bytes == 0
     }
@@ -399,20 +416,39 @@ fn compute_queued_pieces(have_pieces: &BS, selected_pieces: &BS) -> anyhow::Resu
     ))
 }
 
-pub(crate) fn compute_selected_pieces(
+/// How many bytes of each piece lie in the selected files, padding left out.
+/// A piece with none is not wanted.
+pub(crate) fn compute_selected_bytes(
     lengths: &Lengths,
     only_files_is_empty_or_contains: impl Fn(usize) -> bool,
     file_infos: &FileInfos,
-) -> BF {
-    let mut bf = BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice());
+) -> Box<[u32]> {
+    let mut bytes = vec![0u32; lengths.total_pieces() as usize].into_boxed_slice();
     for (_, fi) in file_infos
         .iter()
         .enumerate()
         .filter(|(_, fi)| !fi.attrs.padding)
         .filter(|(id, _)| only_files_is_empty_or_contains(*id))
     {
-        if let Some(r) = bf.get_mut(fi.piece_range_usize()) {
-            r.fill(true);
+        for piece in fi.piece_range.clone() {
+            let Some(slot) = bytes.get_mut(piece as usize) else {
+                continue;
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                *slot += lengths.size_of_piece_in_file(piece, fi.offset_in_torrent, fi.len) as u32;
+            }
+        }
+    }
+    bytes
+}
+
+// The pieces with bytes in the selected files.
+fn pieces_with_bytes(lengths: &Lengths, file_bytes: &[u32]) -> BF {
+    let mut bf = BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice());
+    for (piece, bytes) in file_bytes.iter().enumerate() {
+        if *bytes > 0 {
+            bf.set(piece, true);
         }
     }
     bf
@@ -429,11 +465,13 @@ impl ChunkTracker {
     pub fn new(
         // Have pieces are the ones we have already downloaded and verified.
         have_pieces: BoxBitV,
-        // Selected pieces are the ones the user has selected
-        selected_pieces: BF,
+        // Each piece's bytes in the files the user has selected
+        // (`compute_selected_bytes`).
+        file_bytes: Box<[u32]>,
         lengths: Lengths,
         file_infos: &FileInfos,
     ) -> anyhow::Result<Self> {
+        let selected_pieces = pieces_with_bytes(&lengths, &file_bytes);
         let needed_pieces = compute_queued_pieces(have_pieces.as_slice(), &selected_pieces)
             .context("error computing needed pieces")?;
 
@@ -452,7 +490,7 @@ impl ChunkTracker {
             index: PickIndex::new(total_pieces),
             have_count: have_pieces.as_slice().count_ones() as u32,
             selection: Box::new(PieceSelection {
-                files_selected: selected_pieces.clone(),
+                file_bytes,
                 priorities: vec![PiecePriority::Normal; total_pieces as usize],
                 priority_counts,
             }),
@@ -466,6 +504,40 @@ impl ChunkTracker {
         ct.hns = ct.calc_hns();
         ct.recount_queue();
         Ok(ct)
+    }
+
+    /// Takes back the blocks a checkpoint recorded as written: each is
+    /// received, so no peer is asked for it, and a piece not had keeps
+    /// waiting for the rest before its hash is checked (libtorrent
+    /// `torrent::read_resume_data` and `piece_picker::mark_as_finished` for
+    /// each block of an unfinished piece). `blocks` is in the tracker's own
+    /// layout, as [`Self::checkpoint`] gives it.
+    pub(crate) fn restore_blocks(&mut self, blocks: &BS) {
+        for chunk in blocks.iter_ones() {
+            self.chunk_status.set(chunk, true);
+        }
+        self.recount_queue();
+    }
+
+    /// What a checkpoint records of the torrent: the pieces had, and every
+    /// block written, those of the pieces not had among them (libtorrent
+    /// `torrent::write_resume_data`: `have_pieces`, and `unfinished_pieces`
+    /// with the blocks of each downloading piece that are finished), then
+    /// the stamp of each of the first `file_count` files of `files`. The
+    /// stamps are read after the blocks: a block written in between is
+    /// fetched again, and none is recorded that the files do not hold.
+    pub(crate) fn checkpoint(&self, files: &dyn TorrentStorage, file_count: usize) -> Checkpoint {
+        let have = self.have.as_slice().to_bitvec().into_boxed_bitslice();
+        let blocks = self.chunk_status.clone();
+        Checkpoint {
+            have,
+            blocks: Some(blocks),
+            files: Some(
+                (0..file_count)
+                    .map(|file| files.stamp(file).ok().flatten())
+                    .collect(),
+            ),
+        }
     }
 
     fn recalculate_per_file_bytes(&mut self, file_infos: &FileInfos) {
@@ -670,14 +742,22 @@ impl ChunkTracker {
         for piece in self.lengths.iter_piece_infos() {
             let id = piece.piece_index.get() as usize;
             let len = piece.len as u64;
+            let wanted = u64::from(self.selection.file_bytes[id]);
             let is_have = self.have.as_slice()[id];
             let is_selected = self.selected[id];
             let is_needed = is_selected && !is_have;
             hns.have_bytes += len * (is_have as u64);
-            hns.selected_bytes += len * (is_selected as u64);
             hns.needed_bytes += len * (is_needed as u64);
+            hns.wanted_bytes += wanted * (is_selected as u64);
+            hns.wanted_done_bytes += wanted * ((is_selected && is_have) as u64);
         }
         hns
+    }
+
+    /// What the whole torrent still lacks, whatever is wanted, held or
+    /// paused (libtorrent `torrent::bytes_left`).
+    pub fn bytes_left(&self) -> u64 {
+        self.lengths.total_length() - self.hns.have_bytes
     }
 
     /// The pieces a peer may be handed, in index order: wanted, not had, and
@@ -763,6 +843,7 @@ impl ChunkTracker {
             self.hns.have_bytes += len;
             if self.selected[id] {
                 self.hns.needed_bytes -= len;
+                self.hns.wanted_done_bytes += u64::from(self.selection.file_bytes[id]);
             }
         }
     }
@@ -793,7 +874,7 @@ impl ChunkTracker {
     }
 
     pub fn get_remaining_bytes(&self) -> u64 {
-        self.hns.needed_bytes
+        self.hns.remaining()
     }
 
     // return true if the whole piece is marked downloaded
@@ -830,7 +911,7 @@ impl ChunkTracker {
         file_infos: &FileInfos,
         new_only_files: &HashSet<usize>,
     ) -> anyhow::Result<HaveNeededSelected> {
-        self.selection.files_selected = compute_selected_pieces(
+        self.selection.file_bytes = compute_selected_bytes(
             &self.lengths,
             |idx| new_only_files.contains(&idx),
             file_infos,
@@ -862,7 +943,7 @@ impl ChunkTracker {
     // Recompute what is wanted (the selected files' pieces less the skipped ones),
     // and bring the queue in line with it.
     fn apply_selection(&mut self) -> HaveNeededSelected {
-        let mut selected = self.selection.files_selected.clone();
+        let mut selected = pieces_with_bytes(&self.lengths, &self.selection.file_bytes);
         if self.selection.priority_counts[PiecePriority::Skip as usize] > 0 {
             for (idx, p) in self.selection.priorities.iter().enumerate() {
                 if *p == PiecePriority::Skip {
@@ -963,7 +1044,7 @@ mod tests {
         bitv::BitV, chunk_tracker::HaveNeededSelected, file_info::FileInfo, type_aliases::BF,
     };
 
-    use super::{ChunkTracker, compute_chunk_have_status};
+    use super::{ChunkTracker, compute_chunk_have_status, compute_selected_bytes};
 
     #[test]
     fn test_compute_chunk_status() {
@@ -1113,9 +1194,9 @@ mod tests {
         // Initially, we need all files and all pieces.
         let mut ct = ChunkTracker::new(
             initial_have.clone().into_dyn(),
-            initial_selected.clone(),
+            compute_selected_bytes(&l, |_| true, &all_files),
             l,
-            &Default::default(),
+            &all_files,
         )
         .unwrap();
 
@@ -1125,7 +1206,8 @@ mod tests {
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
-                selected_bytes: total_len,
+                wanted_bytes: total_len,
+                wanted_done_bytes: 0,
                 needed_bytes: total_len,
             }
         );
@@ -1139,7 +1221,8 @@ mod tests {
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
-                selected_bytes: all_files[0].len,
+                wanted_bytes: all_files[0].len,
+                wanted_done_bytes: 0,
                 needed_bytes: all_files[0].len,
             }
         );
@@ -1153,7 +1236,8 @@ mod tests {
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
-                selected_bytes: piece_len as u64,
+                wanted_bytes: all_files[1].len,
+                wanted_done_bytes: 0,
                 needed_bytes: piece_len as u64,
             }
         );
@@ -1167,7 +1251,8 @@ mod tests {
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
-                selected_bytes: 0,
+                wanted_bytes: 0,
+                wanted_done_bytes: 0,
                 needed_bytes: 0,
             }
         );
@@ -1181,7 +1266,8 @@ mod tests {
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
-                selected_bytes: (piece_len + 1) as u64,
+                wanted_bytes: all_files[3].len,
+                wanted_done_bytes: 0,
                 needed_bytes: (piece_len + 1) as u64,
             }
         );
@@ -1195,7 +1281,8 @@ mod tests {
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
-                selected_bytes: all_files[0].len + all_files[3].len + 1,
+                wanted_bytes: all_files[0].len + all_files[3].len,
+                wanted_done_bytes: 0,
                 needed_bytes: all_files[0].len + all_files[3].len + 1,
             }
         );
@@ -1209,7 +1296,8 @@ mod tests {
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
-                selected_bytes: total_len,
+                wanted_bytes: total_len,
+                wanted_done_bytes: 0,
                 needed_bytes: total_len
             }
         );
@@ -1235,8 +1323,7 @@ mod tests {
         }];
         let bf_len = l.piece_bitfield_bytes();
         let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
-        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
-        selected.get_mut(0..3).unwrap().fill(true);
+        let selected = compute_selected_bytes(&l, |_| true, &files);
         let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
         let p0 = l.validate_piece_index(0).unwrap();
 
@@ -1288,8 +1375,7 @@ mod tests {
         ];
         let bf_len = l.piece_bitfield_bytes();
         let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
-        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
-        selected.get_mut(0..4).unwrap().fill(true);
+        let selected = compute_selected_bytes(&l, |_| true, &files);
         let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
         let p = |i| l.validate_piece_index(i).unwrap();
         let wanted = |ct: &ChunkTracker| -> Vec<usize> { ct.selected.iter_ones().collect() };
@@ -1318,6 +1404,75 @@ mod tests {
         assert_eq!(ct.get_hns().needed_bytes, piece_len as u64 * 3);
     }
 
+    // What is left is the whole torrent less what is had, whatever is
+    // wanted (libtorrent `torrent::bytes_left`); the progress total is the
+    // selected files' bytes, without padding or the part of a boundary piece
+    // an unselected file holds; finished is every wanted piece had.
+    #[test]
+    fn left_progress_and_finished_have_one_definition_each() {
+        use crate::core::torrent_metainfo::FileDetailsAttrs;
+
+        let piece_len = CHUNK_SIZE;
+        let p64 = piece_len as u64;
+        let half = p64 / 2;
+        let l = Lengths::new(p64 * 4, piece_len).unwrap();
+        let file = |name: &str, offset: u64, len: u64, pieces, padding| FileInfo {
+            relative_filename: name.into(),
+            offset_in_torrent: offset,
+            piece_range: pieces,
+            len,
+            attrs: FileDetailsAttrs {
+                padding,
+                ..Default::default()
+            },
+        };
+        // a: piece 0 and half of 1; padding: the rest of 1; b: piece 2 and
+        // half of 3; c, not selected: the rest of 3.
+        let files = vec![
+            file("a", 0, p64 + half, 0..2, false),
+            file("pad", p64 + half, half, 1..2, true),
+            file("b", p64 * 2, p64 + half, 2..4, false),
+            file("c", p64 * 3 + half, half, 3..4, false),
+        ];
+        let bf_len = l.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let selected = compute_selected_bytes(&l, |id| id != 3, &files);
+        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
+        let p = |i| l.validate_piece_index(i).unwrap();
+
+        assert_eq!(ct.bytes_left(), p64 * 4);
+        assert_eq!(ct.get_hns().total(), files[0].len + files[2].len);
+        assert_eq!(ct.get_hns().progress(), 0);
+        assert!(!ct.is_finished());
+
+        // The boundary piece counts only b's half toward progress, and the
+        // whole of it toward what is left.
+        ct.mark_piece_downloaded(p(3));
+        assert_eq!(ct.bytes_left(), p64 * 3);
+        assert_eq!(ct.get_hns().progress(), half);
+        assert_eq!(ct.get_hns().remaining(), p64 * 2 + half);
+
+        // Deselecting b leaves what is left as it was.
+        ct.update_only_files(&files, &HashSet::from_iter([0]))
+            .unwrap();
+        assert_eq!(ct.bytes_left(), p64 * 3);
+        assert_eq!(ct.get_hns().total(), files[0].len);
+        assert_eq!(ct.get_hns().progress(), 0);
+        ct.update_only_files(&files, &HashSet::from_iter([0, 2]))
+            .unwrap();
+        assert_eq!(ct.get_hns().progress(), half);
+
+        // Finished flips with the last wanted piece and not before.
+        ct.mark_piece_downloaded(p(0));
+        ct.mark_piece_downloaded(p(2));
+        assert!(!ct.is_finished());
+        ct.mark_piece_downloaded(p(1));
+        assert!(ct.is_finished());
+        assert_eq!(ct.get_hns().progress(), ct.get_hns().total());
+        assert_eq!(ct.bytes_left(), 0);
+        assert_eq!(ct.get_hns(), &ct.calc_hns());
+    }
+
     // The counts a pick reads are kept, and agree with a recount of the
     // bitfields after every kind of move.
     #[test]
@@ -1336,8 +1491,7 @@ mod tests {
         let bf_len = l.piece_bitfield_bytes();
         let mut have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
         have.set(3, true);
-        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
-        selected.get_mut(0..4).unwrap().fill(true);
+        let selected = compute_selected_bytes(&l, |_| true, &files);
         let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
         let p = |i| l.validate_piece_index(i).unwrap();
         let block = vec![0u8; CHUNK_SIZE as usize];
