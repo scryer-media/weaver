@@ -38,7 +38,10 @@ use crate::core::{
     spawn_utils::{spawn, spawn_with_cancel},
 };
 use crate::crate_version;
-use governor::{DefaultDirectRateLimiter as RateLimiter, Quota};
+use governor::{
+    Quota, clock::Clock, middleware::NoOpMiddleware, nanos::Nanos, state::InMemoryState,
+    state::NotKeyed,
+};
 use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use parking_lot::RwLock;
 use std::num::NonZeroU32;
@@ -64,6 +67,34 @@ pub struct DhtStats {
 
 struct OutstandingRequest {
     done: tokio::sync::oneshot::Sender<crate::dht::Result<ResponseOrError>>,
+}
+
+// A request's entry in `inflight_by_transaction_id`, from the moment the request
+// is issued. Dropping it withdraws the entry, however the request ended.
+struct Outstanding<'a> {
+    dht: &'a DhtState,
+    key: (u16, SocketAddr),
+}
+
+impl<'a> Outstanding<'a> {
+    fn register(
+        dht: &'a DhtState,
+        key: (u16, SocketAddr),
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<crate::dht::Result<ResponseOrError>>,
+    ) {
+        let (done, answer) = tokio::sync::oneshot::channel();
+        dht.inflight_by_transaction_id
+            .insert(key, OutstandingRequest { done });
+        (Self { dht, key }, answer)
+    }
+}
+
+impl Drop for Outstanding<'_> {
+    fn drop(&mut self) {
+        self.dht.inflight_by_transaction_id.remove(&self.key);
+    }
 }
 
 pub struct WorkerSendRequest {
@@ -171,6 +202,32 @@ struct SearchOutcome {
     failed: usize,
 }
 
+// The outgoing rate limiter reads tokio's clock, the one every DHT deadline
+// runs on, so a wait on the limiter and the deadline that bounds it are measured
+// in the same time.
+#[derive(Debug, Clone, Copy)]
+struct TokioClock {
+    start: tokio::time::Instant,
+}
+
+impl Clock for TokioClock {
+    type Instant = Nanos;
+
+    fn now(&self) -> Nanos {
+        Nanos::from(tokio::time::Instant::now() - self.start)
+    }
+}
+
+type RateLimiter =
+    governor::RateLimiter<NotKeyed, InMemoryState, TokioClock, NoOpMiddleware<Nanos>>;
+
+// Resolves once the limiter lets one more request out.
+async fn until_ready(limiter: &RateLimiter) {
+    while let Err(not_until) = limiter.check() {
+        tokio::time::sleep(not_until.wait_time_from(limiter.clock().now())).await;
+    }
+}
+
 fn make_rate_limiter() -> RateLimiter {
     // TODO: move to configuration, i'm lazy.
     let dht_queries_per_second = std::env::var("DHT_QUERIES_PER_SECOND")
@@ -185,7 +242,12 @@ fn make_rate_limiter() -> RateLimiter {
     let quota = Quota::with_period(Duration::from_millis(100) / per_100_ms.get())
         .expect("the refill period is not zero")
         .allow_burst(max);
-    let limiter = RateLimiter::direct(quota);
+    let limiter = RateLimiter::direct_with_clock(
+        quota,
+        TokioClock {
+            start: tokio::time::Instant::now(),
+        },
+    );
     if let Some(spent) = NonZeroU32::new(max.get() - per_100_ms.get()) {
         let _ = limiter.check_n(spent);
     }
@@ -577,38 +639,30 @@ impl DhtState {
         request: Request,
         addr: SocketAddr,
     ) -> crate::dht::Result<ResponseOrError> {
-        self.rate_limiter.until_ready().await;
+        // A request lives RESPONSE_TIMEOUT from the moment it is issued: first
+        // waiting on the rate limiter, then on the answer. It is outstanding
+        // until then, and withdrawn at its deadline or when whoever issued it
+        // drops it, so a request never outlives the search that wanted it.
+        let deadline = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
         let (tid, message) = self.create_request(request, addr);
-        let key = (tid, addr);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.inflight_by_transaction_id
-            .insert(key, OutstandingRequest { done: tx });
-        trace!("sending {message:?}");
-        match self.worker_sender.send(WorkerSendRequest {
-            our_tid: Some(tid),
-            message,
-            addr,
-        }) {
-            Ok(_) => {}
-            Err(_) => {
-                self.inflight_by_transaction_id.remove(&key);
-                return Err(Error::DhtDead);
-            }
+        let (_outstanding, answer) = Outstanding::register(self, (tid, addr));
+        let send_and_wait = async {
+            until_ready(&self.rate_limiter).await;
+            trace!("sending {message:?}");
+            self.worker_sender
+                .send(WorkerSendRequest {
+                    our_tid: Some(tid),
+                    message,
+                    addr,
+                })
+                .map_err(|_| Error::DhtDead)?;
+            answer.await.map_err(|_| Error::DhtDead)?
         };
-        match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
-            Ok(Ok(r)) => r.map(|r| {
-                trace!("received {r:?}");
-                r
-            }),
-            Ok(Err(_)) => {
-                self.inflight_by_transaction_id.remove(&key);
-                Err(Error::DhtDead)
-            }
-            Err(_) => {
-                self.inflight_by_transaction_id.remove(&key);
-                Err(Error::ResponseTimeout(RESPONSE_TIMEOUT))
-            }
-        }
+        let response = tokio::time::timeout_at(deadline, send_and_wait)
+            .await
+            .unwrap_or(Err(Error::ResponseTimeout(RESPONSE_TIMEOUT)))?;
+        trace!("received {response:?}");
+        Ok(response)
     }
 
     fn create_request(&self, request: Request, addr: SocketAddr) -> (u16, Message<ByteBufOwned>) {
@@ -1826,6 +1880,14 @@ mod tests {
         std::sync::Arc<DhtState>,
         tokio::sync::mpsc::UnboundedReceiver<super::WorkerSendRequest>,
     ) {
+        let (dht, rx) = fixture_state();
+        (std::sync::Arc::new(dht), rx)
+    }
+
+    fn fixture_state() -> (
+        DhtState,
+        tokio::sync::mpsc::UnboundedReceiver<super::WorkerSendRequest>,
+    ) {
         use crate::dht::peer_store::PeerStore;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let id = crate::core::hash_id::Id20::new([0x11; 20]);
@@ -1839,7 +1901,18 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             None,
         );
-        (std::sync::Arc::new(dht), rx)
+        (dht, rx)
+    }
+
+    fn get_peers_search(
+        dht: &std::sync::Arc<DhtState>,
+    ) -> super::RecursiveRequest<super::RecursiveRequestCallbacksGetPeers> {
+        super::RecursiveRequest::get_peers(
+            dht.clone(),
+            crate::core::hash_id::Id20::new([0x22; 20]),
+            None,
+            tokio::sync::mpsc::unbounded_channel().0,
+        )
     }
 
     // `n` nodes, each with its own id and address, none of which ever answers.
@@ -1856,18 +1929,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_search_keeps_at_most_branching_requests_in_flight_and_ends() {
-        use super::{RecursiveRequest, SEARCH_BRANCHING, SearchOutcome};
+        use super::{SEARCH_BRANCHING, SearchOutcome};
         use crate::dht::RESPONSE_TIMEOUT;
         use std::{collections::HashSet, task::Poll};
 
         let (dht, mut sent) = fixture_dht();
         let nodes = silent_nodes(20);
-        let req = RecursiveRequest::get_peers(
-            dht.clone(),
-            crate::core::hash_id::Id20::new([0x22; 20]),
-            None,
-            tokio::sync::mpsc::unbounded_channel().0,
-        );
+        let req = get_peers_search(&dht);
         let mut search = std::pin::pin!(req.search(nodes.clone().into_iter()));
 
         let mut asked = HashSet::new();
@@ -1894,6 +1962,76 @@ mod tests {
             SearchOutcome {
                 answered: 0,
                 failed: 20
+            }
+        );
+        assert_eq!(dht.get_stats().outstanding_requests, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cancelling_a_search_withdraws_its_requests_waiting_on_the_limiter() {
+        use super::SEARCH_BRANCHING;
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        // Nothing more goes out until the limiter refills, and the clock stands
+        // still until the test moves it.
+        while dht.rate_limiter.check().is_ok() {}
+        let req = get_peers_search(&dht);
+        let mut search = Box::pin(req.search(silent_nodes(8).into_iter()));
+
+        assert!(matches!(futures::poll!(search.as_mut()), Poll::Pending));
+        assert_eq!(dht.get_stats().outstanding_requests, SEARCH_BRANCHING);
+        assert!(sent.try_recv().is_err(), "sent past an empty limiter");
+
+        drop(search);
+        assert_eq!(dht.get_stats().outstanding_requests, 0);
+        // The limiter refills; nobody is left waiting to send.
+        tokio::time::advance(RESPONSE_TIMEOUT).await;
+        assert!(
+            sent.try_recv().is_err(),
+            "a cancelled search sent a request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_request_the_limiter_holds_past_its_deadline_is_dropped_with_its_search() {
+        use super::{RateLimiter, SEARCH_BRANCHING, SearchOutcome, TokioClock};
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::{num::NonZeroU32, task::Poll};
+
+        let (mut state, mut sent) = fixture_state();
+        // One request a minute, already spent: every request of the search would
+        // have to wait longer than it lives.
+        state.rate_limiter = RateLimiter::direct_with_clock(
+            governor::Quota::per_minute(NonZeroU32::new(1).unwrap()),
+            TokioClock {
+                start: tokio::time::Instant::now(),
+            },
+        );
+        assert!(state.rate_limiter.check().is_ok());
+        let dht = std::sync::Arc::new(state);
+        let req = get_peers_search(&dht);
+        let mut search = std::pin::pin!(req.search(silent_nodes(8).into_iter()));
+
+        let mut rounds = 0;
+        let outcome = loop {
+            let polled = futures::poll!(search.as_mut());
+            assert!(sent.try_recv().is_err(), "sent past an empty limiter");
+            assert!(dht.get_stats().outstanding_requests <= SEARCH_BRANCHING);
+            if let Poll::Ready(outcome) = polled {
+                break outcome.unwrap();
+            }
+            rounds += 1;
+            tokio::time::advance(RESPONSE_TIMEOUT).await;
+        };
+        // 5 then 3 requests, each dropped at its deadline.
+        assert_eq!(rounds, 2);
+        assert_eq!(
+            outcome,
+            SearchOutcome {
+                answered: 0,
+                failed: 8
             }
         );
         assert_eq!(dht.get_stats().outstanding_requests, 0);
