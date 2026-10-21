@@ -259,6 +259,13 @@ pub struct Tree {
     // Every namespace writes into one directory, so one ledger names them
     // all.
     names: NameLedger,
+    // Every live recovery object by the namespace it is bound in, its home,
+    // and the home each is listed under: what a namespace's sets are, asked
+    // without visiting the members and objects beside them. Kept only by
+    // `rehome`, at the moments a set is bound, moves, retires or goes, or its
+    // home goes; never recorded, so a rebuild lists every set again.
+    sets: BTreeSet<(NodeId, NodeId)>,
+    homed: BTreeMap<NodeId, NodeId>,
     next_node: u32,
     // How deep a namespace may sit: an object that would open one deeper is
     // never built, and its member is refused as the container it is.
@@ -283,6 +290,8 @@ impl Tree {
             retired: BTreeMap::new(),
             given: BTreeMap::new(),
             names: NameLedger::new(),
+            sets: BTreeSet::new(),
+            homed: BTreeMap::new(),
             next_node: 1,
             nesting: u32::MAX,
             emits: Vec::new(),
@@ -364,7 +373,41 @@ impl Tree {
             && let Some(found) = self.nodes.get_mut(&node)
         {
             found.covers_in = Some(into);
+            self.rehome(node);
         }
+    }
+
+    // List the object at `node` under the namespace it is homed in now, if
+    // it is a live recovery object, and under none otherwise: the one place
+    // `sets` is kept. Called where a node is bound, moves, retires or goes,
+    // which are the only moments its listing can change.
+    fn rehome(&mut self, node: NodeId) {
+        if let Some(home) = self.homed.remove(&node) {
+            self.sets.remove(&(home, node));
+        }
+        if let Some(home) = self
+            .home(node)
+            .filter(|_| self.is_live(node) && self.recovers(node))
+        {
+            self.homed.insert(node, home);
+            self.sets.insert((home, node));
+        }
+    }
+
+    // Where a set stands among the sets of its home: its own before those
+    // that moved in from the namespace above, owners by their first member
+    // before windows by theirs, as the namespaces list what is bound in them.
+    fn standing(&self, set: NodeId) -> (bool, bool, Option<MemberId>, NodeId) {
+        let binding = self
+            .nodes
+            .get(&set)
+            .and_then(|found| found.binding.as_ref());
+        (
+            binding.map(|binding| binding.parent) != self.home(set),
+            binding.is_some_and(|binding| binding.window.is_some()),
+            binding.and_then(|binding| binding.volumes.values().min().copied()),
+            set,
+        )
     }
 
     fn object(&self, node: NodeId) -> Option<&dyn Object> {
@@ -394,15 +437,18 @@ impl Tree {
         self.recovery(node).is_some() || self.lent(node)
     }
 
-    // The recovery objects bound in `node`'s namespace, in binding order:
-    // the ones that cover its members. Those posted beside its object that
-    // moved into it come after its own.
+    // The recovery objects bound in `node`'s namespace, the ones that cover
+    // its members, in the order the namespace lists what is bound in it.
+    // Those posted beside its object that moved into it come after its own.
+    // Read off `sets`, so it costs what the namespace's sets are, whatever
+    // else is bound beside them.
     pub fn recovery_nodes(&self, node: NodeId) -> Vec<NodeId> {
-        let mut found = self.bound_below(node);
-        if let Some((parent, _)) = self.volumes(node) {
-            found.extend(self.bound_below(parent));
-        }
-        found.retain(|child| self.recovers(*child) && self.home(*child) == Some(node));
+        let mut found: Vec<NodeId> = self
+            .sets
+            .range((node, NodeId(0))..=(node, NodeId(u32::MAX)))
+            .map(|(_, set)| *set)
+            .collect();
+        found.sort_by_cached_key(|set| self.standing(*set));
         found
     }
 
@@ -1370,13 +1416,18 @@ impl Tree {
         Position(path)
     }
 
-    // A node leaves the tree, and its members' names with it.
+    // A node leaves the tree, and its members' names with it. A set that
+    // moved into its namespace is homed where it was posted again.
     fn remove_node(&mut self, node: NodeId) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
         self.retired.retain(|(at, _), _| *at != node);
         self.given.retain(|(at, _), _| *at != node);
         for record in removed.namespace.members() {
             self.names.release((node, record.id));
+        }
+        self.rehome(node);
+        for set in self.recovery_nodes(node) {
+            self.rehome(set);
         }
         Some(removed)
     }
@@ -1968,6 +2019,7 @@ impl Tree {
         };
         self.nodes
             .insert(child, Node::new(Some(object), Some(binding)));
+        self.rehome(child);
         Ok(Some(child))
     }
 
@@ -2017,6 +2069,7 @@ impl Tree {
             .entry(member)
             .or_default()
             .push(child);
+        self.rehome(child);
         for (offset, bytes, provenance) in passed {
             self.deliver_window(child, offset, &bytes, provenance, builder, effects);
         }
@@ -2311,6 +2364,7 @@ impl Tree {
             if let Some(found) = self.nodes.get_mut(&at) {
                 found.retired = true;
             }
+            self.rehome(at);
         }
     }
 
@@ -2578,6 +2632,7 @@ mod tests {
     use crate::deliver::{Delivery, RecoveryKind};
 
     mod reposted;
+    mod sets;
     mod windows;
 
     const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";

@@ -210,6 +210,7 @@ impl Tree {
             coverage.write(range, run.provenance);
         }
         self.nodes.insert(record.node, node);
+        self.rehome(record.node);
         Ok(())
     }
 

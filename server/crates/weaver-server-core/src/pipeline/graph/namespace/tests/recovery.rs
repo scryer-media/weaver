@@ -52,14 +52,15 @@ fn a_set_lives_in_the_namespace_of_the_members_it_describes() {
     let other = job.member("other.mkv", Some(4));
     let set = job.set_node();
     assert_eq!(job.writer.sets(&job.tree), vec![(NodeId::ROOT, set)]);
+    let sets = job.tree.recovery_nodes(NodeId::ROOT);
     assert_eq!(
         job.writer
-            .covering(&job.tree, NodeId::ROOT, video)
+            .covering(&job.tree, &sets, video)
             .collect::<Vec<_>>(),
         vec![set]
     );
     assert_eq!(
-        job.writer.covering(&job.tree, NodeId::ROOT, other).count(),
+        job.writer.covering(&job.tree, &sets, other).count(),
         0,
         "a member the set does not describe has no set"
     );

@@ -56,20 +56,27 @@ impl NamespaceWriter {
             .collect()
     }
 
-    // The sets of the namespace that cover the member: the one place a
-    // member is matched to the sets that describe it.
+    // Of `sets`, a namespace's sets as the tree listed them, the ones that
+    // cover the member. The namespace's sets are asked once and handed to
+    // the work over each of its members.
     pub(crate) fn covering<'t>(
-        &self,
+        &'t self,
         tree: &'t Tree,
-        node: NodeId,
+        sets: &'t [NodeId],
         member: MemberId,
     ) -> impl Iterator<Item = NodeId> + 't {
-        tree.recovery_nodes(node).into_iter().filter(move |set| {
-            tree.recovery(*set).map_or_else(
-                || tree.lent_covers(*set, member),
-                |recovery| recovery.covers(member),
-            )
-        })
+        sets.iter()
+            .copied()
+            .filter(move |set| self.covers(tree, *set, member))
+    }
+
+    // Whether the set covers the member: the one place a member is matched
+    // to a set that describes it. A set out on loan answers as it left.
+    pub(crate) fn covers(&self, tree: &Tree, set: NodeId, member: MemberId) -> bool {
+        tree.recovery(set).map_or_else(
+            || tree.lent_covers(set, member),
+            |recovery| recovery.covers(member),
+        )
     }
 
     // The member is a set's own volume: recovery data, in its own file.
@@ -473,13 +480,14 @@ impl NamespaceWriter {
         (node, set): (NodeId, NodeId),
         out: &mut Vec<Effect>,
     ) -> Result<Vec<MemberId>, WriteError> {
+        let sets = tree.recovery_nodes(node);
         let marked: Vec<(MemberId, ByteRange)> = tree
             .namespace(node)
             .map(|namespace| {
                 namespace
                     .damaged_ranges()
                     .filter(|(member, _)| {
-                        self.covering(tree, node, *member)
+                        self.covering(tree, &sets, *member)
                             .any(|covering| covering == set)
                     })
                     .collect()
@@ -558,7 +566,8 @@ impl NamespaceWriter {
     // they are damage.
     pub(super) fn feed(&mut self, tree: &mut Tree, segments: &dyn Segments, arrival: &Arrival) {
         let member = arrival.member;
-        let covering: Vec<NodeId> = self.covering(tree, arrival.node, member).collect();
+        let sets = tree.recovery_nodes(arrival.node);
+        let covering: Vec<NodeId> = self.covering(tree, &sets, member).collect();
         if covering.is_empty() {
             return;
         }
