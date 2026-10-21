@@ -1116,14 +1116,27 @@ impl TorrentStateLive {
     }
 
     /// The torrent's limits grant bytes of the `want` a peer asks for, and
-    /// the session's then grant what they granted (libtorrent
+    /// the session's then grant some or all of those; the torrent has back
+    /// what the session did not grant (libtorrent
     /// `peer_connection::request_bandwidth` asks every channel over the peer
     /// for one request).
     async fn grant_bandwidth(&self, channel: Channel, want: u64) -> u64 {
-        let granted = self.shared.options.ratelimits.request(channel, want).await;
-        match self.shared.session.upgrade() {
-            Some(session) => session.ratelimits.request(channel, granted).await,
-            None => granted,
+        let torrent = &self.shared.options.ratelimits;
+        let granted = torrent.request(channel, want).await;
+        let Some(session) = self.shared.session.upgrade() else {
+            return granted;
+        };
+        let both = session.ratelimits.request(channel, granted).await;
+        torrent.give_back(channel, granted - both);
+        both
+    }
+
+    /// Bytes granted to a peer that will not cross its socket go back to
+    /// the torrent's limits and the session's.
+    fn give_back_bandwidth(&self, channel: Channel, bytes: u64) {
+        self.shared.options.ratelimits.give_back(channel, bytes);
+        if let Some(session) = self.shared.session.upgrade() {
+            session.ratelimits.give_back(channel, bytes);
         }
     }
 
@@ -1900,6 +1913,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             gate(false);
         }
         granted
+    }
+
+    fn return_bandwidth(&self, channel: Channel, bytes: u64) {
+        self.state.give_back_bandwidth(channel, bytes);
     }
 
     fn on_protocol_bytes(&self, channel: Channel, bytes: u64) {

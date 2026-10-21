@@ -68,6 +68,9 @@ pub trait PeerConnectionHandler {
     async fn request_bandwidth(&self, _channel: Channel, bytes: u64) -> u64 {
         bytes
     }
+    /// `bytes` granted that will not cross the socket: the connection ended
+    /// holding them.
+    fn return_bandwidth(&self, _channel: Channel, _bytes: u64) {}
     /// `bytes` that are not block payload crossed the socket on `channel`:
     /// handshakes and every message but a piece's block (libtorrent
     /// `stat::sent_bytes`, `received_bytes`, the protocol half).
@@ -234,7 +237,7 @@ struct ManagePeerArgs {
 /// those that crossed the socket since it was made (libtorrent
 /// `peer_connection::m_quota`). Bytes that crossed before anything was paid,
 /// the handshakes, are a debt the next payment covers.
-struct Quota<'a, H> {
+struct Quota<'a, H: PeerConnectionHandler> {
     handler: &'a H,
     channel: Channel,
     meter: Meter,
@@ -274,6 +277,16 @@ impl<'a, H: PeerConnectionHandler> Quota<'a, H> {
     async fn reserve(&mut self, bytes: u64) {
         while self.held() < i128::from(bytes) {
             self.pay(bytes).await;
+        }
+    }
+}
+
+// A connection that ends holding quota gives it back, so its limits are
+// paid for the bytes that crossed and no more.
+impl<H: PeerConnectionHandler> Drop for Quota<'_, H> {
+    fn drop(&mut self) {
+        if let Ok(held @ 1..) = u64::try_from(self.held()) {
+            self.handler.return_bandwidth(self.channel, held);
         }
     }
 }
@@ -982,7 +995,7 @@ mod tests {
     }
 
     /// Grants at most [`Self::GRANT`] bytes a request, and keeps count of
-    /// what it granted and what it was told crossed.
+    /// what it granted and did not have back, and what it was told crossed.
     #[derive(Default)]
     struct Ledger {
         paid: [AtomicU64; 2],
@@ -1031,6 +1044,9 @@ mod tests {
             let granted = bytes.min(Ledger::GRANT);
             self.paid[index(channel)].fetch_add(granted, Ordering::Relaxed);
             granted
+        }
+        fn return_bandwidth(&self, channel: Channel, bytes: u64) {
+            self.paid[index(channel)].fetch_sub(bytes, Ordering::Relaxed);
         }
         fn on_protocol_bytes(&self, channel: Channel, bytes: u64) {
             self.protocol[index(channel)].fetch_add(bytes, Ordering::Relaxed);
@@ -1102,8 +1118,9 @@ mod tests {
 
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         assert_eq!(meter.received(), 9 + 13 + 100 + 9);
-        // And the length of the next frame, which the reader waits for.
-        assert_eq!(load(&ledger.paid[0]), meter.received() + 4);
+        // The length of the next frame, which the reader waited for, was
+        // given back when the connection ended.
+        assert_eq!(load(&ledger.paid[0]), meter.received());
         assert_eq!(load(&ledger.payload), 100);
         assert_eq!(load(&ledger.protocol[0]), meter.received() - 100);
         assert!(meter.sent() > 68 + 9);

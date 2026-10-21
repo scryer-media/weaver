@@ -24,10 +24,9 @@ use crate::{
 const PIECE_LENGTH: u32 = 1024;
 const PIECES: usize = 64;
 const TOTAL: u64 = PIECES as u64 * PIECE_LENGTH as u64;
-// Chunks the leecher must have pulled through the low cap before it is raised:
-// past the limiter's burst of one CHUNK_SIZE (16 chunks here), so some of them
-// waited for the refill.
-const CHUNKS_UNDER_LOW_CAP: u64 = 20;
+// Chunks' worth the leecher must have pulled through the low cap before it is
+// raised. The limiter has no burst: every byte of them waited for a round.
+const CHUNKS_UNDER_LOW_CAP: u64 = 3;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_cap_changes_while_the_torrent_runs() -> anyhow::Result<()> {
