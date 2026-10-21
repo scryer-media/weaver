@@ -20,11 +20,11 @@ use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::{multi_member_store_set, single_member_store_set};
 
 const GIB: u64 = 1024 * 1024 * 1024;
-const FLOOR: u64 = 256 * 1024;
+pub(super) const FLOOR: u64 = 256 * 1024;
 const DEPTH_LIMIT: usize = crate::pipeline::completion::finalize::MAX_GRAPH_NESTING_DEPTH as usize;
 
 // Limits no row here comes near, with `edit` applied.
-fn limits(edit: impl FnOnce(&mut ExtractionLimits)) -> ExtractionLimits {
+pub(super) fn limits(edit: impl FnOnce(&mut ExtractionLimits)) -> ExtractionLimits {
     let mut limits = ExtractionLimits {
         max_job_bytes: 2 * 1024 * GIB,
         max_member_bytes: 1024 * GIB,
@@ -39,7 +39,7 @@ fn limits(edit: impl FnOnce(&mut ExtractionLimits)) -> ExtractionLimits {
     limits
 }
 
-fn assert_refused(outcome: &super::harness::Outcome, reason: &str) {
+pub(super) fn assert_refused(outcome: &super::harness::Outcome, reason: &str) {
     let marker = format!("WEAVER_EXTRACTION_REJECTED[{reason}]: ");
     assert!(
         outcome
@@ -55,7 +55,7 @@ fn assert_refused(outcome: &super::harness::Outcome, reason: &str) {
 
 // A zstd frame of `blocks` RLE blocks of 128 KiB of zeros each: a few bytes
 // posted for every 128 KiB it inflates to.
-fn zeros_zstd(blocks: usize) -> Vec<u8> {
+pub(super) fn zeros_zstd(blocks: usize) -> Vec<u8> {
     const BLOCK: u32 = 128 * 1024;
     let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38];
     for block in 0..blocks {

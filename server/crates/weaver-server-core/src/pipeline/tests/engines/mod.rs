@@ -73,6 +73,7 @@
 
 mod caps;
 mod checkpoint_cost;
+mod deep;
 mod depth;
 mod divergence;
 mod embedded;

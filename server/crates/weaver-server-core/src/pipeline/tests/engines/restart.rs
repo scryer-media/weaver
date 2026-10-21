@@ -307,7 +307,7 @@ async fn restart_heard(
 
 // The restarted run finished as the uninterrupted one did, and asked again
 // only for what some restart since it last fetched it had in memory.
-fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
+pub(super) fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
     assert!(restarted.restarts > 0, "the run restarted");
     assert_eq!(restarted.status, whole.status, "status");
     assert_eq!(
