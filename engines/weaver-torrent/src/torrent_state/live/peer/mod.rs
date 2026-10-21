@@ -392,6 +392,11 @@ pub(crate) struct LivePeerState {
 
     request_slots_changed: Arc<Notify>,
 
+    // The blocks the peer asked us for that we have not sent yet. The writer
+    // sends a block only by taking it from here, so a Cancel that removes it
+    // first keeps it from going out.
+    upload_queue: HashSet<ChunkInfo>,
+
     // The main channel to send requests to peer.
     pub tx: PeerTx,
 
@@ -417,6 +422,7 @@ impl LivePeerState {
             block_time: BlockTime::default(),
             snubbed: false,
             request_slots_changed: Default::default(),
+            upload_queue: Default::default(),
             tx,
             connection_kind,
         }
@@ -531,6 +537,28 @@ impl LivePeerState {
 
     pub fn inflight_requests_debug(&self) -> &HashSet<InflightRequest> {
         &self.inflight_requests
+    }
+
+    /// The peer asked us for `chunk`.
+    pub fn queue_upload(&mut self, chunk: ChunkInfo) {
+        self.upload_queue.insert(chunk);
+    }
+
+    /// The peer cancelled its request for `chunk`. A block already sent is
+    /// not in the queue, and stays sent.
+    pub fn cancel_upload(&mut self, chunk: &ChunkInfo) {
+        self.upload_queue.remove(chunk);
+    }
+
+    /// Whether the peer still wants `chunk` and has not been sent it.
+    pub fn is_upload_queued(&self, chunk: &ChunkInfo) -> bool {
+        self.upload_queue.contains(chunk)
+    }
+
+    /// Takes `chunk` off the queue to send it. False when it is no longer
+    /// there, and it is not sent.
+    pub fn claim_upload(&mut self, chunk: &ChunkInfo) -> bool {
+        self.upload_queue.remove(chunk)
     }
 }
 

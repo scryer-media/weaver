@@ -31,6 +31,16 @@ struct Harness {
 impl Harness {
     /// A live torrent of two four-chunk pieces, none of them had, and no peers.
     async fn new(name: &str) -> Self {
+        Self::build(name, 0x00).await
+    }
+
+    /// A live torrent of two four-chunk pieces, both had, and no peers.
+    async fn seeding(name: &str) -> Self {
+        Self::build(name, 0xc0).await
+    }
+
+    // `have` is the bitfield of the pieces had.
+    async fn build(name: &str, have: u8) -> Self {
         let torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
             .await
             .unwrap();
@@ -38,7 +48,7 @@ impl Harness {
         let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
             .await
             .unwrap();
-        let have = BF::from_boxed_slice(vec![0u8; 1].into_boxed_slice());
+        let have = BF::from_boxed_slice(vec![have].into_boxed_slice());
         let handle = session
             .add_torrent(
                 AddTorrent::from_bytes(torrent.torrent.clone()),
@@ -91,6 +101,13 @@ impl Harness {
 
     fn piece(&self, index: u32) -> ValidPieceIndex {
         self.lengths.validate_piece_index(index).unwrap()
+    }
+
+    /// Chunk `chunk` of piece `index`.
+    fn chunk(&self, index: u32, chunk: u32) -> ChunkInfo {
+        self.lengths
+            .chunk_info_from_received_data(self.piece(index), chunk * CHUNK_SIZE, CHUNK_SIZE)
+            .unwrap()
     }
 
     fn missing_chunks(&self, index: u32) -> Vec<u32> {
@@ -348,4 +365,71 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
 
     assert_eq!(snubbed.acquire_next_piece().unwrap(), None);
     assert!(fast.acquire_next_piece().unwrap().is_some());
+}
+
+/// What the upload side queues for a peer's writer.
+#[derive(Debug, PartialEq, Eq)]
+enum Sent {
+    Choke,
+    Unchoke,
+    /// The block at (piece, offset), handed to the writer to send.
+    Block(u32, u32),
+}
+
+fn sent(request: WriterRequest) -> Sent {
+    match request {
+        WriterRequest::Message(Message::Choke) => Sent::Choke,
+        WriterRequest::Message(Message::Unchoke) => Sent::Unchoke,
+        WriterRequest::ReadChunkRequest(c) => Sent::Block(c.piece_index.get(), c.offset),
+        other => panic!("unexpected writer request {other:?}"),
+    }
+}
+
+/// The next thing queued for the peer's writer, waiting until there is one.
+async fn next_sent(rx: &mut PeerRx) -> Sent {
+    sent(rx.recv().await.expect("the peer's writer queue closed"))
+}
+
+/// The request for chunk `chunk` of piece `index`.
+fn request(index: u32, chunk: u32) -> Request {
+    Request {
+        index,
+        begin: chunk * CHUNK_SIZE,
+        length: CHUNK_SIZE,
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_takes_an_unsent_block_off_the_upload_queue() {
+    let h = Harness::seeding("a_cancel_drops_an_upload").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+
+    for chunk in [0, 1] {
+        peer.on_received_message(Message::Request(request(0, chunk)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, CHUNK_SIZE));
+
+    // Both blocks are with the writer, unsent: the cancelled one is not sent.
+    peer.on_received_message(Message::Cancel(request(0, 0)))
+        .await
+        .unwrap();
+    assert!(!peer.claim_upload(&h.chunk(0, 0)));
+    assert!(peer.claim_upload(&h.chunk(0, 1)));
+
+    // A block cancelled before the rate limits let it through never reaches
+    // the writer: the next one does.
+    peer.on_received_message(Message::Request(request(1, 0)))
+        .await
+        .unwrap();
+    peer.on_received_message(Message::Cancel(request(1, 0)))
+        .await
+        .unwrap();
+    peer.on_received_message(Message::Request(request(1, 1)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(1, CHUNK_SIZE));
 }
