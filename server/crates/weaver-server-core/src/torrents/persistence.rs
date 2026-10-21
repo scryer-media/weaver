@@ -6,6 +6,7 @@ use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::SeedingPolicy;
+use crate::settings::model::tracker_host;
 use crate::torrents::queries::{TORRENT_COLUMNS, torrent_by_infohash_tx};
 use crate::torrents::{
     TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
@@ -15,6 +16,21 @@ use weaver_torrent::ResumePeers;
 // A tracker row holds where the tracker sits in the announce list; how
 // announcing to it goes is read from the session.
 const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url) VALUES ({}, {}, {})";
+// Every host a torrent has announced to stays known after the torrent is
+// gone, so a tracker rule can be picked from them. The URL is not kept: a
+// private tracker's carries the operator's passkey.
+const TRACKER_HOST_INSERT: &str =
+    "INSERT INTO tracker_hosts (host) VALUES ({}) ON CONFLICT (host) DO NOTHING";
+
+fn tracker_host_args(trackers: &[TrackerEntry]) -> Vec<Vec<SqlArg>> {
+    trackers
+        .iter()
+        .filter_map(|tracker| tracker_host(&tracker.url))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|host| vec![SqlArg::Text(host)])
+        .collect()
+}
 
 fn stored(value: u64) -> Result<i64, StateError> {
     i64::try_from(value)
@@ -113,6 +129,7 @@ impl Database {
                 ])
             })
             .collect::<Result<Vec<_>, StateError>>()?;
+        let host_args = tracker_host_args(trackers);
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "insert_torrent", |tx| {
@@ -120,6 +137,7 @@ impl Database {
                 let torrent_args = torrent_args.clone();
                 let file_args = file_args.clone();
                 let tracker_args = tracker_args.clone();
+                let host_args = host_args.clone();
                 Box::pin(async move {
                     if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
                         return Ok(TorrentInsert::Duplicate(existing.job_id));
@@ -146,6 +164,9 @@ impl Database {
                             args,
                         )
                         .await?;
+                    }
+                    for args in &host_args {
+                        tx.execute(TRACKER_HOST_INSERT, args).await?;
                     }
                     tx.execute(
                         "INSERT INTO torrent_counters (job_id, updated_at_ms) VALUES ({}, {})",
@@ -361,12 +382,14 @@ impl Database {
                 ]
             })
             .collect::<Vec<_>>();
+        let host_args = tracker_host_args(trackers);
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_metainfo", |tx| {
                 let head = head.clone();
                 let file_args = file_args.clone();
                 let tracker_args = tracker_args.clone();
+                let host_args = host_args.clone();
                 Box::pin(async move {
                     let changed = tx
                         .execute(
@@ -400,6 +423,9 @@ impl Database {
                             args,
                         )
                         .await?;
+                    }
+                    for args in &host_args {
+                        tx.execute(TRACKER_HOST_INSERT, args).await?;
                     }
                     Ok(true)
                 })

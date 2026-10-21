@@ -96,6 +96,14 @@ impl SettingsQuery {
         Ok(rules.into_iter().map(Into::into).collect())
     }
 
+    /// Every host a torrent has announced to, which a tracker rule's host is
+    /// picked from.
+    #[graphql(guard = "AdminGuard")]
+    async fn tracker_hosts(&self, ctx: &Context<'_>) -> Result<Vec<String>> {
+        let db = ctx.data::<Database>()?.clone();
+        Ok(tokio::task::spawn_blocking(move || db.list_tracker_hosts()).await??)
+    }
+
     #[graphql(guard = "AdminGuard")]
     async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::settings::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();

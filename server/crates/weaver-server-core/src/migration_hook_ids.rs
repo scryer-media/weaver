@@ -15,6 +15,7 @@ pub(crate) fn is_known_migration_hook_id(hook_id: &str) -> bool {
             | "raise_script_concurrency_v58"
             | "name_proxy_resolvers_v64"
             | "move_bandwidth_to_networking_v69"
+            | "fill_tracker_hosts_v81"
     )
 }
 

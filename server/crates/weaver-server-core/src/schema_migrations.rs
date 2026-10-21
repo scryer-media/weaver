@@ -23,6 +23,7 @@ pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
 pub(crate) mod script_instances_v55;
+pub(crate) mod tracker_hosts_v81;
 pub(crate) mod unwanted_extensions_v56;
 
 const EMBEDDED_MIGRATION_CATALOG: &[u8] =
@@ -34,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 80;
+const CURRENT_SCHEMA_VERSION: i64 = 81;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -817,6 +818,9 @@ async fn run_rust_hook(
         }
         networking_bandwidth_v69::HOOK_ID => {
             networking_bandwidth_v69::move_bandwidth_to_networking(&mut SqlConn::Sqlite(tx)).await
+        }
+        tracker_hosts_v81::HOOK_ID => {
+            tracker_hosts_v81::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
@@ -1604,6 +1608,52 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row, ("saved".to_string(), None, None));
+        pool.close().await;
+    }
+
+    // Migration 81 keeps the hosts the torrents already announce to, each once
+    // and as a rule matches it.
+    #[tokio::test]
+    async fn sqlite_migration_81_fills_tracker_hosts_from_the_torrents() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-tracker-hosts.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(80), true)
+            .await
+            .unwrap();
+        for (job_id, hash) in [(7_i64, 7_u8), (8, 8)] {
+            sqlx::query(
+                "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
+                 VALUES (?, ?, 'hosts', 'magnet', 1, 'queued')",
+            )
+            .bind(job_id)
+            .bind(vec![hash; 20])
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO torrent_trackers (job_id, tier, url)
+             VALUES (7, 0, 'https://Tracker.Invalid./k1/announce'),
+                    (7, 1, 'udp://tracker.invalid:6969'),
+                    (8, 0, 'udp://Bücher.invalid:80'),
+                    (8, 1, 'not a url')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let hosts: Vec<String> = sqlx::query_scalar("SELECT host FROM tracker_hosts ORDER BY host")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(hosts, ["tracker.invalid", "xn--bcher-kva.invalid"]);
         pool.close().await;
     }
 

@@ -530,19 +530,24 @@ impl TrackerRule {
     }
 }
 
+// The host an announce URL names, as a rule matches it and as it is stored:
+// read as an http URL reads it whatever the tracker's scheme, so lower case,
+// an international name in punycode and an IPv4 address in dotted decimal,
+// without a trailing dot. A udp URL's host is otherwise kept as written.
+pub fn tracker_host(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url.trim()).ok()?;
+    let host = reqwest::Url::parse(&format!("http://{}/", url.host_str()?)).ok()?;
+    let host = host.host_str()?.trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
 // The rule a torrent announcing to `trackers` seeds under: the one whose
 // pattern names one of their hosts most closely, the lower id on a tie.
 pub fn tracker_rule_for<'r, 't>(
     rules: &'r [TrackerRule],
     trackers: impl IntoIterator<Item = &'t str>,
 ) -> Option<&'r TrackerRule> {
-    let hosts: Vec<String> = trackers
-        .into_iter()
-        .filter_map(|url| {
-            let url = reqwest::Url::parse(url.trim()).ok()?;
-            Some(url.host_str()?.trim_end_matches('.').to_ascii_lowercase())
-        })
-        .collect();
+    let hosts: Vec<String> = trackers.into_iter().filter_map(tracker_host).collect();
     rules
         .iter()
         .filter_map(|rule| {

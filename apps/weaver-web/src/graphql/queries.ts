@@ -1462,6 +1462,13 @@ export const TRACKER_RULES_QUERY = gql`
   ${TRACKER_RULE_FIELDS}
 `;
 
+/** Every host a torrent has announced to. */
+export const TRACKER_HOSTS_QUERY = gql`
+  query TrackerHosts {
+    trackerHosts
+  }
+`;
+
 export const SAVE_TRACKER_RULE_MUTATION = gql`
   mutation SaveTrackerRule($id: Int, $input: TrackerRuleInput!) {
     saveTrackerRule(id: $id, input: $input) {

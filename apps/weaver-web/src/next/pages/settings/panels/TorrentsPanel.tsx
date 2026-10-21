@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   DELETE_TRACKER_RULE_MUTATION,
   SAVE_TRACKER_RULE_MUTATION,
   TORRENT_SETTINGS_QUERY,
+  TRACKER_HOSTS_QUERY,
   TRACKER_RULES_QUERY,
   UPDATE_TORRENT_SETTINGS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
+import { announceHosts, patternsOf, torrentAnnounces } from "@/lib/tracker-hosts";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { Toggle } from "../../../components/controls";
+import { SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
@@ -95,6 +97,123 @@ function goalsText(t: Translate, policy: SeedingPolicy | null): string {
   return goals.length > 0 ? goals.join(" · ") : EM_DASH;
 }
 
+type HostSource = "known" | "custom" | "file";
+
+/**
+ * A rule's host: one a torrent has announced to, typed, or one a .torrent
+ * file's trackers name, read in the browser. Opens on the known hosts when
+ * the pattern is one of them, or is still to be picked and some are known.
+ */
+function HostPicker({
+  t,
+  value,
+  onChange,
+  known,
+}: {
+  t: Translate;
+  value: string;
+  onChange: (pattern: string) => void;
+  known: readonly string[];
+}) {
+  const [chosen, setChosen] = useState<HostSource | null>(null);
+  const [file, setFile] = useState<{ name: string; patterns: string[] } | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const source = chosen ?? ((value === "" ? known.length > 0 : known.includes(value)) ? "known" : "custom");
+  const label = t("next.torrents.trackerRuleHost");
+
+  // A list keeps the pattern only when it offers it; the text field keeps it to edit.
+  const pick = (next: HostSource) => {
+    const list = next === "known" ? known : next === "file" ? (file?.patterns ?? []) : null;
+    if (list && !list.includes(value)) {
+      onChange("");
+    }
+    setChosen(next);
+  };
+
+  const read = async (picked: File) => {
+    const announces = torrentAnnounces(new Uint8Array(await picked.arrayBuffer()));
+    const patterns = announces ? patternsOf(announceHosts(announces)) : [];
+    setFileError(
+      announces === null
+        ? t("next.torrents.trackerRuleFileInvalid")
+        : patterns.length === 0
+          ? t("next.torrents.trackerRuleFileEmpty")
+          : null,
+    );
+    setFile({ name: picked.name, patterns });
+    onChange(patterns[0] ?? "");
+  };
+
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <Segmented<HostSource>
+        value={source}
+        label={label}
+        onChange={pick}
+        className="self-start"
+        options={[
+          { value: "known", label: t("next.torrents.trackerRuleHostKnown"), disabled: known.length === 0 },
+          { value: "custom", label: t("next.torrents.trackerRuleHostCustom") },
+          { value: "file", label: t("next.torrents.trackerRuleHostFile") },
+        ]}
+      />
+      {source === "known" ? (
+        <Select
+          value={value}
+          label={label}
+          placeholder={t("next.torrents.trackerRuleHostChoose")}
+          onChange={onChange}
+          className="font-wv-mono text-[12px]"
+          menuClassName="max-h-[320px]"
+          options={known.map((pattern) => ({ value: pattern, label: pattern }))}
+        />
+      ) : source === "custom" ? (
+        <TextField value={value} label={label} placeholder="*.tracker.example" onChange={onChange} />
+      ) : (
+        <>
+          <div className="flex h-[34px] min-w-0 items-center gap-3">
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".torrent,application/x-bittorrent"
+              aria-label={t("next.torrents.trackerRuleHostFile")}
+              className="hidden"
+              onChange={(event) => {
+                const picked = event.target.files?.[0] ?? null;
+                // Cleared so the same file can be chosen again.
+                event.target.value = "";
+                if (picked) {
+                  void read(picked);
+                }
+              }}
+            />
+            <SecondaryButton icon="chooseFile" onClick={() => fileRef.current?.click()}>
+              {t("next.torrents.trackerRuleChooseFile")}
+            </SecondaryButton>
+            {file ? (
+              <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg" title={file.name}>
+                {file.name}
+              </span>
+            ) : null}
+          </div>
+          {fileError ? <span className="text-[12px] text-wv-error-text">{fileError}</span> : null}
+          {file && file.patterns.length > 0 ? (
+            <Select
+              value={value}
+              label={label}
+              placeholder={t("next.torrents.trackerRuleHostChoose")}
+              onChange={onChange}
+              className="font-wv-mono text-[12px]"
+              options={file.patterns.map((pattern) => ({ value: pattern, label: pattern }))}
+            />
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
 /** The tracker rules' table, and the editor and confirmation it opens. */
 function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactNode } {
   const [{ data }, reexecute] = useQuery<{ trackerRules: TrackerRule[] }>({ query: TRACKER_RULES_QUERY });
@@ -106,6 +225,14 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<TrackerRule | null>(null);
+  // Counts the editor's openings, so each one starts its host picker afresh.
+  const [opening, setOpening] = useState(0);
+  const [{ data: hosts }] = useQuery<{ trackerHosts: string[] }>({
+    query: TRACKER_HOSTS_QUERY,
+    pause: editingId === null,
+    requestPolicy: "cache-and-network",
+  });
+  const known = useMemo(() => patternsOf(hosts?.trackerHosts ?? []), [hosts?.trackerHosts]);
 
   const rules = useMemo(() => data?.trackerRules ?? [], [data?.trackerRules]);
   const editing = typeof editingId === "number" ? rules.find((rule) => rule.id === editingId) : null;
@@ -124,6 +251,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
       : NEW_TRACKER_RULE;
     setForm(start);
     setOpened(start);
+    setOpening((count) => count + 1);
     setEditingId(rule ? rule.id : "new");
   };
 
@@ -215,10 +343,16 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                 label: t("next.torrents.trackerRuleHost"),
                 keywords: "tracker host announce",
                 control: {
-                  kind: "text",
-                  value: form.hostPattern,
-                  placeholder: "*.tracker.example",
-                  onChange: (hostPattern) => setForm((current) => ({ ...current, hostPattern })),
+                  kind: "custom",
+                  control: (
+                    <HostPicker
+                      key={opening}
+                      t={t}
+                      value={form.hostPattern}
+                      known={known}
+                      onChange={(hostPattern) => setForm((current) => ({ ...current, hostPattern }))}
+                    />
+                  ),
                 },
               },
               {

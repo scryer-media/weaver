@@ -233,6 +233,20 @@ impl Database {
         })
     }
 
+    // Every host a torrent has announced to, in order.
+    pub fn list_tracker_hosts(&self) -> Result<Vec<String>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT host FROM tracker_hosts ORDER BY host",
+                &[],
+            )
+            .await?;
+            rows.iter().map(|row| Ok(row.text("host")?)).collect()
+        })
+    }
+
     pub fn get_torrent_counters(
         &self,
         job_id: JobId,
