@@ -17,7 +17,7 @@ use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
     piece_priority::PiecePriority,
-    type_aliases::{BF, BS, FileInfos, FilePriorities},
+    type_aliases::{BF, BS, FileInfos},
 };
 
 struct PieceSelection {
@@ -263,36 +263,34 @@ impl ChunkTracker {
         hns
     }
 
-    // The queued pieces in the order to fetch them: by priority level, highest first,
-    // and within a level by file priority. A level no piece is at costs nothing, so
-    // with every piece at Normal this is a single pass in file order.
-    pub(crate) fn iter_queued_pieces<'a>(
-        &'a self,
-        file_priorities: &'a FilePriorities,
-        file_infos: &'a FileInfos,
-    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
-        PiecePriority::WANTED_DESCENDING
-            .into_iter()
-            .filter(|level| self.selection.priority_counts[*level as usize] > 0)
-            .flat_map(move |level| {
-                self.iter_queued_pieces_in_file_order(file_priorities, file_infos)
-                    .filter(move |id| self.selection.priorities[id.get_usize()] == level)
-            })
+    /// The pieces a peer may be handed, in index order: wanted, not had, and
+    /// not in flight. Which one goes first is the piece picker's call.
+    pub(crate) fn iter_queued_pieces(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.queue_pieces
+            .iter_ones()
+            .filter_map(|id| self.lengths.validate_piece_index(id.try_into().ok()?))
     }
 
-    fn iter_queued_pieces_in_file_order<'a>(
-        &'a self,
-        file_priorities: &'a FilePriorities,
-        file_infos: &'a FileInfos,
-    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
-        file_priorities
-            .iter()
-            .filter_map(|p| Some((*p, file_infos.get(*p)?)))
-            .filter(|(id, f)| self.per_file_bytes[*id] != f.len)
-            .flat_map(|(_id, f)| f.iter_piece_priorities())
-            .filter(|id| self.queue_pieces[*id])
-            .filter_map(|id| id.try_into().ok())
-            .filter_map(|id| self.lengths.validate_piece_index(id))
+    /// The fetch priority of `piece`.
+    pub(crate) fn priority(&self, piece: ValidPieceIndex) -> PiecePriority {
+        self.selection.priorities[piece.get_usize()]
+    }
+
+    /// Whether any piece is at `level`.
+    pub(crate) fn any_at(&self, level: PiecePriority) -> bool {
+        self.selection.priority_counts[level as usize] > 0
+    }
+
+    /// How many chunks of `piece` were received.
+    pub(crate) fn received_chunks(&self, piece: ValidPieceIndex) -> usize {
+        self.chunk_status
+            .get(self.lengths.chunk_range(piece))
+            .map_or(0, |chunks| chunks.count_ones())
+    }
+
+    /// How many pieces we have.
+    pub(crate) fn have_count(&self) -> usize {
+        self.have.as_slice().count_ones()
     }
 
     pub(crate) fn is_piece_have(&self, id: ValidPieceIndex) -> bool {

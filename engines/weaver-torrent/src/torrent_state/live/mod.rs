@@ -102,12 +102,12 @@ use crate::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
     piece_priority::PiecePriority,
-    piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
+    piece_tracker::{AcquireRequest, AcquireResult, PickOptions, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
     torrent_state::utils::atomic_inc,
-    type_aliases::{BF, FilePriorities, FileStorage, PeerHandle},
+    type_aliases::{FileStorage, PeerHandle},
 };
 
 use self::{
@@ -135,9 +135,6 @@ pub(crate) struct TorrentStateLocked {
     // Coordinates piece state: what chunks we have, need, and what pieces are in-flight.
     // If this is None, the torrent was paused, and this live state is useless, and needs to be dropped.
     pub(crate) pieces: Option<PieceTracker>,
-
-    // The sorted file list in which order to download them.
-    file_priorities: FilePriorities,
 
     // If this is None, then it was already used
     fatal_errors_tx: Option<tokio::sync::oneshot::Sender<anyhow::Error>>,
@@ -263,20 +260,6 @@ impl TorrentStateLive {
         let finished_at_start = paused.chunk_tracker.get_hns().finished();
         let lengths = *paused.chunk_tracker.get_lengths();
 
-        // TODO: make it configurable
-        let file_priorities = {
-            let mut pri = (0..paused.metadata.file_infos.len()).collect::<Vec<usize>>();
-            // sort by filename, cause many torrents have random sort order.
-            pri.sort_unstable_by_key(|id| {
-                paused
-                    .metadata
-                    .file_infos
-                    .get(*id)
-                    .map(|fi| fi.relative_filename.as_path())
-            });
-            pri
-        };
-
         let (ratelimit_upload_tx, ratelimit_upload_rx) = unbounded_channel::<QueuedUpload>();
 
         let state = Arc::new(TorrentStateLive {
@@ -285,7 +268,6 @@ impl TorrentStateLive {
             peers: PeerStates::new(session_stats.peers.clone(), lengths.total_pieces()),
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
-                file_priorities,
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
                 smart_ban: SmartBan::default(),
@@ -1505,13 +1487,7 @@ impl PeerHandler {
                 let mut g = self.state.lock_write("acquire_next_piece");
 
                 let bf = &live.bitfield;
-                // Extract references to disjoint fields
-                let TorrentStateLocked {
-                    pieces,
-                    file_priorities,
-                    ..
-                } = &mut **g;
-                let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
+                let pieces = g.pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
                 // A piece the storage has no room for waits on new_pieces_notify,
                 // which the storage rings when it has room again.
                 let result = pieces.acquire_admitted_piece(
@@ -1523,12 +1499,17 @@ impl PeerHandler {
                             self.counters.average_piece_download_time()
                         },
                         priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
-                        file_priorities,
-                        file_infos: &self.state.metadata.file_infos,
                         // Only a piece that can be checked once it arrives.
                         peer_has_piece: |p| {
                             bf.get(p.get() as usize).map(|v| *v) == Some(true)
                                 && self.state.metadata.can_verify(p)
+                        },
+                        availability: |p| self.state.peers.availability.get(p),
+                        num_peers: self.state.peers.stats().live as usize,
+                        outstanding_requests: live.requested_inflight_count(),
+                        options: PickOptions {
+                            reverse: live.is_snubbed(),
+                            on_parole: false,
                         },
                         can_steal: |p| {
                             self.state.per_piece_locks[p.get_usize()]

@@ -28,7 +28,6 @@ pub(crate) struct PeerSource {
 }
 pub type FileInfos = Vec<FileInfo>;
 pub(crate) type FileStorage = Box<dyn TorrentStorage>;
-pub(crate) type FilePriorities = Vec<usize>;
 
 pub type BoxAsyncReadVectored = Box<dyn AsyncReadVectored + Unpin + Send + 'static>;
 pub type BoxAsyncWrite = Box<dyn AsyncWrite + Unpin + Send + 'static>;

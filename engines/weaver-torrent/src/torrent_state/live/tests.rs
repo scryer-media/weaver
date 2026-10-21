@@ -14,6 +14,7 @@ use crate::{
     core::constants::CHUNK_SIZE,
     storage::StorageFactory,
     tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+    type_aliases::BF,
 };
 
 const CHUNKS_PER_PIECE: u32 = 4;
@@ -144,7 +145,7 @@ impl Harness {
         let pieces = g.get_pieces().unwrap();
         let queued: Vec<u32> = pieces
             .chunks()
-            .iter_queued_pieces(&g.file_priorities, &self.live.metadata.file_infos)
+            .iter_queued_pieces()
             .map(|p| p.get())
             .collect();
         for p in &queued {

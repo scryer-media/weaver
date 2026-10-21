@@ -6,6 +6,7 @@
 use std::sync::atomic::AtomicU32;
 
 use crate::{
+    core::lengths::ValidPieceIndex,
     torrent_state::utils::{atomic_dec, atomic_inc},
     type_aliases::BS,
 };
@@ -18,6 +19,10 @@ pub(crate) struct Availability(Box<[AtomicU32]>);
 impl Availability {
     pub fn new(total_pieces: u32) -> Self {
         Self((0..total_pieces).map(|_| AtomicU32::new(0)).collect())
+    }
+
+    pub fn get(&self, piece: ValidPieceIndex) -> u32 {
+        self.0[piece.get_usize()].load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Every piece's count, in piece order.

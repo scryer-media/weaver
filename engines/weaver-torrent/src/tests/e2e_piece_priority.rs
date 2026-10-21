@@ -36,8 +36,7 @@ async fn fetch_two_missing(
     let out = TempDir::with_prefix(name)?;
     let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
     let storage = MemoryStorageFactory::default();
-    // Pieces 0 and 4 are missing. Piece 0, the first of the file, comes first in the
-    // usual order.
+    // Pieces 0 and 4 are missing.
     let mut have = BF::from_boxed_slice(vec![0xffu8; PIECES.div_ceil(8)].into_boxed_slice());
     have.set(0, false);
     have.set(4, false);
@@ -64,8 +63,10 @@ async fn fetch_two_missing(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_without_priorities_the_first_piece_of_the_file_comes_first() -> anyhow::Result<()> {
-    let order = fetch_two_missing("test_piece_priority_default", None).await?;
+async fn test_without_priorities_both_missing_pieces_arrive() -> anyhow::Result<()> {
+    // As rare as each other, so the picker takes either first.
+    let mut order = fetch_two_missing("test_piece_priority_default", None).await?;
+    order.sort();
     assert_eq!(order, vec![0, 4]);
     Ok(())
 }
