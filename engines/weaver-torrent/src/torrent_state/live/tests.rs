@@ -24,7 +24,7 @@ struct Harness {
     live: Arc<TorrentStateLive>,
     content: Vec<u8>,
     _session: Arc<Session>,
-    _torrent: TestTorrent,
+    _torrent: Option<TestTorrent>,
     _out: TempDir,
 }
 
@@ -57,13 +57,19 @@ impl Harness {
             live: handle.live().unwrap(),
             content: torrent.content.clone(),
             _session: session,
-            _torrent: torrent,
+            _torrent: Some(torrent),
             _out: out,
         }
     }
 
     /// A live peer at `addr` with every piece, and the queue of what we send it.
     fn peer(&self, addr: &str) -> (PeerHandler, PeerRx) {
+        self.peer_speaking(addr, false)
+    }
+
+    /// A live peer at `addr` with every piece, that speaks v2 when
+    /// `speaks_v2` holds, and the queue of what we send it.
+    fn peer_speaking(&self, addr: &str, speaks_v2: bool) -> (PeerHandler, PeerRx) {
         let addr: SocketAddr = addr.parse().unwrap();
         let (tx, rx) = unbounded_channel();
         let counters = self
@@ -75,6 +81,7 @@ impl Harness {
             addr,
             incoming: true,
             on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(speaks_v2),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,
@@ -83,8 +90,10 @@ impl Harness {
             cancel_token: self.live.cancellation_token.child_token(),
             client_name_and_version: String::new(),
         };
+        let mut every_piece = make_piece_bitfield(&self.lengths);
+        every_piece[..self.lengths.total_pieces() as usize].fill(true);
         handler
-            .on_bitfield(ByteBufOwned::from(vec![0xc0u8]))
+            .on_bitfield(ByteBufOwned::from(every_piece.as_raw_slice().to_vec()))
             .unwrap();
         (handler, rx)
     }
@@ -348,4 +357,271 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
 
     assert_eq!(snubbed.acquire_next_piece().unwrap(), None);
     assert!(fast.acquire_next_piece().unwrap().is_some());
+}
+
+mod v2 {
+    //! The fetch of a v2 torrent's piece layers from peers that speak v2
+    //! (libtorrent `hash_picker`, `bt_peer_connection::on_hashes`,
+    //! `on_hash_reject`).
+
+    use super::*;
+    use crate::{
+        core::{
+            Id32,
+            merkle::PieceTree,
+            v2_test_torrent::{TestTorrent as V2TestTorrent, file_hashes, payload},
+        },
+        peer_protocol::{HashRequest, Hashes},
+        torrent_state::live::hash_fetch::Pick,
+    };
+
+    const PIECE: u64 = 16384;
+    /// Two runs of the layer: 512 pieces, then 88 asked for as 128.
+    const PIECES: u32 = 600;
+
+    /// A v2 torrent without its piece layers: a file of [`PIECES`] pieces
+    /// and one of a single piece.
+    fn layerless() -> V2TestTorrent {
+        let mut torrent = V2TestTorrent::new(
+            vec![
+                ("a", payload(PIECES as usize * PIECE as usize, 1)),
+                ("b", payload(100, 2)),
+            ],
+            PIECE,
+        );
+        torrent.layers = false;
+        torrent
+    }
+
+    impl Harness {
+        /// `torrent` live, none of its pieces had, and no peers.
+        async fn v2(name: &str, torrent: &V2TestTorrent) -> Self {
+            let out = TempDir::with_prefix(name).unwrap();
+            let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+                .await
+                .unwrap();
+            let pieces: usize = torrent
+                .files
+                .iter()
+                .map(|(_, data)| data.len().div_ceil(PIECE as usize))
+                .sum();
+            let have = BF::from_boxed_slice(vec![0u8; pieces.div_ceil(8)].into_boxed_slice());
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(torrent.torrent_bytes()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                        initial_have: Some(have),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_handle()
+                .unwrap();
+            handle.wait_until_initialized().await.unwrap();
+            Self {
+                live: handle.live().unwrap(),
+                content: torrent.v1_payload(),
+                _session: session,
+                _torrent: None,
+                _out: out,
+            }
+        }
+
+        fn expected(&self, piece: u32) -> Option<Id32> {
+            self.metadata.v2.as_ref().unwrap().expected(piece)
+        }
+    }
+
+    /// The tree over the piece layer of file "a".
+    fn tree(torrent: &V2TestTorrent) -> PieceTree {
+        let layer = file_hashes(&torrent.files[0].1, PIECE).1.unwrap();
+        PieceTree::from_piece_layer(layer, 1)
+    }
+
+    /// The answer a peer holding the layers gives to `request`.
+    fn answer(torrent: &V2TestTorrent, request: HashRequest) -> Hashes<ByteBufOwned> {
+        let hashes = tree(torrent)
+            .hashes(
+                request.base,
+                request.index.into(),
+                request.count.into(),
+                request.proof_layers,
+            )
+            .unwrap();
+        Hashes::new(request, &hashes)
+    }
+
+    async fn next_hash_request(task: &mut Task<'_>, rx: &mut PeerRx) -> HashRequest {
+        match next_message(task, rx).await {
+            Message::HashRequest(r) => r,
+            other => panic!("expected a hash request, got {other:?}"),
+        }
+    }
+
+    fn shape(r: HashRequest) -> (u32, u32, u32, u32) {
+        (r.base, r.index, r.count, r.proof_layers)
+    }
+
+    #[tokio::test]
+    async fn a_v2_piece_waits_for_its_layer_run_which_a_v2_peer_proves() {
+        let torrent = layerless();
+        let h = Harness::v2("a_v2_piece_waits_for_its_layer", &torrent).await;
+        let (peer, mut rx) = h.peer_speaking("127.0.0.1:6881", true);
+        peer.on_i_am_unchoked();
+
+        // Only the one-piece file, which its root proves, may be fetched.
+        assert_eq!(
+            peer.acquire_next_piece().unwrap().map(|p| p.get()),
+            Some(PIECES)
+        );
+        assert_eq!(peer.acquire_next_piece().unwrap(), None);
+
+        // The peer is asked for both runs of the layer, from the piece
+        // layer, each proven to the root (libtorrent
+        // `hash_picker::pick_hashes`).
+        let mut fetch: Task<'_> = Box::pin(peer.fetch_layers());
+        let first = next_hash_request(&mut fetch, &mut rx).await;
+        let second = next_hash_request(&mut fetch, &mut rx).await;
+        assert_eq!(first.root, tree(&torrent).root());
+        assert_eq!(shape(first), (0, 0, 512, 9));
+        assert_eq!(shape(second), (0, 512, 128, 9));
+
+        // The second run proven: its pieces may be fetched, the first's not.
+        peer.on_hashes(answer(&torrent, second).as_borrowed())
+            .unwrap();
+        let piece = peer.acquire_next_piece().unwrap().unwrap().get();
+        assert!((512..PIECES).contains(&piece), "{piece}");
+        assert_eq!(h.expected(0), None);
+
+        // Both proven: the torrent file carries the piece layers, as one
+        // that came with them (libtorrent `write_torrent_file`).
+        peer.on_hashes(answer(&torrent, first).as_borrowed())
+            .unwrap();
+        let tree = tree(&torrent);
+        assert!((0..PIECES).all(|p| h.expected(p) == Some(tree.pieces()[p as usize])));
+        let mut whole = layerless();
+        whole.layers = true;
+        assert_eq!(h.metadata.torrent_bytes(), whole.torrent_bytes());
+        assert!(matches!(
+            h.layer_fetch.pick(
+                peer.addr,
+                |_| true,
+                Duration::ZERO,
+                tokio::time::Instant::now()
+            ),
+            Pick::Done
+        ));
+    }
+
+    #[tokio::test]
+    async fn hashes_that_prove_nothing_drop_the_peer_and_the_run_goes_to_another() {
+        let torrent = layerless();
+        let h = Harness::v2("hashes_that_prove_nothing", &torrent).await;
+        let (bad, mut bad_rx) = h.peer_speaking("127.0.0.1:6881", true);
+        let mut bad_fetch: Task<'_> = Box::pin(bad.fetch_layers());
+        let first = next_hash_request(&mut bad_fetch, &mut bad_rx).await;
+        let _second = next_hash_request(&mut bad_fetch, &mut bad_rx).await;
+
+        // test_hash_picker.cpp `add_bad_hashes`: the last hash flipped.
+        let mut hashes = answer(&torrent, first).hashes();
+        hashes.last_mut().unwrap().0[0] ^= 1;
+        assert!(
+            bad.on_hashes(Hashes::new(first, &hashes).as_borrowed())
+                .is_err()
+        );
+        assert_eq!(h.expected(0), None);
+
+        // The run is free for the next peer; the other stays with the first.
+        let (good, mut good_rx) = h.peer_speaking("127.0.0.2:6881", true);
+        let mut good_fetch: Task<'_> = Box::pin(good.fetch_layers());
+        assert_eq!(
+            next_hash_request(&mut good_fetch, &mut good_rx).await,
+            first
+        );
+        good.on_hashes(answer(&torrent, first).as_borrowed())
+            .unwrap();
+        assert_eq!(h.expected(0), Some(tree(&torrent).pieces()[0]));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_run_goes_to_another_peer_and_an_unasked_answer_is_ignored() {
+        let torrent = layerless();
+        let h = Harness::v2("a_rejected_run", &torrent).await;
+        let (first_peer, mut first_rx) = h.peer_speaking("127.0.0.1:6881", true);
+        let mut first_fetch: Task<'_> = Box::pin(first_peer.fetch_layers());
+        let first = next_hash_request(&mut first_fetch, &mut first_rx).await;
+        let second = next_hash_request(&mut first_fetch, &mut first_rx).await;
+
+        // An answer from a peer that was not asked is ignored (libtorrent
+        // `bt_peer_connection::on_hashes`).
+        let (other, mut other_rx) = h.peer_speaking("127.0.0.2:6881", true);
+        other
+            .on_hashes(answer(&torrent, first).as_borrowed())
+            .unwrap();
+        assert_eq!(h.expected(0), None);
+
+        // A reject frees the run for the other peer at once (libtorrent
+        // `hash_picker::hashes_rejected`), and the peer that rejected it is
+        // not asked again.
+        first_peer.on_hash_reject(first);
+        let mut other_fetch: Task<'_> = Box::pin(other.fetch_layers());
+        assert_eq!(
+            next_hash_request(&mut other_fetch, &mut other_rx).await,
+            first
+        );
+        assert!(matches!(
+            h.layer_fetch.pick(
+                first_peer.addr,
+                |_| true,
+                Duration::from_secs(60),
+                tokio::time::Instant::now()
+            ),
+            Pick::Wait(_)
+        ));
+        other
+            .on_hashes(answer(&torrent, first).as_borrowed())
+            .unwrap();
+        first_peer
+            .on_hashes(answer(&torrent, second).as_borrowed())
+            .unwrap();
+        assert!((0..PIECES).all(|p| h.expected(p).is_some()));
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_run_goes_to_another_peer_at_the_request_timeout() {
+        let torrent = layerless();
+        let h = Harness::v2("an_unanswered_run", &torrent).await;
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let (slow, mut slow_rx) = h.peer_speaking("127.0.0.1:6881", true);
+        let mut slow_fetch: Task<'_> = Box::pin(slow.fetch_layers());
+        let first = next_hash_request(&mut slow_fetch, &mut slow_rx).await;
+        let second = next_hash_request(&mut slow_fetch, &mut slow_rx).await;
+
+        // The slow peer has delivered nothing, so its timeout is the
+        // longest; the other peer is asked for both runs once it passes.
+        let (other, mut other_rx) = h.peer_speaking("127.0.0.2:6881", true);
+        let mut other_fetch: Task<'_> = Box::pin(other.fetch_layers());
+        assert_eq!(
+            next_hash_request(&mut other_fetch, &mut other_rx).await,
+            first
+        );
+        assert_eq!(
+            next_hash_request(&mut other_fetch, &mut other_rx).await,
+            second
+        );
+        let timeout = h
+            .peers
+            .with_live(slow.addr, |live| live.request_timeout())
+            .unwrap();
+        assert_eq!(timeout, Duration::from_secs(60));
+        assert!(tokio::time::Instant::now() >= start + timeout);
+
+        // A late answer from the slow peer still counts.
+        slow.on_hashes(answer(&torrent, first).as_borrowed())
+            .unwrap();
+        assert!(h.expected(0).is_some());
+    }
 }

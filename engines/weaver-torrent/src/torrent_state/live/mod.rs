@@ -47,6 +47,7 @@
 // > so don't lock them both at the same time at all, or at the worst lock them in the
 // > same order (peers one first, then the global one).
 
+mod hash_fetch;
 pub mod peer;
 pub mod peers;
 pub mod stats;
@@ -207,6 +208,7 @@ pub struct TorrentStateLive {
 
     finished_notify: Notify,
     new_pieces_notify: Arc<Notify>,
+    layer_fetch: hash_fetch::LayerFetch,
     // Whether every wanted piece was already present when this run began.
     finished_at_start: bool,
 
@@ -290,6 +292,7 @@ impl TorrentStateLive {
                 paused.shared.options.peer_limit.unwrap_or(128),
             )),
             new_pieces_notify: Arc::new(Notify::new()),
+            layer_fetch: hash_fetch::LayerFetch::new(paused.metadata.v2.as_ref()),
             finished_notify: Notify::new(),
             finished_at_start,
             down_speed_estimator,
@@ -478,6 +481,7 @@ impl TorrentStateLive {
             addr: checked_peer.addr,
             incoming: true,
             on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
@@ -540,6 +544,7 @@ impl TorrentStateLive {
             addr,
             incoming: false,
             on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
             state: state.clone(),
             tx,
@@ -1076,6 +1081,9 @@ struct PeerHandler {
     // is received.
     on_bitfield_notify: Notify,
 
+    // The peer speaks v2 on this connection, and so exchanges hashes.
+    speaks_v2: AtomicBool,
+
     addr: SocketAddr,
     incoming: bool,
     tx: PeerTx,
@@ -1128,6 +1136,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 trace!("keepalive received");
             }
             Message::Have(h) => self.on_have(h),
+            Message::Hashes(hashes) => self.on_hashes(hashes).context("on_hashes")?,
+            Message::HashReject(request) => self.on_hash_reject(request),
             Message::NotInterested => {
                 trace!("received \"not interested\", but we don't process it yet")
             }
@@ -1186,8 +1196,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         &self,
         handshake: Handshake,
         ckind: ConnectionKind,
-        _speaks_v2: bool,
+        speaks_v2: bool,
     ) -> anyhow::Result<()> {
+        self.speaks_v2.store(speaks_v2, Ordering::Relaxed);
         self.state.set_peer_live(self.addr, handshake, ckind);
         Ok(())
     }
@@ -1312,6 +1323,7 @@ impl PeerHandler {
             }
         };
         let prev = pe.value_mut().take_state(peers);
+        self.state.layer_fetch.forget(handle);
 
         match prev {
             PeerState::Connecting(_) => {}
@@ -1594,12 +1606,14 @@ impl PeerHandler {
     }
 
     // The job of this is to request chunks, time out the requests the peer
-    // does not answer, and also to keep peer alive.
+    // does not answer, fetch the piece layers a v2 torrent lacks, and also
+    // to keep peer alive.
     // The moment this ends, the peer is disconnected.
     async fn task_peer_chunk_requester(&self) -> crate::Result<()> {
         tokio::select! {
             r = self.request_chunks() => r,
             r = self.time_out_requests() => r,
+            r = self.fetch_layers() => r,
         }
     }
 

@@ -1549,11 +1549,11 @@ impl Session {
         if opts.list_only {
             return Ok(AddTorrentResponse::ListOnly(ListOnlyResponse {
                 info_hash,
+                torrent_bytes: metadata.torrent_bytes(),
                 info: metadata.info,
                 only_files,
                 output_folder,
                 seen_peers,
-                torrent_bytes: metadata.torrent_bytes,
             }));
         }
 
