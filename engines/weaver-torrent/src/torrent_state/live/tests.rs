@@ -496,8 +496,12 @@ async fn a_block_that_arrives_after_its_cancel_restarts_the_wait_for_the_next() 
     // The cancelled block arrives anyway, 5 s on.
     tokio::time::advance(Duration::from_secs(5)).await;
     h.deliver(&peer, (piece, CHUNK_SIZE)).await;
+    // Its timeout, 27.5 s, passes the 20 s piece timeout, which comes
+    // first (libtorrent `settings_pack::piece_timeout`).
     let (moved, timeout) = deadline(&h);
-    assert_eq!(moved, Some(tokio::time::Instant::now() + timeout));
+    let piece_timeout = Duration::from_secs(20);
+    assert!(timeout > piece_timeout);
+    assert_eq!(moved, Some(tokio::time::Instant::now() + piece_timeout));
     assert!(moved > first);
     assert!(h.snubbed(&peer));
     assert_eq!(h.inflight_count(&peer), CHUNKS_PER_PIECE as usize - 2);

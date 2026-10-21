@@ -73,6 +73,12 @@ const MIN_REQUEST_QUEUE: usize = 2;
 // requests outstanding to a peer before any block has arrived from it.
 const INITIAL_REQUEST_QUEUE: usize = 4;
 
+// libtorrent `settings_pack::piece_timeout`: with requests outstanding, how
+// long a peer may go without sending a block or being sent a request before
+// it is snubbed (`peer_connection::second_tick`), whatever its request
+// timeout.
+const PIECE_TIMEOUT: Duration = Duration::from_secs(20);
+
 // libtorrent `peer_connection::second_tick`: how long a seed waits on an
 // interested peer it unchoked to ask for a block, or to be sent the last one
 // it asked for, before it ends the connection.
@@ -760,6 +766,11 @@ pub(crate) struct LivePeerState {
     // requests are outstanding.
     waiting_since: Instant,
 
+    // When a block last arrived from the peer, or a request last went to it
+    // (libtorrent `peer_connection::m_last_piece`). Read only while requests
+    // are outstanding.
+    last_piece: Instant,
+
     // How long the peer takes to deliver a block, which sets its request timeout.
     block_time: BlockTime,
 
@@ -874,6 +885,7 @@ impl LivePeerState {
             inflight_requests: Default::default(),
             late_cancelled_request_tolerance: 0,
             waiting_since: Instant::now(),
+            last_piece: Instant::now(),
             block_time: BlockTime::default(),
             snubbed: false,
             request_slots_changed: Default::default(),
@@ -1010,9 +1022,16 @@ impl LivePeerState {
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
         let none_outstanding = self.inflight_requests.is_empty();
         let added = self.inflight_requests.insert(chunk);
-        if added && none_outstanding {
-            // The wait for a block starts now, and the request timeout with it.
-            self.waiting_since = Instant::now();
+        if added {
+            // A request sent restarts the piece timeout (libtorrent
+            // `peer_connection::send_block_requests` sets `m_last_piece`).
+            let now = Instant::now();
+            self.last_piece = now;
+            if none_outstanding {
+                // The wait for a block starts now, and the request timeout
+                // with it (`m_requested`).
+                self.waiting_since = now;
+            }
             self.request_slots_changed.notify_waiters();
         }
         added
@@ -1024,11 +1043,15 @@ impl LivePeerState {
     }
 
     /// When the requests outstanding to the peer time out: the peer has gone
-    /// its request timeout without delivering a block. None while none are
-    /// outstanding.
+    /// its request timeout without delivering a block, or [`PIECE_TIMEOUT`]
+    /// without delivering one or being sent a request (libtorrent
+    /// `peer_connection::second_tick`, which snubs on either). None while
+    /// none are outstanding.
     pub fn request_deadline(&self) -> Option<Instant> {
-        (!self.inflight_requests.is_empty())
-            .then(|| self.waiting_since + self.block_time.request_timeout())
+        (!self.inflight_requests.is_empty()).then(|| {
+            (self.waiting_since + self.block_time.request_timeout())
+                .min(self.last_piece + PIECE_TIMEOUT)
+        })
     }
 
     /// The peer delivered `chunk`. A block it was asked for, wanted still or
@@ -1048,6 +1071,7 @@ impl LivePeerState {
         let now = Instant::now();
         self.block_time.add(now - self.waiting_since);
         self.waiting_since = now;
+        self.last_piece = now;
         if matches!(answer, RemoveInflightRequestResult::Expected) {
             self.snubbed = false;
         }
@@ -1487,6 +1511,66 @@ mod tests {
         let mut moved = vec![piece(5)];
         moved.extend(kept.iter().copied().filter(|p| *p != piece(5)));
         assert_eq!(live.suggested, moved);
+    }
+
+    // libtorrent `peer_connection::request_timeout`: 60 s
+    // (`settings_pack::request_timeout`) before the first block, then the
+    // mean block time with a fifth, or with four mean deviations, between
+    // 2 s and 60 s; and `second_tick` snubs too once no block has arrived
+    // and no request gone out for 20 s (`settings_pack::piece_timeout`).
+    #[tokio::test(start_paused = true)]
+    async fn the_requests_time_out_at_the_request_timeout_or_twenty_seconds_without_a_block_or_request()
+     {
+        let lengths = Lengths::new(8 * 16384, 8 * 16384).unwrap();
+        let piece = lengths.validate_piece_index(0).unwrap();
+        let chunk = |i: u32| {
+            lengths
+                .chunk_info_from_received_data(piece, i * 16384, 16384)
+                .unwrap()
+        };
+        let (tx, _rx) = unbounded_channel();
+        let counters = stats::atomic::PeerStats::default().counters;
+        let fresh = || {
+            LivePeerState::new(
+                Id20::default(),
+                tx.clone(),
+                ConnectionKind::Tcp,
+                &counters,
+                true,
+            )
+        };
+        let mut live = fresh();
+        let secs = Duration::from_secs;
+        assert_eq!(live.request_deadline(), None);
+
+        // No block yet: the request timeout is a minute, the piece timeout
+        // twenty seconds from the last request.
+        live.add_inflight_request(chunk(0));
+        let first = Instant::now();
+        assert_eq!(live.request_timeout(), secs(60));
+        assert_eq!(live.request_deadline(), Some(first + secs(20)));
+        tokio::time::advance(secs(5)).await;
+        live.add_inflight_request(chunk(1));
+        assert_eq!(live.request_deadline(), Some(first + secs(25)));
+
+        // Blocks at 10 s and then 30 s: a timeout past twenty seconds.
+        tokio::time::advance(secs(5)).await;
+        live.remove_inflight_request(&chunk(0));
+        tokio::time::advance(secs(30)).await;
+        live.add_inflight_request(chunk(2));
+        live.remove_inflight_request(&chunk(1));
+        let timeout = live.request_timeout();
+        assert!(timeout > secs(20) && timeout <= secs(60), "{timeout:?}");
+        assert_eq!(live.request_deadline(), Some(Instant::now() + secs(20)));
+
+        // A block at once: the request timeout is the floor, under the
+        // piece timeout.
+        let mut live = fresh();
+        live.add_inflight_request(chunk(0));
+        live.remove_inflight_request(&chunk(0));
+        live.add_inflight_request(chunk(1));
+        assert_eq!(live.request_timeout(), secs(2));
+        assert_eq!(live.request_deadline(), Some(Instant::now() + secs(2)));
     }
 
     #[tokio::test(start_paused = true)]
