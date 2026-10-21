@@ -429,10 +429,12 @@ impl Namespace {
 
     // Bytes of `posting` arrived over `range` with `provenance`. The
     // posting records them, and the member it is takes them except where
-    // they are damaged and another posting brought those bytes clean: a
-    // clean byte replaces a damaged one or a hole, whichever posting brings
-    // it, and a damaged byte never replaces a clean one. Returns the member
-    // and the parts of `range` it took, in order.
+    // they are damaged and another posting brought those bytes clean, or
+    // its own record already answers them: a clean byte replaces a damaged
+    // one or a hole, whichever posting brings it, a damaged byte never
+    // replaces a clean one another posting brought, and damage never takes
+    // back a repair. Returns the member and the parts of `range` it took,
+    // in order.
     pub fn arrive(
         &mut self,
         posting: MemberId,
@@ -443,7 +445,7 @@ impl Namespace {
         let taken = if provenance.is_verified() {
             vec![range]
         } else {
-            gaps(range, &self.clean_elsewhere(posting, member, range))
+            gaps(range, &self.standing(posting, member, range, provenance))
         };
         if posting != member
             && let Some(copy) = self.members.get_mut(&posting)
@@ -456,6 +458,29 @@ impl Namespace {
             }
         }
         (member, taken)
+    }
+
+    // What of `range` stands against bytes of `posting` arriving with
+    // `provenance`, which is not verified: what another posting brought
+    // clean, and what the member's own record answers.
+    fn standing(
+        &self,
+        posting: MemberId,
+        member: MemberId,
+        range: ByteRange,
+        provenance: Provenance,
+    ) -> Coverage {
+        let mut standing = self.clean_elsewhere(posting, member, range);
+        if let Some(record) = self.members.get(&member) {
+            for run in record.coverage.overlapping(range) {
+                if run.provenance.answers(provenance)
+                    && let Some(piece) = run.range.intersect(range)
+                {
+                    standing.write(piece, Provenance::Fresh);
+                }
+            }
+        }
+        standing
     }
 
     // What of `range` a posting of the member other than `posting` brought
@@ -702,6 +727,28 @@ mod tests {
         assert!(!coverage.verified(ByteRange::new(0, 30)));
         assert!(coverage.verified(ByteRange::new(10, 20)));
         assert_eq!(coverage.damaged_ranges().count(), 2);
+    }
+
+    // Damage arriving over a member whose middle a repair rebuilt: the
+    // member takes it only at the damaged ends, and the repair stands.
+    #[test]
+    fn damage_never_takes_back_a_repair() {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(30));
+        namespace.arrive(member, ByteRange::new(0, 30), Provenance::Damaged);
+        namespace.arrive(member, ByteRange::new(10, 20), Provenance::Repaired);
+        let (_, taken) = namespace.arrive(member, ByteRange::new(0, 30), Provenance::Damaged);
+        assert_eq!(taken, vec![ByteRange::new(0, 10), ByteRange::new(20, 30)]);
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![
+                (0, 10, Provenance::Damaged),
+                (10, 20, Provenance::Repaired),
+                (20, 30, Provenance::Damaged),
+            ]
+        );
+        let (_, taken) = namespace.arrive(member, ByteRange::new(5, 25), Provenance::Fresh);
+        assert_eq!(taken, vec![ByteRange::new(5, 25)]);
     }
 
     #[test]

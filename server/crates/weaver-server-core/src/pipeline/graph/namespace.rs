@@ -108,6 +108,15 @@ impl Files {
     }
 }
 
+// A run of a volume an object placed as its own: the volume range, and
+// where in which envelope its bytes were kept.
+#[derive(Clone, Copy)]
+struct KeptRun {
+    range: ByteRange,
+    envelope: u32,
+    at: u64,
+}
+
 pub(crate) struct NamespaceWriter {
     // The job's process-wide id, which with a node id names a namespace to
     // the holds accountant that every job shares.
@@ -118,6 +127,8 @@ pub(crate) struct NamespaceWriter {
     caps: Caps,
     files: BTreeMap<NodeId, Files>,
     envelopes: Envelopes,
+    // Where each object's own bytes were kept, by object and volume.
+    kept: BTreeMap<(NodeId, VolumeIndex), Vec<KeptRun>>,
     // Member reads the recovery objects made while repairing.
     read_backs: u64,
     // Members carrying recovery data no object here reads, by namespace.
@@ -137,6 +148,7 @@ impl NamespaceWriter {
         Self {
             scope,
             envelopes: Envelopes::new(working_dir.clone()),
+            kept: BTreeMap::new(),
             working_dir,
             accountant,
             free_disk,
@@ -586,6 +598,8 @@ impl NamespaceWriter {
                 range: ByteRange::new(arrival.offset + placed, arrival.range().end),
             });
         }
+        let moved = self.unkept(tree, (child, volume), arrival.range());
+        self.keep_runs((child, volume), arrival.offset, &placements);
         let kept = self
             .envelopes
             .capture(child, &placements, &arrival.bytes, arrival.provenance);
@@ -598,6 +612,11 @@ impl NamespaceWriter {
                 .take(held_volume(arrival.member), arrival.range());
         }
         let mut breached = Vec::new();
+        for (offset, bytes) in moved {
+            if self.keep_held(arrival.node, arrival.member, offset, bytes.clone())? {
+                breached.push((offset, bytes));
+            }
+        }
         for placement in &placements {
             let Placement::Held { range } = placement else {
                 continue;
@@ -627,6 +646,97 @@ impl NamespaceWriter {
             self.write_file(tree, arrival.node, arrival.member, offset, &bytes)?;
         }
         Ok(())
+    }
+
+    // The bytes of `volume` the object at `child` kept as its own that its
+    // map now places elsewhere, read back from where they were kept, past
+    // `arrival`, which is placed afresh. A header that came again, repaired,
+    // says whose the bytes behind it are: they are held for the member again,
+    // as any bytes whose place the namespace does not have, and go down where
+    // the map now puts them.
+    fn unkept(
+        &mut self,
+        tree: &Tree,
+        (child, volume): (NodeId, VolumeIndex),
+        arrival: ByteRange,
+    ) -> Vec<(u64, Bytes)> {
+        let Some(runs) = self.kept.get_mut(&(child, volume)) else {
+            return Vec::new();
+        };
+        let mut moved = Vec::new();
+        let mut stays = Vec::with_capacity(runs.len());
+        let mut placements = Vec::new();
+        for run in runs.drain(..) {
+            for range in outside(run.range, arrival) {
+                let at = run.at + (range.start - run.range.start);
+                placements.clear();
+                tree.locate(child, volume, range, &mut placements);
+                let mut offset = range.start;
+                for placement in &placements {
+                    let piece = ByteRange::at(offset, placement.len());
+                    let kept_at = at + (piece.start - range.start);
+                    offset = piece.end;
+                    let same = matches!(placement, Placement::Envelope { envelope, range }
+                        if *envelope == run.envelope && range.start == kept_at);
+                    if same {
+                        stays.push(KeptRun {
+                            range: piece,
+                            envelope: run.envelope,
+                            at: kept_at,
+                        });
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    let read = self.envelopes.read(
+                        child,
+                        run.envelope,
+                        ByteRange::at(kept_at, piece.len()),
+                        &mut bytes,
+                    );
+                    if read {
+                        moved.push((piece.start, Bytes::from(bytes)));
+                    }
+                }
+            }
+        }
+        *runs = stays;
+        moved
+    }
+
+    // The runs of a delivery at `offset` the object placed as its own.
+    fn keep_runs(
+        &mut self,
+        (child, volume): (NodeId, VolumeIndex),
+        offset: u64,
+        placements: &[Placement],
+    ) {
+        let runs = self.kept.entry((child, volume)).or_default();
+        let mut cursor = offset;
+        for placement in placements {
+            let range = ByteRange::at(cursor, placement.len());
+            cursor = range.end;
+            if let Placement::Envelope {
+                envelope,
+                range: kept,
+            } = placement
+            {
+                runs.push(KeptRun {
+                    range,
+                    envelope: *envelope,
+                    at: kept.start,
+                });
+            }
+        }
+        runs.sort_by_key(|run| run.range.start);
+        runs.dedup_by(|next, run| {
+            let joins = run.envelope == next.envelope
+                && run.range.end == next.range.start
+                && run.at + run.range.len() == next.at;
+            if joins {
+                run.range = ByteRange::new(run.range.start, next.range.end);
+            }
+            joins
+        });
     }
 
     // The node's envelopes, shared with the run of an engine that reads
@@ -1159,6 +1269,7 @@ impl NamespaceWriter {
     // namespace retired or gone holds no entries and keeps nothing resident.
     fn prune(&mut self, tree: &Tree) -> Result<(), WriteError> {
         self.caps.release_gone(tree);
+        self.kept.retain(|(object, _), _| !tree.buried(*object));
         let nodes: Vec<NodeId> = self.files.keys().copied().collect();
         for node in nodes {
             if tree.buried(node) {
@@ -1559,3 +1670,10 @@ pub(crate) use loan::{Loan, Returned};
 pub(crate) use recovery::{Lender, SetState};
 #[cfg(test)]
 mod tests;
+
+// The parts of `range` outside `cut`, in order.
+fn outside(range: ByteRange, cut: ByteRange) -> impl Iterator<Item = ByteRange> {
+    let before = ByteRange::new(range.start, range.end.min(cut.start).max(range.start));
+    let after = ByteRange::new(range.start.max(cut.end).min(range.end), range.end);
+    [before, after].into_iter().filter(|part| !part.is_empty())
+}
