@@ -27,7 +27,7 @@ use crate::{
         StreamListener,
     },
     spawn_utils::BlockingSpawner,
-    stream_connect::{ConnectionKind, StreamConnector, StreamConnectorArgs},
+    stream_connect::{ConnectionKind, StreamConnector, StreamConnectorArgs, Transports},
     tests::test_util::{
         TestPeerMetadata, create_default_random_dir_with_torrents, setup_test_logging,
     },
@@ -292,7 +292,8 @@ async fn test_stream_connector_dials_through_factory() -> anyhow::Result<()> {
     })
     .await?;
 
-    let (accepted, connected) = tokio::join!(listener.accept(), connector.connect(addr));
+    let (accepted, connected) =
+        tokio::join!(listener.accept(), connector.connect(addr, Transports::Any));
     let (kind, _r, _w) = connected?;
     let (_stream, peer_addr) = accepted?;
 

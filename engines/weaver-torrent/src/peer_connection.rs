@@ -35,7 +35,7 @@ use tracing::{Instrument, trace, trace_span};
 use crate::{
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
-    stream_connect::StreamConnector,
+    stream_connect::{StreamConnector, Transports},
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
 };
 
@@ -146,6 +146,8 @@ pub(crate) struct PeerConnection<H> {
     options: PeerConnectionOptions,
     spawner: BlockingSpawner,
     connector: Arc<StreamConnector>,
+    // What an outgoing connection may go over.
+    transports: Transports,
 }
 
 pub(crate) async fn with_timeout<T>(
@@ -190,7 +192,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             spawner,
             options: options.unwrap_or_default(),
             connector,
+            transports: Transports::Any,
         }
+    }
+
+    /// The outgoing connection goes over `transports`.
+    pub fn over(self, transports: Transports) -> Self {
+        Self { transports, ..self }
     }
 
     // By the time this is called:
@@ -287,6 +295,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connector
             .connect_and_send_handshake(
                 self.addr,
+                self.transports,
                 &greeting,
                 &write_buf[..hsz],
                 connect_timeout,

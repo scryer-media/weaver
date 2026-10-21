@@ -1225,10 +1225,11 @@ mod tests {
 
     // libtorrent `bt_peer_connection::on_holepunch`, `connect`: the peer is
     // added or found and connected to at once (`torrent::connect_to_peer`),
-    // whatever its failures, unless it is connected or banned; holepunch
-    // mode ends with the connection.
+    // over uTP, whatever its failures, unless it is connected or banned;
+    // holepunch mode ends with the connection.
     #[test]
     fn a_holepunched_peer_is_connected_to_next_whatever_its_failures() {
+        use crate::stream_connect::Transports;
         let peers = make_peer_states();
         let t0 = Instant::now();
         let fresh = peer_addr(1);
@@ -1247,12 +1248,15 @@ mod tests {
         );
         assert_eq!(state_of(&peers, failed), Some("connecting"));
 
-        // The holepunched connection fails too: the peer is out again.
+        // The holepunched connection goes over uTP alone, and fails too:
+        // the peer is out again, and may be dialed over TCP once more.
         peers
             .with_peer_mut(failed, "test", |peer| {
                 assert!(peer.holepunched());
+                assert_eq!(peer.transports(), Transports::Utp);
                 peers.connection_closed(peer, Some(last), true);
                 assert!(!peer.holepunched());
+                assert_eq!(peer.transports(), Transports::Any);
             })
             .unwrap();
         assert_eq!(state_of(&peers, failed), Some("dead"));

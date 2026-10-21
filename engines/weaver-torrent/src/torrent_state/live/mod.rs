@@ -727,9 +727,9 @@ impl TorrentStateLive {
         _slot: ConnectionSlot,
     ) -> crate::Result<()> {
         let state = self;
-        let counters = state
+        let (counters, transports) = state
             .peers
-            .with_peer(addr, |p| p.stats.counters.clone())
+            .with_peer(addr, |p| (p.stats.counters.clone(), p.transports()))
             .ok_or(Error::BugPeerNotFound)?;
 
         let handler = PeerHandler {
@@ -761,7 +761,8 @@ impl TorrentStateLive {
             Some(options),
             state.shared.spawner.clone(),
             state.shared.connector.clone(),
-        );
+        )
+        .over(transports);
         let requester = aframe!(
             handler
                 .task_peer_chunk_requester()

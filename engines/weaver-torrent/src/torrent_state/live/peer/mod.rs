@@ -26,7 +26,7 @@ use tokio::time::Instant;
 
 use crate::peer_connection::WriterRequest;
 use crate::peer_protocol::extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP};
-use crate::stream_connect::ConnectionKind;
+use crate::stream_connect::{ConnectionKind, Transports};
 use crate::type_aliases::BF;
 
 use super::PeerStates;
@@ -304,6 +304,18 @@ impl Peer {
     /// for has not closed.
     pub(crate) fn holepunched(&self) -> bool {
         self.holepunch
+    }
+
+    /// What a connection to the peer may go over: uTP alone while a
+    /// holepunch introduced it (libtorrent `bt_peer_connection::on_holepunch`
+    /// marks it `supports_utp`, so `torrent::connect_to_peer` dials it
+    /// through the uTP socket manager).
+    pub(crate) fn transports(&self) -> Transports {
+        if self.holepunch {
+            Transports::Utp
+        } else {
+            Transports::Any
+        }
     }
 
     /// A holepunch introduced the peer: unless we are connected or
