@@ -24,6 +24,7 @@ use crate::dht::{
         FindNodeRequest, GetPeersRequest, Message, MessageKind, Node, PingRequest, Response, Want,
     },
     peer_store::{PEER_PURGE_INTERVAL, PeerStore},
+    query_limiter::QueryLimiter,
     routing_table::{InsertResult, NodeStatus, RoutingTable},
 };
 use backon::{ExponentialBuilder, Retryable};
@@ -601,6 +602,9 @@ pub struct DhtState {
 
     pub(crate) peer_store: PeerStore,
 
+    // Which sources have sent too many queries to be answered.
+    query_limiter: parking_lot::Mutex<QueryLimiter>,
+
     // BEP 5 "v": sent with every outgoing message when set.
     client_version: Option<ByteBufOwned>,
 }
@@ -627,6 +631,7 @@ impl DhtState {
             listen_addr,
             rate_limiter: make_rate_limiter(),
             peer_store: PeerStore::new(id),
+            query_limiter: parking_lot::Mutex::new(QueryLimiter::new()),
             cancellation_token,
             client_version,
         }
@@ -819,6 +824,15 @@ impl DhtState {
             }
             _ => {}
         };
+
+        if !self
+            .query_limiter
+            .lock()
+            .admit(addr.ip(), tokio::time::Instant::now())
+        {
+            trace!("ignoring a query from {addr}: it sends too many");
+            return Ok(());
+        }
 
         trace!("received query from {addr}: {msg:?}");
 
@@ -2044,5 +2058,62 @@ mod tests {
             }
         );
         assert_eq!(dht.get_stats().outstanding_requests, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_source_over_the_query_limit_is_ignored_until_its_block_lapses() {
+        use crate::dht::query_limiter::{BLOCK, QUERY_LIMIT, WINDOW};
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let (dht, mut sent) = fixture_dht();
+        let flooder = SocketAddr::from(([10, 0, 0, 1], 6881));
+        let quiet = SocketAddr::from(([10, 0, 0, 2], 6881));
+        // `from` pings us; whether it was answered.
+        let mut ping = |from: SocketAddr| {
+            dht.on_received_message(
+                bprotocol::Message {
+                    kind: MessageKind::PingRequest(bprotocol::PingRequest {
+                        id: crate::core::hash_id::Id20::new([0x33; 20]),
+                    }),
+                    transaction_id: ByteBufOwned::from(&b"aa"[..]),
+                    version: None,
+                    ip: None,
+                },
+                from,
+            )
+            .unwrap();
+            match sent.try_recv() {
+                Ok(reply) => {
+                    assert_eq!(reply.addr, from);
+                    assert!(matches!(reply.message.kind, MessageKind::Response(_)));
+                    true
+                }
+                Err(TryRecvError::Empty) => false,
+                Err(e) => panic!("{e}"),
+            }
+        };
+
+        // Every query short of the limit is answered; the one that reaches it,
+        // and every one after, is not.
+        for _ in 1..QUERY_LIMIT {
+            assert!(ping(flooder));
+        }
+        assert!(!ping(flooder));
+        assert!(!ping(flooder));
+
+        // A source under the limit is answered meanwhile.
+        assert!(ping(quiet));
+
+        // The block outlasts the window, and the queries sent during it do
+        // not lengthen it.
+        tokio::time::advance(WINDOW).await;
+        assert!(!ping(flooder));
+        assert!(ping(quiet));
+        tokio::time::advance(BLOCK - WINDOW - Duration::from_secs(1)).await;
+        assert!(!ping(flooder));
+
+        // Once it lapses the source is answered again.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(ping(flooder));
     }
 }
