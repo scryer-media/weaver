@@ -161,7 +161,7 @@ impl JsonSessionPersistenceStore {
             .metadata
             .load()
             .as_ref()
-            .map(|i| i.torrent_bytes.clone())
+            .map(|i| i.torrent_bytes())
             .unwrap_or_default();
 
         if write_torrent_file && !torrent_bytes.is_empty() {

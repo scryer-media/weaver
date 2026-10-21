@@ -15,14 +15,18 @@ pub mod utils;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::buffers::ByteBufOwned;
-use crate::core::hash_id::Id20;
-use crate::core::lengths::Lengths;
+use crate::core::hash_id::{Id20, Id32, InfoHashes};
+use crate::core::lengths::{Lengths, ValidPieceIndex};
+use crate::core::magnet::Magnet;
+use crate::core::torrent_metainfo::{TorrentMetaV1Owned, TorrentVersion};
+use crate::peer_protocol::HashRequest;
+use crate::v2_hashes::V2Hashes;
 use anyhow::Context;
 use anyhow::bail;
 use arc_swap::ArcSwapOption;
@@ -135,6 +139,8 @@ pub(crate) struct ManagedTorrentOptions {
     pub ratelimits: Limits,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
+    /// [`AddTorrentOptions::disable_v1_hashes`](crate::AddTorrentOptions::disable_v1_hashes).
+    pub disable_v1_hashes: bool,
 }
 
 impl ManagedTorrentOptions {
@@ -146,16 +152,28 @@ impl ManagedTorrentOptions {
 // Torrent bencodee "info" + some precomputed fields based on it for frequent access.
 pub struct TorrentMetadata {
     pub info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
-    pub torrent_bytes: Bytes,
+    /// The torrent file as added, or as built from a magnet link.
+    torrent_file: Bytes,
+    /// `torrent_file` with the piece layers fetched from peers, once every
+    /// one is held.
+    torrent_file_with_layers: OnceLock<Bytes>,
     pub info_bytes: Bytes,
+    /// The hashes of `info_bytes`: v1, v2 or both.
+    pub info_hashes: InfoHashes,
     pub file_infos: FileInfos,
+    /// The v2 hashes of a v2 or hybrid torrent.
+    pub(crate) v2: Option<V2Hashes>,
 }
 
 impl TorrentMetadata {
+    /// `layers` are the piece layers the torrent carries, one entry per
+    /// file ([`ValidatedTorrentMetaV1Info::piece_layers`]); none for a
+    /// magnet link.
     pub(crate) fn new(
         info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
         torrent_bytes: Bytes,
         info_bytes: Bytes,
+        layers: Vec<Option<Vec<Id32>>>,
     ) -> anyhow::Result<Self> {
         let file_infos = info
             .iter_file_details_ext()
@@ -171,16 +189,113 @@ impl TorrentMetadata {
             .collect::<anyhow::Result<Vec<FileInfo>>>()?;
 
         Ok(Self {
+            info_hashes: info.info().check_info_bytes(&info_bytes)?,
+            v2: V2Hashes::new(&info, layers),
             info,
-            torrent_bytes,
+            torrent_file: torrent_bytes,
+            torrent_file_with_layers: OnceLock::new(),
             info_bytes,
             file_infos,
         })
     }
 
+    /// The torrent file: as added, and with the piece layers fetched from
+    /// peers once every one is held (libtorrent `write_torrent_file`, which
+    /// writes `piece layers` from the trees it holds).
+    pub fn torrent_bytes(&self) -> Bytes {
+        self.torrent_file_with_layers
+            .get()
+            .unwrap_or(&self.torrent_file)
+            .clone()
+    }
+
+    /// Which hashes verify the torrent's pieces.
+    pub fn version(&self) -> TorrentVersion {
+        self.info.version()
+    }
+
+    /// Takes a peer's answer to the request for a run of a piece layer ([`V2Hashes::add_chunk`]); once every layer is held they go
+    /// into the torrent file.
+    pub(crate) fn add_layer_chunk(
+        &self,
+        request: &HashRequest,
+        hashes: &[Id32],
+    ) -> anyhow::Result<()> {
+        let v2 = self
+            .v2
+            .as_ref()
+            .context("a v1 torrent has no piece layers")?;
+        if v2.add_chunk(request, hashes)?
+            && let Some(layers) = v2.layers()
+        {
+            let _ = self
+                .torrent_file_with_layers
+                .set(with_piece_layers(&self.torrent_file, &layers)?.into());
+        }
+        Ok(())
+    }
+
+    /// The metadata of a torrent file, with the piece layers it carries.
+    pub(crate) fn from_torrent(
+        meta: TorrentMetaV1Owned,
+        torrent_bytes: Bytes,
+    ) -> anyhow::Result<Self> {
+        let info = meta.info.data.validate()?;
+        let layers = match &meta.piece_layers {
+            Some(layers) => info.piece_layers(layers)?,
+            None => Vec::new(),
+        };
+        Self::new(info, torrent_bytes, meta.info.raw_bytes.0, layers)
+    }
+
     pub fn lengths(&self) -> &Lengths {
         self.info.lengths()
     }
+
+    /// Whether a piece fetched now could be checked: always with v1
+    /// hashes, and with v2 alone once its file's piece layer is held.
+    /// libtorrent fetches such a piece anyway and holds it unverified until
+    /// `hash_picker::pick_hashes` brings the layer; Weaver fetches the
+    /// layer first, so a piece is never held without a verdict.
+    pub(crate) fn can_verify(&self, piece: ValidPieceIndex) -> bool {
+        self.info.info().has_v1_listing()
+            || self
+                .v2
+                .as_ref()
+                .is_some_and(|v2| v2.expected(piece.get()).is_some())
+    }
+}
+
+/// `torrent`, a torrent file, with `layers`, each file's root and piece
+/// layer, as its `piece layers`, in place of any it had.
+fn with_piece_layers(torrent: &[u8], layers: &[(Id32, &[Id32])]) -> anyhow::Result<Vec<u8>> {
+    use crate::bencode::{
+        ByteBuf, WithRawBytes, bencode_serialize_to_writer, from_bytes, raw_value::RawValue,
+    };
+    use std::collections::BTreeMap;
+
+    let top: BTreeMap<ByteBuf<'_>, WithRawBytes<serde::de::IgnoredAny, ByteBuf<'_>>> =
+        from_bytes(torrent).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let concatenated: Vec<Vec<u8>> = layers
+        .iter()
+        .map(|(_, layer)| layer.iter().flat_map(|h| h.0).collect())
+        .collect();
+    let by_root: BTreeMap<ByteBuf<'_>, ByteBuf<'_>> = layers
+        .iter()
+        .zip(&concatenated)
+        .map(|((root, _), layer)| (ByteBuf(&root.0), ByteBuf(layer)))
+        .collect();
+    let mut piece_layers = Vec::new();
+    bencode_serialize_to_writer(&by_root, &mut piece_layers)?;
+
+    let mut out: BTreeMap<ByteBuf<'_>, RawValue<&[u8]>> = top
+        .iter()
+        .map(|(key, value)| (*key, RawValue(value.raw_bytes.0)))
+        .collect();
+    out.insert(ByteBuf(b"piece layers"), RawValue(&piece_layers));
+    let mut file = Vec::new();
+    bencode_serialize_to_writer(&out, &mut file)?;
+    Ok(file)
 }
 
 /// Common information about torrent shared among all possible states.
@@ -190,7 +305,10 @@ impl TorrentMetadata {
 // of stuff, but it shouldn't access the state.
 pub struct ManagedTorrentShared {
     pub id: TorrentId,
+    /// The hash the torrent is known by, `info_hashes.best()`.
     pub info_hash: Id20,
+    /// Every hash the torrent answers to and announces under.
+    pub info_hashes: InfoHashes,
     pub(crate) spawner: BlockingSpawner,
     /// Every tracker in `tracker_tiers`.
     pub trackers: HashSet<url::Url>,
@@ -287,6 +405,30 @@ impl ManagedTorrent {
 
     pub fn info_hash(&self) -> Id20 {
         self.shared.info_hash
+    }
+
+    /// The torrent's v1 and v2 hashes.
+    pub fn info_hashes(&self) -> InfoHashes {
+        self.shared.info_hashes
+    }
+
+    /// Which hashes verify the torrent's pieces; `None` until its metadata
+    /// is known.
+    pub fn version(&self) -> Option<TorrentVersion> {
+        self.with_metadata(|m| m.version()).ok()
+    }
+
+    /// The link to the torrent: both its hashes, its name and its trackers
+    /// in tier order (libtorrent `make_magnet_uri(torrent_handle)`).
+    pub fn magnet(&self) -> Magnet {
+        let trackers = self
+            .shared
+            .tracker_tiers
+            .iter()
+            .flatten()
+            .map(|t| t.to_string())
+            .collect();
+        Magnet::of(self.info_hashes(), self.name(), trackers)
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {

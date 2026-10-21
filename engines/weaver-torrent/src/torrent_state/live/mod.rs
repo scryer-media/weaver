@@ -48,6 +48,7 @@
 // > same order (peers one first, then the global one).
 
 pub(crate) mod choker;
+mod hash_fetch;
 pub mod peer;
 pub mod peers;
 pub mod stats;
@@ -94,7 +95,7 @@ use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     connection_slots::ConnectionSlot,
-    file_ops::FileOps,
+    file_ops::{FileOps, Verdict, inconsistent_hashes},
     limits::LimitKind,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
@@ -209,6 +210,7 @@ pub struct TorrentStateLive {
 
     finished_notify: Notify,
     new_pieces_notify: Arc<Notify>,
+    layer_fetch: hash_fetch::LayerFetch,
     // Whether every wanted piece was already present when this run began.
     finished_at_start: bool,
 
@@ -293,6 +295,7 @@ impl TorrentStateLive {
                 paused.shared.options.peer_limit.unwrap_or(128),
             )),
             new_pieces_notify: Arc::new(Notify::new()),
+            layer_fetch: hash_fetch::LayerFetch::new(paused.metadata.v2.as_ref()),
             finished_notify: Notify::new(),
             finished_at_start,
             down_speed_estimator,
@@ -527,6 +530,7 @@ impl TorrentStateLive {
             addr: checked_peer.addr,
             incoming: true,
             on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
@@ -543,7 +547,7 @@ impl TorrentStateLive {
         };
         let peer_connection = PeerConnection::new(
             checked_peer.addr,
-            self.shared.info_hash,
+            self.shared.info_hashes,
             self.shared.peer_id,
             &handler,
             Some(options),
@@ -589,6 +593,7 @@ impl TorrentStateLive {
             addr,
             incoming: false,
             on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
             state: state.clone(),
             tx,
@@ -606,7 +611,7 @@ impl TorrentStateLive {
         };
         let peer_connection = PeerConnection::new(
             addr,
-            state.shared.info_hash,
+            state.shared.info_hashes,
             state.shared.peer_id,
             &handler,
             Some(options),
@@ -744,7 +749,11 @@ impl TorrentStateLive {
         self.shared.peer_id
     }
     pub(crate) fn file_ops(&self) -> FileOps<'_> {
-        FileOps::new(&self.metadata.info, &*self.files, &self.metadata.file_infos)
+        FileOps::new(
+            &self.metadata,
+            &*self.files,
+            self.shared.options.disable_v1_hashes,
+        )
     }
 
     pub(crate) fn lock_read(
@@ -1125,6 +1134,9 @@ struct PeerHandler {
     // is received.
     on_bitfield_notify: Notify,
 
+    // The peer speaks v2 on this connection, and so exchanges hashes.
+    speaks_v2: AtomicBool,
+
     addr: SocketAddr,
     incoming: bool,
     tx: PeerTx,
@@ -1180,6 +1192,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 trace!("keepalive received");
             }
             Message::Have(h) => self.on_have(h),
+            Message::Hashes(hashes) => self.on_hashes(hashes).context("on_hashes")?,
+            Message::HashReject(request) => self.on_hash_reject(request),
+            Message::HashRequest(request) => {
+                self.on_hash_request(request).context("on_hash_request")?
+            }
             Message::NotInterested => self
                 .state
                 .choker
@@ -1233,7 +1250,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Ok(len)
     }
 
-    fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()> {
+    fn on_handshake(
+        &self,
+        handshake: Handshake,
+        ckind: ConnectionKind,
+        speaks_v2: bool,
+    ) -> anyhow::Result<()> {
+        self.speaks_v2.store(speaks_v2, Ordering::Relaxed);
         self.state.set_peer_live(self.addr, handshake, ckind);
         Ok(())
     }
@@ -1365,6 +1388,7 @@ impl PeerHandler {
             }
         };
         let prev = pe.value_mut().take_state(peers);
+        self.state.layer_fetch.forget(handle);
 
         // Whether the connection held an upload slot, when it was live. The
         // choker hears of it once the peer table is let go: it takes its own
@@ -1475,7 +1499,11 @@ impl PeerHandler {
                         priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                         file_priorities,
                         file_infos: &self.state.metadata.file_infos,
-                        peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
+                        // Only a piece that can be checked once it arrives.
+                        peer_has_piece: |p| {
+                            bf.get(p.get() as usize).map(|v| *v) == Some(true)
+                                && self.state.metadata.can_verify(p)
+                        },
                         can_steal: |p| {
                             self.state.per_piece_locks[p.get_usize()]
                                 .try_write()
@@ -1683,12 +1711,14 @@ impl PeerHandler {
     }
 
     // The job of this is to request chunks, time out the requests the peer
-    // does not answer, and also to keep peer alive.
+    // does not answer, fetch the piece layers a v2 torrent lacks, and also
+    // to keep peer alive.
     // The moment this ends, the peer is disconnected.
     async fn task_peer_chunk_requester(&self) -> crate::Result<()> {
         tokio::select! {
             r = self.request_chunks() => r,
             r = self.time_out_requests() => r,
+            r = self.fetch_layers() => r,
         }
     }
 
@@ -2096,7 +2126,10 @@ impl PeerHandler {
                 .check_piece(chunk_info.piece_index)
                 .with_context(|| format!("error checking piece={index}"))?
             {
-                true => {
+                Verdict::Inconsistent => {
+                    return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
+                }
+                Verdict::Passed => {
                     {
                         let mut g = state.lock_write("mark_piece_downloaded");
                         g.get_pieces_mut()?
@@ -2136,7 +2169,7 @@ impl PeerHandler {
 
                     state.transmit_haves(chunk_info.piece_index);
                 }
-                false => {
+                Verdict::Failed | Verdict::Unknown => {
                     warn!(
                         id = state.shared.id,
                         info_hash = ?state.shared.info_hash,

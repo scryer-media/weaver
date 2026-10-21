@@ -12,9 +12,13 @@ use std::{
 };
 
 use crate::buffers::{ByteBuf, ByteBufOwned};
-use crate::core::{hash_id::Id20, lengths::ChunkInfo, peer_id::try_decode_peer_id};
+use crate::core::{
+    hash_id::{Id20, InfoHashes},
+    lengths::ChunkInfo,
+    peer_id::try_decode_peer_id,
+};
 use crate::peer_protocol::{
-    Handshake, MAX_MSG_LEN, Message,
+    Handshake, Hashes, MAX_MSG_LEN, Message,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
@@ -39,7 +43,13 @@ pub trait PeerConnectionHandler {
     fn on_connected(&self, _connection_time: Duration) {}
     fn should_send_bitfield(&self) -> bool;
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
-    fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()>;
+    /// `speaks_v2`: the peer speaks BEP 52, so it may exchange hashes.
+    fn on_handshake(
+        &self,
+        handshake: Handshake,
+        ckind: ConnectionKind,
+        speaks_v2: bool,
+    ) -> anyhow::Result<()>;
     fn on_extended_handshake(
         &self,
         extended_handshake: &ExtendedHandshake<ByteBuf>,
@@ -69,6 +79,7 @@ pub enum WriterRequest {
     Message(Message<'static>),
     UtMetadata(UtMetadata<ByteBufOwned>),
     UtPex(UtPex<ByteBufOwned>),
+    Hashes(Hashes<ByteBufOwned>),
     ReadChunkRequest(ChunkInfo),
     Disconnect(anyhow::Result<()>),
 }
@@ -120,7 +131,7 @@ mod optional_seconds {
 pub(crate) struct PeerConnection<H> {
     handler: H,
     addr: SocketAddr,
-    info_hash: Id20,
+    info_hashes: InfoHashes,
     peer_id: Id20,
     options: PeerConnectionOptions,
     spawner: BlockingSpawner,
@@ -140,6 +151,7 @@ pub(crate) async fn with_timeout<T>(
 
 struct ManagePeerArgs {
     handshake_supports_extended: bool,
+    speaks_v2: bool,
     read_buf: ReadBuf,
     write_buf: Box<[u8; MAX_MSG_LEN]>,
     read: BoxAsyncReadVectored,
@@ -150,7 +162,7 @@ struct ManagePeerArgs {
 impl<H: PeerConnectionHandler> PeerConnection<H> {
     pub fn new(
         addr: SocketAddr,
-        info_hash: Id20,
+        info_hashes: InfoHashes,
         peer_id: Id20,
         handler: H,
         options: Option<PeerConnectionOptions>,
@@ -160,7 +172,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         PeerConnection {
             handler,
             addr,
-            info_hash,
+            info_hashes,
             peer_id,
             spawner,
             options: options.unwrap_or_default(),
@@ -182,7 +194,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .read_write_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
 
-        if incoming.handshake.info_hash != self.info_hash {
+        // A peer speaks v2 when it greets with the truncated v2 hash or
+        // offers v2, which a torrent without v2 refuses (libtorrent
+        // `bt_peer_connection::on_receive_handshake`).
+        let greeted = incoming.handshake.info_hash;
+        let speaks_v2 = self.info_hashes.is_v2(greeted) || incoming.handshake.offers_v2();
+        if !self.info_hashes.answers_to(greeted) || (speaks_v2 && self.info_hashes.v2.is_none()) {
             return Err(Error::WrongInfoHash);
         }
 
@@ -196,7 +213,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         );
 
         let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-        let my_handshake = Handshake::new(self.info_hash, self.peer_id);
+        let my_handshake = self.greeting(speaks_v2);
         let hlen = my_handshake.serialize_unchecked_len(&mut *write_buf);
         with_timeout(
             "writing handshake",
@@ -212,11 +229,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let handshake_supports_extended = incoming.handshake.supports_extended();
 
         self.handler
-            .on_handshake(incoming.handshake, incoming.kind)
+            .on_handshake(incoming.handshake, incoming.kind, speaks_v2)
             .map_err(Error::Anyhow)?;
 
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
+            speaks_v2,
             read_buf: incoming.read_buf,
             write_buf,
             read: incoming.reader,
@@ -241,7 +259,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .unwrap_or_else(|| Duration::from_secs(10));
 
         let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-        let handshake = Handshake::new(self.info_hash, self.peer_id);
+        // Every peer is greeted as v1 first, which a hybrid's v2 peers
+        // answer too (libtorrent `peer_connection::associated_info_hash`).
+        let handshake = self.greeting(false);
+        let greeting = handshake.info_hash;
         let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
 
         // Connecting includes sending our handshake: an encrypted connection
@@ -251,7 +272,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connector
             .connect_and_send_handshake(
                 self.addr,
-                &self.info_hash,
+                &greeting,
                 &write_buf[..hsz],
                 connect_timeout,
                 rwtimeout,
@@ -269,18 +290,24 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 decoded_id=?try_decode_peer_id(h.peer_id),
                 "connected",
             );
-            if h.info_hash != self.info_hash {
+            if !self.info_hashes.accepts_answer(greeting, h.info_hash) {
                 return Err(Error::WrongInfoHash);
             }
+            // Only the hash it answers with says the peer speaks v2
+            // (libtorrent `bt_peer_connection::on_receive_handshake`).
+            let speaks_v2 = self.info_hashes.is_v2(h.info_hash);
 
             if h.peer_id == self.peer_id {
                 return Err(Error::ConnectingToOurselves);
             }
 
-            self.handler.on_handshake(h, ckind).map_err(Error::Anyhow)?;
+            self.handler
+                .on_handshake(h, ckind, speaks_v2)
+                .map_err(Error::Anyhow)?;
 
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
+                speaks_v2,
                 read_buf,
                 write_buf,
                 read,
@@ -293,9 +320,18 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         .await
     }
 
+    /// Our handshake: the hash of the protocol the peer speaks, offering
+    /// v2 to a peer that does not speak it when the torrent has v2
+    /// (libtorrent `bt_peer_connection::write_handshake`).
+    fn greeting(&self, speaks_v2: bool) -> Handshake {
+        Handshake::new(self.info_hashes.for_peer(speaks_v2), self.peer_id)
+            .offering_v2(!speaks_v2 && self.info_hashes.v2.is_some())
+    }
+
     async fn manage_peer(&self, args: ManagePeerArgs) -> Result<()> {
         let ManagePeerArgs {
             handshake_supports_extended,
+            speaks_v2,
             mut read_buf,
             mut write_buf,
             mut read,
@@ -384,6 +420,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
                             .serialize(&mut *write_buf, ext_msg_ids)?
                     }
+                    WriterRequest::Hashes(hashes) => Message::Hashes(hashes.as_borrowed())
+                        .serialize(&mut *write_buf, ext_msg_ids)?,
                     WriterRequest::ReadChunkRequest(chunk) => {
                         if !self.handler.claim_upload(&chunk) {
                             trace!(?chunk, "upload taken off the queue before it was sent");
@@ -467,6 +505,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             loop {
                 let message = read_buf.read_message(&mut read, rwtimeout).await?;
                 trace!("received: {:?}", &message);
+                // libtorrent `bt_peer_connection::on_hash_request`, `on_hashes`
+                // and `on_hash_reject` disconnect a peer that does not speak v2.
+                if message.is_v2_only() && !speaks_v2 {
+                    return Err(Error::HashMessageFromV1Peer);
+                }
 
                 tokio::task::yield_now().await;
 

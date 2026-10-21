@@ -147,9 +147,9 @@ impl TorrentStateInitializing {
             .spawner
             .block_in_place_with_semaphore(|| {
                 let fo = crate::file_ops::FileOps::new(
-                    &self.metadata.info,
+                    &self.metadata,
                     &self.files,
-                    &self.metadata.file_infos,
+                    self.shared.options.disable_v1_hashes,
                 );
 
                 let mut to_validate = BF::from_boxed_slice(
@@ -254,10 +254,21 @@ impl TorrentStateInitializing {
         let have_pieces = self
             .shared
             .spawner
-            .block_in_place_with_semaphore(|| {
-                FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos)
-                    .initial_check(&self.checked_bytes, &self.pause_requested)
-            })
+            .block_in_place_with_permits(
+                self.metadata.lengths().total_pieces() as usize,
+                |threads| {
+                    FileOps::new(
+                        &self.metadata,
+                        &self.files,
+                        self.shared.options.disable_v1_hashes,
+                    )
+                    .initial_check(
+                        threads,
+                        &self.checked_bytes,
+                        &self.pause_requested,
+                    )
+                },
+            )
             .await?;
         bitv_factory
             .store_initial_check(id, have_pieces)

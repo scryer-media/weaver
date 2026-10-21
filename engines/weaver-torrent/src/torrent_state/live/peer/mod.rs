@@ -495,6 +495,11 @@ impl LivePeerState {
         added
     }
 
+    /// How long the peer may take to answer a request.
+    pub fn request_timeout(&self) -> Duration {
+        self.block_time.request_timeout()
+    }
+
     /// When the requests outstanding to the peer time out: the peer has gone
     /// its request timeout without delivering a block. None while none are
     /// outstanding.

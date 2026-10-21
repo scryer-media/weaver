@@ -11,12 +11,16 @@ mod error;
 pub mod hash_id;
 pub mod lengths;
 pub mod magnet;
+pub mod merkle;
 pub mod net;
 pub mod peer_id;
 pub mod spawn_utils;
 pub mod speed_estimator;
 pub mod torrent_metainfo;
-pub use hash_id::{Id20, Id32};
+#[cfg(test)]
+pub(crate) mod v2_test_torrent;
+pub mod v2_tree;
+pub use hash_id::{Id20, Id32, InfoHashes};
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;

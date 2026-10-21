@@ -13,7 +13,7 @@ use anyhow::Context;
 use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use tracing::{Instrument, debug, debug_span};
 
-use crate::core::hash_id::Id20;
+use crate::core::hash_id::{Id20, InfoHashes};
 use crate::{
     peer_connection::PeerConnectionOptions, peer_info_reader, spawn_utils::BlockingSpawner,
     stream_connect::StreamConnector,
@@ -36,7 +36,7 @@ pub enum ReadMetainfoResult<Rx> {
 
 pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unpin>(
     peer_id: Id20,
-    info_hash: Id20,
+    info_hashes: InfoHashes,
     initial_addrs: Vec<SocketAddr>,
     addrs_stream: A,
     peer_connection_options: Option<PeerConnectionOptions>,
@@ -57,7 +57,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
             let ret = peer_info_reader::read_metainfo_from_peer(
                 addr,
                 peer_id,
-                info_hash,
+                info_hashes,
                 peer_connection_options,
                 // This shouldn't be called anyway as we aren't reading/writing to disk, so it's
                 // ok not to use a shared one.
@@ -147,7 +147,10 @@ mod tests {
         let peer_id = generate_peer_id(b"-xx1234-");
         match read_metainfo_from_peer_receiver(
             peer_id,
-            info_hash,
+            InfoHashes {
+                v1: Some(info_hash),
+                v2: None,
+            },
             Vec::new(),
             peer_rx,
             None,

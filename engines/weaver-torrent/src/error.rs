@@ -36,6 +36,8 @@ pub enum Error {
 
     #[error("wrong info hash")]
     WrongInfoHash,
+    #[error("a hash message from a peer that does not speak v2")]
+    HashMessageFromV1Peer,
     #[error("connecting to ourselves")]
     ConnectingToOurselves,
 
