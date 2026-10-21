@@ -1838,6 +1838,23 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .fetch_add(connection_time.as_millis() as u64, Ordering::Relaxed);
     }
 
+    fn encrypt_outgoing(&self) -> bool {
+        self.state
+            .peers
+            .with_peer_mut(self.addr, "encrypt_outgoing", |peer| {
+                peer.encrypt_outgoing()
+            })
+            .unwrap_or(true)
+    }
+
+    fn on_outgoing_handshake(&self, encrypted: bool) {
+        self.state
+            .peers
+            .with_peer_mut(self.addr, "outgoing_handshake", |peer| {
+                peer.outgoing_handshake(encrypted)
+            });
+    }
+
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {
         let first = !self.first_message_received.swap(true, Ordering::Relaxed);
         if first {

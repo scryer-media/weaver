@@ -42,6 +42,10 @@ pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
+// libtorrent `peer_connection::fast_reconnect`: the most connections to one
+// peer that may follow a failed encrypted handshake at once, without the
+// wait to reconnect.
+const MAX_FAST_RECONNECTS: u8 = 2;
 // libtorrent `peer_connection::second_tick`: each failure in a row gives the
 // next connection to the peer this much longer to open.
 const CONNECT_TIMEOUT_PER_FAILURE: Duration = Duration::from_secs(3);
@@ -270,6 +274,18 @@ pub(crate) struct Peer {
     // When its last connection closed, failed or not (libtorrent
     // `torrent_peer::last_connected`, set in `peer_list::connection_closed`).
     last_connected: Option<Instant>,
+    // Whether the next connection we make to the peer tries the encrypted
+    // handshake where encryption is preferred: the method the peer last
+    // completed one with, encrypted until it has (libtorrent
+    // `torrent_peer::pe_support`).
+    encrypt: bool,
+    // The connections to the peer that followed a failed encrypted
+    // handshake at once (libtorrent `torrent_peer::fast_reconnects`).
+    fast_reconnects: u8,
+    // The connection being made tries the encrypted handshake, and the
+    // next follows at once if it does not complete it (libtorrent
+    // `peer_connection::m_fast_reconnect`).
+    fast_reconnect: bool,
     // When the choker last gave the peer the optimistic slot, on any
     // connection to it.
     pub last_optimistic_unchoke: Option<Instant>,
@@ -307,6 +323,9 @@ impl Peer {
             failcount: 0,
             upload_only: false,
             last_connected: None,
+            encrypt: true,
+            fast_reconnects: 0,
+            fast_reconnect: false,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
             supports_holepunch: false,
@@ -325,6 +344,9 @@ impl Peer {
             failcount: 0,
             upload_only: false,
             last_connected: None,
+            encrypt: true,
+            fast_reconnects: 0,
+            fast_reconnect: false,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
             supports_holepunch: false,
@@ -475,10 +497,38 @@ impl Peer {
         self.failcount = 0;
     }
 
+    /// Whether the connection we are making to the peer, its transport just
+    /// open where encryption is preferred, tries the encrypted handshake.
+    /// The next tries the other method unless this one completes its
+    /// handshake, and follows at once when an encrypted one does not, at
+    /// most [`MAX_FAST_RECONNECTS`] times (libtorrent
+    /// `bt_peer_connection::on_connected`, `peer_connection::fast_reconnect`).
+    pub(crate) fn encrypt_outgoing(&mut self) -> bool {
+        let encrypt = self.encrypt;
+        self.encrypt = !encrypt;
+        self.fast_reconnect = encrypt && self.fast_reconnects < MAX_FAST_RECONNECTS;
+        encrypt
+    }
+
+    /// The connection we made to the peer completed its handshake, the
+    /// encrypted one when `encrypted`: the next tries that method again
+    /// (libtorrent `bt_peer_connection::on_receive_handshake`, and the
+    /// encrypted handshake's last step).
+    pub(crate) fn outgoing_handshake(&mut self, encrypted: bool) {
+        self.encrypt = encrypted;
+        self.fast_reconnect = false;
+        if let Some(live) = self.get_live_mut() {
+            live.encrypted = encrypted;
+        }
+    }
+
     /// Settles the peer after its connection closed at `closed_at`, in an
     /// error when `failed`; `needed` says whether we still want the peer.
     /// Every close starts the wait to reconnect, and a failure lengthens it
-    /// (libtorrent `peer_list::connection_closed`).
+    /// (libtorrent `peer_list::connection_closed`), but for an encrypted
+    /// handshake that did not complete: its close is dated back by the
+    /// longest wait a candidate has, so the next connection is due at once
+    /// (libtorrent `peer_connection::fast_reconnect`).
     pub(crate) fn connection_closed(
         &mut self,
         closed_at: Instant,
@@ -486,7 +536,12 @@ impl Peer {
         needed: bool,
         counters: &PeerStates,
     ) {
-        self.last_connected = Some(closed_at);
+        self.last_connected = if std::mem::take(&mut self.fast_reconnect) {
+            self.fast_reconnects += 1;
+            closed_at.checked_sub(MIN_RECONNECT_TIME * MAX_FAILCOUNT)
+        } else {
+            Some(closed_at)
+        };
         if failed {
             self.failcount = self.failcount.saturating_add(1);
         }
@@ -555,6 +610,9 @@ impl Peer {
             failcount: self.failcount,
             upload_only: self.upload_only,
             last_connected: self.last_connected,
+            encrypt: self.encrypt,
+            fast_reconnects: self.fast_reconnects,
+            fast_reconnect: false,
             last_optimistic_unchoke: self.last_optimistic_unchoke,
             trust: self.trust,
             supports_holepunch: self.supports_holepunch,
@@ -912,6 +970,10 @@ pub(crate) struct LivePeerState {
     // The pieces the peer suggested, the latest first (libtorrent
     // `m_suggested_pieces`).
     pub suggested: Vec<ValidPieceIndex>,
+
+    // The connection completed the encrypted handshake (libtorrent
+    // `bt_peer_connection::supports_encryption`, `m_encrypted`).
+    pub encrypted: bool,
 }
 
 /// Why a request the peer sent us is not queued.
@@ -983,6 +1045,7 @@ impl LivePeerState {
             allowed_fast_to_peer: None,
             allowed_fast_from_peer: Vec::new(),
             suggested: Vec::new(),
+            encrypted: false,
         }
     }
 

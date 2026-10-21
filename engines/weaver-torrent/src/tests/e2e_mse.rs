@@ -120,7 +120,7 @@ async fn assert_downloads_encrypted(
     let stats = encryption_stats(&d.session);
     assert!(stats.rc4 >= 1, "{stats:?}");
     assert_eq!(stats.failures, 0, "{stats:?}");
-    assert_eq!(stats.plaintext_fallbacks, 0, "{stats:?}");
+    assert_eq!(stats.plaintext, 0, "{stats:?}");
     Ok(())
 }
 
@@ -147,7 +147,7 @@ async fn test_require_downloader_against_disabled_seeder_is_refused() -> anyhow:
     let stats = encryption_stats(&d.session);
     assert_eq!(stats.rc4, 0, "{stats:?}");
     assert_eq!(stats.header_only, 0, "{stats:?}");
-    assert_eq!(stats.plaintext_fallbacks, 0, "{stats:?}");
+    assert_eq!(stats.plaintext, 0, "{stats:?}");
     assert_eq!(d.handle.stats().progress_bytes, 0);
     assert!(d.storage.log.written_pieces().is_empty());
 
@@ -164,6 +164,7 @@ async fn test_require_downloader_against_disabled_seeder_is_refused() -> anyhow:
             Transports::Any,
             &info_hash,
             &hs[..len],
+            || unreachable!("encryption is required, so nothing is asked"),
             Duration::MAX,
             Duration::MAX,
         )
@@ -177,8 +178,12 @@ async fn test_require_downloader_against_disabled_seeder_is_refused() -> anyhow:
     Ok(())
 }
 
+// libtorrent `bt_peer_connection::on_connected` and
+// `peer_connection::fast_reconnect`: the encrypted handshake the seeder
+// refuses ends that connection, and the next one, made at once, tries
+// plaintext.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_prefer_downloader_against_disabled_seeder_falls_back() -> anyhow::Result<()> {
+async fn test_prefer_downloader_tries_plaintext_against_disabled_seeder() -> anyhow::Result<()> {
     setup_test_logging();
     let t = TestTorrent::new("test_mse_prefer_vs_disabled", FILE_SIZE, PIECE_LENGTH).await?;
     let (_seeder, seeder_addr) = seed(&t, EncryptionPolicy::Disabled).await?;
@@ -192,6 +197,6 @@ async fn test_prefer_downloader_against_disabled_seeder_falls_back() -> anyhow::
     let stats = encryption_stats(&d.session);
     assert_eq!(stats.rc4, 0, "{stats:?}");
     assert!(stats.failures >= 1, "{stats:?}");
-    assert_eq!(stats.plaintext_fallbacks, stats.failures, "{stats:?}");
+    assert!(stats.plaintext >= 1, "{stats:?}");
     Ok(())
 }

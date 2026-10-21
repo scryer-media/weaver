@@ -2088,4 +2088,136 @@ mod tests {
             }
         }
     }
+
+    /// How an outgoing connection in [`attempt_at`] ends.
+    #[derive(Clone, Copy)]
+    enum Ends {
+        /// Its handshake completes, and we close it later.
+        Completed,
+        /// Its handshake does not complete: the peer refuses it.
+        Failed,
+        /// We close it before its handshake completes.
+        Closed,
+    }
+
+    // Connects to `addr`, due at `at`, where encryption is preferred: asks
+    // which handshake the connection tries, which ends as `ends` says, at
+    // `at`. Returns whether it tried the encrypted handshake.
+    fn attempt_at(peers: &PeerStates, addr: SocketAddr, at: Instant, ends: Ends) -> bool {
+        peers
+            .with_peer_mut(addr, "test", |peer| {
+                peer.connect_if_due(at, peers).expect("a due candidate");
+                let encrypted = peer.encrypt_outgoing();
+                if let Ends::Completed = ends {
+                    peer.connecting_to_live(Id20::default(), peers, ConnectionKind::Tcp);
+                    peer.outgoing_handshake(encrypted);
+                }
+                peers.connection_closed(peer, at, matches!(ends, Ends::Failed), true);
+                encrypted
+            })
+            .unwrap()
+    }
+
+    // When the peer is due again after a connection closed at `at`.
+    fn due_after(peers: &PeerStates, at: Instant) -> Instant {
+        match peers.next_candidate(at) {
+            NextCandidate::Due => at,
+            NextCandidate::At(due) => due,
+            NextCandidate::None => panic!("no candidate"),
+        }
+    }
+
+    // libtorrent `bt_peer_connection::on_connected` and
+    // `peer_connection::fast_reconnect`: an encrypted handshake that fails
+    // leaves `pe_support` pointing at plaintext, and the next connection
+    // tries it at once, not held by the wait to reconnect. A plaintext one
+    // that fails waits as any failure does, and points back at encryption.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_encrypted_handshake_is_followed_at_once_by_a_plaintext_one() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        let t0 = Instant::now();
+
+        assert!(attempt_at(&peers, a, t0, Ends::Failed));
+        assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
+        assert!(!attempt_at(&peers, a, t0, Ends::Failed));
+        assert_eq!(
+            peers.next_candidate(t0),
+            NextCandidate::At(t0 + reconnect_wait(2))
+        );
+        assert!(attempt_at(
+            &peers,
+            a,
+            t0 + reconnect_wait(2),
+            Ends::Completed
+        ));
+    }
+
+    // libtorrent `bt_peer_connection::on_receive_handshake` and the
+    // encrypted handshake's last step set `pe_support` to the method that
+    // completed: the next connection tries it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_is_tried_again_with_the_handshake_it_last_completed() {
+        let peers = make_peer_states();
+        let (plain, encrypted) = (peer_addr(1), peer_addr(2));
+        let t0 = Instant::now();
+
+        peers.add_peer(plain, PeerSourceFlag::Tracker);
+        assert!(attempt_at(&peers, plain, t0, Ends::Failed));
+        assert!(!attempt_at(&peers, plain, t0, Ends::Completed));
+        let t1 = due_after(&peers, t0);
+        assert!(t1 > t0);
+        assert!(!attempt_at(&peers, plain, t1, Ends::Completed));
+
+        peers.add_peer(encrypted, PeerSourceFlag::Tracker);
+        assert!(attempt_at(&peers, encrypted, t1, Ends::Completed));
+        assert!(attempt_at(
+            &peers,
+            encrypted,
+            t1 + MIN_RECONNECT_TIME,
+            Ends::Completed
+        ));
+    }
+
+    // libtorrent `peer_connection::fast_reconnect` takes effect while
+    // `torrent_peer::fast_reconnects` is under two: a third encrypted
+    // handshake that does not complete waits like any other close.
+    #[tokio::test(start_paused = true)]
+    async fn only_two_connections_follow_an_encrypted_handshake_at_once() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        let mut at = Instant::now();
+        for at_once in [true, true, false] {
+            assert!(attempt_at(&peers, a, at, Ends::Closed));
+            let due = due_after(&peers, at);
+            assert_eq!(due == at, at_once, "{due:?} after {at:?}");
+            at = due;
+            // The plaintext one in between, closed too, waits.
+            assert!(!attempt_at(&peers, a, at, Ends::Closed));
+            assert_eq!(due_after(&peers, at), at + MIN_RECONNECT_TIME);
+            at += MIN_RECONNECT_TIME;
+        }
+    }
+
+    // libtorrent `bt_peer_connection::on_connected` reads and flips
+    // `pe_support` under `pe_enabled` alone: where encryption is required
+    // nothing asks, so a failed connection neither toggles the peer's
+    // method nor is followed at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_asks_nothing_toggles_nothing() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        let t0 = Instant::now();
+        fail_at(&peers, a, t0);
+        fail_at(&peers, a, t0 + reconnect_wait(1));
+        assert_eq!(
+            peers.next_candidate(t0 + reconnect_wait(1)),
+            NextCandidate::At(t0 + reconnect_wait(1) + reconnect_wait(2))
+        );
+        let tried = peers.with_peer_mut(a, "test", |peer| peer.encrypt_outgoing());
+        assert_eq!(tried, Some(true));
+    }
 }

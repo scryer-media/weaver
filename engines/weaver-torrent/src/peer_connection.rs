@@ -44,6 +44,17 @@ use crate::{
 
 pub trait PeerConnectionHandler {
     fn on_connected(&self, _connection_time: Duration) {}
+    /// Whether the outgoing connection, its transport just open, tries the
+    /// encrypted handshake where encryption is preferred; asked once per
+    /// connection (libtorrent `bt_peer_connection::on_connected`, by
+    /// `torrent_peer::pe_support`). A handler that remembers nothing of the
+    /// peer tries it.
+    fn encrypt_outgoing(&self) -> bool {
+        true
+    }
+    /// The outgoing connection completed its handshake, the encrypted one
+    /// when `encrypted` holds.
+    fn on_outgoing_handshake(&self, _encrypted: bool) {}
     fn should_send_bitfield(&self) -> bool;
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
     /// `speaks_v2`: the peer speaks BEP 52, so it may exchange hashes.
@@ -427,13 +438,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
         let now = Instant::now();
-        let (ckind, mut read, write, meter) = self
+        let (ckind, mut read, write, meter, encrypted) = self
             .connector
             .connect_and_send_handshake(
                 self.addr,
                 self.transports,
                 &greeting,
                 &write_buf[..hsz],
+                || self.handler.encrypt_outgoing(),
                 connect_timeout,
                 handshake_timeout,
             )
@@ -467,6 +479,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.handler
                 .on_handshake(h, ckind, speaks_v2)
                 .map_err(Error::Anyhow)?;
+            // The peer answered, so the method this connection tried works
+            // with it (libtorrent `bt_peer_connection::on_receive_handshake`).
+            self.handler.on_outgoing_handshake(encrypted);
 
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
