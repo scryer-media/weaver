@@ -2069,7 +2069,7 @@ mod v2 {
             let pieces: usize = torrent
                 .files
                 .iter()
-                .map(|(_, data)| data.len().div_ceil(PIECE as usize))
+                .map(|(_, data)| data.len().div_ceil(torrent.piece_length as usize))
                 .sum();
             let have = BF::from_boxed_slice(vec![0u8; pieces.div_ceil(8)].into_boxed_slice());
             let handle = session
@@ -2177,7 +2177,7 @@ mod v2 {
                 Duration::ZERO,
                 tokio::time::Instant::now()
             ),
-            Pick::Done
+            Pick::Wait(None)
         ));
     }
 
@@ -2340,6 +2340,176 @@ mod v2 {
                 "{bad:?}"
             );
         }
+    }
+
+    /// A v2 torrent, a hybrid when `hybrid` holds, of one file of two
+    /// four-block pieces, with its layers.
+    fn two_pieces(hybrid: bool) -> V2TestTorrent {
+        let mut torrent = V2TestTorrent::new(
+            vec![("a", payload(2 * PIECE_LENGTH as usize, 3))],
+            u64::from(PIECE_LENGTH),
+        );
+        torrent.hybrid = hybrid;
+        torrent
+    }
+
+    /// The leaves under piece `index` of `torrent`'s file, as the
+    /// answer to the request for them carries them.
+    fn leaves(torrent: &V2TestTorrent, index: u32) -> Vec<Id32> {
+        let start = (index * PIECE_LENGTH) as usize;
+        torrent.files[0].1[start..start + PIECE_LENGTH as usize]
+            .chunks(CHUNK_SIZE as usize)
+            .map(merkle::hash_block)
+            .collect()
+    }
+
+    // libtorrent torrent::piece_failed asks for the block hashes of a v2
+    // piece whose bad blocks are not known (verify_block_hashes); once they
+    // come, hash_picker::add_hashes names the blocks that differ, and
+    // torrent::piece_failed penalises their senders alone, as known bad
+    // (penalize_peers). Weaver blames no one before.
+    async fn the_leaves_of_a_failed_v2_piece_blame_only_its_bad_blocks_sender(hybrid: bool) {
+        let torrent = two_pieces(hybrid);
+        let h = Harness::v2("leaves_blame_bad_blocks", &torrent).await;
+        tokio::time::pause();
+        let (bad, mut bad_rx) = h.peer("127.0.0.1:6881");
+        let (good, mut good_rx) = h.peer("127.0.0.2:6881");
+
+        // `bad` sends the first half, its second block corrupt, `good` the
+        // second: the piece fails, is downloaded again, and no one is
+        // blamed yet.
+        h.fail_shared(&bad, &good).await;
+        for peer in [&bad, &good] {
+            assert_eq!(h.trust(peer), (0, 0, false));
+            assert!(!h.banned(peer));
+        }
+        assert_eq!(
+            h.get_failed_bytes(),
+            u64::from(PIECE_LENGTH),
+            "the whole piece counts as corrupt"
+        );
+
+        // A peer that speaks v2 is asked for the piece's leaves, proven to
+        // its node of the tree.
+        let (v2_peer, mut v2_rx) = h.peer_speaking("127.0.0.3:6881", true);
+        let mut fetch: Task<'_> = Box::pin(v2_peer.fetch_layers());
+        let request = next_hash_request(&mut fetch, &mut v2_rx).await;
+        assert_eq!(
+            request.root,
+            file_hashes(&torrent.files[0].1, PIECE_LENGTH.into())
+                .0
+                .unwrap()
+        );
+        assert_eq!(shape(request), (0, 0, CHUNKS_PER_PIECE, 1));
+
+        // Leaves that do not prove the piece drop the peer, and blame no
+        // one.
+        let mut wrong = leaves(&torrent, 0);
+        wrong[1] = merkle::hash_block(b"wrong");
+        assert!(
+            v2_peer
+                .on_hashes(Hashes::new(request, &wrong).as_borrowed())
+                .is_err()
+        );
+        assert_eq!(h.trust(&bad), (0, 0, false));
+        h.layer_fetch.forget(v2_peer.addr);
+
+        // The leaves come: the sender of the block that differs is
+        // penalised and banned; the other keeps its standing.
+        let (other, mut other_rx) = h.peer_speaking("127.0.0.4:6881", true);
+        let mut other_fetch: Task<'_> = Box::pin(other.fetch_layers());
+        assert_eq!(
+            next_hash_request(&mut other_fetch, &mut other_rx).await,
+            request
+        );
+        other
+            .on_hashes(Hashes::new(request, &leaves(&torrent, 0)).as_borrowed())
+            .unwrap();
+        assert_eq!(h.trust(&bad), (-2, 1, true));
+        assert!(h.banned(&bad) && told_to_disconnect(&mut bad_rx));
+        assert_eq!(h.trust(&good), (0, 0, false));
+        assert!(!h.banned(&good) && !told_to_disconnect(&mut good_rx));
+
+        // The leaves are wanted no more.
+        assert!(matches!(
+            h.layer_fetch.pick(
+                other.addr,
+                |_| true,
+                Duration::ZERO,
+                tokio::time::Instant::now()
+            ),
+            Pick::Wait(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_leaves_of_a_failed_v2_piece_blame_only_the_sender_of_its_bad_block() {
+        the_leaves_of_a_failed_v2_piece_blame_only_its_bad_blocks_sender(false).await;
+    }
+
+    #[tokio::test]
+    async fn the_leaves_of_a_failed_hybrid_piece_blame_only_the_sender_of_its_bad_block() {
+        the_leaves_of_a_failed_v2_piece_blame_only_its_bad_blocks_sender(true).await;
+    }
+
+    // No peer gave the leaves before the piece passed: the good copy names
+    // the sender of the bad block, as the smart ban does, and the leaves
+    // are wanted no more.
+    #[tokio::test]
+    async fn a_failed_v2_piece_that_passes_before_its_leaves_come_blames_by_the_good_copy() {
+        let torrent = two_pieces(false);
+        let h = Harness::v2("passes_before_leaves", &torrent).await;
+        tokio::time::pause();
+        let (bad, _bad_rx) = h.peer("127.0.0.1:6881");
+        let (good, _good_rx) = h.peer("127.0.0.2:6881");
+        let (third, _third_rx) = h.peer("127.0.0.3:6881");
+        h.fail_shared(&bad, &good).await;
+
+        h.take(&third, 0);
+        for chunk in 0..CHUNKS_PER_PIECE {
+            h.send(&third, (0, chunk), false).await.unwrap();
+        }
+        assert!(h.missing_chunks(0).is_empty());
+        assert!(h.banned(&bad));
+        assert!(!h.banned(&good) && !h.banned(&third));
+        assert_eq!(h.trust(&good), (0, 0, false));
+        let (v2_peer, _rx) = h.peer_speaking("127.0.0.4:6881", true);
+        assert!(matches!(
+            h.layer_fetch.pick(
+                v2_peer.addr,
+                |_| true,
+                Duration::ZERO,
+                tokio::time::Instant::now()
+            ),
+            Pick::Wait(None)
+        ));
+    }
+
+    // libtorrent torrent::piece_failed: a piece one peer sent all of names
+    // that peer, with no block hashes to wait for.
+    #[tokio::test]
+    async fn the_sole_sender_of_a_failed_v2_piece_is_banned_at_once() {
+        let torrent = two_pieces(false);
+        let h = Harness::v2("v2_sole_sender", &torrent).await;
+        tokio::time::pause();
+        let (peer, mut rx) = h.peer("127.0.0.1:6881");
+        h.take(&peer, 0);
+        for chunk in 0..CHUNKS_PER_PIECE {
+            h.send(&peer, (0, chunk), chunk == 2).await.unwrap();
+        }
+        assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+        assert_eq!(h.trust(&peer), (-2, 1, true));
+        assert!(h.banned(&peer) && told_to_disconnect(&mut rx));
+        let (v2_peer, _rx) = h.peer_speaking("127.0.0.2:6881", true);
+        assert!(matches!(
+            h.layer_fetch.pick(
+                v2_peer.addr,
+                |_| true,
+                Duration::ZERO,
+                tokio::time::Instant::now()
+            ),
+            Pick::Wait(None)
+        ));
     }
 
     #[tokio::test]
