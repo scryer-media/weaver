@@ -23,7 +23,7 @@ pub(crate) mod source;
 pub(crate) mod window;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 use weaver_graph::{ByteRange, NodeId, Pull, Purpose, Seek, Segment, VolumeIndex, Weight};
 

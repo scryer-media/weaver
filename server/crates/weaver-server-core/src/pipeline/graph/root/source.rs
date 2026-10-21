@@ -13,9 +13,11 @@
 
 mod durable;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use weaver_graph::{ByteRange, Pull, VolumeIndex};
+
+use super::facts::{Chunk, Marks, of_boundary, of_ordinal};
 
 // How soon an article is fetched, soonest first: the download queue's
 // dispatch classes, with the unlock window's draw order inside its own.
@@ -81,6 +83,11 @@ struct Volume {
     // The articles carry no position of their own, so the volume can only
     // be placed in order, from the front.
     ordered_only: bool,
+    // The ordinals of the articles arrived at each decoded start. The last
+    // of them holds the segments from that start to the next one.
+    starts: BTreeMap<u64, BTreeSet<u32>>,
+    // The chunks of the volume's facts each change touched.
+    marks: Marks<Chunk>,
 }
 
 impl Volume {
@@ -106,6 +113,83 @@ impl Volume {
             encoded_len: encoded,
             known: BTreeMap::from([(0, 0)]),
             ordered_only: false,
+            starts: BTreeMap::new(),
+            marks: Marks::default(),
+        }
+    }
+
+    // The one way an article's state changes: its chunk is marked, and a
+    // start it gains or loses moves segments between chunks, so the chunk
+    // they leave and the one they join are marked too.
+    fn set_state(&mut self, index: usize, state: State) {
+        let Article {
+            ordinal,
+            state: was,
+            ..
+        } = self.articles[index];
+        if was == state {
+            return;
+        }
+        self.articles[index].state = state;
+        self.marks.mark(Chunk::Articles(of_ordinal(ordinal)));
+        let (from, to) = (start_of(was), start_of(state));
+        if from == to {
+            return;
+        }
+        if let Some(start) = from {
+            self.move_start(start, |held| {
+                held.remove(&ordinal);
+            });
+        }
+        if let Some(start) = to {
+            self.move_start(start, |held| {
+                held.insert(ordinal);
+            });
+        }
+    }
+
+    fn move_start(&mut self, start: u64, change: impl FnOnce(&mut BTreeSet<u32>)) {
+        let before = self.owner(start);
+        let held = self.starts.entry(start).or_default();
+        change(held);
+        if held.is_empty() {
+            self.starts.remove(&start);
+        }
+        let after = self.owner(start);
+        self.marks.mark(Chunk::Segments(before));
+        self.marks.mark(Chunk::Segments(after));
+    }
+
+    // The chunk whose segments part holds a segment starting at `offset`:
+    // that of the article arrived at the greatest start at or before it, the
+    // last ordinal of several at one start, and the first chunk before any.
+    fn owner(&self, offset: u64) -> u32 {
+        self.starts
+            .range(..=offset)
+            .next_back()
+            .and_then(|(_, held)| held.last())
+            .map_or(0, |ordinal| of_ordinal(*ordinal))
+    }
+
+    fn set_class(&mut self, index: usize, class: Class) {
+        let article = &mut self.articles[index];
+        if article.class == class {
+            return;
+        }
+        article.class = class;
+        let chunk = of_ordinal(article.ordinal);
+        self.marks.mark(Chunk::Articles(chunk));
+    }
+
+    fn know(&mut self, boundary: usize, offset: u64) {
+        if self.known.insert(boundary, offset) != Some(offset) {
+            self.marks.mark(Chunk::Known(of_boundary(boundary as u64)));
+        }
+    }
+
+    fn unknow(&mut self, boundary: usize) {
+        if self.known.remove(&boundary).is_some() {
+            self.marks.mark(Chunk::Known(of_boundary(boundary as u64)));
         }
     }
 
@@ -218,8 +302,8 @@ impl Volume {
             if !range.is_empty() {
                 out.push(range);
             }
-            for article in &mut self.articles[start..index] {
-                article.state = State::Lost { damaged: true };
+            for at in start..index {
+                self.set_state(at, State::Lost { damaged: true });
             }
         }
     }
@@ -249,16 +333,16 @@ impl ArticleMap {
         let Some(index) = found.index(ordinal) else {
             return;
         };
-        found.articles[index].state = State::Arrived(Some(range));
-        found.known.insert(index, range.start);
-        found.known.insert(index + 1, range.end);
+        found.set_state(index, State::Arrived(Some(range)));
+        found.know(index, range.start);
+        found.know(index + 1, range.end);
     }
 
     // The file's decoded length, which the first decoded article declares.
     pub(crate) fn set_length(&mut self, volume: VolumeIndex, length: u64) {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
             let end = found.articles.len();
-            found.known.insert(end, length);
+            found.know(end, length);
         }
     }
 
@@ -276,7 +360,7 @@ impl ArticleMap {
         if let Some(index) = found.index(ordinal)
             && found.articles[index].state == State::Waiting
         {
-            found.articles[index].state = State::Lost { damaged: false };
+            found.set_state(index, State::Lost { damaged: false });
         }
     }
 
@@ -284,9 +368,10 @@ impl ArticleMap {
     pub(crate) fn arrived_before(&mut self, mut queued: impl FnMut(VolumeIndex, u32) -> bool) {
         for (index, found) in self.volumes.iter_mut().enumerate() {
             let volume = VolumeIndex(index as u32);
-            for article in &mut found.articles {
+            for at in 0..found.articles.len() {
+                let article = found.articles[at];
                 if article.state == State::Waiting && !queued(volume, article.ordinal) {
-                    article.state = State::Arrived(None);
+                    found.set_state(at, State::Arrived(None));
                 }
             }
         }
@@ -323,12 +408,13 @@ impl ArticleMap {
     pub(crate) fn parked(&mut self, mut held: impl FnMut(VolumeIndex, u32) -> bool) {
         for (index, found) in self.volumes.iter_mut().enumerate() {
             let volume = VolumeIndex(index as u32);
-            for article in &mut found.articles {
+            for at in 0..found.articles.len() {
+                let article = found.articles[at];
                 if article.state == State::Waiting
                     && article.class == Class::Ordinary
                     && held(volume, article.ordinal)
                 {
-                    article.class = Class::Parked;
+                    found.set_class(at, Class::Parked);
                 }
             }
         }
@@ -385,11 +471,11 @@ impl ArticleMap {
         });
         let mut moved = 0;
         for index in covering {
-            let article = &mut found.articles[index];
+            let article = found.articles[index];
             if let Some(class) = class.filter(|class| *class < article.class)
                 && article.state == State::Waiting
             {
-                article.class = class;
+                found.set_class(index, class);
                 self.moves.push(Move {
                     volume,
                     ordinal: article.ordinal,
@@ -410,9 +496,9 @@ impl ArticleMap {
         };
         let covering: Vec<usize> = found.covering(range).collect();
         for index in covering {
-            let article = &mut found.articles[index];
+            let article = found.articles[index];
             if article.state == State::Waiting && article.class >= Class::Ordinary {
-                article.class = Class::Ordinary;
+                found.set_class(index, Class::Ordinary);
                 self.moves.push(Move {
                     volume,
                     ordinal: article.ordinal,
@@ -426,11 +512,12 @@ impl ArticleMap {
     pub(crate) fn sample(&mut self) {
         for index in 0..self.volumes.len() {
             let volume = VolumeIndex(index as u32);
-            let Some(first) = self.volumes[index].articles.first_mut() else {
+            let found = &mut self.volumes[index];
+            let Some(first) = found.articles.first().copied() else {
                 continue;
             };
             if first.state == State::Waiting && Class::FirstArticle < first.class {
-                first.class = Class::FirstArticle;
+                found.set_class(0, Class::FirstArticle);
                 self.moves.push(Move {
                     volume,
                     ordinal: first.ordinal,
@@ -452,5 +539,12 @@ impl ArticleMap {
         moves.sort_by_key(|found| (found.class, found.volume, found.ordinal));
         moves.dedup();
         moves
+    }
+}
+
+fn start_of(state: State) -> Option<u64> {
+    match state {
+        State::Arrived(Some(range)) => Some(range.start),
+        _ => None,
     }
 }

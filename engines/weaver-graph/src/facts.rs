@@ -16,7 +16,9 @@ use crate::tree::NodeId;
 
 mod sealed;
 
-pub use sealed::{Give, Part, Sealed, Shelf, Take, decode_parts, encode_parts};
+pub use sealed::{
+    Change, Give, Part, Sealed, Shelf, Take, decode_parts, encode_changes, encode_parts, stamped,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {

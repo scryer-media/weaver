@@ -28,9 +28,11 @@ use weaver_graph::{
 };
 
 use super::envelope::durable::KeptRecord;
-use super::root::facts::{self, RootFacts, RootFactsError};
+use super::job::GraphJob;
+use super::root::facts::{self, Parts, RootFacts, RootFactsError};
 use crate::jobs::graph_checkpoint::{
-    CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, MemberRow, NodeRow, PartRow, Row,
+    Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, MemberRow, NodeRow,
+    PartRow, Row,
 };
 use crate::jobs::ids::JobId;
 use crate::pipeline::Pipeline;
@@ -48,6 +50,15 @@ pub(crate) struct Snapshot {
     pub(crate) files: BTreeMap<(NodeId, MemberId), FileState>,
     pub(crate) kept: Vec<KeptRecord>,
     // The candidate each node was offered last, by index.
+    pub(crate) passwords: BTreeMap<NodeId, usize>,
+}
+
+// The job's checkpoint apart from the root's facts, which a checkpoint
+// encodes from the root itself.
+pub(crate) struct Records {
+    pub(crate) tree: TreeRecord,
+    pub(crate) files: BTreeMap<(NodeId, MemberId), FileState>,
+    pub(crate) kept: Vec<KeptRecord>,
     pub(crate) passwords: BTreeMap<NodeId, usize>,
 }
 
@@ -80,8 +91,14 @@ pub(crate) struct Pending(Arc<Mutex<Slot>>);
 #[derive(Default)]
 struct Slot {
     root: facts::Encoded,
+    // The root's facts parts as `root` last encoded them, by part: what the
+    // database holds of them once what is queued is written, when it holds
+    // the job at all. They are kept apart from `last`, so a step compares
+    // only the parts it changed.
+    root_parts: BTreeMap<i64, Arc<[u8]>>,
     // `None` until a checkpoint is written or read: what the database holds
-    // of the job is not known, so the next change is the whole job.
+    // of the job is not known, so the next change is the whole job. Every
+    // row but the root's facts parts.
     last: Option<GraphCheckpoint>,
     // The change a queued write takes: `Some` exactly while one is queued.
     queued: Option<Delta>,
@@ -105,10 +122,35 @@ impl Pending {
 
     // Queue what this checkpoint changes; true when a write must be queued
     // to take it.
-    fn put(&self, snapshot: &Snapshot) -> bool {
+    pub(super) fn put(&self, job: &GraphJob) -> bool {
+        let records = job.records();
         let mut slot = self.slot();
-        let rows = rows_with(&mut slot.root, snapshot);
-        let delta = Delta::between(slot.last.as_ref(), &rows);
+        let slot = &mut *slot;
+        let encoding = job.encode_root(&mut slot.root, records.tree.next_node);
+        let rows = rows_of(
+            root_row(encoding.version, encoding.bytes),
+            &records.tree,
+            &records.files,
+            &records.kept,
+            &records.passwords,
+        );
+        let mut delta = Delta::between(slot.last.as_ref(), &rows);
+        let changed = root_parts(&mut slot.root_parts, encoding.parts);
+        if delta.whole {
+            let root = i64::from(NodeId::ROOT.0);
+            delta
+                .parts
+                .extend(slot.root_parts.iter().map(|(part, bytes)| {
+                    let row = PartRow {
+                        node: root,
+                        part: *part,
+                        bytes: Arc::clone(bytes),
+                    };
+                    (row.key(), Some(row))
+                }));
+        } else {
+            delta.parts.extend(changed);
+        }
         slot.last = Some(rows);
         slot.tally.checkpoints += 1;
         slot.tally.rows += delta.rows();
@@ -128,7 +170,7 @@ impl Pending {
         }
     }
 
-    fn take(&self) -> Option<Delta> {
+    pub(super) fn take(&self) -> Option<Delta> {
         self.slot().queued.take()
     }
 
@@ -140,9 +182,21 @@ impl Pending {
         slot.queued = None;
     }
 
-    // The database holds these rows, as a restore read them.
-    pub(crate) fn written(&self, rows: GraphCheckpoint) {
-        self.slot().last = Some(rows);
+    // The database holds these rows, as a restore read them. A job's
+    // checkpoints are one `Pending`, told this before it takes any, so its
+    // encoder has read nothing and the next encoding reads the root whole
+    // and is compared with them.
+    pub(crate) fn written(&self, mut rows: GraphCheckpoint) {
+        let mut slot = self.slot();
+        let root = i64::from(NodeId::ROOT.0);
+        slot.root_parts = rows
+            .parts
+            .iter()
+            .filter(|row| row.node == root)
+            .map(|row| (row.part, Arc::clone(&row.bytes)))
+            .collect();
+        rows.parts.retain(|row| row.node != root);
+        slot.last = Some(rows);
     }
 
     #[cfg(test)]
@@ -158,7 +212,7 @@ impl Pipeline {
             return;
         };
         let pending = graph.pending().clone();
-        if !pending.put(&graph.snapshot()) {
+        if !pending.put(graph) {
             return;
         }
         let writer = pending.clone();
@@ -190,10 +244,57 @@ impl Pipeline {
     }
 }
 
-// Every row of the snapshot, the root's facts encoded afresh.
-#[cfg(test)]
-pub(crate) fn rows(snapshot: &Snapshot) -> GraphCheckpoint {
-    rows_with(&mut facts::Encoded::default(), snapshot)
+// What an encoding of the root changed of the root's facts parts `held`,
+// which it brings up to date: a part counts as changed when its bytes did.
+fn root_parts(held: &mut BTreeMap<i64, Arc<[u8]>>, parts: Parts) -> Changes<PartRow> {
+    let node = i64::from(NodeId::ROOT.0);
+    let mut out = Changes::<PartRow>::new();
+    let mut put = |held: &mut BTreeMap<i64, Arc<[u8]>>, part: i64, bytes: Option<Arc<[u8]>>| {
+        let row = match bytes {
+            Some(bytes) => {
+                let same = held
+                    .get(&part)
+                    .is_some_and(|was| Arc::ptr_eq(was, &bytes) || *was == bytes);
+                if same {
+                    return;
+                }
+                held.insert(part, Arc::clone(&bytes));
+                Some(PartRow { node, part, bytes })
+            }
+            None => {
+                if held.remove(&part).is_none() {
+                    return;
+                }
+                None
+            }
+        };
+        out.insert((node, part), row);
+    };
+    match parts {
+        Parts::All(parts) => {
+            let now: BTreeMap<i64, Arc<[u8]>> = parts
+                .into_iter()
+                .map(|part| (part.key as i64, part.bytes))
+                .collect();
+            let gone: Vec<i64> = held
+                .keys()
+                .filter(|part| !now.contains_key(part))
+                .copied()
+                .collect();
+            for part in gone {
+                put(held, part, None);
+            }
+            for (part, bytes) in now {
+                put(held, part, Some(bytes));
+            }
+        }
+        Parts::Changed(parts) => {
+            for part in parts {
+                put(held, part.key as i64, part.bytes);
+            }
+        }
+    }
+    out
 }
 
 fn part_rows(node: i64, parts: &[Part]) -> impl Iterator<Item = PartRow> + '_ {
@@ -205,15 +306,9 @@ fn part_rows(node: i64, parts: &[Part]) -> impl Iterator<Item = PartRow> + '_ {
     })
 }
 
-// Every row of the snapshot, each table in key order, the root's facts
-// encoded again only where they changed since `root` last encoded them.
-fn rows_with(root: &mut facts::Encoded, snapshot: &Snapshot) -> GraphCheckpoint {
-    let mut out = GraphCheckpoint::default();
-    let (root_version, root_facts, root_parts) = facts::encode(root, &snapshot.root);
-    let root_id = i64::from(NodeId::ROOT.0);
-    out.parts.extend(part_rows(root_id, &root_parts));
-    out.nodes.push(NodeRow {
-        node: root_id,
+fn root_row(version: u16, facts: Vec<u8>) -> NodeRow {
+    NodeRow {
+        node: i64::from(NodeId::ROOT.0),
         parent: None,
         parent_member: None,
         volumes: None,
@@ -221,11 +316,23 @@ fn rows_with(root: &mut facts::Encoded, snapshot: &Snapshot) -> GraphCheckpoint 
         kind: ROOT_KIND.to_owned(),
         state: state_name(NodeState::Live).to_owned(),
         reason: None,
-        facts_version: i64::from(root_version),
-        facts: root_facts,
+        facts_version: i64::from(version),
+        facts,
         winning_password: None,
-    });
-    for node in &snapshot.tree.nodes {
+    }
+}
+
+// Every row but the root's facts parts, each table in key order.
+fn rows_of(
+    root: NodeRow,
+    tree: &TreeRecord,
+    files: &BTreeMap<(NodeId, MemberId), FileState>,
+    kept: &[KeptRecord],
+    passwords: &BTreeMap<NodeId, usize>,
+) -> GraphCheckpoint {
+    let mut out = GraphCheckpoint::default();
+    out.nodes.push(root);
+    for node in &tree.nodes {
         let id = i64::from(node.node.0);
         if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
             let volumes: Vec<(u32, u32)> = node
@@ -246,16 +353,12 @@ fn rows_with(root: &mut facts::Encoded, snapshot: &Snapshot) -> GraphCheckpoint 
                 reason: node.reason.map(|why| why_name(why).to_owned()),
                 facts_version: i64::from(facts.version),
                 facts: facts.bytes.clone(),
-                winning_password: snapshot
-                    .passwords
-                    .get(&node.node)
-                    .map(|index| *index as i64),
+                winning_password: passwords.get(&node.node).map(|index| *index as i64),
             });
             out.parts.extend(part_rows(id, &facts.parts));
         }
         for member in &node.members {
-            let state = snapshot
-                .files
+            let state = files
                 .get(&(node.node, member.member))
                 .copied()
                 .unwrap_or_default();
@@ -293,7 +396,7 @@ fn rows_with(root: &mut facts::Encoded, snapshot: &Snapshot) -> GraphCheckpoint 
             seed: crypt.seed.to_vec(),
         }));
     }
-    for kept in &snapshot.kept {
+    for kept in kept {
         let row = |range: ByteRange, provenance| EnvelopeRow {
             node: i64::from(kept.node.0),
             volume: i64::from(kept.envelope),
