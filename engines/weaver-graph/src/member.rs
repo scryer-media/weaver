@@ -116,6 +116,13 @@ impl Coverage {
         self.runs.values().all(|run| run.provenance.is_verified())
     }
 
+    // Whether any byte in `range` is held as damage: what clean bytes over
+    // it would mend.
+    pub fn damaged(&self, range: ByteRange) -> bool {
+        self.overlapping(range)
+            .any(|run| run.provenance == Provenance::Damaged)
+    }
+
     pub fn damaged_ranges(&self) -> impl Iterator<Item = ByteRange> + '_ {
         self.runs
             .values()
@@ -210,8 +217,9 @@ pub struct Namespace {
     ended: BTreeSet<MemberId>,
 }
 
-// What arrived of a member's first FIRST_BYTES, and where: bytes past a
-// hole are kept, so the front reaches as far as they do once it fills.
+// What arrived of a member's first FIRST_BYTES, and how: bytes past a
+// hole are kept, so the front reaches as far as they do once it fills, and
+// damage is a hole with bytes in it, filled by the repair that replaces it.
 #[derive(Debug, Default)]
 struct Front {
     bytes: Vec<u8>,
@@ -527,9 +535,15 @@ impl Namespace {
     }
 
     // Keep the part of a delivered range that lies in the member's first
-    // FIRST_BYTES. Bytes over what is kept replace it, the way a repair
-    // replaces a damaged first article.
-    pub fn keep_first_bytes(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+    // FIRST_BYTES, with how it arrived. Bytes over what is kept replace it,
+    // the way a repair replaces a damaged first article.
+    pub fn keep_first_bytes(
+        &mut self,
+        member: MemberId,
+        offset: u64,
+        bytes: &[u8],
+        provenance: Provenance,
+    ) {
         if !self.members.contains_key(&member) {
             return;
         }
@@ -547,21 +561,23 @@ impl Namespace {
         front.bytes[start..end].copy_from_slice(&bytes[..end - start]);
         front
             .arrived
-            .write(ByteRange::new(start as u64, end as u64), Provenance::Fresh);
+            .write(ByteRange::new(start as u64, end as u64), provenance);
     }
 
     // The member's front: what arrived contiguous from offset zero, at most
-    // FIRST_BYTES, because a front with a hole in it identifies nothing.
+    // FIRST_BYTES, because a front with a hole in it identifies nothing,
+    // and damage says nothing of what the member is.
     pub fn first_bytes(&self, member: MemberId) -> &[u8] {
         let Some(front) = self.first_bytes.get(&member) else {
             return &[];
         };
-        let reached = front
-            .arrived
-            .runs()
-            .next()
-            .filter(|run| run.range.start == 0)
-            .map_or(0, |run| run.range.end);
+        let mut reached = 0;
+        for run in front.arrived.runs() {
+            if run.range.start != reached || run.provenance == Provenance::Damaged {
+                break;
+            }
+            reached = run.range.end;
+        }
         &front.bytes[..usize::try_from(reached).unwrap_or(0).min(front.bytes.len())]
     }
 
@@ -716,13 +732,27 @@ mod tests {
             .unwrap()
             .coverage
             .write(ByteRange::new(0, bytes.len() as u64), Provenance::Fresh);
-        namespace.keep_first_bytes(member, 0, &bytes);
+        namespace.keep_first_bytes(member, 0, &bytes, Provenance::Fresh);
         let front = std::mem::size_of::<Front>() as u64 + FIRST_BYTES as u64 + run;
         assert_eq!(namespace.resident(member), record + run + front);
         namespace.retract(member);
         assert_eq!(namespace.resident(member), record);
         namespace.remove(member);
         assert_eq!(namespace.resident(member), 0);
+    }
+
+    // A lost first article arrives as damage, zero filled: it is no front,
+    // and what arrived clean past it waits for the repair that fills it.
+    #[test]
+    fn damage_at_the_front_identifies_nothing_until_a_repair_fills_it() {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(600));
+        namespace.keep_first_bytes(member, 0, &[0; 200], Provenance::Damaged);
+        namespace.keep_first_bytes(member, 200, &[7; 400], Provenance::Fresh);
+        assert_eq!(namespace.first_bytes(member), &[]);
+        namespace.keep_first_bytes(member, 0, &[9; 200], Provenance::Repaired);
+        assert_eq!(namespace.first_bytes(member).len(), 600);
+        assert_eq!(namespace.first_bytes(member)[199..201], [9, 7]);
     }
 
     #[test]

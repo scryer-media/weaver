@@ -14,7 +14,7 @@ use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::engines::harness::{JOB, finished};
 use crate::pipeline::tests::engines::restart::stamp_graph;
 
-mod grouping;
+pub(in crate::pipeline::tests) mod grouping;
 mod two_sets;
 
 // What a schedule came to under the graph.
@@ -51,10 +51,21 @@ pub(in super::super) struct GraphOutcome {
 }
 
 // What a post leaves a job under one schedule: the members it can deliver
-// whole, and whether every posted file the schedule damaged can be rebuilt.
+// whole, whether every posted file the schedule damaged can be rebuilt,
+// and the pieces the job holds as plain files when nothing gives it reason
+// to read the post as an archive: no name says so, and no piece whose
+// bytes say so reaches it.
 pub(in super::super) struct Leaves {
     pub(in super::super) deliverable: BTreeSet<String>,
     pub(in super::super) mended: bool,
+    pub(in super::super) files: Option<Files>,
+}
+
+// Pieces a job holds as plain files: how many the post carries to it, and
+// how many of those come whole.
+pub(in super::super) struct Files {
+    pub(in super::super) posted: usize,
+    pub(in super::super) whole: usize,
 }
 
 // What a post is under one schedule: the members its archive holds, and
@@ -104,6 +115,7 @@ pub(in super::super) fn rar_post(
         Leaves {
             deliverable,
             mended,
+            files: None,
         }
     })
 }
@@ -228,7 +240,10 @@ fn loses(interruption: Interruption) -> bool {
 // The one rule set, as the ways a run disagrees with it. The members
 // delivered whole are exactly the deliverable ones. The job is complete
 // when every member is whole and the post mended all the schedule
-// damaged, failed when nothing is whole, and partial otherwise. A job that
+// damaged, failed when nothing is whole, and partial otherwise. A post the
+// job has no reason to read as an archive is files as posted, held to the
+// same rule: complete when every piece came whole, failed when none did,
+// partial otherwise. A job that
 // delivered nothing leaves nothing in its output directory; one that
 // delivered anything moved all of itself there. Only the members and the
 // post's own files are published. Nothing on disk is asked for again. A
@@ -244,6 +259,7 @@ pub(in super::super) fn graph_disagreements(
     let Leaves {
         deliverable,
         mended,
+        files,
     } = &post.leaves;
     let whole: BTreeSet<String> = post
         .members
@@ -251,7 +267,15 @@ pub(in super::super) fn graph_disagreements(
         .filter(|(name, bytes)| outcome.files[*name].as_deref() == Some(bytes.as_slice()))
         .map(|(name, _)| name.clone())
         .collect();
-    let status = if whole.is_empty() {
+    let status = if let Some(files) = files {
+        if files.whole == 0 {
+            matches!(outcome.status, Some(JobStatus::Failed { .. }))
+        } else if files.whole == files.posted {
+            outcome.status == Some(JobStatus::Complete)
+        } else {
+            outcome.status == Some(JobStatus::Partial)
+        }
+    } else if whole.is_empty() {
         matches!(outcome.status, Some(JobStatus::Failed { .. }))
     } else if whole.len() == post.members.len() && *mended {
         outcome.status == Some(JobStatus::Complete)
@@ -260,10 +284,14 @@ pub(in super::super) fn graph_disagreements(
     };
     if !status {
         said.push(format!(
-            "status {:?} with {} of {} members whole, mended={mended}",
+            "status {:?} with {} of {} members whole, mended={mended}, files={}",
             outcome.status,
             whole.len(),
-            post.members.len()
+            post.members.len(),
+            files.as_ref().map_or("none".to_string(), |files| format!(
+                "{} of {} whole",
+                files.whole, files.posted
+            ))
         ));
     }
     if whole != *deliverable {

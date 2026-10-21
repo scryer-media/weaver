@@ -6,6 +6,7 @@
 // member it repeats.
 
 use super::*;
+use crate::deliver::Posted;
 
 const SECOND: u64 = VOLUME_LEN - HEADER;
 
@@ -21,9 +22,11 @@ fn post(
         tree.deliver(
             NodeId::ROOT,
             member,
-            offset,
-            Bytes::from_static(bytes),
-            provenance,
+            Posted {
+                offset,
+                bytes: Bytes::from_static(bytes),
+                provenance,
+            },
             &mut Build,
             &mut effects,
         );

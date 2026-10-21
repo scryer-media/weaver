@@ -59,6 +59,24 @@ pub(super) struct Restarted {
 pub(super) type Inspect<'a> = &'a mut dyn FnMut(&crate::jobs::graph_checkpoint::GraphCheckpoint);
 
 pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) -> Restarted {
+    run_restarting_at(scenario, inspect, Down::Crash, &|_| true).await
+}
+
+// How the pipeline goes down: as a crash drops it, or shut down.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Down {
+    Crash,
+    Shutdown,
+}
+
+// As `run_restarting`, going down as `down` says and only after the articles
+// `at` picks: the nth article asked for the first time, counted from one.
+async fn run_restarting_at(
+    scenario: &Scenario,
+    inspect: Inspect<'_>,
+    down: Down,
+    at: &dyn Fn(usize) -> bool,
+) -> Restarted {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
@@ -94,7 +112,10 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
             // fetches again comes back before the next one, so the run moves.
             // A live run is no reason to wait: the checkpoint describes what
             // is on disk, never how far a run has read.
-            if first {
+            if first && at(requests.len()) {
+                if down == Down::Shutdown {
+                    shut_down(&mut pipeline).await;
+                }
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, inspect).await;
                 restarts += 1;
             }
@@ -198,6 +219,21 @@ fn next_work(pipeline: &mut Pipeline, scenario: &Scenario) -> Option<DownloadWor
         queue.push(work);
     }
     Some(next)
+}
+
+// A shutdown hands every article in flight on to the job, hears every run
+// out on a thread and stops it where it stands: what a run read is on its
+// shelf for the restored job, and nothing of the job is out when the
+// pipeline is down.
+async fn shut_down(pipeline: &mut Pipeline) {
+    pipeline.drain().await;
+    assert!(
+        !pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.awaits_mail()),
+        "the drain left a run or a repair of the job out on its thread"
+    );
 }
 
 // The pipeline goes down with what it held in memory, and a new one restores
@@ -452,8 +488,105 @@ async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
         vec!["lantern beacon/ember.bin".to_string()]
     );
     assert!(restarted.files["lantern beacon/ember.bin"] == body);
-    let said: Vec<String> = restarted
-        .events
+    assert_eq!(
+        repairs_and_end(&restarted.events),
+        ["RepairComplete 1", "JobCompleted"]
+    );
+}
+
+// The job served as `run` serves it, and the pipeline drained and taken down
+// once, the first time a repair of the job is out on a thread. Whether the
+// restored job lent a repair again.
+async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, bool) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    stamp_graph(&pipeline.db);
+    pipeline.admit_graph_job(JOB, Engine::Graph);
+    let mut sent = pipeline.event_tx.subscribe();
+    let mut events = Vec::new();
+    let mut in_memory = BTreeSet::new();
+    let (mut restarted, mut lent_again) = (false, false);
+    let mut quiet = 0;
+    let mut asked = 0usize;
+    loop {
+        while let Some(work) = next_work(&mut pipeline, scenario) {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            asked += 1;
+            serve(&mut pipeline, scenario, article).await;
+        }
+        if finished(&pipeline) {
+            break;
+        }
+        let before = asked;
+        if pipeline.write_buffered_bytes > 0 {
+            pipeline.flush_quiescent_write_backlog().await;
+        }
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        let (awaits_mail, repair_out) = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map_or((false, false), |job| (job.awaits_mail(), job.repair_out()));
+        if repair_out && restarted {
+            lent_again = true;
+        }
+        if repair_out && !restarted {
+            pipeline.drain().await;
+            assert!(
+                !pipeline.graph_jobs[&JOB].awaits_mail(),
+                "the drain left the job's repair out on its thread"
+            );
+            drain(&mut sent, &mut events);
+            (pipeline, sent) =
+                restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;
+            restarted = true;
+            continue;
+        }
+        if awaits_mail {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        if asked == before {
+            quiet += 1;
+            assert!(
+                quiet < 3,
+                "restarted job stalled at {:?}",
+                job_status_for_assert(&pipeline, JOB)
+            );
+        } else {
+            quiet = 0;
+        }
+    }
+    assert!(restarted, "a repair went out before the job finished");
+    let status = job_status_for_assert(&pipeline, JOB);
+    pipeline.db.flush_write_queue().await.unwrap();
+    drain(&mut sent, &mut events);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    let done = RestartedDone {
+        status,
+        files,
+        events,
+    };
+    (done, lent_again)
+}
+
+// What the job announced of its repair and its end, in order.
+fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
+    events
         .iter()
         .filter_map(|event| match event {
             PipelineEvent::RepairComplete {
@@ -465,8 +598,25 @@ async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
             }
             _ => None,
         })
-        .collect();
-    assert_eq!(said, ["RepairComplete 1", "JobCompleted"]);
+        .collect()
+}
+
+// The pipeline goes down while the repair is out on its thread. The drain
+// hears it back, so the checkpoint holds the repair: the restored job applies
+// it once, lends no second one, and finishes.
+#[tokio::test]
+async fn a_job_restarted_while_its_repair_is_out_applies_the_repair_once_with_no_second_loan() {
+    let body = payload(9 * ARTICLE + 21, 71);
+    let posts = with_par2(vec![Post::plain("ember.bin", body.clone())], 2);
+    let (restarted, lent_again) =
+        run_restarted_while_repairing(&Scenario::new(posts).damaged(0, 3)).await;
+    assert!(!lent_again, "the restored job lent the repair again");
+    assert_eq!(restarted.status, Some(JobStatus::Complete));
+    assert!(restarted.files["lantern beacon/ember.bin"] == body);
+    assert_eq!(
+        repairs_and_end(&restarted.events),
+        ["RepairComplete 1", "JobCompleted"]
+    );
 }
 
 #[tokio::test]
@@ -831,6 +981,93 @@ async fn obfuscated_7z_parts_under_par2_restarted_after_every_article_are_bound_
         .framed(20 * 1024)
         .first(&[(0, 0), (0, 1), (1, 1), (1, 0)]);
     restart_row(scenario).await;
+}
+
+// Nameless header-encrypted RAR5 volumes under a PAR2 set that names them,
+// its index posted first, then the second volume ahead of the first. The
+// second is bound to a store of its own, which gives it back once the set
+// renames it, and the store it founds opens the headers before the first
+// volume arrives.
+fn nameless_header_encrypted_second_first() -> Scenario {
+    let body = payload(70_001, 51);
+    let parts = header_encrypted_store_set(
+        "nested/feature.mkv",
+        &body,
+        4,
+        SECRET,
+        HeaderCheck::For(SECRET),
+    );
+    let named: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut set = par2_set("silver.horizon", &named, 2);
+    let mut posts = vec![set.remove(0)];
+    posts.extend(volumes(obfuscate_volumes(&parts)));
+    posts.extend(set);
+    Scenario::new(posts)
+        .framed(64 * 1024)
+        .password(SECRET)
+        .first(&[(0, 0), (2, 0), (1, 0), (3, 0), (4, 0)])
+}
+
+// The run shut down and restored after each article `at` picks finishes as
+// the run that never restarted does, and fetches nothing it had on disk.
+async fn shut_down_after(scenario: Scenario, at: &dyn Fn(usize) -> bool) {
+    let whole = run(&scenario, Engine::Graph).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Shutdown, at).await;
+    assert_restarted(&restarted, &whole);
+}
+
+// A solid RAR5 set in hex-named volumes under a PAR2 set that names them,
+// its index posted first. The engine's run is out over the first volume
+// whenever the pipeline goes down, waiting for bytes of a volume still to
+// come or for the owner of a member still undecided, which nothing brings
+// once the pipeline is down: the drain stops it where it stands, and the
+// restored job reads the volumes back and fetches none again.
+#[tokio::test]
+async fn a_solid_rar5_set_in_hex_names_shut_down_while_its_run_waits_is_read_back() {
+    let parts: Vec<(String, Vec<u8>)> = (1..=4)
+        .map(|part| {
+            let name = format!("rar5_solid_four.part0{part}.rar");
+            let path = format!(
+                "{}/tests/fixtures/extraction_profiles/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            (name, std::fs::read(path).unwrap())
+        })
+        .collect();
+    let named: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut set = par2_set("harbour", &named, 2);
+    let mut posts = vec![set.remove(0)];
+    posts.extend(volumes(obfuscate_volumes(&parts)));
+    posts.extend(set);
+    shut_down_after(Scenario::new(posts).framed(4096), &|_| true).await;
+}
+
+// Restarted before the first volume arrives, the store the given-back
+// volume founded still opens the first volume's headers.
+#[tokio::test]
+async fn nameless_header_encrypted_volumes_restarted_before_the_first_arrives_are_bound_whole() {
+    shut_down_after(nameless_header_encrypted_second_first(), &|nth| nth == 2).await;
+}
+
+// Restarted once the first volume is in, the store reads both volumes back
+// from disk and fetches neither again.
+#[tokio::test]
+async fn nameless_header_encrypted_volumes_restarted_after_the_first_arrives_are_read_back() {
+    shut_down_after(nameless_header_encrypted_second_first(), &|nth| nth == 3).await;
+}
+
+// Restarted after every article, each store the restore rebuilds opens
+// what it opened before.
+#[tokio::test]
+async fn nameless_header_encrypted_volumes_restarted_after_every_article_deliver() {
+    shut_down_after(nameless_header_encrypted_second_first(), &|_| true).await;
 }
 
 // One stored member in a zip of its own.

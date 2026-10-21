@@ -198,7 +198,7 @@ impl Gate {
 impl Volumes for Gate {
     fn next(&self, after: Option<VolumeIndex>) -> std::io::Result<Option<VolumeIndex>> {
         let next = after.map_or(0, |after| after.0 as usize + 1);
-        Ok((next < self.volumes.len()).then(|| VolumeIndex(next as u32)))
+        Ok((next < self.volumes.len()).then_some(VolumeIndex(next as u32)))
     }
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
@@ -399,6 +399,24 @@ fn claim_places_a_nameless_volume_by_its_headers() {
     engine.bound(VolumeIndex(1), "a1b2.102", &volumes[1], None);
     let said = run(&mut engine, volumes);
     assert_eq!(said[1], Said::Bytes(0, spanning()));
+}
+
+// A store gives the engine a volume whose front never reached the tree, as
+// after a restart: bound, it states nothing. The next volume states its
+// number, and the one before it, saying nothing, says nothing against it.
+#[test]
+fn a_stated_volume_is_placed_beside_a_bound_volume_whose_front_is_unread() {
+    let volumes = two_volumes();
+    let mut engine = RarEngine::new();
+    engine.bound(VolumeIndex(0), "a1b2.101", &volumes[0], None);
+    engine.bound(VolumeIndex(1), "a1b2.102", b"", None);
+    let third = [
+        rar5::start(Some(2)),
+        rar5::file("tail.bin", 0, NOTES, NOTES.len() as u64, Some(crc32(NOTES))),
+        rar5::end(false),
+    ]
+    .concat();
+    assert_eq!(engine.claim("a1b2.103", &third, None), Some(VolumeIndex(2)));
 }
 
 #[test]

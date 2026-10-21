@@ -24,7 +24,7 @@ use crate::pipeline::direct_store::plan::{AdmissionRefusal, DirectSetPlan};
 
 // What the volumes are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Container {
+pub(in crate::pipeline::tests) enum Container {
     Rar4,
     Rar5,
     // Encrypted data under plain headers: the headers still chain the set.
@@ -53,7 +53,7 @@ pub(super) enum Container {
 
 // The names the volumes are posted under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Naming {
+pub(in crate::pipeline::tests) enum Naming {
     // `silver.horizon.partNN.rar`, `silver.horizon.7z.NNN`.
     Conventional,
     // [`Naming::Conventional`] over four volumes, so two are middle volumes.
@@ -90,7 +90,7 @@ pub(super) enum Naming {
 
 // What, besides the volumes, could group or order them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Binding {
+pub(in crate::pipeline::tests) enum Binding {
     // A PAR2 index carrying the real names arrives before any volume.
     Par2RealFirst,
     // A PAR2 index carrying the real names arrives after every volume.
@@ -111,7 +111,7 @@ pub(super) enum Binding {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Cell {
+pub(in crate::pipeline::tests) struct Cell {
     pub container: Container,
     pub naming: Naming,
     pub binding: Binding,
@@ -361,10 +361,7 @@ fn crossed(cell: Cell) -> Ruling {
     };
     // A 7z continuation volume carries no header of its own, so with no
     // real-name index nothing but the name orders it.
-    let real = matches!(
-        binding,
-        Binding::Par2RealFirst | Binding::Par2RealLast | Binding::LegacyReal
-    );
+    let real = binding.names_real();
     let unordered = Expectation {
         admission: Admission::Unnamed,
         direct_store: Expect::Fails(UNORDERED_7Z),
@@ -571,7 +568,7 @@ impl Naming {
 
     // Whether the posted names place the set, so a lost offset-zero article
     // leaves no volume without a set.
-    fn names_place(self) -> bool {
+    pub(super) fn names_place(self) -> bool {
         matches!(
             self,
             Self::Conventional
@@ -838,6 +835,14 @@ impl Fixture {
 }
 
 impl Binding {
+    // Whether an index gives the volumes their real names, which place them.
+    pub(super) fn names_real(self) -> bool {
+        matches!(
+            self,
+            Self::Par2RealFirst | Self::Par2RealLast | Self::LegacyReal
+        )
+    }
+
     // How the schedule is driven, and the names any listing carries.
     pub(super) fn drive(self, fixture: &Fixture) -> (ScheduleOptions, Option<Vec<String>>) {
         let matrix = ScheduleOptions::MATRIX;

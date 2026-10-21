@@ -10,6 +10,14 @@ use crate::member::MemberId;
 use crate::object::Kind;
 use crate::volume::{ByteRange, VolumeIndex};
 
+// Bytes posted for a member: where they start, what they are, and how
+// they came.
+pub struct Posted {
+    pub offset: u64,
+    pub bytes: Bytes,
+    pub provenance: Provenance,
+}
+
 // Where the bytes came from and whether they can be trusted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Provenance {

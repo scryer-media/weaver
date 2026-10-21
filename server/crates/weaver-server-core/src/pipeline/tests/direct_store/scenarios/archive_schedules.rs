@@ -49,8 +49,8 @@ fn enable_schedule_trace() {
 }
 
 mod extended;
-pub(super) mod graph;
-mod grouping;
+pub(in crate::pipeline::tests) mod graph;
+pub(in crate::pipeline::tests) mod grouping;
 
 pub(super) fn arrival_orders() -> Vec<Vec<(u32, u32)>> {
     fn permute(at: usize, items: &mut [(u32, u32)], output: &mut Vec<Vec<(u32, u32)>>) {
@@ -983,7 +983,7 @@ fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize,
 
 // What a schedule's recovery set is authored as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RecoveryFormat {
+pub(in crate::pipeline::tests) enum RecoveryFormat {
     // One PAR2 file carrying the descriptions and every recovery block.
     Par2,
     // The same blocks as a poster lays them out: an index of descriptions
@@ -1130,12 +1130,14 @@ pub(super) async fn run_schedule_with(
 // NZB carries, each one's article count, and the arrivals as articles of
 // those volumes. A withheld volume leaves the spec, and its slots name
 // nothing.
+type PostedVolumes = (Vec<(String, Vec<u8>)>, Vec<usize>, Vec<(u32, u32)>);
+
 fn posted_schedule(
     spec: &mut JobSpec,
     written: &[(String, Vec<u8>)],
     order: &[(u32, u32)],
     interruption: Interruption,
-) -> (Vec<(String, Vec<u8>)>, Vec<usize>, Vec<(u32, u32)>) {
+) -> PostedVolumes {
     let layout: Vec<usize> = spec.files[..written.len()]
         .iter()
         .map(|file| file.segments.len())

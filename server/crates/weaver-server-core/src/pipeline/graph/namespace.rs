@@ -23,10 +23,12 @@
 // disk. It takes a node everywhere and never assumes the root.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use weaver_graph::Posted;
 use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed};
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
@@ -532,9 +534,11 @@ impl NamespaceWriter {
         tree.deliver(
             node,
             member,
-            arrival.offset,
-            arrival.bytes.clone(),
-            arrival.provenance,
+            Posted {
+                offset: arrival.offset,
+                bytes: arrival.bytes.clone(),
+                provenance: arrival.provenance,
+            },
             &mut self.placing(builder),
             &mut effects,
         );
@@ -1246,10 +1250,10 @@ impl NamespaceWriter {
     ) -> Result<&mut Leaf, WriteError> {
         let dir = self.working_dir.clone();
         let leaves = &mut self.files_mut(node).leaves;
-        if !leaves.contains_key(&member) {
-            leaves.insert(member, Leaf::at(&dir, output_name)?);
+        match leaves.entry(member) {
+            Entry::Occupied(leaf) => Ok(leaf.into_mut()),
+            Entry::Vacant(free) => Ok(free.insert(Leaf::at(&dir, output_name)?)),
         }
-        Ok(leaves.get_mut(&member).expect("inserted above"))
     }
 
     // The node's holds scratch, created empty the first time anything pages.

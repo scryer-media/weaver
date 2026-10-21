@@ -53,6 +53,17 @@ pub(crate) struct RunVolumes {
     // it touches the disk.
     files: Mutex<BTreeMap<u32, File>>,
     lost: AtomicBool,
+    stopped: AtomicBool,
+}
+
+impl std::fmt::Debug for RunVolumes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunVolumes")
+            .field("generation", &self.generation)
+            .field("lost", &self.lost())
+            .field("stopped", &self.stopped())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RunVolumes {
@@ -62,7 +73,20 @@ impl RunVolumes {
             generation,
             files: Mutex::default(),
             lost: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
         }
+    }
+
+    // The run's owner stops it where it stands: its next read fails, and
+    // nothing it says from here on is heard. Set under the shelf's lock, so
+    // a run between a look at the shelf and its wait on it is woken too.
+    pub(crate) fn stop(&self) {
+        self.shelf
+            .update(|_| self.stopped.store(true, Ordering::Release));
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 
     // Whether a read failed because nothing will bring its bytes.
@@ -72,7 +96,7 @@ impl RunVolumes {
 
     // Whether the run may still speak: nothing has stopped it.
     pub(crate) fn current(&self) -> bool {
-        self.shelf.generation() == self.generation
+        !self.stopped() && self.shelf.generation() == self.generation
     }
 
     // Wait until `range` of `volume` can be read, as far as a closed volume
@@ -85,7 +109,7 @@ impl RunVolumes {
     ) -> Result<(u64, Option<std::path::PathBuf>), Unreadable> {
         let mut state = self.shelf.lock();
         loop {
-            if state.generation != self.generation {
+            if state.generation != self.generation || self.stopped() {
                 return Err(Unreadable::Stopped);
             }
             let complete = state.complete;
@@ -130,7 +154,7 @@ impl Volumes for RunVolumes {
         };
         let mut state = self.shelf.lock();
         loop {
-            if state.generation != self.generation {
+            if state.generation != self.generation || self.stopped() {
                 return Err(Unreadable::Stopped.into());
             }
             // No index lies between `after` and `from`, so only a gap past

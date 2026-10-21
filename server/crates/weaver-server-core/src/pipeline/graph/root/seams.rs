@@ -228,17 +228,21 @@ impl Pipeline {
 
     // How many runs a graph job may hold now: the extraction concurrency the
     // tuner allows at this moment, the limit the repair slots follow too.
-    pub(in crate::pipeline::graph) fn graph_slot_limit(&self) -> usize {
+    pub(in crate::pipeline) fn graph_slot_limit(&self) -> usize {
         limits::budgets(&self.direct_store.settings(), &self.tuner).1
     }
 
     fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {
-        if let Err(error) = result {
-            warn!(job_id = job_id.0, error = %error, "graph job step failed");
-        }
         // A step the job's extraction budget refused ends the job here, so
         // nothing more is fetched or decoded for it.
         if self.fail_graph_job_on_breach(job_id) {
+            return;
+        }
+        // A step that failed otherwise fails the job with its error: what
+        // it did not write, nothing after it can read.
+        if let Err(error) = result {
+            warn!(job_id = job_id.0, error = %error, "graph job step failed");
+            self.fail_job_on_extraction_error(job_id, error.to_extraction());
             return;
         }
         self.wake_repair_waiters();

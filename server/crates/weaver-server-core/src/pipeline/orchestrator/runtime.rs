@@ -1835,6 +1835,10 @@ impl Pipeline {
         // Every batch the drain and the flush handed to the disk owner is
         // still writing, off this task; its commit is joined here the same way.
         self.settle_all_segment_writes().await;
+        // A graph job's run or repair still out on a thread speaks through
+        // the run mail; heard here, so nothing of a job is out when the
+        // pipeline is down and the checkpoint holds what it came to.
+        self.drain_graph_runs().await;
 
         if self.active_downloads > 0
             || !self.active_decodes_by_job.is_empty()
@@ -1943,6 +1947,31 @@ impl Pipeline {
                         "timed out waiting for in-flight download/decode work during shutdown"
                     );
                     break;
+                }
+            }
+        }
+    }
+
+    // Every run is heard out and stopped where it stands: a run waits for
+    // bytes, or for a member's owner, that nothing will bring once the
+    // pipeline is down, and what it read is on its shelf for the restored
+    // job. A repair out on its thread is heard to its end, and whatever its
+    // ruling starts is stopped in turn.
+    async fn drain_graph_runs(&mut self) {
+        loop {
+            self.hear_graph_runs();
+            let limit = self.graph_slot_limit();
+            for job in self.graph_jobs.values_mut() {
+                job.stop_runs(limit);
+            }
+            if !self.graph_jobs.values().any(|job| job.awaits_mail()) {
+                return;
+            }
+            match self.graph_runs.recv().await {
+                Some(said) => self.graph_run_said(said),
+                None => {
+                    warn!("shutdown drain channel closed before in-flight work completed");
+                    return;
                 }
             }
         }

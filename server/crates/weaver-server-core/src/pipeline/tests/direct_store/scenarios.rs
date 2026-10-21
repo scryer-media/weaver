@@ -7,7 +7,7 @@
 
 use super::*;
 
-mod archive_schedules;
+pub(in crate::pipeline::tests) mod archive_schedules;
 
 mod chasing;
 mod classification_frontier;

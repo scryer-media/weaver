@@ -209,13 +209,23 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     // The run reads the volumes from the owner's files; the bytes on their
-    // way there say nothing the run does not read itself.
+    // way there say nothing the run does not read itself, but a volume's
+    // front. A volume can be bound before its front comes, as a restored
+    // volume fetched again is: what its front states of its place is the
+    // engine's when it does.
     fn deliver(
         &mut self,
-        _delivery: Delivery<'_>,
+        delivery: Delivery<'_>,
         _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         _out: &mut Vec<Emit>,
     ) {
+        let volume = delivery.volume.0;
+        if delivery.offset == 0
+            && self.bound.contains(&volume)
+            && let Some(front) = F::front(delivery.bytes)
+        {
+            self.fronts.entry(volume).or_insert(front);
+        }
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {}

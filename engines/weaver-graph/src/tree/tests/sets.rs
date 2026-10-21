@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::*;
+use crate::deliver::Posted;
 use crate::facts::{Durable, Facts, Restore, RestoreError};
 use crate::recovery::{MemberAccess, RepairOutcome};
 use crate::{Segment, SliceVerdict};
@@ -120,9 +121,11 @@ fn deliver(tree: &mut Tree, member: MemberId, offset: u64, bytes: &[u8]) {
     tree.deliver(
         NodeId::ROOT,
         member,
-        offset,
-        Bytes::copy_from_slice(bytes),
-        Provenance::Fresh,
+        Posted {
+            offset,
+            bytes: Bytes::copy_from_slice(bytes),
+            provenance: Provenance::Fresh,
+        },
         &mut Sets,
         &mut Vec::new(),
     );

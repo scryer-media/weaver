@@ -29,6 +29,7 @@ use self::passwords::Passwords;
 use super::Engine;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
+use super::leaf::LeafError;
 use super::limits::Caps;
 use super::namespace::{NamespaceWriter, SetState, WriteError};
 use super::root::intake::Decoded;
@@ -38,11 +39,31 @@ use super::root::source::{Class, Move};
 use super::root::{ArticleRoot, Ask};
 use super::status::RepairSlots;
 use crate::operations::disk::CapacityReader;
+use crate::pipeline::ExtractionError;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraphError {
     #[error("the namespace write path failed")]
     Write(#[from] WriteError),
+}
+
+impl GraphError {
+    // What the failure is to the job: a file's I/O error classed as the
+    // extractors class theirs, a refusal as the refusal, anything else
+    // terminal.
+    pub(crate) fn to_extraction(&self) -> ExtractionError {
+        let Self::Write(write) = self;
+        let message = format!("{self}: {write}");
+        match write {
+            WriteError::Leaf(LeafError::Io { source, .. }) => {
+                ExtractionError::from_io(message, source)
+            }
+            WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
+            WriteError::Leaf(_) | WriteError::UnknownMember { .. } => {
+                ExtractionError::terminal(message)
+            }
+        }
+    }
 }
 
 // Where a graph job writes and what it may hold: its working directory, the
@@ -179,9 +200,15 @@ impl GraphJob {
 
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
-    #[cfg(test)]
-    pub(crate) fn awaits_mail(&self) -> bool {
+    pub(in crate::pipeline) fn awaits_mail(&self) -> bool {
         self.runs.live() || self.loans.out()
+    }
+
+    // The pipeline is going down. Every run stops where it stands and is
+    // forgotten: what it read is on its shelf, and the restored job reads it
+    // again. A repair out on its thread still comes back through the mail.
+    pub(in crate::pipeline) fn stop_runs(&mut self, limit: usize) {
+        self.runs.stop(limit);
     }
 
     // Whether a repair of the job is out on a thread.

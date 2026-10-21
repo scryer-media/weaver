@@ -142,16 +142,48 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
         } else {
             rar_reads(&left, password, &members)
         };
+        // A 7z set's only signature is in its first piece: a job holding
+        // opaque pieces that no name calls a set has no reason to read them
+        // as one, and holds the pieces posted as files. A recovery set under
+        // the posted names says nothing of what the pieces are, and what it
+        // recreates is already in what the post leaves.
+        let archive = !cell.container.is_sevenz()
+            || cell.naming.names_place()
+            || cell.binding.names_real()
+            || left.first().is_some_and(|piece| {
+                piece
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.starts_with(SEVENZ))
+            });
+        let files = (!archive).then(|| {
+            let posted: Vec<&Vec<u8>> = left.iter().flatten().collect();
+            Files {
+                posted: posted.len(),
+                whole: posted
+                    .iter()
+                    .filter(|piece| fixture.volumes.iter().any(|(_, bytes)| bytes == **piece))
+                    .count(),
+            }
+        });
         Leaves {
             deliverable,
             mended,
+            files,
         }
     })
 }
 
+// The bytes a 7z archive opens with.
+const SEVENZ: &[u8] = &[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
+
 // Runs `cases` over `cell` under each recovery layout a case is posted
 // under, and holds every one to the rule set.
 async fn run_cell(cell: Cell, cases: Vec<(usize, Schedule)>) {
+    run_cell_under(cell, cases, None).await;
+}
+
+// [`run_cell`], kept to the one recovery layout `only` when it names one.
+async fn run_cell_under(cell: Cell, cases: Vec<(usize, Schedule)>, only: Option<RecoveryFormat>) {
     if let Ruling::Impossible(why) = rule(cell) {
         panic!("{cell:?} is no grouping cell: {why}");
     }
@@ -162,7 +194,10 @@ async fn run_cell(cell: Cell, cases: Vec<(usize, Schedule)>) {
         if !runs_under_graph(schedule.1) || !cell.presents(schedule.1) {
             continue;
         }
-        for layout in recovery_layouts(options, schedule.1) {
+        for layout in recovery_layouts(options, schedule.1)
+            .into_iter()
+            .filter(|layout| only.is_none_or(|recovery| layout.recovery == recovery))
+        {
             match layouts
                 .iter_mut()
                 .find(|(laid, _)| laid.recovery == layout.recovery)
@@ -191,6 +226,26 @@ async fn run_cell(cell: Cell, cases: Vec<(usize, Schedule)>) {
         reports.extend(graph_fixture_cases(&graph, cases).await);
     }
     assert_cells(&reports);
+}
+
+// One replay index of the matrix's schedules over `cell`, under the one
+// recovery layout `recovery`, held to the rule set: a row elsewhere pins a
+// case the matrix found.
+pub(in crate::pipeline::tests) async fn cell_case(
+    cell: Cell,
+    case: usize,
+    recovery: RecoveryFormat,
+) {
+    let schedule = schedules().swap_remove(case);
+    let fixture = Fixture::build(cell);
+    let (options, _) = cell.binding.drive(&fixture);
+    assert!(
+        recovery_layouts(options, schedule.1)
+            .iter()
+            .any(|layout| layout.recovery == recovery),
+        "{cell:?} case={case} is never posted under {recovery:?}"
+    );
+    run_cell_under(cell, vec![(case, schedule)], Some(recovery)).await;
 }
 
 // A cell's campaign: the matrix's smoke schedules.

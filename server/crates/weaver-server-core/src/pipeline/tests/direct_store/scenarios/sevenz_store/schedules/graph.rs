@@ -38,6 +38,7 @@ fn sevenz_post(
         Leaves {
             deliverable,
             mended: !interruption.fails(),
+            files: None,
         }
     })
 }

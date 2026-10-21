@@ -656,6 +656,69 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
     assert_eq!(job.file("video.mkv"), b"abcmidend");
 }
 
+// The tree's coverage and the leaf on disk agree: a run the coverage records
+// that the file no longer gives back ends the replay with the file's error.
+#[test]
+fn replaying_a_leaf_whose_file_is_gone_ends_in_the_leaf_error() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("video.mkv", Some(5));
+    job.send(member, 0, b"bytes", Provenance::Fresh);
+    assert!(!job.is_open(NodeId::ROOT, member));
+    std::fs::remove_file(job.dir.path().join("video.mkv")).expect("remove the leaf");
+
+    let mut build = job.build();
+    let replayed = job.writer.replay_file(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        NodeId::ROOT,
+        member,
+        &mut job.out,
+    );
+    assert!(
+        matches!(&replayed, Err(WriteError::Leaf(LeafError::Io { source, .. })) if source.kind() == std::io::ErrorKind::NotFound),
+        "{replayed:?}"
+    );
+}
+
+// A range held as damage may never have arrived: a lost tail past what the
+// file holds is no read, and the replay hands down what the file has.
+#[test]
+fn replaying_a_leaf_whose_lost_tail_was_never_written_replays_what_it_holds() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("video.mkv", None);
+    job.send(member, 0, b"bytes", Provenance::Fresh);
+    let mut effects = Vec::new();
+    job.tree.damage(
+        NodeId::ROOT,
+        VolumeIndex(member.0),
+        ByteRange::new(5, 15),
+        &mut effects,
+    );
+    let mut build = job.build();
+    job.writer
+        .apply_all(&mut job.tree, &mut build, &Source, effects, &mut job.out)
+        .expect("apply the loss");
+    assert_eq!(
+        std::fs::metadata(job.dir.path().join("video.mkv"))
+            .unwrap()
+            .len(),
+        5,
+        "a member of unknown length is only as long as what arrived"
+    );
+
+    let replayed = job.writer.replay_file(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        NodeId::ROOT,
+        member,
+        &mut job.out,
+    );
+    assert!(replayed.is_ok(), "{replayed:?}");
+    assert_eq!(job.file("video.mkv"), b"bytes");
+}
+
 #[test]
 fn a_member_of_unknown_length_is_sized_when_it_closes() {
     let mut job = Job::new(PLENTY);
@@ -670,10 +733,12 @@ fn a_member_of_unknown_length_is_sized_when_it_closes() {
 #[test]
 fn directory_members_and_empty_members_exist_once_announced() {
     let mut job = Job::new(PLENTY);
-    job.member("extras/", Some(0));
+    let extras = job.member("extras/", Some(0));
     job.member("empty.txt", Some(0));
     let nested = job.member("extras/inner.txt", Some(2));
     job.send(nested, 0, b"hi", Provenance::Fresh);
+    assert!(job.dir.path().join("extras").is_dir());
+    job.close(extras);
     assert!(job.dir.path().join("extras").is_dir());
     assert_eq!(job.file("empty.txt"), b"");
     assert_eq!(job.file("extras/inner.txt"), b"hi");

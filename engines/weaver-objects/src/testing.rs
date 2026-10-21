@@ -263,7 +263,8 @@ impl<O: Object> Job<O> {
                 .coverage
                 .write(ByteRange::at(offset, bytes.len() as u64), provenance);
         }
-        self.namespace.keep_first_bytes(member, offset, bytes);
+        self.namespace
+            .keep_first_bytes(member, offset, bytes, provenance);
     }
 
     // A volume named but not yet arrived, claimed and bound as the tree

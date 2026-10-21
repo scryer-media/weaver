@@ -82,8 +82,9 @@ impl RarStore {
     // A fresh layout over every volume read far enough.
     fn build(&mut self, out: &mut Vec<Emit>) -> Option<StoredLayoutBuilder> {
         // A volume held where its headers do not place it is mapped by no
-        // layout: it is given back at its close. One held first stops the
-        // layout before it starts.
+        // layout: it is given back at its close. One only its links put
+        // where it is held waits for its end record before it is mapped.
+        // One held first stops the layout before it starts.
         let first = self
             .volumes
             .get(&VolumeIndex(0))?
@@ -104,7 +105,10 @@ impl RarStore {
             let Some(facts) = found.walk.facts.as_ref() else {
                 break;
             };
-            if (facts.members.is_empty() && !found.walk.ended) || claim::misplaced(*index, facts) {
+            if (facts.members.is_empty() && !found.walk.ended)
+                || claim::misplaced(*index, facts)
+                || !claim::settled(*index, found)
+            {
                 break;
             }
             let refusal = if facts.is_solid {

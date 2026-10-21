@@ -248,7 +248,7 @@ impl Tree {
     }
 
     // The object at `node` is told; what it says is applied as if it said
-    // it in `deliver`.
+    // it in `deliver`. A retired object hears nothing: its word was its last.
     fn tell(
         &mut self,
         node: NodeId,
@@ -261,6 +261,7 @@ impl Tree {
         if let Some(object) = self
             .nodes
             .get_mut(&node)
+            .filter(|found| !found.retired)
             .and_then(|found| found.object.as_mut())
         {
             match told {

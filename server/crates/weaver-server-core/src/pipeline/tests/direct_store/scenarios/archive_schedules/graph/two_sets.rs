@@ -61,6 +61,7 @@ impl TwoSets {
                     .map(|(_, name)| name.clone())
                     .collect(),
                 mended: lost.is_empty(),
+                files: None,
             }
         });
         GraphFixture {

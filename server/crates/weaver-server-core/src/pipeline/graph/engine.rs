@@ -122,6 +122,8 @@ enum Life {
 struct Run {
     life: Life,
     ticket: Option<Ticket>,
+    // The reader the run is out with, through which its owner stops it.
+    volumes: Option<Arc<RunVolumes>>,
     // The resident bytes reserved for the run, held from before it starts
     // until it ends or is forgotten; zero while none is taken.
     reserved: u64,
@@ -233,6 +235,7 @@ impl Runs {
         let run = self.runs.entry(node).or_insert(Run {
             life: Life::Queued,
             ticket: None,
+            volumes: None,
             reserved: 0,
         });
         if run.ticket.is_some() {
@@ -289,6 +292,8 @@ impl Runs {
         };
         let generation = shelf.begin();
         run.life = Life::Running { generation };
+        let volumes = Arc::new(RunVolumes::new(shelf, generation));
+        run.volumes = Some(Arc::clone(&volumes));
         let (scope, mail) = (self.scope, self.mail.clone());
         let said = move |heard| Said {
             scope,
@@ -297,7 +302,6 @@ impl Runs {
             heard,
         };
         tokio::task::spawn_blocking(move || {
-            let volumes = Arc::new(RunVolumes::new(shelf, generation));
             let reader = Arc::clone(&volumes);
             let mut sink =
                 |emit| volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok();
@@ -330,13 +334,33 @@ impl Runs {
     // or unbound. Their slots and their memory go to whoever waits; returns
     // the nodes that may start now.
     pub(crate) fn forget_gone(&mut self, engines: &[NodeId], limit: usize) -> Vec<NodeId> {
-        let mut admitted = self.follow(limit);
-        let gone: Vec<NodeId> = self
+        let gone = self
             .runs
             .keys()
             .filter(|node| !engines.contains(node))
             .copied()
             .collect();
+        self.forget(gone, limit)
+    }
+
+    // Stop every run where it stands and forget it: the job is going down.
+    // What a run read is on its shelf, for the restored job to read again.
+    pub(crate) fn stop(&mut self, limit: usize) {
+        for run in self.runs.values() {
+            if let Some(volumes) = &run.volumes {
+                volumes.stop();
+            }
+        }
+        let all = self.runs.keys().copied().collect();
+        self.forget(all, limit);
+    }
+
+    // Forget the runs of `gone`, whose threads may still be out: what they
+    // say is under a generation no run holds, and is not heard. Their slots
+    // and their memory go to whoever waits; returns the nodes that may
+    // start now.
+    fn forget(&mut self, gone: Vec<NodeId>, limit: usize) -> Vec<NodeId> {
+        let mut admitted = self.follow(limit);
         // Out of the queue first, so a slot one of them frees cannot go to
         // another of them.
         for node in &gone {

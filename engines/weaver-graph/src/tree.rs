@@ -14,6 +14,7 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
+use crate::deliver::Posted;
 use crate::deliver::{Emit, Provenance, Why};
 use crate::engine::Engine;
 use crate::member::{Member, MemberId, Namespace};
@@ -1269,34 +1270,8 @@ impl Tree {
         let empty = binding.volumes.is_empty();
         let mut offered = Vec::new();
         for (volume, member) in taken {
-            let carried = self
-                .nodes
-                .get_mut(&node)
-                .and_then(|found| found.object.as_mut())
-                .and_then(|object| object.give_back(volume));
-            if let Some(found) = self.nodes.get_mut(&parent) {
-                found.children.remove(&member);
-                found.namespace.unbind(member);
-            }
-            effects.push(Effect::GivenBack {
-                node: parent,
-                member,
-                from: node,
-                volume,
-            });
-            match carried {
-                Some(carried) => {
-                    self.given.insert((parent, member), carried);
-                    offered.push(member);
-                }
-                None => {
-                    self.retired.insert((parent, member), None);
-                    effects.push(Effect::Refused {
-                        node: parent,
-                        member,
-                        why: Why::Unmapped,
-                    });
-                }
+            if self.park(parent, (node, volume), member, effects) {
+                offered.push(member);
             }
         }
         self.forget_empty(node, empty);
@@ -1442,12 +1417,15 @@ impl Tree {
         &mut self,
         node: NodeId,
         posting: MemberId,
-        offset: u64,
-        bytes: Bytes,
-        provenance: Provenance,
+        arrival: Posted,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        let Posted {
+            offset,
+            bytes,
+            provenance,
+        } = arrival;
         let range = ByteRange::at(offset, bytes.len() as u64);
         let Some(found) = self.nodes.get_mut(&node) else {
             return;
@@ -1460,12 +1438,8 @@ impl Tree {
                 .namespace
                 .get(found.namespace.resolve(posting))
                 .is_some_and(|record| {
-                    let damaged = record
-                        .coverage
-                        .overlapping(range)
-                        .any(|run| run.provenance == Provenance::Damaged);
-                    let missing = record.closed && !record.coverage.covered(range);
-                    damaged || missing
+                    record.coverage.damaged(range)
+                        || record.closed && !record.coverage.covered(range)
                 });
         let (member, taken) = found.namespace.arrive(posting, range, provenance);
         for part in taken {
@@ -1491,7 +1465,9 @@ impl Tree {
         let Some(found) = self.nodes.get_mut(&node) else {
             return;
         };
-        found.namespace.keep_first_bytes(member, offset, &bytes);
+        found
+            .namespace
+            .keep_first_bytes(member, offset, &bytes, provenance);
         // Bytes that landed in the member's contiguous front, whoever sent
         // them: an undecided member is asked who owns it each time, since
         // a front that stopped at a hole grows again when the hole fills.
@@ -1506,7 +1482,17 @@ impl Tree {
                 .namespace(node)
                 .is_some_and(|namespace| namespace.copy_of(member).is_some())
             {
-                self.deliver(node, member, offset, bytes, provenance, builder, effects);
+                self.deliver(
+                    node,
+                    member,
+                    Posted {
+                        offset,
+                        bytes,
+                        provenance,
+                    },
+                    builder,
+                    effects,
+                );
                 return;
             }
         }
@@ -1851,7 +1837,19 @@ impl Tree {
                 if into != member && self.fold(node, member, into, effects) {
                     return true;
                 }
-                continue;
+                let yields = into != member
+                    && refused.is_none()
+                    && self
+                        .nodes
+                        .get(child)
+                        .and_then(|found| found.object.as_ref())
+                        .is_some_and(|object| {
+                            object.provisional(volume, prefix, self.given.get(&(node, member)))
+                        });
+                if !yields {
+                    continue;
+                }
+                self.displace(node, (*child, volume), into, effects);
             }
             match refused {
                 None => self.join(node, member, (*child, volume), (&name, prefix), effects),
@@ -1882,6 +1880,73 @@ impl Tree {
             return true;
         }
         false
+    }
+
+    // The holder of a place its object holds provisionally makes way for a
+    // claim that names the place, as take_named moves a volume: the holder
+    // leaves the object with what was parsed of it, its holds in place, and
+    // is parked as a member given back, so the claimant joins the place
+    // first and the holder is offered again beside it.
+    fn displace(
+        &mut self,
+        node: NodeId,
+        (child, volume): (NodeId, VolumeIndex),
+        holder: MemberId,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(binding) = self
+            .nodes
+            .get_mut(&child)
+            .and_then(|found| found.binding.as_mut())
+        {
+            binding.volumes.remove(&volume);
+            binding.awaiting.remove(&volume);
+        }
+        self.park(node, (child, volume), holder, effects);
+    }
+
+    // A volume out of its object's binding leaves the object with what was
+    // parsed of it and is parked beside `parent`'s namespace as a member
+    // given back, or is refused when the object will not carry it. Pointer
+    // work: the member's holds stay in place. Whether it is parked, for the
+    // caller to offer it again.
+    fn park(
+        &mut self,
+        parent: NodeId,
+        (child, volume): (NodeId, VolumeIndex),
+        member: MemberId,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let carried = self
+            .nodes
+            .get_mut(&child)
+            .and_then(|found| found.object.as_mut())
+            .and_then(|object| object.give_back(volume));
+        if let Some(found) = self.nodes.get_mut(&parent) {
+            found.children.remove(&member);
+            found.namespace.unbind(member);
+        }
+        effects.push(Effect::GivenBack {
+            node: parent,
+            member,
+            from: child,
+            volume,
+        });
+        match carried {
+            Some(carried) => {
+                self.given.insert((parent, member), carried);
+                true
+            }
+            None => {
+                self.retired.insert((parent, member), None);
+                effects.push(Effect::Refused {
+                    node: parent,
+                    member,
+                    why: Why::Unmapped,
+                });
+                false
+            }
+        }
     }
 
     // A member an object claims as a volume it holds already is another
@@ -2129,10 +2194,12 @@ impl Tree {
         let mut emits = std::mem::take(&mut self.emits);
         emits.clear();
         // The object is out of its node while it takes the delivery, so its
-        // reads can walk the tree below it.
+        // reads can walk the tree below it. A retired object hears nothing:
+        // its word was its last.
         if let Some(mut object) = self
             .nodes
             .get_mut(&node)
+            .filter(|found| !found.retired)
             .and_then(|found| found.object.take())
         {
             if let Some(length) = length {
@@ -2201,7 +2268,17 @@ impl Tree {
                     bytes,
                     provenance,
                 } => {
-                    self.deliver(node, member, offset, bytes, provenance, builder, effects);
+                    self.deliver(
+                        node,
+                        member,
+                        Posted {
+                            offset,
+                            bytes,
+                            provenance,
+                        },
+                        builder,
+                        effects,
+                    );
                 }
                 Emit::MemberClosed(member) => self.close(node, member, builder, effects),
                 Emit::Retract(member) => self.retract(node, member, effects),
@@ -2858,9 +2935,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            0,
-            bytes.into(),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: bytes.into(),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -2909,9 +2988,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            0,
-            bytes.into(),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: bytes.into(),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -2936,9 +3017,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             member,
-            0,
-            Bytes::from_static(b"hello"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"hello"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -2969,9 +3052,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             second,
-            0,
-            Bytes::from_static(b"world"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"world"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -2999,9 +3084,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             second,
-            0,
-            Bytes::from_static(b"world"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"world"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -3013,9 +3100,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            0,
-            bytes.into(),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: bytes.into(),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -3043,9 +3132,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             piece,
-            0,
-            Bytes::from_static(b"world"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"world"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -3064,9 +3155,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            0,
-            bytes.into(),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: bytes.into(),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -3104,9 +3197,11 @@ mod tests {
             tree.deliver(
                 NodeId::ROOT,
                 member,
-                range.start as u64,
-                Bytes::copy_from_slice(&body[range]),
-                provenance,
+                Posted {
+                    offset: range.start as u64,
+                    bytes: Bytes::copy_from_slice(&body[range]),
+                    provenance,
+                },
                 &mut Build,
                 &mut Vec::new(),
             );
@@ -3139,9 +3234,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             second,
-            0,
-            Bytes::from_static(b"w"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"w"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut Vec::new(),
         );
@@ -3323,9 +3420,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             second,
-            0,
-            Bytes::from_static(b"w"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"w"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut Vec::new(),
         );
@@ -3333,9 +3432,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            20,
-            Bytes::from_static(b"REFUSE"),
-            Provenance::Fresh,
+            Posted {
+                offset: 20,
+                bytes: Bytes::from_static(b"REFUSE"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -3412,18 +3513,22 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             second,
-            0,
-            Bytes::from_static(b"w"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"w"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut Vec::new(),
         );
         tree.deliver(
             NodeId::ROOT,
             first,
-            20,
-            Bytes::from_static(b"REFUSE"),
-            Provenance::Fresh,
+            Posted {
+                offset: 20,
+                bytes: Bytes::from_static(b"REFUSE"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut Vec::new(),
         );
@@ -3444,9 +3549,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             later,
-            0,
-            bytes.into(),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: bytes.into(),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -3475,9 +3582,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            20,
-            Bytes::from_static(b"REFUSE"),
-            Provenance::Fresh,
+            Posted {
+                offset: 20,
+                bytes: Bytes::from_static(b"REFUSE"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut Vec::new(),
         );
@@ -3489,9 +3598,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             later,
-            0,
-            bytes.into(),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: bytes.into(),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -3592,9 +3703,11 @@ mod tests {
             tree.deliver(
                 NodeId::ROOT,
                 member,
-                0,
-                Bytes::from_static(b"w"),
-                Provenance::Fresh,
+                Posted {
+                    offset: 0,
+                    bytes: Bytes::from_static(b"w"),
+                    provenance: Provenance::Fresh,
+                },
                 &mut Build,
                 &mut Vec::new(),
             )
@@ -3663,9 +3776,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             second,
-            0,
-            Bytes::from_static(b"w"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"w"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut Vec::new(),
         );
@@ -3679,9 +3794,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            20,
-            Bytes::from_static(b"ENGINE"),
-            Provenance::Fresh,
+            Posted {
+                offset: 20,
+                bytes: Bytes::from_static(b"ENGINE"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut effects,
         );
@@ -3741,9 +3858,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            20,
-            Bytes::from_static(b"ENGINE"),
-            Provenance::Fresh,
+            Posted {
+                offset: 20,
+                bytes: Bytes::from_static(b"ENGINE"),
+                provenance: Provenance::Fresh,
+            },
             &mut Build,
             &mut Vec::new(),
         );
@@ -3907,6 +4026,161 @@ mod tests {
         );
     }
 
+    // A pretend store whose first volume is `show.rar`, which holds
+    // `linked.bin` where its links put it, provisionally: the first free
+    // place after the first, and `stated.r00` at the place it states, 1.
+    #[derive(Default)]
+    struct Yielder {
+        held: BTreeMap<VolumeIndex, String>,
+    }
+
+    impl Yielder {
+        fn free(&self) -> Option<VolumeIndex> {
+            (1..)
+                .map(VolumeIndex)
+                .find(|volume| !self.held.contains_key(volume))
+        }
+    }
+
+    impl Object for Yielder {
+        fn kind(&self) -> Kind {
+            Kind::RarStore
+        }
+        fn deliver(
+            &mut self,
+            _: Delivery<'_>,
+            _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+            _: &mut Vec<Emit>,
+        ) {
+        }
+        fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+        fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+        fn wants(&mut self, _: &mut Vec<Seek>) {}
+        fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+        fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+            out.push(Placement::Envelope {
+                envelope: volume.0,
+                range,
+            });
+        }
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
+            None
+        }
+        fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
+            match name {
+                "show.rar" => Some(VolumeIndex(0)),
+                "stated.r00" => Some(VolumeIndex(1)),
+                "linked.bin" => self.free(),
+                _ => None,
+            }
+        }
+        fn bound(&mut self, volume: VolumeIndex, name: &str, _: &[u8], _length: Option<u64>) {
+            self.held.insert(volume, name.to_owned());
+        }
+        fn provisional(&self, volume: VolumeIndex, front: &[u8], _: Option<&Carried>) -> bool {
+            front == b"stat"
+                && self
+                    .held
+                    .get(&volume)
+                    .is_some_and(|name| name == "linked.bin")
+        }
+        fn give_back(&mut self, volume: VolumeIndex) -> Option<Carried> {
+            self.held
+                .remove(&volume)
+                .map(|name| Box::new(name) as Carried)
+        }
+        fn reclaim(&mut self, _: &str, carried: &Carried) -> Option<VolumeIndex> {
+            (carried.downcast_ref::<String>()? == "linked.bin")
+                .then(|| self.free())
+                .flatten()
+        }
+    }
+
+    struct YielderBuild;
+    impl Builder for YielderBuild {
+        fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
+            (kind == Kind::RarStore).then(|| Box::new(Yielder::default()) as Box<dyn Object>)
+        }
+        fn read(
+            &self,
+            _: &Tree,
+            _: NodeId,
+            _: VolumeIndex,
+            _: &Placement,
+            _: &mut Vec<u8>,
+        ) -> bool {
+            false
+        }
+    }
+
+    // A member whose claim names a place its object holds only
+    // provisionally takes the place; the holder is given back, its parse
+    // with it, and joins the object again at the place it then links to.
+    #[test]
+    fn a_claim_naming_a_provisionally_held_place_takes_it_and_the_holder_moves() {
+        let mut build = YielderBuild;
+        let mut tree = Tree::new();
+        let mut effects = Vec::new();
+        let first = tree.announce_root("show.rar", None, &mut Vec::new());
+        tree.deliver(
+            NodeId::ROOT,
+            first,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(SIGNATURE),
+                provenance: Provenance::Fresh,
+            },
+            &mut build,
+            &mut effects,
+        );
+        let store = tree.child_of(NodeId::ROOT, first).expect("bound").0;
+        let linked = tree.announce_root("linked.bin", None, &mut Vec::new());
+        tree.deliver(
+            NodeId::ROOT,
+            linked,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"held"),
+                provenance: Provenance::Fresh,
+            },
+            &mut build,
+            &mut effects,
+        );
+        assert_eq!(
+            tree.child_of(NodeId::ROOT, linked),
+            Some((store, VolumeIndex(1)))
+        );
+        effects.clear();
+        let stated = tree.announce_root("stated.r00", None, &mut Vec::new());
+        tree.deliver(
+            NodeId::ROOT,
+            stated,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"stat"),
+                provenance: Provenance::Fresh,
+            },
+            &mut build,
+            &mut effects,
+        );
+        assert_eq!(
+            tree.child_of(NodeId::ROOT, stated),
+            Some((store, VolumeIndex(1)))
+        );
+        assert_eq!(
+            tree.child_of(NodeId::ROOT, linked),
+            Some((store, VolumeIndex(2)))
+        );
+        assert!(effects.contains(&Effect::GivenBack {
+            node: NodeId::ROOT,
+            member: linked,
+            from: store,
+            volume: VolumeIndex(1),
+        }));
+        assert!(!tree.given_back(NodeId::ROOT, linked));
+    }
+
     // A pretend store that holds every byte as envelope and, on `GIVE`,
     // gives back every volume it holds in one say. Asked to take one back,
     // it would, at the volume it held it at: what it is never asked is
@@ -3996,9 +4270,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             first,
-            0,
-            Bytes::from_static(SIGNATURE),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(SIGNATURE),
+                provenance: Provenance::Fresh,
+            },
             &mut build,
             &mut effects,
         );
@@ -4007,9 +4283,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             second,
-            0,
-            Bytes::from_static(b"held"),
-            Provenance::Fresh,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"held"),
+                provenance: Provenance::Fresh,
+            },
             &mut build,
             &mut effects,
         );
@@ -4021,9 +4299,11 @@ mod tests {
         tree.deliver(
             NodeId::ROOT,
             second,
-            4,
-            Bytes::from_static(b"GIVE"),
-            Provenance::Fresh,
+            Posted {
+                offset: 4,
+                bytes: Bytes::from_static(b"GIVE"),
+                provenance: Provenance::Fresh,
+            },
             &mut build,
             &mut effects,
         );

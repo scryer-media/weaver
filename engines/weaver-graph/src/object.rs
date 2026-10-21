@@ -370,6 +370,20 @@ pub trait Object: Send + Sync {
         None
     }
 
+    // Bytes outrank names, headers outrank links: whether I hold `volume`
+    // only provisionally, by links alone, where the member whose claim
+    // named it, by its first bytes or what was parsed of it, states its
+    // place, so the member takes the place and the holder is given back.
+    // Only reads.
+    fn provisional(
+        &self,
+        _volume: VolumeIndex,
+        _first_bytes: &[u8],
+        _carried: Option<&Carried>,
+    ) -> bool {
+        false
+    }
+
     // A volume I said I give back: what I parsed of it, to travel with the
     // member, or `None` when I keep nothing of it worth carrying or more
     // than an object may carry, and the member is refused instead.

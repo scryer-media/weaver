@@ -14,8 +14,7 @@ use weaver_graph::{ByteRange, Emit, Object, Provenance, RecoveryKind, VolumeInde
 
 use super::RarStore;
 use crate::keys::{CAPACITY, Keys};
-use crate::quiet::Placed;
-use crate::testing::{Quiet, payload};
+use crate::testing::payload;
 use owner::Owner;
 use writer::{Item, Options, Version, write};
 
@@ -294,38 +293,115 @@ fn a_nameless_volume_posted_again_is_the_held_volume_its_neighbours_link_it_to()
     );
 }
 
-// One member spans every volume of a nameless RAR4 set, so each middle
-// volume's front links it to every other and states no number: beside the
-// first and the last, either middle volume fits either middle place. The
-// store claims neither while the set stands, refuses the set for them once
-// the job is quiet, and the refused set takes them past every volume it
-// holds.
+// One member spans every volume of a nameless RAR4 set, so a middle
+// volume's front links it to every free place beside the first and the
+// last and states no number. It takes the lower, by links alone, and once
+// its walk reads its end record, which numbers it elsewhere, it is given
+// back.
 #[test]
-fn two_adjacent_nameless_volumes_both_fitting_refuse_the_set_at_quiet() {
+fn a_nameless_middle_volume_fitting_two_places_takes_the_lower_and_moves_when_its_end_says_otherwise()
+ {
     let volumes = write(
         &[Item::File("feature.bin", payload(5, 23_000))],
         &split(Version::Rar4),
     );
     assert_eq!(volumes.len(), 4);
+    // Each volume's end record states its number: more volumes follow
+    // (0x0001), the number is present (0x0004).
+    let numbered = |index: usize| {
+        let mut bytes = volumes[index].clone();
+        bytes.truncate(bytes.len() - 7);
+        let flags = u16::from(index + 1 < volumes.len()) | 0x0004;
+        let mut rest = vec![0x7b];
+        rest.extend(flags.to_le_bytes());
+        rest.extend(9u16.to_le_bytes());
+        rest.extend((index as u16).to_le_bytes());
+        bytes.extend((crate::grid::crc32(&rest) as u16).to_le_bytes());
+        bytes.extend(rest);
+        bytes
+    };
     let name = |index: usize| format!("{:x}3c9e1f", index * 7 + 11);
-    let front = |index: usize| volumes[index][..4096].to_vec();
-    let mut object = store();
-    object.bound(VolumeIndex(0), &name(0), &front(0), None);
-    object.bound(VolumeIndex(3), &name(3), &volumes[3], None);
-    let middles: Vec<(String, Vec<u8>)> = [1, 2].map(|index| (name(index), front(index))).into();
-    for (name, front) in &middles {
-        assert_eq!(object.claim_volume(name, front), Some(Placed::Unordered));
-        assert_eq!(object.claim(name, front, None), None);
+    // The third volume arrives where the second would go.
+    let posted = [0, 2, 1, 3]
+        .map(|index| (name(index), numbered(index)))
+        .into();
+    let mut owner = Owner::new(store(), posted);
+    owner
+        .object
+        .bound(VolumeIndex(3), &name(3), &numbered(3), None);
+    owner.frames(0, 4096);
+    owner.close(0);
+    owner.frames(1, 4096);
+    owner.close(1);
+    assert!(
+        owner.said.contains(&Emit::GiveBack(VolumeIndex(1))),
+        "{:?}",
+        owner.said
+    );
+}
+
+// One stored member spans every volume of a nameless RAR4 set, so the last
+// volume, arriving before the third, links to the free place after the
+// second and is held there. Only its end record states its number: until
+// it is read, the set is never judged by a chain that volume closes.
+#[test]
+fn a_nameless_volume_its_links_misplace_never_refuses_the_set() {
+    let volumes = write(
+        &[Item::File("feature.bin", payload(5, 23_000))],
+        &split(Version::Rar4),
+    );
+    assert_eq!(volumes.len(), 4);
+    // Each volume's end record states its number, as RAR 3 and later write
+    // it: more volumes follow (0x0001), the number is present (0x0004).
+    let numbered = |index: usize| {
+        let mut bytes = volumes[index].clone();
+        bytes.truncate(bytes.len() - 7);
+        let flags = u16::from(index + 1 < volumes.len()) | 0x0004;
+        let mut rest = vec![0x7b];
+        rest.extend(flags.to_le_bytes());
+        rest.extend(9u16.to_le_bytes());
+        rest.extend((index as u16).to_le_bytes());
+        bytes.extend((crate::grid::crc32(&rest) as u16).to_le_bytes());
+        bytes.extend(rest);
+        bytes
+    };
+    let named = [0, 1, 3]
+        .map(|index| (format!("{:x}3c9e1f", index * 7 + 11), numbered(index)))
+        .into();
+    let mut owner = Owner::new(store(), named);
+    for volume in 0..2 {
+        owner.frames(volume, 4096);
+        owner.close(volume);
     }
-    let beside = middles
-        .iter()
-        .map(|(name, front)| (name.as_str(), front.as_slice(), 6_000))
-        .collect();
-    let mut out = Vec::new();
-    object.quiet(&Quiet(beside), &mut out);
-    assert_eq!(out, vec![Emit::Refuse(Why::OrderUnknown)]);
-    let (name, front) = &middles[0];
-    assert_eq!(object.claim(name, front, None), Some(VolumeIndex(4)));
+    owner.frames(2, 4096);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_))),
+        "{:?}",
+        owner.said
+    );
+}
+
+// A nameless RAR4 volume a founding put first holds that place by links
+// alone: a claim whose front states the place, the set's real first
+// volume, takes it. A claim that only links, or a holder its own headers
+// place, moves nothing.
+#[test]
+fn a_volume_links_alone_hold_yields_to_a_claim_that_states_its_place() {
+    let volumes = write(
+        &[Item::File("feature.bin", payload(5, 23_000))],
+        &split(Version::Rar4),
+    );
+    let front = |index: usize| volumes[index][..4096].to_vec();
+    let mut held = store();
+    held.bound(VolumeIndex(0), "c0ffee", &front(2), None);
+    assert!(held.provisional(VolumeIndex(0), &front(0), None));
+    assert!(!held.provisional(VolumeIndex(0), &front(1), None));
+    let mut first = store();
+    first.bound(VolumeIndex(0), "d00d", &front(0), None);
+    assert!(!first.provisional(VolumeIndex(0), &front(0), None));
 }
 
 #[test]

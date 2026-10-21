@@ -595,9 +595,6 @@ impl Object for SevenZipStore {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
-        if self.gone {
-            return;
-        }
         let Some(range) = self.container(delivery.volume, delivery.range()) else {
             return;
         };
@@ -626,9 +623,6 @@ impl Object for SevenZipStore {
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         self.stale = true;
         self.settle(out);
     }
@@ -637,9 +631,6 @@ impl Object for SevenZipStore {
     // opened nothing, a piece beside the set that nothing orders, or a
     // member named and never placed leaves the container unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         let why = crate::quiet::damaged(standing)
             .or_else(|| self.shut())
             .or_else(|| {
@@ -654,9 +645,6 @@ impl Object for SevenZipStore {
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         let Some(range) = self.container(volume, range) else {
             return;
         };
@@ -682,9 +670,6 @@ impl Object for SevenZipStore {
     }
 
     fn wants(&mut self, out: &mut Vec<Seek>) {
-        if self.gone {
-            return;
-        }
         // Only volumes bound so far can be bid: a seek into one not yet
         // claimed would be answered as unseekable.
         if self.geometry.is_none() {
@@ -707,7 +692,7 @@ impl Object for SevenZipStore {
     }
 
     fn pulled(&mut self, seek: Seek, pull: Pull, out: &mut Vec<Emit>) {
-        if self.gone || pull != Pull::Unseekable || self.map.is_some() {
+        if pull != Pull::Unseekable || self.map.is_some() {
             return;
         }
         let Some(range) = self.container(seek.volume, seek.range) else {
@@ -757,9 +742,6 @@ impl Object for SevenZipStore {
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         // The offer answers the question the store asked: a candidate that
         // opens nothing leaves it free to ask for the next one.
         self.asked = false;

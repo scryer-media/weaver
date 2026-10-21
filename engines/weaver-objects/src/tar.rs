@@ -371,7 +371,7 @@ impl Object for Tar {
         _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
-        if self.gone || delivery.volume != VOLUME || delivery.bytes.is_empty() {
+        if delivery.volume != VOLUME || delivery.bytes.is_empty() {
             return;
         }
         let range = delivery.range();
@@ -395,7 +395,7 @@ impl Object for Tar {
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
-        if self.gone || volume != VOLUME || self.end.is_some() {
+        if volume != VOLUME || self.end.is_some() {
             return;
         }
         let length = self.length.unwrap_or(self.reached);
@@ -410,7 +410,7 @@ impl Object for Tar {
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.gone || volume != VOLUME {
+        if volume != VOLUME {
             return;
         }
         self.lost.push(range);
@@ -426,9 +426,6 @@ impl Object for Tar {
     // Nothing more will arrive. A member still damaged, or one named and
     // never placed, leaves the archive unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         if let Some(why) =
             crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
         {

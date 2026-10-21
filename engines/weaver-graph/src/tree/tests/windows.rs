@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use crate::deliver::Posted;
 use crate::recovery::{MemberAccess, RepairOutcome};
 use crate::seek::Weight;
 use crate::{Segment, SliceVerdict};
@@ -146,9 +147,11 @@ fn a_window_takes_what_passed_and_what_passes_at_its_own_offsets() {
     tree.deliver(
         NodeId::ROOT,
         first,
-        12,
-        Bytes::from(vec![7u8; 25]),
-        Provenance::Damaged,
+        Posted {
+            offset: 12,
+            bytes: Bytes::from(vec![7u8; 25]),
+            provenance: Provenance::Damaged,
+        },
         &mut Taping(Arc::clone(&log)),
         &mut effects,
     );

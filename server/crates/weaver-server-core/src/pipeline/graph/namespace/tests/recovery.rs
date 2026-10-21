@@ -109,6 +109,47 @@ fn a_set_rules_once_every_member_it_covers_is_closed_and_known() {
     assert_eq!(job.file("video.mkv"), b"goOKgood");
 }
 
+// Beside the set only a member it does not describe: the index covers
+// nothing, and its own volume is still open.
+fn an_index_covering_nothing(job: &mut Job) -> MemberId {
+    let other = job.member("other.mkv", Some(4));
+    job.send(other, 0, b"body", Provenance::Fresh);
+    job.close(other);
+    assert_eq!(
+        job.writer
+            .covering(&job.tree, &job.tree.recovery_nodes(NodeId::ROOT), other)
+            .count(),
+        0
+    );
+    job.root().find_by_name("set.par2").expect("own volume").id
+}
+
+#[test]
+fn an_index_that_covers_nothing_and_has_no_volume_in_is_not_due() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = an_index_covering_nothing(&mut job);
+    assert!(!job.root().get(own).unwrap().closed);
+    job.rule(false);
+    assert!(
+        job.par.lock().unwrap().volume.is_none(),
+        "no repair was lent"
+    );
+    assert_eq!(job.writer.outcomes(&job.tree), vec![None]);
+}
+
+#[test]
+fn an_index_that_covers_nothing_is_due_once_its_volume_closes() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = an_index_covering_nothing(&mut job);
+    job.close(own);
+    job.rule(false);
+    assert_eq!(
+        job.par.lock().unwrap().volume.as_deref(),
+        Some(PAR2_SIGNATURE),
+        "the repair was lent and read the set's own volume"
+    );
+}
+
 #[test]
 fn a_namespace_without_sets_has_ruled_and_one_with_an_unruled_set_has_not() {
     let mut job = Job::new(PLENTY);
