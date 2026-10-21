@@ -1646,9 +1646,62 @@ impl PeerHandler {
         }
     }
 
-    // The job of this is to request chunks and also to keep peer alive.
+    // The job of this is to request chunks, time out the requests the peer
+    // does not answer, and also to keep peer alive.
     // The moment this ends, the peer is disconnected.
     async fn task_peer_chunk_requester(&self) -> crate::Result<()> {
+        tokio::select! {
+            r = self.request_chunks() => r,
+            r = self.time_out_requests() => r,
+        }
+    }
+
+    /// Returns the requests outstanding to this peer when it goes its request
+    /// timeout (LivePeerState::request_deadline) without delivering a block.
+    async fn time_out_requests(&self) -> crate::Result<()> {
+        self.wait_for_bitfield().await;
+        loop {
+            let Some(notify) = self.request_slots_changed() else {
+                return Ok(());
+            };
+            let changed = notify.notified();
+            let Some(deadline) = self
+                .state
+                .peers
+                .with_live(self.addr, |live| live.request_deadline())
+            else {
+                return Ok(());
+            };
+            let Some(deadline) = deadline else {
+                changed.await;
+                continue;
+            };
+            tokio::select! {
+                // A block that arrived moved the deadline.
+                biased;
+                _ = changed => {}
+                _ = tokio::time::sleep_until(deadline) => self.on_requests_timed_out()?,
+            }
+        }
+    }
+
+    fn on_requests_timed_out(&self) -> crate::Result<()> {
+        let timed_out = self.return_requests()?;
+        debug!(requests = timed_out.len(), "requests timed out");
+        for request in timed_out {
+            // The chunk is for whoever takes its piece next to fetch.
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::Cancel(Request {
+                    index: request.piece_index.get(),
+                    begin: request.offset,
+                    length: request.size,
+                })));
+        }
+        Ok(())
+    }
+
+    async fn request_chunks(&self) -> crate::Result<()> {
         let handle = self.addr;
         self.wait_for_bitfield().await;
 

@@ -69,4 +69,7 @@ windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System
 # The e2e tests lift the open-file limit.
 nix = { workspace = true, features = ["resource", "uio"] }
 tempfile = { workspace = true }
+# `test-util` for the paused clock: the request timeout tests advance it
+# past a peer's deadline instead of waiting for one.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

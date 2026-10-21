@@ -226,3 +226,58 @@ async fn a_choke_returns_every_outstanding_request_and_unchoke_asks_again() {
         again
     );
 }
+
+/// The next `n` cancels `task` sends, as (piece, offset).
+async fn next_cancels(task: &mut Task<'_>, rx: &mut PeerRx, n: usize) -> BTreeSet<(u32, u32)> {
+    let mut cancels = BTreeSet::new();
+    while cancels.len() < n {
+        match next_message(task, rx).await {
+            Message::Cancel(r) => assert!(cancels.insert((r.index, r.begin))),
+            other => panic!("expected a cancel, got {other:?}"),
+        }
+    }
+    cancels
+}
+
+#[tokio::test]
+async fn an_undelivered_request_is_free_again_after_the_timeout_and_a_delivered_one_is_kept() {
+    let h = Harness::new("a_request_times_out").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+
+    peer.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, every_chunk().len()).await,
+        every_chunk()
+    );
+    drop(requester);
+
+    // The first block takes 10 s, so the peer's timeout is 12 s from it.
+    tokio::time::advance(Duration::from_secs(10)).await;
+    h.deliver(&peer, (0, 0)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    assert_eq!(
+        h.peers
+            .with_live(peer.addr, |live| live.request_deadline())
+            .unwrap(),
+        Some(deadline)
+    );
+
+    // Nothing more arrives: the watcher cancels every undelivered request
+    // once the deadline passes, and not before.
+    let mut watcher: Task<'_> = Box::pin(peer.time_out_requests());
+    let mut undelivered = every_chunk();
+    undelivered.remove(&(0, 0));
+    assert_eq!(
+        next_cancels(&mut watcher, &mut rx, undelivered.len()).await,
+        undelivered
+    );
+    assert!(tokio::time::Instant::now() >= deadline);
+
+    // The undelivered chunks are free for any peer; the delivered one stays had.
+    assert_eq!(h.inflight_count(&peer), 0);
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
+    assert_eq!(h.missing_chunks(1), vec![0, 1, 2, 3]);
+}

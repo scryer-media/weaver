@@ -10,6 +10,7 @@ pub mod stats;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
+use std::time::Duration;
 
 use crate::core::hash_id::Id20;
 use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
@@ -19,6 +20,7 @@ use tokio::sync::{
     Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::peer_connection::WriterRequest;
@@ -281,6 +283,14 @@ pub(crate) struct LivePeerState {
     // canceled chunk, so a peer is not disconnected for racing our cancel messages.
     late_cancelled_request_tolerance: u32,
 
+    // When we began waiting for the peer's next block: the request that found
+    // none outstanding, or the last requested block to arrive. Read only while
+    // requests are outstanding.
+    waiting_since: Instant,
+
+    // How long the peer takes to deliver a block, which sets its request timeout.
+    block_time: BlockTime,
+
     request_slots_changed: Arc<Notify>,
 
     // The main channel to send requests to peer.
@@ -304,6 +314,8 @@ impl LivePeerState {
             seeder: false,
             inflight_requests: Default::default(),
             late_cancelled_request_tolerance: 0,
+            waiting_since: Instant::now(),
+            block_time: BlockTime::default(),
             request_slots_changed: Default::default(),
             tx,
             connection_kind,
@@ -323,11 +335,29 @@ impl LivePeerState {
     }
 
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
-        self.inflight_requests.insert(chunk)
+        let none_outstanding = self.inflight_requests.is_empty();
+        let added = self.inflight_requests.insert(chunk);
+        if added && none_outstanding {
+            // The wait for a block starts now, and the request timeout with it.
+            self.waiting_since = Instant::now();
+            self.request_slots_changed.notify_waiters();
+        }
+        added
+    }
+
+    /// When the requests outstanding to the peer time out: the peer has gone
+    /// its request timeout without delivering a block. None while none are
+    /// outstanding.
+    pub fn request_deadline(&self) -> Option<Instant> {
+        (!self.inflight_requests.is_empty())
+            .then(|| self.waiting_since + self.block_time.request_timeout())
     }
 
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
         if self.inflight_requests.remove(chunk) {
+            let now = Instant::now();
+            self.block_time.add(now - self.waiting_since);
+            self.waiting_since = now;
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
         }
@@ -391,4 +421,45 @@ pub(crate) enum RemoveInflightRequestResult {
     Expected,
     LateCanceled,
     Unexpected,
+}
+
+/// How long a peer takes to deliver a block we wait on: a running mean, and
+/// the mean distance of samples from it, over about the last
+/// [`Self::SAMPLES`] blocks.
+#[derive(Debug, Default)]
+struct BlockTime {
+    samples: u32,
+    mean_secs: f64,
+    deviation_secs: f64,
+}
+
+impl BlockTime {
+    const SAMPLES: u32 = 20;
+    /// The timeout before a peer's first block, and the longest one after.
+    const MAX_TIMEOUT: Duration = Duration::from_secs(60);
+    /// No timeout is shorter: below this, ordinary jitter would trip it.
+    const MIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn add(&mut self, sample: Duration) {
+        let sample = sample.as_secs_f64();
+        let deviation = (self.mean_secs - sample).abs();
+        self.samples = (self.samples + 1).min(Self::SAMPLES);
+        self.mean_secs += (sample - self.mean_secs) / f64::from(self.samples);
+        if self.samples > 1 {
+            self.deviation_secs += (deviation - self.deviation_secs) / f64::from(self.samples - 1);
+        }
+    }
+
+    /// How long the peer may go without delivering a block it was asked for:
+    /// 60 s until it has delivered one; then its mean block time with a fifth
+    /// added after one block, and with four mean deviations added after more;
+    /// never under 2 s or over 60 s.
+    fn request_timeout(&self) -> Duration {
+        let secs = match self.samples {
+            0 => return Self::MAX_TIMEOUT,
+            1 => self.mean_secs + self.mean_secs / 5.0,
+            _ => self.mean_secs + 4.0 * self.deviation_secs,
+        };
+        Duration::from_secs_f64(secs).clamp(Self::MIN_TIMEOUT, Self::MAX_TIMEOUT)
+    }
 }
