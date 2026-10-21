@@ -104,7 +104,7 @@ use crate::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
     piece_priority::PiecePriority,
-    piece_tracker::{AcquireRequest, AcquireResult, PickOptions, PieceTracker},
+    piece_tracker::{AcquireRequest, AcquireResult, Arrival, PickOptions, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
@@ -1892,6 +1892,10 @@ impl PeerHandler {
                         steal_info = Some((from_peer, piece));
                         Ok(Some(piece))
                     }
+                    AcquireResult::EndGame { piece, chunk } => {
+                        debug!("end game: asking for {chunk:?}, asked of another peer too");
+                        Ok(Some(piece))
+                    }
                     AcquireResult::NoneAvailable => Ok(None),
                 }
             })
@@ -2320,12 +2324,13 @@ impl PeerHandler {
             };
 
             // Only the chunks not yet received: a stolen piece keeps the
-            // chunks its previous owner delivered.
+            // chunks its previous owner delivered. In the end game, the one
+            // block this peer doubles.
             let missing = self
                 .state
                 .lock_read("missing chunks")
                 .get_pieces()?
-                .missing_chunks(next)
+                .chunks_to_request(next, self.addr)
                 .collect::<Vec<_>>();
 
             for chunk in missing {
@@ -2369,7 +2374,7 @@ impl PeerHandler {
                             .state
                             .lock_read("add chunk request")
                             .get_pieces()
-                            .is_ok_and(|pieces| pieces.is_owned_by(next, self.addr));
+                            .is_ok_and(|pieces| pieces.may_request(next, self.addr));
                         owned.then(|| live.add_inflight_request(chunk))
                     }) {
                     Some(Some(true)) => {}
@@ -2570,34 +2575,33 @@ impl PeerHandler {
             // So that by the time we are done writing AND if it was the last piece,
             // we can actually checksum etc.
             // Otherwise it might get into some weird state.
-            let ppl_guard = {
-                let g = state.lock_read("check_steal");
+            let (ppl_guard, cancel) = {
+                let mut g = state.lock_write("check_steal");
 
                 let ppl = state
                     .per_piece_locks
                     .get(piece.index as usize)
                     .map(|l| l.read());
 
-                match g.get_pieces()?.get_inflight(chunk_info.piece_index) {
-                    Some(inflight) if inflight.peer == addr => {}
-                    Some(inflight) => {
+                match g.get_pieces_mut()?.block_arrived(chunk_info, addr) {
+                    Arrival::Write { cancel } => (ppl, cancel),
+                    Arrival::Discard => {
                         debug!(
-                            "in-flight piece {} was stolen by {}, ignoring",
-                            chunk_info.piece_index, inflight.peer
+                            "{chunk_info:?} is no longer asked of this peer, or arrived from another first, ignoring"
                         );
                         return Ok(());
                     }
-                    None => {
-                        debug!(
-                            "in-flight piece {} not found. it was probably completed by someone else",
-                            chunk_info.piece_index
-                        );
-                        return Ok(());
-                    }
-                };
-
-                ppl
+                }
             };
+            // The block was asked of another peer too, in the end game: it
+            // need not send it (libtorrent `torrent::cancel_block`).
+            if let Some(other) = cancel {
+                state
+                    .peers
+                    .with_live_mut(other, "cancel_duplicate", |live| {
+                        live.cancel_inflight_request(chunk_info)
+                    });
+            }
 
             // While we hold per piece lock, noone can steal it.
             // So we can proceed writing knowing that the piece is ours now and will still be by the time

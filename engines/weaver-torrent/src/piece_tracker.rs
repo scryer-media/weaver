@@ -50,6 +50,23 @@ const MAX_PARTIAL_CHUNKS: usize = 2048;
 pub struct InflightPiece {
     pub peer: PeerHandle,
     pub started: Instant,
+    // The blocks of the piece asked of another peer as well, in the end
+    // game, one such peer a block: the block index and the peer.
+    duplicates: Vec<(u32, PeerHandle)>,
+}
+
+/// What becomes of a block that arrives (libtorrent
+/// `peer_connection::incoming_piece`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// The peer's copy is the one written. The other peer the block was
+    /// asked of in the end game, if any, is to have its request cancelled
+    /// (libtorrent `torrent::cancel_block`).
+    Write { cancel: Option<PeerHandle> },
+    /// The block is not wanted from this peer: its piece is not asked of it,
+    /// or another copy of the block arrived first (libtorrent counts it as
+    /// redundant bytes).
+    Discard,
 }
 
 /// The sender of every block of one piece, by block index; None for a
@@ -90,6 +107,12 @@ pub enum AcquireResult {
     Stolen {
         piece: ValidPieceIndex,
         from_peer: PeerHandle,
+    },
+    /// The end game: a block of a piece in flight with another peer, which
+    /// this peer is to ask for too.
+    EndGame {
+        piece: ValidPieceIndex,
+        chunk: ChunkInfo,
     },
     /// No pieces are available for this peer.
     NoneAvailable,
@@ -159,6 +182,10 @@ pub struct PieceTracker {
     // (libtorrent keeps a block's downloader in the piece picker,
     // `block_info::peer`, read by `piece_picker::get_downloaders`).
     senders: HashMap<ValidPieceIndex, Senders>,
+    // The blocks a copy of which arrived and is being written, by absolute
+    // index: any other copy is redundant (libtorrent
+    // `piece_picker::mark_as_writing`).
+    writing: HashSet<u32>,
     // Breaks ties between equally rare pieces, and starts the initial random
     // pick.
     rng: StdRng,
@@ -177,6 +204,7 @@ impl PieceTracker {
             chunks,
             inflight: HashMap::new(),
             senders: HashMap::new(),
+            writing: HashSet::new(),
             rng,
         }
     }
@@ -206,7 +234,8 @@ impl PieceTracker {
     /// 1. Take over a piece from a peer that's 10x slower
     /// 2. Reserve a piece: a stream's next piece first, then the one
     ///    [`Self::pick`] chooses
-    /// 3. In the end game, take over a piece from a peer that's 3x slower
+    /// 3. In the end game, take over a piece from a peer that's 3x slower,
+    ///    or else ask for a block already asked of another peer
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
     /// the old peer and update counters.
@@ -266,19 +295,80 @@ impl PieceTracker {
             return self.reserve_piece(piece, req.peer);
         }
 
-        // 3. The end game: every wanted piece is in flight, and the peer has
-        // nothing left to download. libtorrent request_a_block with
-        // strict_end_game_mode.
-        let end_game =
-            req.outstanding_requests == 0 && self.chunks.iter_queued_pieces().next().is_none();
-        if may_steal
-            && end_game
-            && let Some(result) = self.try_steal(&req, 3.0)
-        {
-            return result;
+        // 3. The end game: every wanted piece has a block asked for or
+        // received, and the peer has no request outstanding (libtorrent
+        // `request_a_block` with `strict_end_game_mode`: a busy block only
+        // once the download queue holds every piece wanted, and only by a
+        // peer whose queues are empty). A piece held three times as long as
+        // the peer takes to download one goes over whole; otherwise the
+        // peer doubles a block.
+        let end_game = req.outstanding_requests == 0
+            && self
+                .chunks
+                .iter_queued_pieces()
+                .all(|p| self.chunks.received_chunks(p) > 0);
+        if may_steal && end_game {
+            if let Some(result) = self.try_steal(&req, 3.0) {
+                return result;
+            }
+            if let Some(result) = self.double_a_block(&req) {
+                return result;
+            }
         }
 
         AcquireResult::NoneAvailable
+    }
+
+    /// The end game's pick for the peer `req` asks for, after libtorrent
+    /// `piece_picker::pick_pieces` past its "end-game mode" mark: a random
+    /// piece the peer has that another peer is downloading, then a random
+    /// block of it neither received, nor being written, nor asked of a
+    /// third peer already. Each block is asked of one peer besides its
+    /// owner at most.
+    fn double_a_block<I, P, A, S>(
+        &mut self,
+        req: &AcquireRequest<'_, I, P, A, S>,
+    ) -> Option<AcquireResult>
+    where
+        I: Iterator<Item = ValidPieceIndex>,
+        P: Fn(ValidPieceIndex) -> bool,
+        A: Fn(ValidPieceIndex) -> u32,
+        S: Fn(ValidPieceIndex) -> bool,
+    {
+        let Self {
+            chunks,
+            inflight,
+            writing,
+            rng,
+            ..
+        } = self;
+        let mut pieces: Vec<(ValidPieceIndex, Vec<ChunkInfo>)> = inflight
+            .iter()
+            .filter(|(piece, info)| info.peer != req.peer && (req.peer_has_piece)(**piece))
+            .map(|(piece, info)| {
+                let free: Vec<_> = chunks
+                    .iter_missing_chunks(*piece)
+                    .filter(|c| {
+                        !writing.contains(&c.absolute_index)
+                            && !info.duplicates.iter().any(|(b, _)| *b == c.chunk_index)
+                    })
+                    .collect();
+                (*piece, free)
+            })
+            .filter(|(_, free)| !free.is_empty())
+            .collect();
+        // In index order, so the pick follows the rng alone.
+        pieces.sort_unstable_by_key(|(piece, _)| piece.get());
+        if pieces.is_empty() {
+            return None;
+        }
+        let (piece, free) = pieces.swap_remove(rng.random_range(0..pieces.len()));
+        let chunk = free[rng.random_range(0..free.len())];
+        inflight
+            .get_mut(&piece)?
+            .duplicates
+            .push((chunk.chunk_index, req.peer));
+        Some(AcquireResult::EndGame { piece, chunk })
     }
 
     /// The queued piece to hand the peer `req` asks for, after libtorrent
@@ -398,6 +488,7 @@ impl PieceTracker {
             InflightPiece {
                 peer,
                 started: Instant::now(),
+                duplicates: Vec::new(),
             },
         );
         AcquireResult::Reserved(piece)
@@ -438,6 +529,7 @@ impl PieceTracker {
         let info = self.inflight.get_mut(&piece)?;
         info.peer = req.peer;
         info.started = Instant::now();
+        info.duplicates.retain(|(_, peer)| *peer != req.peer);
 
         Some(AcquireResult::Stolen {
             piece,
@@ -490,12 +582,48 @@ impl PieceTracker {
             self.inflight.remove(&piece);
             self.chunks.requeue_piece_if_not_have(piece);
         }
+        // The blocks it doubled in the end game are asked of their owners
+        // alone again.
+        for info in self.inflight.values_mut() {
+            info.duplicates.retain(|(_, holder)| *holder != peer);
+        }
         count
+    }
+
+    /// `peer`'s copy of `chunk` arrived: whether it is the one written. The
+    /// first copy of a block asked of two peers is, and the other peer's
+    /// request is to be cancelled (libtorrent `peer_connection::incoming_piece`:
+    /// `mark_as_writing`, then `torrent::cancel_block` when the block had
+    /// more than one peer). Any later copy, and a block of a piece not asked
+    /// of the peer, is not.
+    pub fn block_arrived(&mut self, chunk: &ChunkInfo, peer: PeerHandle) -> Arrival {
+        if self.chunks.is_chunk_received(chunk) || self.writing.contains(&chunk.absolute_index) {
+            return Arrival::Discard;
+        }
+        let Some(info) = self.inflight.get_mut(&chunk.piece_index) else {
+            return Arrival::Discard;
+        };
+        let doubled = info
+            .duplicates
+            .iter()
+            .position(|(block, _)| *block == chunk.chunk_index);
+        let cancel = match doubled {
+            Some(at) if peer == info.peer => Some(info.duplicates.swap_remove(at).1),
+            Some(at) if peer == info.duplicates[at].1 => {
+                info.duplicates.swap_remove(at);
+                Some(info.peer)
+            }
+            None if peer == info.peer => None,
+            _ => return Arrival::Discard,
+        };
+        self.writing.insert(chunk.absolute_index);
+        Arrival::Write { cancel }
     }
 
     // === QUERIES ===
 
     /// Get the inflight info for a piece, if it's currently being downloaded.
+    #[cfg(test)]
     pub fn get_inflight(&self, piece: ValidPieceIndex) -> Option<&InflightPiece> {
         self.inflight.get(&piece)
     }
@@ -508,10 +636,41 @@ impl PieceTracker {
             .is_some_and(|info| info.peer == peer)
     }
 
-    /// The chunks of `piece` its owner still has to request: those not yet
-    /// received. A peer that steals a half-received piece requests only these.
+    /// Whether `peer` requests chunks of `piece`: it owns it, or asks for a
+    /// block of it in the end game that has not arrived. A peer whose piece
+    /// was stolen stops requesting it.
+    pub fn may_request(&self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
+        self.is_owned_by(piece, peer)
+            || self
+                .inflight
+                .get(&piece)
+                .is_some_and(|info| info.duplicates.iter().any(|(_, p)| *p == peer))
+    }
+
+    /// The chunks of `piece` not yet received. A peer that steals a
+    /// half-received piece requests only these.
     pub fn missing_chunks(&self, piece: ValidPieceIndex) -> impl Iterator<Item = ChunkInfo> + '_ {
         self.chunks.iter_missing_chunks(piece)
+    }
+
+    /// The chunks of `piece` `peer` is to request: its owner, those not yet
+    /// received; a peer that doubles a block of it in the end game, that
+    /// block.
+    pub fn chunks_to_request(
+        &self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+    ) -> impl Iterator<Item = ChunkInfo> + '_ {
+        let info = self.inflight.get(&piece);
+        let owner = info.is_some_and(|info| info.peer == peer);
+        self.missing_chunks(piece).filter(move |chunk| {
+            owner
+                || info.is_some_and(|info| {
+                    info.duplicates
+                        .iter()
+                        .any(|d| *d == (chunk.chunk_index, peer))
+                })
+        })
     }
 
     /// Check if a piece is currently in-flight.
@@ -536,15 +695,17 @@ impl PieceTracker {
         piece: &Piece<ByteBuf<'_>>,
         sender: PeerHandle,
     ) -> Option<ChunkMarkingResult> {
+        let lengths = self.chunks.get_lengths();
+        let index = lengths.validate_piece_index(piece.index)?;
+        let chunk = lengths.chunk_info_from_received_data(
+            index,
+            piece.begin,
+            piece.len().try_into().ok()?,
+        )?;
+        self.writing.remove(&chunk.absolute_index);
         let result = self.chunks.mark_chunk_downloaded(piece)?;
         if !matches!(result, ChunkMarkingResult::PreviouslyCompleted) {
             let lengths = self.chunks.get_lengths();
-            let index = lengths.validate_piece_index(piece.index)?;
-            let chunk = lengths.chunk_info_from_received_data(
-                index,
-                piece.begin,
-                piece.len().try_into().ok()?,
-            )?;
             let blocks = lengths.chunks_per_piece(index) as usize;
             let record = self
                 .senders
@@ -1166,8 +1327,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_end_game_takes_over_a_slow_piece_only_when_nothing_is_queued_and_the_peer_is_idle()
-    {
+    async fn the_end_game_takes_over_a_slow_piece_only_when_every_piece_is_started_and_the_peer_is_idle()
+     {
         let (slow, fast) = (peer(1), peer(2));
         let mut tracker = tracker(3);
         let slow_has = |p: ValidPieceIndex| p.get() < 2;
@@ -1306,5 +1467,145 @@ mod tests {
         );
         assert!(tracker.is_owned_by(piece, fast));
         assert!(!tracker.is_owned_by(piece, slow));
+    }
+
+    /// The block the end game hands `who`, which has every piece, has no
+    /// request outstanding and no average piece time.
+    fn doubled(tracker: &mut PieceTracker, who: PeerHandle) -> Option<ChunkInfo> {
+        match tracker.acquire_piece(ask(who, all, one)) {
+            AcquireResult::EndGame { chunk, .. } => Some(chunk),
+            AcquireResult::NoneAvailable => None,
+            other => panic!("expected EndGame, got {other:?}"),
+        }
+    }
+
+    fn chunk_of(tracker: &PieceTracker, piece: u32, chunk: u32) -> ChunkInfo {
+        let piece = index(tracker, piece);
+        tracker
+            .chunks()
+            .get_lengths()
+            .iter_chunk_infos(piece)
+            .nth(chunk as usize)
+            .unwrap()
+    }
+
+    #[test]
+    fn in_the_end_game_a_peer_with_no_piece_time_asks_for_a_block_asked_of_another() {
+        let mut tracker = tracker(1);
+        let (owner, idle) = (peer(1), peer(2));
+        assert_eq!(reserved(tracker.acquire_piece(ask(owner, all, one))), 0);
+        deliver_from(&mut tracker, owner, 0, 0);
+
+        // Every wanted piece is in flight and the idle peer has no request
+        // outstanding: it asks for one block the owner has not delivered,
+        // and requests that block alone.
+        let chunk = doubled(&mut tracker, idle).unwrap();
+        assert_ne!(chunk.chunk_index, 0);
+        let piece = index(&tracker, 0);
+        assert!(tracker.may_request(piece, idle));
+        assert_eq!(
+            tracker.chunks_to_request(piece, idle).collect::<Vec<_>>(),
+            [chunk]
+        );
+        assert_eq!(tracker.chunks_to_request(piece, owner).count(), 3);
+    }
+
+    #[test]
+    fn each_block_is_asked_of_one_peer_besides_its_owner_at_most() {
+        let mut tracker = tracker(1);
+        assert_eq!(reserved(tracker.acquire_piece(ask(peer(1), all, one))), 0);
+        deliver_from(&mut tracker, peer(1), 0, 0);
+
+        let picked: BTreeSet<u32> = (2..5)
+            .map(|p| doubled(&mut tracker, peer(p)).unwrap().chunk_index)
+            .collect();
+        assert_eq!(picked, BTreeSet::from([1, 2, 3]));
+        assert_eq!(doubled(&mut tracker, peer(5)), None);
+    }
+
+    #[test]
+    fn no_block_is_doubled_while_a_wanted_piece_is_unstarted_or_by_a_busy_or_paroled_peer() {
+        let mut tracker = tracker(2);
+        let (owner, idle) = (peer(1), peer(2));
+        let has_0 = |p: ValidPieceIndex| p.get() == 0;
+        assert_eq!(reserved(tracker.acquire_piece(ask(owner, has_0, one))), 0);
+
+        // Piece 1 is wanted and no one has started it: no end game, though
+        // the idle peer lacks it.
+        let result = tracker.acquire_piece(ask(idle, has_0, one));
+        assert!(matches!(result, AcquireResult::NoneAvailable), "{result:?}");
+
+        // Once a block of it is received, every wanted piece is started.
+        deliver_from(&mut tracker, peer(3), 1, 0);
+        let mut busy = ask(idle, has_0, one);
+        busy.outstanding_requests = 1;
+        let result = tracker.acquire_piece(busy);
+        assert!(matches!(result, AcquireResult::NoneAvailable), "{result:?}");
+        let mut paroled = ask(idle, has_0, one);
+        paroled.options.on_parole = true;
+        let result = tracker.acquire_piece(paroled);
+        assert!(matches!(result, AcquireResult::NoneAvailable), "{result:?}");
+        assert!(matches!(
+            tracker.acquire_piece(ask(idle, has_0, one)),
+            AcquireResult::EndGame { .. }
+        ));
+    }
+
+    #[test]
+    fn the_first_copy_of_a_doubled_block_is_written_and_the_other_request_cancelled() {
+        let mut tracker = tracker(1);
+        let (owner, idle, stranger) = (peer(1), peer(2), peer(3));
+        assert_eq!(reserved(tracker.acquire_piece(ask(owner, all, one))), 0);
+        let first = doubled(&mut tracker, idle).unwrap();
+
+        // The doubling peer's copy comes first: the owner's request goes,
+        // and so does its copy, while being written and once written.
+        assert_eq!(
+            tracker.block_arrived(&first, idle),
+            Arrival::Write {
+                cancel: Some(owner)
+            }
+        );
+        assert!(!tracker.may_request(index(&tracker, 0), idle));
+        assert_eq!(tracker.block_arrived(&first, owner), Arrival::Discard);
+        deliver_from(&mut tracker, idle, 0, first.chunk_index);
+        assert_eq!(tracker.block_arrived(&first, owner), Arrival::Discard);
+
+        // The owner's copy comes first: the doubling peer's request goes.
+        let second = doubled(&mut tracker, idle).unwrap();
+        assert_eq!(
+            tracker.block_arrived(&second, owner),
+            Arrival::Write { cancel: Some(idle) }
+        );
+        assert_eq!(tracker.block_arrived(&second, idle), Arrival::Discard);
+
+        // A block asked of no one else is the owner's alone.
+        let rest = (0..4)
+            .map(|c| chunk_of(&tracker, 0, c))
+            .find(|c| *c != first && *c != second)
+            .unwrap();
+        assert_eq!(tracker.block_arrived(&rest, stranger), Arrival::Discard);
+        assert_eq!(
+            tracker.block_arrived(&rest, owner),
+            Arrival::Write { cancel: None }
+        );
+    }
+
+    #[test]
+    fn a_peer_that_goes_away_leaves_the_block_it_doubled_to_be_doubled_again() {
+        let mut tracker = tracker(1);
+        let (owner, gone, next) = (peer(1), peer(2), peer(3));
+        assert_eq!(reserved(tracker.acquire_piece(ask(owner, all, one))), 0);
+        for chunk in 0..3 {
+            deliver_from(&mut tracker, owner, 0, chunk);
+        }
+        let last = chunk_of(&tracker, 0, 3);
+        assert_eq!(doubled(&mut tracker, gone), Some(last));
+        assert_eq!(doubled(&mut tracker, next), None);
+
+        assert_eq!(tracker.release_pieces_owned_by(gone), 0);
+        assert!(!tracker.may_request(index(&tracker, 0), gone));
+        assert_eq!(tracker.block_arrived(&last, gone), Arrival::Discard);
+        assert_eq!(doubled(&mut tracker, next), Some(last));
     }
 }

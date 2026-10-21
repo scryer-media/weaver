@@ -899,6 +899,19 @@ impl LivePeerState {
         }
     }
 
+    /// Stops waiting for `chunk`, which arrived from another peer it was
+    /// asked of in the end game. The peer is told; a copy already on its
+    /// way is let through as late (libtorrent `peer_connection::cancel_request`).
+    pub fn cancel_inflight_request(&mut self, chunk: &ChunkInfo) {
+        if self.inflight_requests.remove(chunk) {
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::Cancel(wire_request(chunk))));
+            self.late_cancelled_request_tolerance += 1;
+            self.request_slots_changed.notify_waiters();
+        }
+    }
+
     pub fn cancel_inflight_requests_for_piece(&mut self, piece: ValidPieceIndex) {
         let tx = &self.tx;
         let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;

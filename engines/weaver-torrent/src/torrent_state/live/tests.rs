@@ -425,7 +425,17 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
         .unwrap();
     tokio::time::advance(Duration::from_secs(100)).await;
 
-    assert_eq!(snubbed.acquire_next_piece().unwrap(), None);
+    // In the end game it may double a block, but both pieces stay the
+    // owner's.
+    snubbed.acquire_next_piece().unwrap();
+    let owned = |p| {
+        h.live
+            .lock_read("test")
+            .get_pieces()
+            .unwrap()
+            .is_owned_by(h.piece(p), owner.addr)
+    };
+    assert!(owned(0) && owned(1));
     assert!(fast.acquire_next_piece().unwrap().is_some());
 }
 
