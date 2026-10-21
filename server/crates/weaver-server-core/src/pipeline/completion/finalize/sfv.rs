@@ -350,7 +350,7 @@ impl SfvFileCrc {
 // Streaming CRC32 of a whole file. The disk arm's only I/O.
 fn stream_crc32(path: &Path) -> std::io::Result<u32> {
     let mut file = File::open(path)?;
-    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    let mut digest = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
     let mut buffer = vec![0u8; SFV_READ_BUFFER_BYTES];
     loop {
         let read = file.read(&mut buffer)?;

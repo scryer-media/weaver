@@ -1568,6 +1568,12 @@ impl Pipeline {
                     .write_buffers
                     .get(&file_id)
                     .is_some_and(|buffer| buffer.buffered_len() != 0)
+                // A batch out to the disk owner is marked persisted before it
+                // lands, so its bytes are not on disk yet.
+                || self
+                    .segment_writes
+                    .get(&file_id)
+                    .is_some_and(|tickets| !tickets.is_empty())
             {
                 continue;
             }

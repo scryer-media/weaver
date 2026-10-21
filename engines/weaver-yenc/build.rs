@@ -56,8 +56,8 @@ fn main() {
             .file("rapidyenc_shim.cc")
             .compile("rapidyenc_arm");
 
-        // CRC dispatch + the ARM kernels it installs (needed by the
-        // crc_probe example's rapidyenc lane). `crc_arm*.cc` self-stub when the
+        // CRC dispatch + the ARM kernels it installs (the rapidyenc CRC
+        // lane of the article_profile example and the rapidyenc_parity bench). `crc_arm*.cc` self-stub when the
         // required ISA extension is not enabled, so `flag_if_supported` is safe.
         cc::Build::new()
             .cpp(true)
@@ -117,8 +117,8 @@ fn main() {
         b.compile(&format!("rapidyenc_{name}"));
     }
 
-    // CRC dispatch + its x86 folding kernels, for the crc_probe example's
-    // rapidyenc lane. `YENC_DISABLE_CRCUTIL` keeps the *generic* fallback as
+    // CRC dispatch + its x86 folding kernels, for the rapidyenc CRC lane of
+    // the article_profile example and the rapidyenc_parity bench. `YENC_DISABLE_CRCUTIL` keeps the *generic* fallback as
     // rapidyenc's own slice table instead of pulling in the whole crcutil-1.0
     // tree; on any CPU with SSE4.1+SSSE3+PCLMUL the generic path is overwritten
     // by crc_clmul_set_funcs() anyway (rapidyenc src/crc.cc:231-240).

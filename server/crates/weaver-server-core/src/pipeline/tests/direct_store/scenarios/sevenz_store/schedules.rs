@@ -10,6 +10,7 @@ use super::*;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
 
 mod extended;
+pub(in super::super) mod graph;
 
 // Bytes in which no slice recurs. A recovery set mends a lost slice from any
 // copy of it elsewhere in the set, so a payload that repeats survives a loss
@@ -163,15 +164,36 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
     .await;
 }
 
-// Runs `cases`, and `wrong_password` under a password the archive does not
-// open with, over `shape` and holds each to what `profile` allows.
-async fn run_shape(
-    shape: Shape,
-    profile: ExtractionProfile,
-    options: ScheduleOptions,
-    wrong_password: Vec<Schedule>,
-    cases: Vec<(usize, Schedule)>,
-) {
+// Whether a shape's entries are its archive's bytes: stored under `Copy`,
+// deciphered in place when encrypted, or packed by a coder, solid or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Packing {
+    Stored,
+    Packed,
+}
+
+// A shape's archive as posted: its entries by name and bytes, how they are
+// packed, the archive and the volumes it is split into, the names its
+// recovery set describes them by, and the job, with the password when the
+// archive needs one.
+struct ShapeFixture {
+    expected: BTreeMap<&'static str, Vec<u8>>,
+    packing: Packing,
+    archive: Vec<u8>,
+    count: usize,
+    volumes: Vec<(String, Vec<u8>)>,
+    described: Option<Vec<String>>,
+    password: Option<&'static str>,
+    spec: JobSpec,
+}
+
+impl ShapeFixture {
+    fn wanted(&self) -> Vec<&'static str> {
+        self.expected.keys().copied().collect()
+    }
+}
+
+fn shape_fixture(shape: Shape) -> ShapeFixture {
     // A described volume is bound by the fingerprint of its first 16 KiB,
     // which its offset-zero article has to cover whole.
     let first = if matches!(shape, Shape::CopyObfuscated | Shape::CopySingleObfuscated) {
@@ -198,7 +220,17 @@ async fn run_shape(
         }
         _ => {}
     }
-    let method = if matches!(shape, Shape::Lzma2Fallback | Shape::EncryptedLzma2) {
+    let coded = matches!(shape, Shape::Lzma2Fallback | Shape::EncryptedLzma2);
+    let solid = matches!(
+        shape,
+        Shape::Solid | Shape::SolidEncrypted | Shape::SolidHeaders
+    );
+    let packing = if coded || solid {
+        Packing::Packed
+    } else {
+        Packing::Stored
+    };
+    let method = if coded {
         EncoderMethod::LZMA2
     } else {
         EncoderMethod::COPY
@@ -212,10 +244,7 @@ async fn run_shape(
             | Shape::SolidHeaders
     )
     .then_some("moonlit-harbour");
-    let archive = if matches!(
-        shape,
-        Shape::Solid | Shape::SolidEncrypted | Shape::SolidHeaders
-    ) {
+    let archive = if solid {
         expected.clear();
         for (index, name) in ["part0.bin", "part1.bin", "part2.bin"]
             .into_iter()
@@ -267,22 +296,43 @@ async fn run_shape(
         };
     let mut spec = sevenz_job_spec(&volumes, 4 / count);
     spec.password = password.map(str::to_owned);
-    let wanted = expected.keys().copied().collect::<Vec<_>>();
+    ShapeFixture {
+        expected,
+        packing,
+        archive,
+        count,
+        volumes,
+        described,
+        password,
+        spec,
+    }
+}
+
+// Runs `cases`, and `wrong_password` under a password the archive does not
+// open with, over `shape` and holds each to what `profile` allows.
+async fn run_shape(
+    shape: Shape,
+    profile: ExtractionProfile,
+    options: ScheduleOptions,
+    wrong_password: Vec<Schedule>,
+    cases: Vec<(usize, Schedule)>,
+) {
+    let fixture = shape_fixture(shape);
+    let wanted = fixture.wanted();
+    let ShapeFixture {
+        expected,
+        packing,
+        archive,
+        count,
+        volumes,
+        described,
+        password,
+        spec,
+    } = fixture;
     // AES over `Copy` is the member's bytes once deciphered in place, under a
     // plain header or one the password opens.
-    let direct_compatible = matches!(
-        shape,
-        Shape::Copy
-            | Shape::CopyFourVolumes
-            | Shape::CopySingle
-            | Shape::CopySingleObfuscated
-            | Shape::Multiple
-            | Shape::EmptyEntry
-            | Shape::Nested
-            | Shape::EncryptedCopy
-            | Shape::EncryptedHeaders
-    ) || (matches!(shape, Shape::CopyObfuscated)
-        && options.recovery != RecoveryFormat::Par3);
+    let direct_compatible = packing == Packing::Stored
+        && !(matches!(shape, Shape::CopyObfuscated) && options.recovery == RecoveryFormat::Par3);
     // A 7z set's layout lives in articles of its own: the start header opens
     // the first volume and the end header closing the last volume holds the
     // map. Every schedule spans four article slots, so those are slots 0 and

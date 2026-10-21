@@ -10,6 +10,14 @@ use crate::member::MemberId;
 use crate::object::Kind;
 use crate::volume::{ByteRange, VolumeIndex};
 
+// Bytes posted for a member: where they start, what they are, and how
+// they came.
+pub struct Posted {
+    pub offset: u64,
+    pub bytes: Bytes,
+    pub provenance: Provenance,
+}
+
 // Where the bytes came from and whether they can be trusted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Provenance {
@@ -28,6 +36,13 @@ impl Provenance {
     // that passed an independent checksum upstream.
     pub fn is_verified(self) -> bool {
         matches!(self, Provenance::Fresh | Provenance::Repaired)
+    }
+
+    // Whether a record of bytes with this provenance already answers the
+    // same bytes arriving again with `later`, and stands: damage never takes
+    // back a repair. Any other later arrival is the newer word on its bytes.
+    pub(crate) fn answers(self, later: Provenance) -> bool {
+        matches!((self, later), (Provenance::Repaired, Provenance::Damaged))
     }
 }
 
@@ -49,20 +64,17 @@ impl Delivery<'_> {
 pub enum RecoveryKind {
     Par2,
     Par3,
-    // A RAR recovery record: Reed-Solomon over the volume's own bytes, which
-    // only a RAR engine can apply.
+    // A RAR recovery record: parity over the volume's own bytes before it.
     Rar,
 }
 
 impl RecoveryKind {
-    // The recovery object built over the range. A RAR recovery record has
-    // none: nothing in the build decodes one, so it is only known to be
-    // there.
-    pub fn object(self) -> Option<Kind> {
+    // The recovery object built over the range.
+    pub fn object(self) -> Kind {
         match self {
-            RecoveryKind::Par2 => Some(Kind::Par2),
-            RecoveryKind::Par3 => Some(Kind::Par3),
-            RecoveryKind::Rar => None,
+            RecoveryKind::Par2 => Kind::Par2,
+            RecoveryKind::Par3 => Kind::Par3,
+            RecoveryKind::Rar => Kind::RarRecord,
         }
     }
 }
@@ -102,6 +114,9 @@ pub enum Why {
     // never placed every member it named: its map never came, or never
     // closed what it announced.
     Unmapped,
+    // A volume the set needs is in, and nothing states where in the set it
+    // goes: more than one free place fits it and no name or header chooses.
+    OrderUnknown,
     // The object would sit deeper than a job's namespaces may nest. What
     // the member holds is the container, delivered as it is.
     TooDeep,
@@ -114,7 +129,11 @@ impl Why {
     // output as they stand.
     pub fn withholds(self) -> bool {
         match self {
-            Why::Encrypted | Why::EncryptedHeader | Why::Compressed | Why::Unmapped => true,
+            Why::Encrypted
+            | Why::EncryptedHeader
+            | Why::Compressed
+            | Why::Unmapped
+            | Why::OrderUnknown => true,
             Why::TailUnreachable
             | Why::UnboundedEntry
             | Why::NotAFile
@@ -143,6 +162,7 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unmapped
+            | Why::OrderUnknown
             | Why::TooDeep => false,
         }
     }
@@ -205,6 +225,7 @@ mod tests {
             Why::EncryptedHeader,
             Why::Compressed,
             Why::Unmapped,
+            Why::OrderUnknown,
         ];
         let delivered = [
             Why::TailUnreachable,

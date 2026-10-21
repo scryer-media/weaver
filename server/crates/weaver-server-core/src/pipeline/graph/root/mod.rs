@@ -26,7 +26,7 @@ pub(crate) mod source;
 pub(crate) mod window;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -34,7 +34,7 @@ use weaver_graph::{
     ByteRange, NodeId, Part, Pull, Purpose, Seek, Segment, Tree, VolumeIndex, Weight,
 };
 
-use self::facts::{PostFacts, RootFactsError};
+use self::facts::{Parts, PostFacts, RootFactsError};
 use self::intake::{Checksums, Decoded};
 use self::source::{ArticleMap, Class, Move};
 use self::window::{Bid, Window};
@@ -69,30 +69,15 @@ pub(crate) trait Root: Segments {
     const NAME: &'static str;
     const FACTS_VERSION: u16;
 
-    fn facts(&self) -> Self::Facts;
-
     // The facts' bytes and the parts they name, encoding again only what
-    // changed since `kept` last encoded. Facts kept whole name no parts.
-    fn encode(&self, _kept: &mut Self::Kept) -> Result<(Vec<u8>, Vec<Part>), RootFactsError> {
-        rmp_serde::to_vec(&self.facts())
-            .map(|bytes| (bytes, Vec::new()))
-            .map_err(|error| RootFactsError::Encode(error.to_string()))
-    }
+    // changed since `kept` last encoded; into nothing kept, every part.
+    fn encode(&self, kept: &mut Self::Kept) -> Result<(Vec<u8>, Parts), RootFactsError>;
 
     // The facts back from their bytes and parts.
-    fn decode(bytes: &[u8], parts: &[Part]) -> Result<Self::Facts, RootFactsError> {
-        if !parts.is_empty() {
-            return Err(RootFactsError::Decode(
-                "parts of facts kept whole".to_owned(),
-            ));
-        }
-        rmp_serde::from_slice(bytes).map_err(|error| RootFactsError::Decode(error.to_string()))
-    }
+    fn decode(bytes: &[u8], parts: &[Part]) -> Result<Self::Facts, RootFactsError>;
 
     // Units the queues do not hold were fetched by an earlier run.
     fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool);
-    // Some volume's opening bytes have yet to arrive.
-    fn any_head_waiting(&self) -> bool;
     // The class the root fetches a unit under now.
     fn class(&self, volume: VolumeIndex, unit: u32) -> Option<Self::Class>;
     // Raise what samples the post ahead of the payload.
@@ -220,12 +205,8 @@ impl Root for ArticleRoot {
     const NAME: &'static str = "articles";
     const FACTS_VERSION: u16 = PostFacts::VERSION;
 
-    fn facts(&self) -> PostFacts {
-        self.post_facts()
-    }
-
-    fn encode(&self, kept: &mut facts::Encoded) -> Result<(Vec<u8>, Vec<Part>), RootFactsError> {
-        facts::encode_post(kept, &self.post_facts())
+    fn encode(&self, kept: &mut facts::Encoded) -> Result<(Vec<u8>, Parts), RootFactsError> {
+        facts::encode_post(self, kept)
     }
 
     fn decode(bytes: &[u8], parts: &[Part]) -> Result<PostFacts, RootFactsError> {
@@ -234,10 +215,6 @@ impl Root for ArticleRoot {
 
     fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool) {
         self.map.arrived_before(queued);
-    }
-
-    fn any_head_waiting(&self) -> bool {
-        self.map.any_head_waiting()
     }
 
     fn class(&self, volume: VolumeIndex, unit: u32) -> Option<Class> {

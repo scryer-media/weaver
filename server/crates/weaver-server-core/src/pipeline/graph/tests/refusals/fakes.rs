@@ -111,6 +111,9 @@ impl Store {
 }
 
 impl Object for Store {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::RarStore
     }
@@ -180,7 +183,7 @@ impl Object for Store {
         }
     }
 
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
@@ -237,7 +240,7 @@ impl Object for Store {
         None
     }
 
-    fn claim(&mut self, name: &str, _: &[u8]) -> Option<VolumeIndex> {
+    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
         let (_, part) = name.rsplit_once(".part")?;
         let part: u32 = part.strip_suffix(".rar")?.parse().ok()?;
         (part >= 2).then(|| VolumeIndex(part - 1))
@@ -254,6 +257,9 @@ struct LockedEngine {
 }
 
 impl Object for LockedEngine {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::RarEngine
     }
@@ -266,7 +272,7 @@ impl Object for LockedEngine {
     }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {

@@ -429,7 +429,7 @@ impl Object for Zip {
         }
     }
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         if self.gone {
             return;
         }
@@ -465,6 +465,22 @@ impl Object for Zip {
         }
     }
 
+    // Each member the bytes reached forgets what was said of them and is
+    // open until they are said again.
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let mut placements = Vec::new();
+        self.locate(volume, range, &mut placements);
+        for placement in placements {
+            if let Placement::Member { member, range } = placement
+                && !range.is_empty()
+                && let Some(said) = self.members.get_mut(member.0 as usize)
+            {
+                said.coverage.erase(range);
+                said.closed = false;
+            }
+        }
+    }
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         self.place(volume, range, out);
     }
@@ -491,7 +507,7 @@ impl Object for Zip {
         self.kept.read(range).map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
         let first = self.names.values().next();
         if let Some(parsed) = ZipFormat::parse(name)
             && first.is_none_or(|first| first.same_set(&parsed))
@@ -513,7 +529,12 @@ impl Object for Zip {
         }
     }
 
-    fn claim(&mut self, name: &str, _first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        name: &str,
+        _first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         let candidate = ZipFormat::parse(name)?;
         // The member that founds the store binds at its own name's index,
         // the `.zip` at the symbolic last.
@@ -526,7 +547,7 @@ impl Object for Zip {
             .same_set(&candidate)
             .then(|| candidate.slot(&self.names))??;
         let before_last = index == LAST || self.last_disk.is_none_or(|last| index < last);
-        (before_last && !self.bound.contains(&index)).then_some(VolumeIndex(index))
+        before_last.then_some(VolumeIndex(index))
     }
 
     fn facts(&self) -> Facts {

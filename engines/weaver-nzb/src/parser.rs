@@ -88,7 +88,8 @@ pub struct ParseDiagnostics {
 pub struct FileParseDiagnostics {
     // Segments skipped for a missing or invalid number, size, or message-ID.
     pub malformed_segments: u32,
-    // Segments skipped because their number was already listed.
+    // Segments whose number was already listed: a new ID joins that number's
+    // segment, a repeated one is skipped.
     pub duplicate_segment_numbers: u32,
     // Segments skipped because their message-ID was already listed.
     pub duplicate_message_ids: u32,
@@ -245,7 +246,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             subject,
                             groups: Vec::new(),
                             segments: Vec::new(),
-                            segment_numbers: HashSet::new(),
+                            segment_numbers: HashMap::new(),
                             message_ids: HashSet::new(),
                             duplicates: DuplicateSegmentTally::default(),
                             notes: FileParseDiagnostics::default(),
@@ -359,7 +360,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 }
                                 f.last_number = Some(number);
 
-                                if f.segment_numbers.contains(&number) {
+                                let slot = f.segment_numbers.get(&number).copied();
+                                if f.message_ids.contains(&message_id) && slot.is_some() {
                                     f.duplicates.note_number(&message_id);
                                     f.notes.duplicate_segment_numbers =
                                         f.notes.duplicate_segment_numbers.saturating_add(1);
@@ -367,15 +369,23 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                     f.duplicates.note_message_id(&message_id);
                                     f.notes.duplicate_message_ids =
                                         f.notes.duplicate_message_ids.saturating_add(1);
-                                } else {
-                                    f.segment_numbers.insert(number);
+                                } else if total_segments >= limits.max_segments {
+                                    // Every ID held counts, a part's later ones too.
+                                    return Err(NzbError::ResourceLimit(format!(
+                                        "NZB has more than {} segments",
+                                        limits.max_segments
+                                    )));
+                                } else if let Some(slot) = slot {
+                                    // The part was posted again: its segment keeps
+                                    // this ID behind the ones before it.
+                                    f.notes.duplicate_segment_numbers =
+                                        f.notes.duplicate_segment_numbers.saturating_add(1);
                                     f.message_ids.insert(message_id.clone());
-                                    if total_segments >= limits.max_segments {
-                                        return Err(NzbError::ResourceLimit(format!(
-                                            "NZB has more than {} segments",
-                                            limits.max_segments
-                                        )));
-                                    }
+                                    total_segments += 1;
+                                    f.segments[slot].message_ids.push(message_id);
+                                } else {
+                                    f.segment_numbers.insert(number, f.segments.len());
+                                    f.message_ids.insert(message_id.clone());
                                     total_declared_bytes = total_declared_bytes
                                         .checked_add(bytes as u64)
                                         .ok_or_else(|| {
@@ -393,7 +403,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                     f.segments.push(NzbSegment {
                                         number,
                                         bytes,
-                                        message_id,
+                                        message_ids: vec![message_id],
                                     });
                                 }
                             }
@@ -490,8 +500,12 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     // no bookkeeping on the download path. Placements retain their semantics.
     if limits.max_message_id_uses < limits.max_segments {
         let mut uses = HashMap::<&str, usize>::new();
-        for segment in files.iter().flat_map(|file| &file.segments) {
-            let count = uses.entry(&segment.message_id).or_default();
+        let ids = files
+            .iter()
+            .flat_map(|file| &file.segments)
+            .flat_map(|segment| &segment.message_ids);
+        for id in ids {
+            let count = uses.entry(id).or_default();
             if *count >= limits.max_message_id_uses {
                 return Err(NzbError::ResourceLimit(format!(
                     "message-ID fan-out exceeds {} placements",
@@ -527,7 +541,8 @@ struct FileBuilder {
     subject: String,
     groups: Vec<String>,
     segments: Vec<NzbSegment>,
-    segment_numbers: HashSet<u32>,
+    // Each part number listed so far, and the index of its segment.
+    segment_numbers: HashMap<u32, usize>,
     message_ids: HashSet<String>,
     duplicates: DuplicateSegmentTally,
     notes: FileParseDiagnostics,
@@ -696,7 +711,7 @@ mod tests {
         assert_eq!(file.segments.len(), 1);
         assert_eq!(file.segments[0].number, 1);
         assert_eq!(file.segments[0].bytes, 500000);
-        assert_eq!(file.segments[0].message_id, "abc123@example.com");
+        assert_eq!(file.segments[0].message_id(), "abc123@example.com");
     }
 
     // 2. Parse with full metadata (title, password, tags)
@@ -758,7 +773,7 @@ mod tests {
         assert_eq!(
             segments
                 .iter()
-                .map(|segment| segment.message_id.as_str())
+                .map(|segment| segment.message_id())
                 .collect::<Vec<_>>(),
             vec!["one@example.com", "four@example.com", "six@example.com"]
         );
@@ -848,11 +863,11 @@ mod tests {
         let nzb = parse_nzb(xml).unwrap();
         let segs = &nzb.files[0].segments;
         assert_eq!(segs[0].number, 1);
-        assert_eq!(segs[0].message_id, "a@host");
+        assert_eq!(segs[0].message_id(), "a@host");
         assert_eq!(segs[1].number, 2);
-        assert_eq!(segs[1].message_id, "b@host");
+        assert_eq!(segs[1].message_id(), "b@host");
         assert_eq!(segs[2].number, 3);
-        assert_eq!(segs[2].message_id, "c@host");
+        assert_eq!(segs[2].message_id(), "c@host");
     }
 
     // 8. Empty NZB returns error
@@ -969,11 +984,13 @@ mod tests {
         assert_eq!(nzb.files[0].segments.len(), 1);
         assert_eq!(nzb.files[0].segments[0].number, 6);
         assert_eq!(nzb.files[0].segments[0].bytes, 42);
-        assert_eq!(nzb.files[0].segments[0].message_id, "valid");
+        assert_eq!(nzb.files[0].segments[0].message_id(), "valid");
     }
 
+    // A part listed again under another ID is one segment holding both IDs in
+    // document order; listed again under an ID it already holds, it is skipped.
     #[test]
-    fn duplicate_segment_numbers_are_skipped() {
+    fn a_part_posted_again_is_one_segment_with_every_id() {
         let xml = br#"<?xml version="1.0"?>
 <nzb>
   <file poster="p" date="0" subject="s">
@@ -982,17 +999,19 @@ mod tests {
       <segment bytes="1" number="1">first</segment>
       <segment bytes="2" number="1">duplicate</segment>
       <segment bytes="3" number="2">second</segment>
+      <segment bytes="1" number="1">first</segment>
     </segments>
   </file>
 </nzb>"#;
-        let nzb = parse_nzb(xml).unwrap();
+        let (nzb, diagnostics) = parse_nzb_with_diagnostics(xml).unwrap();
         let segments = &nzb.files[0].segments;
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].number, 1);
         assert_eq!(segments[0].bytes, 1);
-        assert_eq!(segments[0].message_id, "first");
+        assert_eq!(segments[0].message_ids, ["first", "duplicate"]);
         assert_eq!(segments[1].number, 2);
-        assert_eq!(segments[1].message_id, "second");
+        assert_eq!(segments[1].message_ids, ["second"]);
+        assert_eq!(diagnostics.files[0].duplicate_segment_numbers, 2);
     }
 
     #[test]
@@ -1012,9 +1031,9 @@ mod tests {
         let segments = &nzb.files[0].segments;
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].number, 1);
-        assert_eq!(segments[0].message_id, "same-id");
+        assert_eq!(segments[0].message_id(), "same-id");
         assert_eq!(segments[1].number, 3);
-        assert_eq!(segments[1].message_id, "next-id");
+        assert_eq!(segments[1].message_id(), "next-id");
     }
 
     // A file whose segment list repeats itself is worth one line, not one
@@ -1072,7 +1091,7 @@ mod tests {
         let segments = &nzb.files[0].segments;
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].number, 1);
-        assert_eq!(segments[0].message_id, "shared-id");
+        assert_eq!(segments[0].message_id(), "shared-id");
     }
 
     // Additional: invalid date value
@@ -1115,7 +1134,7 @@ mod tests {
   </file>
 </nzb>"#;
         let nzb = parse_nzb(xml).unwrap();
-        assert_eq!(nzb.files[0].segments[0].message_id, "abc@host");
+        assert_eq!(nzb.files[0].segments[0].message_id(), "abc@host");
     }
 
     // Additional: HTML entities in subjects are decoded
@@ -1196,7 +1215,7 @@ mod tests {
 
         let nzb = parse_nzb(xml.as_bytes()).unwrap();
         assert_eq!(nzb.files[0].segments.len(), 1);
-        assert_eq!(nzb.files[0].segments[0].message_id, "one");
+        assert_eq!(nzb.files[0].segments[0].message_id(), "one");
     }
 
     #[test]
@@ -1212,7 +1231,7 @@ mod tests {
 
         let nzb = parse_nzb(xml).unwrap();
         assert_eq!(nzb.files[0].segments.len(), 1);
-        assert_eq!(nzb.files[0].segments[0].message_id, "one");
+        assert_eq!(nzb.files[0].segments[0].message_id(), "one");
     }
 
     #[test]
@@ -1280,7 +1299,7 @@ mod tests {
             for (actual, expected) in actual.segments.iter().zip(&expected.segments) {
                 assert_eq!(actual.number, expected.number);
                 assert_eq!(actual.bytes, expected.bytes);
-                assert_eq!(actual.message_id, expected.message_id);
+                assert_eq!(actual.message_ids, expected.message_ids);
             }
         }
     }
@@ -1418,7 +1437,7 @@ mod tests {
             segments: vec![NzbSegment {
                 number: 1,
                 bytes: 0,
-                message_id: String::new(),
+                message_ids: vec![String::new()],
             }],
         }
     }

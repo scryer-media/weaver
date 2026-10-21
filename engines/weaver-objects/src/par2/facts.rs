@@ -307,6 +307,7 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
                 .into_iter()
                 .map(|(file, member)| (FileId::from_bytes(file), member))
                 .collect(),
+            &[],
         );
         state.last = set.last;
         par2.sets.insert(set.key, state);

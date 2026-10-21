@@ -12,15 +12,17 @@
 // and the names are only there to prove it is the same post.
 //
 // What grows with the post is kept as parts, a chunk of articles to a part,
-// so a step that changes one article encodes and writes one part.
+// so a step that changes one article encodes and writes one part. The root's
+// state marks the chunks each change touches, so an encoding reads again
+// only the chunks marked since it last read.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
-    encode_parts,
+    ByteRange, Change, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
+    encode_since,
 };
 
 use super::phase::RootPhase;
@@ -36,7 +38,8 @@ pub(crate) struct RootRow {
 }
 
 impl RootRow {
-    // Version 2 was the article root's facts with the job's beside them.
+    // Version 2 was the article root's facts with the job's beside them; no
+    // released build wrote it.
     pub(crate) const VERSION: u16 = 3;
 }
 
@@ -61,22 +64,43 @@ pub(crate) struct RootBlob {
     pub(crate) parts: Vec<Part>,
 }
 
+// The parts one encoding of a root's facts names.
+pub(crate) enum Parts {
+    // Every part the facts have.
+    All(Vec<Part>),
+    // The parts changed since the encoding before.
+    Changed(Vec<Change>),
+}
+
 impl RootBlob {
-    // The root's facts as the checkpoint keeps them. Facts that do not
-    // encode are facts nothing could restore, so they say so as
-    // unsupported, which a restore refuses.
-    pub(crate) fn of<R: Root>(root: &R, kept: &mut R::Kept) -> Self {
-        let (version, bytes, mut parts) = match root.encode(kept) {
-            Ok((bytes, parts)) => (R::FACTS_VERSION, bytes, parts),
-            Err(_) => (Facts::UNSUPPORTED, Vec::new(), Vec::new()),
+    // The root's facts whole, every part with them: an encoding into
+    // nothing kept reads the root whole.
+    pub(crate) fn of<R: Root>(root: &R) -> Self {
+        let (mut blob, parts) = Self::encode(root, &mut R::Kept::default());
+        blob.parts = match parts {
+            Parts::All(parts) => parts,
+            Parts::Changed(_) => unreachable!("a fresh encoding is whole"),
         };
-        parts.sort_by_key(|part| part.key);
-        Self {
+        blob.parts.sort_by_key(|part| part.key);
+        blob
+    }
+
+    // The root's facts as the checkpoint keeps them, encoding again only
+    // what changed since `kept` last encoded; the parts come apart from the
+    // blob. Facts that do not encode are facts nothing could restore, so
+    // they say so as unsupported, which a restore refuses.
+    pub(crate) fn encode<R: Root>(root: &R, kept: &mut R::Kept) -> (Self, Parts) {
+        let (version, bytes, parts) = match root.encode(kept) {
+            Ok((bytes, parts)) => (R::FACTS_VERSION, bytes, parts),
+            Err(_) => (Facts::UNSUPPORTED, Vec::new(), Parts::All(Vec::new())),
+        };
+        let blob = Self {
             root: R::NAME.to_owned(),
             version,
             bytes,
-            parts,
-        }
+            parts: Vec::new(),
+        };
+        (blob, parts)
     }
 
     // The facts, for a root of the kind that wrote them.
@@ -92,6 +116,25 @@ impl RootBlob {
         }
         R::decode(&self.bytes, &self.parts)
     }
+}
+
+// Facts kept whole: their bytes name no parts.
+pub(crate) fn whole<T: Serialize>(facts: &T) -> Result<(Vec<u8>, Parts), RootFactsError> {
+    rmp_serde::to_vec(facts)
+        .map(|bytes| (bytes, Parts::All(Vec::new())))
+        .map_err(|error| RootFactsError::Encode(error.to_string()))
+}
+
+pub(crate) fn from_whole<T: DeserializeOwned>(
+    bytes: &[u8],
+    parts: &[Part],
+) -> Result<T, RootFactsError> {
+    if !parts.is_empty() {
+        return Err(RootFactsError::Decode(
+            "parts of facts kept whole".to_owned(),
+        ));
+    }
+    rmp_serde::from_slice(bytes).map_err(|error| RootFactsError::Decode(error.to_string()))
 }
 
 // The article root's facts.
@@ -155,15 +198,6 @@ pub(crate) enum RootFactsError {
 }
 
 impl ArticleRoot {
-    pub(crate) fn post_facts(&self) -> PostFacts {
-        let mut volumes = self.map.facts();
-        self.checksums.facts(&mut volumes);
-        PostFacts {
-            posted: self.posted.clone(),
-            volumes,
-        }
-    }
-
     // The root at the state its facts describe, over the post's articles.
     // The post must be the one they were taken from: its files by name, as
     // the map checks them by their articles.
@@ -182,19 +216,6 @@ impl ArticleRoot {
     }
 }
 
-// The root row of version 2: the article root's facts whole, with the next
-// node and the job's own beside them. A checkpoint written before the
-// reported phase was kept has none.
-#[derive(Deserialize)]
-struct Version2 {
-    next_node: u32,
-    posted: Vec<String>,
-    volumes: Vec<VolumeFacts>,
-    read_backs: u64,
-    #[serde(default)]
-    reported: Option<RootPhase>,
-}
-
 pub(crate) fn encode(row: &RootRow) -> Vec<u8> {
     // Plain structs of integers, strings and bytes always encode.
     rmp_serde::to_vec(row).unwrap_or_default()
@@ -206,47 +227,27 @@ pub(crate) fn decode(
     bytes: &[u8],
     parts: &[Part],
 ) -> Result<RootRow, RootFactsError> {
-    let mut parts = parts.to_vec();
-    parts.sort_by_key(|part| part.key);
-    if version != 2 {
-        let mut row: RootRow = read_version(RootRow::VERSION, version, bytes)?;
-        row.root.parts = parts;
-        return Ok(row);
-    }
-    let before: Version2 = read_version(2, version, bytes)?;
-    let post = PostFacts {
-        posted: before.posted,
-        volumes: before.volumes,
-    };
-    let (bytes, parts) = encode_post(&mut Encoded::default(), &post)?;
-    Ok(RootRow {
-        next_node: before.next_node,
-        job: JobFacts {
-            read_backs: before.read_backs,
-            reported: before.reported,
-        },
-        root: RootBlob {
-            root: ArticleRoot::NAME.to_owned(),
-            version: PostFacts::VERSION,
-            bytes,
-            parts,
-        },
-    })
-}
-
-fn read_version<T: DeserializeOwned>(
-    expected: u16,
-    version: u16,
-    bytes: &[u8],
-) -> Result<T, RootFactsError> {
-    if version != expected {
+    if version != RootRow::VERSION {
         return Err(RootFactsError::Version(version));
     }
-    rmp_serde::from_slice(bytes).map_err(|error| RootFactsError::Decode(error.to_string()))
+    let mut row: RootRow =
+        rmp_serde::from_slice(bytes).map_err(|error| RootFactsError::Decode(error.to_string()))?;
+    row.root.parts = parts.to_vec();
+    row.root.parts.sort_by_key(|part| part.key);
+    Ok(row)
 }
 
 // Articles to a part.
-const CHUNK: u32 = 16;
+pub(crate) const CHUNK: u32 = 16;
+
+// A chunk of one volume's facts: of its articles and their raised classes,
+// of its known boundaries, or of its segments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Chunk {
+    Articles(u32),
+    Known(u32),
+    Segments(u32),
+}
 
 // The post's facts as they are encoded: kept from one checkpoint to the
 // next, so a part whose entries did not change keeps its bytes and is not
@@ -255,6 +256,10 @@ const CHUNK: u32 = 16;
 pub(crate) struct Encoded {
     posted: Sealed<Vec<String>>,
     volumes: Vec<EncodedVolume>,
+    // The generation of each of its sealed values when its parts were last
+    // taken, by number in the walk.
+    #[serde(skip)]
+    taken: Vec<u64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -269,52 +274,21 @@ struct EncodedVolume {
     segments: Shelf<Vec<(u64, u64, u32, bool)>>,
     // By ordinal.
     raised: Shelf<Vec<(u32, ClassFacts)>>,
+    // The generations of the root's map and checksums for the volume when
+    // this encoding last read them; `None` until it has read them whole.
+    #[serde(skip)]
+    read: Option<(u64, u64)>,
 }
 
-// Entries grouped by the chunk each lies in.
-fn chunked<T: Clone>(entries: &[T], chunk: impl Fn(&T) -> u32) -> BTreeMap<u32, Vec<T>> {
-    let mut out: BTreeMap<u32, Vec<T>> = BTreeMap::new();
-    for entry in entries {
-        out.entry(chunk(entry)).or_default().push(entry.clone());
-    }
-    out
-}
-
-fn of_ordinal(ordinal: u32) -> u32 {
+pub(crate) fn of_ordinal(ordinal: u32) -> u32 {
     ordinal / CHUNK
 }
 
-fn of_boundary(boundary: u64) -> u32 {
+pub(crate) fn of_boundary(boundary: u64) -> u32 {
     u32::try_from(boundary / u64::from(CHUNK)).unwrap_or(u32::MAX)
 }
 
 impl EncodedVolume {
-    fn refresh(&mut self, facts: &VolumeFacts) {
-        let starts: BTreeMap<u64, u32> = facts
-            .articles
-            .iter()
-            .filter_map(|(ordinal, article)| match article {
-                ArticleFacts::Arrived(Some((start, _))) => Some((*start, *ordinal)),
-                _ => None,
-            })
-            .collect();
-        self.articles.set(chunked(&facts.articles, |(ordinal, _)| {
-            of_ordinal(*ordinal)
-        }));
-        self.known.set(chunked(&facts.known, |(boundary, _)| {
-            of_boundary(*boundary)
-        }));
-        self.ordered_only = facts.ordered_only;
-        self.segments.set(chunked(&facts.segments, |(start, ..)| {
-            starts
-                .range(..=*start)
-                .next_back()
-                .map_or(0, |(_, ordinal)| of_ordinal(*ordinal))
-        }));
-        self.raised
-            .set(chunked(&facts.raised, |(ordinal, _)| of_ordinal(*ordinal)));
-    }
-
     fn facts(&self) -> VolumeFacts {
         fn joined<T: Clone + Serialize, K: Ord>(
             shelf: &Shelf<Vec<T>>,
@@ -364,15 +338,6 @@ impl Durable for Encoded {
 }
 
 impl Encoded {
-    fn refresh(&mut self, facts: &PostFacts) {
-        self.posted.set(facts.posted.clone());
-        self.volumes
-            .resize_with(facts.volumes.len(), EncodedVolume::default);
-        for (encoded, volume) in self.volumes.iter_mut().zip(&facts.volumes) {
-            encoded.refresh(volume);
-        }
-    }
-
     fn facts(&self) -> PostFacts {
         PostFacts {
             posted: self.posted.get().clone(),
@@ -381,19 +346,135 @@ impl Encoded {
     }
 }
 
-// The post's facts' bytes and their parts, encoding again only the parts
-// that changed since `encoded` last encoded. A part that does not encode
-// fails the whole: the blob then says so as unsupported.
+fn some<T>(entries: Vec<T>) -> Option<Vec<T>> {
+    (!entries.is_empty()).then_some(entries)
+}
+
+// Each chunk read, kept where it holds anything.
+fn filled<T>(chunks: &[u32], read: impl Fn(u32) -> Vec<T>) -> Vec<(u32, Vec<T>)> {
+    chunks
+        .iter()
+        .filter_map(|chunk| Some((*chunk, some(read(*chunk))?)))
+        .collect()
+}
+
+// The post's facts encoded into `encoded`, reading of the root only the
+// chunks marked since `encoded` last read it, and all of it the first
+// time. Facts that do not encode fail the whole, and the next encoding
+// reads the root whole again.
 pub(crate) fn encode_post(
+    root: &ArticleRoot,
     encoded: &mut Encoded,
-    facts: &PostFacts,
-) -> Result<(Vec<u8>, Vec<Part>), RootFactsError> {
-    encoded.refresh(facts);
-    encode_parts(encoded).map_err(RootFactsError::Encode)
+) -> Result<(Vec<u8>, Parts), RootFactsError> {
+    let read = encoded.volumes.len() == root.map.volume_count()
+        && encoded.volumes.iter().all(|volume| volume.read.is_some());
+    let done = match read {
+        true => root.encode_changed(encoded),
+        false => root.encode_whole(encoded),
+    };
+    done.map_err(|error| {
+        for volume in &mut encoded.volumes {
+            volume.read = None;
+        }
+        RootFactsError::Encode(error)
+    })
 }
 
 pub(crate) fn decode_post(bytes: &[u8], parts: &[Part]) -> Result<PostFacts, RootFactsError> {
     decode_parts::<Encoded>(bytes, parts)
         .map(|encoded| encoded.facts())
         .map_err(RootFactsError::Decode)
+}
+
+impl ArticleRoot {
+    fn encode_whole(&self, encoded: &mut Encoded) -> Result<(Vec<u8>, Parts), String> {
+        encoded.posted.set(self.posted.clone());
+        encoded
+            .volumes
+            .resize_with(self.map.volume_count(), EncodedVolume::default);
+        for (index, volume) in encoded.volumes.iter_mut().enumerate() {
+            let read = self.marked(index);
+            let (mut articles, mut known, mut segments) = (Vec::new(), Vec::new(), Vec::new());
+            for chunk in self.map.chunks(index).collect::<BTreeSet<_>>() {
+                match chunk {
+                    Chunk::Articles(chunk) => articles.push(chunk),
+                    Chunk::Known(chunk) => known.push(chunk),
+                    Chunk::Segments(chunk) => segments.push(chunk),
+                }
+            }
+            volume.articles.set(filled(&articles, |chunk| {
+                self.map.articles_in(index, chunk)
+            }));
+            volume
+                .raised
+                .set(filled(&articles, |chunk| self.map.raised_in(index, chunk)));
+            volume
+                .known
+                .set(filled(&known, |chunk| self.map.known_in(index, chunk)));
+            volume
+                .segments
+                .set(filled(&segments, |chunk| self.segments_in(index, chunk)));
+            volume.ordered_only = self.map.ordered_only(index);
+            volume.read = Some(read);
+        }
+        let taken = encode_since(encoded, None)?;
+        encoded.taken = taken.at;
+        Ok((taken.bytes, Parts::All(taken.parts)))
+    }
+
+    fn encode_changed(&self, encoded: &mut Encoded) -> Result<(Vec<u8>, Parts), String> {
+        for (index, volume) in encoded.volumes.iter_mut().enumerate() {
+            let now = self.marked(index);
+            volume.ordered_only = self.map.ordered_only(index);
+            let Some((map, sums)) = volume.read.filter(|read| *read != now) else {
+                continue;
+            };
+            let mut chunks: BTreeSet<Chunk> = self.map.marked_since(index, map).collect();
+            chunks.extend(
+                self.checksums
+                    .marked_since(VolumeIndex(index as u32), sums)
+                    .map(|offset| Chunk::Segments(self.map.owner(index, offset))),
+            );
+            for chunk in chunks {
+                match chunk {
+                    Chunk::Articles(chunk) => {
+                        volume
+                            .articles
+                            .put(chunk, some(self.map.articles_in(index, chunk)));
+                        volume
+                            .raised
+                            .put(chunk, some(self.map.raised_in(index, chunk)));
+                    }
+                    Chunk::Known(chunk) => volume
+                        .known
+                        .put(chunk, some(self.map.known_in(index, chunk))),
+                    Chunk::Segments(chunk) => volume
+                        .segments
+                        .put(chunk, some(self.segments_in(index, chunk))),
+                }
+            }
+            volume.read = Some(now);
+        }
+        let taken = encode_since(encoded, Some(&encoded.taken))?;
+        encoded.taken = taken.at;
+        Ok((taken.bytes, Parts::Changed(taken.changes)))
+    }
+
+    fn marked(&self, volume: usize) -> (u64, u64) {
+        (
+            self.map.marked(volume),
+            self.checksums.marked(VolumeIndex(volume as u32)),
+        )
+    }
+
+    // One chunk of a volume's segments, in start order.
+    fn segments_in(&self, volume: usize, chunk: u32) -> Vec<(u64, u64, u32, bool)> {
+        let mut out = Vec::new();
+        for starts in self.map.owned_by(volume, chunk) {
+            self.checksums
+                .segments_in(VolumeIndex(volume as u32), starts, &mut out);
+        }
+        out.sort_by_key(|(start, ..)| *start);
+        out
+    }
 }

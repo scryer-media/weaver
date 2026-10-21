@@ -45,8 +45,13 @@ pub(super) struct SetState {
     whole: BTreeMap<FileId, u32>,
     // Recovery packets by exponent: the first copy found is the one kept.
     pub(super) recovery: BTreeMap<u32, Location>,
-    // Which member each described file is bound to.
+    // Which member each described file is bound to: by its front, its
+    // name, or the slices a repair read back.
     members: BTreeMap<FileId, MemberId>,
+    // The complete members nothing named that could be a file of the set
+    // no member is bound to: what a repair reads back for its slices, or
+    // binds by elimination.
+    unnamed: Vec<(MemberId, Length)>,
     // What the set's last repair came to, over the members bound then.
     pub(super) last: Option<SetRepair>,
 }
@@ -61,6 +66,7 @@ impl SetState {
             whole: BTreeMap::new(),
             recovery: BTreeMap::new(),
             members: BTreeMap::new(),
+            unnamed: Vec::new(),
             last: None,
         }
     }
@@ -128,15 +134,61 @@ impl SetState {
         &self.members
     }
 
-    // A verdict was on the members bound then; other members, or the same
-    // members bound to other files, void it. Returns whether it was voided.
-    pub(super) fn bind(&mut self, members: BTreeMap<FileId, MemberId>) -> bool {
-        let changed = members != self.members;
+    // A verdict was on the members bound then and the unnamed ones it read;
+    // others, or the same members bound to other files, void it. Returns
+    // whether it was voided.
+    pub(super) fn bind(
+        &mut self,
+        mut members: BTreeMap<FileId, MemberId>,
+        unnamed: &[(MemberId, Length)],
+    ) -> bool {
+        // A member bound before that nothing names now, as one a repair
+        // knew by its slices, stays that file while no other member is.
+        for (file, member) in &self.members {
+            if unnamed.iter().any(|(candidate, _)| candidate == member) {
+                members.entry(*file).or_insert(*member);
+            }
+        }
+        let free: Vec<u64> = self.usable().map_or_else(Vec::new, |index| {
+            index
+                .recovery_file_ids
+                .iter()
+                .filter(|file| !members.contains_key(file))
+                .filter_map(|file| Some(index.file_description(file)?.length))
+                .collect()
+        });
+        let unnamed: Vec<_> = unnamed
+            .iter()
+            .copied()
+            .filter(|(member, length)| {
+                free.iter().any(|long| length.fits(*long))
+                    && !members.values().any(|bound| bound == member)
+            })
+            .collect();
+        let changed = members != self.members || unnamed != self.unnamed;
         if changed {
             self.members = members;
+            self.unnamed = unnamed;
             self.last = None;
         }
         changed
+    }
+
+    pub(super) fn unnamed(&self) -> &[(MemberId, Length)] {
+        &self.unnamed
+    }
+
+    // An unnamed member that could be a described file may be it until a
+    // repair has read it.
+    pub(super) fn may_be(&self, length: u64) -> bool {
+        self.last.is_none() && self.unnamed.iter().any(|(_, long)| long.fits(length))
+    }
+
+    // The repair knew the unnamed member as the file, by a slice it read
+    // back or by elimination: it is it.
+    pub(super) fn know(&mut self, file: FileId, member: MemberId) {
+        self.unnamed.retain(|(candidate, _)| *candidate != member);
+        self.members.insert(file, member);
     }
 
     // An impossible verdict counted the blocks of the volumes bound then; a
@@ -314,6 +366,31 @@ fn named_blocks(name: &str) -> Option<u64> {
     let (_, tail) = stem.rsplit_once(".vol")?;
     let (_, count) = tail.split_once('+')?;
     count.parse().ok()
+}
+
+// What is known of an unnamed member's length. A member some byte of which
+// decoded knows its length exactly; one none of whose did is only bounded
+// by its post's encoded size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Length {
+    Exact(u64),
+    AtMost(u64),
+}
+
+impl Length {
+    // Whether the member could be a described file of `long`.
+    pub(super) fn fits(self, long: u64) -> bool {
+        match self {
+            Self::Exact(length) => length == long,
+            Self::AtMost(bound) => long <= bound,
+        }
+    }
+
+    pub(super) fn bound(self) -> u64 {
+        match self {
+            Self::Exact(length) | Self::AtMost(length) => length,
+        }
+    }
 }
 
 #[cfg(test)]

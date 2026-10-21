@@ -1402,6 +1402,7 @@ async fn a_restored_job_with_a_conventional_floor_is_never_readmitted() {
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     let on_disk = std::fs::read(working_dir.join(volume_name)).unwrap();
     let first_diff = on_disk
         .iter()
@@ -2149,6 +2150,7 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
         .received_bytes();
 
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
 
     assert_eq!(
         pipeline.write_buffers[&protected_file].buffered_len(),
@@ -2183,6 +2185,7 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
 
     // A second idle turn with only the protected article is also a no-op.
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     assert_eq!(pipeline.write_buffered_bytes, tail.len());
     assert_eq!(pipeline.write_buffered_segments, 1);
     settle_direct_demotion_work(&mut pipeline).await;
@@ -4793,9 +4796,11 @@ async fn damaged_article_waits_for_reconstruction_before_writing_and_retrying() 
             .contains_key(&segment_id)
     );
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     assert_eq!(pipeline.write_buffers[&file_id].buffered_len(), 1);
     settle_direct_demotion_work(&mut pipeline).await;
     pipeline.flush_quiescent_write_backlog().await;
+    pipeline.settle_all_segment_writes().await;
     let bytes = std::fs::read(working_dir.join(&volumes[1].0)).unwrap();
     assert_eq!(&bytes[start..end], damaged.as_slice());
     let file = pipeline.jobs[&job_id].assembly.file(file_id).unwrap();

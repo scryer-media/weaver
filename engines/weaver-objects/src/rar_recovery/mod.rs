@@ -63,15 +63,21 @@ impl Rev {
         self.closed && !self.lost && self.length.is_some()
     }
 
+    // The header tells how much of the front it needs only as the front
+    // grows, so the front takes from these bytes for as long as each read of
+    // it asks for more and they reach: what it takes never depends on where
+    // the deliveries were cut.
     fn take(&mut self, offset: u64, bytes: &[u8]) {
-        let have = self.front.len() as u64;
-        if self.wanted > self.front.len() && offset <= have {
-            let skip = (have - offset) as usize;
-            let room = self.wanted - self.front.len();
-            if let Some(fresh) = bytes.get(skip..) {
-                self.front
-                    .extend_from_slice(&fresh[..fresh.len().min(room)]);
+        let end = offset + bytes.len() as u64;
+        while self.wanted > self.front.len() {
+            let have = self.front.len() as u64;
+            if offset > have || end <= have {
+                break;
             }
+            let fresh = &bytes[(have - offset) as usize..];
+            let room = self.wanted - self.front.len();
+            self.front
+                .extend_from_slice(&fresh[..fresh.len().min(room)]);
             self.wanted = match header::rar5(&self.front) {
                 Read::Short(needed) => needed,
                 Read::Header(_) | Read::Not => 0,
@@ -79,7 +85,6 @@ impl Rev {
         }
         if let Some(length) = self.length {
             let start = length.saturating_sub(RAR3_FOOTER as u64);
-            let end = offset + bytes.len() as u64;
             for at in offset.max(start)..end.min(length) {
                 self.footer[(at - start) as usize] = Some(bytes[(at - offset) as usize]);
             }
@@ -291,11 +296,15 @@ impl Object for RarRecovery {
         self.rev(volume).lost = true;
     }
 
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
     // The volume stays in its member's own file, where the restore reads it.
+    // The front and footer it copies out are in its facts, which a restart
+    // keeps: it says nothing of the posted bytes.
+    fn unposted(&mut self, _volume: VolumeIndex, _range: ByteRange) {}
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
             envelope: volume.0,
@@ -311,15 +320,20 @@ impl Object for RarRecovery {
 
     // Every recovery volume of the set this one covers, numbered as it
     // comes. The first is the one the object was built for.
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         let rev = first_bytes.starts_with(REV5_SIGN) || naming::recovery_stem(name).is_some();
         (rev && !self.revs.is_empty()
             && self.stem.is_some()
             && naming::recovery_stem(name) == self.stem)
-            .then(|| VolumeIndex(self.revs.len() as u32))
+            .then_some(VolumeIndex(self.revs.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         if self.stem.is_none() {
             self.stem = naming::recovery_stem(name);
         }
@@ -347,18 +361,28 @@ impl Object for RarRecovery {
 
 impl Recovery for RarRecovery {
     // The data volumes the set's naming puts in the set, one member per
-    // index; the first a name gives an index keeps it.
+    // index; the first a name gives an index keeps it. The set is the one
+    // with the longest name the first recovery volume's name covers: a set
+    // called `set2` owns `set21.rev` ahead of one called `set`.
     fn bind(&mut self, namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {
-        let Some(stem) = self.stem.clone() else {
+        let Some(rev) = self.revs.first().filter(|_| self.stem.is_some()) else {
             return;
         };
+        let stem = namespace
+            .members()
+            .filter(|member| member.bound_to != Some(self.id))
+            .filter_map(|member| naming::parse(&member.name))
+            .map(|volume| volume.stem().to_owned())
+            .filter(|stem| naming::recovery_covers(&rev.name, stem))
+            .max_by_key(String::len);
         let mut bound = BTreeMap::new();
         let mut names = BTreeMap::new();
         for member in namespace
             .members()
             .filter(|member| member.bound_to != Some(self.id))
         {
-            let Some(volume) = naming::parse(&member.name).filter(|name| name.stem() == stem)
+            let Some(volume) =
+                naming::parse(&member.name).filter(|name| Some(name.stem()) == stem.as_deref())
             else {
                 continue;
             };
@@ -425,7 +449,7 @@ impl Recovery for RarRecovery {
         });
     }
 
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
         let outcome = self.rule(access);
@@ -448,9 +472,5 @@ impl Recovery for RarRecovery {
                 (self.usable() < needed && self.coming()).then_some(RepairOutcome::Waiting)
             }
         }
-    }
-
-    fn blocks_reachable(&self) -> u64 {
-        self.usable() + self.revs.iter().filter(|rev| !rev.closed).count() as u64
     }
 }

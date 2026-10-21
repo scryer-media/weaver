@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use crate::deliver::Posted;
 use crate::recovery::{MemberAccess, RepairOutcome};
 use crate::seek::Weight;
 use crate::{Segment, SliceVerdict};
@@ -31,6 +32,9 @@ impl Tape {
 }
 
 impl Object for Tape {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::Par2
     }
@@ -51,7 +55,7 @@ impl Object for Tape {
     fn volume_lost(&mut self, _: VolumeIndex, range: ByteRange, _: &mut Vec<Emit>) {
         self.hear(Heard::Lost(range));
     }
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         out.push(Seek::recovery(
             VolumeIndex(0),
             ByteRange::new(5, u64::MAX),
@@ -83,15 +87,12 @@ impl Recovery for Tape {
     }
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn repair(&mut self, _: &mut dyn MemberAccess) -> RepairOutcome {
         RepairOutcome::Clean
     }
     fn outcome(&self) -> Option<RepairOutcome> {
         None
-    }
-    fn blocks_reachable(&self) -> u64 {
-        0
     }
 }
 
@@ -149,9 +150,11 @@ fn a_window_takes_what_passed_and_what_passes_at_its_own_offsets() {
     tree.deliver(
         NodeId::ROOT,
         first,
-        12,
-        Bytes::from(vec![7u8; 25]),
-        Provenance::Damaged,
+        Posted {
+            offset: 12,
+            bytes: Bytes::from(vec![7u8; 25]),
+            provenance: Provenance::Damaged,
+        },
         &mut Taping(Arc::clone(&log)),
         &mut effects,
     );

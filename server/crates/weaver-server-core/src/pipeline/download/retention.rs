@@ -232,16 +232,29 @@ impl Pipeline {
     pub(in crate::pipeline) fn book_unservable_work(&mut self, work: &DownloadWork) {
         warn!(
             segment = %work.segment_id,
+            message_id = %work.message_id,
             exclude_servers = ?work.exclude_servers,
-            "no server may fetch this article; booking it as missing so repair can proceed"
+            "no server may fetch this article by its id; it moves to its next id or is booked missing so repair can proceed"
         );
+        self.message_id_unavailable(work.segment_id, &work.exclude_servers);
+    }
+
+    // The article's id in use failed on every server it may use. The article
+    // moves to its next id, or with every id spent is booked missing.
+    pub(in crate::pipeline) fn message_id_unavailable(
+        &mut self,
+        segment_id: SegmentId,
+        exclude_servers: &[usize],
+    ) {
+        if self.spend_message_id(segment_id) {
+            return;
+        }
         self.metrics
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
-        let segment_id = work.segment_id;
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
         if self.book_failed_segment(segment_id) {
-            self.note_gap_servers_support_fact(segment_id.file_id.job_id, &work.exclude_servers);
+            self.note_gap_servers_support_fact(segment_id.file_id.job_id, exclude_servers);
         }
     }
 

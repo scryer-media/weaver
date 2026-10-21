@@ -257,7 +257,7 @@ impl RarStore {
                         self.say_damaged(volume, range, crc, out);
                     }
                 }
-                Step::Locked(encryption) => self.open_headers(&encryption, out),
+                Step::Locked(encryption) => self.open_headers(volume, &encryption, out),
                 Step::Broken(range) => {
                     if found.kept.verified(range) {
                         return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
@@ -278,8 +278,10 @@ impl RarStore {
     // store holds it was claimed on too little: its front said nothing that
     // placed it, and a founding put it first. It goes back to its namespace
     // with everything read of it, to be claimed where it belongs. Only at
-    // its close, so nothing of it is still on its way here, and the headers
-    // are read as far as they go: the parse that travels is the whole one.
+    // its close, so nothing of it is still on its way here. What travels is
+    // the walk as far as it got: a password that came after the close lets
+    // it through no further than the main header, and the headers below
+    // wait for the next owner to want them.
     // The store never mapped any of it, since the layout stops at a volume
     // its headers do not place. The volume held first is the one the store
     // was founded on, and every other was taken as a volume of the set it
@@ -377,7 +379,7 @@ impl Object for RarStore {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
-        if self.gone || delivery.bytes.is_empty() {
+        if delivery.bytes.is_empty() {
             return;
         }
         let volume = delivery.volume;
@@ -436,9 +438,6 @@ impl Object for RarStore {
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         // A volume adopted closed was walked to its close already.
         let found = self.volume(volume);
         if !found.closed {
@@ -454,9 +453,6 @@ impl Object for RarStore {
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         let Some(found) = self.volumes.get(&volume) else {
             return;
         };
@@ -483,9 +479,6 @@ impl Object for RarStore {
     // Otherwise a member still damaged, a password still asked for, or a
     // member named and never placed leaves the set unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         let first = self.volumes.get(&VolumeIndex(0));
         let why = match first.is_none_or(|found| found.name.is_none()) {
             true => Some(Why::FirstBytesLost),
@@ -498,10 +491,7 @@ impl Object for RarStore {
         }
     }
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
-        if self.gone {
-            return;
-        }
+    fn wants(&self, out: &mut Vec<Seek>) {
         // The first volume not read to its end.
         let reading = (0..)
             .find(|index| {
@@ -555,6 +545,10 @@ impl Object for RarStore {
         Box::new(self.posted_over(ranges))
     }
 
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        self.unsay(volume, range);
+    }
+
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         let found = self.volume(volume);
         if found.length.is_some() {
@@ -567,22 +561,10 @@ impl Object for RarStore {
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         // The offer answers the question the store asked: a candidate that
         // opens nothing leaves it free to ask for the next one.
         self.asked = false;
-        if !self
-            .candidates
-            .iter()
-            .any(|candidate| candidate.secret.as_str() == secret)
-        {
-            self.candidates.push(Candidate {
-                secret: Zeroizing::new(secret.to_owned()),
-                headers_wrong: false,
-            });
-        }
+        self.candidate(secret);
         for volume in self.volumes.values_mut() {
             volume.walk.touch();
         }
@@ -598,7 +580,7 @@ impl Object for RarStore {
             .map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         let facts = self.front_facts(front);
         let bound = self.volume(volume);
         bound.name = Some(name.to_owned());
@@ -608,34 +590,63 @@ impl Object for RarStore {
 
     // A store that gave its set up still claims the rest of it, so the rest
     // goes where the set went.
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        self.claim_volume(name, first_bytes)
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
+        self.claim_volume(name, first_bytes)?
+            .claimed(self.gone, self.past())
     }
 
     // What was read of the volume goes with it, unless it is more than a
     // volume's headers can need: then the member is refused, never read
     // again.
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        self.stale = true;
         self.giving
             .remove(&volume)
+            .or_else(|| self.volumes.remove(&volume))
             .filter(|given| given.kept.len() <= claim::CARRIED)
-            .map(|given| Box::new(given) as weaver_graph::Carried)
+            .map(|volume| Box::new(volume) as weaver_graph::Carried)
+    }
+
+    // A volume links alone placed: no layout maps it, so it goes as it is.
+    fn provisional(
+        &self,
+        volume: VolumeIndex,
+        first_bytes: &[u8],
+        carried: Option<&weaver_graph::Carried>,
+    ) -> bool {
+        let Some(holder) = self.volumes.get(&volume) else {
+            return false;
+        };
+        let given = carried.and_then(|carried| carried.downcast_ref::<Volume>());
+        let facts = match given {
+            Some(given) => given.walk.facts.clone().or_else(|| given.front.clone()),
+            None => self.front_facts(first_bytes),
+        };
+        claim::yields(volume, holder, facts.as_ref())
     }
 
     fn reclaim(&mut self, name: &str, carried: &weaver_graph::Carried) -> Option<VolumeIndex> {
-        self.reclaim_volume(name, carried.downcast_ref::<Volume>()?)
+        self.reclaim_volume(name, carried.downcast_ref::<Volume>()?)?
+            .claimed(self.gone, self.past())
     }
 
     // The volume as its giver read it: its headers walked, its bytes kept,
-    // its length and close. Nothing of it is read or walked again, and no
-    // key is derived again: derivations live in the process's shared cache,
-    // and a volume's walk holds no key of its own.
+    // its length and close. None of its bytes is read again. No password
+    // travels with it: its headers are walked again under this store's own,
+    // so headers no password of the store opens ask the job, and every
+    // password the store holds is one the job offered it.
     fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
-        let Ok(mut given) = carried.downcast::<Volume>() else {
-            return self.bound(volume, name, &[]);
+        let Ok(mut held) = carried.downcast::<Volume>() else {
+            return self.bound(volume, name, &[], None);
         };
-        given.name = Some(name.to_owned());
-        self.volumes.insert(volume, *given);
+        held.name = Some(name.to_owned());
+        held.walk.touch();
+        self.volumes.insert(volume, *held);
         self.stale = true;
     }
 
@@ -643,5 +654,9 @@ impl Object for RarStore {
         if let Some(found) = self.volumes.get_mut(&volume) {
             found.name = Some(name.to_owned());
         }
+    }
+
+    fn refused(&mut self) {
+        self.gone = true;
     }
 }

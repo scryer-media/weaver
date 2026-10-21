@@ -869,7 +869,7 @@ async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
     let mut second = spec.files[0].segments[0].clone();
     second.ordinal = 1;
     second.article_number = 2;
-    second.message_id = "second@example.invalid".to_string();
+    second.message_ids = "second@example.invalid".into();
     spec.files[0].segments.push(second);
     spec.total_bytes *= 2;
     insert_active_job(&mut pipeline, uu_job, spec.clone()).await;

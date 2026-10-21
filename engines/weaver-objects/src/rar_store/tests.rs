@@ -245,11 +245,163 @@ fn nameless_volumes_are_grouped_by_their_headers() {
 fn a_nameless_volume_without_its_predecessor_is_placed_where_it_states() {
     let volumes = write(&items(), &split(Version::Rar5));
     let mut object = store();
-    object.bound(VolumeIndex(0), "c0ffee", &[]);
+    object.bound(VolumeIndex(0), "c0ffee", &[], None);
     // Volume 2 of the set states its number; volume 1, which nobody holds
     // yet, does not decide where it goes.
     let front = &volumes[2][..4096.min(volumes[2].len())];
-    assert_eq!(object.claim("d00d", front), Some(VolumeIndex(2)));
+    assert_eq!(object.claim("d00d", front, None), Some(VolumeIndex(2)));
+}
+
+// A store holding only a set's second volume takes the first volume that
+// carries on into it, never another set's first, which states the same
+// number but ends on a member the second volume does not open on.
+#[test]
+fn a_first_volume_joins_only_the_set_it_carries_on_into() {
+    let ours = write(&items(), &split(Version::Rar5));
+    let theirs = write(
+        &[Item::File("delta.bin", payload(4, 10_000))],
+        &split(Version::Rar5),
+    );
+    let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+    let mut object = store();
+    object.bound(VolumeIndex(1), "c0ffee", &front(&ours[1]), None);
+    assert_eq!(object.claim("d00d", &front(&theirs[0]), None), None);
+    assert_eq!(
+        object.claim("beef", &front(&ours[0]), None),
+        Some(VolumeIndex(0))
+    );
+}
+
+// A nameless RAR4 volume posted again goes where no free place takes it:
+// the one held place its neighbours link it to.
+#[test]
+fn a_nameless_volume_posted_again_is_the_held_volume_its_neighbours_link_it_to() {
+    // Each front is the whole volume, so it states the member it ends on.
+    let volumes = write(&items(), &split(Version::Rar4));
+    let mut object = store();
+    for (index, volume) in volumes.iter().enumerate() {
+        object.bound(
+            VolumeIndex(index as u32),
+            &format!("{:x}3c9e1f", index * 7 + 11),
+            volume,
+            None,
+        );
+    }
+    assert_eq!(
+        object.claim("d00d", &volumes[1], None),
+        Some(VolumeIndex(1))
+    );
+}
+
+// One member spans every volume of a nameless RAR4 set, so a middle
+// volume's front links it to every free place beside the first and the
+// last and states no number. It takes the lower, by links alone, and once
+// its walk reads its end record, which numbers it elsewhere, it is given
+// back.
+#[test]
+fn a_nameless_middle_volume_fitting_two_places_takes_the_lower_and_moves_when_its_end_says_otherwise()
+ {
+    let volumes = write(
+        &[Item::File("feature.bin", payload(5, 23_000))],
+        &split(Version::Rar4),
+    );
+    assert_eq!(volumes.len(), 4);
+    // Each volume's end record states its number: more volumes follow
+    // (0x0001), the number is present (0x0004).
+    let numbered = |index: usize| {
+        let mut bytes = volumes[index].clone();
+        bytes.truncate(bytes.len() - 7);
+        let flags = u16::from(index + 1 < volumes.len()) | 0x0004;
+        let mut rest = vec![0x7b];
+        rest.extend(flags.to_le_bytes());
+        rest.extend(9u16.to_le_bytes());
+        rest.extend((index as u16).to_le_bytes());
+        bytes.extend((crate::grid::crc32(&rest) as u16).to_le_bytes());
+        bytes.extend(rest);
+        bytes
+    };
+    let name = |index: usize| format!("{:x}3c9e1f", index * 7 + 11);
+    // The third volume arrives where the second would go.
+    let posted = [0, 2, 1, 3]
+        .map(|index| (name(index), numbered(index)))
+        .into();
+    let mut owner = Owner::new(store(), posted);
+    owner
+        .object
+        .bound(VolumeIndex(3), &name(3), &numbered(3), None);
+    owner.frames(0, 4096);
+    owner.close(0);
+    owner.frames(1, 4096);
+    owner.close(1);
+    assert!(
+        owner.said.contains(&Emit::GiveBack(VolumeIndex(1))),
+        "{:?}",
+        owner.said
+    );
+}
+
+// One stored member spans every volume of a nameless RAR4 set, so the last
+// volume, arriving before the third, links to the free place after the
+// second and is held there. Only its end record states its number: until
+// it is read, the set is never judged by a chain that volume closes.
+#[test]
+fn a_nameless_volume_its_links_misplace_never_refuses_the_set() {
+    let volumes = write(
+        &[Item::File("feature.bin", payload(5, 23_000))],
+        &split(Version::Rar4),
+    );
+    assert_eq!(volumes.len(), 4);
+    // Each volume's end record states its number, as RAR 3 and later write
+    // it: more volumes follow (0x0001), the number is present (0x0004).
+    let numbered = |index: usize| {
+        let mut bytes = volumes[index].clone();
+        bytes.truncate(bytes.len() - 7);
+        let flags = u16::from(index + 1 < volumes.len()) | 0x0004;
+        let mut rest = vec![0x7b];
+        rest.extend(flags.to_le_bytes());
+        rest.extend(9u16.to_le_bytes());
+        rest.extend((index as u16).to_le_bytes());
+        bytes.extend((crate::grid::crc32(&rest) as u16).to_le_bytes());
+        bytes.extend(rest);
+        bytes
+    };
+    let named = [0, 1, 3]
+        .map(|index| (format!("{:x}3c9e1f", index * 7 + 11), numbered(index)))
+        .into();
+    let mut owner = Owner::new(store(), named);
+    for volume in 0..2 {
+        owner.frames(volume, 4096);
+        owner.close(volume);
+    }
+    owner.frames(2, 4096);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_))),
+        "{:?}",
+        owner.said
+    );
+}
+
+// A nameless RAR4 volume a founding put first holds that place by links
+// alone: a claim whose front states the place, the set's real first
+// volume, takes it. A claim that only links, or a holder its own headers
+// place, moves nothing.
+#[test]
+fn a_volume_links_alone_hold_yields_to_a_claim_that_states_its_place() {
+    let volumes = write(
+        &[Item::File("feature.bin", payload(5, 23_000))],
+        &split(Version::Rar4),
+    );
+    let front = |index: usize| volumes[index][..4096].to_vec();
+    let mut held = store();
+    held.bound(VolumeIndex(0), "c0ffee", &front(2), None);
+    assert!(held.provisional(VolumeIndex(0), &front(0), None));
+    assert!(!held.provisional(VolumeIndex(0), &front(1), None));
+    let mut first = store();
+    first.bound(VolumeIndex(0), "d00d", &front(0), None);
+    assert!(!first.provisional(VolumeIndex(0), &front(0), None));
 }
 
 #[test]
@@ -374,59 +526,55 @@ fn a_wrong_password_then_the_right_one() {
     posted_whole(&owner);
 }
 
+// RAR5 proves a candidate by its password check; RAR4 lets it through to
+// the walk, whose first header refutes a wrong one by its CRC.
 #[test]
 fn encrypted_headers_open_with_the_password() {
-    let version = Version::Rar5;
-    let volumes = write(&items(), &split_encrypted(version, true));
-    let mut owner = Owner::new(
-        store(),
-        volumes
-            .into_iter()
-            .enumerate()
-            .map(|(index, bytes)| (format!("alpha.part{}.rar", index + 1), bytes))
-            .collect(),
-    );
-    owner.frames(0, 4096);
-    assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
-    assert!(owner.members.is_empty());
-    owner.offer("not-the-passphrase");
-    assert!(owner.members.is_empty());
-    owner.offer(PASSWORD);
-    owner.whole(4096);
-    owner.said.retain(|emit| *emit != Emit::NeedsPassword);
-    no_trouble(&owner);
-    streamed(&owner);
-    posted_whole(&owner);
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split_encrypted(version, true));
+        let mut owner = Owner::new(
+            store(),
+            volumes
+                .into_iter()
+                .enumerate()
+                .map(|(index, bytes)| (format!("alpha.part{}.rar", index + 1), bytes))
+                .collect(),
+        );
+        owner.frames(0, 4096);
+        assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
+        assert!(owner.members.is_empty());
+        owner.offer("not-the-passphrase");
+        assert!(owner.members.is_empty(), "{version:?}");
+        owner.offer(PASSWORD);
+        owner.whole(4096);
+        owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+        no_trouble(&owner);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
 }
 
 #[test]
 fn encrypted_headers_without_the_password_are_refused_at_quiet() {
-    let version = Version::Rar5;
-    let volumes = write(&items(), &encrypted(version, true));
-    let mut owner = Owner::named(store(), volumes);
-    owner.frames(0, 4096);
-    owner.offer("not-the-passphrase");
-    owner.close(0);
-    // The question is still open: a candidate may yet answer it.
-    assert!(!owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)));
-    owner.quiet();
-    assert!(
-        owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
-        "{version:?} {:?}",
-        owner.said
-    );
-}
-
-// RAR4 headers carry no password check, so nothing can prove a candidate
-// before a header is deciphered with it.
-#[test]
-fn rar4_encrypted_headers_go_to_an_engine() {
-    let volumes = write(&items(), &split_encrypted(Version::Rar4, true));
-    let mut owner = Owner::named(store(), volumes);
-    owner.offer(PASSWORD);
-    owner.frames(0, 4096);
-    assert!(owner.members.is_empty());
-    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::EncryptedHeader)]);
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &encrypted(version, true));
+        let mut owner = Owner::named(store(), volumes);
+        owner.frames(0, 4096);
+        owner.offer("not-the-passphrase");
+        owner.close(0);
+        // The question is still open: a candidate may yet answer it.
+        assert!(
+            !owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
+            "{version:?}"
+        );
+        assert!(owner.members.is_empty(), "{version:?}");
+        owner.quiet();
+        assert!(
+            owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
+            "{version:?} {:?}",
+            owner.said
+        );
+    }
 }
 
 #[test]

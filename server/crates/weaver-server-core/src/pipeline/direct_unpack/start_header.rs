@@ -115,7 +115,7 @@ impl StartHeader {
 
         let expected = u32::from_le_bytes(header[8..12].try_into().expect("4-byte slice"));
         let actual =
-            crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, &header[12..32]) as u32;
+            crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &header[12..32]) as u32;
         if expected != actual {
             return Err(StartHeaderError::CrcMismatch { expected, actual });
         }
@@ -178,7 +178,8 @@ mod tests {
         header[12..20].copy_from_slice(&next_header_offset.to_le_bytes());
         header[20..28].copy_from_slice(&next_header_size.to_le_bytes());
         header[28..32].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
-        let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, &header[12..32]) as u32;
+        let crc =
+            crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &header[12..32]) as u32;
         header[8..12].copy_from_slice(&crc.to_le_bytes());
         header
     }

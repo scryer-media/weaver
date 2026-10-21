@@ -29,20 +29,48 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
     ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Object,
-    Placement, Posting, Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
+    Placement, Posting, Pull, Seek, Sniff, Standing, Take, VolumeIndex, Weight, Why, signed,
 };
 use zeroize::Zeroizing;
 
 use crate::RECOVERY;
 use crate::crypt::{Cbc, Chain, Padding};
-use crate::engine::Format;
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
 use crate::keys::Keys;
-use crate::sevenz_engine::SevenZip;
+use crate::quiet::Placed;
+use crate::split;
 use geometry::Geometry;
 use header::{SIGNATURE, Signature, Start};
 use map::Map;
+
+// The length of the container a first piece's signature header measures,
+// when the front is one: a front that measures what the set's first piece
+// measured is that piece.
+pub(crate) fn measured(first_bytes: &[u8]) -> Option<u64> {
+    match header::signature(first_bytes) {
+        Signature::Start(start) => Some(start.total()),
+        _ => None,
+    }
+}
+
+// Where a piece with no number goes by its length alone, among the free
+// places of a set whose first piece is `first` bytes long and measures a
+// container of `total`: every piece but the last is as long as the first,
+// so a piece that long fits every free place but the last.
+pub(crate) fn fits(
+    first: u64,
+    total: u64,
+    length: u64,
+    free: impl Fn(VolumeIndex) -> bool,
+) -> Option<Placed> {
+    let geometry = Geometry::new(first, total)?;
+    Placed::of(
+        (1..=geometry.last().0)
+            .map(VolumeIndex)
+            .filter(|at| free(*at) && geometry.holds(*at) == length),
+    )
+}
 
 // The one envelope: container coordinates, for every byte that belongs to no
 // member. Bytes a volume carries past what the geometry gives it go to the
@@ -66,6 +94,15 @@ enum Lock {
 impl Lock {
     fn is_locked(&self) -> bool {
         matches!(self, Lock::Locked | Lock::Sealed(..))
+    }
+
+    // The plaintext past the files, of a cipher that was ever open.
+    fn padding_mut(&mut self) -> Option<&mut Padding> {
+        match self {
+            Lock::Open(_, padding) => Some(Arc::make_mut(padding)),
+            Lock::Sealed(_, padding) => Some(padding),
+            Lock::Plain | Lock::Locked => None,
+        }
     }
 }
 
@@ -130,6 +167,10 @@ pub struct SevenZipStore {
     lengths: BTreeMap<VolumeIndex, u64>,
     kept: Kept,
     start: Option<Start>,
+    // How long the container is, as the signature header in the front the
+    // first piece was bound with states it: with that piece's length, what
+    // places the pieces bound after it, before any byte is delivered.
+    measured: Option<u64>,
     geometry: Option<Geometry>,
     // The end header is known to be encrypted.
     encrypted: bool,
@@ -163,7 +204,8 @@ pub struct SevenZipStore {
 impl Durable for SevenZipStore {
     // 3: the grid shelved by chunk of blocks, kept apart from the bytes.
     // 4: a sealed value encodes as nothing, numbered by its owner's walk.
-    const VERSION: u16 = 4;
+    // 5: the container's length as the first piece's front states it.
+    const VERSION: u16 = 5;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.grid.parts(take)
@@ -214,6 +256,7 @@ impl SevenZipStore {
             lengths: BTreeMap::new(),
             kept,
             start: None,
+            measured: None,
             geometry: None,
             encrypted: false,
             header_ranges: Vec::new(),
@@ -253,6 +296,40 @@ impl SevenZipStore {
             Some(geometry) => geometry.to_volumes(range, out),
             None => out.push((VolumeIndex(0), range)),
         }
+    }
+
+    // Where a member's facts put it in the set. A piece of a split set has
+    // no signature of its own; one whose front a format names is that
+    // format's, a container of its own or a recovery volume, however long
+    // it is. The first piece is the one signed piece: a front whose
+    // signature measures the container the first piece measured is that
+    // piece posted again. A piece numbered from the first piece's name is
+    // at that number; one with no number is at each free place its length
+    // fits, and a piece as long as the first fits every free place but
+    // the last.
+    fn placed(&self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Option<Placed> {
+        if matches!(signed(first_bytes, length), Sniff::Object(_)) {
+            let again = matches!(
+                header::signature(first_bytes),
+                Signature::Start(start) if Some(start.total()) == self.measured
+            );
+            return again.then_some(Placed::At(VolumeIndex(0)));
+        }
+        let first = *self.lengths.get(&VolumeIndex(0))?;
+        let (total, length, names) = (self.measured?, length?, &self.names);
+        Geometry::new(first, total)?;
+        let numbered = split::parse(names.get(&VolumeIndex(0))?)
+            .and_then(|first| split::parse(name)?.index_from(&first))
+            .map(VolumeIndex);
+        if let Some(numbered) = numbered {
+            return Some(Placed::At(numbered));
+        }
+        fits(first, total, length, |at| !names.contains_key(&at))
+    }
+
+    // One past every volume held.
+    fn past(&self) -> Option<VolumeIndex> {
+        Placed::past(self.names.keys().next_back().map(|volume| volume.0))
     }
 
     fn give_up(&mut self, emit: Emit, out: &mut Vec<Emit>) {
@@ -362,14 +439,9 @@ impl SevenZipStore {
             if geometry.agrees(*volume, *length) || !self.lengths_said.insert(*volume) {
                 continue;
             }
-            let expected = if *volume == geometry.last() {
-                geometry.total().saturating_sub(geometry.base(*volume))
-            } else {
-                geometry.base(VolumeIndex(1))
-            };
             out.push(Emit::Damaged {
                 volume: *volume,
-                range: ByteRange::new(0, (*length).max(expected)),
+                range: ByteRange::new(0, (*length).max(geometry.holds(*volume))),
             });
         }
     }
@@ -532,9 +604,6 @@ impl Object for SevenZipStore {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
-        if self.gone {
-            return;
-        }
         let Some(range) = self.container(delivery.volume, delivery.range()) else {
             return;
         };
@@ -563,22 +632,21 @@ impl Object for SevenZipStore {
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         self.stale = true;
         self.settle(out);
     }
 
     // Nothing more will arrive. A member still damaged, a password that
-    // opened nothing, or a member named and never placed leaves the
-    // container unread.
+    // opened nothing, a piece beside the set that nothing orders, or a
+    // member named and never placed leaves the container unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         let why = crate::quiet::damaged(standing)
             .or_else(|| self.shut())
+            .or_else(|| {
+                crate::quiet::unordered(standing, |beside| {
+                    self.placed(beside.name, beside.front, beside.length)
+                })
+            })
             .or_else(|| crate::quiet::unplaced(standing));
         if let Some(why) = why {
             self.give_up(Emit::Refuse(why), out);
@@ -586,9 +654,6 @@ impl Object for SevenZipStore {
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         let Some(range) = self.container(volume, range) else {
             return;
         };
@@ -613,10 +678,7 @@ impl Object for SevenZipStore {
         }
     }
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
-        if self.gone {
-            return;
-        }
+    fn wants(&self, out: &mut Vec<Seek>) {
         // Only volumes bound so far can be bid: a seek into one not yet
         // claimed would be answered as unseekable.
         if self.geometry.is_none() {
@@ -639,7 +701,7 @@ impl Object for SevenZipStore {
     }
 
     fn pulled(&mut self, seek: Seek, pull: Pull, out: &mut Vec<Emit>) {
-        if self.gone || pull != Pull::Unseekable || self.map.is_some() {
+        if pull != Pull::Unseekable || self.map.is_some() {
             return;
         }
         let Some(range) = self.container(seek.volume, seek.range) else {
@@ -679,6 +741,10 @@ impl Object for SevenZipStore {
         Box::new(self.posted_over(ranges))
     }
 
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        self.unsay(volume, range);
+    }
+
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         if self.lengths.contains_key(&volume) {
             return;
@@ -689,9 +755,6 @@ impl Object for SevenZipStore {
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         // The offer answers the question the store asked: a candidate that
         // opens nothing leaves it free to ask for the next one.
         self.asked = false;
@@ -718,26 +781,51 @@ impl Object for SevenZipStore {
         self.kept.read(range).map(bytes::Bytes::copy_from_slice)
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8]) {
+    // The first volume is the piece with the signature header, whose front
+    // says how long the container is; its length is how long every piece
+    // but the last is. Both are what places the pieces bound after it.
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], length: Option<u64>) {
         self.names.insert(volume, name.to_owned());
+        if let Some(length) = length {
+            self.lengths.entry(volume).or_insert(length);
+            self.stale = true;
+        }
+        if volume.0 == 0
+            && let Signature::Start(start) = header::signature(front)
+        {
+            self.measured = Some(start.total());
+        }
     }
 
     fn renamed(&mut self, volume: VolumeIndex, name: &str) {
         self.names.insert(volume, name.to_owned());
     }
 
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        // A volume of a split set has no signature of its own; one that has
-        // is a container of its own.
-        if first_bytes.starts_with(&header::MAGIC) {
-            return None;
-        }
-        // Its place is its number counted from the first volume's own, so a
-        // set renamed to numbers of its own chains as a plain one does.
-        let first = SevenZip::parse(self.names.get(&VolumeIndex(0))?)?;
-        let index = SevenZip::parse(name)?.index_from(&first)?;
-        let volume = VolumeIndex(index);
-        (index != 0 && !self.names.contains_key(&volume)).then_some(volume)
+    fn refused(&mut self) {
+        self.gone = true;
+    }
+
+    // Every piece but the last is as long as the first, and the last holds
+    // the rest of the container the first piece's signature header
+    // measures, so a piece's length says which free places it can take.
+    // Where it could take several, as a piece as long as the first can,
+    // only the number its name carries, counted from the first piece's own,
+    // can say which: a numbered piece takes that place whatever its length,
+    // and whether or not it is held, since a piece posted again is that
+    // piece; the store checks its length as it checks every volume's. A
+    // piece with no number takes the one free place its length fits
+    // exactly, and a piece no fact places is not claimed. One that fits
+    // more than one free place is the set's and nothing orders it: a name a
+    // recovery set gives it later may, so it is not claimed while the set
+    // stands, and the set refuses on quiet for it.
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        length: Option<u64>,
+    ) -> Option<VolumeIndex> {
+        self.placed(name, first_bytes, length)?
+            .claimed(self.gone, self.past())
     }
     fn facts(&self) -> Facts {
         Facts::of(Kind::SevenZipStore, self)

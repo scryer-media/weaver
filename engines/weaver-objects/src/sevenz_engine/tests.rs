@@ -132,7 +132,7 @@ impl Gate {
 impl Volumes for Gate {
     fn next(&self, after: Option<VolumeIndex>) -> std::io::Result<Option<VolumeIndex>> {
         let next = after.map_or(0, |after| after.0 as usize + 1);
-        Ok((next < self.volumes.len()).then(|| VolumeIndex(next as u32)))
+        Ok((next < self.volumes.len()).then_some(VolumeIndex(next as u32)))
     }
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
@@ -228,7 +228,7 @@ fn run(engine: &mut SevenZipEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
 fn named(names: &[&str]) -> SevenZipEngine {
     let mut engine = SevenZipEngine::new();
     for (volume, name) in names.iter().enumerate() {
-        engine.bound(VolumeIndex(volume as u32), name, &[]);
+        engine.bound(VolumeIndex(volume as u32), name, &[], None);
     }
     engine
 }
@@ -392,17 +392,24 @@ fn a_sink_that_says_stop_hears_nothing_more() {
 #[test]
 fn claim_names_the_volumes_of_its_own_set_only() {
     let mut engine = named(&["Set.7z.001"]);
-    assert_eq!(engine.claim("set.7Z.002", b""), Some(VolumeIndex(1)));
-    assert_eq!(engine.claim("set.7z.1000", b""), Some(VolumeIndex(999)));
-    assert_eq!(engine.claim("set.7z.001", b""), None);
-    assert_eq!(engine.claim("set.7z.000", b""), None);
-    assert_eq!(engine.claim("other.7z.002", b""), None);
-    assert_eq!(engine.claim("set.7z", b""), None);
-    assert_eq!(engine.claim("set.part2.rar", b""), None);
+    assert_eq!(engine.claim("set.7Z.002", b"", None), Some(VolumeIndex(1)));
+    assert_eq!(
+        engine.claim("set.7z.1000", b"", None),
+        Some(VolumeIndex(999))
+    );
+    assert_eq!(
+        engine.claim("set.7z.0001", b"", None),
+        Some(VolumeIndex(0)),
+        "a piece posted again is that piece"
+    );
+    assert_eq!(engine.claim("set.7z.000", b"", None), None);
+    assert_eq!(engine.claim("other.7z.002", b"", None), None);
+    assert_eq!(engine.claim("set.7z", b"", None), None);
+    assert_eq!(engine.claim("set.part2.rar", b"", None), None);
 
     let mut lone = named(&["set.7z"]);
     assert_eq!(
-        lone.claim("set.7z.002", b""),
+        lone.claim("set.7z.002", b"", None),
         None,
         "a lone 7z has no siblings"
     );
@@ -427,7 +434,7 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     assert_eq!(bids, vec![(1, 1, Purpose::Data), (2, 2, Purpose::Data)]);
 
     seeks.clear();
-    engine.bound(VolumeIndex(3), "set.7z.004", &[]);
+    engine.bound(VolumeIndex(3), "set.7z.004", &[], None);
     engine.reached(VolumeIndex(1), 0);
     engine.wants(&mut seeks);
     let bids: Vec<_> = seeks

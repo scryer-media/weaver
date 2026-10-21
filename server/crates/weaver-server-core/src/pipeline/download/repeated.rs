@@ -185,9 +185,13 @@ impl RepeatedArticles {
         let scratch = memory.try_reserve_retained((count as u64).saturating_mul(48))?;
         let mut counts = HashMap::<&str, bool>::new();
         for file in &spec.files {
-            for segment in &file.segments {
+            for id in file
+                .segments
+                .iter()
+                .flat_map(|segment| segment.message_ids.all())
+            {
                 counts
-                    .entry(&segment.message_id)
+                    .entry(id)
                     .and_modify(|repeated| *repeated = true)
                     .or_insert(false);
             }

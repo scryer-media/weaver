@@ -9,73 +9,37 @@ use weaver_graph::{
     NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
 };
 
-use super::{CheckpointError, FileState, Snapshot, rows, snapshot};
-use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint};
+use super::{CheckpointError, FileState, Pending, Snapshot, rows, snapshot};
+use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint, PartRow};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
+use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::{
-    ArticleFacts, ClassFacts, Encoded, JobFacts, PostFacts, RootBlob, RootFactsError, RootRow,
-    VolumeFacts, decode, encode, encode_post,
+    ArticleFacts, ClassFacts, JobFacts, PostFacts, RootBlob, RootFactsError, RootRow, VolumeFacts,
+    decode, encode, of_ordinal,
 };
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::PieceRoot;
+use crate::pipeline::graph::root::tests::{decoded, file, job_with};
+use crate::pipeline::graph::status::RepairSlots;
 
-// The root row of version 2, as builds before roots had kinds wrote it:
-// the article root's facts with the job's beside them.
-#[derive(serde::Serialize)]
-struct Version2<'a> {
-    next_node: u32,
-    posted: &'a [String],
-    volumes: &'a [VolumeFacts],
-    read_backs: u64,
-    reported: Option<RootPhase>,
-}
-
-// Rewrite an article job's root row as a build before roots had kinds
-// wrote it.
-pub(crate) fn as_version_2(checkpoint: &mut GraphCheckpoint) {
-    let row = checkpoint
-        .nodes
-        .iter_mut()
-        .find(|row| row.node == 0)
-        .expect("a root row");
-    let parts: Vec<Part> = checkpoint
-        .parts
+// The post's facts as a checkpoint encodes them: the root restored from
+// them, encoded whole.
+fn article_blob(facts: PostFacts) -> RootBlob {
+    let files: Vec<RootFile> = facts
+        .posted
         .iter()
-        .filter(|part| part.node == 0)
-        .map(|part| Part {
-            key: part.part as u64,
-            bytes: Arc::clone(&part.bytes),
+        .zip(&facts.volumes)
+        .map(|(name, volume)| RootFile {
+            name: name.clone(),
+            articles: volume
+                .articles
+                .iter()
+                .map(|(ordinal, _)| (*ordinal, 64))
+                .collect(),
         })
         .collect();
-    let now = decode(RootRow::VERSION, &row.facts, &parts).unwrap();
-    let post = now.root.read::<ArticleRoot>().unwrap();
-    row.facts_version = 2;
-    row.facts = rmp_serde::to_vec(&Version2 {
-        next_node: now.next_node,
-        posted: &post.posted,
-        volumes: &post.volumes,
-        read_backs: now.job.read_backs,
-        reported: now.job.reported,
-    })
-    .unwrap();
-    checkpoint.parts.retain(|part| part.node != 0);
-}
-
-fn article_blob(facts: PostFacts) -> RootBlob {
-    article_blob_kept(&mut Encoded::default(), facts)
-}
-
-// The post encoded by `kept`, so parts unchanged since it last encoded
-// keep their bytes.
-fn article_blob_kept(kept: &mut Encoded, facts: PostFacts) -> RootBlob {
-    let (bytes, parts) = encode_post(kept, &facts).unwrap();
-    RootBlob {
-        root: "articles".to_owned(),
-        version: PostFacts::VERSION,
-        bytes,
-        parts,
-    }
+    RootBlob::of(&ArticleRoot::restore(&files, &facts).unwrap())
 }
 
 fn post(blob: &RootBlob) -> PostFacts {
@@ -94,6 +58,7 @@ fn member(id: u32, name: &str) -> MemberRecord {
         given_up: None,
         buried: false,
         undecided: false,
+        copy_of: None,
     }
 }
 
@@ -129,8 +94,10 @@ fn full() -> Snapshot {
         member(0, "set.part1.rar"),
         member(1, "set.par2"),
         member(2, "set.r00"),
+        member(3, "set.part01.rar"),
     ];
     root.members[2].buried = true;
+    root.members[3].copy_of = Some(MemberId(0));
     root.members[0].bound_to = Some(ObjectId(1));
     root.members[0].owner = Some((NodeId(1), VolumeIndex(0)));
     root.members[0].closed = true;
@@ -207,7 +174,6 @@ fn full() -> Snapshot {
                 FileState {
                     has_file: true,
                     refused: Some(Why::Unrepairable),
-                    unusable_at: None,
                 },
             ),
             (
@@ -215,15 +181,6 @@ fn full() -> Snapshot {
                 FileState {
                     has_file: true,
                     refused: None,
-                    unusable_at: Some(1),
-                },
-            ),
-            (
-                (NodeId(0), MemberId(0)),
-                FileState {
-                    has_file: false,
-                    refused: None,
-                    unusable_at: Some(0),
                 },
             ),
         ]),
@@ -277,49 +234,10 @@ fn the_phase_last_reported_comes_back_with_the_job() {
     .unwrap();
     assert_eq!(row.job.reported, Some(RootPhase::Done));
     assert_eq!(row.root, taken.root);
-}
-
-// An article checkpoint a build before roots had kinds wrote comes back as
-// the same snapshot: the article root's facts, and the job's.
-#[test]
-fn an_article_checkpoint_from_before_roots_had_kinds_comes_back() {
-    let taken = full();
-    let mut checkpoint = rows(&taken);
-    as_version_2(&mut checkpoint);
-    assert_eq!(checkpoint.nodes[0].facts_version, 2);
-    assert!(checkpoint.parts.iter().all(|part| part.node != 0));
-    assert_eq!(snapshot(&checkpoint), Ok(taken));
-}
-
-// Root facts written whole, before they were kept as parts, are refused by
-// their version, not misread.
-#[test]
-fn root_facts_without_a_reported_phase_restore_none() {
-    #[derive(serde::Serialize)]
-    struct Before<'a> {
-        next_node: u32,
-        posted: &'a [String],
-        volumes: &'a [VolumeFacts],
-        read_backs: u64,
-    }
-    let taken = full();
-    let facts = post(&taken.root);
-    let before = rmp_serde::to_vec(&Before {
-        next_node: taken.tree.next_node,
-        posted: &facts.posted,
-        volumes: &facts.volumes,
-        read_backs: taken.job.read_backs,
-    })
-    .unwrap();
-    let row = decode(2, &before, &[]).unwrap();
     assert_eq!(
-        row.job,
-        JobFacts {
-            read_backs: 7,
-            reported: None,
-        }
+        post(&row.root).volumes[1].raised,
+        vec![(0, ClassFacts::Recovery)]
     );
-    assert_eq!(post(&row.root), facts);
 }
 
 #[test]
@@ -336,6 +254,7 @@ fn facts_are_read_only_into_the_root_that_wrote_them() {
         Err(RootFactsError::Version(newer.version))
     );
     assert_eq!(decode(1, &[], &[]), Err(RootFactsError::Version(1)));
+    assert_eq!(decode(2, &[], &[]), Err(RootFactsError::Version(2)));
 }
 
 // A post written whole, before its facts were kept as parts, is refused by
@@ -352,48 +271,125 @@ fn root_facts_of_the_whole_blob_layout_are_refused() {
     assert_eq!(whole.read::<ArticleRoot>(), Err(RootFactsError::Version(1)));
 }
 
-// Many articles, of which the step changes one, encoded by `kept`.
-fn long_post(arrived: u32, kept: &mut Encoded) -> Snapshot {
-    let mut taken = full();
-    let mut facts = post(&taken.root);
-    let volume = &mut facts.volumes[0];
-    volume.articles = (0..100)
-        .map(|ordinal| {
-            let start = u64::from(ordinal) * 64;
-            let article = if ordinal < arrived {
-                ArticleFacts::Arrived(Some((start, start + 64)))
-            } else {
-                ArticleFacts::Waiting
-            };
-            (ordinal, article)
-        })
-        .collect();
-    volume.segments = (0..arrived)
-        .map(|ordinal| {
-            let start = u64::from(ordinal) * 64;
-            (start, start + 64, ordinal, false)
-        })
-        .collect();
-    taken.root = article_blob_kept(kept, facts);
-    taken
+fn intake(job: &mut GraphJob, ordinal: u32) {
+    let offset = u64::from(ordinal) * 64;
+    job.intake(
+        decoded(0, ordinal, offset, &[7; 64], Some(6_400)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+}
+
+// A job of many articles, the first `arrived` of them in.
+fn long_post(arrived: u32) -> (GraphJob, tempfile::TempDir) {
+    let (mut job, dir, _) = job_with(&[file("long.bin", &[64; 100])], Vec::new());
+    for ordinal in 0..arrived {
+        intake(&mut job, ordinal);
+    }
+    (job, dir)
+}
+
+// The root's facts parts a change writes, by part: `None` for one it
+// deletes.
+fn root_parts(delta: &Delta) -> BTreeMap<i64, Option<Arc<[u8]>>> {
+    let root = i64::from(NodeId::ROOT.0);
+    delta
+        .parts
+        .iter()
+        .filter(|((node, _), _)| *node == root)
+        .map(|((_, part), row)| (*part, row.as_ref().map(|row| Arc::clone(&row.bytes))))
+        .collect()
+}
+
+// What the database holds once a whole change is written.
+fn held(delta: &Delta) -> GraphCheckpoint {
+    fn of<R: Clone, K>(changes: &BTreeMap<K, Option<R>>) -> Vec<R> {
+        changes.values().flatten().cloned().collect()
+    }
+    assert!(delta.whole);
+    GraphCheckpoint {
+        nodes: of(&delta.nodes),
+        members: of(&delta.members),
+        coverage: of(&delta.coverage),
+        envelopes: of(&delta.envelopes),
+        crypt: of(&delta.crypt),
+        parts: of(&delta.parts),
+    }
 }
 
 #[test]
 fn a_step_writes_only_the_rows_and_parts_it_changed() {
-    let mut kept = Encoded::default();
-    let before = rows(&long_post(40, &mut kept));
-    let after = rows(&long_post(41, &mut kept));
-    let delta = Delta::between(Some(&before), &after);
-    // The article's chunk and the segment's chunk; the root row only names
+    let (mut job, _dir) = long_post(40);
+    let pending = Pending::default();
+    assert!(pending.put(&mut job));
+    let first = pending.take().unwrap();
+    assert!(first.whole);
+    intake(&mut job, 40);
+    assert!(pending.put(&mut job));
+    let step = pending.take().unwrap();
+    assert!(!step.whole);
+    // The arrival's chunk alone of the root's parts; the root row only names
     // its parts, so it stays as it was.
-    assert!(delta.nodes.is_empty(), "{delta:?}");
-    assert_eq!(delta.parts.len(), 2, "{delta:?}");
-    assert_eq!(delta.rows(), 2);
-    assert!(Delta::between(Some(&after), &after).is_empty());
-    // A fresh encoding of the same snapshot is the same rows.
-    let fresh = long_post(41, &mut Encoded::default());
-    assert_eq!(rows(&fresh), after);
-    assert_eq!(snapshot(&after), Ok(fresh));
+    let changed = root_parts(&step);
+    assert!(!changed.is_empty(), "{step:?}");
+    assert!(
+        changed
+            .keys()
+            .all(|part| *part as u32 == of_ordinal(40) && changed[part].is_some()),
+        "{changed:?}"
+    );
+    assert!(
+        !step.nodes.contains_key(&i64::from(NodeId::ROOT.0)),
+        "{step:?}"
+    );
+    assert!(!pending.put(&mut job), "an unchanged job writes nothing");
+    // The parts it wrote over the ones before are a fresh checkpoint's, and
+    // the whole job's rows are the rows of its snapshot.
+    let mut written: BTreeMap<i64, Option<Arc<[u8]>>> = root_parts(&first);
+    written.extend(changed);
+    let fresh = Pending::default();
+    assert!(fresh.put(&mut job));
+    let whole = fresh.take().unwrap();
+    assert_eq!(root_parts(&whole), written);
+    assert_eq!(held(&whole), rows(&job.snapshot()));
+}
+
+#[test]
+fn a_pending_writes_what_the_database_does_not_hold() {
+    let (mut job, _dir) = long_post(20);
+    let pending = Pending::default();
+    assert!(pending.put(&mut job));
+    let first = pending.take().unwrap();
+    // A write that failed: the next checkpoint is the whole job again, every
+    // root part with it.
+    pending.forget();
+    assert!(pending.put(&mut job));
+    let again = pending.take().unwrap();
+    assert!(again.whole);
+    assert_eq!(root_parts(&again), root_parts(&first));
+    assert!(!root_parts(&again).is_empty());
+    // What the database holds, as a restore read it: the job unchanged
+    // writes nothing.
+    let restored = Pending::default();
+    restored.written(held(&first));
+    assert!(!restored.put(&mut job));
+    assert!(restored.take().is_none());
+    // A root part the database holds and the root no longer has is deleted,
+    // and only it.
+    let stale = PartRow {
+        node: i64::from(NodeId::ROOT.0),
+        part: (1 << 32) | 99,
+        bytes: Arc::from([1, 2].as_slice()),
+    };
+    let mut rows = held(&first);
+    rows.parts.push(stale.clone());
+    let restored = Pending::default();
+    restored.written(rows);
+    assert!(restored.put(&mut job));
+    let delta = restored.take().unwrap();
+    assert_eq!(delta.rows(), 1, "{delta:?}");
+    assert_eq!(root_parts(&delta), BTreeMap::from([(stale.part, None)]));
 }
 
 #[test]

@@ -198,7 +198,7 @@ impl Gate {
 impl Volumes for Gate {
     fn next(&self, after: Option<VolumeIndex>) -> std::io::Result<Option<VolumeIndex>> {
         let next = after.map_or(0, |after| after.0 as usize + 1);
-        Ok((next < self.volumes.len()).then(|| VolumeIndex(next as u32)))
+        Ok((next < self.volumes.len()).then_some(VolumeIndex(next as u32)))
     }
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
@@ -289,7 +289,7 @@ fn run(engine: &mut RarEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
 fn named(names: &[&str]) -> RarEngine {
     let mut engine = RarEngine::new();
     for (volume, name) in names.iter().enumerate() {
-        engine.bound(VolumeIndex(volume as u32), name, &[]);
+        engine.bound(VolumeIndex(volume as u32), name, &[], None);
     }
     engine
 }
@@ -332,20 +332,30 @@ fn a_member_spanning_two_volumes_extracts_whole() {
 #[test]
 fn claim_names_the_volumes_of_its_own_set_only() {
     let mut engine = named(&["Set.part1.rar"]);
-    assert_eq!(engine.claim("set.PART2.rar", b""), Some(VolumeIndex(1)));
-    assert_eq!(engine.claim("set.part10.rar", b""), Some(VolumeIndex(9)));
-    assert_eq!(engine.claim("set.part1.rar", b""), None);
-    assert_eq!(engine.claim("other.part2.rar", b""), None);
-    assert_eq!(engine.claim("set.r00", b""), None);
-    assert_eq!(engine.claim("set.par2", b""), None);
+    assert_eq!(
+        engine.claim("set.PART2.rar", b"", None),
+        Some(VolumeIndex(1))
+    );
+    assert_eq!(
+        engine.claim("set.part10.rar", b"", None),
+        Some(VolumeIndex(9))
+    );
+    assert_eq!(
+        engine.claim("set.part01.rar", b"", None),
+        Some(VolumeIndex(0)),
+        "a volume posted again is that volume"
+    );
+    assert_eq!(engine.claim("other.part2.rar", b"", None), None);
+    assert_eq!(engine.claim("set.r00", b"", None), None);
+    assert_eq!(engine.claim("set.par2", b"", None), None);
 
     let mut old = named(&["set.rar"]);
-    assert_eq!(old.claim("set.r00", b""), Some(VolumeIndex(1)));
-    assert_eq!(old.claim("SET.R41", b""), Some(VolumeIndex(42)));
+    assert_eq!(old.claim("set.r00", b"", None), Some(VolumeIndex(1)));
+    assert_eq!(old.claim("SET.R41", b"", None), Some(VolumeIndex(42)));
     // `.sNN` is numbered as `.rNN` is.
-    assert_eq!(old.claim("set.s00", b""), Some(VolumeIndex(1)));
-    assert_eq!(old.claim("set.part2.rar", b""), None);
-    assert_eq!(old.claim("set.rar", b""), None);
+    assert_eq!(old.claim("set.s00", b"", None), Some(VolumeIndex(1)));
+    assert_eq!(old.claim("set.part2.rar", b"", None), None);
+    assert_eq!(old.claim("set.rar", b"", None), Some(VolumeIndex(0)));
 }
 
 // Names that number nothing of a RAR set: each volume is placed by what its
@@ -355,20 +365,23 @@ fn claim_names_the_volumes_of_its_own_set_only() {
 fn claim_places_a_nameless_volume_by_its_headers() {
     let volumes = two_volumes();
     let mut engine = RarEngine::new();
-    engine.bound(VolumeIndex(0), "a1b2.101", &volumes[0]);
-    assert_eq!(engine.claim("a1b2.102", &volumes[1]), Some(VolumeIndex(1)));
+    engine.bound(VolumeIndex(0), "a1b2.101", &volumes[0], None);
     assert_eq!(
-        engine.claim("a1b2.103", &volumes[0]),
-        None,
-        "its place is taken"
+        engine.claim("a1b2.102", &volumes[1], None),
+        Some(VolumeIndex(1))
     );
     assert_eq!(
-        engine.claim("a1b2.103", &one_volume()),
+        engine.claim("a1b2.103", &volumes[0], None),
+        Some(VolumeIndex(0)),
+        "a volume posted again is that volume"
+    );
+    assert_eq!(
+        engine.claim("a1b2.103", &one_volume(), None),
         None,
         "no volume of a set"
     );
     assert_eq!(
-        engine.claim("a1b2.103", b""),
+        engine.claim("a1b2.103", b"", None),
         None,
         "a front that says nothing"
     );
@@ -378,14 +391,32 @@ fn claim_places_a_nameless_volume_by_its_headers() {
     ]
     .concat();
     assert_eq!(
-        engine.claim("a1b2.103", &stranger),
+        engine.claim("a1b2.103", &stranger, None),
         None,
         "it continues no member of ours"
     );
 
-    engine.bound(VolumeIndex(1), "a1b2.102", &volumes[1]);
+    engine.bound(VolumeIndex(1), "a1b2.102", &volumes[1], None);
     let said = run(&mut engine, volumes);
     assert_eq!(said[1], Said::Bytes(0, spanning()));
+}
+
+// A store gives the engine a volume whose front never reached the tree, as
+// after a restart: bound, it states nothing. The next volume states its
+// number, and the one before it, saying nothing, says nothing against it.
+#[test]
+fn a_stated_volume_is_placed_beside_a_bound_volume_whose_front_is_unread() {
+    let volumes = two_volumes();
+    let mut engine = RarEngine::new();
+    engine.bound(VolumeIndex(0), "a1b2.101", &volumes[0], None);
+    engine.bound(VolumeIndex(1), "a1b2.102", b"", None);
+    let third = [
+        rar5::start(Some(2)),
+        rar5::file("tail.bin", 0, NOTES, NOTES.len() as u64, Some(crc32(NOTES))),
+        rar5::end(false),
+    ]
+    .concat();
+    assert_eq!(engine.claim("a1b2.103", &third, None), Some(VolumeIndex(2)));
 }
 
 #[test]
@@ -407,7 +438,7 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     assert_eq!(bids, vec![(1, 1, Purpose::Data), (2, 2, Purpose::Data)]);
 
     seeks.clear();
-    engine.bound(VolumeIndex(3), "set.part4.rar", &[]);
+    engine.bound(VolumeIndex(3), "set.part4.rar", &[], None);
     engine.reached(VolumeIndex(1), 0);
     engine.wants(&mut seeks);
     let bids: Vec<_> = seeks

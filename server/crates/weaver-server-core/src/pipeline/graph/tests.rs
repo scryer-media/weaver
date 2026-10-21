@@ -130,7 +130,9 @@ fn spec(name: &str, posts: &[Post]) -> JobSpec {
                         ordinal: ordinal as u32,
                         article_number: ordinal as u32,
                         bytes: article.len() as u32,
-                        message_id: format!("lantern-{index}-{ordinal}@example.com"),
+                        message_ids: crate::jobs::MessageIds::new(vec![format!(
+                            "lantern-{index}-{ordinal}@example.com"
+                        )]),
                     })
                     .collect(),
             })
@@ -346,7 +348,6 @@ async fn a_par2_set_beside_a_plain_file_adjudicates_it_clean_without_reading_bac
     let summaries = job.recovery_summary();
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].kind, Kind::Par2);
-    assert_eq!(summaries[0].damaged_slices, 0);
     assert_eq!(summaries[0].outcome, Some(RepairOutcome::Clean));
     assert_eq!(job.writer().read_backs(), 0, "the fed segments were enough");
     assert!(job.namespace().is_clean());

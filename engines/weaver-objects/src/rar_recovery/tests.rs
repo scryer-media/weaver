@@ -55,7 +55,7 @@ fn rev(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeInd
 // A recovery volume every byte of which has arrived, not yet closed.
 fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeIndex> {
     let front = &bytes[..bytes.len().min(64)];
-    let volume = match job.object.claim(name, front) {
+    let volume = match job.object.claim(name, front, None) {
         Some(volume) => volume,
         None if job.store.volumes.is_empty() => VolumeIndex(0),
         None => return None,
@@ -63,7 +63,7 @@ fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<Volu
     let member = job.namespace.announce(name, Some(bytes.len() as u64));
     job.arrive(member, 0, bytes, Provenance::Fresh);
     job.namespace.bind(member, OWN);
-    job.object.bound(volume, name, front);
+    job.object.bound(volume, name, front, None);
     job.store.volumes.insert(volume, bytes.to_vec());
     let mut out = Vec::new();
     job.object.sized(volume, bytes.len() as u64, &mut out);
@@ -113,6 +113,30 @@ fn a_rar5_header_reads_once_its_front_is_whole() {
     assert!(matches!(header::rar5(b"Rar!\x1a\x07\x01\x00"), Read::Not));
 }
 
+// Bound on its sign alone, then handed the whole volume at once: the front
+// learns the header's length partway through that delivery and takes the
+// rest of the header from it, so the header reads however the bytes were cut.
+#[test]
+fn a_rar5_header_reads_from_one_delivery_past_a_front_bound_short() {
+    let mut job = job();
+    let bytes = rev5(3, 1, 3, &[300, 300, 120]);
+    let volume = VolumeIndex(0);
+    job.object
+        .bound(volume, "silver.part1.rev", &bytes[..8], None);
+    job.object.deliver(
+        Delivery {
+            volume,
+            offset: 0,
+            bytes: &bytes,
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+    let read = job.object.header().expect("the header reads");
+    assert_eq!(read.sizes, vec![300, 300, 120]);
+}
+
 #[test]
 fn a_rar3_footer_gives_the_set_and_its_width() {
     let bytes = rev3(4, 250);
@@ -140,7 +164,7 @@ fn recovery_volumes_of_one_set_are_claimed_and_another_sets_are_not() {
     );
     assert_eq!(
         job.object
-            .claim("lantern.part2.rar", b"Rar!\x1a\x07\x01\x00"),
+            .claim("lantern.part2.rar", b"Rar!\x1a\x07\x01\x00", None),
         None
     );
 }

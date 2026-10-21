@@ -371,7 +371,7 @@ impl Object for Tar {
         _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
-        if self.gone || delivery.volume != VOLUME || delivery.bytes.is_empty() {
+        if delivery.volume != VOLUME || delivery.bytes.is_empty() {
             return;
         }
         let range = delivery.range();
@@ -395,7 +395,7 @@ impl Object for Tar {
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
-        if self.gone || volume != VOLUME || self.end.is_some() {
+        if volume != VOLUME || self.end.is_some() {
             return;
         }
         let length = self.length.unwrap_or(self.reached);
@@ -410,7 +410,7 @@ impl Object for Tar {
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.gone || volume != VOLUME {
+        if volume != VOLUME {
             return;
         }
         self.lost.push(range);
@@ -426,9 +426,6 @@ impl Object for Tar {
     // Nothing more will arrive. A member still damaged, or one named and
     // never placed, leaves the archive unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        if self.gone {
-            return;
-        }
         if let Some(why) =
             crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
         {
@@ -437,9 +434,25 @@ impl Object for Tar {
     }
 
     // A tar is read in order; it never asks for anything ahead of it.
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
+
+    // Each member the bytes reached forgets what was said of them and is
+    // open until they are said again.
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let mut placements = Vec::new();
+        self.locate(volume, range, &mut placements);
+        for placement in placements {
+            if let Placement::Member { member, range } = placement
+                && !range.is_empty()
+                && let Some(said) = self.members.get_mut(member.0 as usize)
+            {
+                said.coverage.erase(range);
+                said.closed = false;
+            }
+        }
+    }
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         if volume != VOLUME {

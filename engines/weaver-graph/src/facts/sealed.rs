@@ -22,6 +22,11 @@
 //
 // A part does not hold another: a part's own encoding is no owner's walk,
 // so a sealed value inside it keeps no bytes and comes back empty.
+//
+// A sealed value counts its changes, and a shelf marks each chunk it
+// changes under a generation of its own, so the same walk can take only the
+// parts changed since the generations it took last: an owner that keeps
+// them pays for what changed since, not for all it holds.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -31,6 +36,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::Durable;
+use crate::marks::Marks;
 
 // One part of a facts blob: its shelf in the high half of the key, its
 // chunk in the low half.
@@ -40,16 +46,46 @@ pub struct Part {
     pub bytes: Arc<[u8]>,
 }
 
+// A part changed since the walk before: its bytes now, or `None` for one
+// that went away.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub key: u64,
+    pub bytes: Option<Arc<[u8]>>,
+}
+
 fn key(shelf: u32, chunk: u32) -> u64 {
     (u64::from(shelf) << 32) | u64::from(chunk)
 }
 
 // A state's bytes and the parts they name.
 pub fn encode_parts<T: Durable>(state: &T) -> Result<(Vec<u8>, Vec<Part>), String> {
-    let mut take = Take::default();
+    let taken = encode_since(state, None)?;
+    Ok((taken.bytes, taken.parts))
+}
+
+// A state's bytes, and the generation of each of its sealed values, by its
+// number in the walk: with `since` the generations of a walk before, the
+// parts changed after them; without, every part.
+pub struct Taken {
+    pub bytes: Vec<u8>,
+    pub parts: Vec<Part>,
+    pub changes: Vec<Change>,
+    pub at: Vec<u64>,
+}
+
+pub fn encode_since<T: Durable>(state: &T, since: Option<&[u64]>) -> Result<Taken, String> {
+    let mut take = Take {
+        since,
+        ..Take::default()
+    };
     state.parts(&mut take)?;
-    let bytes = rmp_serde::to_vec(state).map_err(|error| error.to_string())?;
-    Ok((bytes, take.parts))
+    Ok(Taken {
+        bytes: rmp_serde::to_vec(state).map_err(|error| error.to_string())?,
+        parts: take.parts,
+        changes: take.changes,
+        at: take.at,
+    })
 }
 
 // A state back from its bytes and every part they name: a part they do not
@@ -66,25 +102,69 @@ pub fn decode_parts<T: Durable>(bytes: &[u8], parts: &[Part]) -> Result<T, Strin
 }
 
 // The walk of an owner's sealed values as its facts are taken: each leaves
-// its parts under the next number.
+// its parts under the next number, every part, or with `since` only those
+// changed after the generation its number had then.
 #[derive(Default)]
-pub struct Take {
+pub struct Take<'a> {
     next: u32,
+    since: Option<&'a [u64]>,
     parts: Vec<Part>,
+    changes: Vec<Change>,
+    at: Vec<u64>,
 }
 
-impl Take {
+impl Take<'_> {
     pub fn sealed<T>(&mut self, sealed: &Sealed<T>) -> Result<(), String> {
         let shelf = self.shelve()?;
-        self.keep(shelf, 0, sealed.bytes.as_ref())
+        self.at.push(sealed.at);
+        match self.since(shelf) {
+            None => self.keep(shelf, 0, sealed.bytes.as_ref()),
+            Some(since) if sealed.at > since => self.change(shelf, 0, Some(sealed)),
+            Some(_) => Ok(()),
+        }
     }
 
     pub fn shelf<T>(&mut self, shelf: &Shelf<T>) -> Result<(), String> {
         let number = self.shelve()?;
-        shelf
-            .chunks
-            .iter()
-            .try_for_each(|(chunk, sealed)| self.keep(number, *chunk, sealed.bytes.as_ref()))
+        self.at.push(shelf.marks.at());
+        match self.since(number) {
+            None => shelf
+                .chunks
+                .iter()
+                .try_for_each(|(chunk, sealed)| self.keep(number, *chunk, sealed.bytes.as_ref())),
+            Some(since) => shelf
+                .marks
+                .since(since)
+                .try_for_each(|chunk| self.change(number, chunk, shelf.chunks.get(&chunk))),
+        }
+    }
+
+    // A value the walk before did not reach has changed whole.
+    fn since(&self, number: u32) -> Option<u64> {
+        self.since
+            .map(|since| since.get(number as usize).copied().unwrap_or(0))
+    }
+
+    fn change<T>(
+        &mut self,
+        shelf: u32,
+        chunk: u32,
+        sealed: Option<&Sealed<T>>,
+    ) -> Result<(), String> {
+        let bytes = match sealed {
+            None => None,
+            Some(sealed) => Some(Arc::clone(
+                sealed
+                    .bytes
+                    .as_ref()
+                    .ok_or_else(|| "a sealed part does not encode".to_owned())?,
+            )),
+        };
+        self.changes.push(Change {
+            key: key(shelf, chunk),
+            bytes,
+        });
+        Ok(())
     }
 
     fn shelve(&mut self) -> Result<u32, String> {
@@ -131,7 +211,9 @@ impl Give {
         let shelf = self.shelve();
         match self.chunks(shelf).as_slice() {
             [(0, bytes)] => {
+                let at = sealed.at + 1;
                 *sealed = decode(Arc::clone(bytes))?;
+                sealed.at = at;
                 Ok(())
             }
             _ => Err("a sealed part is not one part".to_owned()),
@@ -140,11 +222,10 @@ impl Give {
 
     pub fn shelf<T: DeserializeOwned>(&mut self, shelf: &mut Shelf<T>) -> Result<(), String> {
         let number = self.shelve();
-        shelf.chunks = self
-            .chunks(number)
-            .into_iter()
-            .map(|(chunk, bytes)| Ok((chunk, decode(bytes)?)))
-            .collect::<Result<_, String>>()?;
+        for (chunk, bytes) in self.chunks(number) {
+            shelf.chunks.insert(chunk, decode(bytes)?);
+            shelf.touch(chunk);
+        }
         Ok(())
     }
 
@@ -173,6 +254,7 @@ fn decode<T: DeserializeOwned>(bytes: Arc<[u8]>) -> Result<Sealed<T>, String> {
     Ok(Sealed {
         value: Arc::new(value),
         bytes: Some(bytes),
+        at: 1,
     })
 }
 
@@ -187,6 +269,8 @@ pub struct Sealed<T> {
     // `None` when the value would not encode: the owner's facts then fail
     // to encode too, and say so as unsupported.
     bytes: Option<Arc<[u8]>>,
+    // How many times it changed, its making the first.
+    at: u64,
 }
 
 impl<T: Serialize + Clone> Sealed<T> {
@@ -195,6 +279,7 @@ impl<T: Serialize + Clone> Sealed<T> {
         Self {
             value: Arc::new(value),
             bytes,
+            at: 1,
         }
     }
 
@@ -206,6 +291,7 @@ impl<T: Serialize + Clone> Sealed<T> {
     pub fn change<R>(&mut self, change: impl FnOnce(&mut T) -> R) -> R {
         let out = change(Arc::make_mut(&mut self.value));
         self.bytes = encode(&self.value);
+        self.at += 1;
         out
     }
 
@@ -215,7 +301,9 @@ impl<T: Serialize + Clone> Sealed<T> {
         T: PartialEq,
     {
         if *self.value != value {
-            *self = Self::new(value);
+            self.bytes = encode(&value);
+            self.value = Arc::new(value);
+            self.at += 1;
         }
     }
 
@@ -258,6 +346,7 @@ impl<'de, T: Default> Deserialize<'de> for Sealed<T> {
         Ok(Self {
             value: Arc::default(),
             bytes: None,
+            at: 0,
         })
     }
 }
@@ -268,13 +357,22 @@ impl<'de, T: Default> Deserialize<'de> for Sealed<T> {
 #[derive(Clone)]
 pub struct Shelf<T> {
     chunks: BTreeMap<u32, Sealed<T>>,
+    // Each chunk changed, a chunk that went away among them.
+    marks: Marks<u32>,
 }
 
 impl<T> Default for Shelf<T> {
     fn default() -> Self {
         Self {
             chunks: BTreeMap::new(),
+            marks: Marks::default(),
         }
+    }
+}
+
+impl<T> Shelf<T> {
+    fn touch(&mut self, chunk: u32) {
+        self.marks.mark(chunk);
     }
 }
 
@@ -303,6 +401,7 @@ impl<T: Serialize + Clone + Default> Shelf<T> {
         if empty(sealed.get()) {
             self.chunks.remove(&chunk);
         }
+        self.touch(chunk);
         out
     }
 
@@ -313,16 +412,43 @@ impl<T: Serialize + Clone + Default> Shelf<T> {
     {
         let mut next = BTreeMap::new();
         for (chunk, value) in chunks {
-            let sealed = match self.chunks.remove(&chunk) {
-                Some(mut sealed) => {
-                    sealed.set(value);
-                    sealed
-                }
-                None => Sealed::new(value),
-            };
-            next.insert(chunk, sealed);
+            self.put(chunk, Some(value));
+            if let Some(sealed) = self.chunks.remove(&chunk) {
+                next.insert(chunk, sealed);
+            }
+        }
+        let gone: Vec<u32> = self.chunks.keys().copied().collect();
+        for chunk in gone {
+            self.put(chunk, None);
         }
         self.chunks = next;
+    }
+
+    // One chunk made `value`, encoded again only when that changes it, or
+    // dropped for `None`; every other chunk is left as it is.
+    pub fn put(&mut self, chunk: u32, value: Option<T>)
+    where
+        T: PartialEq,
+    {
+        let changed = match (self.chunks.get_mut(&chunk), value) {
+            (Some(sealed), Some(value)) => {
+                let changed = *sealed.get() != value;
+                sealed.set(value);
+                changed
+            }
+            (None, Some(value)) => {
+                self.chunks.insert(chunk, Sealed::new(value));
+                true
+            }
+            (Some(_), None) => {
+                self.chunks.remove(&chunk);
+                true
+            }
+            (None, None) => false,
+        };
+        if changed {
+            self.touch(chunk);
+        }
     }
 }
 
@@ -360,7 +486,7 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
 
-    use super::{Give, Sealed, Shelf, Take, decode_parts, encode_parts};
+    use super::{Change, Give, Sealed, Shelf, Take, decode_parts, encode_parts, encode_since};
     use crate::facts::Durable;
 
     // Counts its own encodings, so a test can see when a value is encoded.
@@ -475,6 +601,59 @@ mod tests {
         assert_eq!(restored.grown, owner.grown);
         owner.grown.change(0, Vec::is_empty, Vec::clear);
         assert_eq!(owner.grown.get(0), None, "an emptied chunk is dropped");
+    }
+
+    #[test]
+    fn a_walk_since_another_takes_the_parts_changed_after_it() {
+        let mut owner = Owner {
+            moving: 0,
+            settled: Sealed::default(),
+            grown: Shelf::default(),
+        };
+        owner.grown.put(2, Some(vec![20]));
+        owner.grown.put(5, Some(vec![50]));
+        let (_, before) = encode_parts(&owner).unwrap();
+        let since = encode_since(&owner, None).unwrap().at;
+        let changes_since = |owner: &Owner| {
+            let taken = encode_since(owner, Some(&since)).unwrap();
+            (taken.bytes, taken.changes)
+        };
+        let (_, none) = changes_since(&owner);
+        assert!(none.is_empty(), "nothing changed: {none:?}");
+        owner.grown.put(5, Some(vec![50]));
+        owner.grown.put(7, None);
+        let (_, same) = changes_since(&owner);
+        assert!(same.is_empty(), "a value put again unchanged: {same:?}");
+        owner.grown.put(5, Some(vec![51]));
+        owner.grown.put(2, None);
+        owner.moving += 1;
+        let (bytes, changes) = changes_since(&owner);
+        let (whole, after) = encode_parts(&owner).unwrap();
+        assert_eq!(bytes, whole, "the owner's bytes are the one encoding");
+        let changed = after.iter().find(|part| !before.contains(part)).unwrap();
+        let gone = before
+            .iter()
+            .find(|part| !after.iter().any(|now| now.key == part.key));
+        assert_eq!(
+            changes,
+            vec![
+                Change {
+                    key: changed.key,
+                    bytes: Some(changed.bytes.clone()),
+                },
+                Change {
+                    key: gone.unwrap().key,
+                    bytes: None,
+                },
+            ]
+        );
+        let restored: Owner = decode_parts(&bytes, &after).unwrap();
+        let restored_since = encode_since(&restored, Some(&[])).unwrap().changes;
+        assert_eq!(
+            restored_since.len(),
+            after.len(),
+            "a restore no walk has taken changes every part"
+        );
     }
 
     #[test]

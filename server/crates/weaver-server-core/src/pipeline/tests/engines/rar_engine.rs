@@ -668,7 +668,7 @@ fn assert_hands_back_the_volume(graph: &Outcome) {
     assert!(delivery.whole.is_empty(), "{delivery:?}");
     assert_eq!(
         delivery.damaged,
-        [name.clone()],
+        std::slice::from_ref(&name),
         "the volume delivered as it stands"
     );
     assert!(delivery.withheld.is_empty(), "{delivery:?}");

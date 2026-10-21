@@ -38,6 +38,9 @@ impl LeafError {
 #[derive(Debug)]
 pub(crate) struct Leaf {
     path: PathBuf,
+    // A directory member, by its name: it has no bytes, and closing it
+    // makes the directory.
+    directory: bool,
     // Open while bytes are still arriving; dropped when the member is
     // covered, and reopened only for a repair.
     file: Option<File>,
@@ -49,6 +52,7 @@ impl Leaf {
     pub(crate) fn at(dir: &Path, output_name: &str) -> Result<Self, LeafError> {
         Ok(Self {
             path: dir.join(relative_path(output_name)?),
+            directory: Self::is_directory(output_name),
             file: None,
         })
     }
@@ -85,6 +89,16 @@ impl Leaf {
         write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))
     }
 
+    // How far the file reaches: every byte written to it lies below.
+    pub(crate) fn len(&self) -> Result<u64, LeafError> {
+        match &self.file {
+            Some(file) => file.metadata(),
+            None => std::fs::metadata(&self.path),
+        }
+        .map(|metadata| metadata.len())
+        .map_err(LeafError::io(&self.path))
+    }
+
     // Fill `into` with `len` bytes from `offset`. The caller only asks for
     // ranges its coverage says were written.
     pub(crate) fn read(
@@ -110,8 +124,12 @@ impl Leaf {
     }
 
     // Every byte is in: the file takes its final length and its handle is
-    // released, so finalize can move it.
+    // released, so finalize can move it. A directory has no bytes to take:
+    // it is made.
     pub(crate) fn close(&mut self, length: u64) -> Result<(), LeafError> {
+        if self.directory {
+            return self.create_directory();
+        }
         let file = self.open(Some(length))?;
         file.set_len(length).map_err(LeafError::io(&self.path))?;
         self.file = None;

@@ -33,13 +33,13 @@ const MAX_DERIVED_BLOCKS_PER_JOB: usize = 65_536;
 pub(crate) const WHOLE: u64 = u64::MAX;
 
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {
-    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
+    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
 }
 
 // The CRC32 of `first` followed by `len_second` bytes whose CRC32 is `second`.
 pub(crate) fn crc32_combine(first: u32, second: u32, len_second: u64) -> u32 {
-    crc_fast::checksum_combine(
-        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+    crc_turbo::checksum_combine(
+        crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
         u64::from(first),
         u64::from(second),
         len_second,
@@ -48,24 +48,9 @@ pub(crate) fn crc32_combine(first: u32, second: u32, len_second: u64) -> u32 {
 
 // CRC32 of `len` zero bytes, by doubling. PAR2 checksums a short final slice
 // zero-padded to the block size, so a CRC over the real bytes is padded the
-// same way before the two are compared; doubling keeps that logarithmic.
+// same way before the two are compared.
 pub(crate) fn crc32_of_zeros(len: u64) -> u32 {
-    let mut unit = (1u64, crc32(&[0]));
-    let mut total: Option<(u64, u32)> = None;
-    let mut remaining = len;
-    while remaining > 0 {
-        if remaining & 1 == 1 {
-            total = Some(match total {
-                Some((have, crc)) => (have + unit.0, crc32_combine(crc, unit.1, unit.0)),
-                None => (unit.0, unit.1),
-            });
-        }
-        remaining >>= 1;
-        if remaining > 0 {
-            unit = (unit.0 * 2, crc32_combine(unit.1, unit.1, unit.0));
-        }
-    }
-    total.map_or_else(|| crc32(&[]), |(_, crc)| crc)
+    crc_turbo::checksum_zeros(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, len) as u32
 }
 
 // A contiguous run inside one block, folded from the segments that made it.

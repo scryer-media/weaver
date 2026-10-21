@@ -23,6 +23,9 @@ struct Carrier {
 }
 
 impl Object for Carrier {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::RarStore
     }
@@ -60,7 +63,7 @@ impl Object for Carrier {
 
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
@@ -108,6 +111,9 @@ struct Trail {
 }
 
 impl Object for Trail {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::Par3
     }
@@ -137,7 +143,7 @@ impl Object for Trail {
         self.tape.lock().unwrap().lost.push(range);
     }
 
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
@@ -166,7 +172,7 @@ impl Recovery for Trail {
 
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
         let mut volume = Vec::new();
@@ -187,10 +193,6 @@ impl Recovery for Trail {
 
     fn outcome(&self) -> Option<RepairOutcome> {
         None
-    }
-
-    fn blocks_reachable(&self) -> u64 {
-        0
     }
 }
 
@@ -349,15 +351,4 @@ fn damage_on_the_volume_is_lost_to_the_window_where_it_falls() {
         )
         .expect("apply");
     assert_eq!(carried.tape().lost, vec![ByteRange::new(0, 2)]);
-}
-
-#[test]
-fn recovery_data_no_object_reads_is_recorded_and_gets_no_window() {
-    let carried = Carried::new(RecoveryKind::Rar);
-    assert!(carried.job.tree.recovery_nodes(NodeId::ROOT).is_empty());
-    assert_eq!(
-        carried.job.writer.unusable_recovery(),
-        &[(NodeId::ROOT, carried.member)]
-    );
-    assert!(carried.tape().bytes.is_empty());
 }

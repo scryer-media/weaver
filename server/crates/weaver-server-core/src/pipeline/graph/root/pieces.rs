@@ -33,10 +33,13 @@ use bitvec::prelude::{BitVec, Msb0};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use weaver_graph::{ByteRange, MemberId, NodeId, Provenance, Pull, Segment, Tree, VolumeIndex};
+use weaver_graph::{
+    ByteRange, MemberId, NodeId, Part, Provenance, Pull, Segment, Tree, VolumeIndex,
+};
 
 pub(crate) use self::facts::PieceFacts;
 pub(crate) use self::layout::{LayoutError, PieceFile, PieceLayout};
+use super::facts::{Parts, RootFactsError, from_whole, whole};
 use super::window::Window;
 use super::{Ask, Asked, Root, round, sample};
 use crate::pipeline::graph::namespace::{Arrival, Segments};
@@ -310,8 +313,12 @@ impl Root for PieceRoot {
     const NAME: &'static str = "pieces";
     const FACTS_VERSION: u16 = PieceFacts::VERSION;
 
-    fn facts(&self) -> PieceFacts {
-        PieceRoot::facts(self)
+    fn encode(&self, _kept: &mut ()) -> Result<(Vec<u8>, Parts), RootFactsError> {
+        whole(&self.facts())
+    }
+
+    fn decode(bytes: &[u8], parts: &[Part]) -> Result<PieceFacts, RootFactsError> {
+        from_whole(bytes, parts)
     }
 
     fn arrived_before(&mut self, mut queued: impl FnMut(VolumeIndex, u32) -> bool) {
@@ -325,12 +332,6 @@ impl Root for PieceRoot {
                 *unit = Unit::Arrived(None);
             }
         }
-    }
-
-    fn any_head_waiting(&self) -> bool {
-        self.units
-            .iter()
-            .any(|units| units.first() == Some(&Unit::Waiting))
     }
 
     fn class(&self, volume: VolumeIndex, unit: u32) -> Option<Class> {

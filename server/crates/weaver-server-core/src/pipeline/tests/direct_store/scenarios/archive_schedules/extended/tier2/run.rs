@@ -411,6 +411,7 @@ pub(in super::super) async fn run(
             continue;
         }
         pipeline.flush_quiescent_write_backlog().await;
+        pipeline.settle_all_segment_writes().await;
         pipeline.check_job_completion(job).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
         if terminal(&pipeline, job) || !pipeline.jobs.contains_key(&job) {

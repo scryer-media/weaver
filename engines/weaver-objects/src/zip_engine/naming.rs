@@ -40,13 +40,12 @@ impl SetName for VolumeName {
     }
 
     // A `name.zip` bound first, as a volume of its own, is a set of one:
-    // nothing joins it.
+    // nothing joins it. A place held already is answered all the same.
     fn slot(&self, bound: &BTreeMap<u32, VolumeName>) -> Option<u32> {
         let alone = bound
             .iter()
             .any(|(index, name)| name.is_last() && *index != LAST);
-        let index = self.index();
-        (!alone && !bound.contains_key(&index)).then_some(index)
+        (!alone).then_some(self.index())
     }
 }
 

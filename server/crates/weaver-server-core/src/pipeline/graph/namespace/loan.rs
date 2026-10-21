@@ -402,6 +402,18 @@ impl MemberAccess for Lent {
         self.members.get(&(self.namespace, member))?.length
     }
 
+    fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+        let Some(taken) = self.members.get(&(self.namespace, member)) else {
+            return;
+        };
+        out.extend(
+            taken
+                .coverage
+                .overlapping(range)
+                .filter_map(|run| run.range.intersect(range)),
+        );
+    }
+
     // Under the directory finalize never delivers, one per recovery object
     // and namespace, so two repairs never share one.
     fn scratch(&mut self) -> Option<PathBuf> {

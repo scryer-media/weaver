@@ -71,26 +71,33 @@
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
+mod binding_order;
 mod caps;
 mod checkpoint_cost;
+mod deep;
 mod depth;
 mod divergence;
 mod embedded;
-mod harness;
+mod encrypted_hex;
+pub(in crate::pipeline::tests) mod harness;
 mod lines;
 mod nesting;
 mod par3;
 mod partial;
+mod perf;
 mod plain_par2;
 mod rar;
 mod rar_engine;
 mod rar_rev;
 mod refused_then_repaired;
-mod restart;
+mod reposted;
+pub(in crate::pipeline::tests) mod restart;
 mod seek;
 mod sets;
 mod sevenz;
+mod sevenz_hex;
 mod sfv;
+mod solid_hex;
 mod split;
 mod streams;
 mod zip;

@@ -102,7 +102,7 @@ fn nzb_to_spec_sanitizes_trailing_quote_filename() {
             segments: vec![NzbSegment {
                 number: 1,
                 bytes: 10,
-                message_id: "one@example.com".to_string(),
+                message_ids: vec!["one@example.com".to_string()],
             }],
         }],
     };
@@ -127,7 +127,7 @@ fn nzb_to_spec_preserves_colliding_sanitized_filenames() {
                 segments: vec![NzbSegment {
                     number: 1,
                     bytes: 10,
-                    message_id: "one@example.com".to_string(),
+                    message_ids: vec!["one@example.com".to_string()],
                 }],
             },
             NzbFile {
@@ -138,7 +138,7 @@ fn nzb_to_spec_preserves_colliding_sanitized_filenames() {
                 segments: vec![NzbSegment {
                     number: 2,
                     bytes: 10,
-                    message_id: "two@example.com".to_string(),
+                    message_ids: vec!["two@example.com".to_string()],
                 }],
             },
         ],
@@ -166,7 +166,7 @@ fn nzb_to_spec_sanitizes_and_classifies_archive_roles() {
                 segments: vec![NzbSegment {
                     number: 1,
                     bytes: 10,
-                    message_id: "one@example.com".to_string(),
+                    message_ids: vec!["one@example.com".to_string()],
                 }],
             },
             NzbFile {
@@ -177,7 +177,7 @@ fn nzb_to_spec_sanitizes_and_classifies_archive_roles() {
                 segments: vec![NzbSegment {
                     number: 2,
                     bytes: 10,
-                    message_id: "two@example.com".to_string(),
+                    message_ids: vec!["two@example.com".to_string()],
                 }],
             },
         ],
@@ -211,17 +211,17 @@ fn nzb_to_spec_uses_dense_ordinals_for_sparse_segments() {
                 NzbSegment {
                     number: 1,
                     bytes: 10,
-                    message_id: "one@example.com".to_string(),
+                    message_ids: vec!["one@example.com".to_string()],
                 },
                 NzbSegment {
                     number: 4,
                     bytes: 20,
-                    message_id: "four@example.com".to_string(),
+                    message_ids: vec!["four@example.com".to_string()],
                 },
                 NzbSegment {
                     number: 6,
                     bytes: 30,
-                    message_id: "six@example.com".to_string(),
+                    message_ids: vec!["six@example.com".to_string()],
                 },
             ],
         }],
@@ -247,7 +247,7 @@ fn nzb_to_spec_uses_dense_ordinals_for_sparse_segments() {
     assert_eq!(
         segments
             .iter()
-            .map(|segment| segment.message_id.as_str())
+            .map(|segment| segment.message_ids.in_use())
             .collect::<Vec<_>>(),
         vec!["one@example.com", "four@example.com", "six@example.com"]
     );

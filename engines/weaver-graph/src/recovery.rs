@@ -69,6 +69,11 @@ pub trait MemberAccess {
     // so the member's coverage says what the object found.
     fn found_damaged(&mut self, _member: MemberId, _range: ByteRange) {}
     fn length(&self, member: MemberId) -> Option<u64>;
+    // The runs of `range` of the member that arrived, in offset order, each
+    // of which reads; the bytes between them never came.
+    fn arrived(&self, _member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+        out.push(range);
+    }
     // An empty directory of the namespace's own, for a recovery object
     // whose format repairs files on disk rather than ranges: it stages its
     // volumes and the members it covers there for this one repair. The
@@ -133,7 +138,7 @@ pub trait Recovery {
 
     // Recovery blocks this object wants ahead of the normal order, given the
     // damage it knows about.
-    fn wants(&mut self, out: &mut Vec<Seek>);
+    fn wants(&self, out: &mut Vec<Seek>);
 
     // Repair what is damaged among the members this object covers.
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome;
@@ -146,11 +151,15 @@ pub trait Recovery {
     // `None`.
     fn outcome(&self) -> Option<RepairOutcome>;
 
+    // The bytes of a covered member, `length` long, that a clean or repaired
+    // ruling proves: what the object's checks reach. Most objects check the
+    // whole member; one whose parity covers only part of it proves that
+    // part, and damage outside it stays as it was.
+    fn proves(&self, _member: MemberId, length: u64) -> ByteRange {
+        ByteRange::new(0, length)
+    }
+
     // Each set the object holds, in the order it repairs them. An object
     // with no sets of its own to name says nothing.
     fn sets(&self, _out: &mut Vec<SetRuling>) {}
-
-    // Recovery blocks reachable right now, for health and for the
-    // impossible verdict. A lost recovery article lowers it.
-    fn blocks_reachable(&self) -> u64;
 }

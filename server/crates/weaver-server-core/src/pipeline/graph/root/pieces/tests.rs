@@ -589,7 +589,7 @@ fn only_a_share_in_hand_is_given_back() {
 fn a_torrent_checkpoint_is_read_only_by_a_torrent_job() {
     let layout = layout();
     let dir = tempfile::tempdir().unwrap();
-    let mut job = torrent_job(&layout, dir.path());
+    let job = torrent_job(&layout, dir.path());
     let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
     assert!(matches!(
         GraphJob::restore(&snapshot, &[], 1, storage(dir.path()), 1),

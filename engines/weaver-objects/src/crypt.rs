@@ -219,6 +219,16 @@ impl Padding {
         }
         self.provenance = Some(provenance);
     }
+
+    // The plaintext past a payload `unpacked_size` long at stream `range` is
+    // not in hand any more: it comes out again when its cipher comes again.
+    pub fn forget(&mut self, unpacked_size: u64, range: ByteRange) {
+        let from = range.start.max(unpacked_size) - unpacked_size;
+        let to = range.end.saturating_sub(unpacked_size).min(BLOCK - 1);
+        for index in from..to {
+            self.tail_filled &= !(1u16 << index);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -371,7 +381,8 @@ impl Cbc {
         out: &mut Vec<Plain>,
     ) {
         let mut seen = self.chain.seen(placed, padding);
-        self.chain.deliver(self.key, &mut seen, arrival, plain, out);
+        self.chain
+            .deliver(&self.key, &mut seen, arrival, plain, out);
         *padding = seen.padding;
     }
 
@@ -390,7 +401,7 @@ impl Cbc {
         range.is_empty()
             || self
                 .chain
-                .seal(self.key, &seen, range, plain, into)
+                .seal(&self.key, &seen, range, plain, into)
                 .is_some()
     }
 }
@@ -415,7 +426,7 @@ impl Chain {
 
     fn deliver(
         &mut self,
-        key: MemberCipherKey,
+        key: &MemberCipherKey,
         seen: &mut Seen<'_>,
         (offset, bytes, provenance): (u64, &[u8], Provenance),
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
@@ -479,7 +490,7 @@ impl Chain {
     // chain they were enciphered on is still the posted one.
     fn file_ciphers(
         &mut self,
-        key: MemberCipherKey,
+        key: &MemberCipherKey,
         seen: &Seen<'_>,
         around: ByteRange,
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
@@ -549,7 +560,7 @@ impl Chain {
     // cipher is gone.
     fn decrypt_range(
         &mut self,
-        key: MemberCipherKey,
+        key: &MemberCipherKey,
         seen: &mut Seen<'_>,
         run: ByteRange,
         out: &mut Vec<Plain>,
@@ -661,7 +672,7 @@ impl Chain {
 
     fn seal(
         &self,
-        key: MemberCipherKey,
+        key: &MemberCipherKey,
         seen: &Seen<'_>,
         range: ByteRange,
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,

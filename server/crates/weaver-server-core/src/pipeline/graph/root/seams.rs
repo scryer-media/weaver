@@ -179,12 +179,14 @@ impl Pipeline {
         )
     }
 
-    // Every server failed an article of a graph job.
-    pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) {
+    // Every server failed an article of a graph job. True when the job is a
+    // graph job: its objects rule on the loss, so the caller's health
+    // arithmetic is not asked.
+    pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let limit = self.graph_slot_limit();
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
-            return;
+            return false;
         };
         let result = graph.lost(
             VolumeIndex(segment_id.file_id.file_index),
@@ -193,6 +195,7 @@ impl Pipeline {
             limit,
         );
         self.after_graph_result(job_id, result);
+        true
     }
 
     // What an engine's run said, or what a repair came back with. A run
@@ -227,17 +230,21 @@ impl Pipeline {
 
     // How many runs a graph job may hold now: the extraction concurrency the
     // tuner allows at this moment, the limit the repair slots follow too.
-    pub(crate) fn graph_slot_limit(&self) -> usize {
+    pub(in crate::pipeline) fn graph_slot_limit(&self) -> usize {
         limits::budgets(&self.direct_store.settings(), &self.tuner).1
     }
 
     fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {
-        if let Err(error) = result {
-            warn!(job_id = job_id.0, error = %error, "graph job step failed");
-        }
         // A step the job's extraction budget refused ends the job here, so
         // nothing more is fetched or decoded for it.
         if self.fail_graph_job_on_breach(job_id) {
+            return;
+        }
+        // A step that failed otherwise fails the job with its error: what
+        // it did not write, nothing after it can read.
+        if let Err(error) = result {
+            warn!(job_id = job_id.0, error = %error, "graph job step failed");
+            self.fail_job_on_extraction_error(job_id, error.to_extraction());
             return;
         }
         self.wake_repair_waiters();

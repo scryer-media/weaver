@@ -308,13 +308,22 @@ impl Object for Par3 {
     // volume still closes once the rest is in.
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         Recovery::wants(self, out);
     }
 
     // Every answer means wait: a lost article of the volume reaches
     // `volume_lost` at its exact range, and the rest of it still comes.
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
+
+    // What arrived there is to come again, and the blocks it carried; a
+    // volume closed over them is open until they do.
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
+        if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
+            found.arrived.erase(range);
+            found.closed = false;
+        }
+    }
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
@@ -331,13 +340,18 @@ impl Object for Par3 {
 
     // Every PAR3 file is a volume of the one object, numbered as it comes,
     // up to the carrier limit.
-    fn claim(&mut self, _name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
+    fn claim(
+        &mut self,
+        _name: &str,
+        first_bytes: &[u8],
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
             && self.volumes.len() < MAX_CARRIERS)
-            .then(|| VolumeIndex(self.volumes.len() as u32))
+            .then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, _name: &str, _front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {
         self.volume(volume);
     }
 
@@ -403,7 +417,8 @@ impl Recovery for Par3 {
         self.identified
             .retain(|member, _| unnamed.contains_key(member));
         for (path, member) in self.by_content() {
-            if namespace.rename(member, &path).is_some() {
+            let length = self.unnamed[&member].length;
+            if namespace.recognise(member, &path, length).is_some() {
                 renamed.push(member);
             }
             bound.insert(path, member);
@@ -447,7 +462,7 @@ impl Recovery for Par3 {
     // Nothing is known before a readback.
     fn verdicts(&self, _member: MemberId, _out: &mut Vec<SliceVerdict>) {}
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         if self.needed == 0 {
             return;
         }
@@ -561,13 +576,5 @@ impl Recovery for Par3 {
             outcome: ruled.outcome.filter(|_| current),
             ..ruled.clone()
         }));
-    }
-
-    // What the kept fronts carry, past any hole in them.
-    fn blocks_reachable(&self) -> u64 {
-        self.front_sets()
-            .iter()
-            .map(|set| rebuild::usable_recovery(set).len() as u64)
-            .sum()
     }
 }

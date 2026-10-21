@@ -1482,14 +1482,14 @@ impl DirectSetRouter {
             let crypt = encrypted
                 .and_then(|facts| {
                     let (member_keys, keying) = keys.get(&name)?;
-                    let mut crypt = MemberCrypt::new(*member_keys, keying);
+                    let mut crypt = MemberCrypt::new(member_keys.clone(), keying);
                     crypt.observe(&facts);
                     Some(crypt)
                 })
                 .or_else(|| {
-                    sevenz_keys
-                        .get(&name)
-                        .map(|(keys, facts)| MemberCrypt::new_sevenz(*keys, facts, unpacked_size))
+                    sevenz_keys.get(&name).map(|(keys, facts)| {
+                        MemberCrypt::new_sevenz(keys.clone(), facts, unpacked_size)
+                    })
                 });
             let member_id = self.next_member_id;
             self.next_member_id = self.next_member_id.saturating_add(1);

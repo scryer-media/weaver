@@ -36,11 +36,10 @@ impl SetName for VolumeName {
     }
 
     fn slot(&self, bound: &BTreeMap<u32, Self>) -> Option<u32> {
-        let index = match bound.get(&0) {
-            Some(first) => self.index_from(first)?,
-            None => self.index(),
-        };
-        (!bound.contains_key(&index)).then_some(index)
+        match bound.get(&0) {
+            Some(first) => self.index_from(first),
+            None => Some(self.index()),
+        }
     }
 }
 

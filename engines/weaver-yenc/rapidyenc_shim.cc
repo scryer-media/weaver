@@ -53,7 +53,8 @@ extern "C" int weaver_rapidyenc_decode_end_state(
     return (int)end;
 }
 
-// CRC32 counterpart, for the crc_probe attribution harness. `crc32_init()` is a
+// CRC32 counterpart, for the rapidyenc lanes of the article_profile example
+// and the rapidyenc_parity bench. `crc32_init()` is a
 // separate initializer from `decoder_init()` (it builds the slice table and then
 // installs the PCLMUL/VPCLMUL/ARM function pointers), so it must be called
 // before weaver_rapidyenc_crc32.
@@ -62,13 +63,13 @@ extern "C" void weaver_rapidyenc_crc32_init(void) {
 }
 
 // `init` is the previous CRC in the finalized (post-xor) domain, matching
-// weaver's Crc32 and crc_fast; pass 0 for a fresh checksum.
+// weaver's Crc32 and crc_turbo; pass 0 for a fresh checksum.
 extern "C" uint32_t weaver_rapidyenc_crc32(const void* data, unsigned long long len, uint32_t init) {
     return RapidYenc::crc32(data, (size_t)len, init);
 }
 
 // Which CRC kernel rapidyenc's own dispatch installed (YEncDecIsaLevel, see
-// rapidyenc src/common.h). Reported by the probe as rapidyenc-side attribution.
+// rapidyenc src/common.h), for rapidyenc-side attribution.
 extern "C" int weaver_rapidyenc_crc32_isa(void) {
     return RapidYenc::crc32_isa_level();
 }

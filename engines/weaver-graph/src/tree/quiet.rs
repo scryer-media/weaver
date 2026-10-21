@@ -10,7 +10,7 @@
 
 use super::{Builder, Effect, NodeId, Tree};
 use crate::member::MemberId;
-use crate::object::Standing;
+use crate::object::{Beside, Standing};
 use crate::recovery::RepairOutcome;
 use crate::volume::{ByteRange, VolumeIndex};
 
@@ -70,13 +70,10 @@ impl Tree {
 
     // The ranges of the node's volumes held as damage, an article that never
     // came or a range an object said was damaged, in its own volume's
-    // coordinates, unless a recovery object above vouched for what it came
-    // out of.
+    // coordinates, less what a recovery object proved, unless what the
+    // namespace came out of was vouched for above.
     fn lost(&self, node: NodeId) -> Vec<(VolumeIndex, ByteRange)> {
         let Some((parent, volumes)) = self.volumes(node) else {
-            return Vec::new();
-        };
-        let Some(namespace) = self.namespace(parent) else {
             return Vec::new();
         };
         if self.vouched_above(node) {
@@ -84,21 +81,33 @@ impl Tree {
         }
         volumes
             .iter()
-            .filter_map(|(volume, member)| Some((*volume, namespace.get(*member)?)))
             .flat_map(|(volume, member)| {
-                member
-                    .coverage
-                    .damaged_ranges()
-                    .map(move |range| (volume, range))
+                self.unproven(parent, *member)
+                    .into_iter()
+                    .map(move |range| (*volume, range))
             })
             .collect()
     }
 
-    // Some member the namespace came out of, at any depth, is vouched for.
+    // Every member the namespace came out of, at some depth, holds no
+    // damage a recovery object did not prove, and one of them was found
+    // whole or made so.
     fn vouched_above(&self, node: NodeId) -> bool {
         let mut at = node;
         while let Some((parent, volumes)) = self.volumes(at) {
-            if volumes.values().any(|member| self.vouched(parent, *member)) {
+            let proven = |member: &MemberId| {
+                self.ruled(parent, *member, |outcome| {
+                    matches!(
+                        outcome,
+                        RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+                    )
+                })
+            };
+            if volumes.values().any(proven)
+                && volumes
+                    .values()
+                    .all(|member| self.unproven(parent, *member).is_empty())
+            {
                 return true;
             }
             at = parent;
@@ -106,16 +115,54 @@ impl Tree {
         false
     }
 
-    // A recovery object of the namespace covers the member and found it
-    // whole or made it so.
-    fn vouched(&self, node: NodeId, member: MemberId) -> bool {
+    // The member's damaged ranges past what every recovery object that
+    // found it whole or made it so proves of it: a set vouches only for
+    // the bytes its checks reach.
+    fn unproven(&self, node: NodeId, member: MemberId) -> Vec<ByteRange> {
+        let Some(record) = self
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+        else {
+            return Vec::new();
+        };
+        let proving: Vec<_> = self
+            .recovery_nodes(node)
+            .into_iter()
+            .filter_map(|recovery_node| self.recovery(recovery_node))
+            .filter(|recovery| {
+                recovery.covers(member)
+                    && recovery.outcome().is_some_and(|outcome| {
+                        matches!(
+                            outcome,
+                            RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+                        )
+                    })
+            })
+            .collect();
+        let mut left: Vec<ByteRange> = record.coverage.damaged_ranges().collect();
+        for recovery in proving {
+            left = left
+                .into_iter()
+                .flat_map(|range| {
+                    let length = record.length.unwrap_or(range.end);
+                    without(range, recovery.proves(member, length))
+                })
+                .collect();
+        }
+        left
+    }
+
+    // A recovery object of the namespace covers the member and ruled on it
+    // as `ruling` asks.
+    fn ruled(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        ruling: impl Fn(RepairOutcome) -> bool,
+    ) -> bool {
         self.recovery_nodes(node).into_iter().any(|recovery_node| {
             self.recovery(recovery_node).is_some_and(|recovery| {
-                recovery.covers(member)
-                    && matches!(
-                        recovery.outcome(),
-                        Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
-                    )
+                recovery.covers(member) && recovery.outcome().is_some_and(&ruling)
             })
         })
     }
@@ -129,7 +176,10 @@ struct Stood<'a> {
 
 impl Standing for Stood<'_> {
     // A repair above rebuilt the bytes below, though the damage an object
-    // marked on what it read before is still recorded.
+    // marked on what it read before is still recorded. A member's damage a
+    // recovery object covering it ruled on is that object's to judge: a
+    // repair that failed leaves the member short, not the object that
+    // wrote it.
     fn damaged(&self) -> bool {
         let (tree, node) = (self.tree, self.node);
         let Some(namespace) = tree.namespace(node) else {
@@ -139,9 +189,9 @@ impl Standing for Stood<'_> {
             && namespace.members().any(|member| {
                 tree.child_of(node, member.id).is_none()
                     && member.coverage.damaged_ranges().next().is_some()
-                    && !tree.retired.contains_key(&(node, member.id))
+                    && !tree.nodes.retired().contains_key(&(node, member.id))
                     && !tree.given_back(node, member.id)
-                    && !tree.vouched(node, member.id)
+                    && !tree.ruled(node, member.id, |outcome| outcome != RepairOutcome::Waiting)
             })
     }
 
@@ -166,4 +216,38 @@ impl Standing for Stood<'_> {
     fn lost(&self) -> bool {
         !self.tree.lost(self.node).is_empty()
     }
+
+    fn beside(&self) -> Vec<Beside<'_>> {
+        let tree = self.tree;
+        let Some((parent, _)) = tree.volumes(self.node) else {
+            return Vec::new();
+        };
+        let Some(namespace) = tree.namespace(parent) else {
+            return Vec::new();
+        };
+        namespace
+            .members()
+            .filter(|member| tree.unowned(parent, member.id))
+            .map(|member| Beside {
+                name: &member.name,
+                front: namespace.first_bytes(member.id),
+                length: member.length,
+                carried: tree.given.get(&(parent, member.id)),
+            })
+            .collect()
+    }
+}
+
+// What of `range` lies outside `proven`.
+fn without(range: ByteRange, proven: ByteRange) -> Vec<ByteRange> {
+    if range.intersect(proven).is_none() {
+        return vec![range];
+    }
+    [
+        ByteRange::new(range.start, proven.start.max(range.start)),
+        ByteRange::new(proven.end.min(range.end), range.end),
+    ]
+    .into_iter()
+    .filter(|piece| !piece.is_empty())
+    .collect()
 }

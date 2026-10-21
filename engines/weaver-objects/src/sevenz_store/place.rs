@@ -186,6 +186,47 @@ impl SevenZipStore {
         }
     }
 
+    // The bytes posted at `range` of the volume come again: each member
+    // they reached forgets what was said of them and is open until it is
+    // said again, and a cipher that was ever open forgets the padding they
+    // came out to. A locked folder's bytes were held, and nothing came out
+    // of them.
+    pub(super) fn unsay(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let (Some(container), Some(map)) = (self.container(volume, range), &self.map) else {
+            return;
+        };
+        let mut pieces = Vec::new();
+        for (index, folder) in map.folders_in(container) {
+            let Some(part) = container.intersect(folder.pack) else {
+                continue;
+            };
+            let local = part.shift(-(folder.pack.start as i64));
+            let lock = &mut self.folders[index];
+            let said = match lock {
+                Lock::Locked => continue,
+                Lock::Plain => local,
+                Lock::Open(..) | Lock::Sealed(..) => ByteRange::new(
+                    local.start.min(folder.plain_len),
+                    local.end.min(folder.plain_len),
+                ),
+            };
+            classify_plain(map, index, said, folder.pack.start, &mut pieces);
+            if let Some(padding) = lock.padding_mut() {
+                padding.forget(folder.plain_len, local);
+            }
+        }
+        let members = Arc::make_mut(&mut self.members);
+        for piece in pieces {
+            if let Piece::Member(member, range) = piece
+                && !range.is_empty()
+                && let Some(said) = members.get_mut(member.0 as usize)
+            {
+                said.coverage.erase(range);
+                said.closed = false;
+            }
+        }
+    }
+
     pub(super) fn member_extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
         if let Some(map) = &self.map {
             self.extent_in(map, member, range, out);

@@ -269,12 +269,26 @@ func TestComposeArgsAppendOverlay(t *testing.T) {
 func TestBuildxBuildBecomesPodmanBuild(t *testing.T) {
 	args := []string{"buildx", "build", "--load", "--provenance=false", "--label", "a=b", "-f", "-", "-t", "img:local", "/ctx"}
 	podman := &Engine{Kind: Podman, Binary: "podman"}
-	if got, want := podman.Args(args...), []string{"build", "--label", "a=b", "-f", "-", "-t", "img:local", "/ctx"}; !reflect.DeepEqual(got, want) {
+	if got, want := podman.Args(args...), []string{"build", "--platform", HostPlatform(), "--label", "a=b", "-f", "-", "-t", "img:local", "/ctx"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("podman build args = %v", got)
 	}
 	docker := &Engine{Kind: Docker, Binary: "docker"}
-	if got := docker.Args(args...); !reflect.DeepEqual(got, args) {
-		t.Fatalf("docker build args changed: %v", got)
+	want := append([]string{"buildx", "build", "--platform", HostPlatform()}, args[2:]...)
+	if got := docker.Args(args...); !reflect.DeepEqual(got, want) {
+		t.Fatalf("docker build args = %v", got)
+	}
+}
+
+// A cached base for another architecture must never satisfy a build, so every
+// build names the host platform, and one that names its own keeps it.
+func TestBuildsNameTheHostPlatform(t *testing.T) {
+	podman := &Engine{Kind: Podman, Binary: "podman"}
+	if got, want := podman.Args("build", "-t", "img:local", "/ctx"), []string{"build", "--platform", HostPlatform(), "-t", "img:local", "/ctx"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("podman build args = %v", got)
+	}
+	pinned := []string{"build", "--platform=linux/amd64", "-t", "img:local", "/ctx"}
+	if got := podman.Args(pinned...); !reflect.DeepEqual(got, pinned) {
+		t.Fatalf("pinned build args changed: %v", got)
 	}
 }
 

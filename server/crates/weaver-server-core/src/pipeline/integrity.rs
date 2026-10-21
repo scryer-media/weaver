@@ -85,36 +85,9 @@ pub(crate) enum BlockVerdict {
 //
 // PAR2 computes the IFSC checksum of a short final slice over the slice
 // zero-padded up to the full block size, so a derived CRC over the file's real
-// bytes has to be padded the same way before the two can be compared. Doing it
-// by combining rather than by hashing keeps the cost logarithmic in the
-// padding length instead of linear.
+// bytes has to be padded the same way before the two can be compared.
 pub(crate) fn crc32_of_zeros(len: u64) -> u32 {
-    if len == 0 {
-        return par2_rs::checksum::crc32(&[]);
-    }
-    // CRC32 of a single zero byte, then square the run length while consuming
-    // the bits of `len`.
-    let mut unit_len = 1u64;
-    let mut unit_crc = par2_rs::checksum::crc32(&[0u8]);
-    let mut acc: Option<(u32, u64)> = None;
-    let mut remaining = len;
-    while remaining > 0 {
-        if remaining & 1 == 1 {
-            acc = Some(match acc {
-                Some((crc, acc_len)) => (
-                    weaver_yenc::crc32_combine(crc, unit_crc, unit_len),
-                    acc_len + unit_len,
-                ),
-                None => (unit_crc, unit_len),
-            });
-        }
-        remaining >>= 1;
-        if remaining > 0 {
-            unit_crc = weaver_yenc::crc32_combine(unit_crc, unit_crc, unit_len);
-            unit_len *= 2;
-        }
-    }
-    acc.expect("len > 0 sets at least one bit").0
+    crc_turbo::checksum_zeros(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, len) as u32
 }
 
 // Fold segments that tile a contiguous range into that range's CRC32.

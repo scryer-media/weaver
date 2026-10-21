@@ -30,6 +30,7 @@ pub mod deliver;
 pub mod engine;
 pub mod facts;
 pub mod holds;
+pub mod marks;
 pub mod member;
 pub mod names;
 pub mod object;
@@ -42,22 +43,23 @@ pub mod tree;
 pub mod volume;
 mod wire;
 
-pub use deliver::{Delivery, Emit, Provenance, RecoveryKind, Why};
+pub use deliver::{Delivery, Emit, Posted, Provenance, RecoveryKind, Why};
 pub use engine::{Engine, Extraction, Sink, Volumes};
 pub use facts::{
-    Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, decode_parts,
-    encode_parts,
+    Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
+    decode_parts, encode_parts, encode_since,
 };
+pub use marks::{Marked, Marks};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{
-    Carried, Extent, Kind, Object, ObjectId, Placement, Placements, Posting, Standing,
+    Beside, Carried, Extent, Kind, Object, ObjectId, Placement, Placements, Posting, Standing,
 };
 pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
 };
 pub use recovery::{Recovery, Segment, SliceVerdict};
 pub use seek::{Pull, Purpose, Seek, SeekUp, Weight};
-pub use sniff::{Sniff, VERDICT_BYTES, sniff};
+pub use sniff::{Sniff, VERDICT_BYTES, signed, sniff};
 pub use tree::{Builder, Effect, NodeId, Tree};
 pub use volume::{ByteRange, VolumeIndex};

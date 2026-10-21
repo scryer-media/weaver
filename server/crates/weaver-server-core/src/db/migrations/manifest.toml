@@ -1060,3 +1060,20 @@ kind = "sql"
 file = "migrations/0083_torrent_file_priority/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 84
+description = "a graph checkpoint keeps which member each further posting of one was folded into, and no longer records members carrying recovery data nothing reads"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0084_graph_member_copy_of/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0084_graph_member_copy_of/postgres.sql"
+engine = "postgres"
+scope = "all"

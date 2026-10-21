@@ -26,6 +26,9 @@ struct Store {
 }
 
 impl Object for Store {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::RarStore
     }
@@ -63,7 +66,7 @@ impl Object for Store {
 
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
@@ -116,6 +119,9 @@ struct Late {
 }
 
 impl Object for Late {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::SevenZipStore
     }
@@ -148,7 +154,7 @@ impl Object for Late {
 
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
@@ -289,6 +295,9 @@ struct Par {
 }
 
 impl Object for Par {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::Par2
     }
@@ -302,7 +311,7 @@ impl Object for Par {
     }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
@@ -359,7 +368,7 @@ impl Recovery for Par {
     }
 
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
         let mut volume = Vec::new();
@@ -380,10 +389,6 @@ impl Recovery for Par {
 
     fn outcome(&self) -> Option<RepairOutcome> {
         None
-    }
-
-    fn blocks_reachable(&self) -> u64 {
-        0
     }
 }
 
@@ -660,6 +665,69 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
     assert_eq!(job.file("video.mkv"), b"abcmidend");
 }
 
+// The tree's coverage and the leaf on disk agree: a run the coverage records
+// that the file no longer gives back ends the replay with the file's error.
+#[test]
+fn replaying_a_leaf_whose_file_is_gone_ends_in_the_leaf_error() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("video.mkv", Some(5));
+    job.send(member, 0, b"bytes", Provenance::Fresh);
+    assert!(!job.is_open(NodeId::ROOT, member));
+    std::fs::remove_file(job.dir.path().join("video.mkv")).expect("remove the leaf");
+
+    let mut build = job.build();
+    let replayed = job.writer.replay_file(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        NodeId::ROOT,
+        member,
+        &mut job.out,
+    );
+    assert!(
+        matches!(&replayed, Err(WriteError::Leaf(LeafError::Io { source, .. })) if source.kind() == std::io::ErrorKind::NotFound),
+        "{replayed:?}"
+    );
+}
+
+// A range held as damage may never have arrived: a lost tail past what the
+// file holds is no read, and the replay hands down what the file has.
+#[test]
+fn replaying_a_leaf_whose_lost_tail_was_never_written_replays_what_it_holds() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("video.mkv", None);
+    job.send(member, 0, b"bytes", Provenance::Fresh);
+    let mut effects = Vec::new();
+    job.tree.damage(
+        NodeId::ROOT,
+        VolumeIndex(member.0),
+        ByteRange::new(5, 15),
+        &mut effects,
+    );
+    let mut build = job.build();
+    job.writer
+        .apply_all(&mut job.tree, &mut build, &Source, effects, &mut job.out)
+        .expect("apply the loss");
+    assert_eq!(
+        std::fs::metadata(job.dir.path().join("video.mkv"))
+            .unwrap()
+            .len(),
+        5,
+        "a member of unknown length is only as long as what arrived"
+    );
+
+    let replayed = job.writer.replay_file(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        NodeId::ROOT,
+        member,
+        &mut job.out,
+    );
+    assert!(replayed.is_ok(), "{replayed:?}");
+    assert_eq!(job.file("video.mkv"), b"bytes");
+}
+
 #[test]
 fn a_member_of_unknown_length_is_sized_when_it_closes() {
     let mut job = Job::new(PLENTY);
@@ -674,10 +742,12 @@ fn a_member_of_unknown_length_is_sized_when_it_closes() {
 #[test]
 fn directory_members_and_empty_members_exist_once_announced() {
     let mut job = Job::new(PLENTY);
-    job.member("extras/", Some(0));
+    let extras = job.member("extras/", Some(0));
     job.member("empty.txt", Some(0));
     let nested = job.member("extras/inner.txt", Some(2));
     job.send(nested, 0, b"hi", Provenance::Fresh);
+    assert!(job.dir.path().join("extras").is_dir());
+    job.close(extras);
     assert!(job.dir.path().join("extras").is_dir());
     assert_eq!(job.file("empty.txt"), b"");
     assert_eq!(job.file("extras/inner.txt"), b"hi");
@@ -733,9 +803,16 @@ fn a_rename_moves_the_file_and_the_name_allocation() {
     let mut job = Job::new(PLENTY);
     let member = job.member("3f9a.bin", Some(4));
     job.send(member, 0, b"data", Provenance::Fresh);
+    let mut build = job.build();
     let renamed = job
         .writer
-        .rename(&mut job.tree, NodeId::ROOT, member, "show.part01.rar")
+        .rename(
+            &mut job.tree,
+            &mut build,
+            NodeId::ROOT,
+            member,
+            "show.part01.rar",
+        )
         .expect("rename");
     assert_eq!(renamed, "show.part01.rar");
     assert_eq!(job.file("show.part01.rar"), b"data");
@@ -949,9 +1026,10 @@ fn a_shallower_member_that_claims_a_written_name_moves_the_deeper_file_aside() {
     assert_eq!(job.file("inner.bin"), b"hello");
     let member = job.member("3f9a.bin", Some(4));
     job.send(member, 0, b"data", Provenance::Fresh);
+    let mut build = job.build();
     let renamed = job
         .writer
-        .rename(&mut job.tree, NodeId::ROOT, member, "INNER.bin")
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, member, "INNER.bin")
         .expect("rename");
     assert_eq!(renamed, "INNER.bin");
     let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();

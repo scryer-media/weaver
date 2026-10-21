@@ -28,6 +28,9 @@ impl Decoded {
 }
 
 impl Object for Decoded {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::Xz
     }
@@ -46,7 +49,7 @@ impl Object for Decoded {
     }
 
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {

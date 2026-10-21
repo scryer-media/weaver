@@ -38,11 +38,31 @@ use super::root::phase::{self, RootPhase};
 use super::root::{ArticleRoot, Ask, Root};
 use super::status::RepairSlots;
 use crate::operations::disk::CapacityReader;
+use crate::pipeline::ExtractionError;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraphError {
     #[error("the namespace write path failed")]
     Write(#[from] WriteError),
+}
+
+impl GraphError {
+    // What the failure is to the job: a file's I/O error classed as the
+    // extractors class theirs, a refusal as the refusal, anything else
+    // terminal.
+    pub(crate) fn to_extraction(&self) -> ExtractionError {
+        let Self::Write(write) = self;
+        let message = format!("{self}: {write}");
+        match write {
+            WriteError::Leaf(LeafError::Io { source, .. }) => {
+                ExtractionError::from_io(message, source)
+            }
+            WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
+            WriteError::Leaf(_) | WriteError::UnknownMember { .. } => {
+                ExtractionError::terminal(message)
+            }
+        }
+    }
 }
 
 // Where a graph job writes and what it may hold: its working directory, the
@@ -253,8 +273,15 @@ impl<R: Root> GraphJob<R> {
 
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
-    pub(crate) fn awaits_mail(&self) -> bool {
+    pub(in crate::pipeline) fn awaits_mail(&self) -> bool {
         self.runs.live() || self.loans.out()
+    }
+
+    // The pipeline is going down. Every run stops where it stands and is
+    // forgotten: what it read is on its shelf, and the restored job reads it
+    // again. A repair out on its thread still comes back through the mail.
+    pub(in crate::pipeline) fn stop_runs(&mut self, limit: usize) {
+        self.runs.stop(limit);
     }
 
     // Whether a repair of the job is out on a thread.
@@ -353,12 +380,6 @@ impl<R: Root> GraphJob<R> {
     // Articles the queues do not hold were fetched by an earlier run.
     pub(crate) fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool) {
         self.root.arrived_before(queued);
-    }
-
-    // A recovery object may still form: an object is known by its opening
-    // bytes, and some member's have yet to arrive.
-    pub(crate) fn recovery_may_form(&self) -> bool {
-        self.root.any_head_waiting()
     }
 
     // The class the root fetches `ordinal` of `volume` under now.
@@ -473,10 +494,10 @@ impl<R: Root> GraphJob<R> {
             .namespace_mut(NodeId::ROOT)
             .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
         {
-            if let Some(range) = range {
-                found.coverage.erase(range);
-            }
             found.closed = false;
+        }
+        if let Some(range) = range {
+            self.tree.uncover(NodeId::ROOT, volume, range);
         }
     }
 
@@ -486,9 +507,10 @@ impl<R: Root> GraphJob<R> {
     // will ask for, such as one whose opening article was lost before
     // anything could name it, holds nothing back. Recovery volumes are left
     // out: what a repair asks of them is the repair's. Root members are
-    // numbered as the volumes they are.
+    // numbered as the volumes they are; a further posting of a member is
+    // a volume of its own whose articles are the member's.
     fn payload_waiting(&self) -> bool {
-        self.namespace().members().any(|member| {
+        self.namespace().records().any(|member| {
             !self
                 .writer
                 .carries_recovery(&self.tree, NodeId::ROOT, member.id)
@@ -574,16 +596,19 @@ impl<R: Root> GraphJob<R> {
 
     // What the writer passed on that is the job's to answer: an object that
     // asks for a password is offered one, and what it says back is applied
-    // and answered the same way.
+    // and answered the same way. An offer goes through the writer even when
+    // the object says nothing back: what it can place under the password
+    // changed, and the writer is where held bytes go down.
     fn heard(&mut self, mut out: Vec<Effect>) -> Result<(), GraphError> {
         loop {
             let mut effects = Vec::new();
+            let mut offered = false;
             for effect in out.drain(..) {
                 if let Effect::NeedsPassword { node } = effect {
-                    self.offer_password(node, &mut effects);
+                    offered |= self.offer_password(node, &mut effects);
                 }
             }
-            if effects.is_empty() {
+            if !offered {
                 return Ok(());
             }
             self.writer.apply_all(

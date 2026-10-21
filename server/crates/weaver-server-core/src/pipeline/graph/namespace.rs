@@ -23,14 +23,16 @@
 // disk. It takes a node everywhere and never assumes the root.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use weaver_graph::Posted;
 use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed};
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
-    Builder, ByteRange, Effect, Emit, Kind, MemberId, NodeId, Object, ObjectId, Placement,
+    Builder, ByteRange, Effect, Emit, Kind, Marked, MemberId, NodeId, Object, ObjectId, Placement,
     Provenance, Segment, Tree, VolumeIndex, Why,
 };
 
@@ -106,6 +108,15 @@ impl Files {
     }
 }
 
+// A run of a volume an object placed as its own: the volume range, and
+// where in which envelope its bytes were kept.
+#[derive(Clone, Copy)]
+struct KeptRun {
+    range: ByteRange,
+    envelope: u32,
+    at: u64,
+}
+
 pub(crate) struct NamespaceWriter {
     // The job's process-wide id, which with a node id names a namespace to
     // the holds accountant that every job shares.
@@ -114,12 +125,14 @@ pub(crate) struct NamespaceWriter {
     accountant: Arc<HoldsAccountant>,
     free_disk: CapacityReader,
     caps: Caps,
-    files: BTreeMap<NodeId, Files>,
+    // Each namespace's files, marked as each changes: a checkpoint reads
+    // again only the namespaces marked since it read last.
+    files: Marked<NodeId, Files>,
     envelopes: Envelopes,
+    // Where each object's own bytes were kept, by object and volume.
+    kept: BTreeMap<(NodeId, VolumeIndex), Vec<KeptRun>>,
     // Member reads the recovery objects made while repairing.
     read_backs: u64,
-    // Members carrying recovery data no object here reads, by namespace.
-    unusable: Vec<(NodeId, MemberId)>,
     renamed: Vec<MemberId>,
     segments: Vec<Segment>,
     placements: Vec<Placement>,
@@ -135,13 +148,13 @@ impl NamespaceWriter {
         Self {
             scope,
             envelopes: Envelopes::new(working_dir.clone()),
+            kept: BTreeMap::new(),
             working_dir,
             accountant,
             free_disk,
             caps: Caps::unbounded(),
-            files: BTreeMap::new(),
+            files: Marked::default(),
             read_backs: 0,
-            unusable: Vec::new(),
             renamed: Vec::new(),
             segments: Vec::new(),
             placements: Vec::new(),
@@ -166,12 +179,6 @@ impl NamespaceWriter {
         self.read_backs
     }
 
-    // Members whose object said they carry recovery data that no object
-    // here can read: health says it is there, and no repair counts on it.
-    pub(crate) fn unusable_recovery(&self) -> &[(NodeId, MemberId)] {
-        &self.unusable
-    }
-
     // Every member of the namespace with a file of its own, and its path.
     pub(crate) fn files(&self, node: NodeId) -> impl Iterator<Item = (MemberId, &Path)> + '_ {
         self.files
@@ -190,7 +197,10 @@ impl NamespaceWriter {
     // holds scratch and envelopes alike. Each is opened again where it then
     // is by the next write.
     pub(crate) fn release(&mut self) {
-        for files in self.files.values_mut() {
+        for node in self.files.keys().copied().collect::<Vec<_>>() {
+            let Some(files) = self.files.get_mut(&node) else {
+                continue;
+            };
             for leaf in files.leaves.values_mut().chain(files.scratch.as_mut()) {
                 leaf.release();
             }
@@ -202,7 +212,10 @@ impl NamespaceWriter {
     // holds follows, so nothing of the job points under `from` any more.
     pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
         self.working_dir = to.to_path_buf();
-        for files in self.files.values_mut() {
+        for node in self.files.keys().copied().collect::<Vec<_>>() {
+            let Some(files) = self.files.get_mut(&node) else {
+                continue;
+            };
             for leaf in files.leaves.values_mut().chain(files.scratch.as_mut()) {
                 leaf.relocate(from, to);
             }
@@ -282,9 +295,9 @@ impl NamespaceWriter {
             .ok_or(WriteError::UnknownMember { node, member })?;
         let (output_name, length) = (record.output_name.clone(), record.length);
         self.caps.admit_name(&output_name)?;
-        self.caps.admit_entry(tree, node)?;
+        self.caps.admit_member(tree, node, member)?;
         if Leaf::is_directory(&output_name) {
-            tree.settle_leaf(node, member);
+            self.settle(tree, builder, segments, node, member, out)?;
             Leaf::at(&self.working_dir, &output_name)?.create_directory()?;
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
@@ -369,6 +382,8 @@ impl NamespaceWriter {
         // them in order, and bytes it gave the owner before the bind, for
         // this member or for one the new object's parent has not decided
         // yet, are never overtaken by what the object makes of the rest.
+        // A member folded into another posting of it is handed over the
+        // same way, as that member's bytes.
         let bound: Vec<(NodeId, MemberId, NodeId)> = effects
             .iter()
             .filter_map(|effect| match effect {
@@ -381,12 +396,45 @@ impl NamespaceWriter {
                 _ => None,
             })
             .collect();
+        let folded: Vec<(NodeId, MemberId)> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Folded { node, copy, .. } => Some((*node, *copy)),
+                _ => None,
+            })
+            .collect();
         for effect in effects {
             self.apply(tree, builder, segments, effect, out)?;
         }
         for (node, member, child) in bound {
             self.hand_over(tree, builder, segments, (node, member), child, out)?;
         }
+        for (node, copy) in folded {
+            self.fold_over(tree, builder, segments, (node, copy), out)?;
+        }
+        Ok(())
+    }
+
+    // What a posting received before it folded into the member it repeats:
+    // held, or in its own file when it was a leaf first. It goes down as
+    // the member's bytes, each run with the provenance it arrived with, and
+    // the posting's file goes: it is never a file of its own.
+    fn fold_over(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, copy): (NodeId, MemberId),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        self.replay(tree, builder, segments, node, copy, ALL, out)?;
+        self.replay_file(tree, builder, segments, node, copy, out)?;
+        let files = self.files_mut(node);
+        files.refused.remove(&copy);
+        if let Some(leaf) = files.leaves.remove(&copy) {
+            leaf.remove()?;
+        }
+        self.caps.forget(tree, node, copy);
         Ok(())
     }
 
@@ -458,13 +506,14 @@ impl NamespaceWriter {
     pub(crate) fn rename(
         &mut self,
         tree: &mut Tree,
+        builder: &mut dyn Builder,
         node: NodeId,
         member: MemberId,
         name: &str,
     ) -> Result<String, WriteError> {
         let mut effects = Vec::new();
         let output_name = tree
-            .rename(node, member, name, &mut effects)
+            .rename(node, member, name, &mut self.placing(builder), &mut effects)
             .ok_or(WriteError::UnknownMember { node, member })?;
         self.moved(&effects)?;
         Ok(output_name)
@@ -525,9 +574,11 @@ impl NamespaceWriter {
         tree.deliver(
             node,
             member,
-            arrival.offset,
-            arrival.bytes.clone(),
-            arrival.provenance,
+            Posted {
+                offset: arrival.offset,
+                bytes: arrival.bytes.clone(),
+                provenance: arrival.provenance,
+            },
             &mut self.placing(builder),
             &mut effects,
         );
@@ -566,10 +617,34 @@ impl NamespaceWriter {
         let mut placements = std::mem::take(&mut self.placements);
         placements.clear();
         tree.locate(child, volume, arrival.range(), &mut placements);
+        // An object that gave the volume back in this delivery places none
+        // of it. What no piece covers is held for the member, as any bytes
+        // whose place is not known, and goes to its own file with the rest.
+        let placed: u64 = placements.iter().map(Placement::len).sum();
+        if placed < arrival.range().len() {
+            placements.push(Placement::Held {
+                range: ByteRange::new(arrival.offset + placed, arrival.range().end),
+            });
+        }
+        let moved = self.unkept(tree, (child, volume), arrival.range());
+        self.keep_runs((child, volume), arrival.offset, &placements);
         let kept = self
             .envelopes
             .capture(child, &placements, &arrival.bytes, arrival.provenance);
+        // What arrives is the member's bytes now, whatever was held of them
+        // before: a repair rewrites what was held, and the held copy never
+        // goes down after it.
+        if let Some(files) = self.files.get_mut(&arrival.node) {
+            files
+                .holds
+                .take(held_volume(arrival.member), arrival.range());
+        }
         let mut breached = Vec::new();
+        for (offset, bytes) in moved {
+            if self.keep_held(arrival.node, arrival.member, offset, bytes.clone())? {
+                breached.push((offset, bytes));
+            }
+        }
         for placement in &placements {
             let Placement::Held { range } = placement else {
                 continue;
@@ -601,6 +676,97 @@ impl NamespaceWriter {
         Ok(())
     }
 
+    // The bytes of `volume` the object at `child` kept as its own that its
+    // map now places elsewhere, read back from where they were kept, past
+    // `arrival`, which is placed afresh. A header that came again, repaired,
+    // says whose the bytes behind it are: they are held for the member again,
+    // as any bytes whose place the namespace does not have, and go down where
+    // the map now puts them.
+    fn unkept(
+        &mut self,
+        tree: &Tree,
+        (child, volume): (NodeId, VolumeIndex),
+        arrival: ByteRange,
+    ) -> Vec<(u64, Bytes)> {
+        let Some(runs) = self.kept.get_mut(&(child, volume)) else {
+            return Vec::new();
+        };
+        let mut moved = Vec::new();
+        let mut stays = Vec::with_capacity(runs.len());
+        let mut placements = Vec::new();
+        for run in runs.drain(..) {
+            for range in outside(run.range, arrival) {
+                let at = run.at + (range.start - run.range.start);
+                placements.clear();
+                tree.locate(child, volume, range, &mut placements);
+                let mut offset = range.start;
+                for placement in &placements {
+                    let piece = ByteRange::at(offset, placement.len());
+                    let kept_at = at + (piece.start - range.start);
+                    offset = piece.end;
+                    let same = matches!(placement, Placement::Envelope { envelope, range }
+                        if *envelope == run.envelope && range.start == kept_at);
+                    if same {
+                        stays.push(KeptRun {
+                            range: piece,
+                            envelope: run.envelope,
+                            at: kept_at,
+                        });
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    let read = self.envelopes.read(
+                        child,
+                        run.envelope,
+                        ByteRange::at(kept_at, piece.len()),
+                        &mut bytes,
+                    );
+                    if read {
+                        moved.push((piece.start, Bytes::from(bytes)));
+                    }
+                }
+            }
+        }
+        *runs = stays;
+        moved
+    }
+
+    // The runs of a delivery at `offset` the object placed as its own.
+    fn keep_runs(
+        &mut self,
+        (child, volume): (NodeId, VolumeIndex),
+        offset: u64,
+        placements: &[Placement],
+    ) {
+        let runs = self.kept.entry((child, volume)).or_default();
+        let mut cursor = offset;
+        for placement in placements {
+            let range = ByteRange::at(cursor, placement.len());
+            cursor = range.end;
+            if let Placement::Envelope {
+                envelope,
+                range: kept,
+            } = placement
+            {
+                runs.push(KeptRun {
+                    range,
+                    envelope: *envelope,
+                    at: kept.start,
+                });
+            }
+        }
+        runs.sort_by_key(|run| run.range.start);
+        runs.dedup_by(|next, run| {
+            let joins = run.envelope == next.envelope
+                && run.range.end == next.range.start
+                && run.at + run.range.len() == next.at;
+            if joins {
+                run.range = ByteRange::new(run.range.start, next.range.end);
+            }
+            joins
+        });
+    }
+
     // The node's envelopes, shared with the run of an engine that reads
     // them as its volumes.
     pub(crate) fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
@@ -615,6 +781,16 @@ impl NamespaceWriter {
         effect: Effect,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        // Every delivery the tree takes for a member ends in a write or a
+        // reach, after the namespace kept what it keeps of the bytes: the
+        // member's front and the runs of what arrived. A rename changes the
+        // names its record keeps. Here what changed is charged.
+        if let Effect::WriteLeaf { node, member, .. }
+        | Effect::Reached { node, member, .. }
+        | Effect::Renamed { node, member, .. } = &effect
+        {
+            self.caps.admit_member(tree, *node, *member)?;
+        }
         match &effect {
             Effect::WriteLeaf {
                 node,
@@ -630,7 +806,7 @@ impl NamespaceWriter {
                     bytes: bytes.clone(),
                     provenance: *provenance,
                 };
-                return self.write_leaf(tree, arrival, out);
+                return self.write_leaf(tree, builder, segments, arrival, out);
             }
             Effect::Reached {
                 node,
@@ -666,8 +842,7 @@ impl NamespaceWriter {
                 // is a leaf, whoever closed it: the root's source or an
                 // object's emit.
                 if tree.is_undecided(*node, *member) {
-                    tree.settle_leaf(*node, *member);
-                    self.release_to_leaf(tree, *node, *member)?;
+                    self.settle(tree, builder, segments, *node, *member, out)?;
                 }
                 // A leaf and a recovery volume live in their own files; a
                 // member another object owns has no file to close.
@@ -688,6 +863,8 @@ impl NamespaceWriter {
                 // Handed what it received before, by `apply_each`.
                 self.bound(tree, *node, *member, *kind, *child);
             }
+            // Handed over as the member's, by `apply_each`.
+            Effect::Folded { .. } => {}
             Effect::Refused { node, member, why } | Effect::NeedsEngine { node, member, why } => {
                 self.refuse(tree, *node, *member, *why);
                 // The engine the refusal handed the member to took it over.
@@ -708,7 +885,7 @@ impl NamespaceWriter {
                 volume,
             } => self.given_back(tree, (*node, *member), (*from, *volume))?,
             Effect::Retracted { node, member } => {
-                self.retract(*node, *member)?;
+                self.retract(tree, *node, *member)?;
                 self.prune(tree)?;
             }
             Effect::RecoveryAt {
@@ -735,8 +912,7 @@ impl NamespaceWriter {
                 // cannot say what it is from them: it is a leaf, as one that
                 // ended first is. A repair there lets it say again.
                 if tree.is_undecided(*node, *member) && tree.front_lost(*node, *member, *range) {
-                    tree.settle_leaf(*node, *member);
-                    self.release_to_leaf(tree, *node, *member)?;
+                    self.settle(tree, builder, segments, *node, *member, out)?;
                 }
                 let mut effects = Vec::new();
                 tree.damaged_under_windows(
@@ -787,30 +963,38 @@ impl NamespaceWriter {
     fn write_leaf(
         &mut self,
         tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
         if tree.is_undecided(node, member) {
-            return self.hold(tree, arrival, out);
+            return self.hold(tree, builder, segments, arrival, out);
         }
         self.release_to_leaf(tree, node, member)?;
         self.write_file(tree, node, member, arrival.offset, &arrival.bytes)
     }
 
-    // Hold bytes whose member is not yet decided. A breach decides it a
-    // leaf: everything held and the new bytes go to its file.
+    // Hold bytes whose member is not yet decided. A breach settles it: the
+    // object that takes it is handed everything held and the new bytes; a
+    // leaf has them go to its file.
     fn hold(
         &mut self,
         tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
         if self.keep_held(node, member, arrival.offset, arrival.bytes.clone())? {
-            tree.settle_leaf(node, member);
+            if let Some(owner) = self.settle(tree, builder, segments, node, member, out)? {
+                let mut effects = Vec::new();
+                self.capture(tree, builder, owner, &arrival, &mut effects)?;
+                return self.apply_each(tree, builder, segments, effects, out);
+            }
             self.refuse(tree, node, member, Why::HoldsBreached);
-            self.release_to_leaf(tree, node, member)?;
             self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
             out.push(Effect::Refused {
                 node,
@@ -845,6 +1029,29 @@ impl NamespaceWriter {
                 .write(page_out.scratch_offset, &page_out.bytes, None)?;
         }
         Ok(matches!(outcome.placed, Placed::Breached(_)))
+    }
+
+    // A member whose front will say no more is settled by the tree: an
+    // object beside it may take it, and is handed what was held of it;
+    // unclaimed, it is a leaf, and what was held goes to its file. The
+    // object that took it, as its volume.
+    fn settle(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        node: NodeId,
+        member: MemberId,
+        out: &mut Vec<Effect>,
+    ) -> Result<Option<(NodeId, VolumeIndex)>, WriteError> {
+        let mut effects = Vec::new();
+        tree.settle_leaf(node, member, &mut effects);
+        self.apply_each(tree, builder, segments, effects, out)?;
+        let owner = tree.child_of(node, member);
+        if owner.is_none() {
+            self.release_to_leaf(tree, node, member)?;
+        }
+        Ok(owner)
     }
 
     // The member was decided as a leaf: what was held is written first, so
@@ -1071,7 +1278,7 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    fn retract(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
+    fn retract(&mut self, tree: &Tree, node: NodeId, member: MemberId) -> Result<(), WriteError> {
         self.take_held(node, member, ALL)?;
         if let Some(leaf) = self
             .files
@@ -1080,14 +1287,17 @@ impl NamespaceWriter {
         {
             leaf.truncate()?;
         }
-        self.caps.forget(node, member);
+        self.caps.forget(tree, node, member);
         Ok(())
     }
 
     // Forget what the tree dropped: the envelopes of every node nothing
     // reads back through, and the file of every member no namespace holds,
-    // with the namespace's own files once the namespace is gone too.
+    // with the namespace's own files once the namespace is gone too. A
+    // namespace retired or gone holds no entries and keeps nothing resident.
     fn prune(&mut self, tree: &Tree) -> Result<(), WriteError> {
+        self.caps.release_gone(tree);
+        self.kept.retain(|(object, _), _| !tree.buried(*object));
         let nodes: Vec<NodeId> = self.files.keys().copied().collect();
         for node in nodes {
             if tree.buried(node) {
@@ -1097,7 +1307,7 @@ impl NamespaceWriter {
                 // Dropping the namespace's holds gives their count back.
                 if let Some(files) = self.files.remove(&node) {
                     for member in files.leaves.keys() {
-                        self.caps.forget(node, *member);
+                        self.caps.forget(tree, node, *member);
                     }
                     for leaf in files.leaves.into_values().chain(files.scratch) {
                         leaf.remove()?;
@@ -1120,7 +1330,7 @@ impl NamespaceWriter {
                 if let Some(leaf) = files.leaves.remove(&member) {
                     leaf.remove()?;
                 }
-                self.caps.forget(node, member);
+                self.caps.forget(tree, node, member);
             }
         }
         Ok(())
@@ -1167,8 +1377,7 @@ impl NamespaceWriter {
         };
         let accountant = &self.accountant;
         self.files
-            .entry(node)
-            .or_insert_with(|| Files::new(namespace, Arc::clone(accountant)))
+            .get_or_insert_with(node, || Files::new(namespace, Arc::clone(accountant)))
     }
 
     fn leaf(
@@ -1179,10 +1388,10 @@ impl NamespaceWriter {
     ) -> Result<&mut Leaf, WriteError> {
         let dir = self.working_dir.clone();
         let leaves = &mut self.files_mut(node).leaves;
-        if !leaves.contains_key(&member) {
-            leaves.insert(member, Leaf::at(&dir, output_name)?);
+        match leaves.entry(member) {
+            Entry::Occupied(leaf) => Ok(leaf.into_mut()),
+            Entry::Vacant(free) => Ok(free.insert(Leaf::at(&dir, output_name)?)),
         }
-        Ok(leaves.get_mut(&member).expect("inserted above"))
     }
 
     // The node's holds scratch, created empty the first time anything pages.
@@ -1471,7 +1680,7 @@ fn held_volume(member: MemberId) -> VolumeIndex {
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
-    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
+    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
 }
 
 fn index(offset: u64) -> usize {
@@ -1488,3 +1697,10 @@ pub(crate) use loan::{Loan, Returned};
 pub(crate) use recovery::{Lender, SetState};
 #[cfg(test)]
 mod tests;
+
+// The parts of `range` outside `cut`, in order.
+fn outside(range: ByteRange, cut: ByteRange) -> impl Iterator<Item = ByteRange> {
+    let before = ByteRange::new(range.start, range.end.min(cut.start).max(range.start));
+    let after = ByteRange::new(range.start.max(cut.end).min(range.end), range.end);
+    [before, after].into_iter().filter(|part| !part.is_empty())
+}

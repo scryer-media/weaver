@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Binding, Node, NodeId, Tree};
+use super::{Binding, Node, NodeId, Nodes, Tree};
 use crate::facts::{Restore, RestoreError};
 use crate::member::{Coverage, Member};
 use crate::records::{CoverageRecord, MemberRecord, NodeRecord, NodeState, TreeRecord};
@@ -27,6 +27,26 @@ impl Tree {
                 .collect(),
             next_node: self.next_node,
         }
+    }
+
+    // The generation of the tree's nodes: a change to a node marks it under
+    // a later one.
+    pub fn generation(&self) -> u64 {
+        self.nodes.generation()
+    }
+
+    // The nodes changed since generation `at`, a node gone since among them.
+    pub fn changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.changed_since(at)
+    }
+
+    // One node's record, `None` for a node not in the tree.
+    pub fn record(&self, node: NodeId) -> Option<NodeRecord> {
+        Some(self.node_record(node, self.nodes.get(&node)?))
+    }
+
+    pub fn next_node(&self) -> u32 {
+        self.next_node
     }
 
     fn node_record(&self, node: NodeId, found: &Node) -> NodeRecord {
@@ -53,7 +73,7 @@ impl Tree {
                 .map(|object| object.facts())
                 .or_else(|| self.lent_facts(node).cloned()),
             members: namespace
-                .members()
+                .records()
                 .map(|member| MemberRecord {
                     member: member.id,
                     name: member.name.clone(),
@@ -62,16 +82,23 @@ impl Tree {
                     closed: member.closed,
                     bound_to: member.bound_to,
                     owner: found.children.get(&member.id).copied(),
-                    given_up: self.retired.get(&(node, member.id)).copied().flatten(),
+                    given_up: self
+                        .nodes
+                        .retired()
+                        .get(&(node, member.id))
+                        .copied()
+                        .flatten(),
                     buried: self
-                        .retired
+                        .nodes
+                        .retired()
                         .get(&(node, member.id))
                         .is_some_and(Option::is_none),
                     undecided: found.undecided.contains(&member.id),
+                    copy_of: namespace.copy_of(member.id),
                 })
                 .collect(),
             coverage: namespace
-                .members()
+                .records()
                 .flat_map(|member| {
                     member.coverage.runs().map(|run| CoverageRecord {
                         member: member.id,
@@ -89,7 +116,7 @@ impl Tree {
 
     pub fn rebuild(record: &TreeRecord, restore: &dyn Restore) -> Result<Tree, RestoreError> {
         let mut tree = Tree::new();
-        tree.nodes.clear();
+        tree.nodes = Nodes::default();
         for node in &record.nodes {
             tree.place_record(node, restore)?;
         }
@@ -155,6 +182,12 @@ impl Tree {
             return Err(refuse("a live node has refused its volumes"));
         }
         node.refused = record.reason;
+        // A refused object hears it again, as it heard it when it was.
+        if node.refused.is_some()
+            && let Some(object) = node.object.as_mut()
+        {
+            object.refused();
+        }
         for member in &record.members {
             if node.namespace.get(member.member).is_some() {
                 return Err(refuse("a member appears twice"));
@@ -176,6 +209,17 @@ impl Tree {
                 node.undecided.insert(member.member);
             }
         }
+        for member in &record.members {
+            let Some(into) = member.copy_of else {
+                continue;
+            };
+            if member.undecided || member.owner.is_some() || member.bound_to.is_some() {
+                return Err(refuse("a further posting has an owner of its own"));
+            }
+            if !node.namespace.restore_copy(member.member, into) {
+                return Err(refuse("a further posting of a member it does not have"));
+            }
+        }
         for run in &record.coverage {
             if run.start >= run.end {
                 return Err(refuse("a coverage run is empty or inverted"));
@@ -192,6 +236,7 @@ impl Tree {
             coverage.write(range, run.provenance);
         }
         self.nodes.insert(record.node, node);
+        self.rehome(record.node);
         Ok(())
     }
 
@@ -265,11 +310,11 @@ impl Tree {
                 if !self.nodes.contains_key(&node) {
                     return Err(refuse("a member was given up by a node not in the record"));
                 }
-                self.retired
-                    .insert((record.node, member.member), Some((node, volume)));
+                self.nodes
+                    .retire((record.node, member.member), Some((node, volume)));
             }
             if member.buried {
-                self.retired.insert((record.node, member.member), None);
+                self.nodes.retire((record.node, member.member), None);
             }
         }
         Ok(())

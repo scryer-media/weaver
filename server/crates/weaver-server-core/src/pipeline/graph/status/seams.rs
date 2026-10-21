@@ -214,8 +214,7 @@ impl Pipeline {
     }
 
     // What the root's recovery objects can say of a graph job now, read
-    // off the tree whenever it is asked: health asks it between articles,
-    // and the tree is what changed since.
+    // off the tree whenever it is asked.
     pub(in crate::pipeline) fn graph_recovery_summary(
         &self,
         job_id: JobId,
@@ -382,12 +381,22 @@ impl Pipeline {
                 .get(member.0 as usize)
                 .is_none_or(|file| file.role.counts_toward_health())
         };
-        // A set whose repair failed covers the member.
+        // A set whose repair failed covers the member: each failed set with
+        // the namespace it lives in, as the summary read them once.
+        let failed: Vec<(NodeId, NodeId)> = failure
+            .as_ref()
+            .map(|failure| {
+                summary
+                    .sets
+                    .iter()
+                    .filter(|set| failure.objects.contains(&set.node))
+                    .map(|set| (set.namespace, set.node))
+                    .collect()
+            })
+            .unwrap_or_default();
         let unrepaired = |node: NodeId, member: MemberId| {
-            failure.as_ref().is_some_and(|failure| {
-                job.writer()
-                    .covering(job.tree(), node, member)
-                    .any(|set| failure.objects.contains(&set))
+            failed.iter().any(|(namespace, set)| {
+                *namespace == node && job.writer().covers(job.tree(), *set, member)
             })
         };
         let delivery = Delivery::read(

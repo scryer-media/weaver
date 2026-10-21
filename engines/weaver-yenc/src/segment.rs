@@ -732,7 +732,7 @@ mod tests {
     }
 
     fn direct(data: &[u8]) -> u32 {
-        crc_fast::crc32_iso_hdlc(data)
+        crc_turbo::crc32_iso_hdlc(data)
     }
 
     fn single_plan(block_size: Option<NonZeroU64>) -> CheckpointPlan {

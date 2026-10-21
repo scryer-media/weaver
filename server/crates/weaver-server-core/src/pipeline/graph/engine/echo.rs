@@ -65,6 +65,9 @@ struct Echo {
 }
 
 impl Object for Echo {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::RarEngine
     }
@@ -77,7 +80,7 @@ impl Object for Echo {
     }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         let Some(on) = self.reached else {
             return;
         };
@@ -102,7 +105,7 @@ impl Object for Echo {
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
-    fn claim(&mut self, name: &str, _: &[u8]) -> Option<VolumeIndex> {
+    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
         let (_, part) = name.rsplit_once(".part")?;
         let part: u32 = part.strip_suffix(".rar")?.parse().ok()?;
         (part >= 2).then(|| VolumeIndex(part - 1))

@@ -10,6 +10,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -116,7 +117,7 @@ func (engine *Engine) ComposeOverlay() string {
 
 // Args rewrites an engine argument vector for this engine. A vector starting
 // with "compose" gets the engine overlay; a `buildx build` becomes Podman's
-// native build.
+// native build; every build is for the host platform unless it names one.
 func (engine *Engine) Args(args ...string) []string {
 	if len(args) == 0 {
 		return args
@@ -125,9 +126,35 @@ func (engine *Engine) Args(args ...string) []string {
 	case args[0] == "compose":
 		return engine.composeArgs(args, os.Getenv)
 	case engine.Kind == Podman && len(args) >= 2 && args[0] == "buildx" && args[1] == "build":
-		return podmanBuildArgs(args[2:])
+		return withHostPlatform(podmanBuildArgs(args[2:]), 1)
+	case len(args) >= 2 && args[0] == "buildx" && args[1] == "build":
+		return withHostPlatform(args, 2)
+	case args[0] == "build":
+		return withHostPlatform(args, 1)
 	}
 	return append([]string(nil), args...)
+}
+
+// HostPlatform is the platform of every image the harness builds or pulls:
+// the host's own. A base cached for another architecture would otherwise
+// satisfy a digest-pinned FROM and run under emulation, where tools such as
+// tcpdump fail. Compose reads it from DOCKER_DEFAULT_PLATFORM, which Use
+// sets; a Podman build ignores that variable, so builds carry the flag.
+func HostPlatform() string {
+	return "linux/" + runtime.GOARCH
+}
+
+// withHostPlatform puts --platform after the build subcommand, which ends at
+// index at, unless the vector already names a platform.
+func withHostPlatform(args []string, at int) []string {
+	for _, arg := range args {
+		if arg == "--platform" || strings.HasPrefix(arg, "--platform=") {
+			return append([]string(nil), args...)
+		}
+	}
+	out := append([]string(nil), args[:at]...)
+	out = append(out, "--platform", HostPlatform())
+	return append(out, args[at:]...)
 }
 
 // Command is exec.Command for the engine CLI.

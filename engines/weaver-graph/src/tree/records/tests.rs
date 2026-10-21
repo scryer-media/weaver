@@ -5,7 +5,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::super::{Builder, Tree};
-use crate::deliver::{Delivery, Emit, Provenance, Why};
+use crate::deliver::{Delivery, Emit, Posted, Provenance, Why};
 use crate::facts::{Durable, Facts, Restore, RestoreError};
 use crate::member::MemberId;
 use crate::object::{Extent, Kind, Object, ObjectId, Placement};
@@ -40,6 +40,9 @@ impl Wrap {
 }
 
 impl Object for Wrap {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
     fn kind(&self) -> Kind {
         self.kind
     }
@@ -69,7 +72,7 @@ impl Object for Wrap {
     }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         let start = range.start.max(self.header());
@@ -131,9 +134,11 @@ fn three_levels() -> (Tree, MemberId) {
         tree.deliver(
             NodeId::ROOT,
             member,
-            offset,
-            Bytes::copy_from_slice(bytes),
-            provenance,
+            Posted {
+                offset,
+                bytes: Bytes::copy_from_slice(bytes),
+                provenance,
+            },
             &mut Objects,
             &mut Vec::new(),
         );
@@ -188,9 +193,11 @@ fn a_rebuilt_tree_takes_the_replay_as_the_live_one_does() {
         tree.deliver(
             NodeId::ROOT,
             archive,
-            18,
-            Bytes::from_static(b" more"),
-            Provenance::Fresh,
+            Posted {
+                offset: 18,
+                bytes: Bytes::from_static(b" more"),
+                provenance: Provenance::Fresh,
+            },
             &mut Objects,
             &mut effects,
         );

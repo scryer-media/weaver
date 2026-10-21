@@ -38,7 +38,9 @@ fn spec(files: Vec<Vec<(&str, u32)>>) -> JobSpec {
                         ordinal: ordinal as u32,
                         article_number: ordinal as u32 + 1,
                         bytes,
-                        message_id: message_id.to_string(),
+                        message_ids: weaver_server_core::MessageIds::new(vec![
+                            message_id.to_string(),
+                        ]),
                     })
                     .collect(),
             })

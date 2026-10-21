@@ -28,6 +28,7 @@ use weaver_graph::{
     Placement, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 
+pub use crate::quiet::Placed;
 pub(crate) use joined::Joined;
 
 // What one engine format knows: its kind, how its set names its volumes,
@@ -49,13 +50,28 @@ pub trait Format: Send + Sync {
     fn states_place(_front: &Self::Front) -> bool {
         false
     }
-    // The index the fronts of the volumes bound give a volume whose front
-    // is `front`: each bound volume by index, with its front when it states
-    // one.
-    fn place(_bound: &BTreeMap<u32, Option<&Self::Front>>, _front: &Self::Front) -> Option<u32> {
+    // Whether the front says the volume is not at `index`.
+    fn misplaced(_front: &Self::Front, _index: u32) -> bool {
+        false
+    }
+    // Where the volumes bound place a volume with `front`, when its front
+    // states one, and `length`, once known: each bound volume by index,
+    // with its front and its length.
+    fn place(
+        _bound: &BTreeMap<u32, Holding<'_, Self::Front>>,
+        _front: Option<&Self::Front>,
+        _length: Option<u64>,
+    ) -> Option<Placed> {
         None
     }
     fn run(password: Option<String>) -> Box<dyn Extraction>;
+}
+
+// A volume bound, as far as it places the others: what its front states,
+// and its length once known.
+pub struct Holding<'a, T> {
+    pub front: Option<&'a T>,
+    pub length: Option<u64>,
 }
 
 // A volume's name as its set numbers it.
@@ -66,11 +82,11 @@ pub trait SetName: Send + Sync + Sized + Serialize + DeserializeOwned {
     fn same_set(&self, other: &Self) -> bool;
 
     // The volume this name becomes beside the volumes of its set already
-    // bound, by index, or `None` when its place is taken. A name is its own
-    // number; a set whose last volume carries none says otherwise.
-    fn slot(&self, bound: &BTreeMap<u32, Self>) -> Option<u32> {
-        let index = self.index();
-        (!bound.contains_key(&index)).then_some(index)
+    // bound, by index, held or not: a volume posted again is that volume.
+    // A name is its own number; a set whose last volume carries none says
+    // otherwise.
+    fn slot(&self, _bound: &BTreeMap<u32, Self>) -> Option<u32> {
+        Some(self.index())
     }
 }
 
@@ -89,6 +105,10 @@ pub struct EngineObject<F: Format> {
     // What the fronts of the volumes bound state of their places.
     #[serde(default)]
     fronts: BTreeMap<u32, F::Front>,
+    // The lengths of the volumes bound, where a format's lengths place
+    // its volumes.
+    #[serde(default)]
+    lengths: BTreeMap<u32, u64>,
     bound: BTreeSet<u32>,
     #[serde(skip)]
     password: Option<String>,
@@ -98,13 +118,20 @@ pub struct EngineObject<F: Format> {
     // The live run asked for a password and no offer has answered it since.
     #[serde(skip)]
     asking: bool,
+    // The set was refused: what it claims after goes where the set went.
+    #[serde(skip)]
+    gone: bool,
 }
 
 impl<F: Format> Durable for EngineObject<F> {
     const VERSION: u16 = 2;
 
     fn impossible(&self) -> Option<&'static str> {
-        let known = self.names.keys().chain(self.fronts.keys());
+        let known = self
+            .names
+            .keys()
+            .chain(self.fronts.keys())
+            .chain(self.lengths.keys());
         let named = known.into_iter().all(|volume| self.bound.contains(volume));
         (!named).then_some("a volume named that is not bound")
     }
@@ -116,10 +143,12 @@ impl<F: Format> Default for EngineObject<F> {
             format: PhantomData,
             names: BTreeMap::new(),
             fronts: BTreeMap::new(),
+            lengths: BTreeMap::new(),
             bound: BTreeSet::new(),
             password: None,
             reached: None,
             asking: false,
+            gone: false,
         }
     }
 }
@@ -127,6 +156,50 @@ impl<F: Format> Default for EngineObject<F> {
 impl<F: Format> EngineObject<F> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // A volume's place is what states it, as the RAR store places one: the
+    // position its front gives, beside what the fronts of the volumes bound
+    // state; else its name in the set's own numbering where the front does
+    // not say the volume is not there; and only a volume that places
+    // neither by what links it to the volumes bound, its front or its
+    // length, which guess wrong across a volume not yet bound. A posted
+    // name is a label, which a recovery set may change later, so the front
+    // outranks it. A place bound already is answered all the same: the
+    // volume posted again is that volume.
+    fn placed(&self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Option<Placed> {
+        let bound = self
+            .bound
+            .iter()
+            .map(|volume| {
+                let holding = Holding {
+                    front: self.fronts.get(volume),
+                    length: self.lengths.get(volume).copied(),
+                };
+                (*volume, holding)
+            })
+            .collect();
+        let front = F::front(first_bytes);
+        let stated = front.as_ref().is_some_and(F::states_place);
+        let placed = F::place(&bound, front.as_ref(), length);
+        let named = F::parse(name)
+            .filter(|candidate| {
+                self.names
+                    .values()
+                    .next()
+                    .is_some_and(|first| first.same_set(candidate))
+            })
+            .and_then(|candidate| candidate.slot(&self.names))
+            .filter(|index| {
+                !front
+                    .as_ref()
+                    .is_some_and(|front| F::misplaced(front, *index))
+            });
+        match (placed, named) {
+            (Some(placed), _) if stated => Some(placed),
+            (_, Some(named)) => Some(Placed::At(VolumeIndex(named))),
+            (linked, None) => linked,
+        }
     }
 }
 
@@ -136,13 +209,23 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     // The run reads the volumes from the owner's files; the bytes on their
-    // way there say nothing the run does not read itself.
+    // way there say nothing the run does not read itself, but a volume's
+    // front. A volume can be bound before its front comes, as a restored
+    // volume fetched again is: what its front states of its place is the
+    // engine's when it does.
     fn deliver(
         &mut self,
-        _delivery: Delivery<'_>,
+        delivery: Delivery<'_>,
         _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         _out: &mut Vec<Emit>,
     ) {
+        let volume = delivery.volume.0;
+        if delivery.offset == 0
+            && self.bound.contains(&volume)
+            && let Some(front) = F::front(delivery.bytes)
+        {
+            self.fronts.entry(volume).or_insert(front);
+        }
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {}
@@ -150,11 +233,17 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
     // Nothing more will reach the run. A member it left damaged, a password
-    // it is still asking for, a member it named and never closed: the set
-    // cannot be read whole, and its volumes go back as they stand.
+    // it is still asking for, a volume beside the set that nothing orders,
+    // a member it named and never closed: the set cannot be read whole,
+    // and its volumes go back as they stand.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         let why = crate::quiet::damaged(standing)
             .or_else(|| self.asking.then_some(Why::EncryptedHeader))
+            .or_else(|| {
+                crate::quiet::unordered(standing, |beside| {
+                    self.placed(beside.name, beside.front, beside.length)
+                })
+            })
             .or_else(|| crate::quiet::unplaced(standing));
         out.extend(why.map(Emit::Refuse));
     }
@@ -162,7 +251,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // The volumes after the one the run is on, the nearest first: weighed
     // by how many bound volumes lie between, since an index orders the
     // volumes and need not be dense.
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         let Some(reached) = self.reached else {
             return;
         };
@@ -177,6 +266,10 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
+
+    // The fronts it copies out are in its facts, which a restart keeps, and
+    // its run reads the volumes themselves: it says nothing of the posted bytes.
+    fn unposted(&mut self, _volume: VolumeIndex, _range: ByteRange) {}
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
@@ -196,7 +289,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         None
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8]) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], length: Option<u64>) {
         let first = self.names.values().next();
         if let Some(parsed) = F::parse(name)
             && first.is_none_or(|first| first.same_set(&parsed))
@@ -206,7 +299,14 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         if let Some(front) = F::front(front) {
             self.fronts.insert(volume.0, front);
         }
+        if let Some(length) = length {
+            self.lengths.insert(volume.0, length);
+        }
         self.bound.insert(volume.0);
+    }
+
+    fn refused(&mut self) {
+        self.gone = true;
     }
 
     // The name a recovery set gave the volume is the set's numbering now.
@@ -220,35 +320,18 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         }
     }
 
-    // A volume's place is what states it, as the RAR store places one: the
-    // number its front gives, beside what the fronts of the volumes bound
-    // state; else its name in the set's own numbering; and only a volume
-    // that states neither by the fronts it links to beside it, which guess
-    // wrong across a volume not yet bound. A posted name is a label, which
-    // a recovery set may change later, so a stated number outranks it.
-    fn claim(&mut self, name: &str, first_bytes: &[u8]) -> Option<VolumeIndex> {
-        let bound = self
-            .bound
-            .iter()
-            .map(|volume| (*volume, self.fronts.get(volume)))
-            .collect();
-        let front = F::front(first_bytes);
-        let stated = front.as_ref().is_some_and(F::states_place);
-        let placed = front.and_then(|front| F::place(&bound, &front));
-        let named = F::parse(name)
-            .filter(|candidate| {
-                self.names
-                    .values()
-                    .next()
-                    .is_some_and(|first| first.same_set(candidate))
-            })
-            .and_then(|candidate| candidate.slot(&self.names));
-        let index = match (placed, named) {
-            (Some(index), _) if stated => index,
-            (_, Some(named)) => named,
-            (linked, None) => linked?,
-        };
-        (!self.bound.contains(&index)).then_some(VolumeIndex(index))
+    // The place the volume's facts give it. One that fits more than one
+    // place is not claimed while the set stands: a name a recovery set
+    // gives it later may order it.
+    fn claim(
+        &mut self,
+        name: &str,
+        first_bytes: &[u8],
+        length: Option<u64>,
+    ) -> Option<VolumeIndex> {
+        let past = Placed::past(self.bound.last().copied());
+        self.placed(name, first_bytes, length)?
+            .claimed(self.gone, past)
     }
 
     fn reads_in_order(&self) -> bool {

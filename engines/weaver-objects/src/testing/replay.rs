@@ -61,7 +61,7 @@ struct Owner {
 impl Owner {
     fn step(&mut self, object: &mut dyn Object, step: &Step<'_>, out: &mut Vec<Emit>) {
         match *step {
-            Step::Bound(volume, name) => object.bound(VolumeIndex(volume), name, &[]),
+            Step::Bound(volume, name) => object.bound(VolumeIndex(volume), name, &[], None),
             Step::Sized(volume, length) => object.sized(VolumeIndex(volume), length, out),
             Step::Bytes(volume, offset, bytes) => {
                 self.deliver(object, VolumeIndex(volume), offset, bytes, out);

@@ -8,6 +8,8 @@
 // member or the envelope. Members are numbered in its order, which is the
 // order every run of the same set numbers them; when new facts disagree with
 // a member already announced, it and every member after it are retracted.
+// A layout the store gives the set up over never becomes its map: no byte
+// was placed by it, so the bytes go back from where the last one put them.
 
 use std::sync::Arc;
 
@@ -80,8 +82,9 @@ impl RarStore {
     // A fresh layout over every volume read far enough.
     fn build(&mut self, out: &mut Vec<Emit>) -> Option<StoredLayoutBuilder> {
         // A volume held where its headers do not place it is mapped by no
-        // layout: it is given back at its close. One held first stops the
-        // layout before it starts.
+        // layout: it is given back at its close. One only its links put
+        // where it is held waits for its end record before it is mapped.
+        // One held first stops the layout before it starts.
         let first = self
             .volumes
             .get(&VolumeIndex(0))?
@@ -102,7 +105,10 @@ impl RarStore {
             let Some(facts) = found.walk.facts.as_ref() else {
                 break;
             };
-            if (facts.members.is_empty() && !found.walk.ended) || claim::misplaced(*index, facts) {
+            if (facts.members.is_empty() && !found.walk.ended)
+                || claim::misplaced(*index, facts)
+                || !claim::settled(*index, found)
+            {
                 break;
             }
             let refusal = if facts.is_solid {
@@ -151,9 +157,9 @@ impl RarStore {
             self.extend(id, member, out);
         }
         self.say_recovery(&layout, out);
-        self.layout = Some(layout);
-        if let Some(emit) = refusal {
-            self.give_up(emit, out);
+        match refusal {
+            Some(emit) => self.give_up(emit, out),
+            None => self.layout = Some(layout),
         }
     }
 

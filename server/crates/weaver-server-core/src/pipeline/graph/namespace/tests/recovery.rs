@@ -52,14 +52,15 @@ fn a_set_lives_in_the_namespace_of_the_members_it_describes() {
     let other = job.member("other.mkv", Some(4));
     let set = job.set_node();
     assert_eq!(job.writer.sets(&job.tree), vec![(NodeId::ROOT, set)]);
+    let sets = job.tree.recovery_nodes(NodeId::ROOT);
     assert_eq!(
         job.writer
-            .covering(&job.tree, NodeId::ROOT, video)
+            .covering(&job.tree, &sets, video)
             .collect::<Vec<_>>(),
         vec![set]
     );
     assert_eq!(
-        job.writer.covering(&job.tree, NodeId::ROOT, other).count(),
+        job.writer.covering(&job.tree, &sets, other).count(),
         0,
         "a member the set does not describe has no set"
     );
@@ -106,6 +107,47 @@ fn a_set_rules_once_every_member_it_covers_is_closed_and_known() {
         Some(&b"goXXgood"[..])
     );
     assert_eq!(job.file("video.mkv"), b"goOKgood");
+}
+
+// Beside the set only a member it does not describe: the index covers
+// nothing, and its own volume is still open.
+fn an_index_covering_nothing(job: &mut Job) -> MemberId {
+    let other = job.member("other.mkv", Some(4));
+    job.send(other, 0, b"body", Provenance::Fresh);
+    job.close(other);
+    assert_eq!(
+        job.writer
+            .covering(&job.tree, &job.tree.recovery_nodes(NodeId::ROOT), other)
+            .count(),
+        0
+    );
+    job.root().find_by_name("set.par2").expect("own volume").id
+}
+
+#[test]
+fn an_index_that_covers_nothing_and_has_no_volume_in_is_not_due() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = an_index_covering_nothing(&mut job);
+    assert!(!job.root().get(own).unwrap().closed);
+    job.rule(false);
+    assert!(
+        job.par.lock().unwrap().volume.is_none(),
+        "no repair was lent"
+    );
+    assert_eq!(job.writer.outcomes(&job.tree), vec![None]);
+}
+
+#[test]
+fn an_index_that_covers_nothing_is_due_once_its_volume_closes() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = an_index_covering_nothing(&mut job);
+    job.close(own);
+    job.rule(false);
+    assert_eq!(
+        job.par.lock().unwrap().volume.as_deref(),
+        Some(PAR2_SIGNATURE),
+        "the repair was lent and read the set's own volume"
+    );
 }
 
 #[test]

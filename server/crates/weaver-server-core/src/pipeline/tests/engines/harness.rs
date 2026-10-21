@@ -19,7 +19,7 @@ use weaver_model::files::FileRole;
 use super::super::{
     debug_job_state, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
     pump_pipeline_runtime_queues, retention_client, retire_pipeline_database,
-    settle_direct_demotion_work, settle_direct_verification_read,
+    settle_direct_demotion_work, settle_direct_verification_read, settle_segment_write_work,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
@@ -36,7 +36,7 @@ use crate::pipeline::{
 pub(super) const ARTICLE: usize = 64;
 
 // Every run is its own pipeline, so one id serves every scenario.
-pub(super) const JOB: JobId = JobId(93_001);
+pub(in crate::pipeline::tests) const JOB: JobId = JobId(93_001);
 const JOB_NAME: &str = "lantern beacon";
 
 pub(super) struct Post {
@@ -279,6 +279,9 @@ pub(super) struct Scenario {
     // Every batch the download queue hands out is served as workers fetching
     // these posts at once: one article of each in turn, in this order.
     pub(super) together: Vec<u32>,
+    // A restarted run serves these articles first, in this order, each once
+    // the queue holds it.
+    pub(super) first: Vec<(u32, u32)>,
     // Every article is uuencoded: it says nothing of where its bytes go,
     // so they are placed in order.
     pub(super) uuencoded: bool,
@@ -304,6 +307,7 @@ impl Scenario {
             article: ARTICLE,
             backwards: false,
             together: Vec::new(),
+            first: Vec::new(),
             uuencoded: false,
             leased: false,
             limits: None,
@@ -357,6 +361,13 @@ impl Scenario {
     // order, then the second of each, and so on.
     pub(super) fn together(mut self, posts: &[u32]) -> Self {
         self.together = posts.to_vec();
+        self
+    }
+
+    // A restarted run serves these articles before any other, in this
+    // order, so a restart lands between two of them.
+    pub(super) fn first(mut self, articles: &[(u32, u32)]) -> Self {
+        self.first = articles.to_vec();
         self
     }
 
@@ -435,7 +446,9 @@ impl Scenario {
                             ordinal: ordinal as u32,
                             article_number: ordinal as u32,
                             bytes: article.len() as u32,
-                            message_id: format!("lantern-{index}-{ordinal}@example.com"),
+                            message_ids: crate::jobs::MessageIds::new(vec![format!(
+                                "lantern-{index}-{ordinal}@example.com"
+                            )]),
                         })
                         .collect(),
                 })
@@ -461,6 +474,9 @@ pub(super) struct GraphView {
     pub(super) claims: BTreeMap<String, Claim>,
     pub(super) blocks_reachable: u64,
     pub(super) outcomes: Vec<Option<RepairOutcome>>,
+    // What each recovery object last ruled, by the kind of object, in the
+    // order of `outcomes`.
+    pub(super) rulings: Vec<(String, Option<RepairOutcome>)>,
     // The kind of every object the tree held at any look, by its name.
     pub(super) kinds: BTreeSet<String>,
     // How many password candidates each node was offered, at the last look.
@@ -470,6 +486,11 @@ pub(super) struct GraphView {
     // What the job's checkpoints asked the database to write, at the last
     // look.
     pub(super) checkpoints: crate::pipeline::graph::checkpoint::Tally,
+    // The most the live namespaces objects produced kept resident for their
+    // members at any look, summed from the tree.
+    pub(super) resident: u64,
+    // The time the looks themselves took, which a run's time is not.
+    pub(super) observed: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -636,7 +657,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
     let (_temp_dir, mut pipeline, complete_dir) = admit(scenario, engine).await;
     // Events the run sends are heard from admission on; nothing sent before
     // the job was admitted belongs to it.
-    let mut sent = pipeline.event_tx.subscribe();
+    let (heard, kept) = hear(pipeline.event_tx.subscribe());
     let mut refused = BTreeSet::new();
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
@@ -771,14 +792,8 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         .filter(|post| post.role.counts_toward_health())
         .map(|post| (post.name.clone(), delivered_claim(&files, post)))
         .collect();
-    let mut events = Vec::new();
-    loop {
-        match sent.try_recv() {
-            Ok(event) => events.push(event),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-            Err(error) => panic!("the run's events were not all kept: {error}"),
-        }
-    }
+    drop(heard);
+    let events = kept.await.expect("every event the run sent is kept");
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         engine,
@@ -808,6 +823,42 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             .collect(),
         events,
     })
+}
+
+// Every event the run sends, kept as it is sent: a task beside the run
+// hears each one as the run yields, so the channel's bound never drops one
+// however many the run sends. Once the returned sender is dropped, what is
+// still in the channel is kept and the list is handed back.
+fn hear(
+    mut sent: tokio::sync::broadcast::Receiver<PipelineEvent>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Vec<PipelineEvent>>,
+) {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let (heard, mut done) = tokio::sync::oneshot::channel::<()>();
+    let kept = tokio::spawn(async move {
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                biased;
+                event = sent.recv() => match event {
+                    Ok(event) => events.push(event),
+                    Err(RecvError::Closed) => return events,
+                    Err(error) => panic!("the run's events were not all kept: {error}"),
+                },
+                _ = &mut done => break,
+            }
+        }
+        loop {
+            match sent.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return events,
+                Err(error) => panic!("the run's events were not all kept: {error}"),
+            }
+        }
+    });
+    (heard, kept)
 }
 
 // A graph run whose completion gate runs only when the pipeline itself
@@ -1045,13 +1096,15 @@ async fn serve_from(
             },
         )
         .await;
-    // What the select loop would pick up after the article: the read-back
-    // a set's last article submits, and a demotion's handback.
+    // What the select loop would pick up after the article: its write
+    // landing, the read-back a set's last article submits, and a demotion's
+    // handback.
+    settle_segment_write_work(pipeline).await;
     settle_direct_verification_read(pipeline, job).await;
     settle_direct_demotion_work(pipeline).await;
 }
 
-pub(super) fn finished(pipeline: &Pipeline) -> bool {
+pub(in crate::pipeline::tests) fn finished(pipeline: &Pipeline) -> bool {
     matches!(
         job_status_for_assert(pipeline, JOB),
         Some(JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }) | None
@@ -1077,7 +1130,7 @@ fn fingerprint(pipeline: &Pipeline, requests: &BTreeMap<(u32, u32), usize>) -> S
 
 // The graph job as it stands; a finished job has left the pipeline, so the
 // last look before that is what the outcome keeps.
-fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
+pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
     let (Some(view), Some(job), Some(state)) = (
         view.as_mut(),
         pipeline.graph_jobs.get(&JOB),
@@ -1085,6 +1138,7 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
     ) else {
         return;
     };
+    let looked = std::time::Instant::now();
     let tree = job.tree();
     view.kinds.extend(
         tree.live()
@@ -1114,9 +1168,34 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
         })
         .collect();
     let summary = job.recovery_summary();
-    view.blocks_reachable = summary.iter().map(|set| set.blocks_reachable).sum();
+    view.blocks_reachable = summary
+        .iter()
+        .filter_map(|set| tree.recovery(set.node))
+        .map(|recovery| {
+            let mut sets = Vec::new();
+            recovery.sets(&mut sets);
+            sets.iter().map(|set| set.blocks_reachable).sum::<u64>()
+        })
+        .sum();
     view.outcomes = summary.iter().map(|set| set.outcome).collect();
+    view.rulings = summary
+        .iter()
+        .map(|set| (set.kind.to_string(), set.outcome))
+        .collect();
+    let resident = tree
+        .live()
+        .into_iter()
+        .filter(|node| tree.volumes(*node).is_some())
+        .filter_map(|node| tree.namespace(node))
+        .flat_map(|namespace| {
+            namespace
+                .records()
+                .map(|record| namespace.resident(record.id))
+        })
+        .sum();
+    view.resident = view.resident.max(resident);
     *reads = job.writer().read_backs();
+    view.observed += looked.elapsed();
 }
 
 fn delivered_claim(files: &BTreeMap<String, Vec<u8>>, post: &Post) -> Claim {

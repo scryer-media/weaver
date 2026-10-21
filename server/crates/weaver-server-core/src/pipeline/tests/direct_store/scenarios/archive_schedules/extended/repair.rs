@@ -7,60 +7,44 @@ use super::*;
 use crate::pipeline::direct_store::router::crypt::{CryptRefusal, HeaderCryptRefusal};
 
 // Combined cases that carry a loss, and so a recovery set.
-const LOSS_CASES: usize = 6777;
+pub(super) const LOSS_CASES: usize = 6777;
 // Combined cases with a demote action at some boundary.
 const DEMOTE_CASES: usize = 2850;
 
 // What a campaign schedules: one of the matrix's archive formats, or two
 // independent single-volume sets in one job.
 #[derive(Clone, Copy, Debug)]
-enum Target {
+pub(super) enum Target {
     Format(Format),
     TwoSets,
 }
 
 // A job and everything a schedule over it must deliver.
-struct Fixture {
-    spec: JobSpec,
-    volumes: Vec<(String, Vec<u8>)>,
-    described: Option<Vec<String>>,
-    members: Vec<(&'static str, Vec<u8>)>,
-    route: Route,
+pub(super) struct Fixture {
+    pub spec: JobSpec,
+    pub volumes: Vec<(String, Vec<u8>)>,
+    pub described: Option<Vec<String>>,
+    pub members: Vec<(&'static str, Vec<u8>)>,
+    pub route: Route,
 }
 
 impl Fixture {
-    fn wanted(&self) -> Vec<&'static str> {
+    pub(super) fn wanted(&self) -> Vec<&'static str> {
         self.members.iter().map(|(name, _)| *name).collect()
     }
 }
 
 // The fixtures the archive matrix posts for the same targets.
-fn fixture(target: Target) -> Fixture {
+pub(super) fn fixture(target: Target) -> Fixture {
     let format = match target {
         Target::Format(format) => format,
         Target::TwoSets => {
-            let members: Vec<_> = [("alpha.mkv", 6001, 7), ("nested/beta.mkv", 4093, 11)]
-                .into_iter()
-                .map(|(name, len, step)| {
-                    let payload = (0..len)
-                        .map(|n| ((n * step + n / 251) % 253) as u8)
-                        .collect::<Vec<_>>();
-                    (name, payload)
-                })
-                .collect();
-            let volumes: Vec<_> = ["alpha", "beta"]
-                .into_iter()
-                .zip(&members)
-                .map(|(stem, (member, payload))| {
-                    let (_, bytes) = single_member_store_set(member, payload, 1).remove(0);
-                    (format!("{stem}.part01.rar"), bytes)
-                })
-                .collect();
+            let (members, payloads, volumes, spec) = two_set_fixture();
             return Fixture {
-                spec: direct_store_job_spec("Two set schedules", &volumes),
+                spec,
                 volumes,
                 described: None,
-                members,
+                members: members.into_iter().zip(payloads).collect(),
                 route: Route {
                     sets: 2,
                     ..Route::DIRECT
@@ -114,7 +98,7 @@ fn fixture(target: Target) -> Fixture {
 
 // Which slice of a campaign one test runs.
 #[derive(Clone, Copy, Debug)]
-enum Slice {
+pub(super) enum Slice {
     // The default suite's sample, drawn from the smoke schedules.
     Smoke,
     // One of `of` shards of the combined cases the campaign keeps.
@@ -124,7 +108,7 @@ enum Slice {
 // The cases a campaign keeps, by the replay index of the matrix they are
 // drawn from: `WEAVER_ARCHIVE_SCHEDULE_CASE` replays a smoke case and
 // `WEAVER_ARCHIVE_COMBINED_CASE` a combined one.
-fn campaign_cases(
+pub(super) fn campaign_cases(
     slice: Slice,
     keep: fn(Interruption) -> bool,
     pinned: usize,
@@ -151,7 +135,7 @@ fn campaign_cases(
     }
 }
 
-fn carries_loss(interruption: Interruption) -> bool {
+pub(super) fn carries_loss(interruption: Interruption) -> bool {
     interruption.loss().is_some()
 }
 
@@ -691,24 +675,35 @@ async fn two_sets_loss_in_a_renamed_demoted_set_leaves_the_other_direct() {
 }
 
 // Shards cut each campaign to well under a thousand cases, so no test
-// approaches the runner's per-test limit.
-macro_rules! par3_campaign {
-    ($module:ident, $format:expr, $profile:expr) => {
+// approaches the runner's per-test limit. Each shard calls `$run` with the
+// bracketed arguments and its slice.
+macro_rules! par3_shards {
+    ($module:ident, $run:path, $args:tt) => {
         mod $module {
             use super::*;
-            par3_campaign!(@each $format, $profile, 8;
+            par3_shards!(@each $run, $args, 8;
                 shard_0 0, shard_1 1, shard_2 2, shard_3 3,
                 shard_4 4, shard_5 5, shard_6 6, shard_7 7);
         }
     };
-    (@each $format:expr, $profile:expr, $of:literal; $($name:ident $shard:literal),+) => {
+    (@each $run:path, $args:tt, $of:literal; $($name:ident $shard:literal),+) => {
         $(
             #[tokio::test]
             #[ignore = "opt-in extended archive matrix; run with the archive-matrix-extended Nextest profile and --run-ignored all"]
             async fn $name() {
-                par3_campaign($format, $profile, Slice::Shard { shard: $shard, of: $of }).await;
+                par3_shards!(@call $run, $args, Slice::Shard { shard: $shard, of: $of });
             }
         )+
+    };
+    (@call $run:path, [$($arg:expr),*], $selection:expr) => {
+        $run($($arg,)* $selection).await
+    };
+}
+pub(super) use par3_shards;
+
+macro_rules! par3_campaign {
+    ($module:ident, $format:expr, $profile:expr) => {
+        par3_shards!($module, par3_campaign, [$format, $profile]);
     };
 }
 

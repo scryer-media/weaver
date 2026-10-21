@@ -100,7 +100,7 @@ impl<R: Root> GraphJob<R> {
             storage.free_disk,
         )
         .capped(storage.caps);
-        let mut unusable = Vec::new();
+        writer.restore_members(&tree);
         for ((node, member), state) in &snapshot.files {
             if tree
                 .namespace(*node)
@@ -110,15 +110,8 @@ impl<R: Root> GraphJob<R> {
                 continue;
             }
             writer.restore_file(&tree, *node, *member, *state)?;
-            if let Some(at) = state.unusable_at {
-                unusable.push((at, (*node, *member)));
-            }
         }
-        unusable.sort_unstable();
-        writer.restore_recovery_facts(
-            unusable.into_iter().map(|(_, found)| found).collect(),
-            snapshot.job.read_backs,
-        );
+        writer.restore_read_backs(snapshot.job.read_backs);
         for kept in &snapshot.kept {
             writer.restore_kept(kept)?;
         }
@@ -156,11 +149,7 @@ impl<R: Root> GraphJob<R> {
     // The node was offered this candidate last: it is offered again, so the
     // object derives its keys from it as it did before.
     fn offer_again(&mut self, node: NodeId, index: usize) -> Result<(), GraphError> {
-        let Some(secret) = self
-            .passwords
-            .offered_before(node, index)
-            .map(str::to_owned)
-        else {
+        let Some(secret) = self.passwords.resume_at(node, index).map(str::to_owned) else {
             return Ok(());
         };
         let mut effects = Vec::new();
@@ -177,7 +166,10 @@ impl<R: Root> GraphJob<R> {
     // next is read: an object's inverse map for a later article can lean on
     // what the earlier ones rebuilt, as a cipher's chain does. What does not
     // read is the root's to fetch again: the article waits, and the bytes
-    // it covered are no longer covered.
+    // it covered are no longer covered, or said at any depth they reached.
+    // A restore starts with no holds, so any it reads through are bytes an
+    // earlier article's delivery moved there from disk, as a member bound
+    // by its bytes moves its file.
     fn read_back(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
         let mut missing = Vec::new();
         let mut bytes = Vec::new();
@@ -188,7 +180,8 @@ impl<R: Root> GraphJob<R> {
                 bytes.clear();
                 if !self
                     .writer
-                    .read_posted(&self.tree, member, range, &mut bytes)
+                    .access(&self.tree)
+                    .read_at(NodeId::ROOT, member, range, &mut bytes)
                 {
                     missing.push((volume, ordinal, Some(range)));
                     continue;
@@ -304,7 +297,7 @@ fn same_volumes(tree: &Tree, volumes: usize) -> Result<(), RestoreFailure> {
         return Err(RestoreFailure::Post(0));
     };
     match namespace
-        .members()
+        .records()
         .find(|member| member.id.0 as usize >= volumes)
     {
         Some(member) => Err(RestoreFailure::Post(member.id.0)),

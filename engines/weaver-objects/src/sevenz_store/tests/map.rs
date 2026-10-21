@@ -17,7 +17,7 @@ fn parsed(bytes: &[u8]) -> Archive {
 }
 
 fn refused(archive: &Archive) -> Why {
-    build(archive).err().expect("refused")
+    build(archive).expect_err("refused")
 }
 
 #[test]

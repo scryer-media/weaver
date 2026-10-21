@@ -6,12 +6,17 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# The recovery record encoders, for other crates' tests. Never enabled in
+# a product build.
+test-support = []
+
 [dependencies]
 aws-lc-rs = { workspace = true }
 brotli = { workspace = true }
 bytes = { workspace = true }
 bzip2 = { workspace = true }
-crc-fast = { workspace = true }
+crc-turbo = { workspace = true }
 flate2 = { workspace = true }
 lzma-turbo = { workspace = true }
 par2-rs = { workspace = true }

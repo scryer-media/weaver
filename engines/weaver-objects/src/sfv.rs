@@ -220,11 +220,15 @@ impl Object for Sfv {
 
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
     // The text stays where the namespace put it, in the .sfv member's file.
+    // The text it copies out is in its facts, which a restart keeps: it says
+    // nothing of the posted bytes.
+    fn unposted(&mut self, _volume: VolumeIndex, _range: ByteRange) {}
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
             envelope: volume.0,
@@ -308,7 +312,7 @@ impl Recovery for Sfv {
         }
     }
 
-    fn wants(&mut self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
         let mut damaged = 0;
@@ -345,10 +349,6 @@ impl Recovery for Sfv {
 
     fn outcome(&self) -> Option<RepairOutcome> {
         self.outcome
-    }
-
-    fn blocks_reachable(&self) -> u64 {
-        0
     }
 }
 
