@@ -18,7 +18,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     time::Duration,
 };
 
@@ -50,6 +50,35 @@ const MAX_PARTIAL_CHUNKS: usize = 2048;
 pub struct InflightPiece {
     pub peer: PeerHandle,
     pub started: Instant,
+}
+
+/// The sender of every block of one piece, by block index; None for a
+/// block whose sender is not known.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Senders(Vec<Option<PeerHandle>>);
+
+impl Senders {
+    /// The sender of each block, by block index.
+    pub fn blocks(&self) -> &[Option<PeerHandle>] {
+        &self.0
+    }
+
+    /// The peers that sent a block of the piece, each once.
+    pub fn participants(&self) -> BTreeSet<PeerHandle> {
+        self.0.iter().flatten().copied().collect()
+    }
+
+    /// Whether one peer sent the whole piece. A block of unknown sender
+    /// counts as sent by another (libtorrent `torrent::piece_failed`).
+    pub fn sole_sender(&self) -> bool {
+        self.0.iter().all(Option::is_some) && self.participants().len() == 1
+    }
+}
+
+impl FromIterator<Option<PeerHandle>> for Senders {
+    fn from_iter<T: IntoIterator<Item = Option<PeerHandle>>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
 }
 
 /// Result of attempting to acquire a piece.
@@ -124,6 +153,12 @@ where
 pub struct PieceTracker {
     chunks: ChunkTracker,
     inflight: HashMap<ValidPieceIndex, InflightPiece>,
+    // Who sent each received block of the pieces not yet handed to their
+    // hash check. A record names only blocks its piece keeps: it outlives a
+    // sender that goes away, as the blocks do, and leaves with them
+    // (libtorrent keeps a block's downloader in the piece picker,
+    // `block_info::peer`, read by `piece_picker::get_downloaders`).
+    senders: HashMap<ValidPieceIndex, Senders>,
     // Breaks ties between equally rare pieces, and starts the initial random
     // pick.
     rng: StdRng,
@@ -141,6 +176,7 @@ impl PieceTracker {
         Self {
             chunks,
             inflight: HashMap::new(),
+            senders: HashMap::new(),
             rng,
         }
     }
@@ -269,6 +305,7 @@ impl PieceTracker {
             chunks,
             inflight,
             rng,
+            ..
         } = self;
         let chunks = &*chunks;
         let started = |p: ValidPieceIndex| chunks.received_chunks(p) > 0;
@@ -410,14 +447,17 @@ impl PieceTracker {
 
     // === PIECE COMPLETION ===
 
-    /// Remove piece from inflight tracking (e.g., after all chunks received).
+    /// The piece has every block and goes to its hash check: it leaves
+    /// inflight tracking, and the record of who sent its blocks leaves with
+    /// it.
     ///
-    /// Returns download duration if piece was in-flight.
-    /// Note: Does NOT mark the piece as downloaded - caller should do hash check
-    /// and then call `mark_piece_hash_ok` or `mark_piece_hash_failed`.
-    pub fn take_inflight(&mut self, piece: ValidPieceIndex) -> Option<Duration> {
+    /// Returns how long it was in flight and who sent its blocks, if it was
+    /// in flight. Does NOT mark the piece as downloaded: the caller checks
+    /// its hash and calls `mark_piece_hash_ok` or `mark_piece_hash_failed`.
+    pub fn take_inflight(&mut self, piece: ValidPieceIndex) -> Option<(Duration, Senders)> {
+        let senders = self.senders.remove(&piece).unwrap_or_default();
         let inflight = self.inflight.remove(&piece)?;
-        Some(inflight.started.elapsed())
+        Some((inflight.started.elapsed(), senders))
     }
 
     /// Mark piece as downloaded after successful hash verification.
@@ -488,12 +528,33 @@ impl PieceTracker {
 
     // === PASS-THROUGH METHODS ===
 
-    /// Mark a chunk as downloaded. Returns the result indicating if the piece is complete.
+    /// `sender` delivered the chunk `piece` carries, and the piece keeps it,
+    /// unless it already had every chunk. Returns the result indicating if
+    /// the piece is complete.
     pub fn mark_chunk_downloaded(
         &mut self,
         piece: &Piece<ByteBuf<'_>>,
+        sender: PeerHandle,
     ) -> Option<ChunkMarkingResult> {
-        self.chunks.mark_chunk_downloaded(piece)
+        let result = self.chunks.mark_chunk_downloaded(piece)?;
+        if !matches!(result, ChunkMarkingResult::PreviouslyCompleted) {
+            let lengths = self.chunks.get_lengths();
+            let index = lengths.validate_piece_index(piece.index)?;
+            let chunk = lengths.chunk_info_from_received_data(
+                index,
+                piece.begin,
+                piece.len().try_into().ok()?,
+            )?;
+            let blocks = lengths.chunks_per_piece(index) as usize;
+            let record = self
+                .senders
+                .entry(index)
+                .or_insert_with(|| Senders(vec![None; blocks]));
+            if let Some(slot) = record.0.get_mut(chunk.chunk_index as usize) {
+                *slot = Some(sender);
+            }
+        }
+        Some(result)
     }
 
     /// Update which files are selected for download.
@@ -502,7 +563,9 @@ impl PieceTracker {
         file_infos: &FileInfos,
         new_only_files: &HashSet<usize>,
     ) -> anyhow::Result<crate::chunk_tracker::HaveNeededSelected> {
-        self.chunks.update_only_files(file_infos, new_only_files)
+        let hns = self.chunks.update_only_files(file_infos, new_only_files)?;
+        self.forget_dropped_blocks();
+        Ok(hns)
     }
 
     /// Set the fetch priority of the given pieces.
@@ -510,7 +573,17 @@ impl PieceTracker {
         &mut self,
         priorities: impl IntoIterator<Item = (ValidPieceIndex, crate::piece_priority::PiecePriority)>,
     ) -> crate::chunk_tracker::HaveNeededSelected {
-        self.chunks.set_piece_priorities(priorities)
+        let hns = self.chunks.set_piece_priorities(priorities);
+        self.forget_dropped_blocks();
+        hns
+    }
+
+    /// A piece wanted again after it was not starts over without the blocks
+    /// it had received: who sent them goes with them.
+    fn forget_dropped_blocks(&mut self) {
+        let chunks = &self.chunks;
+        self.senders
+            .retain(|piece, _| chunks.received_chunks(*piece) > 0);
     }
 
     /// Update per-file have bytes when a piece completes. Returns remaining bytes for the file.
@@ -613,10 +686,23 @@ mod tests {
 
     /// Chunk `chunk` of piece `index` arrives.
     fn deliver(tracker: &mut PieceTracker, index: u32, chunk: u32) {
+        deliver_from(tracker, peer(1), index, chunk);
+    }
+
+    /// Chunk `chunk` of piece `index` arrives from `sender`.
+    fn deliver_from(tracker: &mut PieceTracker, sender: PeerHandle, index: u32, chunk: u32) {
         let block = vec![0u8; CHUNK_SIZE as usize];
         tracker
-            .mark_chunk_downloaded(&Piece::from_data(index, chunk * CHUNK_SIZE, &block))
+            .mark_chunk_downloaded(&Piece::from_data(index, chunk * CHUNK_SIZE, &block), sender)
             .unwrap();
+    }
+
+    /// Who the record of piece `i` names, block by block.
+    fn record(tracker: &PieceTracker, i: u32) -> Option<Vec<Option<PeerHandle>>> {
+        tracker
+            .senders
+            .get(&index(tracker, i))
+            .map(|senders| senders.blocks().to_vec())
     }
 
     type NoStream = std::iter::Empty<ValidPieceIndex>;
@@ -686,6 +772,75 @@ mod tests {
             set.iter()
                 .map(|(i, p)| (lengths.validate_piece_index(*i).unwrap(), *p)),
         );
+    }
+
+    #[test]
+    fn a_piece_has_a_sole_sender_only_when_one_known_peer_sent_every_block() {
+        let (a, b) = (peer(1), peer(2));
+        let sole: Senders = [a, a, a, a].map(Some).into_iter().collect();
+        assert!(sole.sole_sender());
+        assert_eq!(sole.participants(), BTreeSet::from([a]));
+
+        let shared: Senders = [a, b, a, a].map(Some).into_iter().collect();
+        assert!(!shared.sole_sender());
+        assert_eq!(shared.participants(), BTreeSet::from([a, b]));
+
+        // A block of unknown sender may have come from another peer.
+        let partly_unknown: Senders = [None, Some(a), Some(a), Some(a)].into_iter().collect();
+        assert!(!partly_unknown.sole_sender());
+        assert_eq!(partly_unknown.participants(), BTreeSet::from([a]));
+    }
+
+    #[test]
+    fn a_peer_that_goes_away_mid_piece_leaves_a_record_only_of_the_blocks_the_piece_keeps() {
+        let mut tracker = tracker(1);
+        let (gone, next) = (peer(1), peer(2));
+        let piece = reserved(tracker.acquire_piece(ask(gone, all, one)));
+        let piece = index(&tracker, piece);
+
+        // The peer sends block 0 and goes away with blocks 1 to 3 asked for:
+        // the piece goes back with block 0, and the record names only it.
+        deliver_from(&mut tracker, gone, 0, 0);
+        assert_eq!(tracker.release_pieces_owned_by(gone), 1);
+        assert_eq!(
+            record(&tracker, 0),
+            Some(vec![Some(gone), None, None, None])
+        );
+
+        // Another peer finishes it: the hash check is handed both senders,
+        // and the record leaves with the piece.
+        assert_eq!(reserved(tracker.acquire_piece(ask(next, all, one))), 0);
+        for chunk in 1..4 {
+            deliver_from(&mut tracker, next, 0, chunk);
+        }
+        let (_, senders) = tracker.take_inflight(piece).unwrap();
+        assert_eq!(
+            senders.blocks(),
+            [Some(gone), Some(next), Some(next), Some(next)]
+        );
+        assert!(tracker.senders.is_empty());
+
+        // The piece fails and starts over with no record.
+        tracker.mark_piece_hash_failed(piece);
+        assert_eq!(record(&tracker, 0), None);
+    }
+
+    #[test]
+    fn a_piece_that_drops_its_blocks_leaves_no_record() {
+        let mut tracker = tracker(2);
+        deliver_from(&mut tracker, peer(1), 1, 0);
+
+        // Skipped, the piece keeps its block, and the record its sender.
+        pri(&mut tracker, &[(1, PiecePriority::Skip)]);
+        assert_eq!(
+            record(&tracker, 1),
+            Some(vec![Some(peer(1)), None, None, None])
+        );
+
+        // Wanted again, it starts over without the block: the record goes.
+        pri(&mut tracker, &[(1, PiecePriority::Normal)]);
+        assert_eq!(tracker.missing_chunks(index(&tracker, 1)).count(), 4);
+        assert_eq!(record(&tracker, 1), None);
     }
 
     #[test]

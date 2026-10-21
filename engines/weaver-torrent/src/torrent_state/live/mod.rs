@@ -145,8 +145,7 @@ pub(crate) struct TorrentStateLocked {
 
     unflushed_bitv_bytes: u64,
 
-    // Who sent the blocks of the pieces in progress, and the blocks of the
-    // pieces that failed.
+    // The blocks of the pieces that failed, with their senders.
     smart_ban: SmartBan,
 }
 
@@ -2618,31 +2617,23 @@ impl PeerHandler {
             };
 
             let piece_index = chunk_info.piece_index;
-            let blocks = state.lengths.chunks_per_piece(piece_index);
             let full_piece_download = {
                 let mut g = state.lock_write("mark_chunk_downloaded");
-                let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece);
+                let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece, addr);
                 trace!(?piece, chunk_marking_result=?chunk_marking_result);
 
                 match chunk_marking_result {
                     Some(ChunkMarkingResult::Completed) => {
                         trace!("piece={} done, will write and checksum", piece.index);
-                        g.smart_ban.block_received(chunk_info, addr, blocks);
-                        let senders = g.smart_ban.take_senders(piece_index);
                         // Remove from inflight to prevent others from stealing it during hash check.
-                        g.get_pieces_mut()?
-                            .take_inflight(piece_index)
-                            .map(|time| (time, senders))
+                        g.get_pieces_mut()?.take_inflight(piece_index)
                     }
                     Some(ChunkMarkingResult::PreviouslyCompleted) => {
                         // TODO: we might need to send cancellations here.
                         debug!("piece={} was done by someone else, ignoring", piece.index);
                         return Ok(());
                     }
-                    Some(ChunkMarkingResult::NotCompleted) => {
-                        g.smart_ban.block_received(chunk_info, addr, blocks);
-                        None
-                    }
+                    Some(ChunkMarkingResult::NotCompleted) => None,
                     None => {
                         anyhow::bail!(
                             "bogus data received: {:?}, cannot map this to a chunk, dropping peer",

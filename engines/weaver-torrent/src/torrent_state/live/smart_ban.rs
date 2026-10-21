@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-//! Who sent each block of a piece, and the smart ban: the bytes of every
-//! block of a piece that failed its hash check are remembered with their
-//! sender, and once the piece passes, the sender of a block that differs
-//! from the good one is banned (libtorrent `smart_ban.cpp`).
+//! The smart ban: the bytes of every block of a piece that failed its hash
+//! check are remembered with their sender, and once the piece passes, the
+//! sender of a block that differs from the good one is banned (libtorrent
+//! `smart_ban.cpp`). Who sent each block of a piece in progress is the piece
+//! tracker's record, [`Senders`], as libtorrent keeps it in the piece picker.
 
 use std::collections::{BTreeSet, HashMap};
 
 use crate::{
     core::lengths::{ChunkInfo, Lengths, ValidPieceIndex},
+    piece_tracker::Senders,
     sha1w::{ISha1, Sha1},
     type_aliases::PeerHandle,
 };
@@ -24,24 +26,6 @@ pub(crate) trait ReadBlock:
 }
 impl<F: FnMut(PeerHandle, &ChunkInfo, &mut [u8]) -> anyhow::Result<()>> ReadBlock for F {}
 
-/// The sender of every block of one piece, by block index; None for a
-/// block whose sender is not known.
-#[derive(Debug, Default)]
-pub(crate) struct Senders(Vec<Option<PeerHandle>>);
-
-impl Senders {
-    /// The peers that sent a block of the piece, each once.
-    pub fn participants(&self) -> BTreeSet<PeerHandle> {
-        self.0.iter().flatten().copied().collect()
-    }
-
-    /// Whether one peer sent the whole piece. A block of unknown sender
-    /// counts as sent by another (libtorrent `torrent::piece_failed`).
-    pub fn sole_sender(&self) -> bool {
-        self.0.iter().all(Option::is_some) && self.participants().len() == 1
-    }
-}
-
 /// A block of a piece that failed, as `sender` sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SentBlock {
@@ -52,33 +36,12 @@ pub(crate) struct SentBlock {
 
 #[derive(Debug, Default)]
 pub(crate) struct SmartBan {
-    // Who sent the blocks of each piece being downloaded (libtorrent keeps
-    // this in the piece picker, `piece_picker::get_downloaders`).
-    senders: HashMap<ValidPieceIndex, Vec<Option<PeerHandle>>>,
     // Every block of each piece that failed and has not passed since, one
     // per block and sender (libtorrent `smart_ban_plugin::m_block_hashes`).
     failed: HashMap<ValidPieceIndex, Vec<SentBlock>>,
 }
 
 impl SmartBan {
-    /// `sender` delivered `chunk`, of a piece of `blocks` blocks, and the
-    /// piece keeps it.
-    pub fn block_received(&mut self, chunk: &ChunkInfo, sender: PeerHandle, blocks: u32) {
-        let senders = self
-            .senders
-            .entry(chunk.piece_index)
-            .or_insert_with(|| vec![None; blocks as usize]);
-        if let Some(slot) = senders.get_mut(chunk.chunk_index as usize) {
-            *slot = Some(sender);
-        }
-    }
-
-    /// The piece has every block: who sent them, for its hash check to
-    /// settle. The record leaves with them.
-    pub fn take_senders(&mut self, piece: ValidPieceIndex) -> Senders {
-        Senders(self.senders.remove(&piece).unwrap_or_default())
-    }
-
     /// The piece failed its hash check, and `blocks` are its blocks as read
     /// back. Each is remembered; returns the senders that had sent a block
     /// of it before with other bytes, as one of the two was bad (libtorrent
@@ -137,7 +100,7 @@ pub(crate) fn read_back(
     let mut buf = Vec::new();
     lengths
         .iter_chunk_infos(piece)
-        .zip(senders.0.iter())
+        .zip(senders.blocks())
         .filter_map(|(chunk, sender)| {
             let sender = (*sender)?;
             let digest = digest(sender, &chunk, &mut buf, &mut read)?;
@@ -215,13 +178,8 @@ mod tests {
     }
 
     // Piece 0 delivered block by block by `senders`.
-    fn deliver(smart_ban: &mut SmartBan, senders: [PeerHandle; BLOCKS as usize]) -> Senders {
-        let lengths = lengths();
-        let piece = lengths.validate_piece_index(0).unwrap();
-        for (chunk, sender) in lengths.iter_chunk_infos(piece).zip(senders) {
-            smart_ban.block_received(&chunk, sender, BLOCKS);
-        }
-        smart_ban.take_senders(piece)
+    fn deliver(senders: [PeerHandle; BLOCKS as usize]) -> Senders {
+        senders.map(Some).into_iter().collect()
     }
 
     fn piece() -> ValidPieceIndex {
@@ -229,32 +187,10 @@ mod tests {
     }
 
     #[test]
-    fn a_piece_has_a_sole_sender_only_when_one_known_peer_sent_every_block() {
-        let (a, b) = (peer(1), peer(2));
-        let mut smart_ban = SmartBan::default();
-        let sole = deliver(&mut smart_ban, [a, a, a, a]);
-        assert!(sole.sole_sender());
-        assert_eq!(sole.participants(), BTreeSet::from([a]));
-
-        let shared = deliver(&mut smart_ban, [a, b, a, a]);
-        assert!(!shared.sole_sender());
-        assert_eq!(shared.participants(), BTreeSet::from([a, b]));
-
-        // A block of unknown sender may have come from another peer.
-        for chunk in lengths().iter_chunk_infos(piece()).skip(1) {
-            smart_ban.block_received(&chunk, a, BLOCKS);
-        }
-        let partly_unknown = smart_ban.take_senders(piece());
-        assert!(!partly_unknown.sole_sender());
-        assert_eq!(partly_unknown.participants(), BTreeSet::from([a]));
-    }
-
-    #[test]
     fn at_the_pass_the_sender_of_a_block_that_differs_is_named_and_the_records_go() {
         let mut smart_ban = SmartBan::default();
         let (a, b) = (peer(1), peer(2));
-        let senders = deliver(&mut smart_ban, [a, a, b, b]);
-        assert!(smart_ban.senders.is_empty());
+        let senders = deliver([a, a, b, b]);
 
         let bad = Storage::with_bad_block(1);
         let failed = read_back(&lengths(), piece(), &senders, bad.read());
@@ -274,7 +210,7 @@ mod tests {
         let mut smart_ban = SmartBan::default();
         let (a, b) = (peer(1), peer(2));
 
-        let senders = deliver(&mut smart_ban, [a, a, b, b]);
+        let senders = deliver([a, a, b, b]);
         let failed = read_back(
             &lengths(),
             piece(),
@@ -285,7 +221,7 @@ mod tests {
 
         // The same blocks from the same peers fail again, but b's block 2
         // has other bytes this time.
-        let senders = deliver(&mut smart_ban, [a, a, b, b]);
+        let senders = deliver([a, a, b, b]);
         let failed = read_back(
             &lengths(),
             piece(),
@@ -300,7 +236,7 @@ mod tests {
         let mut smart_ban = SmartBan::default();
         let (a, b, c) = (peer(1), peer(2), peer(3));
         for poisoner in [a, b] {
-            let senders = deliver(&mut smart_ban, [poisoner, c, c, c]);
+            let senders = deliver([poisoner, c, c, c]);
             let failed = read_back(
                 &lengths(),
                 piece(),
@@ -321,10 +257,7 @@ mod tests {
         let mut smart_ban = SmartBan::default();
         let a = peer(1);
         let lengths = lengths();
-        for chunk in lengths.iter_chunk_infos(piece()).skip(1) {
-            smart_ban.block_received(&chunk, a, BLOCKS);
-        }
-        let senders = smart_ban.take_senders(piece());
+        let senders: Senders = [None, Some(a), Some(a), Some(a)].into_iter().collect();
 
         // Block 0 has no sender; block 1 cannot be read.
         let bad = Storage::with_bad_block(0);
