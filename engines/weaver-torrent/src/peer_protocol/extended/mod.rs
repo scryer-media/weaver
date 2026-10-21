@@ -34,13 +34,18 @@ pub mod ut_pex;
 
 use super::MY_EXTENDED_UT_METADATA;
 
+/// The id we name for upload_only (libtorrent's
+/// `bt_peer_connection::upload_only_msg` is 3, our ut_metadata's id).
+pub const MY_EXTENDED_UPLOAD_ONLY: u8 = 2;
+
+// An extension we do not speak has no entry in `m` (libtorrent
+// `bt_peer_connection::write_handshake` lists the loaded plugins only).
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct PeerExtendedMessageIds {
     pub ut_metadata: Option<u8>,
     pub ut_pex: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ut_holepunch: Option<u8>,
-    // We send upload_only and take none, so we name no id for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_only: Option<u8>,
 }
@@ -51,7 +56,7 @@ impl PeerExtendedMessageIds {
             ut_metadata: Some(MY_EXTENDED_UT_METADATA),
             ut_pex: Some(MY_EXTENDED_UT_PEX),
             ut_holepunch: None,
-            upload_only: None,
+            upload_only: Some(MY_EXTENDED_UPLOAD_ONLY),
         }
     }
 }
@@ -144,6 +149,16 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
             MY_EXTENDED_UT_HOLEPUNCH => {
                 Ok(ExtendedMessage::UtHolepunch(UtHolepunch::deserialize(buf)?))
             }
+            // One byte, nonzero when the peer only uploads (libtorrent
+            // `bt_peer_connection::on_extended`, `upload_only_msg`).
+            MY_EXTENDED_UPLOAD_ONLY => match buf.get_contiguous(buf.len()) {
+                Some(&[byte]) => Ok(ExtendedMessage::UploadOnly(byte != 0)),
+                _ => Err(MessageDeserializeError::IncorrectMsgLen {
+                    received: buf.len() as u32 + 1,
+                    expected: 2,
+                    msg_id,
+                }),
+            },
             _ => Ok(ExtendedMessage::Dyn(emsg_id, from_bytes_contig(&buf)?)),
         }
     }
@@ -266,8 +281,34 @@ mod tests {
             assert_eq!(buf[..sz], [7, byte]);
         }
         let res = ExtendedMessage::<ByteBuf>::UploadOnly(true)
-            .serialize(&mut buf, &PeerExtendedMessageIds::my);
+            .serialize(&mut buf, &PeerExtendedMessageIds::default);
         assert!(matches!(res, Err(SerializeError::NeedUploadOnly)));
+    }
+
+    // libtorrent `bt_peer_connection::on_extended`: under the id we named,
+    // upload_only is one byte, nonzero when the peer only uploads; a
+    // message of another size is not one.
+    #[test]
+    fn upload_only_is_read_under_our_id() {
+        let mut buf = [0u8; 8];
+        for enabled in [true, false] {
+            let msg = ExtendedMessage::<ByteBuf>::UploadOnly(enabled);
+            let sz = msg
+                .serialize(&mut buf, &PeerExtendedMessageIds::my)
+                .unwrap();
+            let de = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf[..sz], &[])).unwrap();
+            assert_eq!(de, msg);
+        }
+        assert_eq!(
+            ExtendedMessage::deserialize(DoubleBufHelper::new(&[2, 7], &[])).unwrap(),
+            ExtendedMessage::UploadOnly(true)
+        );
+        for bad in [&[2][..], &[2, 1, 1]] {
+            assert!(matches!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])),
+                Err(MessageDeserializeError::IncorrectMsgLen { .. })
+            ));
+        }
     }
 
     #[test]

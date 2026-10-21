@@ -1272,10 +1272,9 @@ impl TorrentStateLive {
             if !self.has_active_streams_unfinished_files(locked) {
                 // prevent deadlocks.
                 drop(g);
-                // There is not point being connected to peers that have all the torrent, when
-                // we don't need anything from them, and they don't need anything from us.
-                self.disconnect_all_peers_that_have_full_torrent();
-                // Nor to a web seed, which only uploads (libtorrent
+                // Each peer's requester, woken by finished_notify, lets a
+                // peer that only uploads go (PeerHandler::request_chunks).
+                // A web seed only uploads too (libtorrent
                 // `torrent::finished`).
                 self.shared.web_seeds.disconnect_all();
                 // The peers left are told we only upload now (libtorrent
@@ -1284,16 +1283,6 @@ impl TorrentStateLive {
             }
         }
         Ok(())
-    }
-
-    fn disconnect_all_peers_that_have_full_torrent(&self) {
-        for pe in self.peers.states.iter() {
-            if let PeerState::Live(l) = pe.value().get_state()
-                && l.has_full_torrent(self.lengths.total_pieces() as usize)
-            {
-                pe.value().disconnect();
-            }
-        }
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
@@ -1520,6 +1509,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 }
             }
             Message::Extended(ExtendedMessage::UtHolepunch(msg)) => self.on_holepunch(msg),
+            Message::Extended(ExtendedMessage::UploadOnly(upload_only)) => {
+                self.on_upload_only(upload_only)
+            }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.pex {
                     self.on_pex_message(pex)?;
@@ -1624,6 +1616,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 live.supports_holepunch = hs.m.ut_holepunch.is_some();
                 live.supports_upload_only = hs.m.upload_only.is_some();
             });
+        // A nonzero `upload_only` says the peer only uploads; zero or none
+        // says nothing (libtorrent `bt_peer_connection::on_extended_handshake`).
+        if hs.upload_only.is_some_and(|upload_only| upload_only != 0) {
+            self.on_upload_only(true);
+        }
 
         // The peer holds at most its `reqq` requests (libtorrent
         // `bt_peer_connection::on_extended_handshake`); our own limit stays
@@ -2157,6 +2154,18 @@ impl PeerHandler {
             });
     }
 
+    /// The peer says whether it only uploads (libtorrent
+    /// `peer_connection::set_upload_only`). Whether the connection is still
+    /// of use is decided where interest is: the requester looks again.
+    fn on_upload_only(&self, upload_only: bool) {
+        self.state
+            .peers
+            .with_live_mut(self.addr, "upload_only", |live| {
+                live.set_upload_only(upload_only)
+            });
+        self.on_bitfield_notify.notify_waiters();
+    }
+
     /// The peer said it is interested. A fast peer is first sent the pieces it
     /// may fetch while we choke it, unless we upload nothing.
     fn on_peer_interested(&self) {
@@ -2169,7 +2178,12 @@ impl PeerHandler {
             self.state
                 .peers
                 .with_live_mut(self.addr, "send_allowed_fast", |live| {
-                    live.send_allowed_fast(self.addr.ip(), info_hash, &self.state.lengths)
+                    live.send_allowed_fast(
+                        self.addr.ip(),
+                        info_hash,
+                        &self.state.lengths,
+                        self.state.super_seeding,
+                    )
                 });
         }
         self.tell_choker_interested();
@@ -2245,7 +2259,7 @@ impl PeerHandler {
         if self.state.super_seeding {
             self.state
                 .peers
-                .super_seed_spread(self.addr, piece, &self.state.lengths);
+                .super_seed_have(self.addr, piece, &self.state.lengths);
         }
         self.on_bitfield_notify.notify_waiters();
         Ok(())
@@ -2254,7 +2268,6 @@ impl PeerHandler {
     fn on_bitfield(&self, bitfield: &[u8]) -> anyhow::Result<()> {
         let bf = ingest_bitfield(bitfield, self.state.lengths.total_pieces())?;
         self.state.peers.update_bitfield(self.addr, bf);
-        self.super_seed();
         self.on_bitfield_notify.notify_waiters();
         Ok(())
     }
@@ -2276,8 +2289,8 @@ impl PeerHandler {
             .unwrap_or(false)
     }
 
-    /// The peer's pieces are known afresh: while we super-seed, it is
-    /// handed a piece unless it holds one it lacks.
+    /// The peer's pieces are known, from its first message: while we
+    /// super-seed, it is handed two.
     fn super_seed(&self) {
         if self.state.super_seeding {
             self.state.peers.super_seed(self.addr, &self.state.lengths);
@@ -2372,6 +2385,11 @@ impl PeerHandler {
                     .upgrade()
                     .is_some_and(|session| session.connection_slots.free() <= 5);
             let now = tokio::time::Instant::now();
+            if self.state.super_seeding {
+                self.state
+                    .peers
+                    .super_seed_tick(self.addr, now, &self.state.lengths);
+            }
             let Some(timed_out) = self
                 .state
                 .peers
@@ -2466,40 +2484,35 @@ impl PeerHandler {
             // Taken before what they guard is read, so no change in between
             // is missed.
             let mut wants_changed = std::pin::pin!(self.wants_changed());
-            let Some(interesting) =
+            let finished = self.state.is_finished_and_no_active_streams();
+            let Some((interesting, redundant)) =
                 self.state
                     .peers
                     .with_live_mut(self.addr, "update_interest", |live| {
-                        self.state.update_interest(live)
+                        let interesting = self.state.update_interest(live);
+                        (interesting, live.is_redundant(finished))
                     })
             else {
                 return Ok(());
             };
+            // The peer only uploads, and we only upload or want nothing it
+            // has: the connection is of no use (libtorrent
+            // `peer_connection::disconnect_if_redundant`, from
+            // `do_update_interest`, `set_upload_only` and `torrent::finished`).
+            if redundant {
+                debug!("the peer only uploads and we want nothing of it, disconnecting peer");
+                self.tx
+                    .send(WriterRequest::Disconnect(Ok(())))
+                    .ok()
+                    .ok_or(Error::PeerTaskDead)?;
+                // The writer sends what was queued before, NotInterested
+                // among it, then closes the connection, which ends this
+                // task.
+                return std::future::pending().await;
+            }
             // The peer has nothing we want: we wait until it, or what we
             // want, changes.
             if !interesting {
-                // A seed has nothing for us, nor we for it, once we only
-                // upload (libtorrent `peer_connection::disconnect_if_redundant`,
-                // upload_upload_connection, from `do_update_interest`).
-                if self.state.is_finished_and_no_active_streams()
-                    && self
-                        .state
-                        .peers
-                        .with_live(self.addr, |live| {
-                            live.has_full_torrent(self.state.lengths.total_pieces() as usize)
-                        })
-                        .unwrap_or(false)
-                {
-                    debug!("nothing left to do, neither of us is interested, disconnecting peer");
-                    self.tx
-                        .send(WriterRequest::Disconnect(Ok(())))
-                        .ok()
-                        .ok_or(Error::PeerTaskDead)?;
-                    // The writer sends what was queued before, NotInterested
-                    // among it, then closes the connection, which ends this
-                    // task.
-                    return std::future::pending().await;
-                }
                 aframe!(wants_changed).await;
                 continue;
             }

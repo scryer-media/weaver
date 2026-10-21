@@ -1,100 +1,106 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-//! Super-seeding (BEP 16): a seed tells each peer of one piece only, and
-//! hands it the next once the piece is seen to have spread.
+//! Super-seeding (BEP 16): a seed tells each peer of two pieces only, and
+//! hands it another once it reports one of them, or stays uninterested.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
+
+use rand::RngExt;
+use tokio::time::Instant;
 
 use crate::{
     core::lengths::{Lengths, ValidPieceIndex},
-    peer_connection::WriterRequest,
-    peer_protocol::Message,
     type_aliases::PeerHandle,
 };
 
 use super::PeerStates;
 
+/// How long a peer stays uninterested before it is handed another piece
+/// (libtorrent `peer_connection::second_tick`).
+const SUPER_SEED_UNINTERESTED: Duration = Duration::from_secs(10);
+
 impl PeerStates {
-    /// The pieces of the peer `handle` are known afresh, from its bitfield
-    /// or from its first message without one. Unless it holds a piece it
-    /// lacks, it is handed one to super-seed and told with HAVE
-    /// (libtorrent `bt_peer_connection::write_bitfield` under super-seeding).
-    /// The piece is one it lacks, held by the fewest live peers, and handed
-    /// to no other peer when one such is left (libtorrent
-    /// `torrent::get_piece_to_super_seed`); the lowest index among equals.
+    /// The pieces of the peer `handle` are known, from its first message:
+    /// it is handed two (libtorrent `bt_peer_connection::write_bitfield`
+    /// under super-seeding).
     pub fn super_seed(&self, handle: PeerHandle, lengths: &Lengths) {
         let _held = self.super_seeding.lock();
-        let holds_one_it_lacks = self.with_live(handle, |live| {
-            live.super_seeded
-                .is_some_and(|piece| !live.bitfield.get(piece.get_usize()).is_some_and(|b| *b))
-        });
-        if holds_one_it_lacks == Some(false) {
-            self.hand_super_seed(handle, lengths);
+        for _ in 0..2 {
+            self.hand_super_seed(handle, None, lengths);
         }
     }
 
-    /// The peer `from` reported `piece`. When it was not the peer handed
-    /// it, or it is our only peer, the piece has spread: every peer handed
-    /// it that has it is handed the next (libtorrent
-    /// `peer_connection::incoming_have` under `strict_super_seeding`).
-    pub fn super_seed_spread(&self, from: PeerHandle, piece: ValidPieceIndex, lengths: &Lengths) {
+    /// The peer `from` reported `piece`: when it was handed that piece, it
+    /// is handed another in its place (libtorrent
+    /// `peer_connection::incoming_have`, without `strict_super_seeding`).
+    pub fn super_seed_have(&self, from: PeerHandle, piece: ValidPieceIndex, lengths: &Lengths) {
         let _held = self.super_seeding.lock();
-        let handed_to_from = self.with_live(from, |live| live.super_seeded == Some(piece));
-        let alone = self
-            .states
-            .iter()
-            .filter(|p| p.get_live().is_some())
-            .count()
-            == 1;
-        if handed_to_from == Some(true) && !alone {
-            return;
-        }
-        let spread: Vec<PeerHandle> = self
-            .states
-            .iter()
-            .filter(|p| {
-                p.get_live().is_some_and(|live| {
-                    live.super_seeded == Some(piece)
-                        && live.bitfield.get(piece.get_usize()).is_some_and(|b| *b)
-                })
-            })
-            .map(|p| *p.key())
-            .collect();
-        for handle in spread {
-            self.hand_super_seed(handle, lengths);
+        if self.super_seeded(from, piece) {
+            self.hand_super_seed(from, Some(piece), lengths);
         }
     }
 
-    /// Whether the peer `handle` may ask for `piece`: only the piece it was
+    /// At `now`, the peer `handle` is handed another piece if it has not
+    /// been interested for longer than `SUPER_SEED_UNINTERESTED`: it may
+    /// want that one (libtorrent `peer_connection::second_tick`).
+    pub fn super_seed_tick(&self, handle: PeerHandle, now: Instant, lengths: &Lengths) {
+        let _held = self.super_seeding.lock();
+        let uninterested = self.with_live(handle, |live| {
+            live.uninterested_since()
+                .is_some_and(|since| now.saturating_duration_since(since) > SUPER_SEED_UNINTERESTED)
+        });
+        if uninterested == Some(true) {
+            self.hand_super_seed(handle, None, lengths);
+        }
+    }
+
+    /// Whether the peer `handle` may ask for `piece`: only a piece it was
     /// handed (libtorrent `peer_connection::incoming_request`).
     pub fn super_seeded(&self, handle: PeerHandle, piece: ValidPieceIndex) -> bool {
-        self.with_live(handle, |live| live.super_seeded == Some(piece)) == Some(true)
+        self.with_live(handle, |live| live.is_super_seeded(piece)) == Some(true)
     }
 
-    // Replaces the piece `handle` holds with the next, under the lock
-    // `super_seeding`. A peer that lacks no piece holds none.
-    fn hand_super_seed(&self, handle: PeerHandle, lengths: &Lengths) {
+    // Hands `handle`, under the lock `super_seeding`, a piece it lacks and
+    // as few live peers have as any; a piece handed to a peer, this one
+    // too, counts as more than any peer count while another is left; a
+    // random one among equals (libtorrent `torrent::get_piece_to_super_seed`).
+    // It replaces `replace`, or the older piece the peer holds; a peer that
+    // lacks no piece holds none.
+    fn hand_super_seed(
+        &self,
+        handle: PeerHandle,
+        replace: Option<ValidPieceIndex>,
+        lengths: &Lengths,
+    ) {
         let handed: HashSet<ValidPieceIndex> = self
             .states
             .iter()
-            .filter(|p| *p.key() != handle)
-            .filter_map(|p| p.get_live()?.super_seeded)
+            .filter_map(|p| Some(p.get_live()?.super_seeded_pieces().collect::<Vec<_>>()))
+            .flatten()
             .collect();
         let Some(has) = self.with_live(handle, |live| live.bitfield.clone()) else {
             return;
         };
-        let next = (0..lengths.total_pieces())
+        let rarity = |piece: &ValidPieceIndex| {
+            if handed.contains(piece) {
+                u32::MAX
+            } else {
+                self.availability.get(*piece)
+            }
+        };
+        let lacks: Vec<ValidPieceIndex> = (0..lengths.total_pieces())
             .filter_map(|i| lengths.validate_piece_index(i))
             .filter(|i| !has.get(i.get_usize()).is_some_and(|b| *b))
-            .min_by_key(|i| (handed.contains(i), self.availability.get(*i), i.get()));
+            .collect();
+        let rarest = lacks.iter().map(rarity).min();
+        let rarest: Vec<ValidPieceIndex> = lacks
+            .into_iter()
+            .filter(|piece| Some(rarity(piece)) == rarest)
+            .collect();
+        let new = (!rarest.is_empty()).then(|| rarest[rand::rng().random_range(0..rarest.len())]);
         self.with_live_mut(handle, "super_seed", |live| {
-            live.super_seeded = next;
-            if let Some(piece) = next {
-                let _ = live
-                    .tx
-                    .send(WriterRequest::Message(Message::Have(piece.get())));
-            }
+            live.hand_super_seed(replace, new)
         });
     }
 }

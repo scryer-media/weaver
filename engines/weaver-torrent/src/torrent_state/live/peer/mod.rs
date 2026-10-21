@@ -369,7 +369,7 @@ impl Peer {
     /// (libtorrent `peer_list::set_seed`, `set_upload_only`).
     pub(crate) fn connection_closing(&mut self) {
         if let Some(live) = self.get_live() {
-            self.upload_only = live.seeder || live.is_upload_only();
+            self.upload_only = live.is_upload_only();
         }
     }
 
@@ -822,9 +822,9 @@ pub(crate) struct LivePeerState {
     // choked it (libtorrent `peer_connection::m_num_invalid_requests`).
     invalid_requests: u16,
 
-    // While we super-seed, the one piece we told the peer we have
-    // (libtorrent `peer_connection::m_superseed_piece`).
-    pub super_seeded: Option<ValidPieceIndex>,
+    // While we super-seed, the two pieces we last told the peer we have,
+    // the newer first (libtorrent `peer_connection::m_superseed_piece`).
+    super_seeded: [Option<ValidPieceIndex>; 2],
 
     // The peer's extended handshake names ut_holepunch (libtorrent
     // `bt_peer_connection::m_holepunch_id`).
@@ -833,6 +833,10 @@ pub(crate) struct LivePeerState {
     // The peer's extended handshake names upload_only (libtorrent
     // `bt_peer_connection::m_upload_only_id`).
     pub supports_upload_only: bool,
+
+    // The peer said it only uploads, in its extended handshake or its last
+    // upload_only message (libtorrent `peer_connection::m_upload_only`).
+    upload_only: bool,
 
     // The peers its PEX messages named and have not dropped since, at most
     // MAX_PEX_PEERS of each address family (libtorrent `ut_pex_plugin`'s
@@ -923,9 +927,10 @@ impl LivePeerState {
             request_slots_changed: Default::default(),
             upload_queue: Default::default(),
             invalid_requests: 0,
-            super_seeded: None,
+            super_seeded: [None; 2],
             supports_holepunch: false,
             supports_upload_only: false,
+            upload_only: false,
             pex_named: HashSet::new(),
             pex_arrivals: [None; PEX_FLOOD_MESSAGES],
             dht_port: None,
@@ -1013,10 +1018,57 @@ impl LivePeerState {
         self.bitfield.get(0..total_pieces).is_some_and(|s| s.all())
     }
 
-    /// Whether the peer said it only uploads (BEP 21 `upload_only`); not
-    /// read yet, so never.
+    /// Whether the peer only uploads: it said so, or has every piece
+    /// (libtorrent `peer_connection::upload_only`; Have All sets the
+    /// bitfield, so `seeder` covers `m_have_all`).
     pub fn is_upload_only(&self) -> bool {
-        false
+        self.upload_only || self.seeder
+    }
+
+    /// The peer said whether it only uploads (libtorrent
+    /// `peer_connection::set_upload_only`).
+    pub(crate) fn set_upload_only(&mut self, upload_only: bool) {
+        self.upload_only = upload_only;
+    }
+
+    /// Whether the connection is of no use to either side: the peer only
+    /// uploads, and we only upload too (`finished`) or want nothing it has
+    /// (libtorrent `peer_connection::disconnect_if_redundant`).
+    pub(crate) fn is_redundant(&self, finished: bool) -> bool {
+        self.is_upload_only() && (finished || !self.interesting)
+    }
+
+    /// Whether we told the peer, super-seeding, that we have `piece`
+    /// (libtorrent `peer_connection::super_seeded_piece`).
+    pub(crate) fn is_super_seeded(&self, piece: ValidPieceIndex) -> bool {
+        self.super_seeded.contains(&Some(piece))
+    }
+
+    /// The pieces we told the peer, super-seeding, that we have.
+    pub(crate) fn super_seeded_pieces(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.super_seeded.iter().flatten().copied()
+    }
+
+    /// Tells the peer, super-seeding, that we have `new`, in place of
+    /// `replace` when it holds that piece, else of the older piece it
+    /// holds; with no `new`, it holds none (libtorrent
+    /// `peer_connection::superseed_piece`).
+    pub(crate) fn hand_super_seed(
+        &mut self,
+        replace: Option<ValidPieceIndex>,
+        new: Option<ValidPieceIndex>,
+    ) {
+        let Some(new) = new else {
+            self.super_seeded = [None; 2];
+            return;
+        };
+        let _ = self
+            .tx
+            .send(WriterRequest::Message(Message::Have(new.get())));
+        if replace.is_some() && self.super_seeded[0] == replace {
+            self.super_seeded.swap(0, 1);
+        }
+        self.super_seeded = [Some(new), self.super_seeded[0]];
     }
 
     pub fn request_slots_changed(&self) -> Arc<Notify> {
@@ -1280,20 +1332,30 @@ impl LivePeerState {
 
     /// The peer said it is interested. On a fast connection it is sent, the
     /// first time, the pieces it may fetch while we choke it: the allowed
-    /// fast set less the pieces it has (libtorrent
-    /// `bt_peer_connection::on_interested`,
+    /// fast set less the pieces it has; none while we `super_seeding`, which
+    /// shows only the pieces it hands out, nor to a peer that only uploads
+    /// (libtorrent `bt_peer_connection::on_interested`,
     /// `peer_connection::send_allowed_set`). The peer at `ip` downloads the
     /// torrent `info_hash` of `lengths`.
-    pub fn send_allowed_fast(&mut self, ip: IpAddr, info_hash: Id20, lengths: &Lengths) {
+    pub fn send_allowed_fast(
+        &mut self,
+        ip: IpAddr,
+        info_hash: Id20,
+        lengths: &Lengths,
+        super_seeding: bool,
+    ) {
         if !self.fast || self.allowed_fast_to_peer.is_some() {
             return;
         }
-        let set: Vec<ValidPieceIndex> =
+        let set: Vec<ValidPieceIndex> = if super_seeding || self.is_upload_only() {
+            Vec::new()
+        } else {
             allowed_fast_set(ip, info_hash, lengths.total_pieces(), ALLOWED_FAST_SET_SIZE)
                 .into_iter()
                 .filter_map(|piece| lengths.validate_piece_index(piece))
                 .filter(|piece| self.bitfield.get(piece.get_usize()).is_none_or(|has| !*has))
-                .collect();
+                .collect()
+        };
         for piece in &set {
             let _ = self
                 .tx
@@ -1431,6 +1493,11 @@ impl LivePeerState {
     /// Whether we want to download from the peer, as we last told it.
     pub(crate) fn is_interesting(&self) -> bool {
         self.interesting
+    }
+
+    /// Since when the peer is not interested; None while it is.
+    pub(crate) fn uninterested_since(&self) -> Option<Instant> {
+        (!self.peer_interested).then_some(self.became_uninterested)
     }
 
     /// Whether the connection is idle enough at `now` to end, with
