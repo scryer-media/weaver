@@ -1023,6 +1023,18 @@ impl Tree {
         })
     }
 
+    // Whether a member of `node`'s namespace has a front that has not yet
+    // decided its owner. It reads the undecided set, not the namespace, so
+    // it costs what is undecided, whatever the namespace's size.
+    pub fn deciding(&self, node: NodeId) -> bool {
+        self.nodes.get(&node).is_some_and(|found| {
+            found.undecided.iter().any(|member| {
+                found.namespace.get(*member).is_some()
+                    && found.namespace.copy_of(*member).is_none()
+            })
+        })
+    }
+
     // The members of `node` whose front has not yet decided their owner.
     pub fn undecided(&self, node: NodeId) -> impl Iterator<Item = MemberId> + '_ {
         self.nodes
