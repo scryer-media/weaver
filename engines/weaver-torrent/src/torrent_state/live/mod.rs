@@ -59,7 +59,7 @@ pub(crate) mod web_seed;
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     num::NonZeroU32,
     sync::{
@@ -97,7 +97,7 @@ use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
-    connection_slots::ConnectionSlot,
+    connection_slots::{ConnectionSlot, ConnectionSlots},
     file_info::FileInfo,
     file_ops::{FileOps, Verdict, inconsistent_hashes},
     limits::LimitKind,
@@ -117,8 +117,9 @@ use crate::{
 use self::{
     choker::CHOKED_REQUEST_GRACE,
     peer::{
-        InflightRequest, LivePeerState, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx, PeerState, PeerTx,
-        Refused, RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
+        DisconnectRank, InflightRequest, LivePeerState, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx,
+        PeerState, PeerTx, Refused, RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
+        opening_rank,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -226,6 +227,12 @@ pub struct TorrentStateLive {
     // The semaphore's permits: the most connections the torrent holds
     // (libtorrent `torrent::max_connections`).
     peer_limit: usize,
+    // The place each connection holds under the torrent's cap and the
+    // session's, by the connection's address. A connection is counted here
+    // until it ends or another displaces it: one asked to close for another
+    // no longer counts, as libtorrent drops a disconnecting connection from
+    // `torrent::m_connections` at once. Taken before `peers`.
+    places: Mutex<HashMap<PeerHandle, Place>>,
 
     finished_notify: Notify,
     new_pieces_notify: Arc<Notify>,
@@ -265,6 +272,43 @@ pub struct TorrentStateLive {
 // A block a peer asked for, on its way through the upload rate limits to the
 // peer's writer.
 type QueuedUpload = (PeerHandle, PeerTx, ChunkInfo);
+
+// One connection's place under the torrent's cap and under the session's.
+struct Place {
+    // The writer queue of the connection that holds it, which closes it.
+    tx: PeerTx,
+    // When the connection began (libtorrent `peer_connection::connected_time`).
+    since: tokio::time::Instant,
+    permit: OwnedSemaphorePermit,
+    slot: ConnectionSlot,
+}
+
+/// A connection's hold on its place: the place is freed when the
+/// connection's task ends, however it ends, unless another connection took
+/// it over first.
+struct Held {
+    state: Arc<TorrentStateLive>,
+    addr: PeerHandle,
+    tx: PeerTx,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut places = self.state.places.lock();
+        if places
+            .get(&self.addr)
+            .is_some_and(|place| place.tx.same_channel(&self.tx))
+        {
+            places.remove(&self.addr);
+        }
+    }
+}
+
+// Where a connection that came to a torrent at its cap finds a place.
+enum Room {
+    Free(OwnedSemaphorePermit),
+    Displacing(PeerHandle),
+}
 
 impl TorrentStateLive {
     fn max_request_window(&self) -> usize {
@@ -321,6 +365,7 @@ impl TorrentStateLive {
             lengths,
             peer_semaphore: Arc::new(Semaphore::new(peer_limit)),
             peer_limit,
+            places: Mutex::new(HashMap::new()),
             new_pieces_notify: Arc::new(Notify::new()),
             layer_fetch: hash_fetch::LayerFetch::new(paused.metadata.v2.as_ref()),
             finished_notify: Notify::new(),
@@ -445,6 +490,7 @@ impl TorrentStateLive {
             let Some((rx, tx)) = self.peers.admit_web_seed(link.handle()) else {
                 continue;
             };
+            let held = self.hold_place(link.handle(), &tx, permit, slot);
             let clients = session.http_clients.clone();
             let resolver = session.resolver.clone();
             self.spawn(
@@ -456,7 +502,7 @@ impl TorrentStateLive {
                 ),
                 aframe!(
                     self.clone()
-                        .task_manage_web_seed(link, clients, resolver, rx, tx, permit, slot)
+                        .task_manage_web_seed(link, clients, resolver, rx, tx, held)
                 ),
             );
         }
@@ -472,8 +518,7 @@ impl TorrentStateLive {
         resolver: Arc<dyn Resolver>,
         rx: PeerRx,
         tx: PeerTx,
-        permit: OwnedSemaphorePermit,
-        _slot: ConnectionSlot,
+        _held: Held,
     ) -> crate::Result<()> {
         let addr = link.handle();
         let counters = self
@@ -515,7 +560,6 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         }
-        drop(permit);
         Ok(())
     }
 
@@ -537,6 +581,9 @@ impl TorrentStateLive {
         &self.up_speed_estimator
     }
 
+    /// Takes an incoming connection that holds `slot` under the session's
+    /// cap. At the torrent's own cap it displaces a connection that ranks
+    /// lower, or is refused (libtorrent `torrent::attach_peer`).
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
@@ -547,16 +594,23 @@ impl TorrentStateLive {
             return Ok(AddIncomingPeerResult::NotWanted);
         }
         let (tx, rx) = unbounded_channel();
-        let permit = match self.peer_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                debug!("limit of live peers reached, keeping incoming peer for later");
-                if self.may_connect_to(checked_peer.addr) {
-                    self.peers
-                        .add_refused_incoming(checked_peer.addr, checked_peer.kind);
+        // Held until the newcomer holds its place, so the connection it
+        // displaces keeps its own until then.
+        let mut places = self.places.lock();
+        let room = match self.peer_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Room::Free(permit),
+            Err(_) => match self.displaced_by(&places, checked_peer.addr) {
+                Some(displaced) => Room::Displacing(displaced),
+                None => {
+                    drop(places);
+                    debug!("limit of live peers reached, keeping incoming peer for later");
+                    if self.may_connect_to(checked_peer.addr) {
+                        self.peers
+                            .add_refused_incoming(checked_peer.addr, checked_peer.kind);
+                    }
+                    return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
                 }
-                return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
-            }
+            },
         };
 
         // The port the connection came to: the one we listen on.
@@ -595,6 +649,19 @@ impl TorrentStateLive {
             }
         };
         atomic_inc(&counters.incoming_connections);
+        // The newcomer takes the place of the connection it displaces, under
+        // both caps; the slot it came with is let go.
+        let (permit, slot) = match room {
+            Room::Free(permit) => (permit, slot),
+            Room::Displacing(displaced) => {
+                let place = Self::give_up_place(&mut places, displaced)
+                    .expect("a place is given up under the lock it was found under");
+                debug!(%displaced, "displaced by an incoming connection");
+                (place.permit, place.slot)
+            }
+        };
+        let held = self.hold_place_in(&mut places, checked_peer.addr, &tx, permit, slot);
+        drop(places);
 
         self.spawn(
             debug_span!(
@@ -606,14 +673,10 @@ impl TorrentStateLive {
                 "[{}][addr={}]manage_incoming_peer",
                 self.shared.id, checked_peer.addr
             ),
-            aframe!(self.clone().task_manage_incoming_peer(
-                checked_peer,
-                counters,
-                tx,
-                rx,
-                permit,
-                slot
-            )),
+            aframe!(
+                self.clone()
+                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, held)
+            ),
         );
         Ok(AddIncomingPeerResult::Added)
     }
@@ -660,8 +723,7 @@ impl TorrentStateLive {
         counters: Arc<AtomicPeerCounters>,
         tx: PeerTx,
         rx: PeerRx,
-        permit: OwnedSemaphorePermit,
-        _slot: ConnectionSlot,
+        _held: Held,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
             addr: checked_peer.addr,
@@ -705,7 +767,6 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         };
-        drop(permit);
         Ok(())
     }
 
@@ -714,8 +775,7 @@ impl TorrentStateLive {
         addr: SocketAddr,
         rx: PeerRx,
         tx: PeerTx,
-        permit: OwnedSemaphorePermit,
-        _slot: ConnectionSlot,
+        _held: Held,
     ) -> crate::Result<()> {
         let state = self;
         let options = state.shared.options.peer_opts;
@@ -791,7 +851,6 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         }
-        drop(permit);
         Ok(())
     }
 
@@ -836,14 +895,11 @@ impl TorrentStateLive {
                 continue;
             };
             slots.begin_connect().await;
+            let held = state.hold_place(addr, &tx, permit, slot);
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(
-                    state
-                        .clone()
-                        .task_manage_outgoing_peer(addr, rx, tx, permit, slot)
-                ),
+                aframe!(state.clone().task_manage_outgoing_peer(addr, rx, tx, held)),
             );
         }
     }
@@ -1221,6 +1277,139 @@ impl TorrentStateLive {
             .max(1)
             .min(self.peers.connect_candidates());
         self.peers.disconnect_lowest(n, tokio::time::Instant::now());
+    }
+
+    // The connection at `addr`, whose writer queue is `tx`, begins: it holds
+    // `permit` under the torrent's cap and `slot` under the session's.
+    fn hold_place(
+        self: &Arc<Self>,
+        addr: PeerHandle,
+        tx: &PeerTx,
+        permit: OwnedSemaphorePermit,
+        slot: ConnectionSlot,
+    ) -> Held {
+        self.hold_place_in(&mut self.places.lock(), addr, tx, permit, slot)
+    }
+
+    fn hold_place_in(
+        self: &Arc<Self>,
+        places: &mut HashMap<PeerHandle, Place>,
+        addr: PeerHandle,
+        tx: &PeerTx,
+        permit: OwnedSemaphorePermit,
+        slot: ConnectionSlot,
+    ) -> Held {
+        let place = Place {
+            tx: tx.clone(),
+            since: tokio::time::Instant::now(),
+            permit,
+            slot,
+        };
+        places.insert(addr, place);
+        Held {
+            state: self.clone(),
+            addr,
+            tx: tx.clone(),
+        }
+    }
+
+    // The connection at `addr` is closed and gives its place up to whoever
+    // displaced it; it no longer counts (libtorrent
+    // `peer_connection::disconnect` with `too_many_connections`, a close
+    // that is no failure).
+    fn give_up_place(places: &mut HashMap<PeerHandle, Place>, addr: PeerHandle) -> Option<Place> {
+        let place = places.remove(&addr)?;
+        let _ = place.tx.send(WriterRequest::Disconnect(Ok(())));
+        Some(place)
+    }
+
+    // The connection that ranks lowest to keep, with its rank (libtorrent
+    // `torrent::find_lowest_ranking_peer`). libtorrent ranks by BEP 40's
+    // `peer_connection::peer_rank`; here the order the torrent turns peers
+    // over by ranks them ([`peer::Peer::disconnect_rank`]).
+    fn lowest_ranked(
+        &self,
+        places: &HashMap<PeerHandle, Place>,
+        now: tokio::time::Instant,
+    ) -> Option<(DisconnectRank, PeerHandle)> {
+        places
+            .keys()
+            .filter_map(|&addr| {
+                Some((
+                    self.peers.with_peer(addr, |p| p.disconnect_rank(now))??,
+                    addr,
+                ))
+            })
+            .min()
+    }
+
+    // Whom a connection from `addr` displaces at the torrent's cap, if
+    // anyone (libtorrent `torrent::attach_peer`). While more than one in ten
+    // of the most connections the torrent holds are still connecting, the
+    // connect begun longest ago gives way; otherwise the connection that
+    // ranks lowest, when the newcomer ranks higher. The newcomer ranks as a
+    // connection just opened, by what the peer list knows of its address.
+    fn displaced_by(
+        &self,
+        places: &HashMap<PeerHandle, Place>,
+        addr: PeerHandle,
+    ) -> Option<PeerHandle> {
+        let connecting = places
+            .iter()
+            .filter(|(addr, _)| {
+                self.peers
+                    .with_peer(**addr, |p| {
+                        matches!(p.get_state(), PeerState::Connecting(_))
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|(addr, place)| (place.since, *addr))
+            .collect::<Vec<_>>();
+        if connecting.len() > self.peer_limit / 10 {
+            return connecting.into_iter().min().map(|(_, addr)| addr);
+        }
+        let newcomer = opening_rank(
+            self.peers
+                .with_peer(addr, |p| p.trust())
+                .unwrap_or_default(),
+        );
+        let (lowest, displaced) = self.lowest_ranked(places, tokio::time::Instant::now())?;
+        (lowest < newcomer).then_some(displaced)
+    }
+
+    /// Closes the connection that ranks lowest, and returns the place under
+    /// the session's cap it gave up; see [`Self::lowest_ranked`].
+    pub(crate) fn give_up_lowest(&self) -> Option<ConnectionSlot> {
+        let mut places = self.places.lock();
+        let (_, lowest) = self.lowest_ranked(&places, tokio::time::Instant::now())?;
+        debug!(%lowest, "closed for a connection past the session's cap");
+        Some(Self::give_up_place(&mut places, lowest)?.slot)
+    }
+
+    /// Whether the connection at `addr` holds a place past the session's
+    /// cap, in its slack.
+    pub(crate) fn exceeds_limit(&self, addr: PeerHandle, slots: &ConnectionSlots) -> bool {
+        self.places
+            .lock()
+            .get(&addr)
+            .is_some_and(|place| slots.exceeds_limit(&place.slot))
+    }
+
+    /// The connection at `addr` takes `slot` for its place under the
+    /// session's cap; with none to take, it is closed.
+    pub(crate) fn settle_slot(&self, addr: PeerHandle, slot: Option<ConnectionSlot>) {
+        let mut places = self.places.lock();
+        match slot {
+            Some(slot) => {
+                if let Some(place) = places.get_mut(&addr) {
+                    place.slot = slot;
+                }
+            }
+            None => {
+                debug!(%addr, "no place under the session's cap, closing incoming connection");
+                Self::give_up_place(&mut places, addr);
+            }
+        }
     }
 
     // A torrent wants peers, outgoing and incoming, unless it has nothing

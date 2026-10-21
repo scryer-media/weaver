@@ -239,6 +239,15 @@ pub(crate) fn ingest_bitfield(payload: &[u8], total_pieces: u32) -> anyhow::Resu
 /// connected (libtorrent `compare_disconnect_peer` in `torrent.cpp`).
 pub(crate) type DisconnectRank = (bool, bool, Reverse<bool>, u64);
 
+/// Where a connection to a peer of `trust` stands before it has carried any
+/// payload, being opened or just opened: neither of us has shown interest,
+/// it is not known for a seed, and it sent nothing (libtorrent
+/// `torrent::attach_peer` ranks an incoming connection as it attaches, by
+/// the peer list's entry for its address).
+pub(crate) fn opening_rank(trust: Trust) -> DisconnectRank {
+    (false, false, Reverse(trust.on_parole()), 0)
+}
+
 #[derive(Debug)]
 pub(crate) struct Peer {
     pub addr: SocketAddr,
@@ -553,9 +562,8 @@ impl Peer {
     /// Where the peer's connection stands when the torrent turns peers over;
     /// the lowest goes first. None when it has no connection.
     pub(crate) fn disconnect_rank(&self, now: Instant) -> Option<DisconnectRank> {
-        let parole = Reverse(self.trust.on_parole());
         Some(match &self.state {
-            PeerState::Connecting(_) => (false, false, parole, 0),
+            PeerState::Connecting(_) => opening_rank(self.trust),
             PeerState::Live(live) => {
                 let fetched = Transfer::of(&self.stats.counters)
                     .fetched
@@ -564,7 +572,7 @@ impl Peer {
                 (
                     live.interesting,
                     live.seeder,
-                    parole,
+                    Reverse(self.trust.on_parole()),
                     fetched / (seconds + 1),
                 )
             }

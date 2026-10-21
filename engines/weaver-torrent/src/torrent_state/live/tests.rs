@@ -3638,6 +3638,140 @@ async fn a_session_at_its_connection_cutoff_turns_over_the_busiest_torrents_peer
     );
 }
 
+impl Harness {
+    /// The place the connection at `addr`, whose writer queue is `tx`, holds
+    /// under the torrent's cap and the session's, as its task would.
+    fn hold(&self, addr: SocketAddr, tx: &PeerTx) -> Held {
+        let permit = self.peer_semaphore.clone().try_acquire_owned().unwrap();
+        let slot = self._session.connection_slots.try_open().unwrap();
+        self.live.hold_place(addr, tx, permit, slot)
+    }
+
+    /// A connection from `addr` the listener took and checked, for this
+    /// torrent, with its place under the session's cap; and our end of it.
+    fn incoming(
+        &self,
+        addr: &str,
+    ) -> (
+        CheckedIncomingConnection,
+        crate::connection_slots::ConnectionSlot,
+        tokio::io::DuplexStream,
+    ) {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = crate::peer_info_reader::tests::halves(ours);
+        let checked = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: sock(addr),
+            reader,
+            writer,
+            read_buf: crate::read_buf::ReadBuf::new(),
+            handshake: Handshake::new(self.shared.info_hash, Id20::new([7; 20])),
+        };
+        let slot = self._session.connection_slots.try_accept().unwrap();
+        (checked, slot, theirs)
+    }
+
+    fn holds_place(&self, addr: &str) -> bool {
+        self.places.lock().contains_key(&sock(addr))
+    }
+}
+
+/// Whether the connection whose writer queue `rx` reads was asked to close.
+fn asked_to_close(rx: &mut PeerRx) -> bool {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|r| matches!(r, WriterRequest::Disconnect(Ok(()))))
+}
+
+// libtorrent `torrent::attach_peer`: at the torrent's cap, while more than
+// one in ten of its most connections are still connecting, the connect begun
+// longest ago gives way to an incoming connection.
+#[tokio::test]
+async fn an_incoming_connection_at_the_cap_replaces_the_oldest_connect_while_many_connect() {
+    let h = turnover_harness("displace_connect", 10, 200).await;
+    tokio::time::pause();
+    let mut held = Vec::new();
+    let mut connects = Vec::new();
+    for addr in ["203.0.113.1:6881", "203.0.113.2:6881"] {
+        h.peers.add_peer(sock(addr));
+        let (addr, rx, tx) = h.peers.connect_next(tokio::time::Instant::now()).unwrap();
+        held.push(h.hold(addr, &tx));
+        connects.push((addr, rx));
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let mut live = Vec::new();
+    for i in 1..=8 {
+        let (peer, rx) = h.new_peer(&format!("198.51.100.{i}:6881"));
+        held.push(h.hold(peer.addr, &peer.tx));
+        live.push(rx);
+    }
+
+    let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+    let [(oldest, oldest_rx), (newer, newer_rx)] = &mut connects[..] else {
+        unreachable!()
+    };
+    assert_eq!(*oldest, sock("203.0.113.1:6881"));
+    assert!(asked_to_close(oldest_rx));
+    assert!(!asked_to_close(newer_rx));
+    assert!(live.iter_mut().all(|rx| !asked_to_close(rx)));
+    assert!(!h.holds_place("203.0.113.1:6881"));
+    assert!(h.places.lock().contains_key(newer));
+    assert!(h.holds_place("192.0.2.1:6881"));
+    assert_eq!(h.connections(), (10, 10));
+}
+
+// libtorrent `torrent::attach_peer`, `find_lowest_ranking_peer`: at the
+// torrent's cap, with few connecting, an incoming connection replaces the
+// connection that ranks lowest when it ranks higher. Here a connection on
+// parole ranks lowest; the newcomer, never seen, is on none.
+#[tokio::test]
+async fn an_incoming_connection_at_the_cap_replaces_a_connection_that_ranks_lower() {
+    let h = turnover_harness("displace_lowest", 2, 200).await;
+    tokio::time::pause();
+    let (on_parole, mut on_parole_rx) = h.new_peer("203.0.113.1:6881");
+    h.peers
+        .with_peer_mut(on_parole.addr, "test", |p| p.piece_failed(false))
+        .unwrap();
+    let (kept, mut kept_rx) = h.new_peer("203.0.113.2:6881");
+    let _held = [
+        h.hold(on_parole.addr, &on_parole.tx),
+        h.hold(kept.addr, &kept.tx),
+    ];
+
+    let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+    assert!(asked_to_close(&mut on_parole_rx));
+    assert!(!asked_to_close(&mut kept_rx));
+    assert!(!h.holds_place("203.0.113.1:6881"));
+    assert!(h.holds_place("192.0.2.1:6881"));
+    assert_eq!(h.connections(), (2, 2));
+}
+
+// libtorrent `torrent::attach_peer`: an incoming connection that ranks no
+// higher than the lowest-ranked connection of a torrent at its cap is
+// refused, and every connection stays.
+#[tokio::test]
+async fn an_incoming_connection_at_the_cap_that_ranks_no_higher_is_refused() {
+    let h = turnover_harness("displace_none", 2, 200).await;
+    tokio::time::pause();
+    let (a, mut a_rx) = h.new_peer("203.0.113.1:6881");
+    let (b, mut b_rx) = h.new_peer("203.0.113.2:6881");
+    let _held = [h.hold(a.addr, &a.tx), h.hold(b.addr, &b.tx)];
+
+    let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(
+        added,
+        AddIncomingPeerResult::ConcurrencyLimitReached
+    ));
+    assert!(!asked_to_close(&mut a_rx));
+    assert!(!asked_to_close(&mut b_rx));
+    assert!(!h.holds_place("192.0.2.1:6881"));
+    assert_eq!(h.connections(), (2, 2));
+}
+
 /// Every dial reaches the test as [`Dialed`](crate::peer_info_reader::tests::Dialed)
 /// does; a datagram socket, which only the idle UDP tracker client holds,
 /// is bound on loopback.

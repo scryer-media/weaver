@@ -53,7 +53,10 @@ use crate::{
     api::TorrentIdOrHash,
     api_error::WithStatus,
     bitv_factory::{BitVFactory, NonPersistentBitVFactory},
-    connection_slots::{ConnectionSlots, DEFAULT_CONNECTION_SPEED, DEFAULT_CONNECTIONS_LIMIT},
+    connection_slots::{
+        ConnectionSlots, DEFAULT_CONNECTION_SPEED, DEFAULT_CONNECTIONS_LIMIT,
+        DEFAULT_CONNECTIONS_SLACK,
+    },
     create_torrent,
     create_torrent_file::CreateTorrentResult,
     dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
@@ -73,8 +76,8 @@ use crate::{
     },
     stream_connect::{ConnectionKind, ConnectionOptions, StreamConnector, StreamConnectorArgs},
     torrent_state::{
-        ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        TorrentMetadata, TorrentStateLive,
+        AddIncomingPeerResult, ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions,
+        ManagedTorrentState, TorrentMetadata, TorrentStateLive,
         initializing::{TorrentStateInitializing, normalize_initial_have},
     },
     type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerStream},
@@ -781,8 +784,15 @@ pub struct SessionOptions {
 
     /// Peer connections, incoming and outgoing, the session holds open at
     /// once across all its torrents. Outgoing connects wait for a free place;
-    /// an incoming connection past it is closed. Defaults to 200.
+    /// an incoming connection past it takes one in the slack. Defaults to
+    /// 200.
     pub connections_limit: usize,
+
+    /// Incoming connections past `connections_limit` the session takes, each
+    /// to replace a connection of the torrent that holds the most when that
+    /// is more than its own torrent holds; one past both is closed (libtorrent
+    /// `connections_slack`). Defaults to 10.
+    pub connections_slack: usize,
 
     /// Outgoing connects the session begins per second across all its
     /// torrents, handed to the torrents that want peers in turn. Defaults
@@ -850,6 +860,7 @@ impl Default for SessionOptions {
             peer_limit: None,
             unchoke_slots_limit: crate::torrent_state::live::choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
             connections_limit: DEFAULT_CONNECTIONS_LIMIT,
+            connections_slack: DEFAULT_CONNECTIONS_SLACK,
             connection_speed: DEFAULT_CONNECTION_SPEED,
             disable_local_service_discovery: false,
             disable_pex: false,
@@ -860,6 +871,15 @@ impl Default for SessionOptions {
             allow_multiple_connections_per_ip: false,
         }
     }
+}
+
+// Where a torrent stands when a connection past the session's cap must
+// replace one of another torrent's; the lowest gives one up: a torrent with
+// connections, then a finished one, so the downloading ones keep theirs,
+// then the most connections (libtorrent `compare_disconnect_torrent`).
+fn disconnect_candidate_rank(torrent: &TorrentStateLive) -> (bool, bool, std::cmp::Reverse<usize>) {
+    let (held, _) = torrent.connections();
+    (held == 0, !torrent.is_finished(), std::cmp::Reverse(held))
 }
 
 fn torrent_file_from_info_bytes(
@@ -1247,6 +1267,7 @@ impl Session {
                 udp_tracker_client,
                 connection_slots: Arc::new(ConnectionSlots::new(
                     opts.connections_limit,
+                    opts.connections_slack,
                     opts.connection_speed,
                 )),
                 ratelimits: Limits::new(opts.ratelimits),
@@ -1475,8 +1496,9 @@ impl Session {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
                             let session = session.upgrade().context("session is dead")?;
-                            // Dropping the halves closes a connection past the session's cap.
-                            let Some(slot) = session.connection_slots.try_open() else {
+                            // Dropping the halves closes a connection past the
+                            // session's cap and its slack.
+                            let Some(slot) = session.connection_slots.try_accept() else {
                                 debug!(%addr, "at the session's connection limit, closing incoming connection");
                                 continue;
                             };
@@ -1502,8 +1524,16 @@ impl Session {
                 },
                 Some(Ok((live, checked, slot))) = futs.next(), if !futs.is_empty() => {
                     let (addr, kind) = (checked.addr, checked.kind);
-                    if let Err(e) = live.add_incoming_peer(checked, slot) {
-                        warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
+                    match live.add_incoming_peer(checked, slot) {
+                        Ok(AddIncomingPeerResult::Added) => {
+                            if let Some(session) = session.upgrade() {
+                                session.settle_over_limit(&live, addr);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
+                        }
                     }
                 },
                 else => continue,
@@ -1746,6 +1776,31 @@ impl Session {
                 torrent.turn_peers_over();
             }
         }
+    }
+
+    // An incoming connection at `addr` of `live` that the slack let in past
+    // the session's cap takes a place under it: a free one, or that of the
+    // lowest-ranked connection of the torrent that holds the most, when it
+    // holds more than `live` does; else it is closed (libtorrent
+    // `session_impl::incoming_connection` marks it
+    // `peer_connection::peer_exceeds_limit`, and attaching it settles that:
+    // `peer_connection::attach_to_torrent`, `find_disconnect_candidate_torrent`,
+    // `torrent::find_lowest_ranking_peer`). One that displaced a connection
+    // of its own torrent took that one's place, and is under the cap.
+    pub(crate) fn settle_over_limit(&self, live: &TorrentStateLive, addr: SocketAddr) {
+        if !live.exceeds_limit(addr, &self.connection_slots) {
+            return;
+        }
+        let slot = self.connection_slots.try_open().or_else(|| {
+            let fullest = self
+                .live_torrents()
+                .into_iter()
+                .min_by_key(|t| disconnect_candidate_rank(t))?;
+            (fullest.connections().0 > live.connections().0)
+                .then(|| fullest.give_up_lowest())
+                .flatten()
+        });
+        live.settle_slot(addr, slot);
     }
 
     /// Run a callback given the currently managed torrents.
@@ -3107,6 +3162,20 @@ mod tests {
         std::sync::Arc<Session>,
         super::ManagedTorrentHandle,
     ) {
+        seeding_with(connections_limit, super::DEFAULT_CONNECTIONS_SLACK, upload).await
+    }
+
+    // As [`seeding`], the session taking `connections_slack` incoming
+    // connections past its cap.
+    async fn seeding_with(
+        connections_limit: usize,
+        connections_slack: usize,
+        upload: crate::limits::LimitKind,
+    ) -> (
+        TempDir,
+        std::sync::Arc<Session>,
+        super::ManagedTorrentHandle,
+    ) {
         let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
             1,
             16384,
@@ -3137,6 +3206,7 @@ mod tests {
                     ..Default::default()
                 }),
                 connections_limit,
+                connections_slack,
                 ..Default::default()
             },
         )
@@ -3421,17 +3491,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_incoming_connection_past_the_session_cap_is_closed() {
-        let (_dir, session, handle) = seeding(1, crate::limits::LimitKind::Unlimited).await;
+    async fn an_incoming_connection_past_the_session_cap_and_slack_is_closed() {
+        let (_dir, session, handle) = seeding_with(1, 0, crate::limits::LimitKind::Unlimited).await;
 
-        // The one place under the cap is taken: the listener closes the
-        // connection it accepts without reading the handshake.
+        // The one place under the cap is taken and there is no slack: the
+        // listener closes the connection it accepts without reading the
+        // handshake (libtorrent `session_impl::incoming_connection`).
         let held = session.connection_slots.try_open().unwrap();
         assert!(answer(&session, &handle).await.is_empty());
 
         // Freed, the same connection is taken and answered.
         drop(held);
         assert!(is_handshake_for(&answer(&session, &handle).await, &handle));
+
+        session.stop().await;
+    }
+
+    // A connection from `addr` the listener took and checked, for the
+    // torrent of `info_hash`; and our end of it.
+    fn incoming(
+        addr: &str,
+        info_hash: super::Id20,
+    ) -> (super::CheckedIncomingConnection, tokio::io::DuplexStream) {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = crate::peer_info_reader::tests::halves(ours);
+        let checked = super::CheckedIncomingConnection {
+            kind: crate::stream_connect::ConnectionKind::Tcp,
+            addr: addr.parse().unwrap(),
+            reader,
+            writer,
+            read_buf: crate::read_buf::ReadBuf::new(),
+            handshake: crate::peer_protocol::Handshake::new(info_hash, super::Id20::new([7; 20])),
+        };
+        (checked, theirs)
+    }
+
+    // libtorrent `session_impl::incoming_connection`: past `connections_limit`
+    // the session takes up to `connections_slack` more incoming connections.
+    // Attaching one closes the lowest-ranked connection of the torrent that
+    // holds the most, when it holds more than the newcomer's own, and the
+    // newcomer is under the cap in its place (`peer_connection::
+    // attach_to_torrent`, `session_impl::find_disconnect_candidate_torrent`,
+    // `torrent::find_lowest_ranking_peer`).
+    #[tokio::test]
+    async fn an_incoming_connection_in_the_slack_replaces_one_of_the_fullest_torrent() {
+        use crate::torrent_state::AddIncomingPeerResult;
+        use tokio::io::AsyncReadExt;
+
+        let (dir, session, fullest) = seeding_with(2, 1, crate::limits::LimitKind::Unlimited).await;
+        // Another torrent of the same file, in pieces of another length.
+        let other = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(32768),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let other = session
+            .add_torrent(
+                AddTorrent::from_bytes(other),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        other.wait_until_completed().await.unwrap();
+        tokio::time::pause();
+        let (fullest_live, other_live) = (fullest.live().unwrap(), other.live().unwrap());
+        let slots = &session.connection_slots;
+
+        // The fullest torrent takes both places under the cap.
+        let mut ends = Vec::new();
+        for addr in ["127.0.0.1:6881", "127.0.0.2:6881"] {
+            let slot = slots.try_accept().unwrap();
+            assert!(!slots.exceeds_limit(&slot));
+            let (checked, theirs) = incoming(addr, fullest.info_hash());
+            let added = fullest_live.add_incoming_peer(checked, slot).unwrap();
+            assert!(matches!(added, AddIncomingPeerResult::Added));
+            ends.push(theirs);
+        }
+
+        // The next connection takes the slack's one place.
+        let slot = slots.try_accept().unwrap();
+        assert!(slots.exceeds_limit(&slot));
+        assert!(slots.try_accept().is_none());
+        let (checked, _newcomer_end) = incoming("127.0.0.3:6881", other.info_hash());
+        let newcomer = checked.addr;
+        let added = other_live.add_incoming_peer(checked, slot).unwrap();
+        assert!(matches!(added, AddIncomingPeerResult::Added));
+        session.settle_over_limit(&other_live, newcomer);
+
+        // It holds a place under the cap, the fullest torrent one connection
+        // fewer, and the slack's place is free again.
+        assert!(!other_live.exceeds_limit(newcomer, slots));
+        assert_eq!(fullest_live.connections().0, 1);
+        assert_eq!(slots.in_use(), 2);
+        assert!(slots.exceeds_limit(&slots.try_accept().unwrap()));
+        // Of its two connections, alike in rank, the first by address closed.
+        let mut rest = Vec::new();
+        ends[0].read_to_end(&mut rest).await.unwrap();
 
         session.stop().await;
     }
