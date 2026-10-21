@@ -2156,6 +2156,7 @@ enum NetworkConsumerKind {
 	OUTBOUND
 	TORRENT_DEFAULT
 	TORRENT_CATEGORY
+	TORRENT_TRACKER
 }
 
 """
@@ -5039,6 +5040,10 @@ type TrackerRule {
 	The client its torrents name themselves as; absent is Weaver.
 	"""
 	client: TorrentClient
+	"""
+	Whether its torrents route through their own consumer.
+	"""
+	torrentRoute: Boolean!
 }
 
 input TrackerRuleInput {
@@ -5047,6 +5052,7 @@ input TrackerRuleInput {
 	neverPause: Boolean! = false
 	unpack: Boolean
 	client: TorrentClient
+	torrentRoute: Boolean! = false
 }
 
 enum TrackerStatus {

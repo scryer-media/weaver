@@ -483,9 +483,8 @@ impl ProxyRuntime {
     }
     // Everyone who owns a route, each with its name and how many connections
     // it holds: every server and feed, default outbound, the default torrent
-    // route, and each category that routes its torrents itself. A category
-    // without its own route rides the default torrent route and is no
-    // consumer.
+    // route, and each category and tracker rule that routes its torrents
+    // itself. A category or rule without its own route is no consumer.
     pub(super) fn consumer_labels(
         db: &Database,
     ) -> Result<Vec<(Consumer, String, u16)>, crate::StateError> {
@@ -516,6 +515,18 @@ impl ProxyRuntime {
                         (
                             Consumer::Torrent(TorrentScope::Category(category.id)),
                             category.name,
+                            1,
+                        )
+                    }),
+            )
+            .chain(
+                db.list_tracker_rules()?
+                    .into_iter()
+                    .filter(|rule| rule.torrent_route)
+                    .map(|rule| {
+                        (
+                            Consumer::Torrent(TorrentScope::TrackerRule(rule.id)),
+                            rule.host_pattern,
                             1,
                         )
                     }),

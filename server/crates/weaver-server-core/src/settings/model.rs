@@ -446,6 +446,9 @@ pub struct TrackerRule {
     // The client a torrent under this rule names itself as; `None` is
     // Weaver.
     pub client: Option<Client>,
+    // The rule's torrents route through `torrent:tracker:<id>` instead of
+    // their category's route or `torrent:default`.
+    pub torrent_route: bool,
 }
 
 // A client a torrent may name itself as, for the trackers that admit only
@@ -739,6 +742,7 @@ mod tests {
             never_pause: false,
             unpack: None,
             client: None,
+            torrent_route: false,
         }
     }
 

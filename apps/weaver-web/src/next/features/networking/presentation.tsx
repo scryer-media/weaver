@@ -127,8 +127,6 @@ export function routeProblemText(t: Translate, problem: RouteProblem): string {
       return t("next.networking.problem.egressDisabled");
     case "proxyRepeated":
       return t("next.networking.problem.proxyRepeated");
-    case "torrentLegs":
-      return t("next.refusal.TORRENT_ROUTE_LEGS");
     case "torrentPool":
       return t("next.refusal.TORRENT_ROUTE_POOL");
   }
