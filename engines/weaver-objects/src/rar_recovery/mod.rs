@@ -63,15 +63,21 @@ impl Rev {
         self.closed && !self.lost && self.length.is_some()
     }
 
+    // The header tells how much of the front it needs only as the front
+    // grows, so the front takes from these bytes for as long as each read of
+    // it asks for more and they reach: what it takes never depends on where
+    // the deliveries were cut.
     fn take(&mut self, offset: u64, bytes: &[u8]) {
-        let have = self.front.len() as u64;
-        if self.wanted > self.front.len() && offset <= have {
-            let skip = (have - offset) as usize;
-            let room = self.wanted - self.front.len();
-            if let Some(fresh) = bytes.get(skip..) {
-                self.front
-                    .extend_from_slice(&fresh[..fresh.len().min(room)]);
+        let end = offset + bytes.len() as u64;
+        while self.wanted > self.front.len() {
+            let have = self.front.len() as u64;
+            if offset > have || end <= have {
+                break;
             }
+            let fresh = &bytes[(have - offset) as usize..];
+            let room = self.wanted - self.front.len();
+            self.front
+                .extend_from_slice(&fresh[..fresh.len().min(room)]);
             self.wanted = match header::rar5(&self.front) {
                 Read::Short(needed) => needed,
                 Read::Header(_) | Read::Not => 0,
@@ -79,7 +85,6 @@ impl Rev {
         }
         if let Some(length) = self.length {
             let start = length.saturating_sub(RAR3_FOOTER as u64);
-            let end = offset + bytes.len() as u64;
             for at in offset.max(start)..end.min(length) {
                 self.footer[(at - start) as usize] = Some(bytes[(at - offset) as usize]);
             }

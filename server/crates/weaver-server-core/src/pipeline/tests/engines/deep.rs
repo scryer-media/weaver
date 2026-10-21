@@ -8,12 +8,14 @@
 // across levels; and the rows where an object gives a member up, to the
 // engine or as a leaf, restarted after every article. Two deep as well: a
 // PAR3 set repairing the archive beside it, an AES zip, one output name at
-// two depths, and a recovery volume a restart cannot read back. Classic
-// runs no repair inside an archive and enforces no cap in this harness, so
-// each row names what it does beside the graph.
+// two depths, a RAR set rebuilt from its `.rev`, a compressed RAR whose
+// password never comes, and the recovery volumes and index a restart cannot
+// read back. Classic runs no repair inside an archive and enforces no cap in
+// this harness, so each row names what it does beside the graph.
 
 use sevenz_turbo::encoder_options::Lzma2Options;
 use sevenz_turbo::{EncoderConfiguration, EncoderMethod};
+use weaver_graph::Why;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::caps::{FLOOR, assert_refused, limits, zeros_zstd};
@@ -22,6 +24,7 @@ use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, kinds, par2_set, par3_set, payload, run, run_both,
     try_run,
 };
+use super::rar_rev::{body as rev_body, rar5_revs};
 use super::restart::{Down, assert_restarted, restart_row, run_restarting, run_restarting_at};
 use super::sevenz::{SECRET, container, members as sevenz_members};
 use super::streams::{tar, xz};
@@ -29,8 +32,8 @@ use super::zip::{archive as zip_archive, members as zip_members, stored as zip_s
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
-use crate::pipeline::tests::direct_store::multi_member_store_set;
 use crate::pipeline::tests::direct_store::scenarios::encrypted_store_set;
+use crate::pipeline::tests::direct_store::{multi_member_store_set, single_member_store_set};
 
 fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
@@ -489,26 +492,29 @@ fn articles_holding(outer: &[u8], inner: &[u8]) -> Vec<(u32, u32)> {
         .collect()
 }
 
-// `ember.bin` after its PAR2 index and volume in a stored RAR, `level.rar`,
-// in a stored RAR posted as `lantern.rar`, served in order, one article of
-// `ember.bin` damaged. The pipeline goes down once the volume is in and
-// before the damaged article comes, and the volume's file is lost: the restore
-// cannot read back the articles holding it, so what they carried was never
-// said at any depth. They come again, the set counts their blocks once, and
-// it repairs as the run that never restarted does.
-#[tokio::test]
-async fn a_par2_volume_two_deep_a_restart_cannot_read_back_comes_again_and_its_set_still_repairs() {
-    let ember = payload(6 * ARTICLE + 5, 104);
-    let set = par2_set("ember", &[("ember.bin", ember.as_slice())], 2);
+// `ember.bin` after `set` in a stored RAR, `level.rar`, in a stored RAR
+// posted as `lantern.rar`, served in order, one article of `ember.bin`
+// damaged. The pipeline goes down after the article `down` picks of those
+// holding `lost`, before the damaged article comes, and the file of `lost`
+// is gone: the restore cannot read back the articles holding it, so what
+// they carried was never said at any depth. They come again, the set is
+// found once and counts their blocks once, and it repairs as the run that
+// never restarted does.
+async fn assert_lost_at_restart_repairs(
+    ember: &[u8],
+    set: &[Post],
+    lost: &Post,
+    down: fn(&[(u32, u32)]) -> u32,
+) {
     let mut entries: Vec<(&str, Vec<u8>)> = set
         .iter()
         .map(|post| (post.name.as_str(), post.bytes.clone()))
         .collect();
-    entries.push(("ember.bin", ember.clone()));
+    entries.push(("ember.bin", ember.to_vec()));
     let outer = rar(&[("level.rar", rar(&entries))]);
-    let volume = &set[1];
-    let held = articles_holding(&outer, &volume.bytes);
-    let damaged = articles_inside(&outer, &ember)[1];
+    let held = articles_holding(&outer, &lost.bytes);
+    let at = down(&held);
+    let damaged = articles_inside(&outer, ember)[1];
     let order: Vec<(u32, u32)> = (0..outer.len().div_ceil(ARTICLE) as u32)
         .map(|ordinal| (0, ordinal))
         .collect();
@@ -518,10 +524,17 @@ async fn a_par2_volume_two_deep_a_restart_cannot_read_back_comes_again_and_its_s
     let whole = run(&scenario, Engine::Graph).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     assert!(whole.files[&delivered("ember.bin")] == ember);
-    let (_, last) = *held.last().unwrap();
-    assert!(damaged > last, "the damage comes after the restart");
-    let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Losing(&volume.name), &|nth| {
-        nth == last as usize + 1
+    assert!(
+        matches!(
+            whole.graph().outcomes[..],
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        whole.graph().outcomes
+    );
+    assert!(damaged > at, "the damage comes after the restart");
+    let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Losing(&lost.name), &|nth| {
+        nth == at as usize + 1
     })
     .await;
     assert_eq!(restarted.restarts, 1);
@@ -533,19 +546,168 @@ async fn a_par2_volume_two_deep_a_restart_cannot_read_back_comes_again_and_its_s
     for (name, bytes) in &whole.files {
         assert!(restarted.files[name] == *bytes, "{name}: delivered bytes");
     }
-    let lost: std::collections::BTreeSet<(u32, u32)> = held
+    let unread: std::collections::BTreeSet<(u32, u32)> = held
         .iter()
+        .filter(|(_, ordinal)| *ordinal <= at)
         .filter(|article| !restarted.in_memory.contains(article))
         .copied()
         .collect();
-    assert!(!lost.is_empty(), "the volume is on disk at the restart");
+    assert!(
+        !unread.is_empty(),
+        "the lost file is on disk at the restart"
+    );
     assert_eq!(
-        restarted.from_disk, lost,
-        "the articles holding the volume on disk, and no other, come again"
+        restarted.from_disk, unread,
+        "the articles holding the lost file on disk, and no other, come again"
     );
     assert_eq!(restarted.graph.outcomes, whole.graph().outcomes);
     assert_eq!(
         restarted.graph.blocks_reachable,
         whole.graph().blocks_reachable
+    );
+}
+
+// The last article holding the post.
+fn its_last(held: &[(u32, u32)]) -> u32 {
+    held.last().unwrap().1
+}
+
+// The pipeline goes down once the PAR2 volume is in.
+#[tokio::test]
+async fn a_par2_volume_two_deep_a_restart_cannot_read_back_comes_again_and_its_set_still_repairs() {
+    let ember = payload(6 * ARTICLE + 5, 104);
+    let set = par2_set("ember", &[("ember.bin", ember.as_slice())], 2);
+    assert_lost_at_restart_repairs(&ember, &set, &set[1], its_last).await;
+}
+
+// The same with a PAR3 set: the pipeline goes down once its volume is in.
+#[tokio::test]
+async fn a_par3_volume_two_deep_a_restart_cannot_read_back_comes_again_and_its_set_still_repairs() {
+    let ember = payload(6 * ARTICLE + 5, 106);
+    let set = par3_set("ember", &[("ember.bin", ember.as_slice())], 2);
+    assert!(set[1].name.contains(".vol"), "{}", set[1].name);
+    assert_lost_at_restart_repairs(&ember, &set, &set[1], its_last).await;
+}
+
+// The PAR2 index, whose packets name the set, lost halfway through, before
+// it is whole: the index comes again and the set is found once, from its
+// packets as they come. Articles of it still in memory at the restart are
+// not lost, so the pipeline goes down partway into it.
+#[tokio::test]
+async fn a_par2_index_two_deep_lost_before_its_packets_were_walked_comes_again_and_its_set_is_found_once()
+ {
+    let ember = payload(6 * ARTICLE + 5, 107);
+    let set = par2_set("ember", &[("ember.bin", ember.as_slice())], 2);
+    assert_lost_at_restart_repairs(&ember, &set, &set[0], |held| {
+        assert!(held.len() > 2, "the index spans articles");
+        held[held.len() / 2].1
+    })
+    .await;
+}
+
+// A stored RAR5 set of four volumes two deep, its second never posted,
+// beside the `.rev` that rebuilds it: the set is rebuilt at depth and the
+// member delivered whole. The `.rev` is delivered beside it, as recovery
+// files below the root are. Classic stalls extracting the RAR two deep.
+#[tokio::test]
+async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev_under_graph() {
+    let body = rev_body();
+    let volumes = single_member_store_set("beacon.bin", &body, 4);
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let revs = rar5_revs("silver.horizon", &bytes, 1);
+    let mut entries: Vec<(&str, Vec<u8>)> = volumes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 1)
+        .map(|(_, (name, bytes))| (name.as_str(), bytes.clone()))
+        .collect();
+    entries.extend(
+        revs.iter()
+            .map(|post| (post.name.as_str(), post.bytes.clone())),
+    );
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", two_deep(&entries))]);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        ["beacon.bin", "silver.horizon.part1.rev"].map(delivered)
+    );
+    assert!(graph.files[&delivered("beacon.bin")] == body, "beacon.bin");
+    assert!(
+        kinds(&graph).contains(&"rar_recovery"),
+        "{:?}",
+        kinds(&graph)
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let classic = try_run(&scenario, Engine::Classic).await;
+    assert!(
+        classic
+            .as_ref()
+            .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
+        "classic stalls extracting the RAR two deep"
+    );
+}
+
+// A compressed, enciphered RAR, `cinder.rar`, two deep beside `beacon.bin`,
+// `candle.bin` one deep, and no password: the store gives the RAR up to its
+// engine, which asks, and nothing answers. The job ends as the locked RAR
+// at the root does, partial on its password with the archive withheld and
+// delivered as posted, and the members above it and beside it delivered.
+// Classic stalls extracting the RAR two deep.
+#[tokio::test]
+async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_the_members_above_it_delivered_under_graph()
+ {
+    let locked = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/rar5_solid_encrypted_small.rar"
+    ))
+    .unwrap();
+    let outer = sevenz(&[
+        ("candle.bin", candle()),
+        (
+            "level.rar",
+            rar(&[("beacon.bin", beacon()), ("cinder.rar", locked.clone())]),
+        ),
+    ]);
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Partial { .. })),
+        "{:?} {:?}",
+        graph.status,
+        graph.failure
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        ["beacon.bin", "candle.bin", "cinder.rar"].map(delivered)
+    );
+    assert!(
+        graph.files[&delivered("beacon.bin")] == beacon(),
+        "beacon.bin"
+    );
+    assert!(
+        graph.files[&delivered("candle.bin")] == candle(),
+        "candle.bin"
+    );
+    assert!(
+        graph.files[&delivered("cinder.rar")] == locked,
+        "cinder.rar"
+    );
+    assert_eq!(
+        graph.graph().delivery.withheld,
+        vec![("cinder.rar".to_owned(), Why::EncryptedHeader)]
+    );
+    assert!(kinds(&graph).contains(&"rar_engine"), "{:?}", kinds(&graph));
+    let classic = try_run(&scenario, Engine::Classic).await;
+    assert!(
+        classic
+            .as_ref()
+            .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
+        "classic stalls extracting the RAR two deep"
     );
 }
