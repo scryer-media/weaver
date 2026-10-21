@@ -471,7 +471,7 @@ impl TorrentStateLive {
         let due = registry.due(
             tokio::time::Instant::now(),
             |handle| self.peers.is_banned(handle.ip()),
-            |missing| self.web_layout.bitfield(missing).contains(&true),
+            |lacks| self.web_layout.bitfield(lacks).any(),
         );
         for due in due {
             // The IP filter: a seed it blocks is tried again later.
@@ -1410,6 +1410,25 @@ impl TorrentStateLive {
                 Self::give_up_place(&mut places, addr);
             }
         }
+    }
+
+    // Peer `peer` sent the whole of `piece`, which failed its hash check:
+    // whether it may be banned for that (libtorrent
+    // `peer_connection::received_invalid_data`). A web seed serves none of
+    // what the piece lies in from then on and has its pieces told again,
+    // and may be banned only when it is left nothing to serve
+    // (`web_peer_connection::received_invalid_data`); any other peer may.
+    fn received_invalid_data(&self, peer: PeerHandle, piece: ValidPieceIndex) -> bool {
+        let Some(have) = self
+            .shared
+            .web_seeds
+            .piece_failed(peer, piece, &self.web_layout)
+        else {
+            return true;
+        };
+        let nothing_left = !have.any();
+        self.peers.update_bitfield(peer, have);
+        nothing_left
     }
 
     // A torrent wants peers, outgoing and incoming, unless it has nothing
@@ -3187,14 +3206,17 @@ impl PeerHandler {
                     let liars = state.peers.piece_failed(piece_index, blocks);
                     // Every peer that sent a block of it loses points and goes
                     // on parole; one at the floor, or that sent the whole
-                    // piece, is banned (libtorrent `torrent::piece_failed`,
+                    // piece when its connection lets it go for that, is
+                    // banned (libtorrent `torrent::piece_failed`,
                     // `torrent::penalize_peers`).
                     let sole_sender = senders.sole_sender();
                     for peer in senders.participants() {
+                        let bannable =
+                            sole_sender && state.received_invalid_data(peer, piece_index);
                         let to_ban = state
                             .peers
-                            .with_peer_mut(peer, "piece_failed", |p| p.piece_failed(sole_sender))
-                            .unwrap_or(sole_sender);
+                            .with_peer_mut(peer, "piece_failed", |p| p.piece_failed(bannable))
+                            .unwrap_or(bannable);
                         if to_ban || liars.contains(&peer) {
                             state.peers.ban(peer);
                         }

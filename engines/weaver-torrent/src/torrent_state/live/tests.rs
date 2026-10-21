@@ -4341,3 +4341,166 @@ async fn a_finish_between_the_check_and_the_wait_is_not_lost() {
     assert!(taken.now_or_never().is_some());
     assert!(after.now_or_never().is_none());
 }
+
+impl Harness {
+    /// A hybrid torrent of `files` live, each file padded to whole pieces,
+    /// none of its pieces had, and no peers.
+    async fn hybrid(name: &str, files: Vec<(&str, Vec<u8>)>) -> Self {
+        use crate::core::v2_test_torrent::TestTorrent as V2TestTorrent;
+
+        let mut torrent = V2TestTorrent::new(files, u64::from(PIECE_LENGTH));
+        torrent.hybrid = true;
+        let out = TempDir::with_prefix(name).unwrap();
+        let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+            .await
+            .unwrap();
+        let pieces = torrent.v1_payload().len() / PIECE_LENGTH as usize;
+        let have = BF::from_boxed_slice(vec![0u8; pieces.div_ceil(8)].into_boxed_slice());
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.torrent_bytes()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    initial_have: Some(have),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        Self {
+            live: handle.live().unwrap(),
+            content: torrent.v1_payload(),
+            _session: session,
+            _torrent: None,
+            _out: out,
+        }
+    }
+
+    /// A web seed of the torrent, connected and live with every piece of
+    /// the files it serves, the queue of what we send it, and its link,
+    /// whose hold keeps the torrent from connecting to the seed itself.
+    fn web_seed(&self) -> (PeerHandler, PeerRx, web_seed::SeedLink) {
+        use crate::core::torrent_metainfo::{WebSeed, WebSeedKind};
+
+        let seeds = &self.shared.web_seeds;
+        assert!(seeds.add(WebSeed {
+            url: "http://192.0.2.1/s/".into(),
+            kind: WebSeedKind::Url,
+        }));
+        // The torrent's metainfo names no seed: this one is the first.
+        let link = seeds.link(0).unwrap();
+        let addr = link.handle();
+        let (rx, tx) = self.peers.admit_web_seed(addr).unwrap();
+        let counters = self
+            .peers
+            .with_peer(addr, |p| p.stats.counters.clone())
+            .unwrap();
+        let handler = PeerHandler {
+            addr,
+            incoming: false,
+            on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
+            sent_dht_port: AtomicBool::new(false),
+            flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
+            state: self.live.clone(),
+            tx,
+            counters,
+            first_message_received: AtomicBool::new(true),
+            cancel_token: self.live.cancellation_token.child_token(),
+            client_name_and_version: String::new(),
+        };
+        (&handler)
+            .on_handshake(handshake(false), ConnectionKind::Tcp, false)
+            .unwrap();
+        let serves = self.web_layout.bitfield(&Default::default());
+        handler.on_bitfield(serves.as_raw_slice()).unwrap();
+        (handler, rx, link)
+    }
+
+    /// The pieces the peer has, one bool each.
+    fn has(&self, peer: &PeerHandler) -> Vec<bool> {
+        let total = self.lengths.total_pieces() as usize;
+        self.peers
+            .with_live(peer.addr, |live| {
+                live.bitfield[..total].iter().by_vals().collect()
+            })
+            .unwrap()
+    }
+}
+
+// libtorrent web_peer_connection::received_invalid_data: a web seed that
+// sent the whole of a piece lying in one file holds another copy of that
+// file, so it no longer has the file's pieces, and is not banned while it
+// has others (torrent::penalize_peers bans a known bad peer only when its
+// connection allows it). A pad file is no part of what the seed serves.
+#[tokio::test]
+async fn a_web_seed_that_fails_a_piece_loses_its_file_and_serves_the_rest() {
+    use crate::core::v2_test_torrent::payload;
+
+    // "a" fills piece 0 and starts piece 1, which a pad file ends; "b" is
+    // piece 2.
+    let h = Harness::hybrid(
+        "web_seed_loses_a_file",
+        vec![
+            ("a", payload(PIECE_LENGTH as usize + 1000, 1)),
+            ("b", payload(PIECE_LENGTH as usize, 2)),
+        ],
+    )
+    .await;
+    tokio::time::pause();
+    let (seed, mut rx, _link) = h.web_seed();
+    assert_eq!(h.has(&seed), [true, true, true]);
+
+    h.take(&seed, 1);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&seed, (1, chunk), chunk == 0).await.unwrap();
+    }
+
+    assert_eq!(h.missing_chunks(1), vec![0, 1, 2, 3]);
+    assert_eq!(h.trust(&seed), (-2, 1, true));
+    assert!(!h.banned(&seed) && !told_to_disconnect(&mut rx));
+    assert_eq!(h.has(&seed), [false, false, true]);
+    assert_eq!(h.shared.web_seeds.list().len(), 1);
+
+    // It goes on serving "b", and is asked for nothing of "a": what is
+    // left to take of it is piece 2, unless taking piece 1 took it first.
+    let left: Vec<u32> = std::iter::from_fn(|| seed.acquire_next_piece().unwrap())
+        .map(|p| p.get())
+        .collect();
+    assert!(left.iter().all(|&p| p == 2), "{left:?}");
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&seed, (2, chunk), false).await.unwrap();
+    }
+    assert!(h.missing_chunks(2).is_empty());
+    assert_eq!(h.trust(&seed), (-1, 1, false));
+}
+
+// libtorrent web_peer_connection::received_invalid_data: the seed of a
+// single-file torrent that sends a bad piece has nothing left to serve,
+// and is banned as any peer that sent a whole bad piece is.
+#[tokio::test]
+async fn the_web_seed_of_a_single_file_torrent_that_fails_a_piece_is_banned() {
+    let h = Harness::new("web_seed_single_file_banned").await;
+    tokio::time::pause();
+    let (seed, mut rx, link) = h.web_seed();
+    assert_eq!(h.has(&seed), [true, true]);
+
+    h.take(&seed, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&seed, (0, chunk), chunk == 2).await.unwrap();
+    }
+
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert!(h.banned(&seed));
+    assert!(told_to_disconnect(&mut rx));
+    drop(link);
+    let due = h.shared.web_seeds.due(
+        tokio::time::Instant::now(),
+        |handle| h.peers.is_banned(handle.ip()),
+        |lacks| h.web_layout.bitfield(lacks).any(),
+    );
+    assert!(due.is_empty());
+}

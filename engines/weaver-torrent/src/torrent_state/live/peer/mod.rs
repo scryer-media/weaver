@@ -190,12 +190,13 @@ impl Trust {
     /// least, as failing costs more than passing earns; one more hash failure;
     /// and parole (libtorrent `torrent::penalize_peers`, with
     /// `use_parole_mode` at its default, on). Returns whether the peer is to
-    /// be banned: it has lost every point it can, or it sent the whole piece.
-    fn piece_failed(&mut self, sole_sender: bool) -> bool {
+    /// be banned: it has lost every point it can, or it is `bannable`, sent
+    /// the whole piece and may be banned for it.
+    fn piece_failed(&mut self, bannable: bool) -> bool {
         self.on_parole = true;
         self.points = self.points.saturating_sub(2).max(Self::MIN_POINTS);
         self.hashfails = self.hashfails.saturating_add(1);
-        self.points <= Self::MIN_POINTS || sole_sender
+        self.points <= Self::MIN_POINTS || bannable
     }
 }
 
@@ -524,11 +525,11 @@ impl Peer {
         self.trust.piece_passed();
     }
 
-    /// A piece the peer sent a block of failed its hash check, and the peer
-    /// sent all of it when `sole_sender` holds. Returns whether the peer is
-    /// to be banned.
-    pub(crate) fn piece_failed(&mut self, sole_sender: bool) -> bool {
-        self.trust.piece_failed(sole_sender)
+    /// A piece the peer sent a block of failed its hash check; the peer
+    /// sent all of it and may be banned for that when `bannable` holds.
+    /// Returns whether the peer is to be banned.
+    pub(crate) fn piece_failed(&mut self, bannable: bool) -> bool {
+        self.trust.piece_failed(bannable)
     }
 
     /// The peer as a pause leaves it on the list: where it listens, its
