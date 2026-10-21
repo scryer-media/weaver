@@ -90,7 +90,7 @@ pub use session::{
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
-    TorrentStatsState, initializing::Checkpoint,
+    TorrentStatsState, initializing::Checkpoint, live::peers::ResumePeers,
 };
 pub use type_aliases::{BF, FileInfos};
 

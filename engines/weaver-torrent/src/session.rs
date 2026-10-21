@@ -80,6 +80,7 @@ use crate::{
         AddIncomingPeerResult, ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions,
         ManagedTorrentState, TorrentMetadata, TorrentStateLive,
         initializing::{Checkpoint, TorrentStateInitializing, normalize_checkpoint},
+        live::peers::PeerList,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream},
 };
@@ -514,6 +515,12 @@ pub struct AddTorrentOptions {
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
+    /// Addresses banned from the start, as a restart saved them (libtorrent
+    /// `add_torrent_params::banned_peers`): no peer at one joins the peer
+    /// list. See [`ManagedTorrent::resume_peers`].
+    #[serde(default)]
+    pub banned_peers: Vec<IpAddr>,
+
     /// Web seeds beside those the torrent names; a magnet link's `ws` join
     /// them (libtorrent `add_torrent_params::url_seeds`).
     #[serde(default)]
@@ -586,6 +593,7 @@ impl Default for AddTorrentOptions {
             disable_trackers: false,
             ratelimits: LimitsConfig::default(),
             initial_peers: None,
+            banned_peers: Vec::new(),
             web_seeds: Vec::new(),
             peer_limit: None,
             preferred_id: None,
@@ -2192,6 +2200,10 @@ impl Session {
                 false,
                 checkpoint,
                 piece_priorities.clone(),
+                PeerList::resumed(
+                    opts.initial_peers.iter().flatten().copied(),
+                    opts.banned_peers.iter().copied(),
+                ),
             ));
             let handle = Arc::new(ManagedTorrent {
                 locked: RwLock::new(ManagedTorrentLocked {

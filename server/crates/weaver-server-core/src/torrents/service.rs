@@ -1133,6 +1133,19 @@ impl TorrentService {
             task.abort();
         }
         self.stop_tick();
+        let attached: Vec<(JobId, Arc<ManagedTorrent>)> = self
+            .inner
+            .live
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(job_id, torrent)| {
+                Some((*job_id, torrent.attached.as_ref()?.handle.clone()))
+            })
+            .collect();
+        for (job_id, handle) in attached {
+            self.save_peers(job_id, &handle).await;
+        }
         self.inner.sessions.stop_all().await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
@@ -1260,16 +1273,44 @@ impl TorrentService {
         self.publish().await;
     }
 
-    // Write the checkpoints of `jobs`.
+    // Write the checkpoints of `jobs`, and beside each the peers and bans of
+    // its torrent while it is in a session.
     async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
-        let jobs: Vec<(JobId, Arc<TorrentJob>)> = {
+        type Saved = (JobId, Arc<TorrentJob>, Option<Arc<ManagedTorrent>>);
+        let jobs: Vec<Saved> = {
             let live = self.inner.live.lock().await;
             jobs.into_iter()
-                .filter_map(|job_id| Some((job_id, live.get(&job_id)?.job.clone()?)))
+                .filter_map(|job_id| {
+                    let torrent = live.get(&job_id)?;
+                    let handle = torrent.attached.as_ref().map(|a| a.handle.clone());
+                    Some((job_id, torrent.job.clone()?, handle))
+                })
                 .collect()
         };
-        for (job_id, job) in jobs {
+        for (job_id, job, handle) in jobs {
             self.save_checkpoint(job_id, &job).await;
+            if let Some(handle) = handle {
+                self.save_peers(job_id, &handle).await;
+            }
+        }
+    }
+
+    // Write the peers and bans the torrent begins its next start with
+    // (libtorrent `torrent::write_resume_data`). A torrent stopped by an
+    // error keeps those last written.
+    async fn save_peers(&self, job_id: JobId, handle: &ManagedTorrent) {
+        let Some(peers) = handle.resume_peers() else {
+            return;
+        };
+        let db = self.inner.db.clone();
+        match tokio::task::spawn_blocking(move || db.save_torrent_peers(job_id, &peers)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not save a torrent's peers");
+            }
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not save a torrent's peers");
+            }
         }
     }
 
@@ -1841,6 +1882,12 @@ impl TorrentService {
                 return;
             }
         };
+        // libtorrent `torrent::read_resume_data`: the saved peers are known
+        // from the start and the saved bans hold.
+        let saved = self.inner.db.torrent_peers(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
+            Default::default()
+        });
         let factory =
             PieceStorageFactory::new(layout, intake as Arc<dyn Pieces>, self.resident(job_id));
         let mut options = AddTorrentOptions {
@@ -1853,6 +1900,8 @@ impl TorrentService {
                 download_bps: LimitKind::Unlimited,
             },
             identity: Some(identity),
+            initial_peers: (!saved.peers.is_empty()).then_some(saved.peers),
+            banned_peers: saved.banned,
             ..Default::default()
         };
         apply_initial_have(&mut options, have);
@@ -1910,6 +1959,7 @@ impl TorrentService {
             self.save_checkpoint(job_id, job).await;
         }
         if let Some(attached) = torrent.attached.take() {
+            self.save_peers(job_id, &attached.handle).await;
             let id = TorrentIdOrHash::Id(attached.handle.id());
             if let Err(error) = attached.session.delete(id, false).await {
                 tracing::debug!(error = %error, "a torrent was already gone from its session");

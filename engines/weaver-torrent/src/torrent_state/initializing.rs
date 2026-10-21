@@ -32,7 +32,11 @@ use crate::{
 
 const MAX_FASTRESUME_CHECKS: usize = 64;
 
-use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
+use super::{
+    ManagedTorrentShared, TorrentMetadata,
+    live::peers::{PeerList, ResumePeers},
+    paused::TorrentStatePaused,
+};
 
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
@@ -48,6 +52,9 @@ pub struct TorrentStateInitializing {
     checkpoint: Option<Checkpoint>,
     // The fetch priority of every piece; None while all are Normal.
     piece_priorities: Option<Vec<PiecePriority>>,
+    // The peer list the first run is founded on: the peers and bans it was
+    // added with.
+    peers: parking_lot::Mutex<PeerList>,
 }
 
 /// What a torrent had written of its data when it was last saved, for the
@@ -113,7 +120,7 @@ pub(crate) fn normalize_checkpoint(
 }
 
 impl TorrentStateInitializing {
-    pub fn new(
+    pub(crate) fn new(
         shared: Arc<ManagedTorrentShared>,
         metadata: Arc<TorrentMetadata>,
         only_files: Option<Vec<usize>>,
@@ -121,6 +128,7 @@ impl TorrentStateInitializing {
         previously_errored: bool,
         checkpoint: Option<Checkpoint>,
         piece_priorities: Option<Vec<PiecePriority>>,
+        peers: PeerList,
     ) -> Self {
         Self {
             shared,
@@ -133,7 +141,13 @@ impl TorrentStateInitializing {
             previously_errored,
             checkpoint,
             piece_priorities,
+            peers: parking_lot::Mutex::new(peers),
         }
+    }
+
+    /// The peers and bans a restart is to begin with; see [`ResumePeers`].
+    pub(crate) fn resume_peers(&self) -> ResumePeers {
+        self.peers.lock().resume_peers()
     }
 
     pub fn get_checked_bytes(&self) -> u64 {
@@ -477,7 +491,7 @@ impl TorrentStateInitializing {
             files: self.files.take()?,
             chunk_tracker,
             streams: Arc::new(Default::default()),
-            peers: Default::default(),
+            peers: std::mem::take(&mut *self.peers.lock()),
         };
         Ok(paused)
     }

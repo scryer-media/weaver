@@ -279,3 +279,35 @@ fn a_torrent_keeps_the_tracker_rule_it_matched_until_the_rule_goes() {
         None
     );
 }
+
+// A torrent's saved peers and bans read back as written, an empty list as
+// none, and a torrent that is not one saves nothing.
+#[test]
+fn a_torrents_peers_and_bans_round_trip() {
+    use weaver_torrent::ResumePeers;
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(1, Some([1; 20]), None), &[], &[])
+        .unwrap();
+    assert_eq!(db.torrent_peers(JobId(1)).unwrap(), ResumePeers::default());
+
+    let saved = ResumePeers {
+        peers: vec![
+            "10.0.0.1:6881".parse().unwrap(),
+            "[2001:db8::1]:51413".parse().unwrap(),
+        ],
+        banned: vec!["10.0.0.9".parse().unwrap(), "2001:db8::9".parse().unwrap()],
+    };
+    assert!(db.save_torrent_peers(JobId(1), &saved).unwrap());
+    assert_eq!(db.torrent_peers(JobId(1)).unwrap(), saved);
+
+    let unbanned = ResumePeers {
+        banned: Vec::new(),
+        ..saved.clone()
+    };
+    assert!(db.save_torrent_peers(JobId(1), &unbanned).unwrap());
+    assert_eq!(db.torrent_peers(JobId(1)).unwrap(), unbanned);
+
+    assert!(!db.save_torrent_peers(JobId(2), &saved).unwrap());
+    assert_eq!(db.torrent_peers(JobId(2)).unwrap(), ResumePeers::default());
+}

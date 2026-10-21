@@ -2084,3 +2084,46 @@ async fn a_torrent_keeps_the_unpack_in_force_once_its_job_is_built() {
     assert!(rig.service.torrent(inherits).await.unwrap().unpack);
     assert!(!rig.service.torrent(off).await.unwrap().unpack);
 }
+
+// libtorrent `torrent::write_resume_data` and `read_resume_data`: the peers
+// and bans a torrent saved come back when it next starts, before it runs,
+// and it saves them again as it stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
+    use weaver_torrent::ResumePeers;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        handle_of(&rig.service, job_id).await.resume_peers(),
+        Some(ResumePeers::default())
+    );
+    rig.service.stop().await;
+    assert_eq!(
+        rig.db.torrent_peers(job_id).unwrap(),
+        ResumePeers::default()
+    );
+    let saved = ResumePeers {
+        peers: vec!["127.0.0.2:6881".parse().unwrap()],
+        banned: vec!["127.0.0.3".parse().unwrap()],
+    };
+    assert!(rig.db.save_torrent_peers(job_id, &saved).unwrap());
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(
+        handle_of(&again, job_id).await.resume_peers(),
+        Some(saved.clone())
+    );
+    again.stop().await;
+    assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
+}

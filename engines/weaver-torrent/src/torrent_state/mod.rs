@@ -587,6 +587,17 @@ impl ManagedTorrent {
         self.with_chunk_tracker(ChunkTracker::checkpoint).ok()
     }
 
+    /// The peers and bans a restart is to begin with (libtorrent
+    /// `torrent::write_resume_data`); None while it is stopped by an error.
+    pub fn resume_peers(&self) -> Option<live::peers::ResumePeers> {
+        self.with_state(|s| match s {
+            ManagedTorrentState::Initializing(init) => Some(init.resume_peers()),
+            ManagedTorrentState::Paused(paused) => Some(paused.peers.resume_peers()),
+            ManagedTorrentState::Live(live) => Some(live.resume_peers()),
+            ManagedTorrentState::Error(_) | ManagedTorrentState::None => None,
+        })
+    }
+
     /// Get the live state if the torrent is live.
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();
@@ -755,6 +766,7 @@ impl ManagedTorrent {
                         // After an error the data is no longer vouched for: check it.
                         None,
                         g.piece_priorities.clone(),
+                        Default::default(),
                     ));
                     g.state = ManagedTorrentState::Initializing(initializing.clone());
                     t.state_change_notify.notify_waiters();

@@ -5488,3 +5488,72 @@ async fn a_checkpoint_keeps_the_written_blocks_of_a_piece_across_a_restart() {
         "no block was fetched twice"
     );
 }
+
+// libtorrent `torrent::write_resume_data` saves the peers and the bans, and
+// `torrent::read_resume_data` takes them back: each peer through
+// `torrent::add_peer` as `peer_info::resume_data`, each ban through
+// `peer_list::ban_peer`. A restarted torrent gets its saved peers as its
+// initial peers and its saved bans as its banned addresses.
+#[tokio::test]
+async fn saved_peers_and_bans_come_back_as_initial_peers_and_bans() {
+    use futures::StreamExt;
+
+    let h = Harness::seeding("saved_peers_come_back").await;
+    // Connected to us over uTP: we can connect back to where it is.
+    let connectable: SocketAddr = "127.0.0.3:6881".parse().unwrap();
+    let (tx, _rx) = unbounded_channel();
+    h.peers
+        .add_incoming(connectable, Id20::default(), tx, ConnectionKind::Utp, 6881)
+        .unwrap();
+    let banned: SocketAddr = "127.0.0.4:6881".parse().unwrap();
+    h.peers.ban(banned);
+    let saved = h.handle().resume_peers().unwrap();
+    assert_eq!(
+        saved,
+        crate::ResumePeers {
+            peers: vec![connectable],
+            banned: vec![banned.ip()],
+        }
+    );
+
+    // Restarted paused, so no peer is connected to.
+    let session = h._session.clone();
+    let bytes = h._torrent.as_ref().unwrap().torrent.clone();
+    session
+        .delete(crate::api::TorrentIdOrHash::Id(h.shared.id), false)
+        .await
+        .unwrap();
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(bytes),
+            Some(AddTorrentOptions {
+                paused: true,
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                checkpoint: Some(crate::Checkpoint::pieces(BF::from_boxed_slice(
+                    vec![0xc0].into_boxed_slice(),
+                ))),
+                initial_peers: Some(saved.peers.clone()),
+                banned_peers: saved.banned.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    let named: Vec<_> = session
+        .make_peer_rx_managed_torrent(&handle, false)
+        .unwrap()
+        .take(saved.peers.len())
+        .collect()
+        .await;
+    assert_eq!(named, [(connectable, PeerSourceFlag::ResumeData)]);
+    // Saved again before it runs, the torrent keeps both.
+    assert_eq!(handle.resume_peers().unwrap(), saved);
+    let paused_list = handle.with_state(|s| match s {
+        crate::ManagedTorrentState::Paused(p) => p.peers.resume_peers(),
+        _ => panic!("the restarted torrent is not paused"),
+    });
+    assert_eq!(paused_list, saved);
+}

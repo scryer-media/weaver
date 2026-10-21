@@ -131,6 +131,101 @@ pub(crate) struct PeerList {
     smart_ban: SmartBan,
 }
 
+impl PeerList {
+    /// The list a torrent is added with: a connect candidate at each of
+    /// `peers` not at a banned address, and `banned` banned (libtorrent
+    /// `torrent::read_resume_data`, which adds each of `peers` with
+    /// `peer_list::add_peer` and bans each of `banned_peers` with
+    /// `peer_list::ban_peer`). The peers are on the list before the torrent
+    /// first runs, so a restart saves them again until it does.
+    pub fn resumed(
+        peers: impl IntoIterator<Item = SocketAddr>,
+        banned: impl IntoIterator<Item = IpAddr>,
+    ) -> Self {
+        let banned: HashSet<IpAddr> = banned.into_iter().collect();
+        let mut seen = HashSet::new();
+        let peers = peers
+            .into_iter()
+            .filter(|addr| !banned.contains(&addr.ip()) && seen.insert(*addr))
+            .map(Peer::new_with_outgoing_address)
+            .collect();
+        Self {
+            peers,
+            banned,
+            ..Default::default()
+        }
+    }
+
+    /// The peers and bans a restart is to begin with; see [`ResumePeers`].
+    pub fn resume_peers(&self) -> ResumePeers {
+        ResumePeers::of(self.peers.iter().map(resume_entry), &self.banned)
+    }
+}
+
+// libtorrent `torrent::write_resume_data`: the peers we were never connected
+// to fill the saved list up to this many.
+pub(crate) const RESUME_PEERS: usize = 100;
+
+/// The peers and bans a restart begins with (libtorrent
+/// `add_torrent_params::peers` and `banned_peers`, which
+/// `torrent::write_resume_data` writes). The peers come back as the
+/// torrent's initial peers, the bans as its banned addresses
+/// (`AddTorrentOptions::initial_peers` and `banned_peers`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResumePeers {
+    /// Where to connect to each peer, those we were connected to first.
+    pub peers: Vec<SocketAddr>,
+    /// The banned addresses, in order.
+    pub banned: Vec<IpAddr>,
+}
+
+// What a saved list needs of a peer: its address, where we can connect to
+// it when we can, and whether we were ever connected to it, or None when it
+// is not to be saved: we cannot connect to it (not `connectable`), its last
+// connection failed (`failcount`), or it sent bad data (`trust_points`
+// below zero).
+fn resume_entry(peer: &Peer) -> (IpAddr, Option<(SocketAddr, bool)>) {
+    let (_, failcount, (_, last_connected)) = peer.connect_rank();
+    let saved = peer
+        .outgoing_address
+        .filter(|_| failcount == 0 && peer.trust().points() >= 0)
+        .map(|addr| {
+            (
+                addr,
+                last_connected.is_some() || peer.connected_out().is_some(),
+            )
+        });
+    (peer.addr.ip(), saved)
+}
+
+impl ResumePeers {
+    // libtorrent `torrent::write_resume_data`: a peer at a banned address is
+    // saved as its ban; every other peer to be saved that we were connected
+    // to is; and of those we never were, the first [`RESUME_PEERS`], at
+    // random, until that many are saved in all.
+    fn of(
+        entries: impl Iterator<Item = (IpAddr, Option<(SocketAddr, bool)>)>,
+        banned: &HashSet<IpAddr>,
+    ) -> Self {
+        let mut peers = Vec::new();
+        let mut never = Vec::new();
+        for (ip, saved) in entries {
+            match saved {
+                _ if banned.contains(&ip) => {}
+                Some((addr, true)) => peers.push(addr),
+                Some((addr, false)) if never.len() < RESUME_PEERS => never.push(addr),
+                Some(_) | None => {}
+            }
+        }
+        rand::seq::SliceRandom::shuffle(never.as_mut_slice(), &mut rand::rng());
+        let room = RESUME_PEERS.saturating_sub(peers.len());
+        peers.extend(never.into_iter().take(room));
+        let mut banned: Vec<IpAddr> = banned.iter().copied().collect();
+        banned.sort_unstable();
+        Self { peers, banned }
+    }
+}
+
 /// Whom the list may forget to make room (libtorrent `peer_list::erase_peers`
 /// and its `force_erase` flag). A connected peer is never forgotten.
 #[derive(Clone, Copy)]
@@ -249,6 +344,18 @@ impl PeerStates {
             banned: self.banned.read().clone(),
             smart_ban,
         }
+    }
+
+    /// The peers and bans a restart is to begin with; see [`ResumePeers`].
+    /// A web seed is on no list, and is not saved.
+    pub fn resume_peers(&self) -> ResumePeers {
+        let entries: Vec<_> = self
+            .states
+            .iter()
+            .filter(|e| !is_web_seed(*e.key()))
+            .map(|e| resume_entry(e.value()))
+            .collect();
+        ResumePeers::of(entries.into_iter(), &self.banned.read())
     }
 
     /// Whether peers at `ip` are banned.
@@ -2311,5 +2418,91 @@ mod tests {
             });
             assert!(peers.encrypt_outgoing(addr), "{addr}");
         }
+    }
+
+    // libtorrent `torrent::write_resume_data`: the saved list holds the
+    // peers we can connect to that did not fail their last connection and
+    // sent no bad data, those we were connected to first; a peer at a
+    // banned address is saved as its ban.
+    #[test]
+    fn the_saved_peers_are_the_connectable_trusted_ones_those_connected_to_first() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let connecting = peer_addr(1);
+        peers.add_peer(connecting, PeerSourceFlag::Tracker);
+        let (_, _connecting_rx, _connecting_tx) = peers.connect_next(t0).unwrap();
+        let never = peer_addr(2);
+        peers.add_peer(never, PeerSourceFlag::Tracker);
+        let failed = peer_addr(3);
+        peers.add_peer(failed, PeerSourceFlag::Tracker);
+        fail_at(&peers, failed, t0);
+        let distrusted = peer_addr(4);
+        peers.add_peer(distrusted, PeerSourceFlag::Tracker);
+        peers
+            .with_peer_mut(distrusted, "test", |p| p.piece_failed(false))
+            .unwrap();
+        // Connected to us: we know no address to connect to it at.
+        let (_, _incoming_rx) = add_live_peer(&peers, "10.0.0.5:50000");
+        let banned = peer_addr(6);
+        peers.add_peer(banned, PeerSourceFlag::Tracker);
+        peers.ban(banned);
+
+        assert_eq!(
+            peers.resume_peers(),
+            ResumePeers {
+                peers: vec![connecting, never],
+                banned: vec![banned.ip()],
+            }
+        );
+        // The list a pause leaves saves the same.
+        assert_eq!(peers.idle_list().resume_peers().banned, vec![banned.ip()]);
+    }
+
+    // libtorrent `torrent::write_resume_data`: every peer we were connected
+    // to is saved, and those we never were fill the list to a hundred.
+    #[test]
+    fn peers_never_connected_to_fill_the_saved_list_to_a_hundred() {
+        let peers = make_peer_states();
+        let connecting = peer_addr(0);
+        peers.add_peer(connecting, PeerSourceFlag::Tracker);
+        let (_, _rx, _tx) = peers.connect_next(Instant::now()).unwrap();
+        for i in 1..=150 {
+            peers.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
+        }
+        let saved = peers.resume_peers().peers;
+        assert_eq!(saved.len(), RESUME_PEERS);
+        assert_eq!(saved[0], connecting);
+        let distinct: HashSet<_> = saved.iter().collect();
+        assert_eq!(distinct.len(), RESUME_PEERS);
+    }
+
+    // libtorrent `torrent::read_resume_data` bans each saved address with
+    // `peer_list::ban_peer`: the list a restart is founded on refuses a peer
+    // there on any port, named or connecting to us.
+    #[test]
+    fn a_saved_ban_refuses_the_peer() {
+        let banned = peer_addr(1);
+        let peers = PeerStates::founded_on(
+            PeerList::resumed([], [banned.ip()]),
+            Default::default(),
+            TOTAL_PIECES as u32,
+        );
+        assert!(peers.is_banned(banned.ip()));
+        peers.add_peer(banned, PeerSourceFlag::ResumeData);
+        assert_eq!(state_of(&peers, banned), None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            peers
+                .add_incoming(
+                    at_port(banned, 50000),
+                    Id20::default(),
+                    tx,
+                    ConnectionKind::Tcp,
+                    OUR_PORT
+                )
+                .err(),
+            Some(IncomingRefused::Banned)
+        );
+        assert_eq!(peers.resume_peers().banned, vec![banned.ip()]);
     }
 }

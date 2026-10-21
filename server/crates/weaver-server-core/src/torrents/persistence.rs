@@ -10,6 +10,7 @@ use crate::torrents::queries::{TORRENT_COLUMNS, torrent_by_infohash_tx};
 use crate::torrents::{
     TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
 };
+use weaver_torrent::ResumePeers;
 
 // A tracker row holds where the tracker sits in the announce list; how
 // announcing to it goes is read from the session.
@@ -18,6 +19,27 @@ const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url) V
 fn stored(value: u64) -> Result<i64, StateError> {
     i64::try_from(value)
         .map_err(|_| StateError::Database(format!("{value} exceeds the database range")))
+}
+
+// A list as a JSON array of its strings; NULL when empty.
+fn stored_list<T: serde::Serialize>(items: &[T]) -> Result<Option<String>, StateError> {
+    (!items.is_empty())
+        .then(|| serde_json::to_string(items))
+        .transpose()
+        .map_err(|error| StateError::Database(error.to_string()))
+}
+
+fn listed<T: serde::de::DeserializeOwned>(
+    column: &str,
+    json: Option<String>,
+) -> Result<Vec<T>, StateError> {
+    json.map(|json| {
+        serde_json::from_str(&json).map_err(|error| {
+            StateError::Database(format!("stored torrent {column} is not valid: {error}"))
+        })
+    })
+    .transpose()
+    .map(Option::unwrap_or_default)
 }
 
 fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
@@ -374,6 +396,52 @@ impl Database {
                 })
             })
             .await
+        })
+    }
+
+    // The peers and bans a torrent begins its next start with, written
+    // beside its checkpoint. Returns whether the torrent exists.
+    pub fn save_torrent_peers(
+        &self,
+        job_id: JobId,
+        peers: &ResumePeers,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(stored_list(&peers.peers)?),
+            SqlArg::OptText(stored_list(&peers.banned)?),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET peers = {}, banned_peers = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The peers and bans a torrent last saved; none when it saved none or
+    // is not a torrent.
+    pub fn torrent_peers(&self, job_id: JobId) -> Result<ResumePeers, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        let row = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT peers, banned_peers FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await
+        })?;
+        let Some(row) = row else {
+            return Ok(ResumePeers::default());
+        };
+        Ok(ResumePeers {
+            peers: listed("peers", row.opt_text("peers")?)?,
+            banned: listed("banned_peers", row.opt_text("banned_peers")?)?,
         })
     }
 }

@@ -953,3 +953,20 @@ kind = "sql"
 file = "migrations/0077_torrent_metadata/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 78
+description = "a torrent keeps its peers and bans across a restart"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0078_torrent_peers/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0078_torrent_peers/postgres.sql"
+engine = "postgres"
+scope = "all"

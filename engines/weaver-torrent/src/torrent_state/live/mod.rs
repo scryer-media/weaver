@@ -974,6 +974,12 @@ impl TorrentStateLive {
     pub fn info_hash(&self) -> Id20 {
         self.shared.info_hash
     }
+    /// The peers and bans a restart is to begin with; see
+    /// [`peers::ResumePeers`].
+    pub(crate) fn resume_peers(&self) -> peers::ResumePeers {
+        self.peers.resume_peers()
+    }
+
     pub fn peer_id(&self) -> Id20 {
         self.shared.peer_id
     }
