@@ -9,12 +9,14 @@ use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
 use crate::tracker::ScrapeOk;
 use either::Either;
+use futures::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 use serde::Deserializer;
 use serde_derive::Deserialize;
 use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    time::Duration,
 };
 
 use crate::core::{
@@ -231,6 +233,63 @@ impl TrackerRequest<'_> {
             s.extend(percent_encode(trackerid, QUERY_VALUE));
         }
         s
+    }
+}
+
+/// How long a tracker may go without sending a byte (libtorrent
+/// `settings_pack::tracker_receive_timeout`).
+pub(crate) const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most bytes a tracker's answer may hold, counted after decompression
+/// (libtorrent `settings_pack::tracker_maximum_response_length`).
+pub(crate) const MAX_RESPONSE_LENGTH: usize = 1024 * 1024;
+
+/// The body of a tracker's answer to a GET of `url`. The answer fails when
+/// the tracker sends nothing for [`RECEIVE_TIMEOUT`], the status is not a
+/// success, or the body passes [`MAX_RESPONSE_LENGTH`]. The bounds are the
+/// engine's own, so they hold whatever client is used.
+pub(crate) async fn get(
+    client: &reqwest::Client,
+    url: url::Url,
+    user_agent: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let response = tokio::time::timeout(
+        RECEIVE_TIMEOUT,
+        client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, user_agent)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the tracker sent nothing for {RECEIVE_TIMEOUT:?}"))??;
+    if !response.status().is_success() {
+        anyhow::bail!("tracker responded with {:?}", response.status());
+    }
+    let chunks = futures::stream::try_unfold(response, |mut response| async move {
+        Ok(response.chunk().await?.map(|chunk| (chunk, response)))
+    });
+    read_body(chunks).await
+}
+
+/// Collects a body from `chunks` within [`RECEIVE_TIMEOUT`] per chunk and
+/// [`MAX_RESPONSE_LENGTH`] in all (libtorrent `timeout_handler`'s read
+/// timeout, `http_connection::on_read`'s size limit).
+async fn read_body(
+    chunks: impl futures::Stream<Item = anyhow::Result<bytes::Bytes>>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut chunks = std::pin::pin!(chunks);
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(RECEIVE_TIMEOUT, chunks.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("the tracker sent nothing for {RECEIVE_TIMEOUT:?}"))?;
+        let Some(chunk) = chunk.transpose()? else {
+            return Ok(body);
+        };
+        if body.len() + chunk.len() > MAX_RESPONSE_LENGTH {
+            anyhow::bail!("the tracker's answer is longer than {MAX_RESPONSE_LENGTH} bytes");
+        }
+        body.extend_from_slice(&chunk);
     }
 }
 
@@ -490,6 +549,52 @@ mod tests {
         assert!(parse_scrape(b"d8:intervali1800ee", &hash).is_err());
         let e = parse_scrape(b"d14:failure reason4:nopee", &hash).unwrap_err();
         assert!(format!("{e:#}").contains("nope"), "{e:#}");
+    }
+
+    /// A body sent as `chunks`, each `gap` after the one before.
+    fn trickle(
+        chunks: Vec<Vec<u8>>,
+        gap: Duration,
+    ) -> impl futures::Stream<Item = anyhow::Result<bytes::Bytes>> {
+        futures::stream::iter(chunks).then(move |chunk| async move {
+            tokio::time::sleep(gap).await;
+            Ok(bytes::Bytes::from(chunk))
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_is_read_up_to_the_length_cap_and_refused_past_it() {
+        let half = MAX_RESPONSE_LENGTH / 2;
+        let body = read_body(trickle(
+            vec![vec![b'a'; half], vec![b'b'; half]],
+            Duration::ZERO,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(body.len(), MAX_RESPONSE_LENGTH);
+
+        let e = read_body(trickle(
+            vec![vec![b'a'; half], vec![b'b'; half], vec![b'c']],
+            Duration::ZERO,
+        ))
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("longer than"), "{e:#}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tracker_may_pause_between_bytes_up_to_the_receive_timeout() {
+        let gap = RECEIVE_TIMEOUT - Duration::from_secs(1);
+        let body = read_body(trickle(vec![b"d".to_vec(), b"e".to_vec()], gap))
+            .await
+            .unwrap();
+        assert_eq!(body, b"de");
+
+        // Silent for the whole receive timeout: refused, whatever came before.
+        let silent = futures::stream::iter([Ok(bytes::Bytes::from_static(b"d"))])
+            .chain(futures::stream::pending());
+        let e = read_body(silent).await.unwrap_err();
+        assert!(format!("{e:#}").contains("sent nothing"), "{e:#}");
     }
 
     #[test]

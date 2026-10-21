@@ -244,6 +244,24 @@ impl AnnounceState {
     }
 }
 
+/// How long an announce or scrape may take from start to finish, whatever
+/// the transport (libtorrent `settings_pack::tracker_completion_timeout`).
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The shortest re-announce interval a tracker may ask for, a guard against
+/// hammering a misconfigured one (libtorrent
+/// `settings_pack::min_announce_interval`).
+const MIN_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Runs one request to a tracker, failing it after [`COMPLETION_TIMEOUT`].
+async fn within_completion_timeout<T>(
+    request: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(COMPLETION_TIMEOUT, request)
+        .await
+        .map_err(|_| anyhow::anyhow!("the tracker did not answer within {COMPLETION_TIMEOUT:?}"))?
+}
+
 /// How long to wait before the next announce.
 #[derive(Debug, PartialEq, Eq)]
 struct ReannounceDelay {
@@ -255,11 +273,17 @@ struct ReannounceDelay {
 }
 
 impl ReannounceDelay {
+    /// `interval` is the tracker's, raised to [`MIN_ANNOUNCE_INTERVAL`]
+    /// (libtorrent `http_tracker_connection::on_response`,
+    /// `udp_tracker_connection::on_announce_response`); a `forced` interval
+    /// is the session's own and replaces it as given.
     fn new(interval: Duration, min_interval: Option<Duration>, forced: Option<Duration>) -> Self {
         let floor = min_interval.unwrap_or_default();
         Self {
             floor,
-            regular: forced.unwrap_or(interval).max(floor),
+            regular: forced
+                .unwrap_or(interval.max(MIN_ANNOUNCE_INTERVAL))
+                .max(floor),
         }
     }
 }
@@ -446,18 +470,21 @@ impl Scraper {
         tracker: &SupportedTracker,
         info_hash: Id20,
     ) -> anyhow::Result<ScrapeOk> {
-        match tracker {
-            SupportedTracker::Http(url) => {
-                self.scrape_http(url, info_hash)
-                    .instrument(trace_span!("http_scrape", tracker = %url))
-                    .await
+        within_completion_timeout(async {
+            match tracker {
+                SupportedTracker::Http(url) => {
+                    self.scrape_http(url, info_hash)
+                        .instrument(trace_span!("http_scrape", tracker = %url))
+                        .await
+                }
+                SupportedTracker::Udp(url) => {
+                    self.scrape_udp(url, info_hash)
+                        .instrument(trace_span!("udp_scrape", tracker = %url))
+                        .await
+                }
             }
-            SupportedTracker::Udp(url) => {
-                self.scrape_udp(url, info_hash)
-                    .instrument(trace_span!("udp_scrape", tracker = %url))
-                    .await
-            }
-        }
+        })
+        .await
     }
 
     async fn scrape_http(&self, tracker_url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
@@ -468,16 +495,8 @@ impl Scraper {
             query.push_str(&format!("&{url_query}"));
         }
         url.set_query(Some(&query));
-        let response = self
-            .reqwest_client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, &self.user_agent)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            anyhow::bail!("tracker responded with {:?}", response.status());
-        }
-        tracker_comms_http::parse_scrape(&response.bytes().await?, &info_hash)
+        let body = tracker_comms_http::get(&self.reqwest_client, url, &self.user_agent).await?;
+        tracker_comms_http::parse_scrape(&body, &info_hash)
     }
 
     async fn scrape_udp(&self, url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
@@ -1142,18 +1161,21 @@ impl TrackerComms {
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
-        match tracker {
-            SupportedTracker::Http(url) => {
-                self.announce_http(url, event, stats)
-                    .instrument(trace_span!("http_tracker", tracker = %url))
-                    .await
+        within_completion_timeout(async {
+            match tracker {
+                SupportedTracker::Http(url) => {
+                    self.announce_http(url, event, stats)
+                        .instrument(trace_span!("http_tracker", tracker = %url))
+                        .await
+                }
+                SupportedTracker::Udp(url) => {
+                    self.announce_udp(url, event, stats)
+                        .instrument(trace_span!("udp_tracker", tracker = %url))
+                        .await
+                }
             }
-            SupportedTracker::Udp(url) => {
-                self.announce_udp(url, event, stats)
-                    .instrument(trace_span!("udp_tracker", tracker = %url))
-                    .await
-            }
-        }
+        })
+        .await
     }
 
     async fn announce_http(
@@ -1187,16 +1209,8 @@ impl TrackerComms {
         }
         url.set_query(Some(&queries));
 
-        let response: reqwest::Response = self
-            .reqwest_client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, &self.identity.user_agent)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            anyhow::bail!("tracker responded with {:?}", response.status());
-        }
-        let bytes = response.bytes().await?;
+        let bytes =
+            tracker_comms_http::get(&self.reqwest_client, url, &self.identity.user_agent).await?;
         if let Ok((error, _)) =
             crate::bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
         {
@@ -1292,7 +1306,7 @@ impl TrackerComms {
                 Ok(Announced {
                     peers: response.addrs,
                     // UDP trackers (BEP 15) send only an interval.
-                    interval: Duration::from_secs(response.interval.max(5) as u64),
+                    interval: Duration::from_secs(response.interval.into()),
                     min_interval: None,
                     seeders: Some(response.seeders),
                     leechers: Some(response.leechers),
@@ -1327,8 +1341,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        AnnounceOk, AnnounceState, AutoScrape, ReannounceDelay, ScrapeOk, StoppedAnnounces,
-        SupportedTracker, Tier, TrackerAnnounce, TrackerComms, TrackerCommsStats,
+        AnnounceOk, AnnounceState, AutoScrape, MIN_ANNOUNCE_INTERVAL, ReannounceDelay, ScrapeOk,
+        StoppedAnnounces, SupportedTracker, Tier, TrackerAnnounce, TrackerComms, TrackerCommsStats,
         TrackerCommsStatsState, TrackerScrape, TrackerTask, UdpTrackerResolveResult,
         udp_tracker_to_socket_addrs,
     };
@@ -1483,10 +1497,10 @@ mod tests {
         );
         // An interval below min interval is raised too.
         assert_eq!(
-            ReannounceDelay::new(s(60), Some(s(120)), None),
+            ReannounceDelay::new(s(600), Some(s(900)), None),
             ReannounceDelay {
-                floor: s(120),
-                regular: s(120)
+                floor: s(900),
+                regular: s(900)
             }
         );
         assert_eq!(
@@ -1496,6 +1510,58 @@ mod tests {
                 regular: s(60)
             }
         );
+    }
+
+    #[test]
+    fn a_tracker_interval_is_never_below_the_minimum_announce_interval() {
+        // libtorrent min_announce_interval, for the interval of either
+        // transport: 0 would be a tight loop.
+        let s = Duration::from_secs;
+        for interval in [s(0), s(5), s(299)] {
+            assert_eq!(
+                ReannounceDelay::new(interval, None, None).regular,
+                MIN_ANNOUNCE_INTERVAL
+            );
+        }
+        assert_eq!(ReannounceDelay::new(s(301), None, None).regular, s(301));
+        // The session's forced interval is its own choice, not the tracker's.
+        assert_eq!(ReannounceDelay::new(s(0), None, Some(s(60))).regular, s(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tracker_answer_that_outlasts_the_completion_timeout_fails() {
+        // A request that never ends: a tracker trickling bytes, each within
+        // the receive timeout, or a UDP exchange retried without end.
+        let start = tokio::time::Instant::now();
+        let e = super::within_completion_timeout(std::future::pending::<anyhow::Result<()>>())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("did not answer"), "{e:#}");
+        assert!(start.elapsed() >= super::COMPLETION_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_http_tracker_fails_the_announce() {
+        // Accepts the connection (the backlog does) and never answers.
+        let (_listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a[0].last.is_some()) => r.unwrap(),
+        };
+        let error = status.announces()[0]
+            .last
+            .clone()
+            .unwrap()
+            .result
+            .unwrap_err();
+        assert!(error.contains("sent nothing"), "{error}");
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
     }
 
     fn v1_hash() -> InfoHashes {
