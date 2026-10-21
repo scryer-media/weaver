@@ -5,7 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::buffers::ByteBuf;
 use crate::core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
@@ -40,12 +40,21 @@ pub struct ChunkTracker {
     // needed initial value = selected & !have
     queue_pieces: BF,
 
+    // How many pieces are queued, and the queued pieces a block of which was
+    // received, by index. Kept, not recounted: moved wherever a piece joins
+    // or leaves the queue or receives or drops its blocks (libtorrent keeps
+    // its started pieces as `m_downloads[piece_downloading]`).
+    queued: u32,
+    started: BTreeSet<u32>,
+
     // This has a bit set per each chunk (block) that we have written to the output file.
     // It doesn't mean it's valid yet. Used to track how much is left in each piece.
     chunk_status: BF,
 
-    // These are the pieces that we actually have, fully checked and downloaded.
+    // These are the pieces that we actually have, fully checked and downloaded,
+    // and how many (libtorrent `m_num_have`).
     have: BoxBitV,
+    have_count: u32,
 
     // The pieces that are wanted: those of the selected files, less the ones whose
     // priority is Skip. This doesn't change unless update_only_files or
@@ -198,6 +207,9 @@ impl ChunkTracker {
             chunk_status: compute_chunk_have_status(&lengths, have_pieces.as_slice())
                 .context("error computing chunk status")?,
             queue_pieces: needed_pieces,
+            queued: 0,
+            started: BTreeSet::new(),
+            have_count: have_pieces.as_slice().count_ones() as u32,
             selection: Box::new(PieceSelection {
                 files_selected: selected_pieces.clone(),
                 priorities: vec![PiecePriority::Normal; total_pieces as usize],
@@ -211,6 +223,7 @@ impl ChunkTracker {
         };
         ct.recalculate_per_file_bytes(file_infos);
         ct.hns = ct.calc_hns();
+        ct.recount_queue();
         Ok(ct)
     }
 
@@ -241,7 +254,48 @@ impl ChunkTracker {
     }
 
     pub fn reserve_needed_piece(&mut self, index: ValidPieceIndex) {
-        self.queue_pieces.set(index.get() as usize, false)
+        self.set_queued(index, false);
+    }
+
+    // Every change to the queue passes here, piece by piece, but the
+    // selection's wholesale one, which recounts.
+    fn set_queued(&mut self, piece: ValidPieceIndex, queued: bool) {
+        if self.queue_pieces.replace(piece.get_usize(), queued) != queued {
+            if queued {
+                self.queued += 1;
+            } else {
+                self.queued -= 1;
+            }
+        }
+        self.reposition(piece);
+    }
+
+    // `piece` joined or left the queue, or received its first block, or
+    // dropped its blocks: it joins or leaves the started pieces.
+    fn reposition(&mut self, piece: ValidPieceIndex) {
+        if self.queue_pieces[piece.get_usize()] && self.received_chunks(piece) > 0 {
+            self.started.insert(piece.get());
+        } else {
+            self.started.remove(&piece.get());
+        }
+    }
+
+    // The counts of the queue, after a change to all of it.
+    fn recount_queue(&mut self) {
+        self.queued = self.queue_pieces.count_ones() as u32;
+        let lengths = self.lengths;
+        let chunk_status = &self.chunk_status;
+        self.started = self
+            .queue_pieces
+            .iter_ones()
+            .filter(|id| {
+                lengths
+                    .validate_piece_index(*id as u32)
+                    .and_then(|piece| chunk_status.get(lengths.chunk_range(piece)))
+                    .is_some_and(|chunks| chunks.any())
+            })
+            .map(|id| id as u32)
+            .collect();
     }
 
     pub fn get_hns(&self) -> &HaveNeededSelected {
@@ -290,7 +344,24 @@ impl ChunkTracker {
 
     /// How many pieces we have.
     pub(crate) fn have_count(&self) -> usize {
-        self.have.as_slice().count_ones()
+        self.have_count as usize
+    }
+
+    /// The queued pieces a block of which was received, in index order.
+    pub(crate) fn started_pieces(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.started
+            .iter()
+            .filter_map(|id| self.lengths.validate_piece_index(*id))
+    }
+
+    /// How many queued pieces received a block.
+    pub(crate) fn started_count(&self) -> usize {
+        self.started.len()
+    }
+
+    /// Whether every queued piece received a block.
+    pub(crate) fn every_queued_piece_started(&self) -> bool {
+        self.queued as usize == self.started.len()
     }
 
     pub(crate) fn is_piece_have(&self, id: ValidPieceIndex) -> bool {
@@ -301,27 +372,22 @@ impl ChunkTracker {
     /// stay received, so whoever takes it next asks only for the rest. Returns
     /// whether it was queued.
     pub fn requeue_piece_if_not_have(&mut self, index: ValidPieceIndex) -> bool {
-        if self
-            .have
-            .as_slice()
-            .get(index.get() as usize)
-            .map(|r| *r)
-            .unwrap_or_default()
-        {
+        if self.is_piece_have(index) {
             return false;
         }
-        self.queue_pieces.set(index.get() as usize, true);
+        self.set_queued(index, true);
         true
     }
 
     pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {
-        if !self.requeue_piece_if_not_have(index) {
+        if self.is_piece_have(index) {
             return;
         }
         debug!("marking piece={} as broken", index);
         if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
             s.fill(false);
         }
+        self.set_queued(index, true);
     }
 
     pub fn mark_piece_downloaded(&mut self, idx: ValidPieceIndex) {
@@ -330,9 +396,10 @@ impl ChunkTracker {
         // anything that queues "selected and not have" - update_only_files() re-selecting
         // its file - queued it. A piece we have is not one a peer should be handed, so
         // whatever queued it in that window is undone here.
-        self.queue_pieces.set(id, false);
+        self.set_queued(idx, false);
         if !self.have.as_slice()[id] {
             self.have.as_slice_mut().set(id, true);
+            self.have_count += 1;
             let len = self.lengths.piece_length(idx) as u64;
             self.hns.have_bytes += len;
             if self.selected[id] {
@@ -391,7 +458,9 @@ impl ChunkTracker {
             piece.index, chunk_info, chunk_range,
         );
 
-        if chunk_range.all() {
+        let completed = chunk_range.all();
+        self.reposition(chunk_info.piece_index);
+        if completed {
             return Some(ChunkMarkingResult::Completed);
         }
         Some(ChunkMarkingResult::NotCompleted)
@@ -472,6 +541,7 @@ impl ChunkTracker {
             have_or_selected |= self.have.as_slice();
             self.queue_pieces &= have_or_selected;
         }
+        self.recount_queue();
 
         self.hns = self.calc_hns();
         self.hns
@@ -876,5 +946,86 @@ mod tests {
         assert!(ct.queue_pieces[3]);
         assert!(!ct.queue_pieces[1]);
         assert_eq!(ct.get_hns().needed_bytes, piece_len as u64 * 3);
+    }
+
+    // The counts a pick reads are kept, and agree with a recount of the
+    // bitfields after every kind of move.
+    #[test]
+    fn the_kept_counts_follow_every_move() {
+        use crate::{peer_protocol::Piece, piece_priority::PiecePriority};
+
+        let piece_len = CHUNK_SIZE * 2;
+        let l = Lengths::new(piece_len as u64 * 4, piece_len).unwrap();
+        let files = vec![FileInfo {
+            relative_filename: "0".into(),
+            offset_in_torrent: 0,
+            piece_range: 0..4,
+            len: piece_len as u64 * 4,
+            attrs: Default::default(),
+        }];
+        let bf_len = l.piece_bitfield_bytes();
+        let mut have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        have.set(3, true);
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..4).unwrap().fill(true);
+        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
+        let p = |i| l.validate_piece_index(i).unwrap();
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        let deliver = |ct: &mut ChunkTracker, i: u32, chunk: u32| {
+            ct.mark_chunk_downloaded(&Piece::from_data(i, chunk * CHUNK_SIZE, &block[..]))
+                .unwrap();
+        };
+        // (queued, started, had), kept and recounted.
+        let counts = |ct: &ChunkTracker| {
+            let recounted = (
+                ct.queue_pieces.count_ones(),
+                ct.iter_queued_pieces()
+                    .filter(|p| ct.received_chunks(*p) > 0)
+                    .map(|p| p.get())
+                    .collect::<Vec<_>>(),
+                ct.have.as_slice().count_ones(),
+            );
+            let kept = (
+                ct.queued as usize,
+                ct.started_pieces().map(|p| p.get()).collect::<Vec<_>>(),
+                ct.have_count(),
+            );
+            assert_eq!(kept, recounted);
+            assert_eq!(
+                ct.every_queued_piece_started(),
+                kept.0 == kept.1.len(),
+                "{kept:?}"
+            );
+            kept
+        };
+        assert_eq!(counts(&ct), (3, vec![], 1));
+
+        // A block of a queued piece starts it; a piece taken leaves the queue.
+        deliver(&mut ct, 1, 0);
+        ct.reserve_needed_piece(p(0));
+        assert_eq!(counts(&ct), (2, vec![1], 1));
+
+        // The taken piece comes back with its block; another is taken.
+        deliver(&mut ct, 0, 1);
+        ct.requeue_piece_if_not_have(p(0));
+        ct.reserve_needed_piece(p(2));
+        assert_eq!(counts(&ct), (2, vec![0, 1], 1));
+        assert!(ct.every_queued_piece_started());
+
+        // A failed piece comes back without its blocks.
+        ct.mark_piece_broken_if_not_have(p(1));
+        assert_eq!(counts(&ct), (2, vec![0], 1));
+        assert!(!ct.every_queued_piece_started());
+
+        // A passed piece is had; one requeued that we have stays out.
+        ct.mark_piece_downloaded(p(2));
+        assert!(!ct.requeue_piece_if_not_have(p(2)));
+        assert_eq!(counts(&ct), (2, vec![0], 2));
+
+        // Skipped and wanted again, a piece starts over.
+        ct.set_piece_priorities([(p(0), PiecePriority::Skip)]);
+        assert_eq!(counts(&ct), (1, vec![], 2));
+        ct.set_piece_priorities([(p(0), PiecePriority::Normal)]);
+        assert_eq!(counts(&ct), (2, vec![], 2));
     }
 }

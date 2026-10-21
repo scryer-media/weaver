@@ -302,11 +302,7 @@ impl PieceTracker {
         // peer whose queues are empty). A piece held three times as long as
         // the peer takes to download one goes over whole; otherwise the
         // peer doubles a block.
-        let end_game = req.outstanding_requests == 0
-            && self
-                .chunks
-                .iter_queued_pieces()
-                .all(|p| self.chunks.received_chunks(p) > 0);
+        let end_game = req.outstanding_requests == 0 && self.chunks.every_queued_piece_started();
         if may_steal && end_game {
             if let Some(result) = self.try_steal(&req, 3.0) {
                 return result;
@@ -416,14 +412,17 @@ impl PieceTracker {
         };
 
         let rarest_first = chunks.have_count() >= INITIAL_PICKER_THRESHOLD;
-        let partials = inflight.len() + chunks.iter_queued_pieces().filter(|p| started(*p)).count();
+        let partials = inflight.len() + chunks.started_count();
         let chunks_per_piece = chunks.get_lengths().default_chunks_per_piece() as usize;
         let prioritize_partials = !rarest_first
             || partials > req.num_peers * 3 / 2
             || partials * chunks_per_piece > MAX_PARTIAL_CHUNKS;
 
         if prioritize_partials {
-            let mut started_pieces = candidates().filter(|p| started(*p));
+            let mut started_pieces = chunks.started_pieces().filter(|p| {
+                chunks.priority(*p) == level
+                    && may_hand(chunks, &req.peer_has_piece, req.options, *p)
+            });
             let partial = if rarest_first {
                 started_pieces
                     .min_by_key(|p| ((req.availability)(*p), Reverse(chunks.received_chunks(*p))))
