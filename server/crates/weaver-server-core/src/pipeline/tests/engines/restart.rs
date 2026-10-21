@@ -400,11 +400,11 @@ fn drain(
 }
 
 // What a run restarted once after its repair came to.
-struct RestartedDone {
-    status: Option<JobStatus>,
-    files: BTreeMap<String, Vec<u8>>,
+pub(super) struct RestartedDone {
+    pub(super) status: Option<JobStatus>,
+    pub(super) files: BTreeMap<String, Vec<u8>>,
     // Every event either pipeline sent from admission on, in order.
-    events: Vec<PipelineEvent>,
+    pub(super) events: Vec<PipelineEvent>,
 }
 
 // The job served as `run` serves it, and the pipeline taken down once, the
@@ -521,7 +521,7 @@ async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
 // The job served as `run` serves it, and the pipeline drained and taken down
 // once, the first time a repair of the job is out on a thread. Whether the
 // restored job lent a repair again.
-async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, bool) {
+pub(super) async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
@@ -609,7 +609,7 @@ async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, b
 }
 
 // What the job announced of its repair and its end, in order.
-fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
+pub(super) fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {

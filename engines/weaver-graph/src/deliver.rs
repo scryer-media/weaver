@@ -37,6 +37,13 @@ impl Provenance {
     pub fn is_verified(self) -> bool {
         matches!(self, Provenance::Fresh | Provenance::Repaired)
     }
+
+    // Whether a record of bytes with this provenance already answers the
+    // same bytes arriving again with `later`, and stands: damage never takes
+    // back a repair. Any other later arrival is the newer word on its bytes.
+    pub(crate) fn answers(self, later: Provenance) -> bool {
+        matches!((self, later), (Provenance::Repaired, Provenance::Damaged))
+    }
 }
 
 pub struct Delivery<'a> {
