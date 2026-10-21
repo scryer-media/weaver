@@ -1031,16 +1031,28 @@ impl LivePeerState {
             .then(|| self.waiting_since + self.block_time.request_timeout())
     }
 
+    /// The peer delivered `chunk`. A block it was asked for, wanted still or
+    /// cancelled late, is the block the wait was for: its time is sampled
+    /// and the wait for the next starts now (libtorrent
+    /// `peer_connection::incoming_piece`, `m_request_time.add_sample` and
+    /// `m_requested` on both its paths). Only one still wanted lifts a snub.
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
-        if self.inflight_requests.remove(chunk) {
-            let now = Instant::now();
-            self.block_time.add(now - self.waiting_since);
-            self.waiting_since = now;
-            self.snubbed = false;
-            self.request_slots_changed.notify_waiters();
-            return RemoveInflightRequestResult::Expected;
+        let answer = if self.inflight_requests.remove(chunk) {
+            RemoveInflightRequestResult::Expected
+        } else {
+            self.answer_to_no_request()
+        };
+        if matches!(answer, RemoveInflightRequestResult::Unexpected) {
+            return answer;
         }
-        self.answer_to_no_request()
+        let now = Instant::now();
+        self.block_time.add(now - self.waiting_since);
+        self.waiting_since = now;
+        if matches!(answer, RemoveInflightRequestResult::Expected) {
+            self.snubbed = false;
+        }
+        self.request_slots_changed.notify_waiters();
+        answer
     }
 
     /// The peer rejected our request for `chunk` (BEP 6). That answers the
