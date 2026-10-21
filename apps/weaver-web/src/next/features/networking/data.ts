@@ -70,6 +70,8 @@ const NO_POOLS: ProxyPool[] = [];
 
 /** A category's own torrent route is keyed by this and the category's id. */
 const TORRENT_CATEGORY_PREFIX = "torrent:category:";
+/** A tracker rule's own torrent route is keyed by this and the rule's id. */
+const TORRENT_TRACKER_PREFIX = "torrent:tracker:";
 
 export const defaultRoute = (): NetworkRoute => ({ legs: [directLeg()], failover: "REDISTRIBUTE" });
 
@@ -81,7 +83,9 @@ export const consumerName = (t: Translate, key: string, name: string) =>
       ? t("next.networking.defaultTorrent")
       : key.startsWith(TORRENT_CATEGORY_PREFIX)
         ? t("next.networking.torrentCategory", { name })
-        : name;
+        : key.startsWith(TORRENT_TRACKER_PREFIX)
+          ? t("next.networking.torrentTracker", { name })
+          : name;
 
 /**
  * Everything that owns a route. The flow names them once the daemon has

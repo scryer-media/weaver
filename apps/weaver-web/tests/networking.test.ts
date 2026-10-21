@@ -72,7 +72,7 @@ test("a torrent route takes several legs but no pool",()=>{
   const one={failover:"HOLD" as const,legs:[directLeg()]};
   const two={failover:"HOLD" as const,legs:[{...directLeg(),weight:50},{...directLeg(),weight:50}]};
   const viaPool={failover:"HOLD" as const,legs:[{egressId:0,weight:100,path:{kind:"LADDER" as const,directFallback:false,rungs:[{kind:"POOL" as const,proxyId:null,poolId:5,chainIds:[]}]}}]};
-  for(const kind of ["TORRENT_DEFAULT","TORRENT_CATEGORY"] as const){
+  for(const kind of ["TORRENT_DEFAULT","TORRENT_CATEGORY","TORRENT_TRACKER"] as const){
     assert.equal(routeProblem(one,{kind}),null);
     assert.equal(routeProblem(two,{kind}),null);
     assert.equal(routeProblem(viaPool,{pools,kind}),"torrentPool");

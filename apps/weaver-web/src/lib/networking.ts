@@ -43,11 +43,14 @@ export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:Co
 export type PoolFlow = { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] };
 /**
  * What owns a route: a server, a feed, Default outbound, which carries every
- * other fetch, or torrent traffic: the default route, or one category's own.
+ * other fetch, or torrent traffic: the default route, or one category's or
+ * one tracker rule's own.
  */
-export type ConsumerKind = "SERVER" | "RSS" | "OUTBOUND" | "TORRENT_DEFAULT" | "TORRENT_CATEGORY";
-/** Whether a consumer carries torrent traffic, whose route has one leg and no pool. */
-export const isTorrentConsumer = (kind: ConsumerKind) => kind === "TORRENT_DEFAULT" || kind === "TORRENT_CATEGORY";
+export type ConsumerKind = "SERVER" | "RSS" | "OUTBOUND" | "TORRENT_DEFAULT" | "TORRENT_CATEGORY" | "TORRENT_TRACKER";
+export type TorrentConsumerKind = Extract<ConsumerKind, "TORRENT_DEFAULT" | "TORRENT_CATEGORY" | "TORRENT_TRACKER">;
+/** Whether a consumer carries torrent traffic, whose route takes no pool. */
+export const isTorrentConsumer = (kind: ConsumerKind): kind is TorrentConsumerKind =>
+  kind === "TORRENT_DEFAULT" || kind === "TORRENT_CATEGORY" || kind === "TORRENT_TRACKER";
 /** Default outbound's key: there is one, and it is never made or removed. */
 export const OUTBOUND_CONSUMER = "outbound";
 /** The default torrent route's key: there is one, like Default outbound. */

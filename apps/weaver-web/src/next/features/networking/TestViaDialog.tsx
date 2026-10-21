@@ -5,7 +5,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { NETWORKING_QUERY, TEST_VIA } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import { routeInput, routeProblem, type ConsumerKind, type NetworkRoute } from "@/lib/networking";
+import { routeInput, routeProblem, type ConsumerKind, type NetworkRoute, type TorrentConsumerKind } from "@/lib/networking";
 import { proxyLabels } from "@/lib/proxies";
 import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
@@ -60,7 +60,7 @@ export function TestViaDialog({
   /** The route the draft starts as, in place of one on `egressId`. */
   route?: NetworkRoute | null;
   /** The torrent consumer whose route is tested, running the test torrent too. */
-  torrent?: Extract<ConsumerKind, "TORRENT_DEFAULT" | "TORRENT_CATEGORY">;
+  torrent?: TorrentConsumerKind;
   /** Hears each run in one sentence: its refusal, or what its paths came to. */
   onTested?: (summary: string) => void;
   onClose: () => void;

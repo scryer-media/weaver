@@ -1448,6 +1448,7 @@ const TRACKER_RULE_FIELDS = `
     neverPause
     unpack
     client
+    torrentRoute
   }
   ${SEEDING_POLICY_FIELDS}
 `;
