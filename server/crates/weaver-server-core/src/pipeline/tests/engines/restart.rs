@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use sevenz_turbo::EncoderMethod;
 
 use super::harness::{
-    ARTICLE, JOB, Outcome, Post, Scenario, collect, finished, par2_set, par3_set, payload, run,
-    serve,
+    ARTICLE, GraphView, JOB, Outcome, Post, Scenario, collect, finished, observe, par2_set,
+    par3_set, payload, run, serve,
 };
 use super::sfv::{crc, listing};
 use super::streams::{brotli, bzip2, gzip, members, tar, xz, zstd};
@@ -52,7 +52,11 @@ pub(super) struct Restarted {
     // Every article asked for again though no restart since it was last
     // served found it in memory: its bytes were on disk when asked.
     pub(super) from_disk: BTreeSet<(u32, u32)>,
+    // Every article some restart found in memory.
+    pub(super) in_memory: BTreeSet<(u32, u32)>,
     pub(super) restarts: usize,
+    // The graph job as last seen before it finished, across every restart.
+    pub(super) graph: GraphView,
 }
 
 // Called with each checkpoint as it stood when the pipeline went down.
@@ -62,19 +66,22 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
     run_restarting_at(scenario, inspect, Down::Crash, &|_| true).await
 }
 
-// How the pipeline goes down: as a crash drops it, or shut down.
+// How the pipeline goes down: as a crash drops it, shut down, or as a crash
+// that also loses the file written for the member of this output name, so
+// the restore cannot read back any article holding its bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Down {
+pub(super) enum Down<'a> {
     Crash,
     Shutdown,
+    Losing(&'a str),
 }
 
 // As `run_restarting`, going down as `down` says and only after the articles
 // `at` picks: the nth article asked for the first time, counted from one.
-async fn run_restarting_at(
+pub(super) async fn run_restarting_at(
     scenario: &Scenario,
     inspect: Inspect<'_>,
-    down: Down,
+    down: Down<'_>,
     at: &dyn Fn(usize) -> bool,
 ) -> Restarted {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -90,8 +97,11 @@ async fn run_restarting_at(
     // What some restart found in memory since the article was last served.
     let mut owed = BTreeSet::new();
     let mut from_disk = BTreeSet::new();
+    let mut in_memory = BTreeSet::new();
     let mut restarts = 0;
     let mut quiet = 0;
+    let mut graph = Some(GraphView::default());
+    let mut reads = 0;
     loop {
         while let Some(work) = next_work(&mut pipeline, scenario) {
             let article = (
@@ -105,6 +115,7 @@ async fn run_restarting_at(
                 from_disk.insert(article);
             }
             serve(&mut pipeline, scenario, article).await;
+            observe(&pipeline, &mut graph, &mut reads);
             if finished(&pipeline) {
                 break;
             }
@@ -116,7 +127,16 @@ async fn run_restarting_at(
                 if down == Down::Shutdown {
                     shut_down(&mut pipeline).await;
                 }
-                pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, inspect).await;
+                let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+                let mut going_down = |rows: &crate::jobs::graph_checkpoint::GraphCheckpoint| {
+                    if let Down::Losing(name) = down {
+                        std::fs::remove_file(working_dir.join(name))
+                            .expect("the member's file is on disk to lose");
+                    }
+                    inspect(rows);
+                };
+                pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut going_down).await;
+                in_memory.extend(owed.iter().copied());
                 restarts += 1;
             }
         }
@@ -131,6 +151,7 @@ async fn run_restarting_at(
             pipeline.check_job_completion(JOB).await;
         }
         pump_pipeline_runtime_queues(&mut pipeline).await;
+        observe(&pipeline, &mut graph, &mut reads);
         if finished(&pipeline) {
             break;
         }
@@ -141,6 +162,7 @@ async fn run_restarting_at(
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
+            observe(&pipeline, &mut graph, &mut reads);
             continue;
         }
         let queued = pipeline
@@ -171,7 +193,9 @@ async fn run_restarting_at(
         status,
         files,
         from_disk,
+        in_memory,
         restarts,
+        graph: graph.unwrap_or_default(),
     }
 }
 
