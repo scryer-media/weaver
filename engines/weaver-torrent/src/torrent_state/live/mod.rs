@@ -60,7 +60,7 @@ pub(crate) mod web_seed;
 use std::{
     borrow::Cow,
     collections::HashSet,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     num::NonZeroU32,
     sync::{
         Arc,
@@ -115,8 +115,8 @@ use crate::{
 use self::{
     choker::{CHOKED_REQUEST_GRACE, Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     peer::{
-        InflightRequest, LivePeerState, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx, PeerState, PeerTx,
-        Refused, RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
+        InflightRequest, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx, PeerState, PeerTx, Refused,
+        RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -1189,22 +1189,42 @@ impl TorrentStateLive {
         self.peers.requeue_not_needed();
     }
 
-    /// The PEX message that adds `connected`, each flagged for what it is
-    /// to us, and drops `dropped` (libtorrent `ut_pex_plugin::tick`). The
-    /// peers are those we connected to, listed where they listen.
-    fn pex_message(&self, connected: &[SocketAddr], dropped: &[SocketAddr]) -> UtPex<ByteBufOwned> {
-        let flags = |addr| {
-            self.peers
-                .with_live(addr, LivePeerState::advertised_pex_flags)
-                .unwrap_or(0)
-        };
-        UtPex::from_peers(
-            connected.iter().map(|&addr| PexPeerInfo {
-                flags: flags(addr),
-                addr,
-            }),
-            dropped.iter().copied(),
-        )
+    /// The next PEX message to the peer at `to`, which our earlier ones
+    /// told of the peers in `told`, and `told` brought up to it; None when
+    /// nothing changed (libtorrent `ut_pex_plugin::tick`,
+    /// `ut_pex_peer_plugin::send_ut_peer_diff`). It adds the peers we list
+    /// that `to` was not told of, and drops those told of that we no longer
+    /// list. A peer on a local network is not told to one that is not: it
+    /// drops them (`ut_pex_peer_plugin::on_extended`).
+    fn next_pex_message(
+        &self,
+        to: SocketAddr,
+        told: &mut HashSet<SocketAddr>,
+    ) -> Option<UtPex<ByteBufOwned>> {
+        // BEP 11: at most 50 added and 50 dropped peers in one message.
+        const MAX_SENT_PEERS: usize = 50;
+        let listed = self.peers.pex_listed();
+        let shown = |addr: &SocketAddr| is_local(to.ip()) || !is_local(addr.ip());
+        let added: Vec<PexPeerInfo> = listed
+            .iter()
+            .filter(|(addr, _)| shown(addr) && !told.contains(*addr))
+            .take(MAX_SENT_PEERS)
+            .map(|(&addr, &flags)| PexPeerInfo { flags, addr })
+            .collect();
+        let dropped: Vec<SocketAddr> = told
+            .iter()
+            .filter(|addr| !listed.contains_key(addr))
+            .take(MAX_SENT_PEERS)
+            .copied()
+            .collect();
+        if added.is_empty() && dropped.is_empty() {
+            return None;
+        }
+        for addr in &dropped {
+            told.remove(addr);
+        }
+        told.extend(added.iter().map(|p| p.addr));
+        Some(UtPex::from_peers(added.into_iter(), dropped.into_iter()))
     }
 
     async fn task_send_pex_to_peer(
@@ -1212,15 +1232,10 @@ impl TorrentStateLive {
         this_peer_addr: SocketAddr,
         tx: PeerTx,
     ) -> anyhow::Result<()> {
-        // As per BEP 11 we should not send more than 50 peers at once
-        // (here it also applies to fist message, should be OK as we anyhow really have more)
-        const MAX_SENT_PEERS: usize = 50;
         // As per BEP 11 recommended interval is min 60 seconds
         const PEX_MESSAGE_INTERVAL: Duration = Duration::from_secs(60);
 
-        let mut connected = Vec::with_capacity(MAX_SENT_PEERS);
-        let mut dropped = Vec::with_capacity(MAX_SENT_PEERS);
-        let mut peer_view_of_live_peers = HashSet::new();
+        let mut told = HashSet::new();
 
         // Wait 10 seconds before sending the first message to assure that peer will stay with us
         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1235,59 +1250,19 @@ impl TorrentStateLive {
                 return Ok(());
             }
 
-            {
-                let live_peers = self.peers.live_outgoing_peers.read();
-                connected.clear();
-                dropped.clear();
-
-                connected.extend(
-                    live_peers
-                        .difference(&peer_view_of_live_peers)
-                        .take(MAX_SENT_PEERS)
-                        .copied(),
-                );
-                dropped.extend(
-                    peer_view_of_live_peers
-                        .difference(&live_peers)
-                        .take(MAX_SENT_PEERS)
-                        .copied(),
-                );
-            }
-
-            trace!(connected_len = connected.len(), dropped_len = dropped.len());
-
-            let peer_ip_non_local = match this_peer_addr.ip() {
-                IpAddr::V4(a) => !a.is_loopback() && !a.is_private(),
-                IpAddr::V6(a) => !a.is_loopback() && !a.is_unique_local(),
-            };
-
-            let other_ip_is_local = |addr: &IpAddr| match addr {
-                IpAddr::V4(a) => a.is_loopback() || a.is_private(),
-                IpAddr::V6(a) => {
-                    a.is_loopback() || a.is_unicast_link_local() || a.is_unique_local()
-                }
-            };
-
-            let filter = |addr: &SocketAddr| !(peer_ip_non_local && other_ip_is_local(&addr.ip()));
-
-            // BEP 11 - Dont send closed if they are now in live
-            // it's assured by mutual exclusion of two  above sets  if in sent_peers_live, it cannot be in addrs_live_to_sent,
-            // and addrs_closed_to_sent are only filtered addresses from sent_peers_live
-
-            if !connected.is_empty() || !dropped.is_empty() {
-                let pex_msg = self.pex_message(&connected, &dropped);
+            if let Some(pex_msg) = self.next_pex_message(this_peer_addr, &mut told) {
+                trace!(?pex_msg, "sending PEX");
                 if tx.send(WriterRequest::UtPex(pex_msg)).is_err() {
                     return Ok(()); // Peer disconnected
                 }
-
-                for addr in &dropped {
-                    peer_view_of_live_peers.remove(addr);
-                }
-                peer_view_of_live_peers.extend(connected.iter().filter(|a| filter(a)).copied());
             }
         }
     }
 }
+
+// libtorrent `ut_pex_peer_plugin::on_extended`: the longest PEX message a
+// peer may send (`pex_message_too_large`).
+const MAX_PEX_MESSAGE_LEN: usize = 500 * 1024;
 
 // libtorrent `settings_pack::max_out_request_queue`: the most requests
 // outstanding to a peer, however fast it delivers.
@@ -1435,7 +1410,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Extended(ExtendedMessage::UtHolepunch(msg)) => self.on_holepunch(msg),
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.pex {
-                    self.on_pex_message(pex);
+                    self.on_pex_message(pex)?;
                 } else {
                     warn!(
                         id = self.state.shared.id,
@@ -2812,21 +2787,39 @@ impl PeerHandler {
         Ok(())
     }
 
-    fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) {
-        // A dropped peer is one the sender lost; only the added ones are news.
-        for peer in msg.added_peers() {
+    /// A PEX message from the peer (libtorrent
+    /// `ut_pex_peer_plugin::on_extended`). One past [`MAX_PEX_MESSAGE_LEN`],
+    /// or past the peer's rate, ends the connection. A peer on a local
+    /// network it names is taken only from a peer on one. Each added peer
+    /// it had not named before is news, a candidate for our peer list, up
+    /// to [`peer::MAX_PEX_PEERS`] of each family; a dropped one is only
+    /// forgotten as named, as the sender lost it, not we.
+    fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) -> anyhow::Result<()> {
+        let len = msg.lists_len();
+        if len > MAX_PEX_MESSAGE_LEN {
+            anyhow::bail!("PEX message of {len} bytes, past {MAX_PEX_MESSAGE_LEN}");
+        }
+        let from_local = is_local(self.addr.ip());
+        let news = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "pex_named", |live| {
+                if !live.pex_arrived(tokio::time::Instant::now()) {
+                    anyhow::bail!("PEX messages too frequent");
+                }
+                Ok(live.pex_named(
+                    msg.added_peers()
+                        .filter(|p| from_local || !is_local(p.addr.ip())),
+                    msg.dropped_peers().map(|p| p.addr),
+                ))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        for peer in news {
             self.state.add_peer(peer.addr);
             self.state.peers.pex_flags(peer.addr, peer.flags);
         }
-        // What the sender named, so it can introduce us to those peers.
-        self.state
-            .peers
-            .with_live_mut(self.addr, "pex_named", |live| {
-                live.pex_named(
-                    msg.added_peers().map(|p| p.addr),
-                    msg.dropped_peers().map(|p| p.addr),
-                )
-            });
+        Ok(())
     }
 
     fn is_choked(&self) -> bool {

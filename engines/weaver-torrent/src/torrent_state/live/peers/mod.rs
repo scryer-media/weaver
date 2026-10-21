@@ -6,7 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
@@ -54,8 +54,6 @@ pub(crate) const MAX_PEERLIST_SIZE: usize = 3000;
 pub(crate) struct PeerStates {
     pub session_stats: Arc<AggregatePeerStatsAtomic>,
 
-    // This keeps track of live addresses we connected to, for PEX.
-    pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
 
@@ -156,7 +154,6 @@ impl PeerStates {
     ) -> Self {
         let peers = Self {
             session_stats,
-            live_outgoing_peers: Default::default(),
             stats: Default::default(),
             states: Default::default(),
             availability: Availability::new(total_pieces),
@@ -484,6 +481,21 @@ impl PeerStates {
             .flatten()
     }
 
+    /// The peers our PEX messages list, each where it listens, with what
+    /// the message says of it (libtorrent `ut_pex_plugin::tick`,
+    /// `send_peer`): every connected peer whose listening address we know,
+    /// as we connected to it there or it told us; never a web seed.
+    pub fn pex_listed(&self) -> HashMap<SocketAddr, u8> {
+        self.states
+            .iter()
+            .filter_map(|e| {
+                let peer = e.value();
+                let flags = peer.get_live()?.advertised_pex_flags();
+                Some((peer.outgoing_address?, flags))
+            })
+            .collect()
+    }
+
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
         let p = self.states.remove(&handle).map(|r| r.1)?;
         if is_web_seed(handle) {
@@ -610,6 +622,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::peer_protocol::extended::ut_pex::PexPeerInfo;
     use crate::torrent_state::live::peer::{MAX_FAILCOUNT, MAX_PEX_PEERS, MIN_RECONNECT_TIME};
 
     const TOTAL_PIECES: usize = 8;
@@ -1365,18 +1378,20 @@ mod tests {
     // named the address.
     #[test]
     fn the_introducer_is_a_holepunch_peer_whose_pex_named_the_address() {
+        let named_by =
+            |addrs: Vec<SocketAddr>| addrs.into_iter().map(|addr| PexPeerInfo { flags: 0, addr });
         let peers = make_peer_states();
         let target = peer_addr(1);
         let (named, _named_rx) = add_live_peer(&peers, "10.0.1.1:6881");
         let (speaks, _speaks_rx) = add_live_peer(&peers, "10.0.1.2:6881");
         peers.with_live_mut(named, "test", |live| {
-            live.pex_named([target].into_iter(), std::iter::empty())
+            live.pex_named(named_by(vec![target]), std::iter::empty())
         });
         assert!(peers.introducer(target).is_none());
 
         peers.with_live_mut(speaks, "test", |live| {
             live.supports_holepunch = true;
-            live.pex_named([target].into_iter(), std::iter::empty());
+            live.pex_named(named_by(vec![target]), std::iter::empty());
         });
         assert!(peers.introducer(target).is_some());
         peers.with_live_mut(speaks, "test", |live| {
@@ -1387,7 +1402,11 @@ mod tests {
         let v4 = (0..300).map(peer_addr);
         let v6 = (0..300).map(|i| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, i], 6881)));
         peers.with_live_mut(speaks, "test", |live| {
-            live.pex_named(v4.chain(v6), std::iter::empty());
+            // Each family takes peers while it has room; the news is what it took.
+            let news = live.pex_named(named_by(v4.chain(v6).collect()), std::iter::empty());
+            assert_eq!(news.len(), 2 * MAX_PEX_PEERS);
+            let again = live.pex_named(named_by(vec![peer_addr(0)]), std::iter::empty());
+            assert!(again.is_empty());
             let kept = |v4| {
                 (0..300)
                     .filter(|&i| {

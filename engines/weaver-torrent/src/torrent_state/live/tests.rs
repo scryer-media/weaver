@@ -2264,6 +2264,76 @@ async fn a_pex_message_adds_its_added_peers_and_not_its_dropped_ones() {
     assert!(!h.knows("10.0.0.2:6881"));
 }
 
+impl PeerHandler {
+    /// The peer sends us `msg`.
+    async fn send_pex(&self, msg: &UtPex<ByteBufOwned>) -> anyhow::Result<()> {
+        self.on_received_message(Message::Extended(ExtendedMessage::UtPex(msg.as_borrowed())))
+            .await
+    }
+}
+
+// libtorrent `ut_pex_peer_plugin::on_extended`: a connection's PEX adds at
+// most `max_pex_peers` of each family to our list, and a peer on a local
+// network only when the connection is on one too.
+#[tokio::test]
+async fn a_pex_message_adds_at_most_max_pex_peers_and_a_local_peer_only_from_a_local_one() {
+    let h = Harness::new("pex_limits").await;
+    let (remote, _remote_rx) = h.peer("198.51.100.1:6881");
+    let public: Vec<String> = (0..60).map(|i| format!("203.0.113.{i}:6881")).collect();
+    let mut added = vec!["192.168.1.1:6881", "10.0.0.1:6881"];
+    added.extend(public.iter().map(String::as_str));
+    remote.send_pex(&pex(&added, &[])).await.unwrap();
+    assert!(!h.knows("192.168.1.1:6881"));
+    assert!(!h.knows("10.0.0.1:6881"));
+    let known = public.iter().filter(|a| h.knows(a)).count();
+    assert_eq!(known, peer::MAX_PEX_PEERS);
+
+    let (local, _local_rx) = h.peer("192.168.1.2:6881");
+    local
+        .send_pex(&pex(&["192.168.1.1:6881"], &[]))
+        .await
+        .unwrap();
+    assert!(h.knows("192.168.1.1:6881"));
+}
+
+// libtorrent `ut_pex_peer_plugin::on_extended`, `m_last_pex`: a peer may
+// send six PEX messages a minute; the seventh ends the connection.
+#[tokio::test]
+async fn a_seventh_pex_message_within_a_minute_ends_the_connection() {
+    let h = Harness::new("pex_flood").await;
+    tokio::time::pause();
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let msg = pex(&[], &[]);
+    for _ in 0..6 {
+        peer.send_pex(&msg).await.unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert!(peer.send_pex(&msg).await.is_err());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    peer.send_pex(&msg).await.unwrap();
+}
+
+// libtorrent `ut_pex_peer_plugin::on_extended`: a PEX message past 500 KiB
+// ends the connection (`pex_message_too_large`), unread.
+#[tokio::test]
+async fn a_pex_message_past_500_kib_ends_the_connection() {
+    let h = Harness::new("pex_too_large").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    // An IPv4 address and its flags byte: seven bytes a peer.
+    let past = MAX_PEX_MESSAGE_LEN / 7 + 1;
+    let named = |n: usize| {
+        let added = (0..n).map(|i| PexPeerInfo {
+            flags: 0,
+            addr: SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 6881)),
+        });
+        UtPex::from_peers(added, std::iter::empty())
+    };
+    assert!(peer.send_pex(&named(past)).await.is_err());
+    assert!(!h.knows("10.0.0.0:6881"));
+    peer.send_pex(&named(past - 1)).await.unwrap();
+    assert!(h.knows("10.0.0.0:6881"));
+}
+
 // libtorrent `session::add_extension`: a session without the ut_pex plugin
 // does not advertise it, and takes no peers from it.
 #[tokio::test]
@@ -2701,52 +2771,79 @@ async fn a_failed_connection_asks_the_peer_whose_pex_named_it_to_introduce_us() 
     assert_eq!(sent, UtHolepunch::Rendezvous(target));
 }
 
-// libtorrent `ut_pex_plugin::tick`: each peer our PEX message adds is
-// flagged a seed, connected over uTP, speaking the holepunch extension, as
-// it is to us.
+// libtorrent `ut_pex_plugin::tick`, `send_peer`: our PEX message lists each
+// connected peer whose listening address we know, where it listens, flagged
+// a seed, connected over uTP, speaking the holepunch extension, as it is to
+// us; the next one drops a peer gone. A peer not on a local network is not
+// told of one that is (it would drop it, `ut_pex_peer_plugin::on_extended`).
 #[tokio::test]
-async fn our_pex_message_flags_each_peer_it_adds_for_what_it_is_to_us() {
+async fn our_pex_message_lists_each_connected_peer_where_it_listens_flagged_for_what_it_is_to_us() {
     use extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP};
     let h = Harness::new("pex_flags_sent").await;
-    let (_seed, _seed_rx) = h.peer("203.0.113.1:6881");
-    let (_plain, _plain_rx) = h.new_peer("203.0.113.2:6881");
-    let (utp_tx, _utp_rx) = unbounded_channel();
-    h.peers
-        .add_incoming(
-            sock("203.0.113.3:6881"),
-            Id20::default(),
-            utp_tx,
-            ConnectionKind::Utp,
-        )
-        .unwrap();
-    let (holepunch, _holepunch_rx) = h.new_peer("203.0.113.4:6881");
-    let mut hs = ExtendedHandshake::new();
-    hs.m.ut_holepunch = Some(9);
-    (&holepunch).on_extended_handshake(&hs).unwrap();
+    let listening_on_6881 = |peer: &PeerHandler, holepunch: bool| {
+        let mut hs = ExtendedHandshake::new();
+        hs.p = Some(6881);
+        if holepunch {
+            hs.m.ut_holepunch = Some(9);
+        }
+        peer.on_extended_handshake(&hs).unwrap();
+    };
+    let utp = |addr: &str| {
+        let (tx, rx) = unbounded_channel();
+        h.peers
+            .add_incoming(sock(addr), Id20::default(), tx, ConnectionKind::Utp)
+            .unwrap();
+        rx
+    };
+    let (seed, _seed_rx) = h.peer("203.0.113.1:50001");
+    listening_on_6881(&seed, false);
+    let (plain, _plain_rx) = h.new_peer("203.0.113.2:50002");
+    listening_on_6881(&plain, false);
+    let _utp_rx = utp("203.0.113.3:6881");
+    let (holepunch, _holepunch_rx) = h.new_peer("203.0.113.4:50004");
+    listening_on_6881(&holepunch, true);
+    // Never says where it listens.
+    let (_silent, _silent_rx) = h.new_peer("203.0.113.5:50005");
+    let _local_rx = utp("192.168.1.3:6881");
 
-    let added = [
-        "203.0.113.1:6881",
-        "203.0.113.2:6881",
-        "203.0.113.3:6881",
-        "203.0.113.4:6881",
-    ]
-    .map(sock);
-    let msg = h.pex_message(&added, &[sock("203.0.113.9:6881")]);
-    let mut wire = Vec::new();
-    crate::bencode::bencode_serialize_to_writer(&msg.as_borrowed(), &mut wire).unwrap();
-    let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&wire).unwrap();
-    let flagged: Vec<_> = msg.added_peers().map(|p| (p.addr, p.flags)).collect();
+    let sorted = |msg: UtPex<ByteBufOwned>| {
+        let mut wire = Vec::new();
+        crate::bencode::bencode_serialize_to_writer(&msg.as_borrowed(), &mut wire).unwrap();
+        let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&wire).unwrap();
+        let mut added: Vec<_> = msg.added_peers().map(|p| (p.addr, p.flags)).collect();
+        let mut dropped: Vec<_> = msg.dropped_peers().map(|p| p.addr).collect();
+        added.sort();
+        dropped.sort();
+        (added, dropped)
+    };
+
+    let remote = sock("198.51.100.1:6881");
+    let mut told = HashSet::new();
+    let (added, dropped) = sorted(h.next_pex_message(remote, &mut told).unwrap());
     assert_eq!(
-        flagged,
+        added,
         [
-            (added[0], PEX_SEED),
-            (added[1], 0),
-            (added[2], PEX_UTP),
-            (added[3], PEX_HOLEPUNCH),
+            (sock("203.0.113.1:6881"), PEX_SEED),
+            (sock("203.0.113.2:6881"), 0),
+            (sock("203.0.113.3:6881"), PEX_UTP),
+            (sock("203.0.113.4:6881"), PEX_HOLEPUNCH),
         ]
     );
-    let dropped: Vec<_> = msg.dropped_peers().map(|p| p.addr).collect();
-    assert_eq!(dropped, [sock("203.0.113.9:6881")]);
+    assert!(dropped.is_empty());
+    assert!(h.next_pex_message(remote, &mut told).is_none());
+
+    let mut local_told = HashSet::new();
+    let (added, _) = sorted(
+        h.next_pex_message(sock("192.168.1.9:6881"), &mut local_told)
+            .unwrap(),
+    );
+    assert_eq!(added.len(), 5);
+    assert!(added.contains(&(sock("192.168.1.3:6881"), PEX_UTP)));
+
+    h.peers.drop_peer(plain.addr);
+    let (added, dropped) = sorted(h.next_pex_message(remote, &mut told).unwrap());
+    assert!(added.is_empty());
+    assert_eq!(dropped, [sock("203.0.113.2:6881")]);
 }
 
 // libtorrent `torrent::do_pause` only disconnects: `torrent::m_peer_list`,

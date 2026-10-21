@@ -10,7 +10,7 @@ pub mod stats;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::hash_id::Id20;
@@ -25,7 +25,7 @@ use tokio::sync::{
 use tokio::time::Instant;
 
 use crate::peer_connection::WriterRequest;
-use crate::peer_protocol::extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP};
+use crate::peer_protocol::extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo};
 use crate::stream_connect::{ConnectionKind, Transports};
 use crate::type_aliases::BF;
 
@@ -41,9 +41,14 @@ pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
-// libtorrent `max_pex_peers`: the most peers of each address family a
-// connection's PEX messages are remembered to have named.
-pub(crate) const MAX_PEX_PEERS: usize = 200;
+// libtorrent `settings_pack::max_pex_peers`: the most peers of each address
+// family a connection's PEX messages are remembered to have named, and so
+// the most it adds to our peer list.
+pub(crate) const MAX_PEX_PEERS: usize = 50;
+// libtorrent `ut_pex_peer_plugin::m_last_pex`: a peer may send this many PEX
+// messages in PEX_FLOOD_WINDOW, and the next ends the connection.
+const PEX_FLOOD_MESSAGES: usize = 6;
+const PEX_FLOOD_WINDOW: Duration = Duration::from_secs(60);
 
 // libtorrent `settings_pack::allowed_fast_set_size`: how many pieces a peer
 // may fetch while we choke it.
@@ -530,30 +535,11 @@ impl Peer {
 
     pub fn destroy(self, counters: &PeerStates) {
         counters.count_out(&self.state);
-        if let (Some(addr), PeerState::Live(..)) = (self.outgoing_address, &self.state) {
-            counters.live_outgoing_peers.write().remove(&addr);
-        }
     }
 
     pub fn set_state(&mut self, new: PeerState, counters: &PeerStates) -> PeerState {
         counters.count_out(&self.state);
         counters.count_in(&new);
-        if let Some(addr) = self.outgoing_address {
-            if matches!(&self.state, PeerState::Live(..)) {
-                counters.live_outgoing_peers.write().remove(&addr);
-            }
-            if matches!(&new, PeerState::Live(..))
-                && self
-                    .stats
-                    .counters
-                    .outgoing_connections
-                    .load(Ordering::Relaxed)
-                    > 0
-            {
-                counters.live_outgoing_peers.write().insert(addr);
-            }
-        }
-
         std::mem::replace(&mut self.state, new)
     }
 
@@ -706,6 +692,10 @@ pub(crate) struct LivePeerState {
     // `m_peers`, `m_peers6`).
     pex_named: HashSet<SocketAddr>,
 
+    // When its last PEX_FLOOD_MESSAGES PEX messages arrived, the oldest
+    // first (libtorrent `ut_pex_peer_plugin::m_last_pex`).
+    pex_arrivals: [Option<Instant>; PEX_FLOOD_MESSAGES],
+
     // The main channel to send requests to peer.
     pub tx: PeerTx,
 
@@ -774,6 +764,7 @@ impl LivePeerState {
             super_seeded: None,
             supports_holepunch: false,
             pex_named: HashSet::new(),
+            pex_arrivals: [None; PEX_FLOOD_MESSAGES],
             tx,
             connection_kind,
             fast: false,
@@ -783,27 +774,45 @@ impl LivePeerState {
         }
     }
 
+    /// A PEX message from the peer arrived at `now`. False when it is one
+    /// more than [`PEX_FLOOD_MESSAGES`] in [`PEX_FLOOD_WINDOW`]: the peer
+    /// floods us (libtorrent `ut_pex_peer_plugin::on_extended`,
+    /// `too_frequent_pex`).
+    pub fn pex_arrived(&mut self, now: Instant) -> bool {
+        if self.pex_arrivals[0].is_some_and(|oldest| now - oldest < PEX_FLOOD_WINDOW) {
+            return false;
+        }
+        self.pex_arrivals.rotate_left(1);
+        self.pex_arrivals[PEX_FLOOD_MESSAGES - 1] = Some(now);
+        true
+    }
+
     /// A PEX message from the peer named `added` and dropped `dropped`
     /// (libtorrent `ut_pex_peer_plugin::on_extended`): the dropped go, then
-    /// the added come while their family has room.
+    /// the added come while their family has room. Returns the added it had
+    /// not named before, the ones that are news.
     pub fn pex_named(
         &mut self,
-        added: impl Iterator<Item = SocketAddr>,
+        added: impl Iterator<Item = PexPeerInfo>,
         dropped: impl Iterator<Item = SocketAddr>,
-    ) {
+    ) -> Vec<PexPeerInfo> {
         for addr in dropped {
             self.pex_named.remove(&addr);
         }
-        for addr in added {
-            let family = self
-                .pex_named
-                .iter()
-                .filter(|a| a.is_ipv4() == addr.is_ipv4())
-                .count();
-            if family < MAX_PEX_PEERS {
-                self.pex_named.insert(addr);
-            }
-        }
+        let mut v4 = self.pex_named.iter().filter(|a| a.is_ipv4()).count();
+        let mut v6 = self.pex_named.len() - v4;
+        added
+            .filter(|peer| {
+                let family = if peer.addr.is_ipv4() {
+                    &mut v4
+                } else {
+                    &mut v6
+                };
+                let new = *family < MAX_PEX_PEERS && self.pex_named.insert(peer.addr);
+                *family += usize::from(new);
+                new
+            })
+            .collect()
     }
 
     /// What our PEX messages say of the peer: a seed, connected over uTP,

@@ -139,6 +139,23 @@ impl<'a> UtPex<ByteBuf<'a>> {
         self.added_peers_inner(&self.dropped, &None)
             .chain(self.added_peers_inner(&self.dropped6, &None))
     }
+
+    /// The bytes of the peer lists the message carries, what a reader of it
+    /// works through.
+    pub fn lists_len(&self) -> usize {
+        fn len<T: CompactSerialize + CompactSerializeFixedLen>(
+            list: &Option<CompactListInBuffer<ByteBuf<'_>, T>>,
+        ) -> usize {
+            list.as_ref()
+                .map_or(0, |l| l.iter().count() * T::fixed_len())
+        }
+        len(&self.added)
+            + len(&self.added_f)
+            + len(&self.added6)
+            + len(&self.added6_f)
+            + len(&self.dropped)
+            + len(&self.dropped6)
+    }
 }
 
 impl UtPex<ByteBufOwned> {
