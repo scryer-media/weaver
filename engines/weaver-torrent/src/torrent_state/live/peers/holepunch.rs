@@ -8,11 +8,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use super::{Displace, PeerStates};
+use crate::peer_protocol::extended::ut_pex::PEX_HOLEPUNCH;
 use crate::torrent_state::live::peer::{Peer, PeerTx};
-
-// libtorrent `pex_holepunch`: the PEX flag of a peer that speaks the
-// holepunch extension.
-pub(crate) const PEX_HOLEPUNCH: u8 = 0x08;
 
 impl PeerStates {
     /// A holepunch introduced the peer at `addr`: it joins the list as a

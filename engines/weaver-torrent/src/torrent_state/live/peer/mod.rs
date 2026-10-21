@@ -25,6 +25,7 @@ use tokio::sync::{
 use tokio::time::Instant;
 
 use crate::peer_connection::WriterRequest;
+use crate::peer_protocol::extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP};
 use crate::stream_connect::ConnectionKind;
 use crate::type_aliases::BF;
 
@@ -745,6 +746,24 @@ impl LivePeerState {
                 self.pex_named.insert(addr);
             }
         }
+    }
+
+    /// What our PEX messages say of the peer: a seed, connected over uTP,
+    /// speaking the holepunch extension (libtorrent `ut_pex_plugin::tick`).
+    /// Encryption is not flagged: the peer's state does not hold whether its
+    /// connection is encrypted.
+    pub fn advertised_pex_flags(&self) -> u8 {
+        let mut flags = 0;
+        if self.seeder {
+            flags |= PEX_SEED;
+        }
+        if matches!(self.connection_kind, ConnectionKind::Utp) {
+            flags |= PEX_UTP;
+        }
+        if self.supports_holepunch {
+            flags |= PEX_HOLEPUNCH;
+        }
+        flags
     }
 
     /// Whether the peer's PEX messages named `addr` and have not dropped it

@@ -84,7 +84,7 @@ use crate::peer_protocol::{
         handshake::ExtendedHandshake,
         ut_holepunch::{self, UtHolepunch},
         ut_metadata::{UtMetadata, UtMetadataData},
-        ut_pex::UtPex,
+        ut_pex::{PexPeerInfo, UtPex},
     },
 };
 use anyhow::Context;
@@ -115,8 +115,8 @@ use crate::{
 use self::{
     choker::{CHOKED_REQUEST_GRACE, Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     peer::{
-        InflightRequest, PeerRx, PeerState, PeerTx, Refused, RemoveInflightRequestResult,
-        empty_bitfield, ingest_bitfield,
+        InflightRequest, LivePeerState, PeerRx, PeerState, PeerTx, Refused,
+        RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -1184,6 +1184,24 @@ impl TorrentStateLive {
         self.peers.requeue_not_needed();
     }
 
+    /// The PEX message that adds `connected`, each flagged for what it is
+    /// to us, and drops `dropped` (libtorrent `ut_pex_plugin::tick`). The
+    /// peers are those we connected to, listed where they listen.
+    fn pex_message(&self, connected: &[SocketAddr], dropped: &[SocketAddr]) -> UtPex<ByteBufOwned> {
+        let flags = |addr| {
+            self.peers
+                .with_live(addr, LivePeerState::advertised_pex_flags)
+                .unwrap_or(0)
+        };
+        UtPex::from_peers(
+            connected.iter().map(|&addr| PexPeerInfo {
+                flags: flags(addr),
+                addr,
+            }),
+            dropped.iter().copied(),
+        )
+    }
+
     async fn task_send_pex_to_peer(
         self: Arc<Self>,
         this_peer_addr: SocketAddr,
@@ -1252,10 +1270,7 @@ impl TorrentStateLive {
             // and addrs_closed_to_sent are only filtered addresses from sent_peers_live
 
             if !connected.is_empty() || !dropped.is_empty() {
-                let pex_msg = extended::ut_pex::UtPex::from_addrs(
-                    connected.iter().copied(),
-                    dropped.iter().copied(),
-                );
+                let pex_msg = self.pex_message(&connected, &dropped);
                 if tx.send(WriterRequest::UtPex(pex_msg)).is_err() {
                     return Ok(()); // Peer disconnected
                 }

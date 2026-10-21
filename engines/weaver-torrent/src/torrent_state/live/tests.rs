@@ -2064,7 +2064,8 @@ fn a_piece_is_counted_into_every_file_past_an_empty_one() {
 fn pex(added: &[&str], dropped: &[&str]) -> UtPex<ByteBufOwned> {
     let addrs = |a: &[&str]| -> Vec<SocketAddr> { a.iter().map(|a| a.parse().unwrap()).collect() };
     let (added, dropped) = (addrs(added), addrs(dropped));
-    UtPex::from_addrs(added.iter().copied(), dropped.iter().copied())
+    let added = added.iter().map(|&addr| PexPeerInfo { flags: 0, addr });
+    UtPex::from_peers(added, dropped.iter().copied())
 }
 
 impl Harness {
@@ -2518,7 +2519,7 @@ async fn a_failed_connection_asks_the_peer_whose_pex_named_it_to_introduce_us() 
     let h = Harness::new("holepunch_introducer").await;
     let (introducer, mut rx) = h.holepunch_peer("127.0.0.1:6881", true);
     let target = closed_port();
-    let msg = pex_flagged(target, peers::holepunch::PEX_HOLEPUNCH);
+    let msg = pex_flagged(target, extended::ut_pex::PEX_HOLEPUNCH);
     let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&msg).unwrap();
     // The PEX is taken in before the connect loop runs: the test runs on
     // one thread and yields only below.
@@ -2536,4 +2537,52 @@ async fn a_failed_connection_asks_the_peer_whose_pex_named_it_to_introduce_us() 
         }
     };
     assert_eq!(sent, UtHolepunch::Rendezvous(target));
+}
+
+// libtorrent `ut_pex_plugin::tick`: each peer our PEX message adds is
+// flagged a seed, connected over uTP, speaking the holepunch extension, as
+// it is to us.
+#[tokio::test]
+async fn our_pex_message_flags_each_peer_it_adds_for_what_it_is_to_us() {
+    use extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP};
+    let h = Harness::new("pex_flags_sent").await;
+    let (_seed, _seed_rx) = h.peer("203.0.113.1:6881");
+    let (_plain, _plain_rx) = h.new_peer("203.0.113.2:6881");
+    let (utp_tx, _utp_rx) = unbounded_channel();
+    h.peers
+        .add_incoming(
+            sock("203.0.113.3:6881"),
+            Id20::default(),
+            utp_tx,
+            ConnectionKind::Utp,
+        )
+        .unwrap();
+    let (holepunch, _holepunch_rx) = h.new_peer("203.0.113.4:6881");
+    let mut hs = ExtendedHandshake::new();
+    hs.m.ut_holepunch = Some(9);
+    (&holepunch).on_extended_handshake(&hs).unwrap();
+
+    let added = [
+        "203.0.113.1:6881",
+        "203.0.113.2:6881",
+        "203.0.113.3:6881",
+        "203.0.113.4:6881",
+    ]
+    .map(sock);
+    let msg = h.pex_message(&added, &[sock("203.0.113.9:6881")]);
+    let mut wire = Vec::new();
+    crate::bencode::bencode_serialize_to_writer(&msg.as_borrowed(), &mut wire).unwrap();
+    let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&wire).unwrap();
+    let flagged: Vec<_> = msg.added_peers().map(|p| (p.addr, p.flags)).collect();
+    assert_eq!(
+        flagged,
+        [
+            (added[0], PEX_SEED),
+            (added[1], 0),
+            (added[2], PEX_UTP),
+            (added[3], PEX_HOLEPUNCH),
+        ]
+    );
+    let dropped: Vec<_> = msg.dropped_peers().map(|p| p.addr).collect();
+    assert_eq!(dropped, [sock("203.0.113.9:6881")]);
 }
