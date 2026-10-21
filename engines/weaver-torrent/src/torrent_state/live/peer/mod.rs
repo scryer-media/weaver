@@ -113,6 +113,15 @@ impl Peer {
         self.is_connect_candidate() && self.reconnect_at().is_none_or(|at| at <= now)
     }
 
+    /// Someone named the peer again: a failure is forgiven, which revives a
+    /// peer that had run out of them.
+    pub(crate) fn rediscovered(&mut self, counters: &PeerStates) {
+        self.failcount = self.failcount.saturating_sub(1);
+        if matches!(self.state, PeerState::Dead) {
+            self.set_state(self.idle_state(), counters);
+        }
+    }
+
     /// The connection completed its handshake and carried a message, so the
     /// failures before it no longer count.
     pub(crate) fn delivered(&mut self) {
@@ -157,7 +166,7 @@ pub(crate) enum PeerState {
     Connecting(PeerTx),
     Live(LivePeerState),
     // Not a connect candidate: it failed MAX_FAILCOUNT times in a row, or we do
-    // not know where it listens. Never connected to again.
+    // not know where it listens. Kept until someone names it again.
     Dead,
     // We don't need to do anything with the peer any longer.
     // The peer has the full torrent, and we have the full torrent, so no need

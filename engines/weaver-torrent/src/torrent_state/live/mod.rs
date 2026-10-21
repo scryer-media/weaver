@@ -35,7 +35,7 @@
 // - queued (initial state) -> connected
 // - connected -> live
 // - connecting/live -> queued or dead (on error: queued until it has failed max_failcount times
-//   in a row, then dead)
+//   in a row, then dead until someone names it again)
 // - ANY STATE -> not_needed (when we don't need to talk to the peer anymore)
 //
 // A failed peer is reconnected (failcount + 1) * min_reconnect_time after its last failure.
@@ -1952,7 +1952,8 @@ impl PeerHandler {
     }
 
     fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) {
-        for peer in msg.dropped_peers().chain(msg.added_peers()) {
+        // A dropped peer is one the sender lost; only the added ones are news.
+        for peer in msg.added_peers() {
             self.state.add_peer(peer.addr);
         }
     }

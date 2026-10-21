@@ -83,10 +83,14 @@ impl PeerStates {
         self.stats.snapshot()
     }
 
-    /// A tracker, DHT or PEX named `addr`: a new peer joins as a connect
-    /// candidate.
+    /// A tracker, DHT or PEX named `addr`: a known peer is named again, a new
+    /// one joins as a connect candidate.
     pub fn add_peer(&self, addr: SocketAddr) {
-        self.admit(addr, |_| (), || Peer::new_with_outgoing_address(addr));
+        self.admit(
+            addr,
+            |peer| peer.rediscovered(self),
+            || Peer::new_with_outgoing_address(addr),
+        );
         self.candidates_changed.notify_one();
     }
 
@@ -656,6 +660,37 @@ mod tests {
         assert_eq!(peers.next_candidate(last), NextCandidate::None);
         let much_later = last + Duration::from_secs(365 * 24 * 3600);
         assert!(peers.connect_next(much_later).is_none());
+    }
+
+    #[test]
+    fn a_dropped_peer_is_revived_when_named_again() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a);
+        let last = fail_out(&peers, a, Instant::now());
+        assert_eq!(state_of(&peers, a), Some("dead"));
+
+        // A tracker, DHT or PEX names it: one failure is forgiven.
+        peers.add_peer(a);
+        assert_eq!(state_of(&peers, a), Some("queued"));
+        assert_eq!(
+            peers.next_candidate(last),
+            NextCandidate::At(last + reconnect_wait(MAX_FAILCOUNT - 1))
+        );
+    }
+
+    #[test]
+    fn a_dropped_peer_is_revived_when_it_connects_to_us() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a);
+        fail_out(&peers, a, Instant::now());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        peers
+            .add_incoming(a, Id20::default(), tx, ConnectionKind::Tcp)
+            .unwrap();
+        assert_eq!(state_of(&peers, a), Some("live"));
     }
 
     #[test]
