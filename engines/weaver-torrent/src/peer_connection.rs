@@ -46,6 +46,12 @@ pub trait PeerConnectionHandler {
     ) -> anyhow::Result<()>;
     async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()>;
     fn on_uploaded_bytes(&self, bytes: u32);
+    /// Takes `chunk` off the peer's upload queue to send it. False when a
+    /// Cancel or a Choke took it off first, and the block is not sent. A
+    /// handler that queues no uploads has none to take.
+    fn claim_upload(&self, _chunk: &ChunkInfo) -> bool {
+        false
+    }
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()>;
     fn update_my_extended_handshake(
         &self,
@@ -346,15 +352,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 trace!("sent bitfield");
             }
 
-            let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
-            with_timeout(
-                "writing",
-                rwtimeout,
-                write.write_all(&write_buf[..len]).map_err(Error::Write),
-            )
-            .await?;
-            trace!("sent unchoke");
-
             loop {
                 let req = match timeout(keep_alive_interval, outgoing_chan.recv()).await {
                     Ok(Some(msg)) => msg,
@@ -388,6 +385,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             .serialize(&mut *write_buf, ext_msg_ids)?
                     }
                     WriterRequest::ReadChunkRequest(chunk) => {
+                        if !self.handler.claim_upload(&chunk) {
+                            trace!(?chunk, "upload taken off the queue before it was sent");
+                            continue;
+                        }
+
                         #[allow(unused_mut)]
                         let mut skip_reading_for_e2e_tests = false;
 

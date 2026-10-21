@@ -47,6 +47,7 @@
 // > so don't lock them both at the same time at all, or at the worst lock them in the
 // > same order (peers one first, then the global one).
 
+pub(crate) mod choker;
 pub mod peer;
 pub mod peers;
 pub mod stats;
@@ -108,6 +109,7 @@ use crate::{
 };
 
 use self::{
+    choker::{CHOKED_REQUEST_GRACE, Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     peer::{
         InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
         stats::{
@@ -218,11 +220,15 @@ pub struct TorrentStateLive {
 
     pub(crate) streams: Arc<TorrentStreams>,
 
-    ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
-        tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-        ChunkInfo,
-    )>,
+    ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<QueuedUpload>,
+
+    // Hands out the upload slots.
+    choker: Choker,
 }
+
+// A block a peer asked for, on its way through the upload rate limits to the
+// peer's writer.
+type QueuedUpload = (PeerHandle, PeerTx, ChunkInfo);
 
 impl TorrentStateLive {
     fn max_request_window(&self) -> usize {
@@ -265,10 +271,7 @@ impl TorrentStateLive {
             pri
         };
 
-        let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
-            tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-            ChunkInfo,
-        )>();
+        let (ratelimit_upload_tx, ratelimit_upload_rx) = unbounded_channel::<QueuedUpload>();
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -301,6 +304,10 @@ impl TorrentStateLive {
                 .map(|_| RwLock::new(()))
                 .collect(),
             ratelimit_upload_tx,
+            choker: Choker::new(
+                session.unchoke_slots_limit,
+                lengths.default_piece_length().into(),
+            ),
         });
 
         state.spawn(
@@ -344,7 +351,44 @@ impl TorrentStateLive {
             format!("[{}]upload_scheduler", state.shared.id),
             state.clone().task_upload_scheduler(ratelimit_upload_rx),
         );
+
+        state.spawn(
+            debug_span!(parent: state.shared.span.clone(), "choker"),
+            format!("[{}]choker", state.shared.id),
+            state.clone().task_choker(),
+        );
         Ok(state)
+    }
+
+    /// Hands the upload slots out every UNCHOKE_INTERVAL and passes the
+    /// optimistic one on every OPTIMISTIC_UNCHOKE_INTERVAL, each at once when
+    /// the choker asks for it sooner. When both fall due the optimistic slot
+    /// passes first, so the round sees its new holder.
+    async fn task_choker(self: Arc<Self>) -> crate::Result<()> {
+        let first = tokio::time::Instant::now() + UNCHOKE_INTERVAL;
+        let mut rounds = tokio::time::interval_at(first, UNCHOKE_INTERVAL);
+        let mut rotations = tokio::time::interval_at(first, OPTIMISTIC_UNCHOKE_INTERVAL);
+        loop {
+            let rotate = tokio::select! {
+                biased;
+                _ = rotations.tick() => true,
+                _ = self.choker.rotation_requested() => {
+                    rotations.reset();
+                    true
+                }
+                _ = self.choker.reshuffle_requested() => {
+                    rounds.reset();
+                    false
+                }
+                _ = rounds.tick() => false,
+            };
+            let now = tokio::time::Instant::now();
+            if rotate {
+                self.choker.rotate_optimistic(&self.peers, now);
+            } else {
+                self.choker.recalculate(&self.peers, now);
+            }
+        }
     }
 
     #[track_caller]
@@ -436,12 +480,17 @@ impl TorrentStateLive {
 
     async fn task_upload_scheduler(
         self: Arc<Self>,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<(
-            tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-            ChunkInfo,
-        )>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<QueuedUpload>,
     ) -> crate::Result<()> {
-        while let Some((tx, ci)) = rx.recv().await {
+        while let Some((addr, tx, ci)) = rx.recv().await {
+            // A block the peer no longer wants spends none of the upload budget.
+            let queued = self
+                .peers
+                .with_live(addr, |live| live.is_upload_queued(&ci))
+                .unwrap_or(false);
+            if !queued {
+                continue;
+            }
             tokio::select! {
                 _ = tx.closed() => {
                     continue;
@@ -1119,7 +1168,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 .context("on_bitfield")?,
             Message::Choke => self.on_i_am_choked().context("on_i_am_choked")?,
             Message::Unchoke => self.on_i_am_unchoked(),
-            Message::Interested => self.on_peer_interested(),
+            Message::Interested => self
+                .state
+                .choker
+                .peer_interested(&self.state.peers, self.addr),
             Message::Piece(piece) => self
                 .on_received_piece(piece)
                 .await
@@ -1128,12 +1180,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 trace!("keepalive received");
             }
             Message::Have(h) => self.on_have(h),
-            Message::NotInterested => {
-                trace!("received \"not interested\", but we don't process it yet")
-            }
-            Message::Cancel(_) => {
-                trace!("received \"cancel\", but we don't process it yet")
-            }
+            Message::NotInterested => self
+                .state
+                .choker
+                .peer_not_interested(&self.state.peers, self.addr),
+            Message::Cancel(request) => self.on_upload_cancelled(request),
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(
                 metadata_piece_id,
             ))) => {
@@ -1200,6 +1251,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .counters
             .uploaded_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn claim_upload(&self, chunk: &ChunkInfo) -> bool {
+        self.state
+            .peers
+            .with_live_mut(self.addr, "claim_upload", |live| live.claim_upload(chunk))
+            .unwrap_or(false)
     }
 
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
@@ -1308,9 +1366,14 @@ impl PeerHandler {
         };
         let prev = pe.value_mut().take_state(peers);
 
+        // Whether the connection held an upload slot, when it was live. The
+        // choker hears of it once the peer table is let go: it takes its own
+        // lock before the table's.
+        let mut held_slot = None;
         match prev {
             PeerState::Connecting(_) => {}
             PeerState::Live(live) => {
+                held_slot = Some(!live.is_choked());
                 let mut g = self.state.lock_write("mark_chunk_requests_canceled");
 
                 // Release all pieces owned by this peer (fixes the bug where pieces
@@ -1366,6 +1429,10 @@ impl PeerHandler {
         let needed = failed_at.is_some() && !self.state.is_finished_and_no_active_streams();
         peers.connection_closed(pe.value_mut(), failed_at, needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
+        drop(pe);
+        if let Some(held_slot) = held_slot {
+            self.state.choker.peer_gone(handle, held_slot);
+        }
         Ok(())
     }
 
@@ -1447,33 +1514,21 @@ impl PeerHandler {
         result
     }
 
+    /// The block of the torrent `request` names, if it names one.
+    fn requested_chunk(&self, request: &Request) -> Option<ChunkInfo> {
+        let piece_index = self.state.lengths.validate_piece_index(request.index)?;
+        self.state
+            .lengths
+            .chunk_info_from_received_data(piece_index, request.begin, request.length)
+    }
+
     fn on_download_request(&self, request: Request) -> anyhow::Result<()> {
         if self.state.torrent().options.disable_upload() {
             anyhow::bail!("upload disabled, but peer requested a piece")
         }
 
-        let piece_index = match self.state.lengths.validate_piece_index(request.index) {
-            Some(p) => p,
-            None => {
-                anyhow::bail!(
-                    "received {:?}, but it is not a valid chunk request (piece index is invalid). Ignoring.",
-                    request
-                );
-            }
-        };
-
-        let chunk_info = match self.state.lengths.chunk_info_from_received_data(
-            piece_index,
-            request.begin,
-            request.length,
-        ) {
-            Some(d) => d,
-            None => {
-                anyhow::bail!(
-                    "received {:?}, but it is not a valid chunk request (chunk data is invalid). Ignoring.",
-                    request
-                );
-            }
+        let Some(chunk_info) = self.requested_chunk(&request) else {
+            anyhow::bail!("received {request:?}, but it is not a valid chunk request");
         };
 
         if !self
@@ -1488,10 +1543,53 @@ impl PeerHandler {
             );
         }
 
+        // A peer that asks without having said it is interested is taken to
+        // have said so.
+        let interested = self
+            .state
+            .peers
+            .with_live(self.addr, |live| live.peer_interested);
+        if interested == Some(false) {
+            self.state
+                .choker
+                .peer_interested(&self.state.peers, self.addr);
+        }
+
+        let Some(queued) = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "queue_upload", |live| {
+                live.queue_upload(chunk_info)
+            })
+        else {
+            return Ok(());
+        };
+        if let Err(choked_at) = queued {
+            let since = tokio::time::Instant::now().saturating_duration_since(choked_at);
+            if since > CHOKED_REQUEST_GRACE {
+                anyhow::bail!("received {request:?} {since:?} after we choked the peer");
+            }
+            trace!(?request, "ignoring a request from a peer we choke");
+            return Ok(());
+        }
         self.state
             .ratelimit_upload_tx
-            .send((self.tx.clone(), chunk_info))?;
+            .send((self.addr, self.tx.clone(), chunk_info))?;
         Ok(())
+    }
+
+    /// The peer no longer wants the block `request` names: it is not sent
+    /// unless it already was.
+    fn on_upload_cancelled(&self, request: Request) {
+        let Some(chunk) = self.requested_chunk(&request) else {
+            trace!(?request, "cancel names no block of the torrent");
+            return;
+        };
+        self.state
+            .peers
+            .with_live_mut(self.addr, "cancel_upload", |live| {
+                live.cancel_upload(&chunk)
+            });
     }
 
     fn on_have(&self, have: u32) {
@@ -1833,11 +1931,6 @@ impl PeerHandler {
             self.state.new_pieces_notify.notify_waiters();
         }
         Ok(taken)
-    }
-
-    fn on_peer_interested(&self) {
-        trace!("peer is interested");
-        self.state.peers.mark_peer_interested(self.addr, true);
     }
 
     fn on_i_am_unchoked(&self) {
