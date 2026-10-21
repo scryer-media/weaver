@@ -55,6 +55,8 @@ pub(super) struct Restarted {
     // Every article some restart found in memory.
     pub(super) in_memory: BTreeSet<(u32, u32)>,
     pub(super) restarts: usize,
+    // Every article in the order it was asked for.
+    pub(super) order: Vec<(u32, u32)>,
     // The graph job as last seen before it finished, across every restart.
     pub(super) graph: GraphView,
 }
@@ -94,6 +96,7 @@ pub(super) async fn run_restarting_at(
     assert!(pipeline.is_graph_job(JOB));
 
     let mut requests = BTreeMap::new();
+    let mut order = Vec::new();
     // What some restart found in memory since the article was last served.
     let mut owed = BTreeSet::new();
     let mut from_disk = BTreeSet::new();
@@ -108,6 +111,7 @@ pub(super) async fn run_restarting_at(
                 work.segment_id.file_id.file_index,
                 work.segment_id.segment_number,
             );
+            order.push(article);
             let asked = requests.entry(article).or_insert(0usize);
             *asked += 1;
             let first = *asked == 1;
@@ -195,6 +199,7 @@ pub(super) async fn run_restarting_at(
         from_disk,
         in_memory,
         restarts,
+        order,
         graph: graph.unwrap_or_default(),
     }
 }
