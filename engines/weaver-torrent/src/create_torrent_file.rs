@@ -161,7 +161,8 @@ async fn create_torrent_raw<'a>(
         }
     }
 
-    if remaining_piece_length > 0 && length > 0 {
+    // A piece read in part is the short last piece.
+    if remaining_piece_length < piece_length {
         piece_hashes.extend_from_slice(&piece_checksum.finish());
     }
     Ok(CreateTorrentRawResult {
@@ -252,6 +253,8 @@ pub async fn create_torrent<'a>(
             publisher_url: None,
             creation_date: None,
             piece_layers: None,
+            url_list: None,
+            httpseeds: None,
             info_hash,
             info_hashes: InfoHashes {
                 v1: Some(info_hash),

@@ -4,7 +4,7 @@
 //! peer, calling the handler as the connection would, and reads what the
 //! handler queues for the wire.
 
-use std::{collections::BTreeSet, future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin, sync::atomic::AtomicU32};
 
 use tempfile::TempDir;
 
@@ -12,8 +12,10 @@ use super::*;
 use crate::{
     AddTorrent, AddTorrentOptions, Session, SessionOptions,
     core::constants::CHUNK_SIZE,
-    storage::StorageFactory,
+    peer_protocol::extended,
+    storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage},
     tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+    type_aliases::BF,
 };
 
 const CHUNKS_PER_PIECE: u32 = 4;
@@ -46,15 +48,72 @@ impl Harness {
 
     // `have` is the bitfield of the pieces had, `slots` the upload slots.
     async fn build(name: &str, have: u8, slots: usize) -> Self {
-        let torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
-            .await
-            .unwrap();
-        let out = TempDir::with_prefix(name).unwrap();
         let opts = SessionOptions {
             unchoke_slots_limit: slots,
             ..isolated_session_opts(false)
         };
+        Self::build_on(
+            name,
+            have,
+            opts,
+            MemoryStorageFactory::default().clone_box(),
+        )
+        .await
+    }
+
+    /// As [`Harness::build`], in a session of `opts`, on the storage
+    /// `storage` makes.
+    async fn build_on(
+        name: &str,
+        have: u8,
+        opts: SessionOptions,
+        storage: BoxStorageFactory,
+    ) -> Self {
+        let add = AddTorrentOptions {
+            storage_factory: Some(storage),
+            ..Default::default()
+        };
+        Self::build_added(name, PIECES, have, opts, add).await
+    }
+
+    /// A live torrent of `pieces` four-chunk pieces, `have` the bitfield
+    /// of those had, added with `add`.
+    async fn build_added(
+        name: &str,
+        pieces: u32,
+        have: u8,
+        opts: SessionOptions,
+        add: AddTorrentOptions,
+    ) -> Self {
+        let out = TempDir::with_prefix(name).unwrap();
         let session = Session::new_with_opts(out.path().into(), opts)
+            .await
+            .unwrap();
+        Self::added_to(session, out, name, pieces, have, add).await
+    }
+
+    /// Another live torrent of the harness's session, of the harness's
+    /// pieces, `have` the bitfield of those had.
+    async fn sibling(&self, name: &str, have: u8) -> Self {
+        let add = AddTorrentOptions {
+            storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+            ..Default::default()
+        };
+        let out = TempDir::with_prefix(name).unwrap();
+        Self::added_to(self._session.clone(), out, name, PIECES, have, add).await
+    }
+
+    /// A live torrent of `pieces` four-chunk pieces, `have` the bitfield of
+    /// those had, added to `session` with `add`.
+    async fn added_to(
+        session: Arc<Session>,
+        out: TempDir,
+        name: &str,
+        pieces: u32,
+        have: u8,
+        add: AddTorrentOptions,
+    ) -> Self {
+        let torrent = TestTorrent::new(name, (pieces * PIECE_LENGTH) as usize, PIECE_LENGTH)
             .await
             .unwrap();
         let have = BF::from_boxed_slice(vec![have].into_boxed_slice());
@@ -62,9 +121,8 @@ impl Harness {
             .add_torrent(
                 AddTorrent::from_bytes(torrent.torrent.clone()),
                 Some(AddTorrentOptions {
-                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
                     initial_have: Some(have),
-                    ..Default::default()
+                    ..add
                 }),
             )
             .await
@@ -89,31 +147,41 @@ impl Harness {
     /// A live peer at `addr` with every piece, that speaks v2 when
     /// `speaks_v2` holds, and the queue of what we send it.
     fn peer_speaking(&self, addr: &str, speaks_v2: bool) -> (PeerHandler, PeerRx) {
+        let (handler, rx) = self.new_peer(addr);
+        handler.speaks_v2.store(speaks_v2, Ordering::Relaxed);
+        handler
+            .first_message_received
+            .store(true, Ordering::Relaxed);
+        let mut every_piece = peer::empty_bitfield(self.lengths.total_pieces());
+        every_piece[..self.lengths.total_pieces() as usize].fill(true);
+        handler.on_bitfield(every_piece.as_raw_slice()).unwrap();
+        (handler, rx)
+    }
+
+    /// A peer at `addr` that just went live and has sent nothing yet, and
+    /// the queue of what we send it.
+    fn new_peer(&self, addr: &str) -> (PeerHandler, PeerRx) {
         let addr: SocketAddr = addr.parse().unwrap();
         let (tx, rx) = unbounded_channel();
         let counters = self
             .live
             .peers
-            .add_incoming(addr, Id20::default(), tx.clone(), ConnectionKind::Tcp)
+            .add_incoming(addr, Id20::default(), tx.clone(), ConnectionKind::Tcp, 6881)
             .unwrap();
         let handler = PeerHandler {
             addr,
             incoming: true,
             on_bitfield_notify: Default::default(),
-            speaks_v2: AtomicBool::new(speaks_v2),
+            speaks_v2: AtomicBool::new(false),
+            sent_dht_port: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,
             counters,
-            first_message_received: AtomicBool::new(true),
+            first_message_received: AtomicBool::new(false),
             cancel_token: self.live.cancellation_token.child_token(),
             client_name_and_version: String::new(),
         };
-        let mut every_piece = make_piece_bitfield(&self.lengths);
-        every_piece[..self.lengths.total_pieces() as usize].fill(true);
-        handler
-            .on_bitfield(ByteBufOwned::from(every_piece.as_raw_slice().to_vec()))
-            .unwrap();
         (handler, rx)
     }
 
@@ -144,7 +212,7 @@ impl Harness {
         let pieces = g.get_pieces().unwrap();
         let queued: Vec<u32> = pieces
             .chunks()
-            .iter_queued_pieces(&g.file_priorities, &self.live.metadata.file_infos)
+            .iter_queued_pieces()
             .map(|p| p.get())
             .collect();
         for p in &queued {
@@ -223,18 +291,99 @@ fn every_chunk() -> BTreeSet<(u32, u32)> {
         .collect()
 }
 
+impl Harness {
+    /// The unchoked `peer` is asked for every chunk, on the paused clock:
+    /// the first piece's four at the depth of a peer no block has come from
+    /// yet; then the first of them arrives, at once, which makes room for the
+    /// rest. Returns the piece asked for first.
+    async fn request_every_chunk(
+        &self,
+        peer: &PeerHandler,
+        task: &mut Task<'_>,
+        rx: &mut PeerRx,
+    ) -> u32 {
+        let first = next_requests(task, rx, CHUNKS_PER_PIECE as usize).await;
+        let (piece, _) = *first.first().unwrap();
+        assert_eq!(first, chunks(piece, 0..CHUNKS_PER_PIECE));
+        self.deliver(peer, (piece, 0)).await;
+        let other = 1 - piece;
+        assert_eq!(
+            next_requests(task, rx, CHUNKS_PER_PIECE as usize).await,
+            chunks(other, 0..CHUNKS_PER_PIECE)
+        );
+        piece
+    }
+}
+
+// libtorrent `peer_connection::update_desired_queue_size`: four requests
+// before any block arrives (`m_desired_queue_size`), then the blocks the
+// peer delivers in `request_queue_time` at its pace, between two and the
+// most outstanding; one while it is snubbed.
+#[tokio::test]
+async fn the_request_depth_follows_the_pace_the_peer_delivers_at() {
+    let h = Harness::new("request_depth_follows_pace").await;
+    let (slow, mut slow_rx) = h.peer("127.0.0.1:6881");
+    let (fast, mut fast_rx) = h.peer("127.0.0.2:6881");
+    tokio::time::pause();
+    let depth = |peer: &PeerHandler| {
+        let max = peer.lock_flow_control("test").request_window;
+        h.peers
+            .with_live(peer.addr, |live| live.desired_queue_size(max))
+            .unwrap()
+    };
+
+    // Before any block: four, so each peer is asked for one piece.
+    let mut slow_requester: Task<'_> = Box::pin(slow.request_chunks());
+    slow.on_i_am_unchoked();
+    let (slow_piece, _) = *next_requests(&mut slow_requester, &mut slow_rx, 4)
+        .await
+        .first()
+        .unwrap();
+    assert_eq!(depth(&slow), 4);
+    assert!(!slow.can_send_request());
+    let mut fast_requester: Task<'_> = Box::pin(fast.request_chunks());
+    fast.on_i_am_unchoked();
+    let (fast_piece, _) = *next_requests(&mut fast_requester, &mut fast_rx, 4)
+        .await
+        .first()
+        .unwrap();
+
+    // A block the moment it was asked for: every request we allow, and no
+    // more than the peer's `reqq`.
+    h.deliver(&fast, (fast_piece, 0)).await;
+    assert_eq!(depth(&fast), DEFAULT_PEER_REQUEST_WINDOW);
+    let mut hs = ExtendedHandshake::new();
+    hs.reqq = Some(5);
+    (&fast).on_extended_handshake(&hs).unwrap();
+    assert_eq!(depth(&fast), 5);
+
+    // Snubbed: one.
+    h.peers
+        .with_live_mut(fast.addr, "test", |live| live.snub())
+        .unwrap();
+    assert_eq!(depth(&fast), 1);
+
+    // A block a second: three seconds' worth.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    h.deliver(&slow, (slow_piece, 0)).await;
+    assert_eq!(depth(&slow), 3);
+
+    // A block every two seconds: one and a half, so the least, two.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    h.deliver(&slow, (slow_piece, CHUNK_SIZE)).await;
+    assert_eq!(depth(&slow), 2);
+}
+
 #[tokio::test]
 async fn a_choke_returns_every_outstanding_request_and_unchoke_asks_again() {
     let h = Harness::new("a_choke_returns_requests").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
     let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
 
     peer.on_i_am_unchoked();
-    assert_eq!(
-        next_requests(&mut requester, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
-    h.deliver(&peer, (0, 0)).await;
+    let taken = h.request_every_chunk(&peer, &mut requester, &mut rx).await;
+    let other = 1 - taken;
 
     peer.on_i_am_choked().unwrap();
 
@@ -242,51 +391,75 @@ async fn a_choke_returns_every_outstanding_request_and_unchoke_asks_again() {
     // queue for any peer, the delivered chunk kept.
     assert_eq!(h.inflight_count(&peer), 0);
     assert_eq!(h.queued_pieces(), vec![0, 1]);
-    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
-    assert_eq!(h.missing_chunks(1), vec![0, 1, 2, 3]);
+    assert_eq!(h.missing_chunks(taken), vec![1, 2, 3]);
+    assert_eq!(h.missing_chunks(other), vec![0, 1, 2, 3]);
 
-    // A block the peer had already sent is let through, and not counted.
-    h.deliver(&peer, (0, CHUNK_SIZE)).await;
-    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
+    // A block the peer had already sent is let through, and kept: we lack
+    // it.
+    h.deliver(&peer, (taken, CHUNK_SIZE)).await;
+    assert_eq!(h.missing_chunks(taken), vec![2, 3]);
 
     peer.on_i_am_unchoked();
-    let mut again = chunks(0, 1..CHUNKS_PER_PIECE);
-    again.extend(chunks(1, 0..CHUNKS_PER_PIECE));
+    let mut again = chunks(taken, 2..CHUNKS_PER_PIECE);
+    again.extend(chunks(other, 0..CHUNKS_PER_PIECE));
     assert_eq!(
         next_requests(&mut requester, &mut rx, again.len()).await,
         again
     );
 }
 
-/// The next `n` cancels `task` sends, as (piece, offset).
-async fn next_cancels(task: &mut Task<'_>, rx: &mut PeerRx, n: usize) -> BTreeSet<(u32, u32)> {
-    let mut cancels = BTreeSet::new();
-    while cancels.len() < n {
-        match next_message(task, rx).await {
-            Message::Cancel(r) => assert!(cancels.insert((r.index, r.begin))),
-            other => panic!("expected a cancel, got {other:?}"),
+impl Harness {
+    /// Polls `task` until a piece goes back to the queue.
+    async fn until_released(&self, task: &mut Task<'_>) {
+        let released = self.new_pieces_notify.notified();
+        tokio::select! {
+            biased;
+            () = released => {}
+            res = task.as_mut() => panic!("the peer task ended: {res:?}"),
         }
     }
-    cancels
+
+    /// Whether `peer` owns piece `index`.
+    fn owns(&self, peer: &PeerHandler, index: u32) -> bool {
+        self.live
+            .lock_read("test")
+            .get_pieces()
+            .unwrap()
+            .is_owned_by(self.piece(index), peer.addr)
+    }
 }
 
+/// The cancels queued for the peer, draining its queue.
+fn cancels_sent(rx: &mut PeerRx) -> BTreeSet<(u32, u32)> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|r| match r {
+            WriterRequest::Message(Message::Cancel(r)) => Some((r.index, r.begin)),
+            _ => None,
+        })
+        .collect()
+}
+
+// libtorrent `peer_connection::snub_peer`: a peer that goes its request
+// timeout without a block is snubbed, and a request whose piece has no free
+// block left times out: the piece is free for other peers, while the
+// request stays in the download queue.
 #[tokio::test]
-async fn an_undelivered_request_is_free_again_after_the_timeout_and_a_delivered_one_is_kept() {
+async fn an_overdue_piece_is_free_again_at_the_timeout_and_its_requests_stay() {
     let h = Harness::new("a_request_times_out").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
     tokio::time::pause();
     let mut requester: Task<'_> = Box::pin(peer.request_chunks());
 
+    // No block has come from the peer yet: it is asked for one piece.
     peer.on_i_am_unchoked();
-    assert_eq!(
-        next_requests(&mut requester, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
+    let asked = next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await;
+    let (piece, _) = *asked.first().unwrap();
+    assert_eq!(asked, chunks(piece, 0..CHUNKS_PER_PIECE));
     drop(requester);
 
     // The first block takes 10 s, so the peer's timeout is 12 s from it.
     tokio::time::advance(Duration::from_secs(10)).await;
-    h.deliver(&peer, (0, 0)).await;
+    h.deliver(&peer, (piece, 0)).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     assert_eq!(
         h.peers
@@ -295,22 +468,177 @@ async fn an_undelivered_request_is_free_again_after_the_timeout_and_a_delivered_
         Some(deadline)
     );
 
-    // Nothing more arrives: the watcher cancels every undelivered request
-    // once the deadline passes, and not before.
+    // Nothing more arrives: once the deadline passes, and not before, the
+    // peer is snubbed and its piece, which waits on it alone, goes back to
+    // the queue with the delivered chunk. No request is cancelled.
     let mut watcher: Task<'_> = Box::pin(peer.time_out_requests());
-    let mut undelivered = every_chunk();
-    undelivered.remove(&(0, 0));
-    assert_eq!(
-        next_cancels(&mut watcher, &mut rx, undelivered.len()).await,
-        undelivered
-    );
+    h.until_released(&mut watcher).await;
     assert!(tokio::time::Instant::now() >= deadline);
-
-    // The undelivered chunks are free for any peer; the delivered one stays had.
-    assert_eq!(h.inflight_count(&peer), 0);
+    assert!(h.snubbed(&peer));
     assert_eq!(h.queued_pieces(), vec![0, 1]);
-    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
-    assert_eq!(h.missing_chunks(1), vec![0, 1, 2, 3]);
+    assert_eq!(h.missing_chunks(piece), vec![1, 2, 3]);
+    assert_eq!(h.missing_chunks(1 - piece), vec![0, 1, 2, 3]);
+    assert_eq!(h.inflight_count(&peer), CHUNKS_PER_PIECE as usize - 1);
+    assert!(rx.is_empty());
+}
+
+#[tokio::test]
+async fn a_late_block_for_a_released_piece_completes_its_chunk() {
+    // libtorrent `peer_connection::incoming_piece`: a block of a request
+    // that timed out is written when no other copy came first, and the
+    // other peer's request for it is cancelled (`torrent::cancel_block`).
+    let h = Harness::new("a_late_block_is_kept").await;
+    let (slow, mut slow_rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(slow.request_chunks());
+    slow.on_i_am_unchoked();
+    let asked = next_requests(&mut requester, &mut slow_rx, CHUNKS_PER_PIECE as usize).await;
+    let (piece, _) = *asked.first().unwrap();
+    drop(requester);
+    let mut watcher: Task<'_> = Box::pin(slow.time_out_requests());
+    h.until_released(&mut watcher).await;
+    drop(watcher);
+
+    // Another peer takes the piece and asks for all of it.
+    let (other, mut other_rx) = h.peer_with("127.0.0.2:6881", &[piece]).await;
+    let mut requester: Task<'_> = Box::pin(other.request_chunks());
+    other.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut other_rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(piece, 0..CHUNKS_PER_PIECE)
+    );
+    drop(requester);
+    assert!(h.owns(&other, piece));
+
+    // The slow peer's block arrives late: it is kept, and the other peer
+    // need not send it.
+    h.deliver(&slow, (piece, CHUNK_SIZE)).await;
+    assert_eq!(h.missing_chunks(piece), vec![0, 2, 3]);
+    assert_eq!(cancels_sent(&mut other_rx), chunks(piece, 1..2));
+
+    // So are the rest: the piece is complete, and passes its check.
+    for chunk in [0, 2, 3] {
+        h.deliver(&slow, (piece, chunk * CHUNK_SIZE)).await;
+    }
+    assert_eq!(cancels_sent(&mut other_rx), chunks(piece, [0, 2, 3]));
+    assert!(
+        h.lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .is_piece_have(h.piece(piece))
+    );
+    assert_eq!(h.inflight_count(&slow), 0);
+    assert_eq!(h.inflight_count(&other), 0);
+}
+
+#[tokio::test]
+async fn a_snubbed_peer_keeps_the_requests_of_pieces_that_still_have_free_blocks() {
+    // libtorrent `peer_connection::snub_peer`: while its piece has a free
+    // block, a request does not hold it up, and does not time out.
+    let h = Harness::new("a_snub_keeps_free_pieces").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    peer.on_i_am_unchoked();
+    let piece = peer.acquire_next_piece().unwrap().unwrap().get();
+    let ask = |blocks: std::ops::Range<u32>| {
+        for block in blocks {
+            h.peers
+                .with_live_mut(peer.addr, "test", |live| {
+                    live.add_inflight_request(h.chunk(piece, block))
+                })
+                .unwrap();
+        }
+    };
+
+    // Two blocks of its piece are asked of it, two are free: the snub
+    // leaves it the piece and the requests.
+    ask(0..2);
+    peer.on_requests_timed_out().unwrap();
+    assert!(h.snubbed(&peer));
+    assert!(h.owns(&peer, piece));
+    assert_eq!(h.inflight_count(&peer), 2);
+
+    // Every block is asked of it: the piece waits on it alone, and the
+    // next snub frees it. The requests stay, and none is cancelled.
+    ask(2..CHUNKS_PER_PIECE);
+    peer.on_requests_timed_out().unwrap();
+    assert!(!h.owns(&peer, piece));
+    assert!(h.queued_pieces().contains(&piece));
+    assert_eq!(h.inflight_count(&peer), CHUNKS_PER_PIECE as usize);
+    assert!(cancels_sent(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn a_parole_peer_is_not_snubbed_of_its_requests() {
+    // libtorrent `peer_connection::snub_peer` returns on parole before it
+    // times out any request: a paroled peer was handed only a piece no one
+    // else had started. It is marked snubbed first all the same.
+    let h = Harness::new("a_parole_peer_keeps_its_requests").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.peers
+        .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false))
+        .unwrap();
+    peer.on_i_am_unchoked();
+    let piece = peer.acquire_next_piece().unwrap().unwrap().get();
+    for block in 0..CHUNKS_PER_PIECE {
+        h.peers
+            .with_live_mut(peer.addr, "test", |live| {
+                live.add_inflight_request(h.chunk(piece, block))
+            })
+            .unwrap();
+    }
+
+    peer.on_requests_timed_out().unwrap();
+    assert!(h.snubbed(&peer));
+    assert!(h.owns(&peer, piece));
+    assert!(!h.queued_pieces().contains(&piece));
+    assert_eq!(h.inflight_count(&peer), CHUNKS_PER_PIECE as usize);
+    assert!(cancels_sent(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn a_block_that_arrives_after_its_cancel_restarts_the_wait_for_the_next() {
+    // libtorrent peer_connection::incoming_piece, for a block it had
+    // stopped wanting: the block's time is sampled and, with requests still
+    // outstanding, the request timer starts again; the snub stays.
+    let h = Harness::new("a_late_block_restarts_the_wait").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    peer.on_i_am_unchoked();
+    let asked = next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await;
+    let (piece, _) = *asked.first().unwrap();
+    drop(requester);
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    h.deliver(&peer, (piece, 0)).await;
+    let deadline = |h: &Harness| {
+        h.peers
+            .with_live(peer.addr, |live| {
+                (live.request_deadline(), live.request_timeout())
+            })
+            .unwrap()
+    };
+    let (first, _) = deadline(&h);
+    let cancelled = h.chunk(piece, 1);
+    h.peers
+        .with_live_mut(peer.addr, "test", |live| {
+            live.cancel_inflight_request(&cancelled);
+            live.snub();
+        })
+        .unwrap();
+
+    // The cancelled block arrives anyway, 5 s on.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    h.deliver(&peer, (piece, CHUNK_SIZE)).await;
+    // Its timeout, 27.5 s, passes the 20 s piece timeout, which comes
+    // first (libtorrent `settings_pack::piece_timeout`).
+    let (moved, timeout) = deadline(&h);
+    let piece_timeout = Duration::from_secs(20);
+    assert!(timeout > piece_timeout);
+    assert_eq!(moved, Some(tokio::time::Instant::now() + piece_timeout));
+    assert!(moved > first);
+    assert!(h.snubbed(&peer));
+    assert_eq!(h.inflight_count(&peer), CHUNKS_PER_PIECE as usize - 2);
 }
 
 impl Harness {
@@ -321,40 +649,62 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn a_timed_out_peer_holds_one_request_until_a_block_arrives() {
+async fn a_timed_out_peer_keeps_its_requests_and_is_asked_for_no_more() {
     let h = Harness::new("a_timed_out_peer_is_snubbed").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
     tokio::time::pause();
     let mut task: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
 
+    // No block has come from the peer yet: it is asked for one piece.
     peer.on_i_am_unchoked();
-    assert_eq!(
-        next_requests(&mut task, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
+    let first = next_requests(&mut task, &mut rx, CHUNKS_PER_PIECE as usize).await;
     assert!(!h.snubbed(&peer));
 
-    // No block arrives: every request times out and the peer is snubbed.
-    assert_eq!(
-        next_cancels(&mut task, &mut rx, every_chunk().len()).await,
-        every_chunk()
-    );
-    assert!(h.snubbed(&peer));
+    let (piece, _) = *first.first().unwrap();
+    let other = 1 - piece;
 
-    // Snubbed, the peer is asked for one chunk and may hold no more.
-    let asked = next_requests(&mut task, &mut rx, 1).await;
-    assert_eq!(h.inflight_count(&peer), 1);
+    // No block arrives: the peer is snubbed, and its piece, which waits on
+    // it alone, goes back to the queue. Its four requests stay outstanding,
+    // past the one a snubbed peer may hold, so it is asked for no more.
+    h.until_released(&mut task).await;
+    assert!(h.snubbed(&peer));
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+    assert_eq!(h.inflight_count(&peer), CHUNKS_PER_PIECE as usize);
     assert!(!peer.can_send_request());
 
-    // The block it was asked for arrives: the snub is lifted and the
-    // requester fills the window with the rest.
-    let delivered = *asked.first().unwrap();
-    h.deliver(&peer, delivered).await;
+    // A block comes past the request timeout: it is kept, and the peer
+    // stays snubbed (libtorrent `incoming_piece` unsnubs only within the
+    // request timeout). The next comes at once, and lifts the snub.
+    let timeout = h
+        .peers
+        .with_live(peer.addr, |live| live.request_timeout())
+        .unwrap();
+    tokio::time::advance(timeout).await;
+    h.deliver(&peer, (piece, 0)).await;
+    assert!(h.snubbed(&peer));
+    assert_eq!(h.missing_chunks(piece), vec![1, 2, 3]);
+    h.deliver(&peer, (piece, CHUNK_SIZE)).await;
     assert!(!h.snubbed(&peer));
-    assert!(peer.can_send_request());
-    let mut rest = every_chunk();
-    rest.remove(&delivered);
-    assert_eq!(next_requests(&mut task, &mut rx, rest.len()).await, rest);
+
+    // The rest complete the piece, and the requester asks for the other
+    // piece, as deep as the peer's pace allows.
+    for chunk in 2..CHUNKS_PER_PIECE {
+        h.deliver(&peer, (piece, chunk * CHUNK_SIZE)).await;
+    }
+    assert!(
+        h.lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .is_piece_have(h.piece(piece))
+    );
+    let depth = h
+        .peers
+        .with_live(peer.addr, |live| live.desired_queue_size(usize::MAX))
+        .unwrap();
+    assert_eq!(
+        next_requests(&mut task, &mut rx, depth).await,
+        chunks(other, 0..depth as u32)
+    );
 }
 
 #[tokio::test]
@@ -381,23 +731,169 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
         .unwrap();
     tokio::time::advance(Duration::from_secs(100)).await;
 
-    assert_eq!(snubbed.acquire_next_piece().unwrap(), None);
+    // In the end game it may double a block, but both pieces stay the
+    // owner's.
+    snubbed.acquire_next_piece().unwrap();
+    let owned = |p| {
+        h.live
+            .lock_read("test")
+            .get_pieces()
+            .unwrap()
+            .is_owned_by(h.piece(p), owner.addr)
+    };
+    assert!(owned(0) && owned(1));
     assert!(fast.acquire_next_piece().unwrap().is_some());
 }
 
+#[tokio::test]
+async fn the_padding_bits_of_a_bitfield_are_cleared_at_ingest() {
+    let h = Harness::new("bitfield_padding_cleared").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+
+    // Piece 1 and every padding bit.
+    peer.on_received_message(Message::Bitfield(ByteBuf(&[0b0111_1111])))
+        .await
+        .unwrap();
+    let bitfield = h
+        .peers
+        .with_live(peer.addr, |live| live.bitfield.clone())
+        .unwrap();
+    assert_eq!(bitfield.as_raw_slice(), [0b0100_0000]);
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+}
+
+#[tokio::test]
+async fn a_bitfield_that_is_not_one_bit_per_piece_ends_the_connection() {
+    let h = Harness::new("bitfield_wrong_length").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+
+    for payload in [&[][..], &[0b1100_0000, 0][..]] {
+        assert!(
+            peer.on_received_message(Message::Bitfield(ByteBuf(payload)))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(h.peers.availability.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn a_have_at_or_past_the_piece_count_ends_the_connection() {
+    let h = Harness::new("have_past_piece_count").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Bitfield(ByteBuf(&[0])))
+        .await
+        .unwrap();
+
+    peer.on_received_message(Message::Have(1)).await.unwrap();
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+    for have in [PIECES, 7, u32::MAX] {
+        assert!(peer.on_received_message(Message::Have(have)).await.is_err());
+    }
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+}
+
+impl Harness {
+    /// The peer set the fast bit in its handshake.
+    fn speak_fast(&self, peer: &PeerHandler) {
+        self.peers
+            .with_live_mut(peer.addr, "test", |live| live.fast = true)
+            .unwrap();
+    }
+}
+
+/// What we open the connection to `peer` with, as it goes on the wire.
+fn opening(peer: &PeerHandler) -> Option<Vec<u8>> {
+    let peer = &peer;
+    peer.should_send_bitfield().then(|| {
+        let mut buf = vec![0u8; 64];
+        let len = peer.serialize_bitfield_message_to_buf(&mut buf).unwrap();
+        buf.truncate(len);
+        buf
+    })
+}
+
+fn wire(msg: Message<'_>) -> Vec<u8> {
+    let mut buf = vec![0u8; 64];
+    let len = msg.serialize(&mut buf, &Default::default).unwrap();
+    buf.truncate(len);
+    buf
+}
+
+#[tokio::test]
+async fn have_all_and_have_none_are_bitfields_of_every_piece_and_of_none() {
+    let h = Harness::new("have_all_and_have_none").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    let bitfield = || {
+        h.peers
+            .with_live(peer.addr, |live| (live.bitfield.clone(), live.seeder))
+            .unwrap()
+    };
+
+    peer.on_received_message(Message::HaveNone).await.unwrap();
+    let (none, seeder) = bitfield();
+    assert_eq!(none.as_raw_slice(), [0]);
+    assert!(!seeder);
+    assert_eq!(h.peers.availability.counts(), [0, 0]);
+
+    // The padding bits stay clear.
+    peer.on_received_message(Message::HaveAll).await.unwrap();
+    let (all, seeder) = bitfield();
+    assert_eq!(all.as_raw_slice(), [0b1100_0000]);
+    assert!(seeder);
+    assert_eq!(h.peers.availability.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn a_fast_connection_opens_with_have_all_have_none_or_a_bitfield() {
+    let seeding = Harness::seeding("opens_seeding").await;
+    let half = Harness::build("opens_half", 0x80, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await;
+    let empty = Harness::new("opens_empty").await;
+    for (h, fast_opening, plain_opening) in [
+        (
+            &seeding,
+            wire(Message::HaveAll),
+            Some(wire(Message::Bitfield(ByteBuf(&[0xc0])))),
+        ),
+        (
+            &half,
+            wire(Message::Bitfield(ByteBuf(&[0x80]))),
+            Some(wire(Message::Bitfield(ByteBuf(&[0x80])))),
+        ),
+        (&empty, wire(Message::HaveNone), None),
+    ] {
+        let (plain, _plain_rx) = h.peer("127.0.0.1:6881");
+        let (fast, _fast_rx) = h.peer("127.0.0.2:6881");
+        h.speak_fast(&fast);
+        assert_eq!(opening(&fast), Some(fast_opening));
+        assert_eq!(opening(&plain), plain_opening);
+    }
+}
+
 /// What the upload side queues for a peer's writer.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Sent {
     Choke,
     Unchoke,
     /// The block at (piece, offset), handed to the writer to send.
     Block(u32, u32),
+    /// A Reject for the block at (piece, offset).
+    Reject(u32, u32),
+    /// An Allowed Fast for the piece.
+    AllowedFast(u32),
 }
 
 fn sent(request: WriterRequest) -> Sent {
     match request {
         WriterRequest::Message(Message::Choke) => Sent::Choke,
         WriterRequest::Message(Message::Unchoke) => Sent::Unchoke,
+        WriterRequest::Message(Message::Reject(r)) => Sent::Reject(r.index, r.begin),
+        WriterRequest::Message(Message::AllowedFast(piece)) => Sent::AllowedFast(piece),
         WriterRequest::ReadChunkRequest(c) => Sent::Block(c.piece_index.get(), c.offset),
         other => panic!("unexpected writer request {other:?}"),
     }
@@ -452,6 +948,388 @@ async fn a_cancel_takes_an_unsent_block_off_the_upload_queue() {
         .await
         .unwrap();
     assert_eq!(next_sent(&mut rx).await, Sent::Block(1, CHUNK_SIZE));
+}
+
+#[tokio::test]
+async fn a_cancel_of_an_unsent_block_is_answered_with_a_reject_on_a_fast_connection() {
+    let h = Harness::seeding("a_fast_cancel_is_rejected").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    peer.on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+    peer.on_received_message(Message::Cancel(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Reject(0, 0));
+    assert!(!peer.claim_upload(&h.chunk(0, 0)));
+
+    // A block already sent stays sent, and its cancel has no answer.
+    peer.on_received_message(Message::Request(request(0, 1)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, CHUNK_SIZE));
+    assert!(peer.claim_upload(&h.chunk(0, 1)));
+    peer.on_received_message(Message::Cancel(request(0, 1)))
+        .await
+        .unwrap();
+    assert!(rx.is_empty());
+}
+
+#[tokio::test]
+async fn a_fast_peer_we_choke_is_sent_a_reject_for_every_block_it_will_not_get() {
+    let h = Harness::seeding_with_slots("a_fast_choke_rejects", 1).await;
+    tokio::time::pause();
+    let (held, mut held_rx) = h.peer("127.0.0.1:6881");
+    let (other, mut other_rx) = h.peer("127.0.0.2:6881");
+    h.speak_fast(&held);
+    let (held, other) = (&held, &other);
+
+    held.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Unchoke);
+    for chunk in [0, 1] {
+        held.on_received_message(Message::Request(request(0, chunk)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
+
+    // The slot passes to the other peer. The Choke goes first, then a Reject
+    // for each unsent block.
+    other
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Choke);
+    let rejects = BTreeSet::from([next_sent(&mut held_rx).await, next_sent(&mut held_rx).await]);
+    assert_eq!(
+        rejects,
+        BTreeSet::from([Sent::Reject(0, 0), Sent::Reject(0, CHUNK_SIZE)])
+    );
+    assert!(!held.claim_upload(&h.chunk(0, 0)));
+    assert!(!held.claim_upload(&h.chunk(0, 1)));
+
+    // What the choked peer asks for now is rejected at once, and within the
+    // grace the connection stays.
+    held.on_received_message(Message::Request(request(1, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Reject(1, 0));
+    assert!(held_rx.is_empty());
+
+    // A cancel for a block already rejected has no answer.
+    held.on_received_message(Message::Cancel(request(0, 0)))
+        .await
+        .unwrap();
+    assert!(held_rx.is_empty());
+}
+
+#[tokio::test]
+async fn a_fast_peer_that_chokes_us_keeps_our_requests_until_it_rejects_one() {
+    let h = Harness::new("a_fast_choke_keeps_requests").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+    peer.on_i_am_unchoked();
+    let taken = h.request_every_chunk(&peer, &mut requester, &mut rx).await;
+    let other = 1 - taken;
+    drop(requester);
+
+    // The peer answers every request with its block or a Reject, so the
+    // Choke leaves them all in flight, and a block still counts.
+    (&peer).on_received_message(Message::Choke).await.unwrap();
+    assert_eq!(h.inflight_count(&peer), every_chunk().len() - 1);
+    assert!(h.queued_pieces().is_empty());
+    h.deliver(&peer, (taken, CHUNK_SIZE)).await;
+    assert_eq!(h.missing_chunks(taken), vec![2, 3]);
+
+    // One Reject gives back both pieces and every request, the delivered
+    // chunks kept.
+    (&peer)
+        .on_received_message(Message::Reject(request(taken, 2)))
+        .await
+        .unwrap();
+    assert_eq!(h.inflight_count(&peer), 0);
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+    assert_eq!(h.missing_chunks(taken), vec![2, 3]);
+
+    // The Rejects for the rest answer requests we no longer wait for.
+    let mut rest = chunks(other, 0..CHUNKS_PER_PIECE);
+    rest.insert((taken, 3 * CHUNK_SIZE));
+    for (index, begin) in rest {
+        (&peer)
+            .on_received_message(Message::Reject(request(index, begin / CHUNK_SIZE)))
+            .await
+            .unwrap();
+    }
+    // One more answers nothing we asked for.
+    assert!(
+        (&peer)
+            .on_received_message(Message::Reject(request(other, 0)))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_reject_for_a_block_we_never_asked_for_ends_the_connection() {
+    let h = Harness::new("a_reject_never_requested").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    assert!(
+        peer.on_received_message(Message::Reject(request(0, 0)))
+            .await
+            .is_err()
+    );
+    let past_the_end = Request {
+        index: PIECES,
+        begin: 0,
+        length: CHUNK_SIZE,
+    };
+    assert!(
+        peer.on_received_message(Message::Reject(past_the_end))
+            .await
+            .is_err()
+    );
+}
+
+/// A seed with one upload slot, a fast peer that has piece 1, and a second
+/// peer. Two pieces are fewer than the set's five, so the fast peer's
+/// allowed fast set is every piece it lacks: piece 0.
+async fn allowed_fast_seed(name: &str) -> (Harness, (PeerHandler, PeerRx), (PeerHandler, PeerRx)) {
+    let h = Harness::seeding_with_slots(name, 1).await;
+    tokio::time::pause();
+    let fast = h.peer("127.0.0.1:6881");
+    let other = h.peer("127.0.0.2:6881");
+    h.speak_fast(&fast.0);
+    fast.0.on_bitfield(&[0x40]).unwrap();
+    (h, fast, other)
+}
+
+#[tokio::test]
+async fn a_fast_peer_we_choke_is_still_served_its_allowed_fast_pieces() {
+    let (h, (fast, mut fast_rx), (other, mut other_rx)) =
+        allowed_fast_seed("allowed_fast_served").await;
+    let (fast, other) = (&fast, &other);
+
+    // The set goes out on the first Interested, and not again.
+    fast.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::AllowedFast(0));
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    fast.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    assert!(fast_rx.is_empty());
+
+    for index in [0, 1] {
+        fast.on_received_message(Message::Request(request(index, 0)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(1, 0));
+
+    // The slot passes to the other peer: the Choke rejects the unsent block
+    // of piece 1 and keeps piece 0's.
+    other
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Choke);
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Reject(1, 0));
+    assert!(fast_rx.is_empty());
+    assert!(fast.claim_upload(&h.chunk(0, 0)));
+    assert!(!fast.claim_upload(&h.chunk(1, 0)));
+
+    // Choked, the peer is served piece 0 and refused piece 1.
+    fast.on_received_message(Message::Request(request(0, 1)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(0, CHUNK_SIZE));
+    fast.on_received_message(Message::Request(request(1, 1)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Reject(1, CHUNK_SIZE));
+    assert!(fast_rx.is_empty());
+}
+
+#[tokio::test]
+async fn a_choked_peer_may_ask_for_an_allowed_fast_piece_three_times_over() {
+    let (h, (fast, mut fast_rx), (other, mut other_rx)) =
+        allowed_fast_seed("allowed_fast_three_times").await;
+    let (fast, other) = (&fast, &other);
+    fast.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::AllowedFast(0));
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    other
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Choke);
+
+    for asked in 0..3 * CHUNKS_PER_PIECE {
+        let chunk = asked % CHUNKS_PER_PIECE;
+        fast.on_received_message(Message::Request(request(0, chunk)))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_sent(&mut fast_rx).await,
+            Sent::Block(0, chunk * CHUNK_SIZE)
+        );
+        // The writer sends it, so the peer may ask for it again.
+        assert!(fast.claim_upload(&h.chunk(0, chunk)));
+    }
+    assert!(
+        fast.on_received_message(Message::Request(request(0, 0)))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn allowed_fast_from_a_peer_names_only_pieces_we_lack() {
+    // Piece 0 is had.
+    let h = Harness::build(
+        "allowed_fast_ingest",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    for index in [0, PIECES, 1, 1] {
+        peer.on_received_message(Message::AllowedFast(index))
+            .await
+            .unwrap();
+    }
+    let allowed = h
+        .peers
+        .with_live(peer.addr, |live| live.allowed_fast_from_peer.clone())
+        .unwrap();
+    assert_eq!(allowed, vec![h.piece(1)]);
+}
+
+#[tokio::test]
+async fn a_peer_that_chokes_us_is_asked_only_for_its_allowed_fast_pieces() {
+    let h = Harness::new("allowed_fast_requested").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    tokio::time::pause();
+    (&peer)
+        .on_received_message(Message::AllowedFast(1))
+        .await
+        .unwrap();
+    let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(1, 0..CHUNKS_PER_PIECE)
+    );
+    assert!(rx.is_empty());
+    assert_eq!(h.queued_pieces(), vec![0]);
+
+    // Unchoked, and a block arrives at once, which deepens the window: the
+    // rest is asked for.
+    peer.on_i_am_unchoked();
+    h.deliver(&peer, (1, 0)).await;
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(0, 0..CHUNKS_PER_PIECE)
+    );
+}
+
+#[tokio::test]
+async fn a_piece_we_may_not_finish_while_choked_goes_back_and_an_allowed_fast_one_follows() {
+    let h = Harness::new("allowed_fast_after_choke").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    peer.lock_flow_control("test").request_window = 1;
+    let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+    peer.on_i_am_unchoked();
+    let first = next_requests(&mut requester, &mut rx, 1).await;
+    let (taken, _) = *first.first().unwrap();
+    assert_eq!(first, chunks(taken, [0]));
+    let other = 1 - taken;
+
+    // Choked mid piece, with the other piece allowed fast: the rest of the
+    // first piece may not be asked for, so it goes back, and the other
+    // follows.
+    (&peer).on_received_message(Message::Choke).await.unwrap();
+    (&peer)
+        .on_received_message(Message::AllowedFast(other))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, 1).await,
+        chunks(other, [0])
+    );
+    assert_eq!(h.queued_pieces(), vec![taken]);
+    assert_eq!(h.inflight_count(&peer), 1);
+}
+
+#[tokio::test]
+async fn a_suggestion_names_only_a_piece_we_lack() {
+    // Piece 0 is had.
+    let h = Harness::build("suggest_ingest", 0x80, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    for index in [0, PIECES, 1] {
+        peer.on_received_message(Message::Suggest(index))
+            .await
+            .unwrap();
+    }
+    let suggested = h
+        .peers
+        .with_live(peer.addr, |live| live.suggested.clone())
+        .unwrap();
+    assert_eq!(suggested, vec![h.piece(1)]);
+}
+
+#[tokio::test]
+async fn the_piece_a_peer_suggests_is_asked_for_first_until_it_rejects_it() {
+    for suggested in 0..PIECES {
+        let h = Harness::new("suggest_requested").await;
+        let (peer, mut rx) = h.peer("127.0.0.1:6881");
+        h.speak_fast(&peer);
+        (&peer)
+            .on_received_message(Message::Suggest(suggested))
+            .await
+            .unwrap();
+        let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+        // Fewer pieces are had than rarest first needs: without the
+        // suggestion the first piece is a random one.
+        peer.on_i_am_unchoked();
+        assert_eq!(
+            next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+            chunks(suggested, 0..CHUNKS_PER_PIECE)
+        );
+        drop(requester);
+
+        (&peer)
+            .on_received_message(Message::Reject(request(suggested, 0)))
+            .await
+            .unwrap();
+        let left = h
+            .peers
+            .with_live(peer.addr, |live| live.suggested.clone())
+            .unwrap();
+        assert!(left.is_empty());
+    }
 }
 
 impl Harness {
@@ -612,6 +1490,125 @@ async fn the_optimistic_slot_passes_every_30_s_to_a_peer_that_never_held_it() {
     assert!(h.choked(&first));
 }
 
+// libtorrent `session_impl::preemptive_unchoke`,
+// `recalculate_optimistic_unchoke_slots`: the upload slots are the
+// session's. A peer of one torrent finds no free slot while a peer of another
+// holds the only one, and the optimistic slot passes between the torrents.
+#[tokio::test]
+async fn a_peer_of_one_torrent_waits_for_the_slot_a_peer_of_another_holds() {
+    // The one slot of the session is the optimistic one.
+    let a = Harness::seeding_with_slots("one_slot_a", 1).await;
+    let b = a.sibling("one_slot_b", 0xc0).await;
+    tokio::time::pause();
+    let (first, mut first_rx) = a.peer("127.0.0.1:6881");
+    let (other, mut other_rx) = b.peer("127.0.0.2:6881");
+
+    (&first)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Unchoke);
+    (&other)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert!(other_rx.is_empty());
+    assert!(b.choked(&other));
+
+    // At the first round the optimistic slot goes to the peer that waited
+    // for it, and the first peer, holding no regular slot, is choked.
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Choke);
+    let other_held_it = tokio::time::Instant::now();
+
+    // The first peer never held the optimistic slot: it takes it next.
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Unchoke);
+    assert_eq!(
+        tokio::time::Instant::now(),
+        other_held_it + choker::OPTIMISTIC_UNCHOKE_INTERVAL
+    );
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Choke);
+    assert!(b.choked(&other));
+}
+
+// libtorrent `session_impl::preemptive_unchoke` counts the slots held,
+// `num_peers_up_unchoked`, and a stopped torrent's connections give theirs
+// up as they go (`torrent::remove_peer`). An interested peer of another
+// torrent takes the freed slot at once, not at the next round.
+#[tokio::test]
+async fn a_stopped_torrents_peer_gives_up_its_slot_at_once() {
+    let a = Harness::seeding_with_slots("stopped_slot_a", 1).await;
+    let b = a.sibling("stopped_slot_b", 0xc0).await;
+    let (held, mut held_rx) = b.peer("127.0.0.2:6881");
+    (&held)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Unchoke);
+
+    let session = &a._session;
+    let handle = session.get(b.shared.id.into()).unwrap();
+    session.pause(&handle).await.unwrap();
+
+    tokio::time::pause();
+    let stopped = tokio::time::Instant::now();
+    let (peer, mut rx) = a.peer("127.0.0.1:6881");
+    (&peer)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    assert_eq!(tokio::time::Instant::now(), stopped);
+}
+
+// libtorrent `session_impl::recalculate_unchoke_slots`: a round ranks the
+// peers of every torrent of the session together.
+#[tokio::test]
+async fn a_peer_of_another_torrent_that_sends_us_more_takes_the_slot_of_one_that_sends_less() {
+    // Two regular slots and the optimistic one, over both torrents.
+    let a = Harness::seeding_with_slots("ranked_together_a", 3).await;
+    let b = a.sibling("ranked_together_b", 0xc0).await;
+    tokio::time::pause();
+    let (slow, mut slow_rx) = a.peer("127.0.0.1:6881");
+    let (steady, mut steady_rx) = a.peer("127.0.0.2:6881");
+    let (optimistic, mut optimistic_rx) = a.peer("127.0.0.3:6881");
+    let (fast, mut fast_rx) = b.peer("127.0.0.4:6881");
+    for (peer, rx) in [
+        (&slow, &mut slow_rx),
+        (&steady, &mut steady_rx),
+        (&optimistic, &mut optimistic_rx),
+    ] {
+        peer.on_received_message(Message::Interested).await.unwrap();
+        assert_eq!(next_sent(rx).await, Sent::Unchoke);
+    }
+
+    // The first round keeps two of the three, none having sent a byte, and
+    // the third comes back on the optimistic slot.
+    assert_eq!(next_sent(&mut optimistic_rx).await, Sent::Choke);
+    assert_eq!(next_sent(&mut optimistic_rx).await, Sent::Unchoke);
+
+    // The other torrent has no peer unchoked, and still no slot is free.
+    (&fast)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert!(fast_rx.is_empty());
+
+    // Over the round the other torrent's peer sends us the most, the slow
+    // one the least: it takes the slow one's slot.
+    for (peer, pieces) in [(&slow, 1u64), (&steady, 2), (&fast, 3)] {
+        peer.counters
+            .fetched_bytes
+            .fetch_add(pieces * u64::from(PIECE_LENGTH), Ordering::Relaxed);
+    }
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut slow_rx).await, Sent::Choke);
+    assert!(steady_rx.is_empty());
+    assert!(!a.choked(&steady));
+    assert!(optimistic_rx.is_empty());
+    assert!(!a.choked(&optimistic));
+}
+
 #[tokio::test]
 async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
     let h = Harness::seeding_with_slots("a_choke_drops_uploads", 1).await;
@@ -703,6 +1700,206 @@ async fn a_peer_that_is_not_interested_is_choked_and_its_slot_handed_on_at_once(
     assert_eq!(next_sent(&mut waiting_rx).await, Sent::Unchoke);
     assert_eq!(tokio::time::Instant::now(), said_so);
     assert!(leaving_rx.is_empty());
+}
+
+impl Harness {
+    /// The peer takes piece `index`, acquiring pieces until it has it.
+    fn take(&self, peer: &PeerHandler, index: u32) {
+        peer.on_i_am_unchoked();
+        while peer
+            .acquire_next_piece()
+            .unwrap()
+            .expect("the piece is not free")
+            .get()
+            != index
+        {}
+    }
+
+    /// The peer is asked for, and sends, chunk `chunk` of piece `index`,
+    /// with its bytes flipped when `corrupt` holds.
+    async fn send(
+        &self,
+        peer: &PeerHandler,
+        (index, chunk): (u32, u32),
+        corrupt: bool,
+    ) -> anyhow::Result<()> {
+        let info = self.chunk(index, chunk);
+        self.peers
+            .with_live_mut(peer.addr, "test", |live| live.add_inflight_request(info))
+            .unwrap();
+        let start = (index * PIECE_LENGTH + chunk * CHUNK_SIZE) as usize;
+        let mut block = self.content[start..start + CHUNK_SIZE as usize].to_vec();
+        if corrupt {
+            block[0] ^= 0xff;
+        }
+        peer.on_received_piece(Piece::from_data(index, chunk * CHUNK_SIZE, &block[..]))
+            .await
+    }
+
+    fn banned(&self, peer: &PeerHandler) -> bool {
+        self.peers.is_banned(peer.addr.ip())
+    }
+
+    /// Whether a peer connecting from `addr` is turned away.
+    fn refused(&self, addr: &str) -> bool {
+        let (tx, _rx) = unbounded_channel();
+        self.peers
+            .add_incoming(
+                addr.parse().unwrap(),
+                Id20::default(),
+                tx,
+                ConnectionKind::Tcp,
+                6881,
+            )
+            .is_err()
+    }
+
+    /// The trust points, hash failures and parole of the peer.
+    fn trust(&self, peer: &PeerHandler) -> (i8, u8, bool) {
+        let trust = self.peers.with_peer(peer.addr, |p| p.trust()).unwrap();
+        (trust.points(), trust.hashfails(), trust.on_parole())
+    }
+
+    /// `bad` sends the first half of piece 0, its second block corrupt, and
+    /// chokes us; `good` sends the rest, and the piece fails.
+    async fn fail_shared(&self, bad: &PeerHandler, good: &PeerHandler) {
+        self.take(bad, 0);
+        self.send(bad, (0, 0), false).await.unwrap();
+        self.send(bad, (0, 1), true).await.unwrap();
+        bad.on_i_am_choked().unwrap();
+        self.take(good, 0);
+        self.send(good, (0, 2), false).await.unwrap();
+        self.send(good, (0, 3), false).await.unwrap();
+        assert_eq!(self.missing_chunks(0), vec![0, 1, 2, 3]);
+    }
+}
+
+/// Whether the peer's writer was told to close the connection.
+fn told_to_disconnect(rx: &mut PeerRx) -> bool {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|r| matches!(r, WriterRequest::Disconnect(Err(_))))
+}
+
+#[tokio::test]
+async fn the_sender_of_a_bad_block_is_banned_once_the_piece_passes_and_the_others_are_not() {
+    let h = Harness::new("smart_ban_two_senders").await;
+    tokio::time::pause();
+    let (bad, mut bad_rx) = h.peer("127.0.0.1:6881");
+    let (good, mut good_rx) = h.peer("127.0.0.2:6881");
+    let (third, mut third_rx) = h.peer("127.0.0.3:6881");
+
+    // The piece the two shared failed: it is downloaded again, and each
+    // loses two points and goes on parole, but neither is banned, nor
+    // disconnected, as either may have sent the bad block.
+    h.fail_shared(&bad, &good).await;
+    for peer in [&bad, &good] {
+        assert_eq!(h.trust(peer), (-2, 1, true));
+        assert!(!h.banned(peer));
+    }
+    assert!(!told_to_disconnect(&mut bad_rx) && !told_to_disconnect(&mut good_rx));
+
+    // A third peer sends the whole piece and it passes: the block the bad
+    // peer sent differs from the one now had.
+    h.take(&third, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&third, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.missing_chunks(0).is_empty());
+    assert!(h.banned(&bad));
+    assert!(told_to_disconnect(&mut bad_rx));
+    assert!(!h.banned(&good) && !told_to_disconnect(&mut good_rx));
+    assert!(!h.banned(&third) && !told_to_disconnect(&mut third_rx));
+    assert_eq!(h.trust(&third), (1, 0, false));
+
+    // The bad peer is turned away when it connects again.
+    assert!(h.refused("127.0.0.1:50000"));
+    // The records went with the pass.
+    assert!(h.peers.piece_passed(h.piece(0)).is_empty());
+}
+
+#[tokio::test]
+async fn the_sole_sender_of_a_failed_piece_is_banned_at_once() {
+    let h = Harness::new("sole_sender_banned").await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+
+    h.take(&peer, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&peer, (0, chunk), chunk == 2).await.unwrap();
+    }
+
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert_eq!(h.trust(&peer), (-2, 1, true));
+    assert!(h.banned(&peer));
+    assert!(told_to_disconnect(&mut rx));
+    assert!(h.refused("127.0.0.1:50000"));
+    assert!(!h.refused("127.0.0.2:6881"));
+}
+
+// libtorrent torrent::piece_failed adds the piece's size to the failed
+// bytes; peer_connection::incoming_piece adds a block it has no use for to
+// the redundant bytes. Both reach the tracker as `corrupt` and `redundant`.
+#[tokio::test]
+async fn a_failed_piece_counts_as_corrupt_and_a_block_already_had_as_redundant() {
+    let h = Harness::new("corrupt_and_redundant_bytes").await;
+    tokio::time::pause();
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.take(&peer, 0);
+    h.send(&peer, (0, 0), false).await.unwrap();
+    assert_eq!((h.get_failed_bytes(), h.get_redundant_bytes()), (0, 0));
+    h.send(&peer, (0, 0), false).await.unwrap();
+    assert_eq!(
+        (h.get_failed_bytes(), h.get_redundant_bytes()),
+        (0, u64::from(CHUNK_SIZE))
+    );
+
+    for chunk in 1..CHUNKS_PER_PIECE {
+        h.send(&peer, (0, chunk), chunk == 2).await.unwrap();
+    }
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert_eq!(
+        (h.get_failed_bytes(), h.get_redundant_bytes()),
+        (u64::from(PIECE_LENGTH), u64::from(CHUNK_SIZE))
+    );
+}
+
+#[tokio::test]
+async fn a_peer_in_four_failed_pieces_is_banned_and_a_passed_piece_earns_a_point() {
+    let h = Harness::new("trust_floor_ban").await;
+    tokio::time::pause();
+    let (a, _a_rx) = h.peer("127.0.0.1:6881");
+    let (b, _b_rx) = h.peer("127.0.0.2:6881");
+    let (c, _c_rx) = h.peer("127.0.0.3:6881");
+    let (d, _d_rx) = h.peer("127.0.0.4:6881");
+    let (e, _e_rx) = h.peer("127.0.0.5:6881");
+
+    // A passed piece: b earns a point.
+    h.take(&b, 1);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&b, (1, chunk), false).await.unwrap();
+    }
+    assert_eq!(h.trust(&b), (1, 0, false));
+    // b chokes us, so no piece it took on the way stays its own.
+    b.on_i_am_choked().unwrap();
+
+    // a shares four failed pieces, each with a peer that is not on parole
+    // (a peer on parole is handed no piece another peer sent part of). Each
+    // failure costs both senders two points; a reaches the floor at the
+    // fourth and is banned, the others, in one each, are not.
+    for (failures, other) in [(1, &b), (2, &c), (3, &d)] {
+        h.fail_shared(&a, other).await;
+        assert_eq!(h.trust(&a), (-2 * failures, failures as u8, true));
+        assert!(!h.banned(&a));
+    }
+    h.fail_shared(&a, &e).await;
+    assert_eq!(h.trust(&a), (peer::Trust::MIN_POINTS, 4, true));
+    assert!(h.banned(&a));
+    assert_eq!(h.trust(&b), (-1, 1, true));
+    for other in [&c, &d, &e] {
+        assert_eq!(h.trust(other), (-2, 1, true));
+    }
+    assert!(!h.banned(&b) && !h.banned(&c) && !h.banned(&d) && !h.banned(&e));
 }
 
 mod v2 {
@@ -1036,4 +2233,1977 @@ mod v2 {
         };
         assert!(peer.on_hash_request(request).is_err());
     }
+}
+
+// libtorrent `peer_connection::incoming_request`: a request is served when it
+// names any block inside a piece we have, no longer than a block.
+#[tokio::test]
+async fn a_request_for_any_block_inside_a_had_piece_is_served() {
+    let h = Harness::seeding("any_block_is_served").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    let unaligned = Request {
+        index: 0,
+        begin: 1,
+        length: 100,
+    };
+    let tail = Request {
+        index: 1,
+        begin: PIECE_LENGTH - 10,
+        length: 10,
+    };
+    for r in [unaligned, tail] {
+        peer.on_received_message(Message::Request(r)).await.unwrap();
+    }
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 1));
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(1, PIECE_LENGTH - 10));
+}
+
+// libtorrent `peer_connection::incoming_request`: past
+// `max_allowed_in_request_queue` blocks asked for and not sent, a request is
+// rejected on a fast connection and the connection stays;
+// `bt_peer_connection::write_extensions` advertises the limit as `reqq`.
+#[tokio::test]
+async fn a_request_past_the_queue_limit_is_rejected_and_reqq_advertises_the_limit() {
+    let h = Harness::seeding("request_queue_limit").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    let mut hs = ExtendedHandshake::new();
+    peer.update_my_extended_handshake(&mut hs).unwrap();
+    assert_eq!(hs.reqq, Some(MAX_ALLOWED_IN_REQUEST_QUEUE));
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    // Distinct one-byte blocks of piece 0, every one a block a peer may ask
+    // for; the writer sends none, so all stay queued.
+    let byte = |begin| Request {
+        index: 0,
+        begin,
+        length: 1,
+    };
+    for begin in 0..MAX_ALLOWED_IN_REQUEST_QUEUE {
+        peer.on_received_message(Message::Request(byte(begin)))
+            .await
+            .unwrap();
+    }
+    // A block asked for again is queued once and goes out once.
+    peer.on_received_message(Message::Request(byte(0)))
+        .await
+        .unwrap();
+    // The queue is full: the next is rejected, and the peer kept.
+    let past = byte(MAX_ALLOWED_IN_REQUEST_QUEUE);
+    peer.on_received_message(Message::Request(past))
+        .await
+        .unwrap();
+    let past_chunk = h
+        .lengths
+        .requested_block(h.piece(0), past.begin, past.length)
+        .unwrap();
+    assert!(!peer.claim_upload(&past_chunk));
+
+    // A cancel makes room, and the same request is queued now.
+    peer.on_received_message(Message::Cancel(byte(1)))
+        .await
+        .unwrap();
+    peer.on_received_message(Message::Request(past))
+        .await
+        .unwrap();
+
+    // Everything queued for the writer up to that last block: each block
+    // once, the first Reject the one past the limit.
+    let mut blocks = Vec::new();
+    let mut rejects = Vec::new();
+    loop {
+        match next_sent(&mut rx).await {
+            Sent::Block(0, begin) => {
+                blocks.push(begin);
+                if begin == past.begin {
+                    break;
+                }
+            }
+            Sent::Reject(0, begin) => rejects.push(begin),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(rejects, [past.begin, 1]);
+    assert_eq!(blocks.iter().filter(|&&b| b == 0).count(), 1);
+    assert_eq!(blocks.last(), Some(&past.begin));
+}
+
+/// A request for what the torrent of [`Harness::build`] with only piece 0
+/// had cannot serve: the request at position `n`, cycling through each way
+/// a request can be wrong.
+fn unservable(n: u32) -> Request {
+    let (index, begin, length) = match n % 5 {
+        0 => (1, 0, CHUNK_SIZE),       // a piece we do not have
+        1 => (0, 0, CHUNK_SIZE + 1),   // longer than a block
+        2 => (0, 0, 0),                // empty
+        3 => (0, PIECE_LENGTH - 1, 2), // past the end of the piece
+        _ => (PIECES, 0, CHUNK_SIZE),  // no such piece
+    };
+    Request {
+        index,
+        begin,
+        length,
+    }
+}
+
+#[tokio::test]
+async fn a_request_we_cannot_serve_is_dropped_and_the_peer_kept() {
+    let h = Harness::build(
+        "unservable_is_dropped",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    for n in 0..5 {
+        peer.on_received_message(Message::Request(unservable(n)))
+            .await
+            .unwrap();
+    }
+    assert!(rx.is_empty());
+
+    peer.on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+}
+
+impl Harness {
+    /// The peer sends `count` requests we cannot serve, each kept.
+    async fn ask_unservable(&self, peer: &PeerHandler, count: u32) {
+        for n in 0..count {
+            peer.on_received_message(Message::Request(unservable(n)))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+// libtorrent `peer_connection::incoming_request`: a peer that is neither
+// interested nor unchoked is told it is choked every tenth request we cannot
+// serve, and disconnected at a tenth past 300 while it does not choke us.
+#[tokio::test]
+async fn a_choked_peer_asking_for_what_we_cannot_serve_is_reminded_then_disconnected() {
+    let h = Harness::build(
+        "unservable_reminded",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    assert!(h.choked(peer));
+
+    for _ in 0..31 {
+        h.ask_unservable(peer, 9).await;
+        assert!(rx.is_empty());
+        h.ask_unservable(peer, 1).await;
+        assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+    }
+
+    // At 310 the peer chokes us, so it was reminded again; once it unchokes
+    // us, the next tenth ends the connection.
+    peer.on_received_message(Message::Unchoke).await.unwrap();
+    h.ask_unservable(peer, 9).await;
+    assert!(
+        peer.on_received_message(Message::Request(unservable(0)))
+            .await
+            .is_err()
+    );
+}
+
+// libtorrent `peer_connection::send_choke`: choking the peer starts its count
+// of requests we cannot serve again.
+#[tokio::test]
+async fn choking_a_peer_starts_its_count_of_unservable_requests_again() {
+    let h = Harness::build(
+        "unservable_count_resets",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    h.ask_unservable(peer, 5).await;
+
+    peer.on_received_message(Message::NotInterested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+
+    h.ask_unservable(peer, 9).await;
+    assert!(rx.is_empty());
+    h.ask_unservable(peer, 1).await;
+    assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+}
+
+/// A memory storage that refuses the next `refusals` pieces it is handed.
+#[derive(Clone, Default)]
+struct RefusingStorageFactory {
+    inner: MemoryStorageFactory,
+    refusals: Arc<AtomicU32>,
+}
+
+struct RefusingStorage {
+    inner: Box<dyn TorrentStorage>,
+    refusals: Arc<AtomicU32>,
+}
+
+impl StorageFactory for RefusingStorageFactory {
+    type Storage = RefusingStorage;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<RefusingStorage> {
+        Ok(RefusingStorage {
+            inner: Box::new(self.inner.create(shared, metadata)?),
+            refusals: self.refusals.clone(),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+impl TorrentStorage for RefusingStorage {
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.inner.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.inner.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.inner.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.inner.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(RefusingStorage {
+            inner: self.inner.take()?,
+            refusals: self.refusals.clone(),
+        }))
+    }
+
+    fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        let refuse = self
+            .refusals
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        anyhow::ensure!(!refuse, "no room for piece {piece:?}");
+        self.inner.on_piece_completed(piece)
+    }
+}
+
+impl Harness {
+    fn have(&self, index: u32) -> bool {
+        self.live
+            .lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .get_have_pieces()
+            .as_slice()[index as usize]
+    }
+}
+
+// libtorrent: the write completes before the hash job, and only then
+// `torrent::piece_passed`; on a disk error `torrent::on_piece_verified`
+// neither credits nor blames the senders.
+#[tokio::test]
+async fn a_piece_the_storage_refuses_is_not_had_and_is_downloaded_again() {
+    let storage = RefusingStorageFactory::default();
+    storage.refusals.store(1, Ordering::SeqCst);
+    let h = Harness::build_on(
+        "storage_refuses",
+        0x00,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    tokio::time::pause();
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.take(&peer, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&peer, (0, chunk), false).await.unwrap();
+    }
+    assert!(!h.have(0));
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert!(h.queued_pieces().contains(&0));
+    assert_eq!(h.trust(&peer), (0, 0, false));
+    assert!(storage.inner.log.completed_pieces().is_empty());
+
+    // Taken the second time, it is ours.
+    h.take(&peer, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&peer, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.have(0));
+    assert_eq!(h.trust(&peer), (1, 0, false));
+    assert_eq!(storage.inner.log.completed_pieces(), vec![0]);
+}
+
+// A piece is counted into every file with bytes in it, an empty file among
+// them or not (libtorrent `torrent::we_have` updates every file the piece
+// maps to).
+#[test]
+fn a_piece_is_counted_into_every_file_past_an_empty_one() {
+    let file = |name: &str, piece_range: std::ops::Range<u32>| FileInfo {
+        relative_filename: name.into(),
+        offset_in_torrent: 0,
+        piece_range,
+        attrs: Default::default(),
+        len: 0,
+    };
+    let files = [
+        file("a", 0..1),
+        file("empty at the start of piece 1", 1..1),
+        file("b", 1..2),
+        file("empty inside piece 1", 1..1),
+        file("c", 1..3),
+        file("d", 3..4),
+    ];
+    let names = |piece| -> Vec<usize> { files_in_piece(&files, piece).map(|(i, _)| i).collect() };
+    assert_eq!(names(0), vec![0]);
+    assert_eq!(names(1), vec![2, 3, 4]);
+    assert_eq!(names(2), vec![4]);
+    assert_eq!(names(3), vec![5]);
+}
+
+/// A PEX message adding `added` and dropping `dropped`.
+fn pex(added: &[&str], dropped: &[&str]) -> UtPex<ByteBufOwned> {
+    let addrs = |a: &[&str]| -> Vec<SocketAddr> { a.iter().map(|a| a.parse().unwrap()).collect() };
+    let (added, dropped) = (addrs(added), addrs(dropped));
+    let added = added.iter().map(|&addr| PexPeerInfo { flags: 0, addr });
+    UtPex::from_peers(added, dropped.iter().copied())
+}
+
+impl Harness {
+    /// Whether the peer at `addr` is in the torrent's peer list.
+    fn knows(&self, addr: &str) -> bool {
+        self.peers
+            .with_peer(addr.parse().unwrap(), |_| ())
+            .is_some()
+    }
+
+    /// The extension ids we advertise to `peer`.
+    fn advertised(&self, peer: &PeerHandler) -> extended::PeerExtendedMessageIds {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.m
+    }
+}
+
+// libtorrent `ut_pex_peer_plugin::on_extended`: the added peers are
+// candidates, the dropped ones are only forgotten by the sender.
+#[tokio::test]
+async fn a_pex_message_adds_its_added_peers_and_not_its_dropped_ones() {
+    let h = Harness::new("pex_added_and_dropped").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    assert!(h.advertised(&peer).ut_pex.is_some());
+
+    let msg = pex(&["10.0.0.1:6881", "[2001:db8::1]:6881"], &["10.0.0.2:6881"]);
+    (&peer)
+        .on_received_message(Message::Extended(ExtendedMessage::UtPex(msg.as_borrowed())))
+        .await
+        .unwrap();
+    assert!(h.knows("10.0.0.1:6881"));
+    assert!(h.knows("[2001:db8::1]:6881"));
+    assert!(!h.knows("10.0.0.2:6881"));
+}
+
+impl PeerHandler {
+    /// The peer sends us `msg`.
+    async fn send_pex(&self, msg: &UtPex<ByteBufOwned>) -> anyhow::Result<()> {
+        self.on_received_message(Message::Extended(ExtendedMessage::UtPex(msg.as_borrowed())))
+            .await
+    }
+}
+
+// libtorrent `ut_pex_peer_plugin::on_extended`: a connection's PEX adds at
+// most `max_pex_peers` of each family to our list, and a peer on a local
+// network only when the connection is on one too.
+#[tokio::test]
+async fn a_pex_message_adds_at_most_max_pex_peers_and_a_local_peer_only_from_a_local_one() {
+    let h = Harness::new("pex_limits").await;
+    let (remote, _remote_rx) = h.peer("198.51.100.1:6881");
+    let public: Vec<String> = (0..60).map(|i| format!("203.0.113.{i}:6881")).collect();
+    let mut added = vec!["192.168.1.1:6881", "10.0.0.1:6881"];
+    added.extend(public.iter().map(String::as_str));
+    remote.send_pex(&pex(&added, &[])).await.unwrap();
+    assert!(!h.knows("192.168.1.1:6881"));
+    assert!(!h.knows("10.0.0.1:6881"));
+    let known = public.iter().filter(|a| h.knows(a)).count();
+    assert_eq!(known, peer::MAX_PEX_PEERS);
+
+    let (local, _local_rx) = h.peer("192.168.1.2:6881");
+    local
+        .send_pex(&pex(&["192.168.1.1:6881"], &[]))
+        .await
+        .unwrap();
+    assert!(h.knows("192.168.1.1:6881"));
+}
+
+// libtorrent `ut_pex_peer_plugin::on_extended`, `m_last_pex`: a peer may
+// send six PEX messages a minute; the seventh ends the connection.
+#[tokio::test]
+async fn a_seventh_pex_message_within_a_minute_ends_the_connection() {
+    let h = Harness::new("pex_flood").await;
+    tokio::time::pause();
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let msg = pex(&[], &[]);
+    for _ in 0..6 {
+        peer.send_pex(&msg).await.unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert!(peer.send_pex(&msg).await.is_err());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    peer.send_pex(&msg).await.unwrap();
+}
+
+// libtorrent `ut_pex_peer_plugin::on_extended`: a PEX message past 500 KiB
+// ends the connection (`pex_message_too_large`), unread.
+#[tokio::test]
+async fn a_pex_message_past_500_kib_ends_the_connection() {
+    let h = Harness::new("pex_too_large").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    // An IPv4 address and its flags byte: seven bytes a peer.
+    let past = MAX_PEX_MESSAGE_LEN / 7 + 1;
+    let named = |n: usize| {
+        let added = (0..n).map(|i| PexPeerInfo {
+            flags: 0,
+            addr: SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 6881)),
+        });
+        UtPex::from_peers(added, std::iter::empty())
+    };
+    assert!(peer.send_pex(&named(past)).await.is_err());
+    assert!(!h.knows("10.0.0.0:6881"));
+    peer.send_pex(&named(past - 1)).await.unwrap();
+    assert!(h.knows("10.0.0.0:6881"));
+}
+
+// libtorrent `session::add_extension`: a session without the ut_pex plugin
+// does not advertise it, and takes no peers from it.
+#[tokio::test]
+async fn a_session_without_pex_does_not_advertise_it_nor_take_peers_from_it() {
+    let opts = SessionOptions {
+        disable_pex: true,
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "pex_disabled",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let advertised = h.advertised(&peer);
+    assert!(advertised.ut_pex.is_none());
+    assert!(advertised.ut_metadata.is_some());
+
+    let msg = pex(&["10.0.0.1:6881"], &[]);
+    (&peer)
+        .on_received_message(Message::Extended(ExtendedMessage::UtPex(msg.as_borrowed())))
+        .await
+        .unwrap();
+    assert!(!h.knows("10.0.0.1:6881"));
+}
+
+/// A handshake from a peer, with the DHT bit when `dht` holds.
+fn handshake(dht: bool) -> Handshake {
+    Handshake::new(Id20::default(), Id20::new([9; 20])).offering_dht(dht)
+}
+
+/// A DHT node on 127.0.0.1 that knows no other node.
+async fn local_dht(silent: SocketAddr) -> crate::dht::Dht {
+    crate::dht::DhtState::with_config(crate::dht::DhtConfig {
+        listen_addr: Some((std::net::Ipv4Addr::LOCALHOST, 0).into()),
+        bootstrap_addrs: Some(vec![silent.to_string()]),
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
+// libtorrent `bt_peer_connection::write_handshake` sets the DHT bit only
+// when the session runs a DHT node; `write_dht_port` sends nothing without
+// one.
+#[tokio::test]
+async fn a_session_without_dht_sets_no_dht_bit_and_sends_no_port() {
+    let h = Harness::new("dht_port_no_dht").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    assert_eq!((&peer).dht_port(), None);
+    (&peer)
+        .on_handshake(handshake(true), ConnectionKind::Tcp, false)
+        .unwrap();
+    (&peer)
+        .on_received_message(Message::Port(6881))
+        .await
+        .unwrap();
+    assert!(rx.try_recv().is_err());
+}
+
+// libtorrent `peer_connection::incoming_dht_port` adds the named node on
+// each PORT; here a connection's repeat of the port it named last adds
+// nothing, and another port is a node to add.
+#[tokio::test]
+async fn a_repeated_dht_port_names_no_new_node() {
+    let h = Harness::new("dht_port_repeat").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    let port = |port| peer.on_received_message(Message::Port(port));
+    let news = |port| {
+        h.peers
+            .with_live_mut(peer.addr, "test", |live| live.dht_node_named(port))
+            .unwrap()
+    };
+    port(6881).await.unwrap();
+    port(6881).await.unwrap();
+    assert!(!news(6881));
+    port(6882).await.unwrap();
+    assert!(!news(6882));
+    assert!(news(6881));
+}
+
+// libtorrent `bt_peer_connection::write_dht_port` after the handshake to a
+// peer with the DHT bit, `on_dht_port` answering a PORT from a peer
+// without it, once per connection; `peer_connection::incoming_dht_port`
+// and `node::add_node`: the named node is pinged and, on its reply, joins
+// the routing table.
+#[tokio::test]
+async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
+    let silent = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let silent = silent.local_addr().unwrap();
+    let opts = SessionOptions {
+        dht: Some(crate::DhtSessionConfig {
+            bootstrap_addrs: Some(vec![silent.to_string()]),
+            ..Default::default()
+        }),
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "dht_port",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let ours = h._session.get_dht().unwrap().clone();
+    let our_port = ours.listen_addr().port();
+
+    let (bit, mut bit_rx) = h.peer("127.0.0.2:6881");
+    assert_eq!((&bit).dht_port(), Some(our_port));
+    (&bit)
+        .on_handshake(handshake(true), ConnectionKind::Tcp, false)
+        .unwrap();
+    assert!(matches!(
+        bit_rx.try_recv(),
+        Ok(WriterRequest::Message(Message::Port(p))) if p == our_port
+    ));
+
+    let (no_bit, mut no_bit_rx) = h.peer("127.0.0.1:6882");
+    (&no_bit)
+        .on_handshake(handshake(false), ConnectionKind::Tcp, false)
+        .unwrap();
+    assert!(no_bit_rx.try_recv().is_err());
+
+    let theirs = local_dht(silent).await;
+    let their_id = theirs.stats().id;
+    (&no_bit)
+        .on_received_message(Message::Port(theirs.listen_addr().port()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        no_bit_rx.try_recv(),
+        Ok(WriterRequest::Message(Message::Port(p))) if p == our_port
+    ));
+    (&no_bit)
+        .on_received_message(Message::Port(theirs.listen_addr().port()))
+        .await
+        .unwrap();
+    assert!(no_bit_rx.try_recv().is_err());
+
+    while !ours.with_routing_tables(|v4, _| v4.iter().any(|n| n.id() == their_id)) {
+        tokio::task::yield_now().await;
+    }
+    theirs.cancellation_token().cancel();
+}
+
+impl Harness {
+    /// A torrent of `pieces` pieces (at most 8), with `have` the bitfield
+    /// of those had, added to super-seed.
+    async fn super_seeding(name: &str, pieces: u32, have: u8) -> Self {
+        let add = AddTorrentOptions {
+            storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+            super_seeding: true,
+            ..Default::default()
+        };
+        Self::build_added(name, pieces, have, isolated_session_opts(false), add).await
+    }
+
+    /// A peer at `addr` whose first message is a bitfield of `pieces`, or
+    /// a keep-alive when it has none.
+    async fn peer_with(&self, addr: &str, pieces: &[u32]) -> (PeerHandler, PeerRx) {
+        let (peer, rx) = self.new_peer(addr);
+        let mut bits = peer::empty_bitfield(self.lengths.total_pieces());
+        for &p in pieces {
+            bits.set(p as usize, true);
+        }
+        let first = if pieces.is_empty() {
+            Message::KeepAlive
+        } else {
+            Message::Bitfield(ByteBuf(bits.as_raw_slice()))
+        };
+        (&peer).on_received_message(first).await.unwrap();
+        (peer, rx)
+    }
+}
+
+/// The pieces we told the peer we have since last asked, draining its
+/// queue.
+fn told_have(rx: &mut PeerRx) -> Vec<u32> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|r| match r {
+            WriterRequest::Message(Message::Have(i)) => Some(i),
+            _ => None,
+        })
+        .collect()
+}
+
+// libtorrent `bt_peer_connection::write_bitfield` under super-seeding
+// sends no bitfield and tells the peer of two pieces from
+// `torrent::get_piece_to_super_seed`: ones it lacks, as rare as any, and
+// handed to no peer, itself included, while one such is left.
+#[tokio::test]
+async fn a_super_seed_sends_no_bitfield_and_hands_each_peer_two_of_the_rarest_pieces() {
+    let h = Harness::super_seeding("super_seed_rarest", 4, 0xf0).await;
+    let (s, mut s_rx) = h.peer_with("127.0.0.1:6881", &[0]).await;
+    assert!(!(&s).should_send_bitfield());
+    let handed = told_have(&mut s_rx);
+    assert_eq!(handed.len(), 2);
+    assert!(handed.iter().all(|p| [1, 2, 3].contains(p)));
+    assert_ne!(handed[0], handed[1]);
+
+    // Of the pieces held by none, one is not handed; then piece 0, held by
+    // one peer, before the pieces handed.
+    let rest = (1..4).find(|p| !handed.contains(p)).unwrap();
+    let (_p, mut p_rx) = h.peer_with("127.0.0.2:6882", &[]).await;
+    assert_eq!(told_have(&mut p_rx), [rest, 0]);
+
+    // A peer that lacks nothing is handed nothing.
+    let (_seed, mut seed_rx) = h.peer_with("127.0.0.3:6883", &[0, 1, 2, 3]).await;
+    assert_eq!(told_have(&mut seed_rx), [] as [u32; 0]);
+}
+
+// libtorrent `peer_connection::incoming_request`: while super-seeding, a
+// request for a piece other than the two handed out is refused.
+#[tokio::test]
+async fn a_super_seeded_peer_is_served_only_the_pieces_it_was_handed() {
+    let h = Harness::super_seeding("super_seed_serves_handed", 3, 0xe0).await;
+    let (peer, mut rx) = h.peer_with("127.0.0.1:6881", &[]).await;
+    let handed = told_have(&mut rx);
+    let other = (0..3).find(|p| !handed.contains(p)).unwrap();
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    peer.on_received_message(Message::Request(request(other, 0)))
+        .await
+        .unwrap();
+    assert!(rx.is_empty());
+    for piece in handed {
+        peer.on_received_message(Message::Request(request(piece, 0)))
+            .await
+            .unwrap();
+        assert_eq!(next_sent(&mut rx).await, Sent::Block(piece, 0));
+    }
+}
+
+// libtorrent `peer_connection::incoming_have` without
+// `strict_super_seeding`: a peer that reports a piece it was handed is
+// handed the next in its place; a piece it got elsewhere hands it nothing.
+#[tokio::test]
+async fn a_peer_that_reports_its_handed_piece_is_handed_the_next() {
+    let h = Harness::super_seeding("super_seed_next", 4, 0xf0).await;
+    let (a, mut a_rx) = h.peer_with("127.0.0.1:6881", &[]).await;
+    let handed = told_have(&mut a_rx);
+    let others: Vec<u32> = (0..4).filter(|p| !handed.contains(p)).collect();
+    let a = &a;
+
+    a.on_received_message(Message::Have(others[0]))
+        .await
+        .unwrap();
+    assert_eq!(told_have(&mut a_rx), [] as [u32; 0]);
+
+    // It lacks the other handed piece and others[1], handed to no peer.
+    a.on_received_message(Message::Have(handed[0]))
+        .await
+        .unwrap();
+    assert_eq!(told_have(&mut a_rx), [others[1]]);
+    assert!(h.peers.super_seeded(a.addr, h.piece(others[1])));
+    assert!(h.peers.super_seeded(a.addr, h.piece(handed[1])));
+    assert!(!h.peers.super_seeded(a.addr, h.piece(handed[0])));
+}
+
+// libtorrent `peer_connection::second_tick`: a peer not interested for
+// more than 10 s is handed another piece, which may interest it, in place
+// of the older of its two.
+#[tokio::test]
+async fn an_uninterested_peer_is_handed_another_piece_after_ten_seconds() {
+    let h = Harness::super_seeding("super_seed_uninterested", 4, 0xf0).await;
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    (&peer)
+        .on_received_message(Message::HaveNone)
+        .await
+        .unwrap();
+    let handed = told_have(&mut rx);
+    assert_eq!(handed.len(), 2);
+
+    let mut idle: Task<'_> = Box::pin(peer.time_out_idle());
+    let WriterRequest::Message(Message::Have(next)) = next_queued(&mut idle, &mut rx).await else {
+        panic!("expected a HAVE");
+    };
+    assert!(tokio::time::Instant::now() - start > Duration::from_secs(10));
+    assert!(!handed.contains(&next));
+    assert!(h.peers.super_seeded(peer.addr, h.piece(next)));
+    assert!(h.peers.super_seeded(peer.addr, h.piece(handed[1])));
+    assert!(!h.peers.super_seeded(peer.addr, h.piece(handed[0])));
+}
+
+// libtorrent `peer_connection::send_allowed_set` sends nothing while
+// super-seeding: the peer learns of no piece but those handed.
+#[tokio::test]
+async fn a_super_seed_sends_no_allowed_fast_set() {
+    let h = Harness::super_seeding("super_seed_no_allowed_fast", 2, 0xc0).await;
+    let (peer, mut rx) = h.peer_with("127.0.0.1:6881", &[]).await;
+    h.speak_fast(&peer);
+    assert_eq!(told_have(&mut rx).len(), 2);
+    (&peer)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    assert!(rx.is_empty());
+}
+
+// libtorrent `torrent::files_checked` turns super-seeding off for a torrent
+// that is not a seed.
+#[tokio::test]
+async fn a_torrent_that_is_not_a_seed_does_not_super_seed() {
+    let h = Harness::super_seeding("super_seed_not_seed", 2, 0x80).await;
+    let (peer, mut rx) = h.peer_with("127.0.0.1:6881", &[]).await;
+    assert!((&peer).should_send_bitfield());
+    assert_eq!(told_have(&mut rx), [] as [u32; 0]);
+}
+
+impl Harness {
+    /// A live peer at `addr` whose extended handshake names ut_holepunch
+    /// when `holepunch` holds, and the queue of what we send it.
+    fn holepunch_peer(&self, addr: &str, holepunch: bool) -> (PeerHandler, PeerRx) {
+        let (peer, rx) = self.peer(addr);
+        let mut hs = ExtendedHandshake::new();
+        hs.m.ut_holepunch = holepunch.then_some(9);
+        (&peer).on_extended_handshake(&hs).unwrap();
+        (peer, rx)
+    }
+}
+
+/// The holepunch messages we queued for the peer since last asked, draining
+/// its queue.
+fn holepunch_sent(rx: &mut PeerRx) -> Vec<UtHolepunch> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|r| match r {
+            WriterRequest::Message(Message::Extended(ExtendedMessage::UtHolepunch(m))) => Some(m),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn send_holepunch(peer: &PeerHandler, msg: UtHolepunch) {
+    peer.on_received_message(Message::Extended(ExtendedMessage::UtHolepunch(msg)))
+        .await
+        .unwrap();
+}
+
+fn sock(addr: &str) -> SocketAddr {
+    addr.parse().unwrap()
+}
+
+/// An address on 127.0.0.1 nothing listens on, so a connection to it fails.
+fn closed_port() -> SocketAddr {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+// libtorrent `bt_peer_connection::write_extensions` names ut_holepunch on
+// every connection.
+#[tokio::test]
+async fn every_connection_advertises_ut_holepunch() {
+    let h = Harness::new("holepunch_advertised").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    assert_eq!(
+        h.advertised(&peer).ut_holepunch,
+        Some(MY_EXTENDED_UT_HOLEPUNCH)
+    );
+}
+
+// libtorrent `bt_peer_connection::on_holepunch`, `rendezvous`: the sender
+// is told to connect to the target, the target to the sender.
+#[tokio::test]
+async fn a_rendezvous_tells_each_peer_to_connect_to_the_other() {
+    let h = Harness::new("holepunch_rendezvous").await;
+    let (a, mut a_rx) = h.holepunch_peer("203.0.113.1:6881", true);
+    let (_b, mut b_rx) = h.holepunch_peer("203.0.113.2:6881", true);
+    send_holepunch(&a, UtHolepunch::Rendezvous(sock("203.0.113.2:6881"))).await;
+    assert_eq!(
+        holepunch_sent(&mut a_rx),
+        [UtHolepunch::Connect(sock("203.0.113.2:6881"))]
+    );
+    assert_eq!(
+        holepunch_sent(&mut b_rx),
+        [UtHolepunch::Connect(sock("203.0.113.1:6881"))]
+    );
+}
+
+// libtorrent `bt_peer_connection::on_holepunch`, `rendezvous`: not
+// connected, no support and no self are errors back to the sender; a local
+// peer and one that is not are not introduced; and a peer that did not
+// advertise the extension is not heard.
+#[tokio::test]
+async fn a_rendezvous_that_cannot_be_made_is_refused_or_ignored() {
+    use ut_holepunch::error::{NO_SELF, NO_SUPPORT, NOT_CONNECTED};
+    let h = Harness::new("holepunch_refused").await;
+    let (a, mut a_rx) = h.holepunch_peer("203.0.113.1:6881", true);
+    let (_mute, mut mute_rx) = h.holepunch_peer("203.0.113.2:6881", false);
+    let (_local, mut local_rx) = h.holepunch_peer("192.168.1.2:6881", true);
+    let (deaf, mut deaf_rx) = h.holepunch_peer("203.0.113.3:6881", false);
+
+    for (target, code) in [
+        ("203.0.113.9:6881", NOT_CONNECTED),
+        ("203.0.113.2:6881", NO_SUPPORT),
+        ("203.0.113.1:6881", NO_SELF),
+    ] {
+        send_holepunch(&a, UtHolepunch::Rendezvous(sock(target))).await;
+        assert_eq!(
+            holepunch_sent(&mut a_rx),
+            [UtHolepunch::Error(sock(target), code)]
+        );
+    }
+    send_holepunch(&a, UtHolepunch::Rendezvous(sock("192.168.1.2:6881"))).await;
+    assert_eq!(holepunch_sent(&mut a_rx), []);
+    assert_eq!(holepunch_sent(&mut local_rx), []);
+    assert_eq!(holepunch_sent(&mut mute_rx), []);
+
+    send_holepunch(&deaf, UtHolepunch::Rendezvous(sock("203.0.113.1:6881"))).await;
+    assert_eq!(holepunch_sent(&mut deaf_rx), []);
+    assert_eq!(holepunch_sent(&mut a_rx), []);
+}
+
+// libtorrent `bt_peer_connection::on_holepunch`, `connect`: we connect to
+// the peer over uTP, so a session without uTP takes no connect; a local
+// address is taken only from a local peer.
+#[tokio::test]
+async fn a_connect_admits_the_peer_only_over_utp_and_a_local_one_only_from_a_local_peer() {
+    let target = closed_port();
+    let without = Harness::new("holepunch_connect_no_utp").await;
+    let (from, _rx) = without.holepunch_peer("127.0.0.1:6881", true);
+    send_holepunch(&from, UtHolepunch::Connect(target)).await;
+    assert!(!without.knows(&target.to_string()));
+
+    let opts = SessionOptions {
+        listen: Some(crate::ListenerOptions {
+            mode: crate::ListenerMode::UtpOnly,
+            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            ..Default::default()
+        }),
+        ..isolated_session_opts(false)
+    };
+    let with = Harness::build_on(
+        "holepunch_connect_utp",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let (remote, _remote_rx) = with.holepunch_peer("203.0.113.1:6881", true);
+    send_holepunch(&remote, UtHolepunch::Connect(target)).await;
+    assert!(!with.knows(&target.to_string()));
+
+    let (from, _rx) = with.holepunch_peer("127.0.0.1:6881", true);
+    send_holepunch(&from, UtHolepunch::Connect(target)).await;
+    assert!(with.knows(&target.to_string()));
+}
+
+/// A PEX message naming `addr` with `flags`.
+fn pex_flagged(addr: SocketAddr, flags: u8) -> Vec<u8> {
+    let SocketAddr::V4(v4) = addr else {
+        panic!("an IPv4 address")
+    };
+    let mut b = b"d5:added6:".to_vec();
+    b.extend_from_slice(&v4.ip().octets());
+    b.extend_from_slice(&v4.port().to_be_bytes());
+    b.extend_from_slice(b"7:added.f1:");
+    b.push(flags);
+    b.push(b'e');
+    b
+}
+
+// libtorrent `peer_connection::connect_failed`: a failed connection to a
+// peer PEX flagged as speaking the holepunch extension sends a rendezvous
+// for it to `torrent::find_introducer`, a holepunch peer whose PEX named it.
+#[tokio::test]
+async fn a_failed_connection_asks_the_peer_whose_pex_named_it_to_introduce_us() {
+    let h = Harness::new("holepunch_introducer").await;
+    // On another host than the target: no connection to its address stands
+    // in the way of the connect.
+    let (introducer, mut rx) = h.holepunch_peer("127.0.0.2:6881", true);
+    let target = closed_port();
+    let msg = pex_flagged(target, extended::ut_pex::PEX_HOLEPUNCH);
+    let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&msg).unwrap();
+    // The PEX is taken in before the connect loop runs: the test runs on
+    // one thread and yields only below.
+    (&introducer)
+        .on_received_message(Message::Extended(ExtendedMessage::UtPex(msg)))
+        .await
+        .unwrap();
+    assert!(h.knows(&target.to_string()));
+
+    // The connect loop connects to the target, which refuses.
+    let sent = loop {
+        match rx.recv().await.unwrap() {
+            WriterRequest::Message(Message::Extended(ExtendedMessage::UtHolepunch(m))) => break m,
+            _ => continue,
+        }
+    };
+    assert_eq!(sent, UtHolepunch::Rendezvous(target));
+}
+
+// libtorrent `ut_pex_plugin::tick`, `send_peer`: our PEX message lists each
+// connected peer whose listening address we know, where it listens, flagged
+// a seed, connected over uTP, speaking the holepunch extension, as it is to
+// us; the next one drops a peer gone. A peer not on a local network is not
+// told of one that is (it would drop it, `ut_pex_peer_plugin::on_extended`).
+#[tokio::test]
+async fn our_pex_message_lists_each_connected_peer_where_it_listens_flagged_for_what_it_is_to_us() {
+    use extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP};
+    let h = Harness::new("pex_flags_sent").await;
+    let listening_on_6881 = |peer: &PeerHandler, holepunch: bool| {
+        let mut hs = ExtendedHandshake::new();
+        hs.p = Some(6881);
+        if holepunch {
+            hs.m.ut_holepunch = Some(9);
+        }
+        peer.on_extended_handshake(&hs).unwrap();
+    };
+    let utp = |addr: &str| {
+        let (tx, rx) = unbounded_channel();
+        h.peers
+            .add_incoming(sock(addr), Id20::default(), tx, ConnectionKind::Utp, 6881)
+            .unwrap();
+        rx
+    };
+    let (seed, _seed_rx) = h.peer("203.0.113.1:50001");
+    listening_on_6881(&seed, false);
+    let (plain, _plain_rx) = h.new_peer("203.0.113.2:50002");
+    listening_on_6881(&plain, false);
+    let _utp_rx = utp("203.0.113.3:6881");
+    let (holepunch, _holepunch_rx) = h.new_peer("203.0.113.4:50004");
+    listening_on_6881(&holepunch, true);
+    // Never says where it listens.
+    let (_silent, _silent_rx) = h.new_peer("203.0.113.5:50005");
+    let _local_rx = utp("192.168.1.3:6881");
+
+    let sorted = |msg: UtPex<ByteBufOwned>| {
+        let mut wire = Vec::new();
+        crate::bencode::bencode_serialize_to_writer(&msg.as_borrowed(), &mut wire).unwrap();
+        let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&wire).unwrap();
+        let mut added: Vec<_> = msg.added_peers().map(|p| (p.addr, p.flags)).collect();
+        let mut dropped: Vec<_> = msg.dropped_peers().map(|p| p.addr).collect();
+        added.sort();
+        dropped.sort();
+        (added, dropped)
+    };
+
+    let remote = sock("198.51.100.1:6881");
+    let mut told = HashSet::new();
+    let (added, dropped) = sorted(h.next_pex_message(remote, &mut told).unwrap());
+    assert_eq!(
+        added,
+        [
+            (sock("203.0.113.1:6881"), PEX_SEED),
+            (sock("203.0.113.2:6881"), 0),
+            (sock("203.0.113.3:6881"), PEX_UTP),
+            (sock("203.0.113.4:6881"), PEX_HOLEPUNCH),
+        ]
+    );
+    assert!(dropped.is_empty());
+    assert!(h.next_pex_message(remote, &mut told).is_none());
+
+    let mut local_told = HashSet::new();
+    let (added, _) = sorted(
+        h.next_pex_message(sock("192.168.1.9:6881"), &mut local_told)
+            .unwrap(),
+    );
+    assert_eq!(added.len(), 5);
+    assert!(added.contains(&(sock("192.168.1.3:6881"), PEX_UTP)));
+
+    h.peers.drop_peer(plain.addr);
+    let (added, dropped) = sorted(h.next_pex_message(remote, &mut told).unwrap());
+    assert!(added.is_empty());
+    assert_eq!(dropped, [sock("203.0.113.2:6881")]);
+}
+
+// libtorrent `torrent::do_pause` only disconnects: `torrent::m_peer_list`,
+// with each `torrent_peer`'s `banned` and `trust_points`, is the list the
+// resumed torrent works from.
+#[tokio::test]
+async fn a_pause_keeps_the_bans_and_the_trust_of_the_peer_list() {
+    let h = Harness::new("pause_keeps_peer_list").await;
+    let banned = sock("203.0.113.1:6881");
+    let (peer, _rx) = h.peer("203.0.113.2:6881");
+    h.peers.ban(banned);
+    h.peers
+        .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false))
+        .unwrap();
+    let trust = h.peers.with_peer(peer.addr, |p| p.trust()).unwrap();
+    assert_ne!(trust, Default::default());
+
+    let session = &h._session;
+    let handle = session.get(h.shared.id.into()).unwrap();
+    session.pause(&handle).await.unwrap();
+    session.unpause(&handle).await.unwrap();
+    let resumed = handle.live().unwrap();
+    assert!(!Arc::ptr_eq(&resumed, &h.live));
+    assert!(resumed.peers.is_banned(banned.ip()));
+    assert_eq!(
+        resumed.peers.with_peer(peer.addr, |p| p.trust()),
+        Some(trust)
+    );
+}
+
+#[tokio::test]
+async fn a_seed_ends_a_connection_whose_unchoked_peer_asks_for_nothing_for_a_minute() {
+    let h = Harness::seeding("no_request").await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    // Forty seconds on the peer asks for a block, and the minute runs again
+    // from when the block is taken to be sent.
+    tokio::time::advance(Duration::from_secs(40)).await;
+    peer.on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+    let chunk = h.chunk(0, 0);
+    let sent = tokio::time::Instant::now();
+    let claimed = h
+        .peers
+        .with_live_mut(peer.addr, "send", |live| live.claim_upload(&chunk));
+    assert_eq!(claimed, Some(true));
+
+    peer.time_out_idle().await.unwrap();
+    assert!(tokio::time::Instant::now().duration_since(sent) > peer::NO_REQUEST_TIMEOUT);
+}
+
+#[tokio::test]
+async fn peers_that_want_nothing_of_each_other_part_after_ten_minutes_when_connections_run_short() {
+    // Five connections in all: the torrent's connections run short.
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        peer_limit: Some(5),
+        ..Default::default()
+    };
+    let h = Harness::build_added(
+        "no_interest",
+        PIECES,
+        0xc0,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+
+    // Five minutes on the peer is interested a while; the ten minutes run
+    // from when it no longer is.
+    tokio::time::advance(Duration::from_secs(300)).await;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    peer.on_received_message(Message::NotInterested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+    let uninterested = tokio::time::Instant::now();
+
+    peer.time_out_idle().await.unwrap();
+    assert!(tokio::time::Instant::now().duration_since(uninterested) > peer::INACTIVITY_TIMEOUT);
+}
+
+// libtorrent `bt_peer_connection::write_extensions` says upload_only in the
+// extended handshake of a torrent that only uploads, and `torrent::finished`
+// tells each peer whose handshake named upload_only once it does
+// (`torrent::send_upload_only`).
+#[tokio::test]
+async fn a_finished_torrent_tells_the_peers_that_take_upload_only() {
+    let h = Harness::new("upload_only").await;
+    let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
+    let (takes, mut takes_rx) = h.peer_with("127.0.0.2:6881", &[]).await;
+    let (deaf, mut deaf_rx) = h.peer_with("127.0.0.3:6881", &[]).await;
+    let mut names_it = ExtendedHandshake::new();
+    names_it.m.upload_only = Some(3);
+    (&takes).on_extended_handshake(&names_it).unwrap();
+    let mut names_none = ExtendedHandshake::new();
+    names_none.m.upload_only = None;
+    (&deaf).on_extended_handshake(&names_none).unwrap();
+
+    let says = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.upload_only
+    };
+    assert_eq!(says(&takes), None);
+
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(seed.task_peer_chunk_requester());
+    seed.on_i_am_unchoked();
+    let first = h
+        .request_every_chunk(&seed, &mut requester, &mut seed_rx)
+        .await;
+    drop(requester);
+    let rest = chunks(first, 1..CHUNKS_PER_PIECE)
+        .into_iter()
+        .chain(chunks(1 - first, 0..CHUNKS_PER_PIECE));
+    for request in rest {
+        h.deliver(&seed, request).await;
+    }
+
+    let upload_only = |sent: &WriterRequest| match sent {
+        WriterRequest::Message(Message::Extended(ExtendedMessage::UploadOnly(enabled))) => {
+            Some(*enabled)
+        }
+        _ => None,
+    };
+    loop {
+        let sent = takes_rx
+            .recv()
+            .await
+            .expect("the peer's writer queue closed");
+        if let Some(enabled) = upload_only(&sent) {
+            assert!(enabled);
+            break;
+        }
+    }
+    // Every peer was told at once, so the one that named no id would have
+    // been sent it by now.
+    while let Ok(sent) = deaf_rx.try_recv() {
+        assert_eq!(upload_only(&sent), None);
+    }
+    assert_eq!(says(&takes), Some(1));
+}
+
+// libtorrent `peer_list::connection_closed`: only a connection that failed
+// counts against the peer; one we asked to close did not fail.
+#[tokio::test]
+async fn a_connection_we_asked_to_close_counts_no_failure() {
+    let h = Harness::new("asked_to_close").await;
+    let mut failcounts = Vec::new();
+    for (addr, error) in [
+        ("127.0.0.1:6881", crate::Error::Disconnect),
+        ("127.0.0.2:6881", crate::Error::TestDisconnect),
+    ] {
+        let (peer, _rx) = h.peer(addr);
+        let counters = peer.counters.clone();
+        peer.on_peer_died(Some(error)).unwrap();
+        let failcount = h
+            .peers
+            .with_peer(sock(addr), |p| p.connect_rank().1)
+            .unwrap();
+        failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
+    }
+    assert_eq!(failcounts, [(0, 0), (1, 1)]);
+}
+
+// libtorrent `peer_list::is_connect_candidate`: once we only upload, a peer
+// whose connection showed it to be a seed is no connect candidate, and any
+// other still is (`settings_pack::seeding_outgoing_connections`, on by
+// default).
+#[tokio::test]
+async fn a_finished_torrent_still_dials_a_leecher_and_not_a_seed() {
+    let h = Harness::seeding("finished_dials").await;
+    let listens = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        hs.p = Some(u32::from(peer.addr.port()));
+        peer.on_extended_handshake(&hs).unwrap();
+    };
+    let (leecher, _leecher_rx) = h.new_peer("127.0.0.1:6881");
+    leecher.on_bitfield(&bitfield_of(&[])).unwrap();
+    listens(&leecher);
+    let (seed, _seed_rx) = h.peer("127.0.0.2:6881");
+    listens(&seed);
+    leecher.on_peer_died(None).unwrap();
+    seed.on_peer_died(None).unwrap();
+
+    let due = tokio::time::Instant::now() + peer::MIN_RECONNECT_TIME;
+    assert_eq!(
+        h.peers.connect_next(due).map(|(addr, ..)| addr),
+        Some(sock("127.0.0.1:6881"))
+    );
+    assert!(h.peers.connect_next(due).is_none());
+}
+
+// libtorrent `peer_list::compare_peer`: among candidates that failed as
+// often, one on a local network is dialed first.
+#[tokio::test]
+async fn a_local_peer_is_dialed_before_a_global_one() {
+    let h = Harness::new("local_first").await;
+    h.peers.add_peer(sock("1.1.1.1:6881"));
+    h.peers.add_peer(sock("192.168.1.1:6881"));
+    let now = tokio::time::Instant::now();
+    let dialed: Vec<_> =
+        std::iter::from_fn(|| h.peers.connect_next(now).map(|(addr, ..)| addr)).collect();
+    assert_eq!(dialed, [sock("192.168.1.1:6881"), sock("1.1.1.1:6881")]);
+}
+
+/// Every dial is reported to the test with when it began, and none is
+/// answered; a datagram socket is bound on loopback, as for [`DialedTcp`].
+struct UnansweredDials(tokio::sync::mpsc::UnboundedSender<tokio::time::Instant>);
+
+impl crate::network::SocketFactory for UnansweredDials {
+    fn connect_tcp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            crate::network::BoxAsyncReadVectored,
+            crate::network::BoxAsyncWrite,
+        )>,
+    > {
+        Box::pin(async move {
+            let _ = self.0.send(tokio::time::Instant::now());
+            std::future::pending().await
+        })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        Box::pin(async { Err(std::io::ErrorKind::Unsupported.into()) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+    {
+        Box::pin(async {
+            let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+            Ok(Arc::new(socket) as Arc<dyn crate::network::DatagramSocket>)
+        })
+    }
+}
+
+// libtorrent `peer_connection::second_tick`: a connect is given up after
+// `peer_connect_timeout` and 3 s more for each failure in a row; the peer
+// is dialed again (failcount + 1) reconnect times after that
+// (`peer_list::find_connect_candidates`).
+#[tokio::test(start_paused = true)]
+async fn the_connect_timeout_grows_by_three_seconds_per_failure() {
+    let (tx, mut dials) = unbounded_channel();
+    let opts = SessionOptions {
+        socket_factory: Some(Arc::new(UnansweredDials(tx))),
+        ..isolated_session_opts(false)
+    };
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        initial_peers: Some(vec![sock("127.0.0.1:6881")]),
+        ..Default::default()
+    };
+    let _h = Harness::build_added("connect_timeout_grows", PIECES, 0x00, opts, add).await;
+    let mut at = Vec::new();
+    for _ in 0..3 {
+        at.push(dials.recv().await.unwrap());
+    }
+    let timeout = crate::peer_connection::DEFAULT_CONNECT_TIMEOUT;
+    assert_eq!(at[1] - at[0], timeout + peer::MIN_RECONNECT_TIME * 2);
+    assert_eq!(
+        at[2] - at[1],
+        timeout + Duration::from_secs(3) + peer::MIN_RECONNECT_TIME * 3
+    );
+}
+
+/// A torrent of at most `peer_limit` connections in a session of at most
+/// `connections_limit`.
+async fn turnover_harness(name: &str, peer_limit: usize, connections_limit: usize) -> Harness {
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        peer_limit: Some(peer_limit),
+        ..Default::default()
+    };
+    let opts = SessionOptions {
+        connections_limit,
+        ..isolated_session_opts(false)
+    };
+    Harness::build_added(name, PIECES, 0x00, opts, add).await
+}
+
+// libtorrent `session_impl::second_tick`: below the session's cutoff, a
+// torrent holding 90% of its own connections turns 4% of them over, at
+// least one, and no more than it has connect candidates to replace them;
+// the one it would keep least goes (`torrent::disconnect_peers`).
+#[tokio::test]
+async fn a_torrent_at_its_connection_cutoff_turns_its_least_worth_peer_over() {
+    let h = turnover_harness("turnover_torrent", 10, 200).await;
+    let _held = h.peer_semaphore.clone().try_acquire_many_owned(9).unwrap();
+    let (kept, mut kept_rx) = h.peer("127.0.0.1:6881");
+    let (_least, mut least_rx) = h.peer("127.0.0.2:6881");
+    h.peers.with_live_mut(kept.addr, "test", |live| {
+        live.interest(true, tokio::time::Instant::now())
+    });
+    let closed = |rx: &mut PeerRx| {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|r| matches!(r, WriterRequest::Disconnect(Ok(()))))
+    };
+
+    // Nobody to take its place: nobody goes.
+    h._session.turn_peers_over();
+    assert!(!closed(&mut least_rx));
+
+    h.peers.add_peer(sock("203.0.113.1:6881"));
+    h._session.turn_peers_over();
+    assert!(closed(&mut least_rx));
+    assert!(!closed(&mut kept_rx));
+}
+
+// libtorrent `session_impl::second_tick`: when the session holds 90% of its
+// connections, the torrent with the most turns peers over, however far
+// below its own cap.
+#[tokio::test]
+async fn a_session_at_its_connection_cutoff_turns_over_the_busiest_torrents_peers() {
+    let h = turnover_harness("turnover_session", 128, 10).await;
+    let _held: Vec<_> = (0..9)
+        .map(|_| h._session.connection_slots.try_open().unwrap())
+        .collect();
+    let (_peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.peers.add_peer(sock("203.0.113.1:6881"));
+
+    h._session.turn_peers_over();
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|r| matches!(r, WriterRequest::Disconnect(Ok(()))))
+    );
+}
+
+/// Every dial reaches the test as [`Dialed`](crate::peer_info_reader::tests::Dialed)
+/// does; a datagram socket, which only the idle UDP tracker client holds,
+/// is bound on loopback.
+struct DialedTcp(crate::peer_info_reader::tests::Dialed);
+
+impl crate::network::SocketFactory for DialedTcp {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            crate::network::BoxAsyncReadVectored,
+            crate::network::BoxAsyncWrite,
+        )>,
+    > {
+        self.0.connect_tcp(addr)
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        self.0.listen_tcp(addr)
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+    {
+        Box::pin(async {
+            let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+            Ok(Arc::new(socket) as Arc<dyn crate::network::DatagramSocket>)
+        })
+    }
+}
+
+/// A torrent with no piece, of a session whose connections take
+/// `peer_opts`, that dials one peer; the far end of that dial, read past
+/// our handshake.
+async fn dialing_with(
+    name: &str,
+    peer_opts: crate::PeerConnectionOptions,
+) -> (Harness, tokio::io::DuplexStream) {
+    use tokio::io::AsyncReadExt;
+    let (tx, mut dialed) = unbounded_channel();
+    let opts = SessionOptions {
+        socket_factory: Some(Arc::new(DialedTcp(crate::peer_info_reader::tests::Dialed(
+            tx,
+        )))),
+        connect: Some(crate::stream_connect::ConnectionOptions {
+            enable_tcp: true,
+            peer_opts: Some(peer_opts),
+        }),
+        ..isolated_session_opts(false)
+    };
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        initial_peers: Some(vec!["127.0.0.1:6881".parse().unwrap()]),
+        ..Default::default()
+    };
+    let h = Harness::build_added(name, PIECES, 0x00, opts, add).await;
+    let (_, mut peer) = dialed.recv().await.unwrap();
+    let mut ours = [0; 68];
+    peer.read_exact(&mut ours).await.unwrap();
+    (h, peer)
+}
+
+// libtorrent `peer_connection::second_tick`: a torrent's connection still
+// in its handshake ends at the session's handshake timeout, whatever the
+// peer timeout.
+#[tokio::test(start_paused = true)]
+async fn a_torrent_connection_ends_an_unanswered_handshake_at_the_session_timeout() {
+    use tokio::io::AsyncReadExt;
+    let handshake_timeout = Duration::from_secs(3);
+    let (_h, mut peer) = dialing_with(
+        "session_handshake_timeout",
+        crate::PeerConnectionOptions {
+            read_write_timeout: Some(Duration::from_secs(120)),
+            handshake_timeout: Some(handshake_timeout),
+            ..Default::default()
+        },
+    )
+    .await;
+    let start = tokio::time::Instant::now();
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    assert_eq!(start.elapsed(), handshake_timeout);
+}
+
+// libtorrent `peer_connection::keep_alive`: a torrent's connection sends a
+// keepalive at the session's keepalive interval.
+#[tokio::test(start_paused = true)]
+async fn a_torrent_connection_sends_keepalives_at_the_session_interval() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let keep_alive = Duration::from_secs(7);
+    let (h, mut peer) = dialing_with(
+        "session_keep_alive",
+        crate::PeerConnectionOptions {
+            read_write_timeout: Some(Duration::from_secs(120)),
+            keep_alive_interval: Some(keep_alive),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut theirs = [0; 68];
+    let len =
+        Handshake::new(h.shared.info_hash, Id20::new([2; 20])).serialize_unchecked_len(&mut theirs);
+    peer.write_all(&theirs[..len]).await.unwrap();
+    // Whatever goes out first, the keepalive is the first empty frame.
+    let start = tokio::time::Instant::now();
+    loop {
+        let frame = peer.read_u32().await.unwrap();
+        if frame == 0 {
+            break;
+        }
+        let mut body = vec![0; frame as usize];
+        peer.read_exact(&mut body).await.unwrap();
+    }
+    assert_eq!(start.elapsed(), keep_alive);
+}
+
+/// The next thing `task` queues for the peer, polling it until it does.
+async fn next_queued(task: &mut Task<'_>, rx: &mut PeerRx) -> WriterRequest {
+    tokio::select! {
+        biased;
+        sent = rx.recv() => sent.expect("the peer's writer queue closed"),
+        res = task.as_mut() => panic!("the peer task ended: {res:?}"),
+    }
+}
+
+/// Whether `task` is waiting, having queued nothing more for the peer.
+fn waiting(task: &mut Task<'_>, rx: &mut PeerRx) -> bool {
+    futures::FutureExt::now_or_never(task.as_mut()).is_none() && rx.is_empty()
+}
+
+/// A bitfield of `pieces` alone.
+fn bitfield_of(pieces: &[u32]) -> Vec<u8> {
+    let mut bf = peer::empty_bitfield(PIECES);
+    for p in pieces {
+        bf.set(*p as usize, true);
+    }
+    bf.as_raw_slice().to_vec()
+}
+
+// libtorrent `torrent::update_piece_priorities` has every peer update its
+// interest (`peer_connection::update_interest`), and
+// `peer_connection::disconnect_if_redundant` lets a seed go once we only
+// upload. Neither waits on a timer, and the peer hears NotInterested
+// before the connection closes.
+#[tokio::test]
+async fn a_torrent_that_stops_wanting_says_so_at_once_and_lets_a_seed_go() {
+    let h = Harness::build("stops_wanting", 0x80, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await;
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    peer.on_bitfield(&bitfield_of(&[1])).unwrap();
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+
+    // We want piece 1, which the peer has; it chokes us, so we wait.
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Message(Message::Interested)
+    ));
+    assert!(waiting(&mut requester, &mut rx));
+
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+        .unwrap();
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Message(Message::NotInterested)
+    ));
+    assert!(waiting(&mut requester, &mut rx));
+
+    // The peer becomes a seed: the connection is to close once what was
+    // queued before has gone out, and the requester waits for that.
+    peer.on_have(0).unwrap();
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Disconnect(Ok(()))
+    ));
+    assert!(waiting(&mut requester, &mut rx));
+    assert_eq!(tokio::time::Instant::now(), start);
+}
+
+// libtorrent `peer_connection::send_allowed_set` sends nothing to a peer
+// that only uploads (`peer_connection::upload_only`).
+#[tokio::test]
+async fn a_peer_that_only_uploads_is_sent_no_allowed_fast_set() {
+    let h = Harness::seeding("upload_only_no_allowed_fast").await;
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    peer.on_received_message(Message::HaveNone).await.unwrap();
+    peer.on_received_message(Message::Extended(ExtendedMessage::UploadOnly(true)))
+        .await
+        .unwrap();
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    assert!(rx.is_empty());
+}
+
+// libtorrent `peer_connection::disconnect_if_redundant`: once we are
+// finished, a peer that only uploads goes, whether its handshake or its
+// upload_only message said so or it has every piece; a peer that may
+// download from us stays.
+#[tokio::test]
+async fn a_peer_that_only_uploads_goes_once_we_are_finished() {
+    let h = Harness::build(
+        "upload_only_finished",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (said, mut said_rx) = h.new_peer("127.0.0.1:6881");
+    let (shook, mut shook_rx) = h.new_peer("127.0.0.2:6881");
+    let (leech, mut leech_rx) = h.new_peer("127.0.0.3:6881");
+    for peer in [&said, &shook, &leech] {
+        peer.on_bitfield(&bitfield_of(&[1])).unwrap();
+    }
+    let (seed, mut seed_rx) = h.peer("127.0.0.4:6881");
+    (&said)
+        .on_received_message(Message::Extended(ExtendedMessage::UploadOnly(true)))
+        .await
+        .unwrap();
+    // It names no extension, so it is not told we only upload.
+    let mut hs = ExtendedHandshake::new();
+    hs.m = Default::default();
+    hs.upload_only = Some(1);
+    (&shook).on_extended_handshake(&hs).unwrap();
+
+    tokio::time::pause();
+    let mut said_task: Task<'_> = Box::pin(said.request_chunks());
+    let mut shook_task: Task<'_> = Box::pin(shook.request_chunks());
+    let mut leech_task: Task<'_> = Box::pin(leech.request_chunks());
+    let mut seed_task: Task<'_> = Box::pin(seed.request_chunks());
+    let mut peers = [
+        (&mut said_task, &mut said_rx, true),
+        (&mut shook_task, &mut shook_rx, true),
+        (&mut leech_task, &mut leech_rx, false),
+        (&mut seed_task, &mut seed_rx, true),
+    ];
+
+    // Each has piece 1, which we want: they stay.
+    for (task, rx, _) in &mut peers {
+        assert!(matches!(
+            next_queued(task, rx).await,
+            WriterRequest::Message(Message::Interested)
+        ));
+        assert!(waiting(task, rx));
+    }
+
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+        .unwrap();
+    for (task, rx, goes) in &mut peers {
+        assert!(matches!(
+            next_queued(task, rx).await,
+            WriterRequest::Message(Message::NotInterested)
+        ));
+        if *goes {
+            assert!(matches!(
+                next_queued(task, rx).await,
+                WriterRequest::Disconnect(Ok(()))
+            ));
+        }
+        assert!(waiting(task, rx));
+    }
+}
+
+// libtorrent `peer_connection::disconnect_if_redundant`: a peer that only
+// uploads goes once it has nothing we want, though we are not finished.
+#[tokio::test]
+async fn a_peer_that_only_uploads_goes_once_it_has_nothing_we_want() {
+    let h = Harness::new("upload_only_uninteresting").await;
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    peer.on_bitfield(&bitfield_of(&[1])).unwrap();
+    (&peer)
+        .on_received_message(Message::Extended(ExtendedMessage::UploadOnly(true)))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Message(Message::Interested)
+    ));
+    assert!(waiting(&mut requester, &mut rx));
+
+    // We still want piece 0, which it lacks.
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+        .unwrap();
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Message(Message::NotInterested)
+    ));
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Disconnect(Ok(()))
+    ));
+    assert!(!h.is_finished());
+}
+
+impl Harness {
+    /// Whether we last told `peer` we are interested.
+    fn interesting(&self, peer: &PeerHandler) -> bool {
+        self.peers
+            .with_live(peer.addr, |live| live.is_interesting())
+            .unwrap()
+    }
+}
+
+// libtorrent `peer_connection::incoming_have_none` and `do_update_interest`:
+// we are interested only in a peer that has a piece we want and lack, so
+// neither a peer with no piece nor one with only pieces we skip hears
+// Interested.
+#[tokio::test]
+async fn a_peer_with_nothing_we_want_is_never_told_interested() {
+    let h = Harness::new("nothing_we_want").await;
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+        .unwrap();
+    let (none, mut none_rx) = h.new_peer("127.0.0.1:6881");
+    (&none)
+        .on_received_message(Message::HaveNone)
+        .await
+        .unwrap();
+    let (skipped, mut skipped_rx) = h.new_peer("127.0.0.2:6881");
+    skipped.on_bitfield(&bitfield_of(&[1])).unwrap();
+    tokio::time::pause();
+    for (peer, rx) in [(&none, &mut none_rx), (&skipped, &mut skipped_rx)] {
+        peer.on_i_am_unchoked();
+        let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+        assert!(waiting(&mut requester, rx));
+        assert!(!h.interesting(peer));
+    }
+}
+
+// libtorrent `peer_connection::incoming_have`: a HAVE of a piece we want
+// and lack makes the peer interesting at once.
+#[tokio::test]
+async fn a_have_of_a_wanted_piece_makes_the_peer_interesting() {
+    let h = Harness::new("have_makes_interesting").await;
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    (&peer)
+        .on_received_message(Message::HaveNone)
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    assert!(waiting(&mut requester, &mut rx));
+
+    (&peer).on_received_message(Message::Have(1)).await.unwrap();
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Message(Message::Interested)
+    ));
+    assert!(h.interesting(&peer));
+}
+
+// libtorrent `torrent::piece_passed`: once we have a piece, each peer we
+// were interested in that has it updates its interest, and one with
+// nothing else we want hears NotInterested.
+#[tokio::test]
+async fn a_peer_whose_pieces_we_come_to_have_stops_being_interesting() {
+    let h = Harness::new("pieces_we_come_to_have").await;
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    peer.on_bitfield(&bitfield_of(&[0])).unwrap();
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    peer.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(0, 0..CHUNKS_PER_PIECE)
+    );
+    assert!(h.interesting(&peer));
+
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.deliver(&peer, (0, chunk * CHUNK_SIZE)).await;
+    }
+    assert!(
+        h.lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .is_piece_have(h.piece(0))
+    );
+    assert!(matches!(
+        next_message(&mut requester, &mut rx).await,
+        Message::NotInterested
+    ));
+    assert!(!h.interesting(&peer));
+    assert!(waiting(&mut requester, &mut rx));
+}
+
+// libtorrent `peer_connection::second_tick`: a connection neither side is
+// interested in ends after the inactivity timeout when connections run
+// short, while the torrent still downloads.
+#[tokio::test]
+async fn a_downloading_torrent_parts_from_a_peer_with_nothing_it_wants() {
+    // Five connections in all: the torrent's connections run short.
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        peer_limit: Some(5),
+        ..Default::default()
+    };
+    let h = Harness::build_added(
+        "no_interest_downloading",
+        PIECES,
+        0x00,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    (&peer)
+        .on_received_message(Message::HaveNone)
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+
+    peer.task_peer_chunk_requester().await.unwrap();
+    assert!(tokio::time::Instant::now().duration_since(start) > peer::INACTIVITY_TIMEOUT);
+    assert!(rx.try_recv().is_err());
+}
+
+// libtorrent `torrent::update_piece_priorities`: a piece wanted again makes
+// the peers that have it interesting at once, and they are asked for it.
+#[tokio::test]
+async fn a_finished_torrent_asks_for_a_piece_the_moment_it_is_wanted_again() {
+    let h = Harness::build("wanted_again", 0x80, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await;
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+        .unwrap();
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    peer.on_bitfield(&bitfield_of(&[1])).unwrap();
+    peer.on_i_am_unchoked();
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    assert!(waiting(&mut requester, &mut rx));
+
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Normal)])
+        .unwrap();
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Message(Message::Interested)
+    ));
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(1, 0..CHUNKS_PER_PIECE)
+    );
+    assert_eq!(tokio::time::Instant::now(), start);
+}
+
+// libtorrent `bt_peer_connection::write_extensions` sends `p`, our listen
+// port, on a connection we made; `on_extended_handshake` takes `p` from a
+// peer, at the address it connected from (`peer_list::update_peer_port`),
+// and never the peer's word on its own address.
+#[tokio::test]
+async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
+    let opts = SessionOptions {
+        listen: Some(crate::ListenerOptions {
+            mode: crate::ListenerMode::TcpOnly,
+            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            announce_port: Some(51413),
+            ..Default::default()
+        }),
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "extended_handshake_ports",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let (incoming, _incoming_rx) = h.peer("127.0.0.1:50000");
+    let (mut outgoing, _outgoing_rx) = h.new_peer("127.0.0.2:6881");
+    outgoing.incoming = false;
+
+    let ours = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.p
+    };
+    assert_eq!(ours(&incoming), None);
+    assert_eq!(ours(&outgoing), Some(51413));
+
+    let theirs = ExtendedHandshake {
+        p: Some(7000),
+        ipv4: Some(std::net::Ipv4Addr::new(203, 0, 113, 9).into()),
+        ipv6: Some(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9).into()),
+        ..Default::default()
+    };
+    (&incoming).on_extended_handshake(&theirs).unwrap();
+    let listen: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    assert_eq!(
+        h.peers.with_peer(incoming.addr, |p| p.outgoing_address),
+        Some(Some(listen))
+    );
+    assert_eq!(
+        h.peers.pex_listed().into_keys().collect::<Vec<_>>(),
+        [listen]
+    );
+}
+
+// libtorrent `piece_picker::inc_refcount` and `dec_refcount`: a HAVE and a
+// peer leaving move the piece in the pick order before the next pick.
+#[tokio::test]
+async fn a_have_and_a_peer_leaving_move_a_piece_in_the_pick_order() {
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        ..Default::default()
+    };
+    // Eight pieces, the first four had: the rarest goes first.
+    let h = Harness::build_added(
+        "have_and_leaving_move_pieces",
+        8,
+        0xf0,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    let (a, _a_rx) = h.peer("127.0.0.1:6881");
+    let (g, _g_rx) = h.peer("127.0.0.2:6881");
+    let (k, _k_rx) = h.peer("127.0.0.3:6881");
+    let _b = h.peer_with("127.0.0.4:6881", &[5, 6, 7]).await;
+    let _c = h.peer_with("127.0.0.5:6881", &[6, 7]).await;
+    let (d, _d_rx) = h.peer_with("127.0.0.6:6881", &[7]).await;
+    let (j, _j_rx) = h.peer_with("127.0.0.7:6881", &[7]).await;
+    for peer in [&a, &g, &k] {
+        peer.on_i_am_unchoked();
+    }
+    let pick = |peer: &PeerHandler| peer.acquire_next_piece().unwrap().map(|p| p.get());
+
+    // Three peers have piece 4, four 5, five 6, seven 7.
+    assert_eq!(pick(&a), Some(4));
+
+    // Two HAVEs of 5: six peers have it, one more than 6.
+    let mut later = Vec::new();
+    for addr in ["127.0.0.8:6881", "127.0.0.9:6881"] {
+        let (peer, rx) = h.peer_with(addr, &[]).await;
+        (&peer).on_received_message(Message::Have(5)).await.unwrap();
+        later.push((peer, rx));
+    }
+    assert_eq!(pick(&g), Some(6));
+
+    // Two of the seven with 7 go: five have it, one fewer than 5.
+    d.on_peer_died(None).unwrap();
+    j.on_peer_died(None).unwrap();
+    assert_eq!(pick(&k), Some(7));
+}
+
+// wait_until_completed takes its wait before it checks: a finish rung
+// between the check and the await wakes it, where a wait taken after the
+// ring sleeps on (tokio `Notify::notify_waiters` wakes only the waits taken
+// by then). The window lies inside one poll, so the ring is put there by
+// hand on the torrent's own notify.
+#[tokio::test(start_paused = true)]
+async fn a_finish_between_the_check_and_the_wait_is_not_lost() {
+    use futures::FutureExt;
+    let h = Harness::new("finish-between").await;
+    let mut taken = std::pin::pin!(h.finished_notify.notified());
+    taken.as_mut().enable();
+    assert!(!h.is_finished());
+    h.finished_notify.notify_waiters();
+    let after = h.finished_notify.notified();
+    assert!(taken.now_or_never().is_some());
+    assert!(after.now_or_never().is_none());
 }

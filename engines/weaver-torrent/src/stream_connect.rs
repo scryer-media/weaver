@@ -41,6 +41,19 @@ impl std::fmt::Display for ConnectionKind {
     }
 }
 
+/// The transports an outgoing connection to a peer may go over.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transports {
+    /// TCP first, and uTP too when TCP has not connected within a second.
+    #[default]
+    Any,
+    /// uTP alone: a holepunch opened the path to the peer, for UDP only
+    /// (libtorrent `bt_peer_connection::on_holepunch` marks the peer
+    /// `supports_utp`, and `torrent::connect_to_peer` then dials it through
+    /// the uTP socket manager).
+    Utp,
+}
+
 pub struct ConnectionOptions {
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
@@ -129,18 +142,25 @@ impl StreamConnector {
         self.encryption
     }
 
-    /// Connect to a peer and send it our BitTorrent `handshake`, through the
-    /// encrypted handshake when the policy asks for it. The returned halves
-    /// carry the peer's reply.
+    /// Connect to a peer over `transports` and send it our BitTorrent
+    /// `handshake`, through the encrypted handshake when the policy asks for
+    /// it. The returned halves carry the peer's reply.
     pub async fn connect_and_send_handshake(
         &self,
         addr: SocketAddr,
+        transports: Transports,
         info_hash: &Id20,
         handshake: &[u8],
         connect_timeout: Duration,
         rw_timeout: Duration,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
-        let connect = || with_timeout("connecting", connect_timeout, self.connect(addr));
+        let connect = || {
+            with_timeout(
+                "connecting",
+                connect_timeout,
+                self.connect(addr, transports),
+            )
+        };
         let send_plaintext = |kind, r, mut w: BoxAsyncWrite| async move {
             with_timeout(
                 "writing",
@@ -233,9 +253,11 @@ impl StreamConnector {
         &self.stats
     }
 
+    /// Connect to the peer at `addr` over `transports`.
     pub async fn connect(
         &self,
         addr: SocketAddr,
+        transports: Transports,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
@@ -251,10 +273,12 @@ impl StreamConnector {
             )));
         }
 
-        // Try to connect over TCP first. If in 1 second we haven't connected, try uTP also (if configured).
-        // Whoever connects first wins.
+        // Try to connect over TCP first, when it may be used. If in 1 second
+        // we haven't connected, try uTP also (if configured). Whoever
+        // connects first wins.
+        let tcp = self.enable_tcp && transports == Transports::Any;
         let tcp_connect = async {
-            if !self.enable_tcp {
+            if !tcp {
                 return Ok(None);
             }
             let conn = match self.socket_factory.as_ref() {
@@ -284,7 +308,7 @@ impl StreamConnector {
             };
 
             // Give TCP priority as it's more mature and simpler.
-            if self.enable_tcp {
+            if tcp {
                 // wait until either 1 second has passed or TCP failed.
                 tokio::select! {
                     _ = tcp_failed_notify.notified() => {},
@@ -352,5 +376,72 @@ impl StreamConnector {
                 },
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use librqbit_utp::UtpSocketUdp;
+
+    use super::*;
+
+    /// A connector that may use TCP, and uTP when `utp` holds.
+    async fn connector(utp: bool) -> StreamConnector {
+        let utp_socket = match utp {
+            true => Some(UtpSocket::Udp(
+                UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into())
+                    .await
+                    .unwrap(),
+            )),
+            false => None,
+        };
+        StreamConnector::new(StreamConnectorArgs {
+            enable_tcp: true,
+            utp_socket,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    fn tcp_attempts(connector: &StreamConnector) -> u64 {
+        connector.stats().tcp.snapshot().v4.attempts
+    }
+
+    // libtorrent `bt_peer_connection::on_holepunch`, `connect`, and
+    // `torrent::connect_to_peer`: a peer a holepunch introduced is dialed
+    // through the uTP socket alone, with no TCP attempt before it.
+    #[tokio::test]
+    async fn a_utp_only_connection_dials_utp_and_never_tcp() {
+        let connector = connector(true).await;
+        let theirs = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .await
+            .unwrap();
+        let (accepted, connected) = tokio::join!(
+            theirs.accept(),
+            connector.connect(theirs.bind_addr(), Transports::Utp)
+        );
+        accepted.unwrap();
+        let (kind, _r, _w) = connected.unwrap();
+        assert!(matches!(kind, ConnectionKind::Utp));
+        assert_eq!(tcp_attempts(&connector), 0);
+        assert_eq!(connector.stats().utp.snapshot().v4.successes, 1);
+    }
+
+    // Without uTP there is no way to a peer that may be reached over uTP
+    // alone: nothing is dialed.
+    #[tokio::test]
+    async fn a_utp_only_connection_without_utp_dials_nothing() {
+        let connector = connector(false).await;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let res = connector
+            .connect(listener.local_addr().unwrap(), Transports::Utp)
+            .await;
+        assert!(matches!(res, Err(Error::ConnectDisabled)));
+        assert_eq!(tcp_attempts(&connector), 0);
     }
 }

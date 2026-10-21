@@ -29,7 +29,7 @@ use crate::tracker::tracker_comms_http::TrackerRequestEvent;
 
 pub(crate) const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
-// const ACTION_SCRAPE: u32 = 2;
+const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
 
 pub const EVENT_NONE: u32 = 0;
@@ -74,6 +74,8 @@ pub struct AnnounceFields {
 pub enum Request {
     Connect,
     Announce(ConnectionId, AnnounceFields),
+    /// One torrent's counts (BEP 15 scrape, action 2).
+    Scrape(ConnectionId, Id20),
 }
 
 impl Request {
@@ -120,6 +122,12 @@ impl Request {
                 w.extend_from_slice(&fields.num_want.to_be_bytes())?;
                 w.extend_from_slice(&fields.port.to_be_bytes())?;
             }
+            Request::Scrape(connection_id, info_hash) => {
+                w.extend_from_slice(&connection_id.to_be_bytes())?;
+                w.extend_from_slice(&ACTION_SCRAPE.to_be_bytes())?;
+                w.extend_from_slice(&transaction_id.to_be_bytes())?;
+                w.extend_from_slice(&info_hash.0)?;
+            }
         }
         Ok(w.offset)
     }
@@ -133,10 +141,19 @@ pub struct AnnounceResponse {
     pub addrs: Vec<SocketAddr>,
 }
 
+/// A torrent's counts, as a scrape reply gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrapeResponse {
+    pub complete: u32,
+    pub downloaded: u32,
+    pub incomplete: u32,
+}
+
 #[derive(Debug)]
 pub enum Response {
     Connect(ConnectionId),
     Announce(AnnounceResponse),
+    Scrape(ScrapeResponse),
     #[allow(dead_code)]
     Error(String),
     Unknown,
@@ -247,6 +264,18 @@ impl Response {
                     seeders,
                     addrs,
                 })
+            }
+            ACTION_SCRAPE => {
+                // The first torrent's counts; a tracker that adds more past
+                // them is not refused (libtorrent `on_scrape_response`).
+                let (complete, b) = u32::parse_num(buf).context("can't parse complete")?;
+                let (downloaded, b) = u32::parse_num(b).context("can't parse downloaded")?;
+                let (incomplete, _) = u32::parse_num(b).context("can't parse incomplete")?;
+                return Ok(Response::Scrape(ScrapeResponse {
+                    complete,
+                    downloaded,
+                    incomplete,
+                }));
             }
             ACTION_ERROR => {
                 let msg = CStr::from_bytes_with_nul(buf)
@@ -512,6 +541,22 @@ impl UdpTrackerClient {
             other => bail!("unexpected response {other:?}, expected announce"),
         }
     }
+
+    /// The tracker's counts for `info_hash` (BEP 15 scrape).
+    pub async fn scrape(
+        &self,
+        tracker: SocketAddr,
+        info_hash: Id20,
+    ) -> anyhow::Result<ScrapeResponse> {
+        let connection_id = self.get_connection_id(tracker).await?;
+        let response = self
+            .request(tracker, Request::Scrape(connection_id, info_hash))
+            .await?;
+        match response {
+            Response::Scrape(r) => Ok(r),
+            other => bail!("unexpected response {other:?}, expected scrape"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -528,7 +573,7 @@ mod tests {
 
     use crate::tracker::tracker_comms_udp::{
         ACTION_CONNECT, AnnounceFields, CONNECTION_ID_MAGIC, EVENT_NONE, Request, Response,
-        UdpTrackerClient, new_transaction_id,
+        ScrapeResponse, UdpTrackerClient, new_transaction_id,
     };
 
     #[tokio::test]
@@ -603,6 +648,110 @@ mod tests {
             // Then ip, key, num_want and port.
             assert_eq!(buf[92..96], 7u32.to_be_bytes());
         }
+    }
+
+    #[test]
+    fn scrape_request_and_reply_follow_bep_15() {
+        let mut buf = [0u8; 64];
+        let len = Request::Scrape(0x0102_0304_0506_0708, Id20::new([9; 20]))
+            .serialize(0x1112_1314, &mut buf)
+            .unwrap();
+        // connection id, action 2, transaction id, then the info hash.
+        assert_eq!(len, 36);
+        assert_eq!(buf[..8], 0x0102_0304_0506_0708u64.to_be_bytes());
+        assert_eq!(buf[8..12], 2u32.to_be_bytes());
+        assert_eq!(buf[12..16], 0x1112_1314u32.to_be_bytes());
+        assert_eq!(buf[16..36], [9; 20]);
+
+        // complete, downloaded, incomplete; a second torrent's counts past
+        // them are not refused (libtorrent `on_scrape_response`).
+        let reply = scrape_reply(&5u32.to_be_bytes(), [4, 9, 6]);
+        for reply in [reply.clone(), [reply, vec![0; 12]].concat()] {
+            let (tid, response) = Response::parse(&reply, false).unwrap();
+            assert_eq!(tid, 5);
+            match response {
+                Response::Scrape(r) => assert_eq!(
+                    r,
+                    ScrapeResponse {
+                        complete: 4,
+                        downloaded: 9,
+                        incomplete: 6,
+                    }
+                ),
+                other => panic!("unexpected response {other:?}"),
+            }
+        }
+
+        // Fewer than three counts is no answer.
+        let short = &scrape_reply(&5u32.to_be_bytes(), [4, 9, 6])[..16];
+        assert!(matches!(
+            Response::parse(short, false).unwrap().1,
+            Response::Unknown
+        ));
+    }
+
+    fn scrape_reply(tid: &[u8], [complete, downloaded, incomplete]: [u32; 3]) -> Vec<u8> {
+        let mut b = super::ACTION_SCRAPE.to_be_bytes().to_vec();
+        b.extend_from_slice(tid);
+        for n in [complete, downloaded, incomplete] {
+            b.extend_from_slice(&n.to_be_bytes());
+        }
+        b
+    }
+
+    #[tokio::test]
+    async fn scrape_connects_then_asks_for_the_torrents_counts() {
+        let tracker_addr: SocketAddr = "192.0.2.1:6969".parse().unwrap();
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        let client = UdpTrackerClient::new_with_socket(
+            token.clone(),
+            Arc::new(FakeSocket {
+                sent: sent_tx,
+                replies: parking_lot::Mutex::new(reply_rx),
+            }),
+            None,
+        );
+
+        let tracker = async move {
+            let mut actions = Vec::new();
+            while let Some((request, to)) = sent_rx.recv().await {
+                assert_eq!(to, tracker_addr);
+                let tid = &request[12..16];
+                let action = u32::from_be_bytes(request[8..12].try_into().unwrap());
+                actions.push(action);
+                let reply = if action == ACTION_CONNECT {
+                    let mut b = ACTION_CONNECT.to_be_bytes().to_vec();
+                    b.extend_from_slice(tid);
+                    b.extend_from_slice(&7u64.to_be_bytes());
+                    b
+                } else {
+                    assert_eq!(request[..8], 7u64.to_be_bytes());
+                    assert_eq!(request[16..36], [1; 20]);
+                    scrape_reply(tid, [3, 8, 2])
+                };
+                reply_tx.send((reply, to)).unwrap();
+            }
+            actions
+        };
+        let tracker = tokio::spawn(tracker);
+
+        let r = client
+            .scrape(tracker_addr, Id20::new([1; 20]))
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            ScrapeResponse {
+                complete: 3,
+                downloaded: 8,
+                incomplete: 2,
+            }
+        );
+        token.cancel();
+        drop(client);
+        assert_eq!(tracker.await.unwrap(), vec![ACTION_CONNECT, 2]);
     }
 
     #[test]

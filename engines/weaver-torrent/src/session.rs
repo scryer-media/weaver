@@ -9,7 +9,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{
@@ -26,15 +26,28 @@ use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
+    net::{HttpClients, Resolver, SystemResolver},
     spawn_utils::spawn_with_cancel,
-    torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info},
+    torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
 };
 use crate::dht::{
     Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr,
 };
 use crate::lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
+use crate::natpmp::{NATPMP_PORT, NatPmpMapper};
 use crate::peer_protocol::Handshake;
-use crate::tracker::{StoppedAnnounces, TrackerComms, UdpTrackerClient};
+use crate::torrent_state::live::{
+    choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
+    web_seed::WebSeeds,
+};
+use crate::tracker::{
+    AnnounceIps, AutoScrape, ListenPort, Reachable, StoppedAnnounces, TrackerComms,
+    UdpTrackerClient, Unreachable,
+};
+use crate::upnp::{
+    PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, UpnpPortForwarder,
+    UpnpPortForwarderOptions,
+};
 use crate::{
     ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
     api::TorrentIdOrHash,
@@ -61,7 +74,7 @@ use crate::{
     stream_connect::{ConnectionKind, ConnectionOptions, StreamConnector, StreamConnectorArgs},
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        RunCounters, TorrentMetadata, TorrentStateLive,
+        TorrentMetadata, TorrentStateLive,
         initializing::{TorrentStateInitializing, normalize_initial_have},
     },
     type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerStream},
@@ -89,6 +102,15 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
 
+// How often the session turns peers over (libtorrent
+// `peer_turnover_interval`), and when it first does after it starts
+// (`session_impl::m_disconnect_time_scaler`).
+const PEER_TURNOVER_INTERVAL: Duration = Duration::from_secs(300);
+const FIRST_PEER_TURNOVER: Duration = Duration::from_secs(90);
+// The share of a connection cap, in percent, at which peers are turned over
+// (libtorrent `peer_turnover_cutoff`).
+const PEER_TURNOVER_CUTOFF: usize = 90;
+
 struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
     torrent_bytes: Bytes,
@@ -109,12 +131,108 @@ fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
 #[derive(Default)]
 pub struct SessionDatabase {
     torrents: HashMap<TorrentId, ManagedTorrentHandle>,
+    // Rings as a torrent is added: a magnet's torrent enters the session
+    // once its metadata is received.
+    added: Arc<Notify>,
 }
 
 impl SessionDatabase {
     fn add_torrent(&mut self, torrent: ManagedTorrentHandle, id: TorrentId) {
         self.torrents.insert(id, torrent);
+        self.added.notify_waiters();
     }
+}
+
+/// The port the session announces (libtorrent `listen_socket_t::
+/// tcp_external_port`): the TCP port a mapper got on the gateway, NAT-PMP's
+/// before UPnP's, else the configured one. Announces subscribe to it and
+/// read it as they go out, so a mapping that lands after a torrent starts
+/// is announced by that torrent.
+struct AnnouncePort {
+    configured: Option<u16>,
+    mapped: parking_lot::Mutex<MappedPorts>,
+    port: tokio::sync::watch::Sender<Option<u16>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MappedPorts {
+    natpmp: Option<u16>,
+    upnp: Option<u16>,
+}
+
+impl AnnouncePort {
+    fn new(configured: Option<u16>) -> Self {
+        Self {
+            configured,
+            mapped: Default::default(),
+            port: tokio::sync::watch::channel(configured).0,
+        }
+    }
+
+    fn get(&self) -> Option<u16> {
+        *self.port.borrow()
+    }
+
+    fn subscribe(&self) -> ListenPort {
+        self.port.subscribe()
+    }
+
+    /// libtorrent `session_impl::on_port_mapping`: a mapper's TCP report,
+    /// a failure included, sets that mapper's port.
+    fn on_port_mapping(&self, event: &PortMapped) {
+        if event.protocol != PortmapProtocol::Tcp {
+            return;
+        }
+        let mut mapped = self.mapped.lock();
+        let port = match event.transport {
+            PortmapTransport::NatPmp => &mut mapped.natpmp,
+            PortmapTransport::Upnp => &mut mapped.upnp,
+        };
+        *port = event.external_port;
+        let announced = self
+            .configured
+            .map(|configured| mapped.natpmp.or(mapped.upnp).unwrap_or(configured));
+        self.port.send_if_modified(|port| {
+            let changed = *port != announced;
+            *port = announced;
+            changed
+        });
+    }
+}
+
+/// The peers the DHT finds for `info_hash`, announcing `port` to the nodes
+/// closest to it. The DHT search reads the port when it starts, so a new
+/// port starts a new search, which announces it (libtorrent
+/// `torrent::dht_announce` reads the port at each announce).
+fn dht_peers(dht: Dht, info_hash: Id20, mut port: ListenPort) -> BoxStream<'static, SocketAddr> {
+    async_stream::stream! {
+        loop {
+            let mut peers = dht.get_peers(info_hash, *port.borrow_and_update());
+            loop {
+                tokio::select! {
+                    peer = peers.next() => match peer {
+                        Some(peer) => yield peer,
+                        None => return,
+                    },
+                    Ok(()) = port.changed() => break,
+                }
+            }
+        }
+    }
+    .boxed()
+}
+
+/// The protocols to map: those the session listens on (libtorrent
+/// `session_impl::remap_ports` maps a socket only once it is open).
+fn listening_protocols(listen: &crate::listen::ListenResult) -> Vec<PortmapProtocol> {
+    [
+        (listen.tcp_socket.is_some() || listen.custom_tcp_socket.is_some())
+            .then_some(PortmapProtocol::Tcp),
+        listen.utp_socket.is_some().then_some(PortmapProtocol::Udp),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 pub struct Session {
@@ -127,14 +245,23 @@ pub struct Session {
     // Network
     // The DHT's, and every torrent's that names none of its own.
     identity: Identity,
-    announce_port: Option<u16>,
+    announce_port: Arc<AnnouncePort>,
     listen_addr: Option<SocketAddr>,
+    // Our own addresses a private torrent's HTTP announces name.
+    own_ips: AnnounceIps,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
-    reqwest_client: reqwest::Client,
+    pub(crate) reqwest_client: reqwest::Client,
+    // Builds the clients web seeds are asked through, each held to the
+    // address its request was checked at.
+    pub(crate) http_clients: Arc<dyn HttpClients>,
+    // Resolves web seeds' host names, so their addresses are known before
+    // they are asked: the socket factory's resolver, or the host's.
+    pub(crate) resolver: Arc<dyn Resolver>,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
     stopped_announces: StoppedAnnounces,
+    auto_scrape: AutoScrape,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -154,6 +281,7 @@ pub struct Session {
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub(crate) connection_slots: Arc<ConnectionSlots>,
+    pub(crate) allow_multiple_connections_per_ip: bool,
     pub ratelimits: Limits,
 
     pub blocklist: IpRanges,
@@ -166,7 +294,67 @@ pub struct Session {
     // Feature flags
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
-    pub(crate) unchoke_slots_limit: usize,
+    // Hands out the session's upload slots to the peers of every torrent.
+    pub(crate) choker: Arc<Choker>,
+    pub(crate) disable_pex: bool,
+    // Whether the session listens on uTP, and so connects over it.
+    pub(crate) utp: bool,
+}
+
+/// Our own addresses as an announce names them (BEP 7 `ipv4=`/`ipv6=`),
+/// read when each announce goes out: the listen address, or for one that
+/// is unspecified, the addresses of the host's interfaces of the families
+/// it accepts (libtorrent `expand_unspecified_address`, re-run as the
+/// interfaces change), each neither local nor loopback
+/// (`torrent::build_tracker_request`). A listener of a socket factory
+/// stands where libtorrent's proxy listen socket does: unspecified, it is
+/// never expanded, since the host's interfaces are not where peers reach
+/// it.
+fn own_ips(listen: Option<SocketAddr>, socket_factory: bool) -> AnnounceIps {
+    let Some(listen) = listen else {
+        return Arc::new(Vec::new);
+    };
+    if !listen.ip().is_unspecified() || socket_factory {
+        let ips = announced_ips(listen.ip(), std::iter::empty());
+        return Arc::new(move || ips.clone());
+    }
+    Arc::new(move || {
+        use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+        let interfaces = match NetworkInterface::show() {
+            Ok(nics) => nics,
+            Err(e) => {
+                debug!("error listing network interfaces: {e:#}");
+                Vec::new()
+            }
+        };
+        announced_ips(
+            listen.ip(),
+            interfaces
+                .iter()
+                .flat_map(|nic| nic.addr.iter().map(|a| a.ip())),
+        )
+    })
+}
+
+/// The addresses of `listen`, or for one that is unspecified, of the
+/// `interfaces` of the families it accepts (an IPv6 one is dual-stack), that
+/// an announce may name: neither unspecified, local nor loopback.
+fn announced_ips(listen: IpAddr, interfaces: impl Iterator<Item = IpAddr>) -> Vec<IpAddr> {
+    use crate::torrent_state::live::peers::holepunch::is_local;
+    let ips: Vec<IpAddr> = if listen.is_unspecified() {
+        interfaces
+            .filter(|ip| listen.is_ipv6() || ip.is_ipv4())
+            .collect()
+    } else {
+        vec![listen]
+    };
+    let mut named = Vec::new();
+    for ip in ips.into_iter().map(|ip| ip.to_canonical()) {
+        if !ip.is_unspecified() && !ip.is_loopback() && !is_local(ip) && !named.contains(&ip) {
+            named.push(ip);
+        }
+    }
+    named
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -303,6 +491,11 @@ pub struct AddTorrentOptions {
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
+    /// Web seeds beside those the torrent names; a magnet link's `ws` join
+    /// them (libtorrent `add_torrent_params::url_seeds`).
+    #[serde(default)]
+    pub web_seeds: Vec<WebSeed>,
+
     /// Max concurrent connected peers.
     pub peer_limit: Option<usize>,
 
@@ -344,6 +537,12 @@ pub struct AddTorrentOptions {
     /// twice is a cost Weaver does not pay.
     #[serde(default = "v1_hashes_disabled_by_default")]
     pub disable_v1_hashes: bool,
+    /// Super-seed (BEP 16) while the torrent is a seed: peers are told of
+    /// no piece but the one each is handed, the rarest it lacks, and a peer
+    /// is handed the next once another peer reports the piece (libtorrent
+    /// `torrent_flags::super_seeding`). Off by default.
+    #[serde(default)]
+    pub super_seeding: bool,
 }
 
 const fn v1_hashes_disabled_by_default() -> bool {
@@ -365,6 +564,7 @@ impl Default for AddTorrentOptions {
             disable_trackers: false,
             ratelimits: LimitsConfig::default(),
             initial_peers: None,
+            web_seeds: Vec::new(),
             peer_limit: None,
             preferred_id: None,
             storage_factory: None,
@@ -373,6 +573,7 @@ impl Default for AddTorrentOptions {
             piece_priorities: None,
             identity: None,
             disable_v1_hashes: v1_hashes_disabled_by_default(),
+            super_seeding: false,
         }
     }
 }
@@ -573,9 +774,9 @@ pub struct SessionOptions {
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
 
-    /// Peers each torrent uploads to at once, one in five of them and at least
-    /// one on optimistic slots (libtorrent `unchoke_slots_limit`). Defaults
-    /// to 8.
+    /// Peers the session uploads to at once, over all its torrents, one in
+    /// five of them and at least one on optimistic slots (libtorrent
+    /// `unchoke_slots_limit`). Defaults to 8.
     pub unchoke_slots_limit: usize,
 
     /// Peer connections, incoming and outgoing, the session holds open at
@@ -591,6 +792,10 @@ pub struct SessionOptions {
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
 
+    /// Leave peer exchange (ut_pex) out: it is not advertised to peers, and
+    /// none is sent or read, as in libtorrent without the ut_pex plugin.
+    pub disable_pex: bool,
+
     /// Force IPv4 only.
     pub ipv4_only: bool,
 
@@ -598,18 +803,27 @@ pub struct SessionOptions {
     /// sockets. See [`SocketFactory`] for what it covers.
     pub socket_factory: Option<Arc<dyn SocketFactory>>,
 
-    /// Use this HTTP client (HTTP trackers, torrent, blocklist and allowlist
-    /// downloads) instead of building one. When set, `bind_device_name` and the identity's User-Agent do not apply to HTTP
-    /// requests; configure them on the client.
+    /// Build the HTTP clients with this instead of the session's own builder.
+    /// Its client for no target asks HTTP trackers and downloads torrents and
+    /// the block and allow lists; a web seed is asked through a client for
+    /// the address the session checked its host at. When set,
+    /// `bind_device_name` and the identity's User-Agent do not apply to HTTP
+    /// requests; configure them on the clients.
     ///
-    /// The client also does its own DNS lookups: [`SocketFactory::resolver`]
-    /// does not apply to it. If HTTP hostname lookups must be routed too, build
-    /// the client with its own resolver (`reqwest::ClientBuilder::dns_resolver`).
-    pub http_client: Option<reqwest::Client>,
+    /// The client for no target does its own DNS lookups:
+    /// [`SocketFactory::resolver`] does not apply to it. If HTTP hostname
+    /// lookups must be routed too, build it with its own resolver
+    /// (`reqwest::ClientBuilder::dns_resolver`).
+    pub http_client: Option<Arc<dyn HttpClients>>,
 
     /// Message stream encryption for peer connections, outgoing and incoming.
     /// Defaults to [`EncryptionPolicy::Disabled`](crate::EncryptionPolicy::Disabled).
     pub encryption: crate::mse::EncryptionPolicy,
+
+    /// Whether peers at one address may each hold a connection to a torrent
+    /// (libtorrent `allow_multiple_connections_per_ip`). Off by default: one
+    /// connection per address.
+    pub allow_multiple_connections_per_ip: bool,
 }
 
 impl Default for SessionOptions {
@@ -638,10 +852,12 @@ impl Default for SessionOptions {
             connections_limit: DEFAULT_CONNECTIONS_LIMIT,
             connection_speed: DEFAULT_CONNECTION_SPEED,
             disable_local_service_discovery: false,
+            disable_pex: false,
             ipv4_only: false,
             socket_factory: None,
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
+            allow_multiple_connections_per_ip: false,
         }
     }
 }
@@ -757,6 +973,11 @@ impl Session {
 
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    /// The cadence paused torrents scrape their trackers on.
+    pub(crate) fn auto_scrape(&self) -> &AutoScrape {
+        &self.auto_scrape
     }
 
     /// Create a new session with options.
@@ -897,21 +1118,25 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let reqwest_client = if let Some(client) = opts.http_client.take() {
-                client
-            } else {
-                #[allow(unused_mut)]
-                let mut builder = reqwest::Client::builder();
-                #[cfg(not(windows))]
-                if let Some(bd) = opts.bind_device_name.as_ref() {
-                    builder = builder.interface(bd);
+            let http_clients: Arc<dyn HttpClients> = match opts.http_client.take() {
+                Some(clients) => clients,
+                None => {
+                    let user_agent = identity.user_agent.clone();
+                    let bind_device = opts.bind_device_name.clone();
+                    Arc::new(move || {
+                        #[allow(unused_mut)]
+                        let mut builder = reqwest::Client::builder().user_agent(&user_agent);
+                        #[cfg(not(windows))]
+                        if let Some(bd) = bind_device.as_ref() {
+                            builder = builder.interface(bd);
+                        }
+                        builder
+                    })
                 }
-
-                builder
-                    .user_agent(&identity.user_agent)
-                    .build()
-                    .context("error building HTTP(S) client")?
             };
+            let reqwest_client = http_clients
+                .client(None)
+                .context("error building HTTP(S) client")?;
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
@@ -994,10 +1219,25 @@ impl Session {
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
                 tasks,
-                announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
+                announce_port: Arc::new(AnnouncePort::new(
+                    listen_result.as_ref().and_then(|l| l.announce_port),
+                )),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
+                own_ips: own_ips(
+                    listen_result.as_ref().map(|l| l.addr),
+                    opts.socket_factory.is_some(),
+                ),
+                utp: listen_result
+                    .as_ref()
+                    .is_some_and(|l| l.utp_socket.is_some()),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
+                http_clients,
+                resolver: opts
+                    .socket_factory
+                    .as_ref()
+                    .and_then(|f| f.resolver())
+                    .unwrap_or_else(|| Arc::new(SystemResolver)),
                 connector: stream_connector,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),
@@ -1017,14 +1257,18 @@ impl Session {
                     opts.tracker_stopped_timeout
                         .unwrap_or(StoppedAnnounces::DEFAULT_TIMEOUT),
                 ),
+                auto_scrape: AutoScrape::default(),
                 peer_limit: opts.peer_limit,
-                unchoke_slots_limit: opts.unchoke_slots_limit,
+                choker: Arc::new(Choker::new(opts.unchoke_slots_limit)),
+                disable_pex: opts.disable_pex,
+                allow_multiple_connections_per_ip: opts.allow_multiple_connections_per_ip,
                 blocklist,
                 allowlist,
                 lsd,
             });
 
             if let Some(mut listen) = listen_result {
+                let protocols = listening_protocols(&listen);
                 if let Some(tcp) = listen.tcp_socket.take() {
                     let max_pending_incoming_handshake_checks =
                         listen.max_pending_incoming_handshake_checks;
@@ -1073,12 +1317,18 @@ impl Session {
                 if listen.enable_upnp_port_forwarding
                     && let Some(announce_port) = listen.announce_port
                 {
-                    info!(port = announce_port, "starting UPnP port forwarder");
-                    let bind_device = bind_device.clone();
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
-                        "upnp_forward",
-                        Self::task_upnp_port_forwarder(announce_port, bind_device),
+                    let requests = protocols
+                        .into_iter()
+                        .map(|protocol| PortMapRequest {
+                            protocol,
+                            local_port: listen.addr.port(),
+                            external_port: announce_port,
+                        })
+                        .collect();
+                    session.start_port_mapping(
+                        requests,
+                        bind_device.clone(),
+                        opts.bind_device_name.as_deref(),
                     );
                 }
             }
@@ -1120,6 +1370,8 @@ impl Session {
             }
 
             session.start_speed_estimator_updater();
+            session.start_peer_turnover();
+            session.start_choker();
 
             Ok(session)
         }
@@ -1133,25 +1385,20 @@ impl Session {
         mut reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
-        let rwtimeout = self
-            .peer_opts
-            .read_write_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
+        let handshake_timeout = self.peer_opts.handshake_timeout();
 
-        let incoming_ip = addr.ip();
-        if self.blocklist.has(incoming_ip) {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is in blocklist");
-        }
-        if self.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is not in allowlist");
+        // The session's one address rule, whichever direction the connection
+        // goes (libtorrent `session_impl::incoming_connection` refuses a
+        // filtered endpoint with `peer_blocked_alert::ip_filter`; it never
+        // sees one of a family it has no listen socket for).
+        if let Err(why) = self.may_reach(addr.ip()) {
+            if why == Unreachable::Filtered {
+                self.stats
+                    .counters
+                    .blocked_incoming
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            bail!("incoming connection refused: {} is {why}", addr.ip());
         }
 
         // With encryption enabled, an encrypted connection is unwrapped here
@@ -1162,7 +1409,7 @@ impl Session {
             self.connector.encryption(),
             &mut reader,
             &mut writer,
-            rwtimeout,
+            handshake_timeout,
             || {
                 self.db
                     .read()
@@ -1177,7 +1424,7 @@ impl Session {
 
         let mut read_buf = ReadBuf::new();
         let h = read_buf
-            .read_handshake(&mut reader, rwtimeout)
+            .read_handshake(&mut reader, handshake_timeout)
             .await
             .context("error reading handshake")?;
         trace!("received handshake from {addr}: {:?}", h);
@@ -1264,12 +1511,66 @@ impl Session {
         }
     }
 
-    async fn task_upnp_port_forwarder(
-        port: u16,
+    /// Keep the listen port mapped on the gateway over UPnP and over PCP /
+    /// NAT-PMP at once (libtorrent `session_impl::start_upnp` and
+    /// `start_natpmp`), and announce the TCP port a mapper got
+    /// (`on_port_mapping`).
+    fn start_port_mapping(
+        &self,
+        requests: Vec<PortMapRequest>,
         bind_device: Option<BindDevice>,
-    ) -> anyhow::Result<()> {
-        let pf = crate::upnp::UpnpPortForwarder::new(vec![port], None, bind_device)?;
-        pf.run_forever().await
+        bind_device_name: Option<&str>,
+    ) {
+        info!(?requests, "starting UPnP and NAT-PMP / PCP port mapping");
+        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let upnp_opts = UpnpPortForwarderOptions {
+            description: self.identity.user_agent.clone(),
+            ..Default::default()
+        };
+        match UpnpPortForwarder::new(requests.clone(), Some(upnp_opts), bind_device) {
+            Ok(upnp) => self.spawn_port_mapper(
+                "upnp_forward",
+                upnp.run(self.cancellation_token.clone(), events_tx.clone()),
+            ),
+            Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
+        }
+        match crate::natpmp::default_gateway(bind_device_name) {
+            Ok(gateway) => {
+                let mapper = NatPmpMapper::new((gateway, NATPMP_PORT).into(), requests, None);
+                self.spawn_port_mapper(
+                    "natpmp_forward",
+                    mapper.run(self.cancellation_token.clone(), events_tx),
+                );
+            }
+            Err(e) => debug!("no gateway for NAT-PMP / PCP: {e:#}"),
+        }
+        let announce_port = self.announce_port.clone();
+        self.spawn_port_mapper("port_mapping", async move {
+            while let Some(event) = events.recv().await {
+                match &event.error {
+                    None => info!(?event, "port mapping"),
+                    Some(error) => {
+                        warn!(?event.transport, ?event.protocol, "port mapping failed: {error}")
+                    }
+                }
+                announce_port.on_port_mapping(&event);
+            }
+            Ok(())
+        });
+    }
+
+    /// A mapper watches the session's token itself and removes its mappings
+    /// on the way out, so it is not dropped on cancel; `stop` waits for it.
+    fn spawn_port_mapper(
+        &self,
+        name: &'static str,
+        fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) {
+        crate::core::spawn_utils::spawn(
+            debug_span!(parent: self.rs(), "port_mapping", task = name),
+            name,
+            self.tasks.track_future(fut),
+        );
     }
 
     pub fn get_dht(&self) -> Option<&Dht> {
@@ -1289,6 +1590,7 @@ impl Session {
             keep_alive_interval: other
                 .keep_alive_interval
                 .or(self.peer_opts.keep_alive_interval),
+            handshake_timeout: other.handshake_timeout.or(self.peer_opts.handshake_timeout),
             max_request_window: other
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
@@ -1342,6 +1644,110 @@ impl Session {
         self.tasks.wait().await;
     }
 
+    fn start_peer_turnover(self: &Arc<Self>) {
+        let session = Arc::downgrade(self);
+        self.spawn(
+            debug_span!(parent: self.rs(), "peer_turnover"),
+            "peer_turnover",
+            async move {
+                let mut tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + FIRST_PEER_TURNOVER,
+                    PEER_TURNOVER_INTERVAL,
+                );
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    session
+                        .upgrade()
+                        .context("session is dead")?
+                        .turn_peers_over();
+                }
+            },
+        )
+    }
+
+    // Hands the upload slots out every UNCHOKE_INTERVAL and passes the
+    // optimistic ones on every OPTIMISTIC_UNCHOKE_INTERVAL, each at once when
+    // the choker asks for it sooner, over every live torrent's peers at once
+    // (libtorrent `session_impl::second_tick`). When both fall due the
+    // optimistic slots pass first, so the round sees their new holders.
+    fn start_choker(self: &Arc<Self>) {
+        let session = Arc::downgrade(self);
+        let choker = self.choker.clone();
+        self.spawn(
+            debug_span!(parent: self.rs(), "choker"),
+            "choker",
+            async move {
+                let first = tokio::time::Instant::now() + UNCHOKE_INTERVAL;
+                let mut rounds = tokio::time::interval_at(first, UNCHOKE_INTERVAL);
+                let mut rotations = tokio::time::interval_at(first, OPTIMISTIC_UNCHOKE_INTERVAL);
+                loop {
+                    let rotate = tokio::select! {
+                        biased;
+                        _ = rotations.tick() => true,
+                        _ = choker.rotation_requested() => {
+                            rotations.reset();
+                            true
+                        }
+                        _ = choker.reshuffle_requested() => {
+                            rounds.reset();
+                            false
+                        }
+                        _ = rounds.tick() => false,
+                    };
+                    let torrents = session
+                        .upgrade()
+                        .context("session is dead")?
+                        .live_torrents();
+                    let now = tokio::time::Instant::now();
+                    if rotate {
+                        choker.rotate_optimistic(&torrents, now);
+                    } else {
+                        choker.recalculate(&torrents, now);
+                    }
+                }
+            },
+        )
+    }
+
+    // The peer at `addr` of `torrent` said it is interested: it takes one of
+    // the session's upload slots when one is free.
+    pub(crate) fn peer_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
+        self.choker.peer_interested(torrent, addr);
+    }
+
+    // The torrents that are live, so whose peers the session uploads to and
+    // turns over.
+    fn live_torrents(&self) -> Vec<Arc<TorrentStateLive>> {
+        self.with_torrents(|torrents| torrents.filter_map(|(_, t)| t.live()).collect())
+    }
+
+    // Makes room for connect candidates when connections run short
+    // (libtorrent `session_impl::second_tick`). When the session holds
+    // PEER_TURNOVER_CUTOFF percent of its cap, the torrent with the most
+    // connections turns some over; otherwise each torrent holding that share
+    // of its own cap does. Under a cap of 6 it would be too disruptive, and
+    // nothing is turned over.
+    pub(crate) fn turn_peers_over(&self) {
+        let limit = self.connection_slots.limit();
+        if limit < 6 {
+            return;
+        }
+        let torrents = self.live_torrents();
+        if self.connection_slots.in_use() >= limit * PEER_TURNOVER_CUTOFF / 100 {
+            if let Some(most) = torrents.iter().max_by_key(|t| t.connections().0) {
+                most.turn_peers_over();
+            }
+            return;
+        }
+        for torrent in &torrents {
+            let (held, max) = torrent.connections();
+            if max >= 6 && held >= max * PEER_TURNOVER_CUTOFF / 100 {
+                torrent.turn_peers_over();
+            }
+        }
+    }
+
     /// Run a callback given the currently managed torrents.
     pub fn with_torrents<R>(
         &self,
@@ -1365,6 +1771,16 @@ impl Session {
                 {
                     let magnet = Magnet::parse(&magnet)
                         .context("provided path is not a valid magnet URL")?;
+                    // The link's peers join those the caller named
+                    // (libtorrent `add_torrent_params::peers`).
+                    opts.initial_peers
+                        .get_or_insert_default()
+                        .extend(magnet.peers.iter().copied());
+                    opts.web_seeds
+                        .extend(magnet.web_seeds.iter().map(|url| WebSeed {
+                            url: url.clone(),
+                            kind: WebSeedKind::Url,
+                        }));
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
                         if opts.only_files.is_none() {
@@ -1653,15 +2069,14 @@ impl Session {
                 storage_factory,
                 options: ManagedTorrentOptions {
                     force_tracker_interval: opts.force_tracker_interval,
-                    peer_connect_timeout: peer_opts.connect_timeout,
-                    peer_read_write_timeout: peer_opts.read_write_timeout,
-                    peer_max_request_window: peer_opts.max_request_window,
+                    peer_opts,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: Limits::new(opts.ratelimits),
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_v1_hashes: opts.disable_v1_hashes,
+                    super_seeding: opts.super_seeding,
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
@@ -1669,6 +2084,7 @@ impl Session {
                 client_name_and_version: identity.version.clone(),
                 user_agent: identity.user_agent.clone(),
                 last_run: Default::default(),
+                web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
             });
 
             let initializing = Arc::new(TorrentStateInitializing::new(
@@ -1688,6 +2104,7 @@ impl Session {
                     only_files,
                     piece_priorities,
                     trackers: None,
+                    auto_scrape: None,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,
@@ -1858,6 +2275,33 @@ impl Session {
         merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), is_private)
     }
 
+    /// Whether the session may reach `ip`, whoever is there: a peer, a web
+    /// seed, or a tracker at any hop. It must be of a family the session
+    /// connects over, as an IPv4-only session reaches no IPv6 address
+    /// (libtorrent `listen_socket_t::can_route`, which
+    /// `http_tracker_connection::on_filter` and
+    /// `udp_tracker_connection::name_lookup` apply first), and the IP filter,
+    /// the blocklist and the allowlist, must let it through (libtorrent's one
+    /// `ip_filter`: `torrent::add_peer` applies it to a peer,
+    /// `torrent::connect_web_seed` to a web seed, and the two tracker
+    /// functions to a tracker).
+    pub(crate) fn may_reach(&self, ip: IpAddr) -> Result<(), Unreachable> {
+        if self.ipv4_only && ip.is_ipv6() {
+            return Err(Unreachable::Family);
+        }
+        if self.blocklist.has(ip) || self.allowlist.as_ref().is_some_and(|l| !l.has(ip)) {
+            return Err(Unreachable::Filtered);
+        }
+        Ok(())
+    }
+
+    /// [`Session::may_reach`] for the tracker task, which already holds the
+    /// session (its counters).
+    fn reachable(self: &Arc<Self>) -> Reachable {
+        let session = self.clone();
+        Arc::new(move |ip| session.may_reach(ip))
+    }
+
     // Get a peer stream from both DHT and trackers, under every hash the
     // torrent goes by (libtorrent `torrent::dht_announce`, `lsd_announce`
     // and `announce_with_tracker` each loop over `info_hash_t::for_each`).
@@ -1876,8 +2320,15 @@ impl Session {
         } else {
             self.dht.as_ref().map(|dht| {
                 futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                    dht.get_peers(info_hash, if announce { self.announce_port } else { None })
-                        .boxed()
+                    dht_peers(
+                        dht.clone(),
+                        info_hash,
+                        if announce {
+                            self.announce_port.subscribe()
+                        } else {
+                            tokio::sync::watch::channel(None).1
+                        },
+                    )
                 }))
             })
         };
@@ -1887,8 +2338,16 @@ impl Session {
         } else {
             self.lsd.as_ref().map(|lsd| {
                 futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                    lsd.announce(info_hash, if announce { self.announce_port } else { None })
-                        .boxed()
+                    lsd.announce(
+                        info_hash,
+                        // Local peers reach the listen port itself.
+                        if announce {
+                            self.announce_port.configured
+                        } else {
+                            None
+                        },
+                    )
+                    .boxed()
                 }))
             })
         };
@@ -1904,8 +2363,16 @@ impl Session {
             self.announce_tiers(tracker_tiers, is_private),
             Box::new(tracker_rx_stats),
             force_tracker_interval,
-            self.announce_port,
-            self.reqwest_client.clone(),
+            self.announce_port.subscribe(),
+            // Only a private torrent tells its trackers our addresses
+            // (libtorrent `torrent::build_tracker_request`).
+            if is_private {
+                self.own_ips.clone()
+            } else {
+                Arc::new(Vec::new)
+            },
+            self.http_clients.clone(),
+            self.reachable(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
         )
@@ -1974,8 +2441,10 @@ impl Session {
         self.listen_addr
     }
 
+    /// The port peers are told to connect to: the one a mapper got on the
+    /// gateway, else the configured one.
     pub fn announce_port(&self) -> Option<u16> {
-        self.announce_port
+        self.announce_port.get()
     }
 
     async fn resolve_magnet(
@@ -2156,37 +2625,71 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         };
         // The running run's counters; once it has ended (its pieces are gone
         // from the live state) the ones recorded as it ended.
+        let last_run = *mt.shared().last_run.lock();
         let run = live
             .as_ref()
-            .and_then(|l| {
-                Some(RunCounters {
-                    uploaded_bytes: l.get_uploaded_bytes(),
-                    downloaded_bytes: l.get_downloaded_bytes(),
-                    left_bytes: l.get_hns()?.needed_bytes,
-                })
+            .map(|l| {
+                (
+                    l.get_uploaded_bytes(),
+                    l.get_downloaded_bytes(),
+                    l.get_failed_bytes(),
+                    l.get_redundant_bytes(),
+                )
             })
-            .or(*mt.shared().last_run.lock());
+            .or(last_run.map(|r| {
+                (
+                    r.uploaded_bytes,
+                    r.downloaded_bytes,
+                    r.corrupt_bytes,
+                    r.redundant_bytes,
+                )
+            }));
+        let (uploaded, downloaded, corrupt, redundant) = run.unwrap_or_default();
+        // What the whole torrent still lacks, whatever is selected, so a
+        // torrent that has its selected files but not every piece never reads
+        // as a seed (libtorrent `torrent::bytes_left`). Once the pieces are
+        // gone with the torrent, what its run recorded as it ended.
+        let left_bytes = mt
+            .with_chunk_tracker(|c| c.get_lengths().total_length() - c.get_hns().have_bytes)
+            .ok()
+            .or(last_run.map(|r| r.left_bytes));
         crate::tracker::TrackerCommsStats {
-            uploaded_bytes: run.map_or(0, |r| r.uploaded_bytes),
-            downloaded_bytes: run.map_or(0, |r| r.downloaded_bytes),
-            left_bytes: run.map(|r| r.left_bytes),
+            uploaded_bytes: uploaded,
+            downloaded_bytes: downloaded,
+            corrupt_bytes: corrupt,
+            redundant_bytes: redundant,
+            left_bytes,
             torrent_state,
-            finished_during_run: live.is_some_and(|l| l.finished_during_run()),
+            // `completed` is for becoming a seed, not for finishing a
+            // selection (libtorrent `torrent::finished` calls `completed`
+            // only when `is_seed`). A run that began finished had every
+            // selected piece, so one that finished during it began short of
+            // a seed too.
+            finished_during_run: live.is_some_and(|l| l.finished_during_run())
+                && left_bytes == Some(0),
         }
     }
 
     fn wait_until_completed(&self) -> BoxFuture<'_, ()> {
         async move {
+            // A magnet still receiving its metadata isn't in the session
+            // yet: it is looked for again as each torrent is added
+            // (libtorrent waits on `metadata_received_alert`).
+            let added = self.session.db.read().added.clone();
             loop {
+                let mut next_added = std::pin::pin!(added.notified());
+                next_added.as_mut().enable();
                 if let Some(mt) = self.torrent() {
-                    if mt.wait_until_completed().await.is_err() {
-                        // The torrent errored, so it won't complete in this run.
+                    // The torrent finishes its selection; it completes only if
+                    // that makes it a seed. An error, or a selection that
+                    // finished short of a seed, leaves nothing to wait on in
+                    // this run: a later regular announce reads the state.
+                    if mt.wait_until_completed().await.is_err() || !self.get().is_completed() {
                         futures::future::pending::<()>().await;
                     }
                     return;
                 }
-                // A magnet still resolving its metadata isn't in the session yet.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                next_added.await;
             }
         }
         .boxed()
@@ -2218,6 +2721,199 @@ mod tests {
 
     fn bstr(s: &str) -> String {
         format!("{}:{s}", s.len())
+    }
+
+    #[test]
+    fn an_announce_names_the_listeners_addresses_that_are_on_the_internet() {
+        // libtorrent expand_unspecified_address and
+        // torrent::build_tracker_request.
+        use super::{announced_ips, own_ips};
+        use std::net::{IpAddr, SocketAddr};
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let nics = || {
+            [
+                "127.0.0.1",
+                "192.168.1.9",
+                "198.51.100.7",
+                "::1",
+                "fe80::1",
+                "fd00::1",
+                "2001:db8::7",
+                "::ffff:203.0.113.5",
+            ]
+            .into_iter()
+            .map(ip)
+        };
+        // A listener on one address names it, whatever the interfaces.
+        assert_eq!(
+            announced_ips(ip("203.0.113.9"), nics()),
+            [ip("203.0.113.9")]
+        );
+        assert_eq!(announced_ips(ip("10.0.0.2"), nics()), [] as [IpAddr; 0]);
+        assert_eq!(announced_ips(ip("::1"), nics()), [] as [IpAddr; 0]);
+        // Unspecified: the interfaces of its families, neither local nor
+        // loopback; an IPv6 listener takes IPv4 too.
+        assert_eq!(announced_ips(ip("0.0.0.0"), nics()), [ip("198.51.100.7")]);
+        assert_eq!(
+            announced_ips(ip("::"), nics()),
+            [ip("198.51.100.7"), ip("2001:db8::7"), ip("203.0.113.5")]
+        );
+        // A socket factory's unspecified listener is never expanded; no
+        // listener names nothing.
+        let any: SocketAddr = "[::]:6881".parse().unwrap();
+        assert_eq!(own_ips(Some(any), true)(), [] as [IpAddr; 0]);
+        assert_eq!(own_ips(None, false)(), [] as [IpAddr; 0]);
+        let one: SocketAddr = "198.51.100.8:6881".parse().unwrap();
+        assert_eq!(own_ips(Some(one), true)(), [ip("198.51.100.8")]);
+    }
+
+    #[test]
+    fn the_session_announces_the_tcp_port_a_mapper_got_nat_pmp_before_upnp() {
+        use super::AnnouncePort;
+        use crate::upnp::{
+            PortMapped,
+            PortmapProtocol::{Tcp, Udp},
+            PortmapTransport::{NatPmp, Upnp},
+        };
+        let event = |transport, protocol, external_port| PortMapped {
+            transport,
+            protocol,
+            local_port: 6881,
+            external_port,
+            external_ip: None,
+            error: None,
+        };
+        let port = AnnouncePort::new(Some(6881));
+        assert_eq!(port.get(), Some(6881));
+        port.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
+        assert_eq!(port.get(), Some(40001));
+        // Peers connect over TCP; a UDP mapping does not move the port.
+        port.on_port_mapping(&event(Upnp, Udp, Some(40002)));
+        assert_eq!(port.get(), Some(40001));
+        port.on_port_mapping(&event(NatPmp, Tcp, Some(50000)));
+        assert_eq!(port.get(), Some(50000));
+        // A failed or removed mapping hands the port back.
+        port.on_port_mapping(&event(NatPmp, Tcp, None));
+        assert_eq!(port.get(), Some(40001));
+        port.on_port_mapping(&event(Upnp, Tcp, None));
+        assert_eq!(port.get(), Some(6881));
+        // An announce hears of a change of the port, and only of a change.
+        let mut announce = port.subscribe();
+        port.on_port_mapping(&event(Upnp, Udp, Some(40002)));
+        port.on_port_mapping(&event(NatPmp, Tcp, None));
+        assert!(!announce.has_changed().unwrap());
+        port.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
+        assert!(announce.has_changed().unwrap());
+        assert_eq!(*announce.borrow_and_update(), Some(40001));
+        // Nothing to announce stays nothing.
+        let none = AnnouncePort::new(None);
+        none.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
+        assert_eq!(none.get(), None);
+    }
+
+    #[tokio::test]
+    async fn the_dht_announces_a_port_that_changes_while_it_searches() {
+        // libtorrent torrent::dht_announce reads the port at each announce.
+        // A node run by hand on 127.0.0.1 answers ping, find_node and
+        // get_peers, giving a token, and reports each announce_peer port.
+        use crate::bencode::{BencodeValue, ByteBufOwned, dyn_from_bytes};
+        use crate::dht::{DhtConfig, DhtState, Id20};
+        use futures::StreamExt;
+        use std::net::Ipv4Addr;
+        use tokio::net::UdpSocket;
+
+        const NODE_ID: [u8; 20] = [0x42; 20];
+
+        fn get<'a>(v: &'a BencodeValue<ByteBufOwned>, key: &str) -> &'a BencodeValue<ByteBufOwned> {
+            match v {
+                BencodeValue::Dict(d) => &d[&ByteBufOwned::from(key.as_bytes())],
+                _ => panic!("not a dict: {v:?}"),
+            }
+        }
+        fn bytes(v: &BencodeValue<ByteBufOwned>) -> &[u8] {
+            match v {
+                BencodeValue::Bytes(b) => b.as_ref(),
+                _ => panic!("not bytes: {v:?}"),
+            }
+        }
+
+        // The port of the next announce_peer the node hears, answering
+        // every query before it.
+        async fn next_announced(node: &UdpSocket) -> i64 {
+            let mut buf = [0u8; 2048];
+            loop {
+                let (len, from) = node.recv_from(&mut buf).await.unwrap();
+                let msg = dyn_from_bytes::<ByteBufOwned>(&buf[..len]).unwrap();
+                if bytes(get(&msg, "y")) != b"q" {
+                    continue;
+                }
+                let tid = bytes(get(&msg, "t"));
+                let mut reply = b"d1:rd2:id20:".to_vec();
+                reply.extend_from_slice(&NODE_ID);
+                reply.extend_from_slice(b"5:token2:tke1:t");
+                reply.extend_from_slice(format!("{}:", tid.len()).as_bytes());
+                reply.extend_from_slice(tid);
+                reply.extend_from_slice(b"1:y1:re");
+                node.send_to(&reply, from).await.unwrap();
+                if bytes(get(&msg, "q")) == b"announce_peer" {
+                    match get(get(&msg, "a"), "port") {
+                        BencodeValue::Integer(port) => return *port,
+                        other => panic!("port is {other:?}"),
+                    }
+                }
+            }
+        }
+
+        let node = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let node_addr = node.local_addr().unwrap();
+        let dht = DhtState::with_config(DhtConfig {
+            listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            bootstrap_addrs: Some(vec![node_addr.to_string()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        dht.add_node(node_addr);
+        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        // The node is the closest there is to the hash: its own id.
+        let mut peers = super::dht_peers(dht, Id20::new(NODE_ID), listen_port);
+        let first = tokio::select! {
+            _ = peers.next() => panic!("the node gave no peers"),
+            port = next_announced(&node) => port,
+        };
+        assert_eq!(first, 6881);
+        port.send_replace(Some(40001));
+        let second = tokio::select! {
+            _ = peers.next() => panic!("the node gave no peers"),
+            port = next_announced(&node) => port,
+        };
+        assert_eq!(second, 40001);
+    }
+
+    #[tokio::test]
+    async fn the_session_maps_tcp_and_udp_only_for_the_sockets_it_listens_on() {
+        use super::listening_protocols;
+        use crate::{
+            listen::{ListenerMode, ListenerOptions},
+            upnp::PortmapProtocol::{Tcp, Udp},
+        };
+        for (mode, expected) in [
+            (ListenerMode::TcpOnly, vec![Tcp]),
+            (ListenerMode::UtpOnly, vec![Udp]),
+            (ListenerMode::TcpAndUtp, vec![Tcp, Udp]),
+        ] {
+            let token = tokio_util::sync::CancellationToken::new();
+            let listen = ListenerOptions {
+                mode,
+                listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                ..Default::default()
+            }
+            .start(None, token.clone(), None, None)
+            .await
+            .unwrap();
+            assert_eq!(listening_protocols(&listen), expected, "{mode:?}");
+            token.cancel();
+        }
     }
 
     /// A one-piece torrent whose announce-list is `[[a1, a2], [b1]]`.
@@ -2467,6 +3163,211 @@ mod tests {
         (dir, session, handle)
     }
 
+    // What a tracker announce of `handle`'s torrent reports.
+    fn tracker_stats(
+        session: &std::sync::Arc<Session>,
+        handle: &super::ManagedTorrentHandle,
+    ) -> (super::PeerRxTorrentInfo, crate::tracker::TrackerCommsStats) {
+        use crate::tracker::TorrentStatsProvider;
+        let info = super::PeerRxTorrentInfo {
+            info_hashes: handle.info_hashes(),
+            session: session.clone(),
+            torrent: Default::default(),
+        };
+        let stats = info.get();
+        (info, stats)
+    }
+
+    #[tokio::test]
+    async fn a_seed_announces_nothing_left() {
+        use crate::tracker::TorrentStatsProvider;
+        use futures::FutureExt;
+        let (_dir, session, handle) = seeding(8, Default::default()).await;
+        let (info, stats) = tracker_stats(&session, &handle);
+        assert_eq!(stats.left_bytes, Some(0));
+        // Seeding from the start: no `completed`, and nothing to wait for.
+        assert!(!stats.finished_during_run);
+        assert!(info.wait_until_completed().now_or_never().is_some());
+        session.stop().await;
+    }
+
+    // A one-piece torrent of a file in a new directory, and a session
+    // reaching no network, the torrent not added to it.
+    async fn unadded(name: &str) -> (TempDir, Bytes, std::sync::Arc<Session>) {
+        let dir =
+            crate::tests::test_util::create_default_random_dir_with_torrents(1, 16384, Some(name));
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(16384),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (dir, torrent, session)
+    }
+
+    // libtorrent waits for a magnet's metadata on `metadata_received_alert`:
+    // the announce's wait for completion finds the torrent as it enters the
+    // session, not on a later look.
+    #[tokio::test]
+    async fn a_magnets_completion_wait_finds_its_torrent_as_it_is_added() {
+        use crate::tracker::TorrentStatsProvider;
+        use futures::FutureExt;
+        let (dir, torrent, session) = unadded("magnet_wait").await;
+        let info_hashes = crate::core::torrent_metainfo::torrent_from_bytes(&torrent)
+            .unwrap()
+            .info_hashes;
+        let info = super::PeerRxTorrentInfo {
+            info_hashes,
+            session: session.clone(),
+            torrent: Default::default(),
+        };
+        let mut wait = info.wait_until_completed();
+        assert!((&mut wait).now_or_never().is_none());
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_completed().await.unwrap();
+        assert!(wait.now_or_never().is_some());
+        session.stop().await;
+    }
+
+    // A torrent's wait for completion follows its state: a torrent removed
+    // while it downloads ends the wait.
+    #[tokio::test]
+    async fn a_completion_wait_ends_when_its_torrent_is_deleted() {
+        use futures::FutureExt;
+        let (_dir, torrent, session) = unadded("deleted_wait").await;
+        let empty = TempDir::with_prefix("deleted_wait_out").unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(empty.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        assert!(handle.live().is_some());
+
+        let mut wait = handle.wait_until_completed();
+        assert!((&mut wait).now_or_never().is_none());
+        session.delete(handle.id().into(), false).await.unwrap();
+        assert!(wait.await.is_err());
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_finished_selection_short_of_a_seed_announces_what_the_torrent_lacks() {
+        // libtorrent torrent::bytes_left counts the whole torrent, and
+        // torrent::finished sends `completed` only when is_seed.
+        use crate::tracker::TorrentStatsProvider;
+        use futures::FutureExt;
+        const PIECE: usize = 16384;
+        let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
+            2,
+            PIECE,
+            Some("partial_selection"),
+        );
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(PIECE as u32),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        std::fs::remove_file(dir.path().join("1.data")).unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        let (_, stats) = tracker_stats(&session, &handle);
+        assert_eq!(stats.left_bytes, Some(PIECE as u64));
+
+        // Drop the missing file from the selection: the selection finishes
+        // during this run, the torrent still lacks that file's piece.
+        let had = handle
+            .with_metadata(|m| {
+                m.file_infos
+                    .iter()
+                    .position(|f| f.relative_filename.ends_with("0.data"))
+                    .unwrap()
+            })
+            .unwrap();
+        handle.update_only_files(&HashSet::from([had])).unwrap();
+        assert!(handle.live().unwrap().finished_during_run());
+
+        let (info, stats) = tracker_stats(&session, &handle);
+        assert_eq!(stats.left_bytes, Some(PIECE as u64));
+        assert!(!stats.finished_during_run);
+        assert!(info.wait_until_completed().now_or_never().is_none());
+
+        // Paused, the pieces still say what the torrent lacks.
+        session.pause(&handle).await.unwrap();
+        let (_, stats) = tracker_stats(&session, &handle);
+        assert_eq!(stats.left_bytes, Some(PIECE as u64));
+        session.stop().await;
+    }
+
     // Connects to the session and sends a handshake for `handle`'s torrent.
     // Returns what the session answers before it closes, up to its own
     // 68-byte handshake: empty when it refused the connection.
@@ -2571,6 +3472,8 @@ mod tests {
                     listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                     ..Default::default()
                 }),
+                // A test greets the seed from this host more than once.
+                allow_multiple_connections_per_ip: true,
                 ..Default::default()
             },
         )
@@ -2740,6 +3643,228 @@ mod tests {
         let mut rest = Vec::new();
         let _ = stream.read_to_end(&mut rest).await;
 
+        session.stop().await;
+    }
+
+    /// A magnet's `x.pe` peers are the torrent's initial peers: with no DHT,
+    /// trackers or other peers, the link's peer alone supplies the metadata
+    /// and the content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_magnets_peer_supplies_its_metadata_and_content() -> anyhow::Result<()> {
+        use crate::{
+            core::{magnet::Magnet, torrent_metainfo},
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+        };
+        use anyhow::Context;
+
+        let t = TestTorrent::new("test_magnet_x_pe", 3 * 16384 + 100, 16384).await?;
+        let seeder =
+            Session::new_with_opts(t.dir.path().into(), isolated_session_opts(true)).await?;
+        seeder
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    output_folder: Some(t.dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?
+            .wait_until_completed()
+            .await?;
+        let seeder_addr = seeder.listen_addr().context("seeder is not listening")?;
+
+        let mut magnet = Magnet::of(
+            torrent_metainfo::torrent_from_bytes(&t.torrent)?.info_hashes,
+            None,
+            Vec::new(),
+        );
+        magnet.peers.push(seeder_addr);
+        let out = TempDir::with_prefix("test_magnet_x_pe_out")?;
+        let downloader =
+            Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+        let storage = MemoryStorageFactory::default();
+        downloader
+            .add_torrent(
+                AddTorrent::from_url(magnet.to_string()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(storage.clone_box()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?
+            .wait_until_completed()
+            .await?;
+        assert!(storage.log.file_contents(0) == t.content, "content differs");
+        Ok(())
+    }
+
+    // An incoming peer's encryption handshake and BitTorrent handshake end
+    // at the handshake timeout, whatever the peer timeout (libtorrent
+    // `peer_connection::second_tick`).
+    #[tokio::test(start_paused = true)]
+    async fn an_incoming_peer_that_sends_no_handshake_ends_at_the_handshake_timeout() {
+        use crate::{
+            mse::EncryptionPolicy,
+            peer_connection::{DEFAULT_HANDSHAKE_TIMEOUT, PeerConnectionOptions},
+            peer_info_reader::tests::halves,
+            stream_connect::ConnectionKind,
+        };
+        for (encryption, step) in [
+            (EncryptionPolicy::Disabled, "error reading handshake"),
+            (
+                EncryptionPolicy::Require,
+                "error in the encryption handshake",
+            ),
+        ] {
+            let dir = TempDir::with_prefix("handshake_timeout").unwrap();
+            let session = Session::new_with_opts(
+                dir.path().into(),
+                SessionOptions {
+                    dht: None,
+                    persistence: None,
+                    disable_trackers: true,
+                    disable_local_service_discovery: true,
+                    encryption,
+                    connect: Some(super::ConnectionOptions {
+                        enable_tcp: true,
+                        peer_opts: Some(PeerConnectionOptions {
+                            read_write_timeout: Some(std::time::Duration::from_secs(120)),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let (ours, _theirs) = tokio::io::duplex(1 << 16);
+            let (reader, writer) = halves(ours);
+            let start = tokio::time::Instant::now();
+            let err = session
+                .clone()
+                .check_incoming_connection(
+                    "127.0.0.1:6881".parse().unwrap(),
+                    ConnectionKind::Tcp,
+                    reader,
+                    writer,
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(format!("{err:#}").contains(step), "{err:#}");
+            assert_eq!(start.elapsed(), DEFAULT_HANDSHAKE_TIMEOUT, "{encryption:?}");
+            session.stop().await;
+        }
+    }
+
+    // A session for the incoming-connection rule tests, with nothing that
+    // reaches out.
+    async fn quiet_session(dir: &TempDir, opts: SessionOptions) -> std::sync::Arc<Session> {
+        Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..opts
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    // Writes an IP list holding `range` into `dir`; returns its file URL.
+    fn ip_list(dir: &TempDir, name: &str, range: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("test:{range}\n")).unwrap();
+        url::Url::from_file_path(path).unwrap().to_string()
+    }
+
+    // Hands the session an incoming connection from `addr` whose peer stays
+    // open and sends nothing, and polls the check once: the refusal when it
+    // refuses without reading, `None` while it waits on the peer's handshake.
+    fn check_once(session: &std::sync::Arc<Session>, addr: &str) -> Option<String> {
+        use crate::{peer_info_reader::tests::halves, stream_connect::ConnectionKind};
+        use futures::FutureExt;
+        let (ours, _theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = halves(ours);
+        session
+            .clone()
+            .check_incoming_connection(addr.parse().unwrap(), ConnectionKind::Tcp, reader, writer)
+            .now_or_never()
+            .map(|checked| format!("{:#}", checked.err().unwrap()))
+    }
+
+    fn blocked_incoming(session: &Session) -> u64 {
+        session
+            .stats
+            .counters
+            .blocked_incoming
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // An incoming connection passes the rule an outgoing one does: libtorrent
+    // `session_impl::incoming_connection` refuses an endpoint its one
+    // `ip_filter` blocks (`peer_blocked_alert::ip_filter`) before reading a
+    // byte, and the blocklist and the allowlist are that one filter.
+    #[tokio::test(start_paused = true)]
+    async fn an_incoming_connection_from_a_filtered_address_is_refused_unread() {
+        let dir = TempDir::with_prefix("incoming_filtered").unwrap();
+        let session = quiet_session(
+            &dir,
+            SessionOptions {
+                blocklist_url: Some(ip_list(&dir, "block.txt", "10.0.0.1-10.0.0.1")),
+                allowlist_url: Some(ip_list(&dir, "allow.txt", "10.0.0.0-10.0.0.255")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // On the blocklist, then off the allowlist: each refused unread, and
+        // counted.
+        for (counted, addr) in [(1, "10.0.0.1:6881"), (2, "192.0.2.1:6881")] {
+            let refusal = check_once(&session, addr).expect("refused unread");
+            assert!(refusal.contains("banned by the IP filter"), "{refusal}");
+            assert_eq!(blocked_incoming(&session), counted);
+        }
+
+        // Let through, the check waits on the peer's handshake.
+        assert_eq!(check_once(&session, "10.0.0.2:6881"), None);
+        assert_eq!(blocked_incoming(&session), 2);
+        session.stop().await;
+    }
+
+    // An IPv4-only session refuses an IPv6 peer whichever way the connection
+    // goes. libtorrent's session has no listen socket of a family it does not
+    // connect over, so `incoming_connection` never sees such a peer and posts
+    // no `peer_blocked_alert` for it: the refusal is not counted as blocked.
+    #[tokio::test(start_paused = true)]
+    async fn an_ipv6_incoming_connection_on_an_ipv4_only_session_is_refused() {
+        let dir = TempDir::with_prefix("incoming_family").unwrap();
+        let session = quiet_session(
+            &dir,
+            SessionOptions {
+                ipv4_only: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let refusal = check_once(&session, "[2001:db8::1]:6881").expect("refused unread");
+        assert!(
+            refusal.contains("of a family the session does not connect over"),
+            "{refusal}"
+        );
+        assert_eq!(blocked_incoming(&session), 0);
+
+        assert_eq!(check_once(&session, "192.0.2.1:6881"), None);
         session.stop().await;
     }
 }

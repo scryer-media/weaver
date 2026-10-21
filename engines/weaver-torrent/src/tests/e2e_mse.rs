@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use crate::{
     AddTorrent, AddTorrentOptions, EncryptionPolicy, Error, MseError, Session, SessionOptions,
     storage::StorageFactory,
-    stream_connect::EncryptionStatsSnapshot,
+    stream_connect::{EncryptionStatsSnapshot, Transports},
     tests::{
         embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
         test_util::setup_test_logging,
@@ -161,6 +161,7 @@ async fn test_require_downloader_against_disabled_seeder_is_refused() -> anyhow:
         .connector
         .connect_and_send_handshake(
             seeder_addr,
+            Transports::Any,
             &info_hash,
             &hs[..len],
             Duration::MAX,

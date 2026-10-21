@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
@@ -15,8 +16,6 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use anyhow::Context;
-use backon::BackoffBuilder;
-use backon::ExponentialBuilder;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -24,6 +23,7 @@ use futures::stream::BoxStream;
 use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
+use tokio::time::Instant;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::debug_span;
@@ -33,8 +33,9 @@ use url::Url;
 
 use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
-use crate::core::net::Resolver;
+use crate::core::net::{HttpClients, Resolver};
 use crate::tracker::tracker_comms_http;
+use crate::tracker::tracker_comms_http::Ask;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
 use crate::tracker::tracker_comms_udp;
 use crate::tracker::tracker_comms_udp::UdpTrackerClient;
@@ -45,13 +46,17 @@ pub struct TrackerComms {
     stats: Arc<dyn TorrentStatsProvider>,
     force_tracker_interval: Option<Duration>,
     tx: Sender,
-    /// The `port` every announce carries (see [`announced_port`]).
-    announce_port: u16,
-    reqwest_client: reqwest::Client,
+    /// The port peers reach this session on, read when each announce goes
+    /// out (see [`announced_port`]).
+    announce_port: ListenPort,
+    /// Our own addresses an HTTP announce names (see [`AnnounceIps`]).
+    announce_ips: AnnounceIps,
+    http_clients: Arc<dyn HttpClients>,
+    reachable: Reachable,
     udp_client: UdpTrackerClient,
     key: u32,
-    // Per tier, the tracker that accepted `started` and so is owed `stopped`.
-    started: Mutex<Vec<Option<SupportedTracker>>>,
+    // The trackers under this hash and what announcing to them has done.
+    list: Mutex<TrackerList>,
     // The `tracker id` each HTTP tracker last gave, sent back on every later
     // announce to it.
     tracker_ids: Mutex<HashMap<Url, Vec<u8>>>,
@@ -78,14 +83,22 @@ pub struct TrackerCommsStats {
     /// check. Pieces the torrent already had when the run began are not
     /// counted, and neither is a piece that failed its check.
     pub downloaded_bytes: u64,
-    /// Bytes of the selected files still to download, 0 once they are all
-    /// here. None while the torrent's size is unknown (a magnet still
-    /// resolving its metadata).
+    /// Bytes of the pieces downloaded during this run that failed their
+    /// hash check (libtorrent `torrent::m_total_failed_bytes`).
+    pub corrupt_bytes: u64,
+    /// Bytes of the blocks received during this run and not used: a copy
+    /// of a block already had, or one no longer asked of the peer
+    /// (libtorrent `torrent::m_total_redundant_bytes`).
+    pub redundant_bytes: u64,
+    /// Bytes of the whole torrent not yet had, whichever files are selected,
+    /// so 0 only for a seed. None while the torrent's size is unknown (a
+    /// magnet still resolving its metadata).
     pub left_bytes: Option<u64>,
     pub torrent_state: TrackerCommsStatsState,
-    /// The torrent was incomplete when its current run began and has every
-    /// wanted piece now. Each tracker hears `completed` (BEP 3) once for such a
-    /// run; a torrent that was already complete when it started never sends it.
+    /// The torrent was incomplete when its current run began and is a seed
+    /// now. Each tracker hears `completed` (BEP 3) once for such a run; a
+    /// torrent that was already a seed when it started never sends it, and
+    /// neither does one that has only its selected files.
     pub finished_during_run: bool,
 }
 
@@ -105,8 +118,8 @@ impl TrackerCommsStats {
 pub trait TorrentStatsProvider: Send + Sync {
     fn get(&self) -> TrackerCommsStats;
 
-    /// Resolves once the torrent has every wanted piece, at once if it already
-    /// has. Lets the tracker task send `completed` without waiting out the
+    /// Resolves once the torrent is a seed, at once if it already is. Lets
+    /// the tracker task send `completed` without waiting out the
     /// announce interval. The default never resolves, so `completed` goes out
     /// with the next regular announce.
     fn wait_until_completed(&self) -> BoxFuture<'_, ()> {
@@ -121,6 +134,71 @@ impl TorrentStatsProvider for () {
 }
 
 type Sender = tokio::sync::mpsc::Sender<SocketAddr>;
+
+/// The port peers reach this session on, None when it accepts no
+/// connections. It can change while a torrent runs (a gateway mapping that
+/// lands after start), so each announce reads it as it goes out (libtorrent
+/// `session_impl::queue_tracker_request` sets `req.listen_port` per request).
+pub type ListenPort = tokio::sync::watch::Receiver<Option<u16>>;
+
+/// Our own addresses an HTTP announce names as `ipv4=` and `ipv6=` (BEP 7),
+/// read as each announce goes out (libtorrent `torrent::build_tracker_request`
+/// reads the session's listen sockets per request).
+pub type AnnounceIps = Arc<dyn Fn() -> Vec<IpAddr> + Send + Sync>;
+
+/// Why the session may not reach an address. The family is judged first, so
+/// a refusal of every address names the last rule any of them met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Unreachable {
+    /// Of a family the session does not connect over (libtorrent
+    /// `errors::announce_skipped`).
+    Family,
+    /// Blocked by the IP filter (libtorrent `errors::banned_by_ip_filter`).
+    Filtered,
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Unreachable::Family => "of a family the session does not connect over",
+            Unreachable::Filtered => "banned by the IP filter",
+        })
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// The addresses the session may reach (the session's `may_reach`): every
+/// address a tracker is asked at, on every hop, passes it.
+pub type Reachable = Arc<dyn Fn(IpAddr) -> Result<(), Unreachable> + Send + Sync>;
+
+/// The addresses of `found` the session may reach, in the order found
+/// (libtorrent `http_tracker_connection::on_filter` and
+/// `udp_tracker_connection::name_lookup` drop the others before any is
+/// connected to). With none left the tracker is refused for the last rule
+/// they met, and nothing is counted: libtorrent posts no alert and bumps no
+/// counter for a tracker's address, the failed announce is the record.
+pub(crate) fn only_reachable<A>(
+    found: Vec<A>,
+    ip: impl Fn(&A) -> IpAddr,
+    reachable: &Reachable,
+) -> anyhow::Result<Vec<A>> {
+    let mut refused = None;
+    let kept: Vec<A> = found
+        .into_iter()
+        .filter(|a| {
+            let why = reachable(ip(a)).err();
+            refused = refused.max(why);
+            why.is_none()
+        })
+        .collect();
+    match refused {
+        Some(why) if kept.is_empty() => {
+            Err(anyhow::Error::new(why).context("no address of the tracker may be reached"))
+        }
+        _ => Ok(kept),
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 enum SupportedTracker {
@@ -156,85 +234,350 @@ impl std::fmt::Debug for SupportedTracker {
     }
 }
 
-/// One tier of a multitracker torrent (BEP 12).
-///
-/// Only one tracker of a tier is announced to at a time. When it fails, the
-/// next one in the tier is tried; the one that answers moves to the front of
-/// the tier and stays the tier's tracker while it keeps answering.
+/// One tracker as one hash of the torrent announces to it, and how that has
+/// gone (libtorrent `announce_infohash`, with the tier of its
+/// `announce_entry`).
 #[derive(Clone, Debug)]
-struct Tier {
-    trackers: Vec<SupportedTracker>,
-    current: usize,
+struct Entry {
+    tracker: SupportedTracker,
+    tier: usize,
+    /// Failures in a row since it last accepted an announce, at most 127.
+    fails: u8,
+    /// No regular announce goes to it before this.
+    next_announce: Instant,
+    /// No announce goes to it before this but one owed `completed` (the
+    /// tracker's `min interval`).
+    min_announce: Instant,
+    /// An announce to it is waiting for its answer.
+    updating: bool,
+    /// The listen port our last announce to it carried; one that differs
+    /// from the current port is due at once (libtorrent
+    /// `session_impl::reopen_listen_sockets` forces every tracker's request
+    /// when the listen port changes).
+    port: Option<u16>,
+    start_sent: bool,
+    complete_sent: bool,
 }
 
-impl Tier {
-    /// `trackers` must not be empty.
-    fn new(trackers: Vec<SupportedTracker>) -> Self {
-        assert!(!trackers.is_empty(), "a tier needs at least one tracker");
+impl Entry {
+    /// A tracker that has not failed since it last answered, or has never
+    /// been asked (libtorrent `announce_infohash::is_working`).
+    fn is_working(&self) -> bool {
+        self.fails == 0
+    }
+
+    /// libtorrent `announce_infohash::can_announce`, with no fail limit: due,
+    /// past its `min interval` unless it is owed `completed`, and not
+    /// waiting for an answer. A second of slack takes trackers due together.
+    fn can_announce(&self, now: Instant, seed: bool, port: Option<u16>) -> bool {
+        let due = now + Duration::from_secs(1) >= self.next_announce
+            && (now >= self.min_announce || (seed && !self.complete_sent));
+        (due || self.port != port) && !self.updating
+    }
+}
+
+/// The trackers one hash of a torrent announces to, tier by tier, and what
+/// announcing to them has done (libtorrent `tracker_list`).
+///
+/// One tracker at a time is announced to, the first that works in list
+/// order (libtorrent `settings_pack::announce_to_all_tiers` and
+/// `announce_to_all_trackers`, both false by default). A tracker that fails
+/// backs off and moves to the end of its tier, so the next one in the tier
+/// is tried at once; a later tier is reached only once every tracker before
+/// it is failing.
+#[derive(Debug)]
+struct TrackerList {
+    /// In tier order.
+    entries: Vec<Entry>,
+    /// A tracker accepted `completed` (libtorrent `torrent::m_complete_sent`).
+    complete_sent: bool,
+}
+
+impl TrackerList {
+    /// A tracker named twice is kept where it is first named (libtorrent
+    /// `tracker_list::add_tracker`).
+    fn new(tiers: &[Vec<SupportedTracker>], now: Instant) -> Self {
+        let mut entries: Vec<Entry> = Vec::new();
+        for (tier, trackers) in tiers.iter().enumerate() {
+            for tracker in trackers {
+                if entries.iter().any(|e| &e.tracker == tracker) {
+                    continue;
+                }
+                entries.push(Entry {
+                    tracker: tracker.clone(),
+                    tier,
+                    fails: 0,
+                    next_announce: now,
+                    min_announce: now,
+                    updating: false,
+                    port: None,
+                    start_sent: false,
+                    complete_sent: false,
+                });
+            }
+        }
         Self {
-            trackers,
-            current: 0,
+            entries,
+            complete_sent: false,
         }
     }
 
-    fn current(&self) -> &SupportedTracker {
-        &self.trackers[self.current]
+    /// The walk of libtorrent `torrent::announce_with_tracker` with neither
+    /// `announce_to_all_tiers` nor `announce_to_all_trackers`: over the
+    /// `considered` trackers in list order, every failing one that
+    /// `may_announce`, then the first working one if it may. The trackers
+    /// after it wait.
+    fn walk(
+        &self,
+        considered: impl Fn(&Entry) -> bool,
+        may_announce: impl Fn(&Entry) -> bool,
+    ) -> Vec<usize> {
+        let mut picked = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if !considered(entry) {
+                continue;
+            }
+            if may_announce(entry) {
+                picked.push(i);
+            }
+            if entry.is_working() {
+                break;
+            }
+        }
+        picked
     }
 
-    /// The current tracker answered: move it to the front of the tier.
-    fn on_success(&mut self) {
-        let tracker = self.trackers.remove(self.current);
-        self.trackers.insert(0, tracker);
-        self.current = 0;
+    /// The regular announces due at `now`, each with its event, marked as
+    /// waiting for their answers; `port` is the listen port they carry.
+    fn start_due(
+        &mut self,
+        now: Instant,
+        port: Option<u16>,
+        stats: &TrackerCommsStats,
+    ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
+        let seed = stats.finished_during_run;
+        self.walk(|_| true, |e| e.can_announce(now, seed, port))
+            .into_iter()
+            .map(|i| {
+                let event = self.event(&self.entries[i], stats);
+                let entry = &mut self.entries[i];
+                entry.updating = true;
+                entry.port = port;
+                (entry.tracker.clone(), event)
+            })
+            .collect()
     }
 
-    /// The current tracker failed: move on to the next one in the tier.
-    /// Returns true when every tracker in the tier has failed in turn since
-    /// the last one that answered.
-    fn on_failure(&mut self) -> bool {
-        self.current = (self.current + 1) % self.trackers.len();
-        self.current == 0
-    }
-}
-
-/// What the current tracker of a tier has been told (BEP 3 events).
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-struct AnnounceState {
-    started: bool,
-    completed: bool,
-}
-
-impl AnnounceState {
-    /// The event the next regular announce carries.
-    fn next_event(&self, stats: &TrackerCommsStats) -> Option<TrackerRequestEvent> {
-        if !self.started {
+    /// The event a regular announce to `entry` carries (libtorrent
+    /// `torrent::send_tracker_request`): `started` until it accepts one, then
+    /// `completed` once the torrent became a seed during this run, unless a
+    /// tracker has accepted `completed` already.
+    fn event(&self, entry: &Entry, stats: &TrackerCommsStats) -> Option<TrackerRequestEvent> {
+        if !entry.start_sent {
             Some(TrackerRequestEvent::Started)
-        } else if stats.finished_during_run && !self.completed {
+        } else if stats.finished_during_run && !self.complete_sent && !entry.complete_sent {
             Some(TrackerRequestEvent::Completed)
         } else {
             None
         }
     }
 
-    /// The tracker accepted an announce that carried `event`.
-    fn on_accepted(&mut self, event: Option<TrackerRequestEvent>) {
+    /// When the next regular announce may come due, None while every
+    /// tracker it could go to waits for an answer (libtorrent
+    /// `torrent::update_tracker_timer`).
+    fn next_due(&self) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        for entry in &self.entries {
+            if entry.updating {
+                break;
+            }
+            let due = entry.next_announce.max(entry.min_announce);
+            next = Some(next.map_or(due, |next| next.min(due)));
+            if entry.is_working() {
+                break;
+            }
+        }
+        next
+    }
+
+    fn position(&self, tracker: &SupportedTracker) -> Option<usize> {
+        self.entries.iter().position(|e| &e.tracker == tracker)
+    }
+
+    /// `tracker` accepted an announce that carried `event` (libtorrent
+    /// `torrent::tracker_response`).
+    fn on_success(
+        &mut self,
+        tracker: &SupportedTracker,
+        event: Option<TrackerRequestEvent>,
+        now: Instant,
+        delay: &ReannounceDelay,
+    ) {
+        let Some(i) = self.position(tracker) else {
+            return;
+        };
+        let entry = &mut self.entries[i];
+        entry.updating = false;
+        entry.fails = 0;
+        entry.next_announce = now + delay.regular;
+        entry.min_announce = now + delay.floor;
         match event {
-            Some(TrackerRequestEvent::Started) => self.started = true,
-            Some(TrackerRequestEvent::Completed) => self.completed = true,
-            Some(TrackerRequestEvent::Stopped) => *self = Self::default(),
-            None => {}
+            Some(TrackerRequestEvent::Started) => entry.start_sent = true,
+            Some(TrackerRequestEvent::Completed) => {
+                entry.complete_sent = true;
+                self.complete_sent = true;
+            }
+            Some(TrackerRequestEvent::Stopped) | None => {}
         }
     }
 
-    /// Whether this tracker may still be owed `completed`, so the wait for
-    /// the next announce should end early when the torrent completes. A
-    /// torrent that is live and complete without having finished during this
-    /// run is seeding from the start and never owes it.
-    fn awaits_completion(&self, stats: &TrackerCommsStats) -> bool {
-        !self.completed
-            && (stats.finished_during_run
-                || !(stats.torrent_state == TrackerCommsStatsState::Live && stats.is_completed()))
+    /// An announce to `tracker` failed: it backs off (libtorrent
+    /// `announce_infohash::failed`) and goes to the end of its tier
+    /// (`tracker_list::deprioritize_tracker`).
+    fn on_failure(&mut self, tracker: &SupportedTracker, now: Instant, retry_interval: Duration) {
+        let Some(i) = self.position(tracker) else {
+            return;
+        };
+        let mut entry = self.entries.remove(i);
+        entry.updating = false;
+        entry.fails = entry.fails.saturating_add(1).min(127);
+        entry.next_announce = now + retry_delay(entry.fails, retry_interval);
+        let end_of_tier = self
+            .entries
+            .iter()
+            .rposition(|e| e.tier == entry.tier)
+            .map_or(i, |last| last + 1);
+        self.entries.insert(end_of_tier, entry);
     }
+
+    /// The torrent became a seed: every tracker not yet told is due at once
+    /// (libtorrent `tracker_list::completed`).
+    fn completed(&mut self, now: Instant) {
+        for entry in self.entries.iter_mut().filter(|e| !e.complete_sent) {
+            entry.next_announce = now;
+            entry.min_announce = now;
+        }
+    }
+
+    /// The trackers owed `stopped`: the walk over those that accepted
+    /// `started`, each of them due (libtorrent `torrent::stop_announcing`).
+    fn stopped(&self) -> Vec<SupportedTracker> {
+        self.walk(|e| e.start_sent, |_| true)
+            .into_iter()
+            .map(|i| self.entries[i].tracker.clone())
+            .collect()
+    }
+}
+
+/// Whether the torrent may yet become a seed during this run, so its
+/// trackers may yet be owed `completed`. A torrent live and complete
+/// without finishing during this run was a seed from the start.
+fn may_complete(stats: &TrackerCommsStats) -> bool {
+    stats.finished_during_run
+        || !(stats.torrent_state == TrackerCommsStatsState::Live && stats.is_completed())
+}
+
+/// The shortest and longest wait before a failing tracker is tried again
+/// (libtorrent `announce_entry.cpp` `tracker_retry_delay_min`,
+/// `tracker_retry_delay_max`), in seconds, and how steeply the wait grows
+/// between them (`settings_pack::tracker_backoff`, a percentage).
+const RETRY_DELAY_MIN: u64 = 5;
+const RETRY_DELAY_MAX: u64 = 60 * 60;
+const TRACKER_BACKOFF: u64 = 250;
+
+/// How long a tracker waits after its `fails`-th failure in a row
+/// (libtorrent `announce_infohash::failed`): 5 s plus 5 s × fails² × 250 %,
+/// so 17, 55, 117, 205 … s up to an hour, and never sooner than the
+/// `retry_interval` the failed answer gave.
+fn retry_delay(fails: u8, retry_interval: Duration) -> Duration {
+    let fails = u64::from(fails);
+    let backoff = RETRY_DELAY_MIN + fails * fails * RETRY_DELAY_MIN * TRACKER_BACKOFF / 100;
+    retry_interval.max(Duration::from_secs(backoff.min(RETRY_DELAY_MAX)))
+}
+
+/// An HTTP tracker answered the announce without accepting it: a `failure
+/// reason`, or an answer that does not parse. libtorrent tries it again no
+/// sooner than the answer's interval, raised to the minimum announce
+/// interval (`http_tracker_connection::on_response`, passed on by
+/// `tracker_connection::fail_impl`); a transport failure gives none.
+#[derive(Debug)]
+struct Refused {
+    reason: String,
+    retry_interval: Duration,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+impl Refused {
+    fn new(reason: String, interval: Option<Duration>) -> anyhow::Error {
+        let interval = interval.unwrap_or(tracker_comms_http::DEFAULT_INTERVAL);
+        anyhow::Error::new(Self {
+            reason,
+            retry_interval: interval.max(MIN_ANNOUNCE_INTERVAL),
+        })
+    }
+
+    /// The least wait before the tracker that gave `error` is tried again.
+    fn retry_interval(error: &anyhow::Error) -> Duration {
+        error
+            .downcast_ref::<Self>()
+            .map_or(Duration::ZERO, |r| r.retry_interval)
+    }
+}
+
+/// An HTTP tracker's answer to an announce: its accepted response, or why it
+/// refused.
+fn read_answer(bytes: &[u8]) -> anyhow::Result<tracker_comms_http::TrackerResponse<'_>> {
+    if let Ok((error, _)) =
+        crate::bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(bytes)
+    {
+        return Err(Refused::new(
+            format!(
+                "tracker returned failure. Failure reason: {}",
+                error.failure_reason
+            ),
+            error.interval,
+        ));
+    }
+    crate::bencode::from_bytes_with_rest::<tracker_comms_http::TrackerResponse>(bytes)
+        .map(|(response, _)| response)
+        .map_err(|e| {
+            Refused::new(
+                format!(
+                    "error deserializing the tracker's answer: {}",
+                    e.into_kind()
+                ),
+                None,
+            )
+        })
+}
+
+/// How long an announce or scrape may take from start to finish, whatever
+/// the transport (libtorrent `settings_pack::tracker_completion_timeout`).
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The `min interval` of a UDP tracker, which sends none (libtorrent
+/// `udp_tracker_connection::on_announce_response`).
+const UDP_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The shortest re-announce interval a tracker may ask for, a guard against
+/// hammering a misconfigured one (libtorrent
+/// `settings_pack::min_announce_interval`).
+const MIN_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Runs one request to a tracker, failing it after [`COMPLETION_TIMEOUT`].
+async fn within_completion_timeout<T>(
+    request: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(COMPLETION_TIMEOUT, request)
+        .await
+        .map_err(|_| anyhow::anyhow!("the tracker did not answer within {COMPLETION_TIMEOUT:?}"))?
 }
 
 /// How long to wait before the next announce.
@@ -248,11 +591,17 @@ struct ReannounceDelay {
 }
 
 impl ReannounceDelay {
-    fn new(interval: Duration, min_interval: Option<Duration>, forced: Option<Duration>) -> Self {
-        let floor = min_interval.unwrap_or_default();
+    /// `interval` is the tracker's, raised to [`MIN_ANNOUNCE_INTERVAL`]
+    /// (libtorrent `http_tracker_connection::on_response`,
+    /// `udp_tracker_connection::on_announce_response`); a `forced` interval
+    /// is the session's own and replaces it as given. `floor` is the
+    /// tracker's min interval.
+    fn new(interval: Duration, floor: Duration, forced: Option<Duration>) -> Self {
         Self {
             floor,
-            regular: forced.unwrap_or(interval).max(floor),
+            regular: forced
+                .unwrap_or(interval.max(MIN_ANNOUNCE_INTERVAL))
+                .max(floor),
         }
     }
 }
@@ -261,7 +610,7 @@ impl ReannounceDelay {
 struct Announced {
     peers: Vec<SocketAddr>,
     interval: Duration,
-    min_interval: Option<Duration>,
+    min_interval: Duration,
     seeders: Option<u32>,
     leechers: Option<u32>,
 }
@@ -270,7 +619,9 @@ struct Announced {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnnounceOk {
     pub interval: Duration,
-    pub min_interval: Option<Duration>,
+    /// The least time between two announces: the tracker's, else the
+    /// protocol's default.
+    pub min_interval: Duration,
     /// Peers with the whole torrent, as the tracker counts them.
     pub seeders: Option<u32>,
     /// Peers still downloading, as the tracker counts them.
@@ -296,51 +647,373 @@ pub struct TrackerAnnounce {
     pub last: Option<LastAnnounce>,
 }
 
-/// The announce table of one [`TrackerComms`]: one entry per tracker it was
-/// started with, in the order given, from the start. Clones share the table,
-/// which stays readable after the tracker task ends.
+/// A torrent's counts as a tracker's scrape reply gave them (BEP 48). A
+/// count the tracker left out is None.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrapeOk {
+    /// Peers with the whole torrent.
+    pub complete: Option<u32>,
+    /// Peers still downloading.
+    pub incomplete: Option<u32>,
+    /// Downloads the tracker has seen finish.
+    pub downloaded: Option<u32>,
+}
+
+impl ScrapeOk {
+    /// The larger of each count: trackers and hashes count the same swarm
+    /// (libtorrent `torrent::update_scrape_state`).
+    fn max(self, other: Self) -> Self {
+        Self {
+            complete: self.complete.max(other.complete),
+            incomplete: self.incomplete.max(other.incomplete),
+            downloaded: self.downloaded.max(other.downloaded),
+        }
+    }
+
+    /// The counts of two scrapes of one tracker, when either was answered.
+    fn either(a: anyhow::Result<Self>, b: anyhow::Result<Self>) -> anyhow::Result<Self> {
+        match (a, b) {
+            (Ok(a), Ok(b)) => Ok(a.max(b)),
+            (Ok(a), Err(_)) | (Err(_), Ok(a)) => Ok(a),
+            (Err(e), Err(_)) => Err(e),
+        }
+    }
+}
+
+impl From<tracker_comms_udp::ScrapeResponse> for ScrapeOk {
+    fn from(r: tracker_comms_udp::ScrapeResponse) -> Self {
+        Self {
+            complete: Some(r.complete),
+            incomplete: Some(r.incomplete),
+            downloaded: Some(r.downloaded),
+        }
+    }
+}
+
+/// The outcome of the most recent scrape of a tracker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastScrape {
+    /// When the scrape finished.
+    pub at: SystemTime,
+    pub result: Result<ScrapeOk, String>,
+}
+
+/// One tracker of a torrent and how scraping it last went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackerScrape {
+    /// The announce URL.
+    pub url: String,
+    /// None until the tracker has been scraped.
+    pub last: Option<LastScrape>,
+}
+
+/// When paused torrents scrape their trackers on their own (libtorrent
+/// `session_impl` auto-scrape of `torrent_want_scrape`): each torrent once
+/// every `interval`, and the session no more than once every
+/// `min_interval`, so with many torrents each waits its turn. Clones share
+/// the session's turns: create one per session.
 #[derive(Clone)]
-pub struct TrackerStatus(Arc<tokio::sync::watch::Sender<Vec<TrackerAnnounce>>>);
+pub struct AutoScrape {
+    interval: Duration,
+    min_interval: Duration,
+    last: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl Default for AutoScrape {
+    fn default() -> Self {
+        Self::new(Self::INTERVAL, Self::MIN_INTERVAL)
+    }
+}
+
+impl AutoScrape {
+    /// libtorrent `settings_pack::auto_scrape_interval`.
+    pub const INTERVAL: Duration = Duration::from_secs(1800);
+    /// libtorrent `settings_pack::auto_scrape_min_interval`.
+    pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+    pub fn new(interval: Duration, min_interval: Duration) -> Self {
+        Self {
+            interval,
+            min_interval,
+            last: Default::default(),
+        }
+    }
+
+    /// Runs `scrape` once every interval, each run in the session's next
+    /// turn, until dropped. libtorrent's round robin gives each of `n`
+    /// torrents a scrape every `max(interval, n * min_interval)`; waiting
+    /// out the interval, then queueing (fairly) for a turn spaced
+    /// `min_interval` after the previous one, gives the same.
+    async fn run<F: std::future::Future<Output = ()>>(&self, mut scrape: impl FnMut() -> F) {
+        loop {
+            tokio::time::sleep(self.interval).await;
+            {
+                let mut last = self.last.lock().await;
+                if let Some(at) = *last {
+                    tokio::time::sleep_until(at + self.min_interval).await;
+                }
+                *last = Some(tokio::time::Instant::now());
+            }
+            scrape().await;
+        }
+    }
+}
+
+/// Scrapes a torrent's trackers under every hash it announces.
+struct Scraper {
+    info_hashes: Vec<Id20>,
+    user_agent: String,
+    // In table order, one per URL.
+    trackers: Vec<SupportedTracker>,
+    http_clients: Arc<dyn HttpClients>,
+    reachable: Reachable,
+    udp_client: UdpTrackerClient,
+}
+
+impl Scraper {
+    /// The counts `tracker` gives under any of the torrent's hashes, the
+    /// larger of each when both are answered.
+    async fn scrape(&self, tracker: &SupportedTracker) -> anyhow::Result<ScrapeOk> {
+        let results = futures::future::join_all(
+            self.info_hashes
+                .iter()
+                .map(|info_hash| self.scrape_hash(tracker, *info_hash)),
+        )
+        .await;
+        results
+            .into_iter()
+            .reduce(ScrapeOk::either)
+            .context("the torrent has no hash to scrape")?
+    }
+
+    async fn scrape_hash(
+        &self,
+        tracker: &SupportedTracker,
+        info_hash: Id20,
+    ) -> anyhow::Result<ScrapeOk> {
+        within_completion_timeout(async {
+            match tracker {
+                SupportedTracker::Http(url) => {
+                    self.scrape_http(url, info_hash)
+                        .instrument(trace_span!("http_scrape", tracker = %url))
+                        .await
+                }
+                SupportedTracker::Udp(url) => {
+                    self.scrape_udp(url, info_hash)
+                        .instrument(trace_span!("udp_scrape", tracker = %url))
+                        .await
+                }
+            }
+        })
+        .await
+    }
+
+    async fn scrape_http(&self, tracker_url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
+        let url =
+            tracker_comms_http::scrape_url(tracker_url).context("the tracker offers no scrape")?;
+        let body = tracker_comms_http::get(
+            &*self.http_clients,
+            self.udp_client.resolver(),
+            &self.reachable,
+            &url,
+            Ask::Scrape,
+            &tracker_comms_http::scrape_querystring(&info_hash),
+            &self.user_agent,
+        )
+        .await?;
+        tracker_comms_http::parse_scrape(&body, &info_hash)
+    }
+
+    async fn scrape_udp(&self, url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
+        let (host, port) = (
+            url.host().context("missing host")?,
+            url.port().context("missing port")?,
+        );
+        let scrape = |addr: SocketAddr| async move {
+            self.udp_client
+                .scrape(addr, info_hash)
+                .await
+                .map(ScrapeOk::from)
+        };
+        let addrs =
+            udp_tracker_to_socket_addrs(host, port, self.udp_client.resolver(), &self.reachable)
+                .await?;
+        match addrs {
+            UdpTrackerResolveResult::One(addr) => scrape(addr).await,
+            UdpTrackerResolveResult::Two(v4, v6) => {
+                let (r4, r6) = tokio::join!(scrape(v4.into()), scrape(v6.into()));
+                ScrapeOk::either(r4, r6)
+            }
+        }
+    }
+}
+
+struct StatusShared {
+    announces: tokio::sync::watch::Sender<Vec<TrackerAnnounce>>,
+    scrapes: tokio::sync::watch::Sender<Vec<TrackerScrape>>,
+    scraper: Scraper,
+}
+
+/// The announce table of one [`TrackerComms`]: one entry per tracker it was
+/// started with, in the order given, from the start, and beside it how
+/// scraping each went. Clones share the tables, which stay readable, and
+/// the trackers scrapable, after the tracker task ends.
+#[derive(Clone)]
+pub struct TrackerStatus(Arc<StatusShared>);
 
 impl std::fmt::Debug for TrackerStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("TrackerStatus")
-            .field(&*self.0.borrow())
+            .field(&*self.0.announces.borrow())
             .finish()
     }
 }
 
 impl TrackerStatus {
-    fn new<'a>(urls: impl IntoIterator<Item = &'a Url>) -> Self {
-        let mut announces: Vec<TrackerAnnounce> = Vec::new();
-        for url in urls {
-            let url = url.to_string();
-            if announces.iter().all(|a| a.url != url) {
-                announces.push(TrackerAnnounce {
-                    url,
-                    in_flight: false,
-                    last: None,
-                });
+    fn new<'a>(
+        trackers: impl IntoIterator<Item = &'a SupportedTracker>,
+        info_hashes: Vec<Id20>,
+        identity: &Identity,
+        http_clients: Arc<dyn HttpClients>,
+        reachable: Reachable,
+        udp_client: UdpTrackerClient,
+    ) -> Self {
+        let mut unique: Vec<SupportedTracker> = Vec::new();
+        for tracker in trackers {
+            if !unique.contains(tracker) {
+                unique.push(tracker.clone());
             }
         }
-        Self(Arc::new(tokio::sync::watch::channel(announces).0))
+        let announces = unique
+            .iter()
+            .map(|t| TrackerAnnounce {
+                url: t.url().to_string(),
+                in_flight: false,
+                last: None,
+            })
+            .collect();
+        let scrapes = unique
+            .iter()
+            .map(|t| TrackerScrape {
+                url: t.url().to_string(),
+                last: None,
+            })
+            .collect();
+        Self(Arc::new(StatusShared {
+            announces: tokio::sync::watch::channel(announces).0,
+            scrapes: tokio::sync::watch::channel(scrapes).0,
+            scraper: Scraper {
+                info_hashes,
+                user_agent: identity.user_agent.clone(),
+                trackers: unique,
+                http_clients,
+                reachable,
+                udp_client,
+            },
+        }))
     }
 
     /// A snapshot of the table.
     pub fn announces(&self) -> Vec<TrackerAnnounce> {
-        self.0.borrow().clone()
+        self.0.announces.borrow().clone()
     }
 
     /// Sees every change to the table.
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Vec<TrackerAnnounce>> {
-        self.0.subscribe()
+        self.0.announces.subscribe()
+    }
+
+    /// How scraping each tracker last went, in the table's order.
+    pub fn scrapes(&self) -> Vec<TrackerScrape> {
+        self.0.scrapes.borrow().clone()
+    }
+
+    /// Asks the tracker that last accepted an announce, or the first
+    /// tracker when none has, for the torrent's counts under every hash it
+    /// announces (libtorrent `torrent::scrape_tracker` without an index,
+    /// `torrent::scrape_tracker_impl`). The outcome goes to
+    /// [`Self::scrapes`], and the counts given replace the seeds and
+    /// leechers of the tracker's last accepted announce: libtorrent keeps
+    /// one set of counts per tracker, which announce and scrape replies
+    /// alike overwrite (`torrent::tracker_scrape_response`).
+    pub async fn scrape(&self) -> anyhow::Result<ScrapeOk> {
+        let tracker = self
+            .scrape_target()
+            .context("the torrent has no trackers")?;
+        let result = self.0.scraper.scrape(&tracker).await;
+        self.record_scrape(&tracker, &result);
+        result
+    }
+
+    /// Scrapes on `schedule` until dropped.
+    pub(crate) async fn auto_scrape(&self, schedule: &AutoScrape) {
+        schedule
+            .run(|| async {
+                if let Err(e) = self.scrape().await {
+                    debug!("auto-scrape failed: {e:#}");
+                }
+            })
+            .await
+    }
+
+    /// libtorrent `tracker_list::last_working`, else `tracker_list::first`.
+    fn scrape_target(&self) -> Option<SupportedTracker> {
+        let last_working = self
+            .0
+            .announces
+            .borrow()
+            .iter()
+            .filter_map(|a| {
+                let last = a.last.as_ref()?;
+                last.result.is_ok().then(|| (last.at, a.url.clone()))
+            })
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, url)| url);
+        let trackers = &self.0.scraper.trackers;
+        match last_working {
+            Some(url) => trackers.iter().find(|t| t.url().as_str() == url),
+            None => trackers.first(),
+        }
+        .cloned()
+    }
+
+    fn record_scrape(&self, tracker: &SupportedTracker, result: &anyhow::Result<ScrapeOk>) {
+        let url = tracker.url().as_str();
+        if let Ok(counts) = result {
+            self.0.announces.send_if_modified(|announces| {
+                let Some(accepted) = announces
+                    .iter_mut()
+                    .find(|a| a.url == url)
+                    .and_then(|a| a.last.as_mut())
+                    .and_then(|last| last.result.as_mut().ok())
+                else {
+                    return false;
+                };
+                let before = (accepted.seeders, accepted.leechers);
+                accepted.seeders = counts.complete.or(accepted.seeders);
+                accepted.leechers = counts.incomplete.or(accepted.leechers);
+                before != (accepted.seeders, accepted.leechers)
+            });
+        }
+        let last = LastScrape {
+            at: SystemTime::now(),
+            result: match result {
+                Ok(counts) => Ok(*counts),
+                Err(e) => Err(format!("{e:#}")),
+            },
+        };
+        self.0.scrapes.send_modify(|scrapes| {
+            if let Some(s) = scrapes.iter_mut().find(|s| s.url == url) {
+                s.last = Some(last);
+            }
+        });
     }
 
     /// Marks an announce to `tracker` as sent; the returned guard records how
     /// it ended.
     fn begin(&self, tracker: &SupportedTracker) -> InFlight<'_> {
         let url = tracker.url().to_string();
-        self.0.send_modify(|announces| {
+        self.0.announces.send_modify(|announces| {
             if let Some(a) = announces.iter_mut().find(|a| a.url == url) {
                 a.in_flight = true;
             }
@@ -382,7 +1055,7 @@ impl InFlight<'_> {
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         let last = self.last.take();
-        self.status.0.send_modify(|announces| {
+        self.status.0.announces.send_modify(|announces| {
             if let Some(a) = announces.iter_mut().find(|a| a.url == self.url) {
                 a.in_flight = false;
                 if last.is_some() {
@@ -418,8 +1091,9 @@ impl Default for StoppedAnnounces {
 }
 
 impl StoppedAnnounces {
-    /// How long a `stopped` announce may take by default.
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// How long a `stopped` announce may take by default (libtorrent
+    /// `settings_pack::stop_tracker_timeout`).
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// `timeout` bounds each `stopped` announce.
     pub fn new(timeout: Duration) -> Self {
@@ -467,14 +1141,7 @@ struct StopOnDrop {
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         let running = self.running.take();
-        let trackers: Vec<SupportedTracker> = self
-            .comms
-            .started
-            .lock()
-            .iter()
-            .flatten()
-            .cloned()
-            .collect();
+        let trackers = self.comms.list.lock().stopped();
         if trackers.is_empty() {
             return;
         }
@@ -516,43 +1183,41 @@ enum UdpTrackerResolveResult {
     Two(SocketAddrV4, SocketAddrV6),
 }
 
+/// Where a UDP tracker at `host` is asked: of the addresses the session may
+/// reach (see [`only_reachable`]), the first IPv4 and the first IPv6.
 async fn udp_tracker_to_socket_addrs(
     host: url::Host<&str>,
     port: u16,
     resolver: Option<&dyn Resolver>,
+    reachable: &Reachable,
 ) -> anyhow::Result<UdpTrackerResolveResult> {
-    let res = match host {
-        url::Host::Domain(name) => {
-            // Use the first IPv4 and the first IPv6 addresses only.
-
-            let mut v4: Option<SocketAddrV4> = None;
-            let mut v6: Option<SocketAddrV6> = None;
-            let addrs: Vec<SocketAddr> = match resolver {
-                Some(resolver) => resolver.resolve(name, port).await,
-                None => tokio::net::lookup_host((name, port))
-                    .await
-                    .map(Iterator::collect),
-            }
-            .with_context(|| format!("error looking up hostname {name}"))?;
-            for addr in addrs {
-                match (v4, v6, addr) {
-                    (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
-                    (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
-                    _ => continue,
-                }
-            }
-            let res = match (v4, v6) {
-                (Some(v4), Some(v6)) => UdpTrackerResolveResult::Two(v4, v6),
-                (Some(v4), None) => UdpTrackerResolveResult::One(v4.into()),
-                (None, Some(v6)) => UdpTrackerResolveResult::One(v6.into()),
-                _ => anyhow::bail!("zero addresses returned looking up {name}"),
-            };
-            trace!(?res, "resolved");
-            res
+    let found: Vec<SocketAddr> = match host {
+        url::Host::Domain(name) => match resolver {
+            Some(resolver) => resolver.resolve(name, port).await,
+            None => tokio::net::lookup_host((name, port))
+                .await
+                .map(Iterator::collect),
         }
-        url::Host::Ipv4(addr) => UdpTrackerResolveResult::One((addr, port).into()),
-        url::Host::Ipv6(addr) => UdpTrackerResolveResult::One((addr, port).into()),
+        .with_context(|| format!("error looking up hostname {name}"))?,
+        url::Host::Ipv4(addr) => vec![(addr, port).into()],
+        url::Host::Ipv6(addr) => vec![(addr, port).into()],
     };
+    let mut v4: Option<SocketAddrV4> = None;
+    let mut v6: Option<SocketAddrV6> = None;
+    for addr in only_reachable(found, SocketAddr::ip, reachable)? {
+        match (v4, v6, addr) {
+            (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
+            (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
+            _ => continue,
+        }
+    }
+    let res = match (v4, v6) {
+        (Some(v4), Some(v6)) => UdpTrackerResolveResult::Two(v4, v6),
+        (Some(v4), None) => UdpTrackerResolveResult::One(v4.into()),
+        (None, Some(v6)) => UdpTrackerResolveResult::One(v6.into()),
+        _ => anyhow::bail!("zero addresses returned looking up {host}"),
+    };
+    trace!(?res, "resolved");
     Ok(res)
 }
 
@@ -577,16 +1242,6 @@ fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-fn backoff() -> backon::ExponentialBackoff {
-    ExponentialBuilder::new()
-        .without_max_times()
-        .with_jitter()
-        .with_factor(2.)
-        .with_min_delay(Duration::from_secs(10))
-        .with_max_delay(Duration::from_secs(600))
-        .build()
-}
-
 impl TrackerComms {
     /// Announce to every tracker in `trackers`, each as a tier of its own.
     ///
@@ -599,8 +1254,10 @@ impl TrackerComms {
         trackers: HashSet<Url>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        listen_port: Option<u16>,
-        reqwest_client: reqwest::Client,
+        listen_port: ListenPort,
+        announce_ips: AnnounceIps,
+        http_clients: Arc<dyn HttpClients>,
+        reachable: Reachable,
         udp_client: UdpTrackerClient,
     ) -> Option<TrackerTask> {
         Self::start_with_tiers(
@@ -610,22 +1267,30 @@ impl TrackerComms {
             stats,
             force_interval,
             listen_port,
-            reqwest_client,
+            announce_ips,
+            http_clients,
+            reachable,
             udp_client,
             StoppedAnnounces::default(),
         )
     }
 
     /// Announce to the trackers of a multitracker torrent (BEP 12): one
-    /// tracker per tier at a time, all tiers in parallel. Trackers within a
-    /// tier are tried in random order, failing over to the next one.
+    /// tracker at a time, the first in tier order that works, the trackers
+    /// of each tier in random order (see `TrackerList`). A failing tracker
+    /// is tried again as libtorrent backs off (`retry_delay`).
     ///
-    /// Each tracker is sent `started`, then `completed` once if the torrent
-    /// finishes during this run (see [`TrackerCommsStats::finished_during_run`]),
-    /// and `stopped` when the returned stream is dropped. `stopped` is bounded
+    /// Each tracker is sent `started`, then `completed` if the torrent
+    /// becomes a seed during this run (see
+    /// [`TrackerCommsStats::finished_during_run`]) and no tracker has
+    /// accepted it yet, and `stopped` when the returned stream is dropped. `stopped` is bounded
     /// and tracked by `stopped`. Each regular announce is recorded in the
     /// returned [`TrackerStatus`]. `listen_port` is the port peers reach this
-    /// session on, None when it accepts no connections.
+    /// session on, None when it accepts no connections; when it changes, each
+    /// tier announces it as soon as its tracker's `min interval` allows.
+    /// `announce_ips` gives the addresses each HTTP announce names as ours.
+    /// A tracker, HTTP or UDP, announce or scrape, every hop, is asked only
+    /// at the addresses `reachable` lets through.
     ///
     /// Each of `info_hashes.ids20()` is announced on its own, with its own
     /// events and failover: a hybrid under v1 and the truncated v2, a v2
@@ -638,8 +1303,10 @@ impl TrackerComms {
         tiers: Vec<Vec<Url>>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        listen_port: Option<u16>,
-        reqwest_client: reqwest::Client,
+        listen_port: ListenPort,
+        announce_ips: AnnounceIps,
+        http_clients: Arc<dyn HttpClients>,
+        reachable: Reachable,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
     ) -> Option<TrackerTask> {
@@ -654,7 +1321,7 @@ impl TrackerComms {
                     return None;
                 }
                 trackers.shuffle(&mut rand::rng());
-                Some(Tier::new(trackers))
+                Some(trackers)
             })
             .collect::<Vec<_>>();
         if tiers.is_empty() {
@@ -665,9 +1332,12 @@ impl TrackerComms {
         tracing::trace!(?tiers);
 
         let status = TrackerStatus::new(
-            tiers
-                .iter()
-                .flat_map(|tier| tier.trackers.iter().map(SupportedTracker::url)),
+            tiers.iter().flatten(),
+            info_hashes.ids20().collect(),
+            &identity,
+            http_clients.clone(),
+            reachable.clone(),
+            udp_client.clone(),
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(16);
@@ -685,11 +1355,13 @@ impl TrackerComms {
                     stats: stats.clone(),
                     force_tracker_interval: force_interval,
                     tx: tx.clone(),
-                    announce_port: announced_port(listen_port),
-                    reqwest_client: reqwest_client.clone(),
+                    announce_port: listen_port.clone(),
+                    announce_ips: announce_ips.clone(),
+                    http_clients: http_clients.clone(),
+                    reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
                     key,
-                    started: Mutex::new(vec![None; tiers.len()]),
+                    list: Mutex::new(TrackerList::new(&tiers, Instant::now())),
                     tracker_ids: Default::default(),
                     status: status.clone(),
                 })
@@ -710,10 +1382,8 @@ impl TrackerComms {
             let _stop_on_drop = stop_on_drop;
             let mut futures = FuturesUnordered::new();
             for comms in &comms {
-                for (idx, tier) in tiers.iter().cloned().enumerate() {
-                    let span = debug_span!(parent: None, "tracker_tier", tier = idx, info_hash = ?comms.info_hash);
-                    futures.push(comms.task_tier(idx, tier).instrument(span));
-                }
+                let span = debug_span!(parent: None, "tracker", info_hash = ?comms.info_hash);
+                futures.push(comms.run().instrument(span));
             }
             while !(futures.is_empty()) {
                 tokio::select! {
@@ -737,66 +1407,94 @@ impl TrackerComms {
         })
     }
 
-    async fn task_tier(&self, idx: usize, mut tier: Tier) -> anyhow::Result<()> {
-        let mut state = AnnounceState::default();
-        let mut retry: Option<backon::ExponentialBackoff> = None;
+    /// Announces under this hash until dropped: whatever the tracker list
+    /// says is due, then waits for an answer, for the next tracker to come
+    /// due, or for the torrent to become a seed.
+    async fn run(&self) -> anyhow::Result<()> {
+        let mut in_flight = FuturesUnordered::new();
+        // The torrent became a seed during this run and the list was told
+        // (libtorrent `torrent::completed`, once per transition).
+        let mut completion_seen = false;
+        // The announces carry the port as they go out; a tracker that heard
+        // another is announced to again (see `Entry::port`).
+        let mut port = self.announce_port.clone();
         loop {
             let stats = self.stats.get();
-            let event = state.next_event(&stats);
-            let tracker = tier.current().clone();
-            let in_flight = self.status.begin(&tracker);
-            let result = self.announce(&tracker, event, &stats).await;
-            in_flight.finish(&result);
-            match result {
-                Ok(announced) => {
-                    tier.on_success();
-                    retry = None;
-                    state.on_accepted(event);
-                    if state.started {
-                        self.started.lock()[idx] = Some(tracker);
-                    }
-                    for peer in announced.peers {
-                        self.tx.send(peer).await.context("peer stream closed")?;
-                    }
-
-                    let delay = ReannounceDelay::new(
-                        announced.interval,
-                        announced.min_interval,
-                        self.force_tracker_interval,
-                    );
-                    debug!(?delay, "sleeping after calling tracker");
-                    tokio::time::sleep(delay.floor).await;
-                    let rest = delay.regular - delay.floor;
-                    if state.awaits_completion(&self.stats.get()) {
-                        tokio::select! {
-                            _ = tokio::time::sleep(rest) => {}
-                            _ = self.stats.wait_until_completed() => {
-                                trace!("torrent completed, announcing early");
-                            }
-                        }
-                    } else {
-                        tokio::time::sleep(rest).await;
-                    }
+            let current = *port.borrow_and_update();
+            let due = self.list.lock().start_due(Instant::now(), current, &stats);
+            for (tracker, event) in due {
+                in_flight.push(self.announce_regular(tracker, event, stats));
+            }
+            let next_due = self.list.lock().next_due();
+            let next_due = async {
+                match next_due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
                 }
-                Err(e) => {
-                    debug!(?tracker, "error calling tracker: {e:#}");
-                    let tier_exhausted = tier.on_failure();
-                    if tier.current() != &tracker {
-                        // A different tracker has heard nothing from us yet.
-                        state = AnnounceState::default();
-                        self.started.lock()[idx] = None;
-                    }
-                    if tier_exhausted {
-                        let delay = retry
-                            .get_or_insert_with(backoff)
-                            .next()
-                            .unwrap_or(Duration::from_secs(600));
-                        debug!(retry_in = ?delay, "every tracker in the tier failed");
-                        tokio::time::sleep(delay).await;
+            };
+            tokio::select! {
+                Some((tracker, event, result)) = in_flight.next() => {
+                    self.on_answer(tracker, event, result).await?;
+                }
+                _ = next_due => {}
+                Ok(()) = port.changed() => {
+                    trace!("announce port changed, announcing early");
+                }
+                _ = self.stats.wait_until_completed(), if !completion_seen && may_complete(&stats) => {
+                    completion_seen = true;
+                    if self.stats.get().finished_during_run {
+                        trace!("torrent completed, announcing early");
+                        self.list.lock().completed(Instant::now());
                     }
                 }
             }
         }
+    }
+
+    /// A regular announce, recorded in the status table.
+    async fn announce_regular(
+        &self,
+        tracker: SupportedTracker,
+        event: Option<TrackerRequestEvent>,
+        stats: TrackerCommsStats,
+    ) -> (
+        SupportedTracker,
+        Option<TrackerRequestEvent>,
+        anyhow::Result<Announced>,
+    ) {
+        let in_flight = self.status.begin(&tracker);
+        let result = self.announce(&tracker, event, &stats).await;
+        in_flight.finish(&result);
+        (tracker, event, result)
+    }
+
+    async fn on_answer(
+        &self,
+        tracker: SupportedTracker,
+        event: Option<TrackerRequestEvent>,
+        result: anyhow::Result<Announced>,
+    ) -> anyhow::Result<()> {
+        let now = Instant::now();
+        match result {
+            Ok(announced) => {
+                let delay = ReannounceDelay::new(
+                    announced.interval,
+                    announced.min_interval,
+                    self.force_tracker_interval,
+                );
+                debug!(?tracker, ?delay, "tracker answered");
+                self.list.lock().on_success(&tracker, event, now, &delay);
+                for peer in announced.peers {
+                    self.tx.send(peer).await.context("peer stream closed")?;
+                }
+            }
+            Err(e) => {
+                debug!(?tracker, "error calling tracker: {e:#}");
+                let retry_interval = Refused::retry_interval(&e);
+                self.list.lock().on_failure(&tracker, now, retry_interval);
+            }
+        }
+        Ok(())
     }
 
     async fn announce(
@@ -805,18 +1503,21 @@ impl TrackerComms {
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
-        match tracker {
-            SupportedTracker::Http(url) => {
-                self.announce_http(url, event, stats)
-                    .instrument(trace_span!("http_tracker", tracker = %url))
-                    .await
+        within_completion_timeout(async {
+            match tracker {
+                SupportedTracker::Http(url) => {
+                    self.announce_http(url, event, stats)
+                        .instrument(trace_span!("http_tracker", tracker = %url))
+                        .await
+                }
+                SupportedTracker::Udp(url) => {
+                    self.announce_udp(url, event, stats)
+                        .instrument(trace_span!("udp_tracker", tracker = %url))
+                        .await
+                }
             }
-            SupportedTracker::Udp(url) => {
-                self.announce_udp(url, event, stats)
-                    .instrument(trace_span!("udp_tracker", tracker = %url))
-                    .await
-            }
-        }
+        })
+        .await
     }
 
     async fn announce_http(
@@ -826,13 +1527,16 @@ impl TrackerComms {
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
+        let ips = (self.announce_ips)();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
-            port: self.announce_port,
+            port: announced_port(*self.announce_port.borrow()),
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
             left: stats.announced_left(),
+            corrupt: stats.corrupt_bytes,
+            redundant: stats.redundant_bytes,
             compact: true,
             no_peer_id: false,
             event,
@@ -840,41 +1544,20 @@ impl TrackerComms {
             numwant: numwant(event),
             key: Some(self.key),
             trackerid: trackerid.as_deref(),
+            ips: &ips,
         };
 
-        let mut url = tracker_url.clone();
-
-        let mut queries = request.as_querystring();
-        if let Some(url_query) = url.query() {
-            queries.push_str(&format!("&{}", url_query));
-        }
-        url.set_query(Some(&queries));
-
-        let response: reqwest::Response = self
-            .reqwest_client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, &self.identity.user_agent)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            anyhow::bail!("tracker responded with {:?}", response.status());
-        }
-        let bytes = response.bytes().await?;
-        if let Ok((error, _)) =
-            crate::bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
-        {
-            anyhow::bail!(
-                "tracker returned failure. Failure reason: {}",
-                error.failure_reason
-            )
-        };
-        let response =
-            crate::bencode::from_bytes_with_rest::<tracker_comms_http::TrackerResponse>(&bytes)
-                .map_err(|e| {
-                    tracing::trace!("error deserializing TrackerResponse: {e:#}");
-                    e.into_kind()
-                })?
-                .0;
+        let bytes = tracker_comms_http::get(
+            &*self.http_clients,
+            self.udp_client.resolver(),
+            &self.reachable,
+            tracker_url,
+            Ask::Announce,
+            &request.as_querystring(),
+            &self.identity.user_agent,
+        )
+        .await?;
+        let response = read_answer(&bytes)?;
         if let Some(id) = &response.tracker_id {
             self.tracker_ids
                 .lock()
@@ -883,8 +1566,8 @@ impl TrackerComms {
 
         Ok(Announced {
             peers: response.iter_peers().collect(),
-            interval: Duration::from_secs(response.interval),
-            min_interval: response.min_interval.map(Duration::from_secs),
+            interval: response.interval,
+            min_interval: response.min_interval,
             seeders: response.complete.map(saturating_u32),
             leechers: response.incomplete.map(saturating_u32),
         })
@@ -900,9 +1583,14 @@ impl TrackerComms {
             url.host().context("missing host")?,
             url.port().context("missing port")?,
         );
-        let addrs = udp_tracker_to_socket_addrs(host.clone(), port, self.udp_client.resolver())
-            .instrument(trace_span!("resolve", ?host))
-            .await?;
+        let addrs = udp_tracker_to_socket_addrs(
+            host.clone(),
+            port,
+            self.udp_client.resolver(),
+            &self.reachable,
+        )
+        .instrument(trace_span!("resolve", ?host))
+        .await?;
 
         match addrs {
             UdpTrackerResolveResult::One(addr) => {
@@ -946,7 +1634,7 @@ impl TrackerComms {
             event: udp_event(event),
             key: self.key,
             num_want: numwant(event),
-            port: self.announce_port,
+            port: announced_port(*self.announce_port.borrow()),
         };
 
         match self.udp_client.announce(addr, request).await {
@@ -954,9 +1642,11 @@ impl TrackerComms {
                 trace!(len = response.addrs.len(), "received announce response");
                 Ok(Announced {
                     peers: response.addrs,
-                    // UDP trackers (BEP 15) send only an interval.
-                    interval: Duration::from_secs(response.interval.max(5) as u64),
-                    min_interval: None,
+                    // UDP trackers (BEP 15) send only an interval; libtorrent
+                    // takes 60 s as the min interval
+                    // (`udp_tracker_connection::on_announce_response`).
+                    interval: Duration::from_secs(response.interval.into()),
+                    min_interval: UDP_MIN_INTERVAL,
                     seeders: Some(response.seeders),
                     leechers: Some(response.leechers),
                 })
@@ -972,7 +1662,7 @@ impl TrackerComms {
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -982,20 +1672,24 @@ mod tests {
 
     use crate::core::{
         hash_id::{Id20, Id32, InfoHashes},
-        net::{DatagramSocket, Resolver},
+        net::{DatagramSocket, HttpClients, HttpTarget, Resolver},
     };
     use futures::{FutureExt, StreamExt, future::BoxFuture};
     use parking_lot::Mutex;
     use tokio_util::sync::CancellationToken;
     use url::Url;
 
+    use tokio::time::Instant;
+
     use super::{
-        AnnounceOk, AnnounceState, ReannounceDelay, StoppedAnnounces, SupportedTracker, Tier,
-        TrackerAnnounce, TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerTask,
-        UdpTrackerResolveResult, udp_tracker_to_socket_addrs,
+        AnnounceOk, AutoScrape, MIN_ANNOUNCE_INTERVAL, Reachable, ReannounceDelay, Refused,
+        ScrapeOk, StoppedAnnounces, SupportedTracker, TrackerAnnounce, TrackerComms,
+        TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape, TrackerTask,
+        UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
+        udp_tracker_to_socket_addrs,
     };
     use crate::Identity;
-    use crate::tracker::tracker_comms_http::TrackerRequestEvent;
+    use crate::tracker::tracker_comms_http::{MAX_INTERVAL, TrackerRequestEvent};
     use crate::tracker::tracker_comms_udp::{
         ACTION_CONNECT, CONNECTION_ID_MAGIC, UdpTrackerClient,
     };
@@ -1004,106 +1698,232 @@ mod tests {
         SupportedTracker::Http(Url::parse(&format!("http://{name}/announce")).unwrap())
     }
 
-    #[test]
-    fn test_tier_fails_over_and_promotes_the_tracker_that_answers() {
-        let mut tier = Tier::new(vec![http("a"), http("b"), http("c")]);
-        assert_eq!(tier.current(), &http("a"));
-
-        // a fails, b fails, c answers: c moves to the front.
-        assert!(!tier.on_failure());
-        assert_eq!(tier.current(), &http("b"));
-        assert!(!tier.on_failure());
-        assert_eq!(tier.current(), &http("c"));
-        tier.on_success();
-        assert_eq!(tier.trackers, vec![http("c"), http("a"), http("b")]);
-        assert_eq!(tier.current(), &http("c"));
-
-        // While c keeps answering it stays the tier's tracker.
-        tier.on_success();
-        assert_eq!(tier.current(), &http("c"));
-
-        // Every tracker failing in turn exhausts the tier and starts over.
-        assert!(!tier.on_failure());
-        assert!(!tier.on_failure());
-        assert!(tier.on_failure());
-        assert_eq!(tier.current(), &http("c"));
-    }
-
-    #[test]
-    fn test_single_tracker_tier_is_exhausted_by_every_failure() {
-        let mut tier = Tier::new(vec![http("a")]);
-        assert!(tier.on_failure());
-        assert!(tier.on_failure());
-        assert_eq!(tier.current(), &http("a"));
-    }
-
     fn live(downloaded: u64, left: u64, finished_during_run: bool) -> TrackerCommsStats {
         TrackerCommsStats {
             uploaded_bytes: 0,
             downloaded_bytes: downloaded,
+            corrupt_bytes: 0,
+            redundant_bytes: 0,
             left_bytes: Some(left),
             torrent_state: TrackerCommsStatsState::Live,
             finished_during_run,
         }
     }
 
-    #[test]
-    fn test_completed_is_sent_once_after_finishing_during_the_run() {
-        let mut state = AnnounceState::default();
-        let downloading = live(10, 90, false);
-        assert_eq!(
-            state.next_event(&downloading),
-            Some(TrackerRequestEvent::Started)
-        );
-        state.on_accepted(Some(TrackerRequestEvent::Started));
-        assert_eq!(state.next_event(&downloading), None);
-        assert!(state.awaits_completion(&downloading));
+    fn list(tiers: &[&[&str]], now: Instant) -> TrackerList {
+        let tiers = tiers
+            .iter()
+            .map(|tier| tier.iter().map(|name| http(name)).collect())
+            .collect::<Vec<_>>();
+        TrackerList::new(&tiers, now)
+    }
 
-        let finished = live(100, 0, true);
-        assert!(state.awaits_completion(&finished));
-        assert_eq!(
-            state.next_event(&finished),
-            Some(TrackerRequestEvent::Completed)
-        );
-        state.on_accepted(Some(TrackerRequestEvent::Completed));
-        assert_eq!(state.next_event(&finished), None);
-        assert!(!state.awaits_completion(&finished));
+    fn order(list: &TrackerList) -> Vec<SupportedTracker> {
+        list.entries.iter().map(|e| e.tracker.clone()).collect()
+    }
+
+    /// A tracker's answer: re-announce in 30 minutes, no `min interval`.
+    const ANSWERED: ReannounceDelay = ReannounceDelay {
+        floor: Duration::ZERO,
+        regular: Duration::from_secs(1800),
+    };
+
+    const STARTED: Option<TrackerRequestEvent> = Some(TrackerRequestEvent::Started);
+    const COMPLETED: Option<TrackerRequestEvent> = Some(TrackerRequestEvent::Completed);
+
+    #[test]
+    fn a_failing_tracker_backs_off_as_libtorrent_does() {
+        // libtorrent announce_infohash::failed with tracker_backoff 250.
+        let s = Duration::from_secs;
+        let delays = (1..=5)
+            .map(|fails| retry_delay(fails, Duration::ZERO))
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [s(17), s(55), s(117), s(205), s(317)]);
+        assert_eq!(retry_delay(16, Duration::ZERO), s(3205));
+        assert_eq!(retry_delay(17, Duration::ZERO), s(3600));
+        assert_eq!(retry_delay(127, Duration::ZERO), s(3600));
+        // The interval of the failed answer holds the retry off longer.
+        assert_eq!(retry_delay(1, s(1800)), s(1800));
+        assert_eq!(retry_delay(16, s(300)), s(3205));
     }
 
     #[test]
-    fn test_completed_is_retried_until_accepted() {
-        let mut state = AnnounceState::default();
-        state.on_accepted(Some(TrackerRequestEvent::Started));
-        let finished = live(100, 0, true);
-        // The completed announce failed: nothing was accepted.
+    fn a_refused_answer_is_retried_no_sooner_than_its_interval() {
+        // libtorrent http_tracker_connection::on_response and
+        // tracker_connection::fail_impl.
+        let s = Duration::from_secs;
+        let e = read_answer(b"d14:failure reason4:nopee").unwrap_err();
+        assert!(format!("{e:#}").contains("nope"), "{e:#}");
+        assert_eq!(Refused::retry_interval(&e), s(1800));
+        let e = read_answer(b"d14:failure reason4:nope8:intervali3600ee").unwrap_err();
+        assert_eq!(Refused::retry_interval(&e), s(3600));
+        // Raised to the minimum announce interval.
+        let e = read_answer(b"d14:failure reason4:nope8:intervali60ee").unwrap_err();
+        assert_eq!(Refused::retry_interval(&e), MIN_ANNOUNCE_INTERVAL);
+        // An answer that does not parse takes the default interval.
+        let e = read_answer(b"not bencode").unwrap_err();
+        assert_eq!(Refused::retry_interval(&e), s(1800));
+        // A tracker that never answered gives no interval.
+        let e = anyhow::anyhow!("connection refused");
+        assert_eq!(Refused::retry_interval(&e), Duration::ZERO);
+        assert!(read_answer(b"d8:intervali1800e5:peers0:e").is_ok());
+    }
+
+    #[test]
+    fn an_interval_too_long_to_reckon_with_is_the_longest_libtorrent_holds() {
+        // libtorrent keeps a tracker's intervals as seconds32
+        // (parse_tracker_response); torrent::tracker_response adds them to
+        // the time of the answer.
+        let t0 = Instant::now();
+        for secs in [u64::MAX, i64::MAX as u64] {
+            let answer =
+                format!("d8:intervali{secs}e12:min intervali{secs}e5:peers0:e").into_bytes();
+            let response = read_answer(&answer).unwrap();
+            assert_eq!(
+                (response.interval, response.min_interval),
+                (MAX_INTERVAL, MAX_INTERVAL)
+            );
+            let mut list = list(&[&["a"]], t0);
+            list.start_due(t0, None, &live(0, 90, false));
+            let delay = ReannounceDelay::new(response.interval, response.min_interval, None);
+            list.on_success(&http("a"), STARTED, t0, &delay);
+            assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL));
+
+            let refusal = format!("d14:failure reason4:nope8:intervali{secs}ee").into_bytes();
+            let retry = Refused::retry_interval(&read_answer(&refusal).unwrap_err());
+            assert_eq!(retry, MAX_INTERVAL);
+            list.start_due(t0 + MAX_INTERVAL, None, &live(0, 90, false));
+            list.on_failure(&http("a"), t0 + MAX_INTERVAL, retry);
+            assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL + MAX_INTERVAL));
+        }
+    }
+
+    #[test]
+    fn an_http_answer_naming_no_interval_takes_libtorrents_defaults() {
+        // libtorrent parse_tracker_response: interval 1800 s, min interval
+        // 30 s; an answer that names neither is still an answer.
+        let s = Duration::from_secs;
+        let response = read_answer(b"d5:peers0:e").unwrap();
+        assert_eq!((response.interval, response.min_interval), (s(1800), s(30)));
+        let response = read_answer(b"d8:intervali900e5:peers0:e").unwrap();
+        assert_eq!((response.interval, response.min_interval), (s(900), s(30)));
+        let response = read_answer(b"d12:min intervali0e5:peers0:e").unwrap();
+        assert_eq!((response.interval, response.min_interval), (s(1800), s(0)));
+    }
+
+    #[test]
+    fn one_tracker_is_announced_to_at_a_time_tier_by_tier() {
+        // libtorrent torrent::announce_with_tracker with neither
+        // announce_to_all_tiers nor announce_to_all_trackers.
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut list = list(&[&["a", "b"], &["c"]], t0);
+        let stats = live(0, 90, false);
+
+        // Only the first tracker of the first tier is announced to, and
+        // nothing more while it waits for its answer.
+        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        assert_eq!(list.start_due(t0, None, &stats), []);
+        assert_eq!(list.next_due(), None);
+
+        // a fails: it backs off to the end of its tier, b is tried at once.
+        list.on_failure(&http("a"), t0, Duration::ZERO);
+        assert_eq!(order(&list), [http("b"), http("a"), http("c")]);
+        assert_eq!(list.start_due(t0, None, &stats), [(http("b"), STARTED)]);
+
+        // b fails too: only now is the next tier tried.
+        list.on_failure(&http("b"), t0, Duration::ZERO);
+        assert_eq!(order(&list), [http("a"), http("b"), http("c")]);
+        assert_eq!(list.start_due(t0, None, &stats), [(http("c"), STARTED)]);
+        list.on_success(&http("c"), STARTED, t0, &ANSWERED);
+        assert_eq!(list.start_due(t0, None, &stats), []);
+
+        // The failing trackers come due after their back-off; c, which
+        // works, is not due yet.
+        assert_eq!(list.next_due(), Some(t0 + s(17)));
+        let t1 = t0 + s(17);
         assert_eq!(
-            state.next_event(&finished),
-            Some(TrackerRequestEvent::Completed)
+            list.start_due(t1, None, &stats),
+            [(http("a"), STARTED), (http("b"), STARTED)]
         );
+
+        // a answers and b fails again, backing off longer. a works and comes
+        // first, so neither b nor c is announced to while it keeps working.
+        list.on_success(&http("a"), STARTED, t1, &ANSWERED);
+        list.on_failure(&http("b"), t1, Duration::ZERO);
+        assert_eq!(list.entries[1].next_announce, t1 + s(55));
+        assert_eq!(list.start_due(t0 + s(1800), None, &stats), []);
+        assert_eq!(list.next_due(), Some(t1 + s(1800)));
         assert_eq!(
-            state.next_event(&finished),
-            Some(TrackerRequestEvent::Completed)
+            list.start_due(t1 + s(1800), None, &stats),
+            [(http("a"), None)]
         );
     }
 
     #[test]
-    fn test_no_completed_for_a_torrent_complete_from_the_start() {
-        let mut state = AnnounceState::default();
+    fn the_tracker_in_use_hears_completed_at_once_and_only_once() {
+        // libtorrent tracker_list::completed, announce_infohash::can_announce
+        // and torrent::send_tracker_request.
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut list = list(&[&["a"], &["b"]], t0);
+        assert_eq!(
+            list.start_due(t0, None, &live(0, 90, false)),
+            [(http("a"), STARTED)]
+        );
+        let delay = ReannounceDelay {
+            floor: s(900),
+            regular: s(1800),
+        };
+        list.on_success(&http("a"), STARTED, t0, &delay);
+
+        // The torrent becomes a seed: a is due at once, inside its min
+        // interval, with `completed`.
+        let seed = live(90, 0, true);
+        let t1 = t0 + s(10);
+        assert_eq!(list.start_due(t1, None, &seed), []);
+        list.completed(t1);
+        assert_eq!(list.start_due(t1, None, &seed), [(http("a"), COMPLETED)]);
+
+        // Refused, a backs off, and b, the first tracker after it that
+        // works, is asked at once.
+        list.on_failure(&http("a"), t1, Duration::ZERO);
+        assert_eq!(list.start_due(t1, None, &seed), [(http("b"), STARTED)]);
+        list.on_success(&http("b"), STARTED, t1, &delay);
+
+        // a is retried with `completed` after its back-off; b, which
+        // works, waits for its interval.
+        let t2 = t1 + s(17);
+        assert_eq!(list.start_due(t2, None, &seed), [(http("a"), COMPLETED)]);
+        list.on_success(&http("a"), COMPLETED, t2, &delay);
+
+        // Once a tracker accepted it, no other is sent `completed`, and a,
+        // working again, is the one announced to.
+        assert_eq!(list.event(&list.entries[1], &seed), None);
+        assert_eq!(
+            list.start_due(t2 + s(1800), None, &seed),
+            [(http("a"), None)]
+        );
+    }
+
+    #[test]
+    fn a_torrent_complete_from_the_start_never_sends_completed() {
+        let t0 = Instant::now();
+        let mut list = list(&[&["a"]], t0);
         let seeding = live(0, 0, false);
-        assert_eq!(
-            state.next_event(&seeding),
-            Some(TrackerRequestEvent::Started)
-        );
-        state.on_accepted(Some(TrackerRequestEvent::Started));
-        assert_eq!(state.next_event(&seeding), None);
-        assert!(!state.awaits_completion(&seeding));
+        assert!(!may_complete(&seeding));
+        assert_eq!(list.start_due(t0, None, &seeding), [(http("a"), STARTED)]);
+        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        let t1 = t0 + ANSWERED.regular;
+        assert_eq!(list.start_due(t1, None, &seeding), [(http("a"), None)]);
     }
 
     #[test]
     fn test_waits_for_completion_before_the_torrent_is_live() {
-        let state = AnnounceState::default();
         // A magnet still resolving its metadata: nothing is known yet.
-        assert!(state.awaits_completion(&TrackerCommsStats::default()));
+        assert!(may_complete(&TrackerCommsStats::default()));
+        assert!(may_complete(&live(0, 90, false)));
+        assert!(may_complete(&live(90, 0, true)));
     }
 
     #[test]
@@ -1117,19 +1937,45 @@ mod tests {
     }
 
     #[test]
-    fn test_stopped_resets_what_the_tracker_was_told() {
-        let mut state = AnnounceState::default();
-        state.on_accepted(Some(TrackerRequestEvent::Started));
-        state.on_accepted(Some(TrackerRequestEvent::Completed));
-        state.on_accepted(Some(TrackerRequestEvent::Stopped));
-        assert_eq!(state, AnnounceState::default());
+    fn stopped_goes_to_the_trackers_announced_to_that_heard_started() {
+        // libtorrent torrent::stop_announcing: the walk with event stopped
+        // skips every tracker that never accepted `started`.
+        let t0 = Instant::now();
+        let mut list = list(&[&["a", "b"], &["c"]], t0);
+        let stats = live(0, 90, false);
+        assert_eq!(list.stopped(), []);
+
+        list.start_due(t0, None, &stats);
+        // Not yet accepted: nothing is owed.
+        assert_eq!(list.stopped(), []);
+        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        assert_eq!(list.stopped(), [http("a")]);
+
+        // a fails and b takes over: until b accepts `started`, a, failing,
+        // is still owed `stopped`.
+        list.on_failure(&http("a"), t0, Duration::ZERO);
+        assert_eq!(list.start_due(t0, None, &stats), [(http("b"), STARTED)]);
+        assert_eq!(list.stopped(), [http("a")]);
+        // Then b, the tracker in use, is.
+        list.on_success(&http("b"), STARTED, t0, &ANSWERED);
+        assert_eq!(list.stopped(), [http("b")]);
+    }
+
+    #[test]
+    fn a_tracker_named_twice_is_kept_where_first_named() {
+        let list = list(&[&["a", "b"], &["a", "c"]], Instant::now());
+        assert_eq!(order(&list), [http("a"), http("b"), http("c")]);
+        assert_eq!(
+            list.entries.iter().map(|e| e.tier).collect::<Vec<_>>(),
+            [0, 0, 1]
+        );
     }
 
     #[test]
     fn test_min_interval_is_a_floor() {
         let s = Duration::from_secs;
         assert_eq!(
-            ReannounceDelay::new(s(1800), Some(s(900)), None),
+            ReannounceDelay::new(s(1800), s(900), None),
             ReannounceDelay {
                 floor: s(900),
                 regular: s(1800)
@@ -1137,7 +1983,7 @@ mod tests {
         );
         // A forced interval below the tracker's min interval is raised to it.
         assert_eq!(
-            ReannounceDelay::new(s(1800), Some(s(900)), Some(s(60))),
+            ReannounceDelay::new(s(1800), s(900), Some(s(60))),
             ReannounceDelay {
                 floor: s(900),
                 regular: s(900)
@@ -1145,19 +1991,151 @@ mod tests {
         );
         // An interval below min interval is raised too.
         assert_eq!(
-            ReannounceDelay::new(s(60), Some(s(120)), None),
+            ReannounceDelay::new(s(600), s(900), None),
             ReannounceDelay {
-                floor: s(120),
-                regular: s(120)
+                floor: s(900),
+                regular: s(900)
             }
         );
         assert_eq!(
-            ReannounceDelay::new(s(1800), None, Some(s(60))),
+            ReannounceDelay::new(s(1800), Duration::ZERO, Some(s(60))),
             ReannounceDelay {
                 floor: s(0),
                 regular: s(60)
             }
         );
+    }
+
+    #[test]
+    fn a_tracker_interval_is_never_below_the_minimum_announce_interval() {
+        // libtorrent min_announce_interval, for the interval of either
+        // transport: 0 would be a tight loop.
+        let s = Duration::from_secs;
+        for interval in [s(0), s(5), s(299)] {
+            assert_eq!(
+                ReannounceDelay::new(interval, Duration::ZERO, None).regular,
+                MIN_ANNOUNCE_INTERVAL
+            );
+        }
+        assert_eq!(
+            ReannounceDelay::new(s(301), Duration::ZERO, None).regular,
+            s(301)
+        );
+        // The session's forced interval is its own choice, not the tracker's.
+        assert_eq!(
+            ReannounceDelay::new(s(0), Duration::ZERO, Some(s(60))).regular,
+            s(60)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tracker_answer_that_outlasts_the_completion_timeout_fails() {
+        // A request that never ends: a tracker trickling bytes, each within
+        // the receive timeout, or a UDP exchange retried without end.
+        let start = tokio::time::Instant::now();
+        let e = super::within_completion_timeout(std::future::pending::<anyhow::Result<()>>())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("did not answer"), "{e:#}");
+        assert!(start.elapsed() >= super::COMPLETION_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_http_tracker_fails_the_announce() {
+        // Accepts the connection (the backlog does) and never answers.
+        let (_listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a[0].last.is_some()) => r.unwrap(),
+        };
+        let error = status.announces()[0]
+            .last
+            .clone()
+            .unwrap()
+            .result
+            .unwrap_err();
+        assert!(error.contains("sent nothing"), "{error}");
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    /// A torrent that names none of its own addresses.
+    fn no_ips() -> super::AnnounceIps {
+        Arc::new(Vec::new)
+    }
+
+    /// The session reaches every address.
+    fn reach_all() -> Reachable {
+        Arc::new(|_| Ok(()))
+    }
+
+    /// The session's rule for one with `blocked` on its blocklist, and no
+    /// IPv6 when `ipv4_only`.
+    fn reach_but(blocked: Vec<IpAddr>, ipv4_only: bool) -> Reachable {
+        Arc::new(move |ip: IpAddr| {
+            if ipv4_only && ip.is_ipv6() {
+                Err(Unreachable::Family)
+            } else if blocked.contains(&ip) {
+                Err(Unreachable::Filtered)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn an_http_announce_names_our_addresses_as_they_are_when_it_goes_out() {
+        // BEP 7; libtorrent torrent::build_tracker_request reads the listen
+        // sockets per request.
+        let (listener, url) = http_listener().await;
+        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        let ips = Arc::new(Mutex::new(vec![std::net::IpAddr::from([198, 51, 100, 7])]));
+        let announce_ips: super::AnnounceIps = {
+            let ips = ips.clone();
+            Arc::new(move || ips.lock().clone())
+        };
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            listen_port,
+            announce_ips,
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            StoppedAnnounces::default(),
+        )
+        .unwrap()
+        .peers;
+        let first = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&first, "ipv4"), Some("198.51.100.7"));
+        assert_eq!(query_param(&first, "ipv6"), None);
+
+        *ips.lock() = vec!["2001:db8::1".parse().unwrap()];
+        port.send_replace(Some(40001));
+        let second = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&second, "ipv4"), None);
+        assert_eq!(query_param(&second, "ipv6"), Some("2001%3Adb8%3A%3A1"));
+        drop(peers);
+        token.cancel();
     }
 
     fn v1_hash() -> InfoHashes {
@@ -1189,8 +2167,10 @@ mod tests {
             vec![vec![url]],
             Box::new(()),
             None,
-            Some(6881),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -1244,6 +2224,28 @@ mod tests {
     async fn next_announce(listener: &tokio::net::TcpListener) -> String {
         let (conn, query) = read_announce(listener).await;
         respond(conn, "d8:intervali1800e5:peers0:e").await;
+        query
+    }
+
+    /// The one peer [`answer_with_a_peer`] has the tracker name.
+    fn the_peer() -> SocketAddr {
+        (Ipv4Addr::LOCALHOST, 0x1a41).into()
+    }
+
+    /// Answers the next announce with `body`, which names [`the_peer`], and
+    /// waits for that peer on the stream: the answer has been taken in.
+    /// Returns the announce's query string.
+    async fn answer_with_a_peer(
+        listener: &tokio::net::TcpListener,
+        peers: &mut (impl futures::Stream<Item = SocketAddr> + Unpin),
+        body: &str,
+    ) -> String {
+        let (conn, query) = tokio::select! {
+            _ = peers.next() => panic!("a peer came before the tracker was asked"),
+            r = read_announce(listener) => r,
+        };
+        respond(conn, body).await;
+        assert_eq!(peers.next().await, Some(the_peer()));
         query
     }
 
@@ -1304,6 +2306,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_port_that_changes_is_announced_without_waiting_out_the_interval() {
+        // libtorrent session_impl::queue_tracker_request reads the listen
+        // port per request. The tracker's interval is 1800 s on the real
+        // clock, so only the port change brings the second announce.
+        let (listener, url) = http_listener().await;
+        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            listen_port,
+            no_ips(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            StoppedAnnounces::default(),
+        )
+        .unwrap()
+        .peers;
+        let first = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&first, "port"), Some("6881"));
+        assert_eq!(query_param(&first, "event"), Some("started"));
+        port.send_replace(Some(40001));
+        let second = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&second, "port"), Some("40001"));
+        assert_eq!(query_param(&second, "event"), None);
+        drop(peers);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_http_announce_reports_the_bytes_that_failed_their_hash_and_the_bytes_we_did_not_need()
+     {
+        // libtorrent torrent::build_tracker_request sends
+        // m_total_failed_bytes as `corrupt` and m_total_redundant_bytes as
+        // `redundant`, read per announce (http_tracker_connection::start).
+        let (listener, url) = http_listener().await;
+        let stats = Arc::new(ManualStats {
+            stats: Mutex::new(TrackerCommsStats {
+                corrupt_bytes: 16384,
+                redundant_bytes: 5,
+                ..live(0, 90, false)
+            }),
+            completed: tokio::sync::watch::channel(false).0,
+        });
+        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(stats.clone()),
+            None,
+            listen_port,
+            no_ips(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            StoppedAnnounces::default(),
+        )
+        .unwrap()
+        .peers;
+        let first = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&first, "corrupt"), Some("16384"));
+        assert_eq!(query_param(&first, "redundant"), Some("5"));
+        *stats.stats.lock() = TrackerCommsStats {
+            corrupt_bytes: 32768,
+            redundant_bytes: 21,
+            ..live(0, 90, false)
+        };
+        port.send_replace(Some(40001));
+        let second = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&second, "corrupt"), Some("32768"));
+        assert_eq!(query_param(&second, "redundant"), Some("21"));
+        drop(peers);
+        token.cancel();
+    }
+
+    #[tokio::test]
     async fn test_http_tracker_hears_started_completed_and_stopped() {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1330,8 +2434,10 @@ mod tests {
             vec![vec![tracker]],
             Box::new(stats.clone()),
             None,
-            Some(6881),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -1348,7 +2454,16 @@ mod tests {
             };
         }
 
-        let q = announce!();
+        // The torrent completes only once `started` is answered: an answer
+        // that comes in after it completed puts the next announce, and with
+        // it `completed`, an interval away (libtorrent
+        // torrent::tracker_response).
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
         assert_eq!(query_param(&q, "event"), Some("started"));
         assert_eq!(query_param(&q, "downloaded"), Some("0"));
         assert_eq!(query_param(&q, "left"), Some("90"));
@@ -1395,12 +2510,14 @@ mod tests {
             vec![vec![url]],
             Box::new(()),
             None,
-            Some(6881),
-            reqwest::Client::builder()
-                .no_proxy()
-                .user_agent("Session/1.0")
-                .build()
-                .unwrap(),
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(|| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .user_agent("Session/1.0")
+            }),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -1458,8 +2575,10 @@ mod tests {
             vec![vec![url]],
             Box::new(stats.clone()),
             None,
-            Some(6881),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -1480,7 +2599,12 @@ mod tests {
             };
         }
 
-        let q = announce!("d8:intervali1800e5:peers0:10:tracker id3:t-1e");
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aA10:tracker id3:t-1e",
+        )
+        .await;
         assert_eq!(query_param(&q, "event"), Some("started"));
         assert_eq!(query_param(&q, "numwant"), Some("200"));
         assert_eq!(query_param(&q, "trackerid"), None);
@@ -1518,8 +2642,10 @@ mod tests {
             vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]],
             Box::new(()),
             None,
-            Some(6881),
-            reqwest::Client::new(),
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(reqwest::Client::builder),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -1558,8 +2684,10 @@ mod tests {
             tiers,
             Box::new(()),
             None,
-            Some(6881),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -1580,7 +2708,7 @@ mod tests {
         let (err, err_url) = http_listener().await;
         let stopped = StoppedAnnounces::default();
         let (task, token) =
-            start(vec![vec![ok_url.clone()], vec![err_url.clone()]], &stopped).await;
+            start(vec![vec![err_url.clone()], vec![ok_url.clone()]], &stopped).await;
         let TrackerTask { mut peers, status } = task;
 
         // Every tracker is listed before any announce goes out.
@@ -1589,7 +2717,7 @@ mod tests {
             in_flight: false,
             last: None,
         };
-        assert_eq!(status.announces(), vec![never(&ok_url), never(&err_url)]);
+        assert_eq!(status.announces(), vec![never(&err_url), never(&ok_url)]);
 
         // Drive the peer stream while the trackers are called.
         macro_rules! driving {
@@ -1601,21 +2729,24 @@ mod tests {
             };
         }
 
-        let ((ok_conn, _), (err_conn, _)) =
-            driving!(async { tokio::join!(read_announce(&ok), read_announce(&err)) });
+        // The first tier's tracker alone is asked, and refuses.
+        let (err_conn, _) = driving!(read_announce(&err));
         let announces = status.announces();
-        for url in [&ok_url, &err_url] {
-            let a = announce_of(&announces, url);
-            assert!(a.in_flight, "{url} should be in flight");
-            assert_eq!(a.last, None);
-        }
+        assert!(announce_of(&announces, &err_url).in_flight);
+        assert_eq!(announce_of(&announces, &ok_url), &never(&ok_url));
+        respond(err_conn, "d14:failure reason4:nopee").await;
 
+        // With the first tier failing, the next tier's is asked.
+        let (ok_conn, _) = driving!(read_announce(&ok));
+        let announces = status.announces();
+        let a = announce_of(&announces, &ok_url);
+        assert!(a.in_flight);
+        assert_eq!(a.last, None);
         respond(
             ok_conn,
             "d8:completei3e10:incompletei5e8:intervali1800e12:min intervali900e5:peers0:e",
         )
         .await;
-        respond(err_conn, "d14:failure reason4:nopee").await;
         let mut rx = status.subscribe();
         driving!(
             rx.wait_for(|announces| announces.iter().all(|a| !a.in_flight && a.last.is_some()))
@@ -1631,7 +2762,7 @@ mod tests {
                 .result,
             Ok(AnnounceOk {
                 interval: Duration::from_secs(1800),
-                min_interval: Some(Duration::from_secs(900)),
+                min_interval: Duration::from_secs(900),
                 seeders: Some(3),
                 leechers: Some(5),
             })
@@ -1679,6 +2810,403 @@ mod tests {
         );
         // `started` was never accepted, so no `stopped` is owed.
         stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    /// A scrape reply giving `entry` as the counts of the tests' torrent.
+    fn scrape_body(entry: &str) -> String {
+        format!("d5:filesd20:{}{entry}ee", "\u{1}".repeat(20))
+    }
+
+    #[tokio::test]
+    async fn scrape_asks_the_tracker_that_last_answered_and_keeps_its_counts() {
+        let (ok, ok_url) = http_listener().await;
+        let (err, err_url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) =
+            start(vec![vec![err_url.clone()], vec![ok_url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        assert_eq!(
+            status.scrapes(),
+            vec![
+                TrackerScrape {
+                    url: err_url.to_string(),
+                    last: None,
+                },
+                TrackerScrape {
+                    url: ok_url.to_string(),
+                    last: None,
+                },
+            ]
+        );
+
+        // `err` refuses the announce, then `ok` accepts it with counts.
+        let ok_conn = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            conn = async {
+                let (err_conn, _) = read_announce(&err).await;
+                respond(err_conn, "d14:failure reason4:nopee").await;
+                read_announce(&ok).await.0
+            } => conn,
+        };
+        respond(
+            ok_conn,
+            "d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e",
+        )
+        .await;
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a.iter().all(|a| !a.in_flight && a.last.is_some())) => r.unwrap(),
+        };
+        // The run ends; the table stays scrapable.
+        drop(peers);
+        let q = next_announce(&ok).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+
+        // The scrape goes to `ok`, at its scrape URL, for the torrent's hash.
+        let tracker = async {
+            let (conn, request) = read_request(&ok).await;
+            let target = request.split(' ').nth(1).unwrap().to_owned();
+            respond(
+                conn,
+                &scrape_body("d8:completei7e10:downloadedi40e10:incompletei1ee"),
+            )
+            .await;
+            target
+        };
+        let (counts, target) = tokio::join!(status.scrape(), tracker);
+        assert_eq!(target, format!("/scrape?info_hash={}", "%01".repeat(20)));
+        let counts = counts.unwrap();
+        assert_eq!(
+            counts,
+            ScrapeOk {
+                complete: Some(7),
+                incomplete: Some(1),
+                downloaded: Some(40),
+            }
+        );
+        let scrapes = status.scrapes();
+        assert_eq!(scrapes[1].last.as_ref().unwrap().result, Ok(counts));
+        assert_eq!(scrapes[0].last, None);
+
+        // The tracker's counts are the scrape's now.
+        let announces = status.announces();
+        let accepted = announce_of(&announces, &ok_url)
+            .last
+            .as_ref()
+            .unwrap()
+            .result
+            .clone()
+            .unwrap();
+        assert_eq!((accepted.seeders, accepted.leechers), (Some(7), Some(1)));
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn scrape_without_an_answered_announce_asks_the_first_tracker() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        // Never polled: nothing was announced.
+        let TrackerTask { peers, status } = task;
+        drop(peers);
+
+        let tracker = async {
+            let (conn, _) = read_request(&listener).await;
+            respond(conn, "d14:failure reason4:nopee").await;
+        };
+        let (result, ()) = tokio::join!(status.scrape(), tracker);
+        let e = result.unwrap_err();
+        assert!(format!("{e:#}").contains("nope"), "{e:#}");
+        let last = status.scrapes()[0].last.clone().unwrap();
+        assert!(last.result.unwrap_err().contains("nope"));
+        // A refused scrape leaves the announce table alone.
+        assert_eq!(status.announces()[0].last, None);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_scrape_waits_the_interval_and_spaces_the_sessions_scrapes() {
+        let schedule = AutoScrape::default();
+        let start = tokio::time::Instant::now();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Two paused torrents on one session's schedule.
+        for torrent in ["a", "b"] {
+            let schedule = schedule.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                schedule
+                    .run(|| {
+                        let _ = tx.send((torrent, tokio::time::Instant::now()));
+                        async {}
+                    })
+                    .await
+            });
+        }
+        let mut scrapes = Vec::new();
+        while scrapes.len() < 4 {
+            scrapes.push(rx.recv().await.unwrap());
+        }
+        // Neither scrapes before the interval has passed.
+        assert!(scrapes[0].1 - start >= AutoScrape::INTERVAL);
+        // Every scrape is a minimum interval after the session's previous one.
+        for pair in scrapes.windows(2) {
+            assert!(
+                pair[1].1 - pair[0].1 >= AutoScrape::MIN_INTERVAL,
+                "{scrapes:?}"
+            );
+        }
+        // Each torrent waits the interval again after its scrape.
+        for torrent in ["a", "b"] {
+            let at: Vec<_> = scrapes
+                .iter()
+                .filter(|(t, _)| *t == torrent)
+                .map(|(_, at)| *at)
+                .collect();
+            assert_eq!(at.len(), 2, "{scrapes:?}");
+            assert!(at[1] - at[0] >= AutoScrape::INTERVAL, "{scrapes:?}");
+        }
+    }
+
+    /// Resolves every name to `at`'s address.
+    struct FixedResolver {
+        at: std::net::IpAddr,
+    }
+
+    impl Resolver for FixedResolver {
+        fn resolve<'a>(
+            &'a self,
+            _host: &'a str,
+            port: u16,
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+            Box::pin(async move { Ok(vec![(self.at, port).into()]) })
+        }
+    }
+
+    /// The error the announce table records for `url`, once it has one.
+    async fn refusal_of(
+        status: &super::TrackerStatus,
+        peers: &mut (impl futures::Stream<Item = SocketAddr> + Unpin),
+        url: &Url,
+    ) -> String {
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("a refused tracker gave peers"),
+            r = rx.wait_for(|a| announce_of(a, url).last.is_some()) => r.unwrap(),
+        };
+        announce_of(&status.announces(), url)
+            .last
+            .clone()
+            .unwrap()
+            .result
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_tracker_url_that_could_forge_a_request_is_never_asked() {
+        // libtorrent ssrf_mitigation: http_tracker_connection::start refuses
+        // a URL whose query names an announce argument, on_filter a loopback
+        // tracker at a path other than /announce, whatever name it is
+        // reached by. Each is refused before any request; the next tier's
+        // tracker is asked.
+        let (refused, at) = http_listener().await;
+        let port = at.port().unwrap();
+        let named = |s: &str| Url::parse(&s.replace("PORT", &port.to_string())).unwrap();
+        let forged = [
+            named("http://127.0.0.1:PORT/announce?passkey=k&INFO_HASH=x"),
+            named("http://127.0.0.1:PORT/x?y=1"),
+            named("http://[::1]:PORT/api"),
+            named("http://tracker.invalid:PORT/announce/../admin"),
+        ];
+        let (ok, ok_url) = http_listener().await;
+        let mut tiers: Vec<Vec<Url>> = forged.iter().map(|u| vec![u.clone()]).collect();
+        tiers.push(vec![ok_url]);
+
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let resolver = Arc::new(FixedResolver {
+            at: Ipv4Addr::LOCALHOST.into(),
+        });
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            tiers,
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap();
+
+        for url in &forged {
+            let e = refusal_of(&status, &mut peers, url).await;
+            assert!(e.contains("SSRF"), "{url}: {e}");
+        }
+        let q = answer_with_a_peer(
+            &ok,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        // The forged trackers' host heard nothing.
+        assert!(refused.accept().now_or_never().is_none());
+
+        drop(peers);
+        let q = next_announce(&ok).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    /// Answers an HTTP request with a redirect to `location`.
+    async fn redirect(conn: tokio::net::TcpStream, location: &str) {
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let mut response = response.as_bytes();
+        while !response.is_empty() {
+            conn.writable().await.unwrap();
+            match conn.try_write(response) {
+                Ok(n) => response = &response[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_loopback_path_no_tracker_answers_is_never_fetched() {
+        // libtorrent http_connection::on_read restarts the GET at the
+        // redirect's URL, whose endpoints on_filter holds to the same rule
+        // before connect: the moved request is refused before it is sent.
+        let (tracker, url) = http_listener().await;
+        let (moved, moved_url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let serve = async {
+            let (conn, _) = read_announce(&tracker).await;
+            redirect(conn, moved_url.join("/admin").unwrap().as_str()).await;
+            std::future::pending::<()>().await
+        };
+        let e = tokio::select! {
+            _ = serve => unreachable!(),
+            e = refusal_of(&status, &mut peers, &url) => e,
+        };
+        assert!(e.contains("SSRF"), "{e}");
+        // The moved host heard nothing.
+        assert!(moved.accept().now_or_never().is_none());
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    // A client looks no name up: it reaches a host only at the addresses it
+    // was built for.
+    struct NoNames;
+
+    impl reqwest::dns::Resolve for NoNames {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let name = name.as_str().to_owned();
+            Box::pin(async move { Err(format!("{name}: no lookups in tests").into()) })
+        }
+    }
+
+    /// The session's clients, each looking no name up; records every target
+    /// a client is built for.
+    #[derive(Default)]
+    struct Pinned {
+        built: Mutex<Vec<(String, u16, Vec<IpAddr>)>>,
+    }
+
+    impl HttpClients for Pinned {
+        fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+            if let Some(t) = &target {
+                self.built
+                    .lock()
+                    .push((t.host.to_owned(), t.port, t.addrs.to_vec()));
+            }
+            let builder = reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(Arc::new(NoNames));
+            Ok(crate::core::net::for_target(builder, target).build()?)
+        }
+    }
+
+    #[tokio::test]
+    async fn every_hop_of_a_tracker_get_goes_only_to_the_addresses_checked_for_it() {
+        // libtorrent http_connection::on_resolve hands the endpoints to
+        // on_filter, then connect tries those left; a redirect starts over
+        // at its own URL. The names are known to the engine's resolver
+        // only: a client that looked one up itself would reach nothing.
+        let (tracker, at) = http_listener().await;
+        let (moved, moved_at) = http_listener().await;
+        let (port, moved_port) = (at.port().unwrap(), moved_at.port().unwrap());
+        let url = Url::parse(&format!("http://tracker.invalid:{port}/announce")).unwrap();
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let resolver = Arc::new(FixedResolver {
+            at: Ipv4Addr::LOCALHOST.into(),
+        });
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let clients = Arc::new(Pinned::default());
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            clients.clone(),
+            reach_all(),
+            udp_client,
+            StoppedAnnounces::default(),
+        )
+        .unwrap()
+        .peers;
+
+        let (conn, q) = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = read_announce(&tracker) => r,
+        };
+        redirect(
+            conn,
+            &format!("http://moved.invalid:{moved_port}/announce?{q}"),
+        )
+        .await;
+        let q = answer_with_a_peer(
+            &moved,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        let loopback = vec![IpAddr::from(Ipv4Addr::LOCALHOST)];
+        assert_eq!(
+            *clients.built.lock(),
+            vec![
+                ("tracker.invalid".to_owned(), port, loopback.clone()),
+                ("moved.invalid".to_owned(), moved_port, loopback),
+            ]
+        );
+        drop(peers);
         token.cancel();
     }
 
@@ -1731,6 +3259,7 @@ mod tests {
             url.host().unwrap(),
             url.port().unwrap(),
             client.resolver(),
+            &reach_all(),
         )
         .await
         .unwrap();
@@ -1760,5 +3289,264 @@ mod tests {
         let (connection_id, ()) = tokio::join!(client.get_connection_id(addr), fake_tracker);
         assert_eq!(connection_id.unwrap(), CONNECTION_ID);
         token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_udp_answer_has_libtorrents_min_interval() {
+        // libtorrent udp_tracker_connection::on_announce_response: BEP 15
+        // carries no min interval, so it is 60 s.
+        let tracker = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = Url::parse(&format!("udp://{}/announce", tracker.local_addr().unwrap())).unwrap();
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        // Answers every connect and announce, the stopped one included.
+        let serve = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                let (len, from) = tracker.recv_from(&mut buf).await.unwrap();
+                let tid = &buf[12..16];
+                let mut reply = Vec::new();
+                if len == 16 {
+                    reply.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+                    reply.extend_from_slice(tid);
+                    reply.extend_from_slice(&1u64.to_be_bytes());
+                } else {
+                    reply.extend_from_slice(&1u32.to_be_bytes()); // announce
+                    reply.extend_from_slice(tid);
+                    reply.extend_from_slice(&1800u32.to_be_bytes()); // interval
+                    reply.extend_from_slice(&5u32.to_be_bytes()); // leechers
+                    reply.extend_from_slice(&3u32.to_be_bytes()); // seeders
+                }
+                tracker.send_to(&reply, from).await.unwrap();
+            }
+        });
+
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|announces| announces.iter().all(|a| a.last.is_some())) => {
+                r.unwrap();
+            }
+        }
+        let announces = status.announces();
+        assert_eq!(
+            announce_of(&announces, &url).last.as_ref().unwrap().result,
+            Ok(AnnounceOk {
+                interval: Duration::from_secs(1800),
+                min_interval: Duration::from_secs(60),
+                seeders: Some(3),
+                leechers: Some(5),
+            })
+        );
+
+        drop(peers);
+        stopped.wait_idle().await;
+        serve.abort();
+        token.cancel();
+    }
+
+    /// Resolves each name to its own addresses, in the order given, and an
+    /// address written out (a UDP URL's host is a name to `url`) to itself,
+    /// as the host's resolver does.
+    struct Named(Vec<(&'static str, Vec<IpAddr>)>);
+
+    impl Resolver for Named {
+        fn resolve<'a>(
+            &'a self,
+            host: &'a str,
+            port: u16,
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+            Box::pin(async move {
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    return Ok(vec![(ip, port).into()]);
+                }
+                let (_, addrs) =
+                    self.0
+                        .iter()
+                        .find(|(name, _)| *name == host)
+                        .ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::NotFound, host.to_owned())
+                        })?;
+                Ok(addrs.iter().map(|ip| (*ip, port).into()).collect())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tracker_with_no_address_the_session_may_reach_is_never_asked() {
+        // libtorrent http_tracker_connection::on_filter and
+        // udp_tracker_connection::name_lookup drop every endpoint the listen
+        // socket cannot route (an IPv4-only session's IPv6 ones), then every
+        // one the ip_filter blocks; with none left the announce fails,
+        // announce_skipped or banned_by_ip_filter, before anything is sent.
+        let (http, http_at) = http_listener().await;
+        let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let (hp, up) = (http_at.port().unwrap(), udp.local_addr().unwrap().port());
+        let url = |s: &str| {
+            Url::parse(
+                &s.replace("HP", &hp.to_string())
+                    .replace("UP", &up.to_string()),
+            )
+            .unwrap()
+        };
+        let banned = "banned by the IP filter";
+        let family = "of a family the session does not connect over";
+        let refused = [
+            (url("http://127.0.0.1:HP/announce"), banned),
+            (url("udp://127.0.0.1:UP/announce"), banned),
+            (url("http://tracker.invalid:HP/announce"), banned),
+            (url("udp://tracker.invalid:UP/announce"), banned),
+            (url("http://[::1]:HP/announce"), family),
+            (url("udp://[::1]:UP/announce"), family),
+        ];
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let resolver = Arc::new(Named(vec![(
+            "tracker.invalid",
+            vec![Ipv6Addr::LOCALHOST.into(), loopback],
+        )]));
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let clients = Arc::new(Pinned::default());
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            refused.iter().map(|(u, _)| vec![u.clone()]).collect(),
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            clients.clone(),
+            reach_but(vec![loopback], true),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap();
+
+        for (url, why) in &refused {
+            let e = refusal_of(&status, &mut peers, url).await;
+            assert!(e.contains(why), "{url}: {e}");
+        }
+        // No client was built, and neither tracker heard anything.
+        assert!(clients.built.lock().is_empty());
+        assert!(http.accept().now_or_never().is_none());
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            udp.try_recv_from(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn every_hop_of_a_tracker_get_goes_only_to_addresses_the_session_may_reach() {
+        // libtorrent http_tracker_connection::on_filter, on the first
+        // resolve and on each redirect's: the endpoints of a family the
+        // listen socket cannot route and those the ip_filter blocks are
+        // dropped, connect tries those left, and a hop with none left fails
+        // the announce banned_by_ip_filter before it is sent.
+        let (tracker, at) = http_listener().await;
+        let port = at.port().unwrap();
+        let url = Url::parse(&format!("http://tracker.invalid:{port}/announce")).unwrap();
+        let blocked = IpAddr::from(Ipv4Addr::new(127, 0, 0, 3));
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let resolver = Arc::new(Named(vec![
+            (
+                "tracker.invalid",
+                vec![Ipv6Addr::LOCALHOST.into(), blocked, loopback],
+            ),
+            ("moved.invalid", vec![blocked]),
+        ]));
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let clients = Arc::new(Pinned::default());
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url.clone()]],
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            clients.clone(),
+            reach_but(vec![blocked], true),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap();
+
+        let serve = async {
+            let (conn, q) = read_announce(&tracker).await;
+            redirect(conn, &format!("http://moved.invalid:{port}/announce?{q}")).await;
+            std::future::pending::<()>().await
+        };
+        let e = tokio::select! {
+            _ = serve => unreachable!(),
+            e = refusal_of(&status, &mut peers, &url) => e,
+        };
+        assert!(e.contains("banned by the IP filter"), "{e}");
+        // The tracker was reached at the one address left; the moved host
+        // never had a client built for it.
+        assert_eq!(
+            *clients.built.lock(),
+            vec![("tracker.invalid".to_owned(), port, vec![loopback])]
+        );
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_udp_tracker_is_asked_only_at_addresses_the_session_may_reach() {
+        // libtorrent udp_tracker_connection::name_lookup keeps the endpoints
+        // the listen socket can route and the ip_filter lets through, in the
+        // order found, and asks from those.
+        let blocked = IpAddr::from(Ipv4Addr::new(127, 0, 0, 3));
+        let resolver = Named(vec![(
+            "tracker.invalid",
+            vec![
+                Ipv6Addr::LOCALHOST.into(),
+                blocked,
+                Ipv4Addr::LOCALHOST.into(),
+                Ipv4Addr::new(127, 0, 0, 4).into(),
+            ],
+        )]);
+        let host = url::Host::Domain("tracker.invalid");
+        let v4 = (Ipv4Addr::LOCALHOST, 6969).into();
+        let v6 = (Ipv6Addr::LOCALHOST, 6969).into();
+
+        let ipv4_only = reach_but(vec![blocked], true);
+        let found = udp_tracker_to_socket_addrs(host.clone(), 6969, Some(&resolver), &ipv4_only)
+            .await
+            .unwrap();
+        assert!(
+            matches!(found, UdpTrackerResolveResult::One(a) if a == v4),
+            "{found:?}"
+        );
+
+        let both = reach_but(vec![blocked], false);
+        let found = udp_tracker_to_socket_addrs(host, 6969, Some(&resolver), &both)
+            .await
+            .unwrap();
+        assert!(
+            matches!(found, UdpTrackerResolveResult::Two(a, b) if SocketAddr::from(a) == v4 && SocketAddr::from(b) == v6),
+            "{found:?}"
+        );
     }
 }

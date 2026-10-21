@@ -5,7 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::str::FromStr;
+use std::{net::SocketAddr, str::FromStr};
 
 use anyhow::Context;
 
@@ -16,6 +16,10 @@ pub struct Magnet {
     id20: Option<Id20>,
     id32: Option<Id32>,
     pub trackers: Vec<String>,
+    /// The peers the link names (`x.pe`), to connect to as any other.
+    pub peers: Vec<SocketAddr>,
+    /// The web seeds the link names (`ws`), BEP 19 URLs as written.
+    pub web_seeds: Vec<String>,
     pub name: Option<String>,
     select_only: Option<Vec<usize>>,
 }
@@ -54,6 +58,8 @@ impl Magnet {
             id20: info_hashes.v1,
             id32: info_hashes.v2,
             trackers,
+            peers: Vec::new(),
+            web_seeds: Vec::new(),
             name,
             select_only: None,
         }
@@ -64,6 +70,8 @@ impl Magnet {
             id20: Some(id20),
             id32: None,
             trackers,
+            peers: Vec::new(),
+            web_seeds: Vec::new(),
             name: None,
             select_only,
         }
@@ -82,6 +90,8 @@ impl Magnet {
             id20,
             id32,
             trackers,
+            peers: Vec::new(),
+            web_seeds: Vec::new(),
             name: None,
             select_only,
         })
@@ -97,6 +107,8 @@ impl Magnet {
                 id32: None,
                 name: None,
                 trackers: vec![],
+                peers: vec![],
+                web_seeds: vec![],
                 select_only: None,
             });
         }
@@ -109,6 +121,8 @@ impl Magnet {
         let mut id32: Option<Id32> = None;
         let mut name: Option<String> = None;
         let mut trackers = Vec::<String>::new();
+        let mut peers = Vec::<SocketAddr>::new();
+        let mut web_seeds = Vec::<String>::new();
         let mut files = Vec::<usize>::new();
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
@@ -128,6 +142,11 @@ impl Magnet {
                     // Any other xt names nothing a torrent is found by.
                 }
                 "tr" => trackers.push(value.into()),
+                // An address and port; one that is not is passed over
+                // (libtorrent `parse_magnet_uri`, `parse_endpoint`).
+                "x.pe" => peers.extend(SocketAddr::from_str(value.trim()).ok()),
+                // A web seed, as written (libtorrent `parse_magnet_uri`, `ws`).
+                "ws" => web_seeds.push(value.into_owned()),
                 "dn" if !value.is_empty() => name = Some(value.into_owned()),
                 "dn" => {}
                 "so" => {
@@ -160,6 +179,8 @@ impl Magnet {
                 id20,
                 id32,
                 trackers,
+                peers,
+                web_seeds,
                 name,
                 select_only: if files.is_empty() { None } else { Some(files) },
             }),
@@ -173,11 +194,11 @@ impl Magnet {
 /// A value as libtorrent escapes it into a link: alphanumerics and
 /// `-_!.~*()` as they are, every other byte as `%` and two lowercase hex
 /// digits (libtorrent `escape_string`).
-struct Escaped<'a>(&'a str);
+pub(crate) struct Escaped<'a>(pub(crate) &'a [u8]);
 
 impl std::fmt::Display for Escaped<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
-        for b in self.0.bytes() {
+        for &b in self.0 {
             if b.is_ascii_alphanumeric() || b"-_!.~*()".contains(&b) {
                 write!(f, "{}", b as char)?;
             } else {
@@ -189,7 +210,8 @@ impl std::fmt::Display for Escaped<'_> {
 }
 
 /// The link in libtorrent's order (`make_magnet_uri`): btih, btmh, dn,
-/// then each tr; a file selection, which libtorrent does not write, last.
+/// then each tr, each ws and each x.pe; a file selection, which libtorrent
+/// does not write, last.
 impl std::fmt::Display for Magnet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "magnet:")?;
@@ -215,11 +237,19 @@ impl std::fmt::Display for Magnet {
         }
         if let Some(name) = self.name.as_deref().filter(|n| !n.is_empty()) {
             write_ampersand(f)?;
-            write!(f, "dn={}", Escaped(name))?;
+            write!(f, "dn={}", Escaped(name.as_bytes()))?;
         }
         for tracker in self.trackers.iter() {
             write_ampersand(f)?;
-            write!(f, "tr={}", Escaped(tracker))?;
+            write!(f, "tr={}", Escaped(tracker.as_bytes()))?;
+        }
+        for web_seed in self.web_seeds.iter() {
+            write_ampersand(f)?;
+            write!(f, "ws={}", Escaped(web_seed.as_bytes()))?;
+        }
+        for peer in self.peers.iter() {
+            write_ampersand(f)?;
+            write!(f, "x.pe={peer}")?;
         }
         if let Some(select_only) = &self.select_only
             && !select_only.is_empty()
@@ -363,5 +393,45 @@ mod tests {
         );
         assert_eq!(m.name.as_deref(), Some("a b"));
         assert_eq!(m.trackers, vec!["udp://foo.bar/announce"]);
+    }
+
+    // libtorrent test_magnet.cpp `parse_web_seeds`, and a torrent's link
+    // carrying its web seeds escaped (`make_magnet_uri`).
+    #[test]
+    fn a_links_web_seeds_are_read_in_order_and_written_escaped() {
+        let cd20 = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let m = Magnet::parse(&format!(
+            "magnet:?xt=urn:btih:{cd20}&ws=http://foo.com/bar&ws=http://bar.com/foo"
+        ))
+        .unwrap();
+        assert_eq!(m.web_seeds, ["http://foo.com/bar", "http://bar.com/foo"]);
+        assert_eq!(
+            m.to_string(),
+            format!(
+                "magnet:?xt=urn:btih:{cd20}&ws=http%3a%2f%2ffoo.com%2fbar\
+                 &ws=http%3a%2f%2fbar.com%2ffoo"
+            )
+        );
+        // An escaped value is read unescaped, and reads back as written.
+        let m = Magnet::parse(&m.to_string()).unwrap();
+        assert_eq!(m.web_seeds, ["http://foo.com/bar", "http://bar.com/foo"]);
+    }
+
+    // libtorrent test_magnet.cpp `parse_peer`, and the endpoints
+    // `parse_endpoint` refuses.
+    #[test]
+    fn a_links_peers_are_read_and_written_and_a_bad_one_passed_over() {
+        let cd20 = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let m = Magnet::parse(&format!(
+            "magnet:?xt=urn:btih:{cd20}&dn=foo&x.pe=127.0.0.1:43&x.pe=<invalid1>\
+             &x.pe=<invalid2>:100&x.pe=[::1]:45&x.pe=127.0.0.1:&x.pe=[::1"
+        ))
+        .unwrap();
+        let peers: Vec<_> = m.peers.iter().map(|p| p.to_string()).collect();
+        assert_eq!(peers, ["127.0.0.1:43", "[::1]:45"]);
+        assert_eq!(
+            m.to_string(),
+            format!("magnet:?xt=urn:btih:{cd20}&dn=foo&x.pe=127.0.0.1:43&x.pe=[::1]:45")
+        );
     }
 }

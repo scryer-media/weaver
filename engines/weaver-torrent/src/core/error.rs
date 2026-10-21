@@ -56,4 +56,15 @@ pub enum Error {
     InvalidBencoding,
     #[error("too many pieces in torrent")]
     TooManyPieces,
+    // libtorrent `torrent_missing_piece_length`.
+    #[error("invalid piece length {0}")]
+    InvalidPieceLength(u32),
+    // libtorrent `torrent_invalid_length`.
+    #[error("file has an invalid length")]
+    InvalidFileLength,
+    // libtorrent `torrent_invalid_hashes`.
+    #[error("{got} bytes of piece hashes for {expected} bytes of pieces")]
+    InvalidPieceHashes { expected: usize, got: usize },
+    #[error("too many 16 KiB blocks in torrent")]
+    TooManyChunks,
 }

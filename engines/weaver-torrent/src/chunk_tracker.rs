@@ -5,19 +5,20 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::buffers::ByteBuf;
 use crate::core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
 use crate::peer_protocol::Piece;
 use anyhow::Context;
+use rand::{RngExt, rngs::StdRng, seq::SliceRandom};
 use tracing::{debug, trace};
 
 use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
     piece_priority::PiecePriority,
-    type_aliases::{BF, BS, FileInfos, FilePriorities},
+    type_aliases::{BF, BS, FileInfos},
 };
 
 struct PieceSelection {
@@ -27,6 +28,241 @@ struct PieceSelection {
     // The fetch priority of each piece, and how many pieces are at each level.
     priorities: Vec<PiecePriority>,
     priority_counts: [u32; PiecePriority::COUNT],
+}
+
+/// The pieces whose count of peers moved since the picker last read the
+/// counts: each one, or `all` of them. libtorrent `piece_picker` moves a
+/// piece at each `inc_refcount`/`dec_refcount`, and a change to many pieces
+/// at once only marks it `m_dirty`, rebuilt at the next pick.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Moved {
+    pub pieces: Vec<u32>,
+    pub all: bool,
+}
+
+/// Where a piece sits in the picker's order: its level, by rank from the
+/// highest, and its bucket in that level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Key {
+    level: u8,
+    bucket: u32,
+}
+
+/// The rank of `level` among the wanted levels, the highest first.
+fn level_rank(level: PiecePriority) -> Option<usize> {
+    PiecePriority::WANTED_DESCENDING
+        .iter()
+        .position(|wanted| *wanted == level)
+}
+
+/// The pieces of one level in pick order, bucket by bucket, in random order
+/// within a bucket: bucket `b` is `pieces[ends[b - 1]..ends[b]]`, the first
+/// from 0 (libtorrent `m_pieces` and `m_priority_boundaries`). Every move
+/// costs a step a bucket boundary crossed, never a step a piece.
+#[derive(Default)]
+struct Ladder {
+    pieces: Vec<ValidPieceIndex>,
+    ends: Vec<u32>,
+}
+
+impl Ladder {
+    fn begin(&self, bucket: usize) -> u32 {
+        if bucket == 0 {
+            0
+        } else {
+            self.ends[bucket - 1]
+        }
+    }
+
+    fn put(&mut self, slot: u32, piece: ValidPieceIndex, at: &mut [u32]) {
+        self.pieces[slot as usize] = piece;
+        at[piece.get_usize()] = slot;
+    }
+
+    fn swap(&mut self, a: u32, b: u32, at: &mut [u32]) {
+        self.pieces.swap(a as usize, b as usize);
+        for slot in [a, b] {
+            at[self.pieces[slot as usize].get_usize()] = slot;
+        }
+    }
+
+    // Buckets up to `bucket` exist; the new ones are empty, at the end.
+    fn reach(&mut self, bucket: usize) {
+        if self.ends.len() <= bucket {
+            self.ends.resize(bucket + 1, self.pieces.len() as u32);
+        }
+    }
+
+    /// libtorrent `piece_picker::add`: `piece` joins `bucket` at a random
+    /// place in it. Each later bucket hands its first piece on to its end,
+    /// which moves the free slot down to the end of `bucket`.
+    fn add(&mut self, piece: ValidPieceIndex, bucket: usize, rng: &mut StdRng, at: &mut [u32]) {
+        self.reach(bucket);
+        let mut free = self.pieces.len() as u32;
+        self.pieces.push(piece);
+        for b in (bucket + 1..self.ends.len()).rev() {
+            let first = self.begin(b);
+            if first != free {
+                self.put(free, self.pieces[first as usize], at);
+            }
+            free = first;
+            self.ends[b] += 1;
+        }
+        self.ends[bucket] += 1;
+        let slot = rng.random_range(self.begin(bucket)..=free);
+        if slot != free {
+            self.put(free, self.pieces[slot as usize], at);
+        }
+        self.put(slot, piece, at);
+    }
+
+    /// libtorrent `piece_picker::remove`: the piece at `slot` of `bucket`
+    /// leaves. The last of its bucket takes its place, and the last of each
+    /// later bucket the place so freed.
+    fn remove(&mut self, slot: u32, bucket: usize, at: &mut [u32]) {
+        let mut free = slot;
+        for b in bucket..self.ends.len() {
+            self.ends[b] -= 1;
+            let last = self.ends[b];
+            if last != free {
+                self.put(free, self.pieces[last as usize], at);
+            }
+            free = last;
+        }
+        self.pieces.pop();
+    }
+
+    /// libtorrent `piece_picker::update` and `shuffle`: the piece at `slot`
+    /// moves from bucket `from` to `to` a boundary at a time, trading places
+    /// with the first piece of each bucket it rises out of or the last of
+    /// each it sinks out of, then with a random piece of `to`.
+    fn update(&mut self, mut slot: u32, from: usize, to: usize, rng: &mut StdRng, at: &mut [u32]) {
+        let piece = self.pieces[slot as usize];
+        self.reach(to);
+        if to < from {
+            for b in (to + 1..=from).rev() {
+                let first = self.begin(b);
+                if first != slot {
+                    self.put(slot, self.pieces[first as usize], at);
+                }
+                slot = first;
+                self.ends[b - 1] += 1;
+            }
+        } else {
+            for b in from..to {
+                let last = self.ends[b] - 1;
+                if last != slot {
+                    self.put(slot, self.pieces[last as usize], at);
+                }
+                slot = last;
+                self.ends[b] -= 1;
+            }
+        }
+        self.put(slot, piece, at);
+        let other = rng.random_range(self.begin(to)..self.ends[to]);
+        self.swap(slot, other, at);
+    }
+}
+
+/// The queued pieces some peer has, in the order the picker hands them out
+/// (libtorrent `piece_picker`'s `m_pieces`, `m_priority_boundaries` and
+/// `m_piece_map`). It moves with each change to a piece or its count of
+/// peers, and a pick reads it from the front only as far as the piece it
+/// hands out.
+struct PickIndex {
+    // One ladder a wanted level, the highest first.
+    levels: [Ladder; PiecePriority::WANTED_DESCENDING.len()],
+    // Each piece's key, or None while it is out of the order: had, not
+    // wanted, in flight, or had by no peer (libtorrent `piece_pos::priority`
+    // -1).
+    keys: Vec<Option<Key>>,
+    // Each piece's slot in its level's ladder (libtorrent `piece_pos::index`).
+    at: Vec<u32>,
+    // How many peers have each piece, as the picker last read the counts
+    // (libtorrent `piece_pos::peer_count`).
+    peers: Vec<u32>,
+    // The ladders are void until the next pick rebuilds them (libtorrent
+    // `m_dirty`, `update_pieces`).
+    dirty: bool,
+    // The place a piece takes among its equals.
+    rng: StdRng,
+}
+
+impl PickIndex {
+    fn new(total_pieces: u32) -> Self {
+        let n = total_pieces as usize;
+        Self {
+            levels: Default::default(),
+            keys: vec![None; n],
+            at: vec![0; n],
+            peers: vec![0; n],
+            dirty: true,
+            rng: rand::make_rng(),
+        }
+    }
+
+    /// `piece` moves to `key`: it joins, leaves, or moves in the order
+    /// (libtorrent `add`, `remove`, `update`).
+    fn place(&mut self, piece: ValidPieceIndex, key: Option<Key>) {
+        let id = piece.get_usize();
+        let old = std::mem::replace(&mut self.keys[id], key);
+        if self.dirty || old == key {
+            return;
+        }
+        let Self {
+            levels, at, rng, ..
+        } = self;
+        let slot = at[id];
+        match (old, key) {
+            (Some(old), Some(new)) if old.level == new.level => levels[new.level as usize].update(
+                slot,
+                old.bucket as usize,
+                new.bucket as usize,
+                rng,
+                at,
+            ),
+            (old, new) => {
+                if let Some(old) = old {
+                    levels[old.level as usize].remove(slot, old.bucket as usize, at);
+                }
+                if let Some(new) = new {
+                    levels[new.level as usize].add(piece, new.bucket as usize, rng, at);
+                }
+            }
+        }
+    }
+
+    /// libtorrent `update_pieces`: every piece is laid out anew by its key,
+    /// each bucket in random order.
+    fn rebuild(&mut self, keys: Vec<Option<Key>>, lengths: &Lengths) {
+        let mut buckets: [Vec<Vec<ValidPieceIndex>>; PiecePriority::WANTED_DESCENDING.len()] =
+            Default::default();
+        for (id, key) in keys.iter().enumerate() {
+            let (Some(key), Some(piece)) = (key, lengths.validate_piece_index(id as u32)) else {
+                continue;
+            };
+            let level = &mut buckets[key.level as usize];
+            let bucket = key.bucket as usize;
+            if level.len() <= bucket {
+                level.resize_with(bucket + 1, Vec::new);
+            }
+            level[bucket].push(piece);
+        }
+        for (ladder, level) in self.levels.iter_mut().zip(buckets) {
+            ladder.pieces.clear();
+            ladder.ends.clear();
+            for mut bucket in level {
+                bucket.shuffle(&mut self.rng);
+                ladder.pieces.extend(bucket);
+                ladder.ends.push(ladder.pieces.len() as u32);
+            }
+            for (slot, piece) in ladder.pieces.iter().enumerate() {
+                self.at[piece.get_usize()] = slot as u32;
+            }
+        }
+        self.keys = keys;
+        self.dirty = false;
+    }
 }
 
 pub struct ChunkTracker {
@@ -40,12 +276,25 @@ pub struct ChunkTracker {
     // needed initial value = selected & !have
     queue_pieces: BF,
 
+    // How many pieces are queued, and the queued pieces a block of which was
+    // received, by index. Kept, not recounted: moved wherever a piece joins
+    // or leaves the queue or receives or drops its blocks (libtorrent keeps
+    // its started pieces as `m_downloads[piece_downloading]`).
+    queued: u32,
+    started: BTreeSet<u32>,
+
+    // The queued pieces in pick order, moved at each change to a piece's
+    // queue bit, priority, blocks or count of peers.
+    index: PickIndex,
+
     // This has a bit set per each chunk (block) that we have written to the output file.
     // It doesn't mean it's valid yet. Used to track how much is left in each piece.
     chunk_status: BF,
 
-    // These are the pieces that we actually have, fully checked and downloaded.
+    // These are the pieces that we actually have, fully checked and downloaded,
+    // and how many (libtorrent `m_num_have`).
     have: BoxBitV,
+    have_count: u32,
 
     // The pieces that are wanted: those of the selected files, less the ones whose
     // priority is Skip. This doesn't change unless update_only_files or
@@ -198,6 +447,10 @@ impl ChunkTracker {
             chunk_status: compute_chunk_have_status(&lengths, have_pieces.as_slice())
                 .context("error computing chunk status")?,
             queue_pieces: needed_pieces,
+            queued: 0,
+            started: BTreeSet::new(),
+            index: PickIndex::new(total_pieces),
+            have_count: have_pieces.as_slice().count_ones() as u32,
             selection: Box::new(PieceSelection {
                 files_selected: selected_pieces.clone(),
                 priorities: vec![PiecePriority::Normal; total_pieces as usize],
@@ -211,6 +464,7 @@ impl ChunkTracker {
         };
         ct.recalculate_per_file_bytes(file_infos);
         ct.hns = ct.calc_hns();
+        ct.recount_queue();
         Ok(ct)
     }
 
@@ -241,7 +495,170 @@ impl ChunkTracker {
     }
 
     pub fn reserve_needed_piece(&mut self, index: ValidPieceIndex) {
-        self.queue_pieces.set(index.get() as usize, false)
+        self.set_queued(index, false);
+    }
+
+    // Every change to the queue passes here, piece by piece, but the
+    // selection's wholesale one, which recounts.
+    fn set_queued(&mut self, piece: ValidPieceIndex, queued: bool) {
+        if self.queue_pieces.replace(piece.get_usize(), queued) != queued {
+            if queued {
+                self.queued += 1;
+            } else {
+                self.queued -= 1;
+            }
+        }
+        self.reposition(piece);
+    }
+
+    // `piece` joined or left the queue, changed priority, or received its
+    // first block or dropped its blocks: it joins or leaves the started
+    // pieces, and moves in the pick order.
+    fn reposition(&mut self, piece: ValidPieceIndex) {
+        if self.queue_pieces[piece.get_usize()] && self.received_chunks(piece) > 0 {
+            self.started.insert(piece.get());
+        } else {
+            self.started.remove(&piece.get());
+        }
+        let key = self.key(piece);
+        self.index.place(piece, key);
+    }
+
+    // Where `piece` belongs in the pick order (libtorrent
+    // `piece_pos::priority`): its level first, then the peers that have it,
+    // the fewest first, a started piece before an open one as rare. Out of
+    // the order unless queued, wanted and had by some peer.
+    fn key(&self, piece: ValidPieceIndex) -> Option<Key> {
+        let id = piece.get_usize();
+        let peers = self.index.peers[id];
+        if !self.queue_pieces[id] || peers == 0 {
+            return None;
+        }
+        let level = level_rank(self.selection.priorities[id])?;
+        let open = self.received_chunks(piece) == 0;
+        Some(Key {
+            level: level as u8,
+            bucket: 2 * (peers - 1) + open as u32,
+        })
+    }
+
+    /// The picker starts afresh, its random choices drawn from `rng`: the
+    /// counts of peers it last read are void, and the next pick reads them
+    /// all.
+    pub(crate) fn start_picking(&mut self, rng: StdRng) {
+        self.index.rng = rng;
+        self.index.dirty = true;
+    }
+
+    /// The pick order catches up with the counts of peers that `moved`
+    /// names, reading each through `peers`: a piece whose count changed
+    /// moves. Every piece is read and laid out anew when `moved` names them
+    /// all or the order was voided (libtorrent `update_pieces` when
+    /// `m_dirty`).
+    pub(crate) fn catch_up(&mut self, moved: Moved, peers: impl Fn(ValidPieceIndex) -> u32) {
+        self.index.dirty |= moved.all;
+        if !self.index.dirty {
+            for id in moved.pieces {
+                let Some(piece) = self.lengths.validate_piece_index(id) else {
+                    continue;
+                };
+                let count = peers(piece);
+                if std::mem::replace(&mut self.index.peers[piece.get_usize()], count) != count {
+                    let key = self.key(piece);
+                    self.index.place(piece, key);
+                }
+            }
+            return;
+        }
+        let total = self.lengths.total_pieces();
+        let mut keys = vec![None; total as usize];
+        for piece in (0..total).filter_map(|id| self.lengths.validate_piece_index(id)) {
+            self.index.peers[piece.get_usize()] = peers(piece);
+            keys[piece.get_usize()] = self.key(piece);
+        }
+        self.index.rebuild(keys, &self.lengths);
+    }
+
+    /// The queued pieces of `level` some peer has, in the order a peer is
+    /// handed them: the rarest first, a started piece before an open one as
+    /// rare, in random order among equals (libtorrent `pick_pieces` walking
+    /// `m_pieces` from `priority_begin`). Read after [`Self::catch_up`].
+    pub(crate) fn pick_order(&self, level: PiecePriority) -> &[ValidPieceIndex] {
+        debug_assert!(
+            !self.index.dirty,
+            "the pick order is read before it is rebuilt"
+        );
+        level_rank(level).map_or(&[], |rank| &self.index.levels[rank].pieces)
+    }
+
+    /// Whether `piece` is in the pick order at `level`.
+    pub(crate) fn picks_at(&self, piece: ValidPieceIndex, level: PiecePriority) -> bool {
+        self.index.keys[piece.get_usize()]
+            .is_some_and(|key| Some(key.level as usize) == level_rank(level))
+    }
+
+    /// How many peers had `piece` when the picker last read the counts.
+    pub(crate) fn peers_with(&self, piece: ValidPieceIndex) -> u32 {
+        self.index.peers[piece.get_usize()]
+    }
+
+    /// The pick order holds exactly the pieces whose key puts them in it,
+    /// each at its slot, in its level's ladder and its bucket's range, the
+    /// buckets in order.
+    #[cfg(test)]
+    pub(crate) fn check_index(&self) {
+        let index = &self.index;
+        assert!(!index.dirty, "the pick order is void");
+        for (rank, ladder) in index.levels.iter().enumerate() {
+            assert!(ladder.ends.is_sorted(), "{:?}", ladder.ends);
+            assert_eq!(
+                ladder.ends.last().copied().unwrap_or(0),
+                ladder.pieces.len() as u32
+            );
+            for (slot, piece) in ladder.pieces.iter().enumerate() {
+                let key = index.keys[piece.get_usize()].expect("a piece in the order has a key");
+                let slot = slot as u32;
+                assert_eq!(key.level as usize, rank, "piece {piece}");
+                assert_eq!(index.at[piece.get_usize()], slot, "piece {piece}");
+                let bucket = key.bucket as usize;
+                assert!(
+                    (ladder.begin(bucket)..ladder.ends[bucket]).contains(&slot),
+                    "piece {piece} at {slot} out of bucket {bucket}: {:?}",
+                    ladder.ends
+                );
+            }
+        }
+        let total = self.lengths.total_pieces();
+        for piece in (0..total).filter_map(|id| self.lengths.validate_piece_index(id)) {
+            assert_eq!(
+                index.keys[piece.get_usize()],
+                self.key(piece),
+                "piece {piece}"
+            );
+        }
+        assert_eq!(
+            index.keys.iter().flatten().count(),
+            index.levels.iter().map(|l| l.pieces.len()).sum::<usize>()
+        );
+    }
+
+    // The counts of the queue, after a change to all of it.
+    fn recount_queue(&mut self) {
+        self.index.dirty = true;
+        self.queued = self.queue_pieces.count_ones() as u32;
+        let lengths = self.lengths;
+        let chunk_status = &self.chunk_status;
+        self.started = self
+            .queue_pieces
+            .iter_ones()
+            .filter(|id| {
+                lengths
+                    .validate_piece_index(*id as u32)
+                    .and_then(|piece| chunk_status.get(lengths.chunk_range(piece)))
+                    .is_some_and(|chunks| chunks.any())
+            })
+            .map(|id| id as u32)
+            .collect();
     }
 
     pub fn get_hns(&self) -> &HaveNeededSelected {
@@ -263,36 +680,47 @@ impl ChunkTracker {
         hns
     }
 
-    // The queued pieces in the order to fetch them: by priority level, highest first,
-    // and within a level by file priority. A level no piece is at costs nothing, so
-    // with every piece at Normal this is a single pass in file order.
-    pub(crate) fn iter_queued_pieces<'a>(
-        &'a self,
-        file_priorities: &'a FilePriorities,
-        file_infos: &'a FileInfos,
-    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
-        PiecePriority::WANTED_DESCENDING
-            .into_iter()
-            .filter(|level| self.selection.priority_counts[*level as usize] > 0)
-            .flat_map(move |level| {
-                self.iter_queued_pieces_in_file_order(file_priorities, file_infos)
-                    .filter(move |id| self.selection.priorities[id.get_usize()] == level)
-            })
+    /// The pieces a peer may be handed, in index order: wanted, not had, and
+    /// not in flight. Which one goes first is the piece picker's call.
+    #[cfg(test)]
+    pub(crate) fn iter_queued_pieces(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.queue_pieces
+            .iter_ones()
+            .filter_map(|id| self.lengths.validate_piece_index(id.try_into().ok()?))
     }
 
-    fn iter_queued_pieces_in_file_order<'a>(
-        &'a self,
-        file_priorities: &'a FilePriorities,
-        file_infos: &'a FileInfos,
-    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
-        file_priorities
+    /// The fetch priority of `piece`.
+    pub(crate) fn priority(&self, piece: ValidPieceIndex) -> PiecePriority {
+        self.selection.priorities[piece.get_usize()]
+    }
+
+    /// How many chunks of `piece` were received.
+    pub(crate) fn received_chunks(&self, piece: ValidPieceIndex) -> usize {
+        self.chunk_status
+            .get(self.lengths.chunk_range(piece))
+            .map_or(0, |chunks| chunks.count_ones())
+    }
+
+    /// How many pieces we have.
+    pub(crate) fn have_count(&self) -> usize {
+        self.have_count as usize
+    }
+
+    /// The queued pieces a block of which was received, in index order.
+    pub(crate) fn started_pieces(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.started
             .iter()
-            .filter_map(|p| Some((*p, file_infos.get(*p)?)))
-            .filter(|(id, f)| self.per_file_bytes[*id] != f.len)
-            .flat_map(|(_id, f)| f.iter_piece_priorities())
-            .filter(|id| self.queue_pieces[*id])
-            .filter_map(|id| id.try_into().ok())
-            .filter_map(|id| self.lengths.validate_piece_index(id))
+            .filter_map(|id| self.lengths.validate_piece_index(*id))
+    }
+
+    /// How many queued pieces received a block.
+    pub(crate) fn started_count(&self) -> usize {
+        self.started.len()
+    }
+
+    /// Whether every queued piece received a block.
+    pub(crate) fn every_queued_piece_started(&self) -> bool {
+        self.queued as usize == self.started.len()
     }
 
     pub(crate) fn is_piece_have(&self, id: ValidPieceIndex) -> bool {
@@ -303,27 +731,22 @@ impl ChunkTracker {
     /// stay received, so whoever takes it next asks only for the rest. Returns
     /// whether it was queued.
     pub fn requeue_piece_if_not_have(&mut self, index: ValidPieceIndex) -> bool {
-        if self
-            .have
-            .as_slice()
-            .get(index.get() as usize)
-            .map(|r| *r)
-            .unwrap_or_default()
-        {
+        if self.is_piece_have(index) {
             return false;
         }
-        self.queue_pieces.set(index.get() as usize, true);
+        self.set_queued(index, true);
         true
     }
 
     pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {
-        if !self.requeue_piece_if_not_have(index) {
+        if self.is_piece_have(index) {
             return;
         }
         debug!("marking piece={} as broken", index);
         if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
             s.fill(false);
         }
+        self.set_queued(index, true);
     }
 
     pub fn mark_piece_downloaded(&mut self, idx: ValidPieceIndex) {
@@ -332,9 +755,10 @@ impl ChunkTracker {
         // anything that queues "selected and not have" - update_only_files() re-selecting
         // its file - queued it. A piece we have is not one a peer should be handed, so
         // whatever queued it in that window is undone here.
-        self.queue_pieces.set(id, false);
+        self.set_queued(idx, false);
         if !self.have.as_slice()[id] {
             self.have.as_slice_mut().set(id, true);
+            self.have_count += 1;
             let len = self.lengths.piece_length(idx) as u64;
             self.hns.have_bytes += len;
             if self.selected[id] {
@@ -343,17 +767,21 @@ impl ChunkTracker {
         }
     }
 
+    /// Whether `chunk` was received.
+    pub(crate) fn is_chunk_received(&self, chunk: &ChunkInfo) -> bool {
+        self.chunk_status
+            .get(chunk.absolute_index as usize)
+            .is_some_and(|received| *received)
+    }
+
     /// The chunks of `piece` not yet received.
     pub fn iter_missing_chunks(
         &self,
         piece: ValidPieceIndex,
     ) -> impl Iterator<Item = ChunkInfo> + '_ {
-        self.lengths.iter_chunk_infos(piece).filter(|chunk| {
-            !self
-                .chunk_status
-                .get(chunk.absolute_index as usize)
-                .is_some_and(|received| *received)
-        })
+        self.lengths
+            .iter_chunk_infos(piece)
+            .filter(|chunk| !self.is_chunk_received(chunk))
     }
 
     pub fn is_chunk_ready_to_upload(&self, chunk: &ChunkInfo) -> bool {
@@ -389,7 +817,9 @@ impl ChunkTracker {
             piece.index, chunk_info, chunk_range,
         );
 
-        if chunk_range.all() {
+        let completed = chunk_range.all();
+        self.reposition(chunk_info.piece_index);
+        if completed {
             return Some(ChunkMarkingResult::Completed);
         }
         Some(ChunkMarkingResult::NotCompleted)
@@ -421,6 +851,7 @@ impl ChunkTracker {
             sel.priority_counts[prev as usize] -= 1;
             sel.priority_counts[priority as usize] += 1;
             wanted_changed |= (prev == PiecePriority::Skip) != (priority == PiecePriority::Skip);
+            self.reposition(index);
         }
         if wanted_changed {
             self.apply_selection();
@@ -470,6 +901,7 @@ impl ChunkTracker {
             have_or_selected |= self.have.as_slice();
             self.queue_pieces &= have_or_selected;
         }
+        self.recount_queue();
 
         self.hns = self.calc_hns();
         self.hns
@@ -489,6 +921,16 @@ impl ChunkTracker {
 
     pub(crate) fn is_finished(&self) -> bool {
         self.get_hns().finished()
+    }
+
+    /// Whether `pieces` names a piece we want and lack: a selected one we do
+    /// not have (libtorrent `peer_connection::do_update_interest`).
+    pub(crate) fn wants_any_of(&self, pieces: &BS) -> bool {
+        let have = self.have.as_slice();
+        !self.is_finished()
+            && pieces.iter_ones().any(|p| {
+                self.selected.get(p).is_some_and(|s| *s) && !have.get(p).is_some_and(|h| *h)
+            })
     }
 
     pub fn per_file_have_bytes(&self) -> &[u64] {
@@ -874,5 +1316,86 @@ mod tests {
         assert!(ct.queue_pieces[3]);
         assert!(!ct.queue_pieces[1]);
         assert_eq!(ct.get_hns().needed_bytes, piece_len as u64 * 3);
+    }
+
+    // The counts a pick reads are kept, and agree with a recount of the
+    // bitfields after every kind of move.
+    #[test]
+    fn the_kept_counts_follow_every_move() {
+        use crate::{peer_protocol::Piece, piece_priority::PiecePriority};
+
+        let piece_len = CHUNK_SIZE * 2;
+        let l = Lengths::new(piece_len as u64 * 4, piece_len).unwrap();
+        let files = vec![FileInfo {
+            relative_filename: "0".into(),
+            offset_in_torrent: 0,
+            piece_range: 0..4,
+            len: piece_len as u64 * 4,
+            attrs: Default::default(),
+        }];
+        let bf_len = l.piece_bitfield_bytes();
+        let mut have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        have.set(3, true);
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..4).unwrap().fill(true);
+        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
+        let p = |i| l.validate_piece_index(i).unwrap();
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        let deliver = |ct: &mut ChunkTracker, i: u32, chunk: u32| {
+            ct.mark_chunk_downloaded(&Piece::from_data(i, chunk * CHUNK_SIZE, &block[..]))
+                .unwrap();
+        };
+        // (queued, started, had), kept and recounted.
+        let counts = |ct: &ChunkTracker| {
+            let recounted = (
+                ct.queue_pieces.count_ones(),
+                ct.iter_queued_pieces()
+                    .filter(|p| ct.received_chunks(*p) > 0)
+                    .map(|p| p.get())
+                    .collect::<Vec<_>>(),
+                ct.have.as_slice().count_ones(),
+            );
+            let kept = (
+                ct.queued as usize,
+                ct.started_pieces().map(|p| p.get()).collect::<Vec<_>>(),
+                ct.have_count(),
+            );
+            assert_eq!(kept, recounted);
+            assert_eq!(
+                ct.every_queued_piece_started(),
+                kept.0 == kept.1.len(),
+                "{kept:?}"
+            );
+            kept
+        };
+        assert_eq!(counts(&ct), (3, vec![], 1));
+
+        // A block of a queued piece starts it; a piece taken leaves the queue.
+        deliver(&mut ct, 1, 0);
+        ct.reserve_needed_piece(p(0));
+        assert_eq!(counts(&ct), (2, vec![1], 1));
+
+        // The taken piece comes back with its block; another is taken.
+        deliver(&mut ct, 0, 1);
+        ct.requeue_piece_if_not_have(p(0));
+        ct.reserve_needed_piece(p(2));
+        assert_eq!(counts(&ct), (2, vec![0, 1], 1));
+        assert!(ct.every_queued_piece_started());
+
+        // A failed piece comes back without its blocks.
+        ct.mark_piece_broken_if_not_have(p(1));
+        assert_eq!(counts(&ct), (2, vec![0], 1));
+        assert!(!ct.every_queued_piece_started());
+
+        // A passed piece is had; one requeued that we have stays out.
+        ct.mark_piece_downloaded(p(2));
+        assert!(!ct.requeue_piece_if_not_have(p(2)));
+        assert_eq!(counts(&ct), (2, vec![0], 2));
+
+        // Skipped and wanted again, a piece starts over.
+        ct.set_piece_priorities([(p(0), PiecePriority::Skip)]);
+        assert_eq!(counts(&ct), (1, vec![], 2));
+        ct.set_piece_priorities([(p(0), PiecePriority::Normal)]);
+        assert_eq!(counts(&ct), (2, vec![], 2));
     }
 }

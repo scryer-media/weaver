@@ -13,6 +13,15 @@ use crate::core::compact_ip::{
 };
 use serde_derive::{Deserialize, Serialize};
 
+// libtorrent `pex_flags.hpp`: what a PEX message says of a peer it adds.
+/// The peer is a seed (libtorrent `pex_seed`).
+pub const PEX_SEED: u8 = 0x02;
+/// We are connected to the peer over uTP (libtorrent `pex_utp`).
+pub const PEX_UTP: u8 = 0x04;
+/// The peer speaks the holepunch extension (libtorrent `pex_holepunch`).
+pub const PEX_HOLEPUNCH: u8 = 0x08;
+
+#[derive(Clone, Copy)]
 pub struct PexPeerInfo {
     pub flags: u8,
     pub addr: SocketAddr,
@@ -130,48 +139,62 @@ impl<'a> UtPex<ByteBuf<'a>> {
         self.added_peers_inner(&self.dropped, &None)
             .chain(self.added_peers_inner(&self.dropped6, &None))
     }
+
+    /// The bytes of the peer lists the message carries, what a reader of it
+    /// works through.
+    pub fn lists_len(&self) -> usize {
+        fn len<T: CompactSerialize + CompactSerializeFixedLen>(
+            list: &Option<CompactListInBuffer<ByteBuf<'_>, T>>,
+        ) -> usize {
+            list.as_ref()
+                .map_or(0, |l| l.iter().count() * T::fixed_len())
+        }
+        len(&self.added)
+            + len(&self.added_f)
+            + len(&self.added6)
+            + len(&self.added6_f)
+            + len(&self.dropped)
+            + len(&self.dropped6)
+    }
 }
 
 impl UtPex<ByteBufOwned> {
-    pub fn from_addrs(
-        addrs_live: impl Iterator<Item = SocketAddr> + Clone,
-        addrs_closed: impl Iterator<Item = SocketAddr> + Clone,
+    /// A PEX message adding `added`, each with its flags, and dropping
+    /// `dropped` (BEP 11).
+    pub fn from_peers(
+        added: impl Iterator<Item = PexPeerInfo> + Clone,
+        dropped: impl Iterator<Item = SocketAddr> + Clone,
     ) -> Self {
-        fn split(
-            addrs: impl Iterator<Item = SocketAddr> + Clone,
-        ) -> (
-            Option<CompactListInBufferOwned<SocketAddrV4>>,
-            Option<CompactListInBufferOwned<SocketAddrV6>>,
-        ) {
-            let v4 =
-                CompactListInBufferOwned::new_from_iter(addrs.clone().filter_map(
-                    |addr| match addr {
-                        SocketAddr::V4(a) => Some(a),
-                        _ => None,
-                    },
-                ));
-            let v6 =
-                CompactListInBufferOwned::new_from_iter(addrs.clone().filter_map(
-                    |addr| match addr {
-                        SocketAddr::V6(a) => Some(a),
-                        _ => None,
-                    },
-                ));
-            (
-                if v4.is_empty() { None } else { Some(v4) },
-                if v6.is_empty() { None } else { Some(v6) },
-            )
+        fn list<T: CompactSerialize + CompactSerializeFixedLen>(
+            it: impl Iterator<Item = T>,
+        ) -> Option<CompactListInBufferOwned<T>> {
+            let l = CompactListInBufferOwned::new_from_iter(it);
+            if l.is_empty() { None } else { Some(l) }
         }
-
-        let (added, added6) = split(addrs_live);
-        let (dropped, dropped6) = split(addrs_closed);
+        let v4 = |p: &PexPeerInfo| match p.addr {
+            SocketAddr::V4(a) => Some((a, Flags(p.flags))),
+            SocketAddr::V6(_) => None,
+        };
+        let v6 = |p: &PexPeerInfo| match p.addr {
+            SocketAddr::V6(a) => Some((a, Flags(p.flags))),
+            SocketAddr::V4(_) => None,
+        };
+        let added4 = added.clone().filter_map(|p| v4(&p));
+        let added6 = added.filter_map(|p| v6(&p));
 
         Self {
-            added,
-            added6,
-            dropped,
-            dropped6,
-            ..Default::default()
+            added: list(added4.clone().map(|(a, _)| a)),
+            added_f: list(added4.map(|(_, f)| f)),
+            added6: list(added6.clone().map(|(a, _)| a)),
+            added6_f: list(added6.map(|(_, f)| f)),
+            dropped: list(dropped.clone().filter_map(|a| match a {
+                SocketAddr::V4(a) => Some(a),
+                SocketAddr::V6(_) => None,
+            })),
+            dropped6: list(dropped.filter_map(|a| match a {
+                SocketAddr::V6(a) => Some(a),
+                SocketAddr::V4(_) => None,
+            })),
         }
     }
 }
@@ -223,18 +246,27 @@ mod tests {
             .unwrap();
 
         let addrs = [a1, aa1, a2, aa2];
-        let pex = UtPex::from_addrs(addrs.iter().copied(), addrs.iter().copied());
+        let added = addrs.iter().zip([PEX_SEED, PEX_UTP, 0, PEX_HOLEPUNCH]);
+        let pex = UtPex::from_peers(
+            added.map(|(&addr, flags)| PexPeerInfo { flags, addr }),
+            addrs.iter().copied(),
+        );
         let pex = pex.as_borrowed();
         let mut bytes = Vec::new();
         bencode_serialize_to_writer(&pex, &mut bytes).unwrap();
         let pex2 = from_bytes::<UtPex<ByteBuf>>(&bytes).unwrap();
         assert_eq!(4, pex2.added_peers().count());
         assert_eq!(pex.added_peers().count(), pex2.added_peers().count());
-        let addrs2: Vec<_> = pex2.added_peers().collect();
-        assert_eq!(a1, addrs2[0].addr);
-        assert_eq!(a2, addrs2[1].addr);
-        assert_eq!(aa1, addrs2[2].addr);
-        assert_eq!(aa2, addrs2[3].addr);
+        let addrs2: Vec<_> = pex2.added_peers().map(|p| (p.addr, p.flags)).collect();
+        assert_eq!(
+            addrs2,
+            [
+                (a1, PEX_SEED),
+                (a2, 0),
+                (aa1, PEX_UTP),
+                (aa2, PEX_HOLEPUNCH)
+            ]
+        );
         let addrs2: Vec<_> = pex2.dropped_peers().collect();
         assert_eq!(a1, addrs2[0].addr);
         assert_eq!(a2, addrs2[1].addr);

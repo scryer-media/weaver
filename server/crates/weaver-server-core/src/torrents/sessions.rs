@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use weaver_torrent::dht::DhtPersistenceConfig;
 use weaver_torrent::{
-    ConnectionOptions, DhtSessionConfig, ListenerMode, ListenerOptions, PeerConnectionOptions,
-    Session, SessionOptions, SocketFactory,
+    ConnectionOptions, DhtSessionConfig, HttpClients, ListenerMode, ListenerOptions,
+    PeerConnectionOptions, Session, SessionOptions, SocketFactory,
 };
 
 use crate::StateError;
@@ -109,7 +109,8 @@ pub struct OpenLeg {
     pub kind: LegKind,
     pub shape: Shape,
     pub factory: Option<Arc<dyn SocketFactory>>,
-    pub http: reqwest::Client,
+    /// The session's HTTP clients, for its trackers and web seeds.
+    pub http: Arc<dyn HttpClients>,
     /// The route's leg the factory dials through, kept while the session
     /// lives.
     pub leg: Option<Arc<TorrentLeg>>,
@@ -205,7 +206,7 @@ impl Routes for NetworkRoutes {
             LegKind::Ladder => Some(leg.bridge()?),
             _ => None,
         };
-        let http = tracker_client(&plan.kind, bridge.as_deref(), &self.identity)?;
+        let http = tracker_client(&plan.kind, bridge, &self.identity)?;
         let dialer = leg.dialer();
         Ok(OpenLeg {
             shape: plan.kind.shape(Some(&dialer)),

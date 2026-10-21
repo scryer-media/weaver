@@ -28,8 +28,11 @@ pub type Dht = Arc<DhtState>;
 
 // How long do we wait for a response from a DHT node.
 pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-// TODO: Not sure if we should re-query tbh.
-pub(crate) const REQUERY_INTERVAL: Duration = Duration::from_secs(60);
+// How often a torrent searches the DHT for peers and announces itself, at
+// the end of that search: libtorrent's `dht_announce_interval`
+// (settings_pack.cpp), the period `session_impl::update_dht_announce_interval`
+// gives each torrent.
+pub(crate) const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 // After how long we consider a routing table node questionable.
 pub(crate) const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 

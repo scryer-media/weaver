@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 /// Each peer is asked for the highest-priority missing piece it has: pieces of
 /// one level are all requested before any piece of a lower level, but only
 /// among the pieces that peer can serve, so a piece no peer has never holds
-/// the others up. Within a level the usual order applies (by file, first and
-/// last piece of each file first).
+/// the others up. Within a level the rarest piece among the connected peers
+/// goes first.
 ///
 /// `Skip` means the piece is not wanted: it is neither requested nor counted
 /// as needed, like the pieces of a file left out of `only_files`. A piece a

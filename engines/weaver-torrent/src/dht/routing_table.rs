@@ -5,7 +5,11 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::{net::SocketAddr, time::Instant};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Instant,
+};
 
 use crate::core::hash_id::Id20;
 use rand::Rng;
@@ -147,6 +151,16 @@ pub fn generate_random_id(start: &Id20, bits: u8) -> Id20 {
     data
 }
 
+// Whether two addresses are in the same /24 (v4) or /64 (v6), libtorrent's
+// `compare_ip_cidr`.
+fn same_subnet(a: SocketAddr, b: SocketAddr) -> bool {
+    match (a.ip().to_canonical(), b.ip().to_canonical()) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => a.octets()[..3] == b.octets()[..3],
+        (IpAddr::V6(a), IpAddr::V6(b)) => a.octets()[..8] == b.octets()[..8],
+        _ => false,
+    }
+}
+
 fn compute_split_start_end(
     start: Id20,
     end_inclusive: Id20,
@@ -274,6 +288,13 @@ impl BucketTree {
             // if already found, quit
             if nodes.nodes.iter().any(|r| r.id == id) {
                 return InsertResult::WasExisting;
+            }
+            // One node per /24 (v4) or /64 (v6) in a bucket: a node close to
+            // one we hold, under another id, is not trusted (libtorrent
+            // `routing_table::add_node_impl` with `dht_restrict_routing_ips`,
+            // `compare_ip_cidr`).
+            if nodes.nodes.iter().any(|r| same_subnet(r.addr, addr)) {
+                return InsertResult::Ignored;
             }
 
             let mut new_node = RoutingTableNode {
@@ -481,6 +502,9 @@ pub struct RoutingTable {
     id: Id20,
     size: usize,
     buckets: BucketTree,
+    // Rings as a node enters the table.
+    #[serde(skip)]
+    entered: Arc<tokio::sync::Notify>,
 }
 
 impl RoutingTable {
@@ -491,7 +515,12 @@ impl RoutingTable {
             id,
             buckets: BucketTree::new(max_size.unwrap_or(Self::DEFAULT_MAX_SIZE)),
             size: 0,
+            entered: Default::default(),
         }
+    }
+    /// Rings each time a node enters the table.
+    pub fn entered(&self) -> Arc<tokio::sync::Notify> {
+        self.entered.clone()
     }
     pub fn id(&self) -> Id20 {
         self.id
@@ -535,6 +564,7 @@ impl RoutingTable {
         };
         if replaced {
             self.size += 1;
+            self.entered.notify_waiters();
         }
         res
     }
@@ -710,5 +740,56 @@ mod tests {
             let id = dbg!(generate_random_id(&start, bits));
             assert!(id >= start && id <= end, "{:?}", id);
         }
+    }
+
+    // libtorrent `routing_table::add_node_impl` with `dht_restrict_routing_ips`
+    // and `compare_ip_cidr`: a bucket holds one node per /24 (v4) and /64 (v6).
+    #[test]
+    fn test_a_bucket_holds_one_node_per_subnet() {
+        use super::InsertResult;
+
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        let mut add =
+            |id: u8, addr: &str| table.add_node(Id20::new([id; 20]), addr.parse().unwrap());
+        assert!(matches!(add(0x80, "5.6.7.1:6881"), InsertResult::Added));
+        assert!(matches!(add(0x81, "5.6.7.2:6881"), InsertResult::Ignored));
+        assert!(matches!(add(0x82, "5.6.8.1:6881"), InsertResult::Added));
+        assert!(matches!(
+            add(0x83, "[2001:db8:1:2::1]:6881"),
+            InsertResult::Added
+        ));
+        assert!(matches!(
+            add(0x84, "[2001:db8:1:2:ff::1]:6881"),
+            InsertResult::Ignored
+        ));
+        assert!(matches!(
+            add(0x85, "[2001:db8:1:3::1]:6881"),
+            InsertResult::Added
+        ));
+        // The same node again is the same node.
+        assert!(matches!(
+            add(0x80, "5.6.7.1:6881"),
+            InsertResult::WasExisting
+        ));
+    }
+
+    // The restriction is per bucket: a node shares a /24 with a node of
+    // another bucket.
+    #[test]
+    fn test_the_subnet_restriction_is_per_bucket() {
+        use super::InsertResult;
+
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        let mut add = |id: u8, addr: [u8; 4]| {
+            table.add_node(Id20::new([id; 20]), SocketAddr::from((addr, 6881)))
+        };
+        // Eight far nodes fill the root bucket, and a ninth splits it.
+        for i in 0..8 {
+            assert!(matches!(add(0x80 + i, [5, 6, i, 1]), InsertResult::Added));
+        }
+        assert!(matches!(add(0x88, [5, 6, 8, 1]), InsertResult::Ignored));
+        // A near node in a far node's /24 goes to the near bucket.
+        assert!(matches!(add(0x01, [5, 6, 0, 2]), InsertResult::Added));
+        assert!(matches!(add(0x02, [5, 6, 0, 3]), InsertResult::Ignored));
     }
 }

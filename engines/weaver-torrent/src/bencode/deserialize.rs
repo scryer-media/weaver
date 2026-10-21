@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use crate::buffers::ByteBuf;
 use crate::clone_to_owned::CloneToOwned;
 use arrayvec::ArrayVec;
-use atoi::{FromRadix10, FromRadix10Signed};
+use atoi::{FromRadix10, FromRadix10Checked, FromRadix10SignedChecked};
 use serde::{Deserialize, Serialize, forward_to_deserialize_any};
 
 use crate::bencode::raw_value::TAG;
@@ -76,10 +76,15 @@ impl<'de> BencodeDeserializer<'de> {
         }
     }
 
-    fn parse_integer<I>(&mut self, atoi: impl Fn(&'de [u8]) -> (I, usize)) -> Result<I, Error> {
+    /// An integer that does not fit `I` is invalid, never wrapped
+    /// (libtorrent `bdecode` refuses one past int64 as an overflow).
+    fn parse_integer<I>(
+        &mut self,
+        atoi: impl Fn(&'de [u8]) -> (Option<I>, usize),
+    ) -> Result<I, Error> {
         self.parse_first_byte(b'i', Error::InvalidValue)?;
         match atoi(self.buf) {
-            (v, len) if len > 0 && self.buf.get(len) == Some(&b'e') => {
+            (Some(v), len) if len > 0 && self.buf.get(len) == Some(&b'e') => {
                 self.buf = &self.buf[len + 1..];
                 Ok(v)
             }
@@ -235,7 +240,17 @@ impl<'de> serde::de::Deserializer<'de> for &mut BencodeDeserializer<'de> {
     {
         match self.buf.first().copied() {
             Some(b'd') => self.deserialize_map(visitor),
-            Some(b'i') => self.deserialize_i64(visitor),
+            Some(b'i') => {
+                // One past i64 is still an integer, read as u64.
+                let buf = self.buf;
+                match self.parse_integer(i64::from_radix_10_signed_checked) {
+                    Ok(v) => visitor.visit_i64(v),
+                    Err(_) => {
+                        self.buf = buf;
+                        visitor.visit_u64(self.parse_integer(u64::from_radix_10_checked)?)
+                    }
+                }
+            }
             Some(b'l') => self.deserialize_seq(visitor),
             Some(_) => self.deserialize_bytes(visitor),
             None => Err(Error::Eof),
@@ -246,7 +261,7 @@ impl<'de> serde::de::Deserializer<'de> for &mut BencodeDeserializer<'de> {
     where
         V: serde::de::Visitor<'de>,
     {
-        let value = self.parse_integer::<u8>(u8::from_radix_10)?;
+        let value = self.parse_integer::<u8>(u8::from_radix_10_checked)?;
         if value > 1 {
             return Err(Error::InvalidBool(value));
         }
@@ -257,56 +272,56 @@ impl<'de> serde::de::Deserializer<'de> for &mut BencodeDeserializer<'de> {
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_i8(self.parse_integer(i8::from_radix_10_signed)?)
+        visitor.visit_i8(self.parse_integer(i8::from_radix_10_signed_checked)?)
     }
 
     fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_i16(self.parse_integer(i16::from_radix_10_signed)?)
+        visitor.visit_i16(self.parse_integer(i16::from_radix_10_signed_checked)?)
     }
 
     fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_i32(self.parse_integer(i32::from_radix_10_signed)?)
+        visitor.visit_i32(self.parse_integer(i32::from_radix_10_signed_checked)?)
     }
 
     fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_i64(self.parse_integer(i64::from_radix_10_signed)?)
+        visitor.visit_i64(self.parse_integer(i64::from_radix_10_signed_checked)?)
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_u8(self.parse_integer(u8::from_radix_10)?)
+        visitor.visit_u8(self.parse_integer(u8::from_radix_10_checked)?)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_u16(self.parse_integer(u16::from_radix_10)?)
+        visitor.visit_u16(self.parse_integer(u16::from_radix_10_checked)?)
     }
 
     fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_u32(self.parse_integer(u32::from_radix_10)?)
+        visitor.visit_u32(self.parse_integer(u32::from_radix_10_checked)?)
     }
 
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_u64(self.parse_integer(u64::from_radix_10)?)
+        visitor.visit_u64(self.parse_integer(u64::from_radix_10_checked)?)
     }
 
     fn deserialize_f32<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
@@ -717,6 +732,18 @@ mod tests {
 
         // trailing bytes
         assert!(from_bytes::<u32>(b"i42ee").is_err());
+
+        // An integer that does not fit is invalid, never wrapped.
+        assert!(from_bytes::<u8>(b"i256e").is_err());
+        assert!(from_bytes::<i64>(b"i9223372036854775808e").is_err());
+        assert!(from_bytes::<u64>(b"i18446744073709551616e").is_err());
+        assert_eq!(
+            from_bytes::<u64>(b"i18446744073709551615e").unwrap(),
+            u64::MAX
+        );
+        // Ignored, one past i64 is read as u64; past u64 it is invalid.
+        assert!(from_bytes::<serde::de::IgnoredAny>(b"i18446744073709551615e").is_ok());
+        assert!(from_bytes::<serde::de::IgnoredAny>(b"i18446744073709551616e").is_err());
     }
 
     #[test]

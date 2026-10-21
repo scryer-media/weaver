@@ -14,10 +14,12 @@ use crate::buffers::ByteBufT;
 use byteorder::WriteBytesExt;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
+use ut_holepunch::UtHolepunch;
 use ut_pex::UtPex;
 
 use crate::peer_protocol::DoubleBufHelper;
 use crate::peer_protocol::MSGID_EXTENDED;
+use crate::peer_protocol::MY_EXTENDED_UT_HOLEPUNCH;
 use crate::peer_protocol::MY_EXTENDED_UT_PEX;
 use crate::peer_protocol::SerializeError;
 
@@ -26,15 +28,28 @@ use self::{handshake::ExtendedHandshake, ut_metadata::UtMetadata};
 use super::MessageDeserializeError;
 
 pub mod handshake;
+pub mod ut_holepunch;
 pub mod ut_metadata;
 pub mod ut_pex;
 
 use super::MY_EXTENDED_UT_METADATA;
 
+/// The id we name for upload_only (libtorrent's
+/// `bt_peer_connection::upload_only_msg` is 3, our ut_metadata's id).
+pub const MY_EXTENDED_UPLOAD_ONLY: u8 = 2;
+
+// An extension we do not speak has no entry in `m` (libtorrent
+// `bt_peer_connection::write_handshake` lists the loaded plugins only).
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct PeerExtendedMessageIds {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ut_metadata: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ut_pex: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ut_holepunch: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_only: Option<u8>,
 }
 
 impl PeerExtendedMessageIds {
@@ -42,6 +57,8 @@ impl PeerExtendedMessageIds {
         Self {
             ut_metadata: Some(MY_EXTENDED_UT_METADATA),
             ut_pex: Some(MY_EXTENDED_UT_PEX),
+            ut_holepunch: None,
+            upload_only: Some(MY_EXTENDED_UPLOAD_ONLY),
         }
     }
 }
@@ -51,6 +68,10 @@ pub enum ExtendedMessage<ByteBuf: ByteBufT> {
     Handshake(ExtendedHandshake<ByteBuf>),
     UtMetadata(UtMetadata<ByteBuf>),
     UtPex(UtPex<ByteBuf>),
+    UtHolepunch(UtHolepunch),
+    /// We only upload the torrent, or no longer only do: one byte, 1 or 0
+    /// (libtorrent `bt_peer_connection::write_upload_only`).
+    UploadOnly(bool),
     Dyn(u8, BencodeValue<ByteBuf>),
 }
 
@@ -84,6 +105,20 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 out.write_u8(emsg_id)?;
                 bencode_serialize_to_writer(m, &mut out)?;
             }
+            ExtendedMessage::UtHolepunch(m) => {
+                let emsg_id = peer_extended_msg_ids()
+                    .ut_holepunch
+                    .ok_or(SerializeError::NeedHolepunch)?;
+                out.write_u8(emsg_id)?;
+                m.serialize(&mut out)?;
+            }
+            ExtendedMessage::UploadOnly(enabled) => {
+                let emsg_id = peer_extended_msg_ids()
+                    .upload_only
+                    .ok_or(SerializeError::NeedUploadOnly)?;
+                out.write_u8(emsg_id)?;
+                out.write_u8(u8::from(*enabled))?;
+            }
         }
         Ok(out.position() as usize)
     }
@@ -113,6 +148,19 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 Ok(ExtendedMessage::UtMetadata(UtMetadata::deserialize(buf)?))
             }
             MY_EXTENDED_UT_PEX => Ok(ExtendedMessage::UtPex(from_bytes_contig(&buf)?)),
+            MY_EXTENDED_UT_HOLEPUNCH => {
+                Ok(ExtendedMessage::UtHolepunch(UtHolepunch::deserialize(buf)?))
+            }
+            // One byte, nonzero when the peer only uploads (libtorrent
+            // `bt_peer_connection::on_extended`, `upload_only_msg`).
+            MY_EXTENDED_UPLOAD_ONLY => match buf.get_contiguous(buf.len()) {
+                Some(&[byte]) => Ok(ExtendedMessage::UploadOnly(byte != 0)),
+                _ => Err(MessageDeserializeError::IncorrectMsgLen {
+                    received: buf.len() as u32 + 1,
+                    expected: 2,
+                    msg_id,
+                }),
+            },
             _ => Ok(ExtendedMessage::Dyn(emsg_id, from_bytes_contig(&buf)?)),
         }
     }
@@ -123,7 +171,7 @@ mod tests {
     use crate::buffers::ByteBuf;
 
     use crate::peer_protocol::{
-        DoubleBufHelper, MessageDeserializeError,
+        DoubleBufHelper, MessageDeserializeError, SerializeError,
         extended::{
             ExtendedMessage, PeerExtendedMessageIds,
             handshake::ExtendedHandshake,
@@ -216,6 +264,53 @@ mod tests {
             .unwrap();
         let de = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf[..sz], &[])).unwrap();
         assert_eq!(msg, de);
+    }
+
+    // libtorrent `bt_peer_connection::write_upload_only`: the extended id
+    // the peer named for upload_only, then 1 or 0; nothing to a peer that
+    // named none.
+    #[test]
+    fn upload_only_is_one_byte_under_the_peers_id() {
+        let mut buf = [0u8; 8];
+        let ids = || PeerExtendedMessageIds {
+            upload_only: Some(7),
+            ..Default::default()
+        };
+        for (enabled, byte) in [(true, 1), (false, 0)] {
+            let sz = ExtendedMessage::<ByteBuf>::UploadOnly(enabled)
+                .serialize(&mut buf, &ids)
+                .unwrap();
+            assert_eq!(buf[..sz], [7, byte]);
+        }
+        let res = ExtendedMessage::<ByteBuf>::UploadOnly(true)
+            .serialize(&mut buf, &PeerExtendedMessageIds::default);
+        assert!(matches!(res, Err(SerializeError::NeedUploadOnly)));
+    }
+
+    // libtorrent `bt_peer_connection::on_extended`: under the id we named,
+    // upload_only is one byte, nonzero when the peer only uploads; a
+    // message of another size is not one.
+    #[test]
+    fn upload_only_is_read_under_our_id() {
+        let mut buf = [0u8; 8];
+        for enabled in [true, false] {
+            let msg = ExtendedMessage::<ByteBuf>::UploadOnly(enabled);
+            let sz = msg
+                .serialize(&mut buf, &PeerExtendedMessageIds::my)
+                .unwrap();
+            let de = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf[..sz], &[])).unwrap();
+            assert_eq!(de, msg);
+        }
+        assert_eq!(
+            ExtendedMessage::deserialize(DoubleBufHelper::new(&[2, 7], &[])).unwrap(),
+            ExtendedMessage::UploadOnly(true)
+        );
+        for bad in [&[2][..], &[2, 1, 1]] {
+            assert!(matches!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])),
+                Err(MessageDeserializeError::IncorrectMsgLen { .. })
+            ));
+        }
     }
 
     #[test]

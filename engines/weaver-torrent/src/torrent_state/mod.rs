@@ -15,6 +15,7 @@ pub mod utils;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -24,7 +25,7 @@ use crate::buffers::ByteBufOwned;
 use crate::core::hash_id::{Id20, Id32, InfoHashes};
 use crate::core::lengths::{Lengths, ValidPieceIndex};
 use crate::core::magnet::Magnet;
-use crate::core::torrent_metainfo::{TorrentMetaV1Owned, TorrentVersion};
+use crate::core::torrent_metainfo::{TorrentMetaV1Owned, TorrentVersion, WebSeed, WebSeedKind};
 use crate::peer_protocol::HashRequest;
 use crate::v2_hashes::V2Hashes;
 use anyhow::Context;
@@ -40,6 +41,7 @@ pub use live::*;
 use parking_lot::RwLock;
 
 use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -124,14 +126,16 @@ pub(crate) struct ManagedTorrentLocked {
     // The announce table of the trackers of the latest live run. It outlives
     // the run, so the last outcomes stay readable while paused.
     pub(crate) trackers: Option<crate::tracker::TrackerStatus>,
+    // While paused, ends the scraping of those trackers when dropped.
+    pub(crate) auto_scrape: Option<tokio_util::sync::DropGuard>,
 }
 
 #[derive(Default)]
 pub(crate) struct ManagedTorrentOptions {
     pub force_tracker_interval: Option<Duration>,
-    pub peer_connect_timeout: Option<Duration>,
-    pub peer_read_write_timeout: Option<Duration>,
-    pub peer_max_request_window: Option<usize>,
+    // The session's peer connection options with the torrent's own over
+    // them; every connection of the torrent takes them whole.
+    pub peer_opts: crate::peer_connection::PeerConnectionOptions,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     // The torrent's own rate limits. Every live run acquires through this one
@@ -141,6 +145,8 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_limit: Option<usize>,
     /// [`AddTorrentOptions::disable_v1_hashes`](crate::AddTorrentOptions::disable_v1_hashes).
     pub disable_v1_hashes: bool,
+    /// [`AddTorrentOptions::super_seeding`](crate::AddTorrentOptions::super_seeding).
+    pub super_seeding: bool,
 }
 
 impl ManagedTorrentOptions {
@@ -163,6 +169,9 @@ pub struct TorrentMetadata {
     pub file_infos: FileInfos,
     /// The v2 hashes of a v2 or hybrid torrent.
     pub(crate) v2: Option<V2Hashes>,
+    /// The web seeds the torrent file names; none for a magnet link, whose
+    /// metadata carries none.
+    pub web_seeds: Vec<WebSeed>,
 }
 
 impl TorrentMetadata {
@@ -196,6 +205,7 @@ impl TorrentMetadata {
             torrent_file_with_layers: OnceLock::new(),
             info_bytes,
             file_infos,
+            web_seeds: Vec::new(),
         })
     }
 
@@ -245,7 +255,16 @@ impl TorrentMetadata {
             Some(layers) => info.piece_layers(layers)?,
             None => Vec::new(),
         };
-        Self::new(info, torrent_bytes, meta.info.raw_bytes.0, layers)
+        let multi_file = info.iter_file_details().nth(1).is_some();
+        let web_seeds = crate::core::torrent_metainfo::web_seeds(
+            meta.url_list.as_ref(),
+            meta.httpseeds.as_ref(),
+            multi_file,
+        );
+        Ok(Self {
+            web_seeds,
+            ..Self::new(info, torrent_bytes, meta.info.raw_bytes.0, layers)?
+        })
     }
 
     pub fn lengths(&self) -> &Lengths {
@@ -332,6 +351,9 @@ pub struct ManagedTorrentShared {
     /// Counters of the most recent live run, recorded as the run ends, so a
     /// `stopped` tracker announce made after it ended reports them.
     pub(crate) last_run: parking_lot::Mutex<Option<RunCounters>>,
+
+    /// The torrent's web seeds, kept across its runs.
+    pub(crate) web_seeds: Arc<live::web_seed::WebSeeds>,
 }
 
 /// Transfer counters of one live run of a torrent, as its tracker announces
@@ -342,6 +364,10 @@ pub(crate) struct RunCounters {
     pub uploaded_bytes: u64,
     /// Bytes of the pieces downloaded during the run that passed their check.
     pub downloaded_bytes: u64,
+    /// Bytes of the pieces downloaded during the run that failed their check.
+    pub corrupt_bytes: u64,
+    /// Bytes of the blocks received during the run and not used.
+    pub redundant_bytes: u64,
     /// Bytes of the selected pieces still missing.
     pub left_bytes: u64,
 }
@@ -428,7 +454,33 @@ impl ManagedTorrent {
             .flatten()
             .map(|t| t.to_string())
             .collect();
-        Magnet::of(self.info_hashes(), self.name(), trackers)
+        let mut magnet = Magnet::of(self.info_hashes(), self.name(), trackers);
+        magnet.web_seeds = self
+            .web_seeds()
+            .into_iter()
+            .filter(|s| s.kind == WebSeedKind::Url)
+            .map(|s| s.url)
+            .collect();
+        magnet
+    }
+
+    /// The torrent's web seeds, but those banned for sending bad data
+    /// (libtorrent `torrent_handle::url_seeds`).
+    pub fn web_seeds(&self) -> Vec<WebSeed> {
+        self.shared.web_seeds.list()
+    }
+
+    /// Adds a web seed, as given; false when the torrent has it (libtorrent
+    /// `torrent_handle::add_url_seed`, `add_http_seed`).
+    pub fn add_web_seed(&self, seed: WebSeed) -> bool {
+        self.shared.web_seeds.add(seed)
+    }
+
+    /// Removes a web seed and closes its connection; false when the torrent
+    /// has no such seed (libtorrent `torrent_handle::remove_url_seed`,
+    /// `remove_http_seed`).
+    pub fn remove_web_seed(&self, seed: &WebSeed) -> bool {
+        self.shared.web_seeds.remove(seed)
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {
@@ -498,7 +550,18 @@ impl ManagedTorrent {
     }
 
     pub(crate) fn with_state_mut<R>(&self, f: impl FnOnce(&mut ManagedTorrentState) -> R) -> R {
-        f(&mut self.locked.write().state)
+        let mut g = self.locked.write();
+        let r = f(&mut g.state);
+        self.state_change_notify.notify_waiters();
+        r
+    }
+
+    // The torrent's next change of state from now on. The wait is enabled
+    // here, so a change between this call and its await is not missed.
+    fn next_state_change(&self) -> Pin<Box<Notified<'_>>> {
+        let mut changed = Box::pin(self.state_change_notify.notified());
+        changed.as_mut().enable();
+        changed
     }
 
     pub(crate) fn with_chunk_tracker<R>(
@@ -569,6 +632,7 @@ impl ManagedTorrent {
 
         self.state_change_notify.notify_waiters();
 
+        g.auto_scrape = None;
         g.state = ManagedTorrentState::Error(error)
     }
 
@@ -653,8 +717,10 @@ impl ManagedTorrent {
                 }
                 ManagedTorrentState::Paused(_) => {
                     if start_paused {
+                        g.auto_scrape = t.spawn_auto_scrape(g.trackers.clone());
                         return Ok(());
                     }
+                    g.auto_scrape = None;
                     let paused = g.state.take().assert_paused();
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let live = TorrentStateLive::new(paused, tx, token.clone())?;
@@ -731,6 +797,39 @@ impl ManagedTorrent {
         self.locked.read().trackers.clone()
     }
 
+    /// Asks a tracker of the latest live run for the swarm's counts now; see
+    /// [`crate::tracker::TrackerStatus::scrape`]. Fails when the torrent has
+    /// not run with trackers yet.
+    pub async fn scrape(&self) -> anyhow::Result<crate::tracker::ScrapeOk> {
+        let trackers = self
+            .tracker_status()
+            .context("the torrent has not run with trackers")?;
+        trackers.scrape().await
+    }
+
+    /// While the torrent rests paused, its trackers are scraped on the
+    /// session's auto-scrape cadence (libtorrent `torrent::update_want_scrape`
+    /// lists paused torrents). Dropping the returned guard ends it.
+    fn spawn_auto_scrape(
+        &self,
+        trackers: Option<crate::tracker::TrackerStatus>,
+    ) -> Option<tokio_util::sync::DropGuard> {
+        let trackers = trackers?;
+        let session = self.shared.session.upgrade()?;
+        let schedule = session.auto_scrape().clone();
+        let token = session.cancellation_token().child_token();
+        spawn_with_cancel(
+            debug_span!(parent: self.shared.span.clone(), "auto_scrape"),
+            "auto_scrape",
+            token.clone(),
+            async move {
+                trackers.auto_scrape(&schedule).await;
+                anyhow::Ok(())
+            },
+        );
+        Some(token.drop_guard())
+    }
+
     /// Pause the torrent if it's live.
     pub(crate) fn pause(&self) -> anyhow::Result<()> {
         let mut g = self.locked.write();
@@ -739,6 +838,7 @@ impl ManagedTorrent {
                 let paused = live.pause()?;
                 g.state = ManagedTorrentState::Paused(paused);
                 g.paused = true;
+                g.auto_scrape = self.spawn_auto_scrape(g.trackers.clone());
                 self.state_change_notify.notify_waiters();
                 Ok(())
             }
@@ -826,8 +926,8 @@ impl ManagedTorrent {
     #[inline(never)]
     pub fn wait_until_initialized(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
-            // TODO: rewrite, this polling is horrible
             loop {
+                let changed = self.next_state_change();
                 let done = self.with_state(|s| match s {
                     ManagedTorrentState::Initializing(_) => Ok(false),
                     ManagedTorrentState::Error(e) => bail!("{:?}", e),
@@ -837,11 +937,7 @@ impl ManagedTorrent {
                 if done {
                     return Ok(());
                 }
-                let _ = timeout(
-                    Duration::from_millis(100),
-                    self.state_change_notify.notified(),
-                )
-                .await;
+                changed.await;
             }
         }
         .boxed()
@@ -850,8 +946,11 @@ impl ManagedTorrent {
     #[inline(never)]
     pub fn wait_until_completed(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
-            // TODO: rewrite, this polling is horrible
-            let live = loop {
+            // A run completes the torrent, or the state changes and is read
+            // again: a paused torrent waits for the next run, a failed or
+            // removed one ends the wait.
+            loop {
+                let changed = self.next_state_change();
                 let live = self.with_state(|s| match s {
                     ManagedTorrentState::Initializing(_) | ManagedTorrentState::Paused(_) => {
                         Ok(None)
@@ -860,14 +959,14 @@ impl ManagedTorrent {
                     ManagedTorrentState::Error(e) => bail!("{:?}", e),
                     ManagedTorrentState::None => bail!("bug: torrent state is None"),
                 })?;
-                if let Some(live) = live {
-                    break live;
+                match live {
+                    Some(live) => tokio::select! {
+                        _ = live.wait_until_completed() => return Ok(()),
+                        _ = changed => {}
+                    },
+                    None => changed.await,
                 }
-                let _ = timeout(Duration::from_secs(1), self.state_change_notify.notified()).await;
-            };
-
-            live.wait_until_completed().await;
-            Ok(())
+            }
         }
         .boxed()
     }
@@ -940,41 +1039,28 @@ fn spawn_fatal_errors_receiver(
     );
 }
 
+/// Hands each peer the trackers, the DHT and the initial list find to the
+/// live run, as each comes (libtorrent `torrent::add_peer`, called from
+/// `tracker_response`, `on_dht_announce_response` and `ut_pex`). The run's
+/// cancellation token ends it (`TorrentStateLive::spawn`), as does the
+/// stream closing; it holds the run weakly, as libtorrent's DHT callback
+/// holds the torrent (`on_dht_announce_response_disp`).
 fn spawn_peer_adder(live: &Arc<TorrentStateLive>, mut peer_rx: PeerStream) {
     live.spawn(
         debug_span!(parent: live.torrent().span.clone(), "external_peer_adder"),
         format!("[{}]external_peer_adder", live.shared.id),
         {
-            let live = live.clone();
+            let live = Arc::downgrade(live);
             async move {
-                let live = {
-                    let weak = Arc::downgrade(&live);
-                    drop(live);
-                    weak
-                };
-
-                loop {
-                    match timeout(Duration::from_secs(5), peer_rx.next()).await {
-                        Ok(Some(peer)) => {
-                            trace!(?peer, "received peer");
-                            let live = match live.upgrade() {
-                                Some(live) => live,
-                                None => return Ok(()),
-                            };
-                            live.add_peer(peer);
-                        }
-                        Ok(None) => {
-                            debug!("peer_rx closed, closing peer adder");
-                            return Ok(());
-                        }
-                        // If timeout, check if the torrent is live.
-                        Err(_) if live.strong_count() == 0 => {
-                            debug!("timed out waiting for peers, torrent isn't live, closing peer adder");
-                            return Ok(());
-                        }
-                        Err(_) => continue,
-                    }
+                while let Some(peer) = peer_rx.next().await {
+                    trace!(?peer, "received peer");
+                    let Some(live) = live.upgrade() else {
+                        return Ok(());
+                    };
+                    live.add_peer(peer);
                 }
+                debug!("peer_rx closed, closing peer adder");
+                Ok(())
             }
         },
     );

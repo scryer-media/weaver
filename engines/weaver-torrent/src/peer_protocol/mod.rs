@@ -63,11 +63,34 @@ pub const MAX_MSG_LEN: usize = if MAX_HASHES_MSG_LEN > MAX_UT_METADATA_MSG_LEN {
     MAX_UT_METADATA_MSG_LEN
 } + MAX_MSG_LEN_LEN_JUST_IN_CASE_EXTRA;
 
+/// The longest frame read: a length prefix past it ends the connection
+/// (libtorrent `bt_peer_connection::on_receive`, `packet_too_large`).
+pub const MAX_PACKET_LEN: usize = 1024 * 1024;
+
+/// The longest frame a torrent of `num_pieces` sends, its bitfield or the
+/// longest other message; [`MAX_MSG_LEN`] while the piece count is unknown.
+pub fn max_frame_len(num_pieces: Option<u32>) -> usize {
+    MAX_MSG_LEN.max(num_pieces.map_or(0, |n| PREAMBLE_LEN + bitfield_len(n)))
+}
+
+/// The bytes of a bitfield of `num_pieces` (libtorrent
+/// `bt_peer_connection::on_bitfield`).
+fn bitfield_len(num_pieces: u32) -> usize {
+    num_pieces.div_ceil(8) as usize
+}
+
 const PSTR_BT1: &str = "BitTorrent protocol";
 
 // libtorrent `bt_peer_connection::write_handshake`: "indicate that we
 // support upgrading to v2".
 const V2_UPGRADE_BIT: u8 = 0x10;
+// libtorrent `bt_peer_connection::write_handshake`: "we support FAST
+// extension" (BEP 6), in the last reserved byte.
+const FAST_BIT: u8 = 0x04;
+
+// libtorrent `bt_peer_connection::write_handshake`: "we support DHT
+// messages", the low bit of the last reserved byte (BEP 5).
+const DHT_BIT: u8 = 0x01;
 
 type MsgId = u8;
 
@@ -80,6 +103,13 @@ const MSGID_BITFIELD: MsgId = 5;
 const MSGID_REQUEST: MsgId = 6;
 const MSGID_PIECE: MsgId = 7;
 const MSGID_CANCEL: MsgId = 8;
+// BEP 6 (libtorrent `bt_peer_connection::msg_suggest_piece` and on).
+const MSGID_SUGGEST: MsgId = 0x0D;
+const MSGID_HAVE_ALL: MsgId = 0x0E;
+const MSGID_HAVE_NONE: MsgId = 0x0F;
+const MSGID_REJECT: MsgId = 0x10;
+const MSGID_ALLOWED_FAST: MsgId = 0x11;
+const MSGID_PORT: MsgId = 9;
 const MSGID_EXTENDED: MsgId = 20;
 // BEP 52 (libtorrent `bt_peer_connection::msg_hash_request` and on).
 const MSGID_HASH_REQUEST: MsgId = 21;
@@ -95,6 +125,9 @@ pub const MY_EXTENDED_UT_METADATA: u8 = 3;
 pub const EXTENDED_UT_PEX_KEY: &[u8] = b"ut_pex";
 pub const MY_EXTENDED_UT_PEX: u8 = 1;
 
+// libtorrent `bt_peer_connection::holepunch_msg`.
+pub const MY_EXTENDED_UT_HOLEPUNCH: u8 = 4;
+
 #[derive(Clone, Copy)]
 pub struct MsgIdDebug(MsgId);
 impl MsgIdDebug {
@@ -109,6 +142,12 @@ impl MsgIdDebug {
             MSGID_REQUEST => "request",
             MSGID_PIECE => "piece",
             MSGID_CANCEL => "cancel",
+            MSGID_SUGGEST => "suggest",
+            MSGID_HAVE_ALL => "have_all",
+            MSGID_HAVE_NONE => "have_none",
+            MSGID_REJECT => "reject",
+            MSGID_ALLOWED_FAST => "allowed_fast",
+            MSGID_PORT => "port",
             MSGID_EXTENDED => "extended",
             MSGID_HASH_REQUEST => "hash_request",
             MSGID_HASHES => "hashes",
@@ -137,6 +176,8 @@ pub enum MessageDeserializeError {
     UnsupportedMessageId(u8),
     #[error(transparent)]
     Bencode(#[from] crate::bencode::DeserializeError),
+    #[error("message length {0} is past the packet limit {MAX_PACKET_LEN}")]
+    PacketTooLarge(u32),
     #[error("incorrect message length msg_id={msg_id:?}, expected={expected}, received={received}")]
     IncorrectMsgLen {
         received: u32,
@@ -163,6 +204,8 @@ pub enum MessageDeserializeError {
         expected_size: u32,
         received_size: u32,
     },
+    #[error("ut_holepunch: malformed message")]
+    UtHolepunchInvalid,
     #[error("pstr doesn't match {PSTR_BT1:?}")]
     HandshakePstrWrongContent,
     #[error("pstr should be 19 bytes long but got {0}")]
@@ -352,6 +395,8 @@ pub enum Message<'a> {
     Bitfield(ByteBuf<'a>),
     KeepAlive,
     Have(u32),
+    /// BEP 5: the UDP port of the sender's DHT node.
+    Port(u16),
     Choke,
     Unchoke,
     Interested,
@@ -361,6 +406,12 @@ pub enum Message<'a> {
     HashRequest(HashRequest),
     Hashes(Hashes<ByteBuf<'a>>),
     HashReject(HashRequest),
+    // BEP 6, the fast extension.
+    Suggest(u32),
+    HaveAll,
+    HaveNone,
+    Reject(Request),
+    AllowedFast(u32),
 }
 
 impl Message<'_> {
@@ -371,6 +422,21 @@ impl Message<'_> {
         matches!(
             self,
             Message::HashRequest(..) | Message::Hashes(..) | Message::HashReject(..)
+        )
+    }
+
+    /// Whether this is a fast extension message, which only a peer that set
+    /// the fast bit in its handshake may send (libtorrent
+    /// `bt_peer_connection::on_suggest_piece`, `on_have_all`, `on_have_none`,
+    /// `on_reject_request`, `on_allowed_fast`).
+    pub fn is_fast_only(&self) -> bool {
+        matches!(
+            self,
+            Message::Suggest(..)
+                | Message::HaveAll
+                | Message::HaveNone
+                | Message::Reject(..)
+                | Message::AllowedFast(..)
         )
     }
 }
@@ -385,6 +451,10 @@ pub enum SerializeError {
     NeedUtMetadata,
     #[error("need peer's handshake to serialize ut_pex, or peer does't support ut_pex")]
     NeedPex,
+    #[error("the peer does not speak ut_holepunch")]
+    NeedHolepunch,
+    #[error("the peer takes no upload_only")]
+    NeedUploadOnly,
 }
 
 impl From<std::io::Error> for SerializeError {
@@ -415,12 +485,13 @@ impl Message<'_> {
         }
 
         match self {
-            Message::Request(request) | Message::Cancel(request) => {
+            Message::Request(request) | Message::Cancel(request) | Message::Reject(request) => {
                 const TOTAL_LEN: usize = PREAMBLE_LEN + INTEGER_LEN * 3;
                 check_len!(TOTAL_LEN);
                 let msg_id = match self {
                     Message::Request(..) => MSGID_REQUEST,
                     Message::Cancel(..) => MSGID_CANCEL,
+                    Message::Reject(..) => MSGID_REJECT,
                     _ => unsafe { unreachable_unchecked() },
                 };
                 write_preamble!((INTEGER_LEN * 3) as u32, msg_id);
@@ -435,13 +506,20 @@ impl Message<'_> {
                 out[PREAMBLE_LEN..PREAMBLE_LEN + block_len].copy_from_slice(b.as_ref());
                 Ok(total_len)
             }
-            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested => {
+            Message::Choke
+            | Message::Unchoke
+            | Message::Interested
+            | Message::NotInterested
+            | Message::HaveAll
+            | Message::HaveNone => {
                 check_len!(PREAMBLE_LEN);
                 let msg_id = match self {
                     Message::Choke => MSGID_CHOKE,
                     Message::Unchoke => MSGID_UNCHOKE,
                     Message::Interested => MSGID_INTERESTED,
                     Message::NotInterested => MSGID_NOT_INTERESTED,
+                    Message::HaveAll => MSGID_HAVE_ALL,
+                    Message::HaveNone => MSGID_HAVE_NONE,
                     _ => unsafe { unreachable_unchecked() },
                 };
                 write_preamble!(0, msg_id);
@@ -461,11 +539,22 @@ impl Message<'_> {
                 out[0..4].copy_from_slice(&0u32.to_be_bytes());
                 Ok(4)
             }
-            Message::Have(v) => {
+            Message::Have(v) | Message::Suggest(v) | Message::AllowedFast(v) => {
                 check_len!(PREAMBLE_LEN + INTEGER_LEN);
-                write_preamble!(INTEGER_LEN as u32, MSGID_HAVE);
+                let msg_id = match self {
+                    Message::Have(..) => MSGID_HAVE,
+                    Message::Suggest(..) => MSGID_SUGGEST,
+                    _ => MSGID_ALLOWED_FAST,
+                };
+                write_preamble!(INTEGER_LEN as u32, msg_id);
                 out[5..9].copy_from_slice(&v.to_be_bytes());
                 Ok(9)
+            }
+            Message::Port(p) => {
+                check_len!(PREAMBLE_LEN + 2);
+                write_preamble!(2, MSGID_PORT);
+                out[5..7].copy_from_slice(&p.to_be_bytes());
+                Ok(7)
             }
             Message::Extended(e) => {
                 check_len!(PREAMBLE_LEN + 2);
@@ -497,9 +586,44 @@ impl Message<'_> {
 }
 
 impl Message<'_> {
+    /// The length rule of a message with `msg_id`, as the inclusive range
+    /// of its payload bytes; `None` for an id not spoken. `num_pieces` is
+    /// the torrent's piece count once its metadata is known (libtorrent
+    /// `bt_peer_connection`'s `on_*` handlers, each checking
+    /// `packet_size()` before the payload is in).
+    fn length_rule(msg_id: MsgId, num_pieces: Option<u32>) -> Option<(usize, usize)> {
+        const ANY: usize = MAX_PACKET_LEN - MSGID_LEN;
+        let rule = match msg_id {
+            MSGID_CHOKE | MSGID_UNCHOKE | MSGID_INTERESTED | MSGID_NOT_INTERESTED => (0, 0),
+            MSGID_HAVE_ALL | MSGID_HAVE_NONE => (0, 0),
+            MSGID_HAVE | MSGID_SUGGEST | MSGID_ALLOWED_FAST => (INTEGER_LEN, INTEGER_LEN),
+            // libtorrent `bt_peer_connection::on_dht_port`: exactly a
+            // 2-byte port.
+            MSGID_PORT => (2, 2),
+            // Without the metadata the size cannot be checked (`on_bitfield`).
+            MSGID_BITFIELD => match num_pieces {
+                Some(n) => (bitfield_len(n), bitfield_len(n)),
+                None => (1, ANY),
+            },
+            MSGID_REQUEST | MSGID_CANCEL | MSGID_REJECT => (INTEGER_LEN * 3, INTEGER_LEN * 3),
+            // At most a block (`on_piece`: `packet_size() - 9 > block_size()`).
+            MSGID_PIECE => (INTEGER_LEN * 2 + 1, INTEGER_LEN * 2 + CHUNK_SIZE as usize),
+            MSGID_EXTENDED => (0, ANY),
+            MSGID_HASH_REQUEST | MSGID_HASH_REJECT => (HASH_REQUEST_LEN, HASH_REQUEST_LEN),
+            // The exact length follows from the request it repeats (`on_hashes`).
+            MSGID_HASHES => (HASH_REQUEST_LEN, ANY),
+            _ => return None,
+        };
+        Some(rule)
+    }
+
+    /// The first message in `buf` then `buf2`, and the bytes it takes. A
+    /// frame past [`MAX_PACKET_LEN`] or its message's length rule is
+    /// refused on its header, before its payload is read.
     pub fn deserialize<'a>(
         buf: &'a [u8],
         buf2: &'a [u8],
+        num_pieces: Option<u32>,
     ) -> Result<(Message<'a>, usize), MessageDeserializeError> {
         let mut buf = DoubleBufHelper::new(buf, buf2);
         let len_prefix = buf
@@ -509,13 +633,24 @@ impl Message<'_> {
         if len_prefix == 0 {
             return Ok((Message::KeepAlive, total_len));
         }
+        if len_prefix as usize > MAX_PACKET_LEN {
+            return Err(MessageDeserializeError::PacketTooLarge(len_prefix));
+        }
 
-        let msg_id = buf.read_u8().ok_or(MessageDeserializeError::NotEnoughData(
-            len_prefix as usize,
-            None,
-        ))?;
+        let msg_id = buf
+            .read_u8()
+            .ok_or(MessageDeserializeError::NotEnoughData(1, None))?;
 
         let msg_len = len_prefix as usize - 1;
+        let (min, max) = Self::length_rule(msg_id, num_pieces)
+            .ok_or(MessageDeserializeError::UnsupportedMessageId(msg_id))?;
+        if !(min..=max).contains(&msg_len) {
+            return Err(MessageDeserializeError::IncorrectMsgLen {
+                received: len_prefix - 1,
+                expected: (if msg_len < min { min } else { max }) as u32,
+                msg_id: MsgIdDebug(msg_id),
+            });
+        }
         if buf.len() < msg_len {
             return Err(MessageDeserializeError::NotEnoughData(
                 msg_len - buf.len(),
@@ -523,59 +658,34 @@ impl Message<'_> {
             ));
         }
 
-        macro_rules! check_msg_len {
-            ($expected:expr) => {{
-                if msg_len != $expected {
-                    return Err(MessageDeserializeError::IncorrectMsgLen {
-                        received: len_prefix - 1,
-                        expected: $expected,
-                        msg_id: MsgIdDebug(msg_id),
-                    });
-                }
-            }};
-            (min $expected:expr) => {{
-                if msg_len < $expected {
-                    return Err(MessageDeserializeError::IncorrectMsgLen {
-                        received: len_prefix - 1,
-                        expected: $expected,
-                        msg_id: MsgIdDebug(msg_id),
-                    });
-                }
-            }};
-        }
-
         match msg_id {
-            MSGID_CHOKE => {
-                check_msg_len!(0);
-                Ok((Message::Choke, total_len))
+            MSGID_CHOKE => Ok((Message::Choke, total_len)),
+            MSGID_UNCHOKE => Ok((Message::Unchoke, total_len)),
+            MSGID_INTERESTED => Ok((Message::Interested, total_len)),
+            MSGID_NOT_INTERESTED => Ok((Message::NotInterested, total_len)),
+            MSGID_HAVE | MSGID_SUGGEST | MSGID_ALLOWED_FAST => {
+                let piece = buf.read_u32_be().unwrap();
+                let msg = match msg_id {
+                    MSGID_HAVE => Message::Have(piece),
+                    MSGID_SUGGEST => Message::Suggest(piece),
+                    _ => Message::AllowedFast(piece),
+                };
+                Ok((msg, total_len))
             }
-            MSGID_UNCHOKE => {
-                check_msg_len!(0);
-                Ok((Message::Unchoke, total_len))
-            }
-            MSGID_INTERESTED => {
-                check_msg_len!(0);
-                Ok((Message::Interested, total_len))
-            }
-            MSGID_NOT_INTERESTED => {
-                check_msg_len!(0);
-                Ok((Message::NotInterested, total_len))
-            }
-            MSGID_HAVE => {
-                check_msg_len!(4);
-                let have = buf.read_u32_be().unwrap();
-                Ok((Message::Have(have), total_len))
+            MSGID_HAVE_ALL => Ok((Message::HaveAll, total_len)),
+            MSGID_HAVE_NONE => Ok((Message::HaveNone, total_len)),
+            MSGID_PORT => {
+                let port = buf.consume::<2>().unwrap();
+                Ok((Message::Port(u16::from_be_bytes(port)), total_len))
             }
             MSGID_BITFIELD => {
-                check_msg_len!(min 1);
                 // In practice, as bitfield is always (almost) the first message, it should be contiguous.
                 let data = buf
                     .get_contiguous(msg_len)
                     .ok_or(MessageDeserializeError::NeedContiguous)?;
                 Ok((Message::Bitfield(ByteBuf::from(data)), total_len))
             }
-            MSGID_REQUEST | MSGID_CANCEL => {
-                check_msg_len!(12);
+            MSGID_REQUEST | MSGID_CANCEL | MSGID_REJECT => {
                 const I32: usize = 4;
                 const I32_3: usize = I32 * 3;
                 let req = buf.consume::<I32_3>().unwrap();
@@ -584,24 +694,14 @@ impl Message<'_> {
                     begin: BE::read_u32(&req[I32..I32 * 2]),
                     length: BE::read_u32(&req[I32 * 2..I32 * 3]),
                 };
-                let req = if msg_id == MSGID_REQUEST {
-                    Message::Request(request)
-                } else {
-                    Message::Cancel(request)
+                let req = match msg_id {
+                    MSGID_REQUEST => Message::Request(request),
+                    MSGID_CANCEL => Message::Cancel(request),
+                    _ => Message::Reject(request),
                 };
                 Ok((req, total_len))
             }
             MSGID_PIECE => {
-                const MIN_PAYLOAD: usize = 1;
-                const MIN_LENGTH: usize = INTEGER_LEN * 2 + MIN_PAYLOAD;
-                if msg_len < MIN_LENGTH {
-                    return Err(MessageDeserializeError::IncorrectMsgLen {
-                        expected: MIN_LENGTH as u32,
-                        received: msg_len as u32,
-                        msg_id: MsgIdDebug(msg_id),
-                    });
-                }
-
                 let index = buf.read_u32_be().unwrap();
                 let begin = buf.read_u32_be().unwrap();
 
@@ -623,7 +723,6 @@ impl Message<'_> {
                 PREAMBLE_LEN + msg_len,
             )),
             MSGID_HASH_REQUEST | MSGID_HASH_REJECT => {
-                check_msg_len!(48); // HASH_REQUEST_LEN
                 let r = HashRequest::deserialize(buf.consume::<HASH_REQUEST_LEN>().unwrap());
                 let msg = if msg_id == MSGID_HASH_REQUEST {
                     Message::HashRequest(r)
@@ -633,7 +732,6 @@ impl Message<'_> {
                 Ok((msg, total_len))
             }
             MSGID_HASHES => {
-                check_msg_len!(min 48); // HASH_REQUEST_LEN
                 let request = HashRequest::deserialize(buf.consume::<HASH_REQUEST_LEN>().unwrap());
                 // Exactly the nodes asked for and their uncles
                 // (libtorrent `bt_peer_connection::on_hashes`).
@@ -657,6 +755,7 @@ impl Message<'_> {
                     total_len,
                 ))
             }
+            // `length_rule` refused every other id.
             msg_id => Err(MessageDeserializeError::UnsupportedMessageId(msg_id)),
         }
     }
@@ -676,6 +775,8 @@ impl Handshake {
         let mut reserved: u64 = 0;
         // supports extended messaging
         reserved |= 1 << 20;
+        // supports the fast extension
+        reserved |= u64::from(FAST_BIT);
 
         Handshake {
             reserved,
@@ -708,11 +809,34 @@ impl Handshake {
         self.reserved.to_be_bytes()[5] & 0x10 > 0
     }
 
+    /// Whether the peer speaks the fast extension (BEP 6): bit 0x04 of the
+    /// last reserved byte (libtorrent `bt_peer_connection::on_receive_handshake`
+    /// sets `m_supports_fast` from it).
+    pub fn supports_fast(&self) -> bool {
+        self.reserved.to_be_bytes()[7] & FAST_BIT > 0
+    }
+
     /// Whether the peer offers to move a hybrid's connection to v2: bit
     /// 0x10 of the last reserved byte (libtorrent
     /// `bt_peer_connection::write_handshake`).
     pub fn offers_v2(&self) -> bool {
         self.reserved.to_be_bytes()[7] & V2_UPGRADE_BIT > 0
+    }
+
+    /// Whether the peer runs a DHT node and takes a PORT message: bit 0x01
+    /// of the last reserved byte (libtorrent
+    /// `bt_peer_connection::on_receive_handshake`, BEP 5).
+    pub fn supports_dht(&self) -> bool {
+        self.reserved.to_be_bytes()[7] & DHT_BIT > 0
+    }
+
+    /// This handshake, saying we run a DHT node when `dht` holds.
+    #[must_use]
+    pub fn offering_dht(mut self, dht: bool) -> Self {
+        if dht {
+            self.reserved |= u64::from(DHT_BIT);
+        }
+        self
     }
 
     /// This handshake, offering a move to v2 when `offer` holds.
@@ -803,7 +927,7 @@ mod tests {
     fn test_deserialize_serialize_extended_non_contiguous() {
         for split_point in 0..EXTENDED.len() {
             let (first, second) = EXTENDED.split_at(split_point);
-            let res = Message::deserialize(first, second);
+            let res = Message::deserialize(first, second, None);
             if split_point > PREAMBLE_LEN + 1 && split_point < EXTENDED.len() {
                 assert!(
                     matches!(res, Err(MessageDeserializeError::NeedContiguous)),
@@ -843,7 +967,7 @@ mod tests {
         for split_point in 0..buf.len() {
             dbg!(split_point);
             let (first, second) = buf.split_at(split_point);
-            let (msg, len) = Message::deserialize(first, second).unwrap();
+            let (msg, len) = Message::deserialize(first, second, None).unwrap();
 
             let piece = match &msg {
                 Message::Piece(piece) => piece,
@@ -889,7 +1013,7 @@ mod tests {
         for split_point in 0..buf.len() {
             dbg!(split_point);
             let (first, second) = buf.split_at(split_point);
-            let (msg, len) = Message::deserialize(first, second).unwrap();
+            let (msg, len) = Message::deserialize(first, second, None).unwrap();
 
             let request = match msg {
                 Message::Request(req) => req,
@@ -914,7 +1038,7 @@ mod tests {
 
         for split_point in 0..buf.len() {
             let (first, second) = buf.split_at(split_point);
-            let (msg, len) = Message::deserialize(first, second).unwrap();
+            let (msg, len) = Message::deserialize(first, second, None).unwrap();
             assert!(matches!(msg, Message::KeepAlive));
             assert_eq!(len, 4);
             let mut tmp = [0u8; 100];
@@ -933,7 +1057,7 @@ mod tests {
 
         for split_point in 0..buf.len() {
             let (first, second) = buf.split_at(split_point);
-            let (msg, len) = Message::deserialize(first, second).unwrap();
+            let (msg, len) = Message::deserialize(first, second, None).unwrap();
             assert!(matches!(msg, Message::Have(42)));
             assert_eq!(len, 9);
             let mut tmp = [0u8; 100];
@@ -954,7 +1078,7 @@ mod tests {
 
         for split_point in 0..buf.len() {
             let (first, second) = buf.split_at(split_point);
-            let res = Message::deserialize(first, second);
+            let res = Message::deserialize(first, second, None);
             if (6..47).contains(&split_point) {
                 assert!(
                     matches!(res, Err(MessageDeserializeError::NeedContiguous)),
@@ -988,17 +1112,21 @@ mod tests {
             MSGID_UNCHOKE,
             MSGID_INTERESTED,
             MSGID_NOT_INTERESTED,
+            MSGID_HAVE_ALL,
+            MSGID_HAVE_NONE,
         ] {
             buf[0..4].copy_from_slice(&1u32.to_be_bytes());
             buf[4] = msgid;
             for split_point in 0..buf.len() {
                 let (first, second) = buf.split_at(split_point);
-                let (msg, len) = Message::deserialize(first, second).unwrap();
+                let (msg, len) = Message::deserialize(first, second, None).unwrap();
                 match (msgid, &msg) {
                     (MSGID_CHOKE, Message::Choke)
                     | (MSGID_UNCHOKE, Message::Unchoke)
                     | (MSGID_INTERESTED, Message::Interested)
-                    | (MSGID_NOT_INTERESTED, Message::NotInterested) => {}
+                    | (MSGID_NOT_INTERESTED, Message::NotInterested)
+                    | (MSGID_HAVE_ALL, Message::HaveAll)
+                    | (MSGID_HAVE_NONE, Message::HaveNone) => {}
                     (msgid, msg) => panic!("msgid={msgid}, msg={msg:?}"),
                 }
                 assert_eq!(len, 5);
@@ -1008,6 +1136,115 @@ mod tests {
                 assert_eq!(buf[..len], tmp[..len]);
             }
         }
+    }
+
+    #[test]
+    fn suggest_and_allowed_fast_carry_one_piece_index_like_have() {
+        for msgid in [MSGID_SUGGEST, MSGID_ALLOWED_FAST] {
+            let mut buf = [0u8; 100];
+            buf[0..4].copy_from_slice(&5u32.to_be_bytes());
+            buf[4] = msgid;
+            buf[5..9].copy_from_slice(&42u32.to_be_bytes());
+            for split_point in 0..buf.len() {
+                let (first, second) = buf.split_at(split_point);
+                let (msg, len) = Message::deserialize(first, second, None).unwrap();
+                match (msgid, &msg) {
+                    (MSGID_SUGGEST, Message::Suggest(42))
+                    | (MSGID_ALLOWED_FAST, Message::AllowedFast(42)) => {}
+                    (msgid, msg) => panic!("msgid={msgid}, msg={msg:?}"),
+                }
+                assert!(msg.is_fast_only());
+                assert_eq!(len, 9);
+                let mut tmp = [0u8; 100];
+                let slen = msg.serialize(&mut tmp, &|| Default::default()).unwrap();
+                assert_eq!(slen, len);
+                assert_eq!(buf[..len], tmp[..len]);
+            }
+        }
+    }
+
+    #[test]
+    fn reject_is_framed_like_request() {
+        let mut buf = [0u8; 100];
+        buf[0..4].copy_from_slice(&13u32.to_be_bytes());
+        buf[4] = MSGID_REJECT;
+        buf[5..9].copy_from_slice(&42u32.to_be_bytes());
+        buf[9..13].copy_from_slice(&16384u32.to_be_bytes());
+        buf[13..17].copy_from_slice(&16384u32.to_be_bytes());
+        for split_point in 0..buf.len() {
+            let (first, second) = buf.split_at(split_point);
+            let (msg, len) = Message::deserialize(first, second, None).unwrap();
+            let Message::Reject(request) = &msg else {
+                panic!("expected reject, got {msg:?}");
+            };
+            assert_eq!(
+                (request.index, request.begin, request.length),
+                (42, 16384, 16384)
+            );
+            assert!(msg.is_fast_only());
+            assert_eq!(len, 17);
+            let mut tmp = [0u8; 100];
+            let slen = msg.serialize(&mut tmp, &|| Default::default()).unwrap();
+            assert_eq!(slen, len);
+            assert_eq!(buf[..len], tmp[..len]);
+        }
+    }
+
+    #[test]
+    fn a_fast_message_of_the_wrong_length_is_refused() {
+        // libtorrent `bt_peer_connection::on_have_all` and the other fast
+        // handlers disconnect on a packet of the wrong size.
+        for (msgid, msg_len) in [
+            (MSGID_HAVE_ALL, 1u32),
+            (MSGID_HAVE_NONE, 1),
+            (MSGID_SUGGEST, 3),
+            (MSGID_ALLOWED_FAST, 5),
+            (MSGID_REJECT, 8),
+        ] {
+            let mut buf = [0u8; 100];
+            buf[0..4].copy_from_slice(&(msg_len + 1).to_be_bytes());
+            buf[4] = msgid;
+            assert!(
+                matches!(
+                    Message::deserialize(&buf, &[], None),
+                    Err(MessageDeserializeError::IncorrectMsgLen { .. })
+                ),
+                "msgid={msgid}"
+            );
+        }
+    }
+
+    #[test]
+    fn our_handshake_offers_the_fast_extension() {
+        // libtorrent `bt_peer_connection::write_handshake` always sets it.
+        let ours = Handshake::new(Id20::new([1; 20]), Id20::new([2; 20]));
+        let mut buf = [0u8; 100];
+        let len = ours.serialize_unchecked_len(&mut buf);
+        assert_eq!(buf[20 + 7] & 0x04, 0x04);
+        let (parsed, _) = Handshake::deserialize(&buf[..len]).unwrap();
+        assert!(parsed.supports_fast());
+        let without = Handshake {
+            reserved: ours.reserved & !0x04,
+            ..ours
+        };
+        assert!(!without.supports_fast());
+    }
+
+    #[test]
+    fn a_peer_offers_the_fast_extension_in_bit_0x04_of_the_last_reserved_byte() {
+        let fast = Handshake {
+            reserved: 0x04,
+            ..Handshake::new(Id20::new([1; 20]), Id20::new([2; 20]))
+        };
+        let mut buf = [0u8; 100];
+        let len = fast.serialize_unchecked_len(&mut buf);
+        assert_eq!(buf[20 + 7] & 0x04, 0x04);
+        let (parsed, _) = Handshake::deserialize(&buf[..len]).unwrap();
+        assert!(parsed.supports_fast());
+        assert!(!fast.supports_extended());
+        assert!(!fast.offers_v2());
+        assert!(!Message::Have(1).is_fast_only());
+        assert!(!Message::Request(Request::new(0, 0, 1)).is_fast_only());
     }
 
     fn hash_request(count: u32, proof_layers: u32) -> HashRequest {
@@ -1044,7 +1281,7 @@ mod tests {
 
             for split_point in 0..want.len() {
                 let (first, second) = want.split_at(split_point);
-                let (back, back_len) = Message::deserialize(first, second).unwrap();
+                let (back, back_len) = Message::deserialize(first, second, None).unwrap();
                 assert_eq!(back_len, want.len());
                 match (msg_id_of(&back), back) {
                     (21, Message::HashRequest(r)) | (23, Message::HashReject(r)) => {
@@ -1095,7 +1332,7 @@ mod tests {
 
         for split_point in 0..len {
             let (first, second) = out[..len].split_at(split_point);
-            match Message::deserialize(first, second) {
+            match Message::deserialize(first, second, None) {
                 Ok((Message::Hashes(h), got)) => {
                     assert_eq!(got, len);
                     assert_eq!(h.request, request);
@@ -1114,7 +1351,7 @@ mod tests {
         let short = len - 32;
         out[..4].copy_from_slice(&((short - 4) as u32).to_be_bytes());
         assert!(matches!(
-            Message::deserialize(&out[..short], &[]),
+            Message::deserialize(&out[..short], &[], None),
             Err(MessageDeserializeError::IncorrectMsgLen { .. })
         ));
     }
@@ -1135,7 +1372,7 @@ mod tests {
         let len = Message::Hashes(owned.as_borrowed())
             .serialize(&mut out, &Default::default)
             .unwrap();
-        let (back, back_len) = Message::deserialize(&out[..len], &[]).unwrap();
+        let (back, back_len) = Message::deserialize(&out[..len], &[], None).unwrap();
         assert_eq!(back_len, len);
         assert!(matches!(back, Message::Hashes(h) if h.hashes() == hashes));
     }
@@ -1152,8 +1389,116 @@ mod tests {
         assert!(offer.offers_v2());
         let mut buf = [0u8; 68];
         offer.serialize_unchecked_len(&mut buf);
-        assert_eq!(buf[20 + 7], 0x10);
+        assert_eq!(buf[20 + 7] & 0x10, 0x10);
         assert_eq!(&buf[20..27], &plain().reserved.to_be_bytes()[..7]);
         assert!(Handshake::deserialize(&buf).unwrap().0.offers_v2());
+    }
+
+    // libtorrent `bt_peer_connection::on_bitfield`: once the piece count is
+    // known a bitfield is one bit per piece, however many pieces, and a
+    // bitfield of another size is refused on its header.
+    #[test]
+    fn a_bitfield_is_sized_by_the_piece_count() {
+        const PIECES: u32 = 300_001;
+        let bits = vec![0xffu8; 37_501];
+        let mut out = vec![0u8; max_frame_len(Some(PIECES))];
+        assert!(out.len() > MAX_MSG_LEN);
+        let len = Message::Bitfield(ByteBuf(&bits))
+            .serialize(&mut out, &Default::default)
+            .unwrap();
+        assert_eq!(len, 5 + 37_501);
+        let (msg, got) = Message::deserialize(&out[..len], &[], Some(PIECES)).unwrap();
+        assert!(matches!(msg, Message::Bitfield(b) if b.as_ref().len() == 37_501));
+        assert_eq!(got, len);
+
+        assert!(matches!(
+            Message::deserialize(&out[..5], &[], Some(PIECES + 8)),
+            Err(MessageDeserializeError::IncorrectMsgLen { .. })
+        ));
+        // Without the metadata the size cannot be checked.
+        assert!(matches!(
+            Message::deserialize(&out[..5], &[], None),
+            Err(MessageDeserializeError::NotEnoughData(..))
+        ));
+    }
+
+    // libtorrent `bt_peer_connection::on_receive` refuses a length past
+    // 1 MiB, `on_piece` a piece longer than a block and `on_request` a
+    // request of any other length, each on the header alone.
+    #[test]
+    fn a_frame_past_its_rule_is_refused_on_its_header() {
+        let header = |len: u32, id: u8| {
+            let mut h = len.to_be_bytes().to_vec();
+            h.push(id);
+            h
+        };
+        let refused = |len: u32, id: u8| Message::deserialize(&header(len, id), &[], None).err();
+        assert!(matches!(
+            refused(MAX_PACKET_LEN as u32 + 1, MSGID_EXTENDED),
+            Some(MessageDeserializeError::PacketTooLarge(..))
+        ));
+        assert!(matches!(
+            refused(MAX_PACKET_LEN as u32, MSGID_EXTENDED),
+            Some(MessageDeserializeError::NotEnoughData(..))
+        ));
+        assert!(matches!(
+            refused(1 + 8 + CHUNK_SIZE + 1, MSGID_PIECE),
+            Some(MessageDeserializeError::IncorrectMsgLen { .. })
+        ));
+        assert!(matches!(
+            refused(1 + 8 + CHUNK_SIZE, MSGID_PIECE),
+            Some(MessageDeserializeError::NotEnoughData(..))
+        ));
+        assert!(matches!(
+            refused(14, MSGID_REQUEST),
+            Some(MessageDeserializeError::IncorrectMsgLen { .. })
+        ));
+        assert!(matches!(
+            refused(5, 99),
+            Some(MessageDeserializeError::UnsupportedMessageId(99))
+        ));
+    }
+
+    // libtorrent `bt_peer_connection::write_handshake` sets 0x01 in the
+    // last reserved byte when it runs a DHT node.
+    #[test]
+    fn the_dht_bit_is_0x01_of_the_last_reserved_byte() {
+        let plain = || Handshake::new(Id20::new([1; 20]), Id20::new([2; 20]));
+        assert!(!plain().supports_dht());
+        assert_eq!(plain().offering_dht(false), plain());
+
+        let dht = plain().offering_dht(true).offering_v2(true);
+        let mut buf = [0u8; 68];
+        let _ = dht.serialize_unchecked_len(&mut buf);
+        // Beside the fast bit every handshake of ours carries.
+        assert_eq!(buf[20 + 7], 0x11 | FAST_BIT);
+        let back = Handshake::deserialize(&buf).unwrap().0;
+        assert!(back.supports_dht() && back.offers_v2() && back.supports_extended());
+    }
+
+    // libtorrent `bt_peer_connection::write_dht_port` writes
+    // `{0,0,0,3, 9, port hi, port lo}`; `on_dht_port` refuses any other
+    // length.
+    #[test]
+    fn a_port_message_is_id_9_with_a_2_byte_port() {
+        let mut out = [0u8; 16];
+        let len = Message::Port(6881)
+            .serialize(&mut out, &|| Default::default())
+            .unwrap();
+        assert_eq!(&out[..len], &[0, 0, 0, 3, 9, 0x1a, 0xe1]);
+        for split in 0..len {
+            let (a, b) = out[..len].split_at(split);
+            let (back, back_len) = Message::deserialize(a, b, None).unwrap();
+            assert_eq!(back_len, len);
+            assert!(matches!(back, Message::Port(6881)));
+        }
+        for wrong in [2u32, 4] {
+            let mut frame = wrong.to_be_bytes().to_vec();
+            frame.extend([MSGID_PORT, 0, 0, 0]);
+            assert!(matches!(
+                Message::deserialize(&frame, &[], None).err(),
+                Some(MessageDeserializeError::IncorrectMsgLen { .. })
+            ));
+        }
     }
 }

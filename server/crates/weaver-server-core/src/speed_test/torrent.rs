@@ -21,7 +21,7 @@ use bitvec::order::Msb0;
 use tokio::sync::watch;
 use weaver_torrent::core::lengths::Lengths;
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerMode, ListenerOptions,
+    AddTorrent, AddTorrentOptions, ConnectionOptions, HttpClients, ListenerMode, ListenerOptions,
     ManagedTorrent, PiecePriority, Session, SessionOptions, TrackerAnnounce,
 };
 use weaver_tunnel::pipe::Dialer;
@@ -31,7 +31,7 @@ use super::progress::StreamProvider;
 use super::torrent_net::{PieceStore, ProbeSockets, Watched};
 use crate::proxies::{FetchPath, start_bridge, through_bridge};
 use crate::torrents::identity::IDENTITY;
-use crate::torrents::net::LegKind;
+use crate::torrents::net::{LegClients, LegKind};
 
 // Where the test torrent is found: the directory of the current Debian
 // netinst torrents.
@@ -205,19 +205,16 @@ fn failed_at(step: P2pStep, error: String) -> P2pReport {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the test torrent's client rides the path's bridge"
-)]
-fn http_client(bridge: &weaver_tunnel::bridge::Bridge) -> Result<reqwest::Client, String> {
-    through_bridge(
-        reqwest::Client::builder()
-            .user_agent(IDENTITY.user_agent())
-            .read_timeout(Duration::from_secs(30)),
-        bridge,
-    )?
-    .build()
-    .map_err(|error| error.to_string())
+// The test torrent's HTTP clients, which ride the path's bridge.
+fn http_client(bridge: Arc<weaver_tunnel::bridge::Bridge>) -> Arc<dyn HttpClients> {
+    Arc::new(LegClients(move || {
+        through_bridge(
+            reqwest::Client::builder()
+                .user_agent(IDENTITY.user_agent())
+                .read_timeout(Duration::from_secs(30)),
+            &bridge,
+        )
+    }))
 }
 
 // The netinst torrent a directory listing names.
@@ -266,7 +263,7 @@ pub(crate) struct TestTorrent {
     name: String,
     bytes: Vec<u8>,
     lengths: Lengths,
-    client: reqwest::Client,
+    client: Arc<dyn HttpClients>,
     bridge: Arc<weaver_tunnel::bridge::Bridge>,
 }
 
@@ -277,15 +274,16 @@ impl TestTorrent {
     ) -> Result<Self, String> {
         let provider = StreamProvider::new(stage, None);
         let bridge = start_bridge(provider as Arc<dyn FetchPath>)?;
-        let client = http_client(&bridge)?;
-        let listing = get_capped(&client, &source.directory).await?;
+        let client = http_client(bridge.clone());
+        let fetcher = client.client(None).map_err(|error| error.to_string())?;
+        let listing = get_capped(&fetcher, &source.directory).await?;
         let name = pick_torrent(&String::from_utf8_lossy(&listing))
             .ok_or_else(|| format!("{} lists no netinst torrent", source.directory))?;
         let url = source
             .directory
             .join(&name)
             .map_err(|error| error.to_string())?;
-        let bytes = get_capped(&client, &url).await?;
+        let bytes = get_capped(&fetcher, &url).await?;
         let lengths = weaver_torrent::torrent_from_bytes(&bytes)
             .map_err(|error| error.to_string())
             .and_then(|torrent| {
@@ -357,6 +355,10 @@ impl Joined {
             }),
             peer_limit: Some(PEER_LIMIT),
             disable_local_service_discovery: true,
+            // The probe measures demand from every peer the tracker names,
+            // several behind one address included; it holds its few slots
+            // for seconds (libtorrent `allow_multiple_connections_per_ip`).
+            allow_multiple_connections_per_ip: true,
             socket_factory: Some(Arc::new(ProbeSockets::new(
                 path.stage.clone(),
                 path.kind.clone(),

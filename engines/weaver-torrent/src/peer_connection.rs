@@ -18,12 +18,12 @@ use crate::core::{
     peer_id::try_decode_peer_id,
 };
 use crate::peer_protocol::{
-    Handshake, Hashes, MAX_MSG_LEN, Message,
+    Handshake, Hashes, Message,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
     },
-    serialize_piece_preamble,
+    max_frame_len, serialize_piece_preamble,
 };
 use crate::{Error, Result, session::CheckedIncomingConnection, stream_connect::ConnectionKind};
 use futures::TryFutureExt;
@@ -35,7 +35,7 @@ use tracing::{Instrument, trace, trace_span};
 use crate::{
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
-    stream_connect::StreamConnector,
+    stream_connect::{StreamConnector, Transports},
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
 };
 
@@ -72,6 +72,16 @@ pub trait PeerConnectionHandler {
     fn client_name_and_version(&self) -> &str {
         crate::client_name_and_version()
     }
+    /// The torrent's piece count once its metadata is known: it sets the
+    /// length of a bitfield, and so of the longest frame.
+    fn num_pieces(&self) -> Option<u32> {
+        None
+    }
+    /// The UDP port of the session's DHT node, when it runs one: the
+    /// handshake then sets the DHT bit (BEP 5).
+    fn dht_port(&self) -> Option<u16> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -95,11 +105,50 @@ pub struct PeerConnectionOptions {
     #[serde(default, with = "optional_seconds")]
     pub keep_alive_interval: Option<Duration>,
 
+    /// How long the encryption handshake, and then the BitTorrent
+    /// handshake, may take on a connection either way; default
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`].
+    #[serde(default, with = "optional_seconds")]
+    pub handshake_timeout: Option<Duration>,
+
     /// The most chunk requests to keep outstanding per peer (default 128, and
     /// never more than the peer's reqq). A newly needed piece, such as the
     /// one at a stream's read position after a seek, is requested only after
     /// those, so a smaller window makes streams react faster to seeks.
     pub max_request_window: Option<usize>,
+}
+
+/// libtorrent `settings_pack::handshake_timeout`: a peer that has not
+/// finished its handshake this long after it last sent anything is
+/// dropped (`peer_connection::second_tick`).
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// libtorrent `settings_pack::peer_connect_timeout`: an outgoing connection
+/// not made this long after it was started is given up
+/// (`peer_connection::second_tick`, while `m_connecting`).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The read and write timeout when none is set.
+const DEFAULT_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl PeerConnectionOptions {
+    pub(crate) fn handshake_timeout(&self) -> Duration {
+        self.handshake_timeout.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT)
+    }
+
+    fn read_write_timeout(&self) -> Duration {
+        self.read_write_timeout
+            .unwrap_or(DEFAULT_READ_WRITE_TIMEOUT)
+    }
+
+    /// A keepalive goes out once nothing has been sent for half the read
+    /// timeout, so a peer that times out a silent connection as we do
+    /// hears from us in time (libtorrent `peer_connection::keep_alive`:
+    /// `timeout() / 2`, the `settings_pack::peer_timeout`).
+    fn keep_alive_interval(&self) -> Duration {
+        self.keep_alive_interval
+            .unwrap_or_else(|| self.read_write_timeout() / 2)
+    }
 }
 
 // A duration as whole seconds, rounded to the nearest one; `None` as none.
@@ -136,6 +185,8 @@ pub(crate) struct PeerConnection<H> {
     options: PeerConnectionOptions,
     spawner: BlockingSpawner,
     connector: Arc<StreamConnector>,
+    // What an outgoing connection may go over.
+    transports: Transports,
 }
 
 pub(crate) async fn with_timeout<T>(
@@ -152,8 +203,11 @@ pub(crate) async fn with_timeout<T>(
 struct ManagePeerArgs {
     handshake_supports_extended: bool,
     speaks_v2: bool,
+    /// The peer set the fast bit in its handshake (libtorrent
+    /// `bt_peer_connection::m_supports_fast`).
+    supports_fast: bool,
     read_buf: ReadBuf,
-    write_buf: Box<[u8; MAX_MSG_LEN]>,
+    write_buf: Box<[u8]>,
     read: BoxAsyncReadVectored,
     write: BoxAsyncWrite,
     outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
@@ -177,7 +231,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             spawner,
             options: options.unwrap_or_default(),
             connector,
+            transports: Transports::Any,
         }
+    }
+
+    /// The outgoing connection goes over `transports`.
+    pub fn over(self, transports: Transports) -> Self {
+        Self { transports, ..self }
     }
 
     // By the time this is called:
@@ -188,11 +248,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         mut incoming: CheckedIncomingConnection,
     ) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-
-        let rwtimeout = self
-            .options
-            .read_write_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
 
         // A peer speaks v2 when it greets with the truncated v2 hash or
         // offers v2, which a torrent without v2 refuses (libtorrent
@@ -212,12 +267,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             try_decode_peer_id(incoming.handshake.peer_id)
         );
 
-        let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
+        let mut write_buf = self.frame_buf();
         let my_handshake = self.greeting(speaks_v2);
         let hlen = my_handshake.serialize_unchecked_len(&mut *write_buf);
         with_timeout(
             "writing handshake",
-            rwtimeout,
+            self.options.handshake_timeout(),
             incoming
                 .writer
                 .write_all(&write_buf[..hlen])
@@ -227,6 +282,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         // What the peer supports is in the peer's handshake, not in ours.
         let handshake_supports_extended = incoming.handshake.supports_extended();
+        let supports_fast = incoming.handshake.supports_fast();
 
         self.handler
             .on_handshake(incoming.handshake, incoming.kind, speaks_v2)
@@ -235,6 +291,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
             speaks_v2,
+            supports_fast,
             read_buf: incoming.read_buf,
             write_buf,
             read: incoming.reader,
@@ -248,17 +305,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         &self,
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
     ) -> Result<()> {
-        let rwtimeout = self
-            .options
-            .read_write_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
-
+        let handshake_timeout = self.options.handshake_timeout();
         let connect_timeout = self
             .options
             .connect_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
-        let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
+        let mut write_buf = self.frame_buf();
         // Every peer is greeted as v1 first, which a hybrid's v2 peers
         // answer too (libtorrent `peer_connection::associated_info_hash`).
         let handshake = self.greeting(false);
@@ -272,10 +325,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connector
             .connect_and_send_handshake(
                 self.addr,
+                self.transports,
                 &greeting,
                 &write_buf[..hsz],
                 connect_timeout,
-                rwtimeout,
+                handshake_timeout,
             )
             .await?;
 
@@ -283,8 +337,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.handler.on_connected(now.elapsed());
 
             let mut read_buf = ReadBuf::new();
-            let h = read_buf.read_handshake(&mut read, rwtimeout).await?;
+            let h = read_buf
+                .read_handshake(&mut read, handshake_timeout)
+                .await?;
             let handshake_supports_extended = h.supports_extended();
+            let supports_fast = h.supports_fast();
             trace!(
                 peer_id=?h.peer_id,
                 decoded_id=?try_decode_peer_id(h.peer_id),
@@ -308,6 +365,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
                 speaks_v2,
+                supports_fast,
                 read_buf,
                 write_buf,
                 read,
@@ -320,18 +378,25 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         .await
     }
 
+    /// A buffer for the longest frame of the torrent.
+    fn frame_buf(&self) -> Box<[u8]> {
+        vec![0u8; max_frame_len(self.handler.num_pieces())].into_boxed_slice()
+    }
+
     /// Our handshake: the hash of the protocol the peer speaks, offering
     /// v2 to a peer that does not speak it when the torrent has v2
     /// (libtorrent `bt_peer_connection::write_handshake`).
     fn greeting(&self, speaks_v2: bool) -> Handshake {
         Handshake::new(self.info_hashes.for_peer(speaks_v2), self.peer_id)
             .offering_v2(!speaks_v2 && self.info_hashes.v2.is_some())
+            .offering_dht(self.handler.dht_port().is_some())
     }
 
     async fn manage_peer(&self, args: ManagePeerArgs) -> Result<()> {
         let ManagePeerArgs {
             handshake_supports_extended,
             speaks_v2,
+            supports_fast,
             mut read_buf,
             mut write_buf,
             mut read,
@@ -341,10 +406,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         use tokio::io::AsyncWriteExt;
 
-        let rwtimeout = self
-            .options
-            .read_write_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
+        let rwtimeout = self.options.read_write_timeout();
 
         let extended_handshake: RwLock<Option<PeerExtendedMessageIds>> = RwLock::new(None);
         let extended_handshake_ref = &extended_handshake;
@@ -369,10 +431,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         }
 
         let writer = async move {
-            let keep_alive_interval = self
-                .options
-                .keep_alive_interval
-                .unwrap_or_else(|| Duration::from_secs(120));
+            let keep_alive_interval = self.options.keep_alive_interval();
 
             if self.handler.should_send_bitfield() {
                 let len = self
@@ -502,13 +561,25 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         };
 
         let reader = async move {
+            let num_pieces = self.handler.num_pieces();
             loop {
-                let message = read_buf.read_message(&mut read, rwtimeout).await?;
+                let message = read_buf
+                    .read_message(&mut read, rwtimeout, num_pieces)
+                    .await?;
                 trace!("received: {:?}", &message);
                 // libtorrent `bt_peer_connection::on_hash_request`, `on_hashes`
                 // and `on_hash_reject` disconnect a peer that does not speak v2.
                 if message.is_v2_only() && !speaks_v2 {
                     return Err(Error::HashMessageFromV1Peer);
+                }
+                // libtorrent `bt_peer_connection::on_suggest_piece`,
+                // `on_have_all`, `on_have_none`, `on_reject_request` and
+                // `on_allowed_fast` disconnect a peer that did not set the
+                // fast bit.
+                if message.is_fast_only() && !supports_fast {
+                    return Err(Error::Anyhow(anyhow::anyhow!(
+                        "fast extension message from a peer without it: {message:?}"
+                    )));
                 }
 
                 tokio::task::yield_now().await;
@@ -554,9 +625,234 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
-    use super::PeerConnectionOptions;
+    use tokio::{sync::mpsc, time::Instant};
+
+    use super::{
+        DEFAULT_CONNECT_TIMEOUT, DEFAULT_HANDSHAKE_TIMEOUT, PeerConnection, PeerConnectionHandler,
+        PeerConnectionOptions,
+    };
+    use crate::{
+        Error,
+        buffers::ByteBuf,
+        core::{
+            hash_id::{Id20, InfoHashes},
+            lengths::ChunkInfo,
+        },
+        mse::EncryptionPolicy,
+        network::{
+            BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket, SocketFactory,
+            StreamListener,
+        },
+        peer_info_reader::tests::{Dialed, halves},
+        peer_protocol::{Handshake, Message, extended::handshake::ExtendedHandshake},
+        read_buf::ReadBuf,
+        session::CheckedIncomingConnection,
+        spawn_utils::BlockingSpawner,
+        stream_connect::{ConnectionKind, StreamConnector, StreamConnectorArgs},
+    };
+
+    struct Quiet;
+
+    impl PeerConnectionHandler for Quiet {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, _: Message<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    const HASH: [u8; 20] = [7; 20];
+
+    /// A connection whose reads and writes may wait two minutes, so only
+    /// the handshake timeout can end a handshake sooner.
+    async fn connection(
+        encryption: EncryptionPolicy,
+    ) -> (
+        PeerConnection<Quiet>,
+        mpsc::UnboundedReceiver<(SocketAddr, tokio::io::DuplexStream)>,
+    ) {
+        let (tx, dialed) = mpsc::unbounded_channel();
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            enable_tcp: true,
+            socket_factory: Some(Arc::new(Dialed(tx))),
+            encryption,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let options = PeerConnectionOptions {
+            read_write_timeout: Some(Duration::from_secs(120)),
+            ..Default::default()
+        };
+        let connection = PeerConnection::new(
+            "127.0.0.1:6881".parse().unwrap(),
+            InfoHashes {
+                v1: Some(Id20::new(HASH)),
+                v2: None,
+            },
+            Id20::new([1; 20]),
+            Quiet,
+            Some(options),
+            BlockingSpawner::new(1),
+            Arc::new(connector),
+        );
+        (connection, dialed)
+    }
+
+    // libtorrent `peer_connection::second_tick` drops a peer still in its
+    // handshake `handshake_timeout` after it last heard from it, whatever
+    // the peer timeout; the encryption handshake is part of it.
+    #[tokio::test(start_paused = true)]
+    async fn an_outgoing_handshake_unanswered_ends_at_the_handshake_timeout() {
+        for (encryption, step) in [
+            (EncryptionPolicy::Disabled, "reading"),
+            (EncryptionPolicy::Require, "encryption handshake"),
+        ] {
+            let (connection, _dialed) = connection(encryption).await;
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let start = Instant::now();
+            let result = connection.manage_peer_outgoing(rx).await;
+            assert!(
+                matches!(result, Err(Error::Timeout(s)) if s == step),
+                "{encryption:?}: {result:?}"
+            );
+            assert_eq!(start.elapsed(), DEFAULT_HANDSHAKE_TIMEOUT, "{encryption:?}");
+        }
+    }
+
+    // libtorrent `peer_connection::keep_alive` sends a keepalive once
+    // nothing has gone out for half the peer timeout.
+    /// Connects that never complete.
+    struct Unanswered;
+
+    impl SocketFactory for Unanswered {
+        fn connect_tcp<'a>(
+            &'a self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+            Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+            Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+        }
+    }
+
+    // libtorrent `peer_connection::second_tick` gives up a connect
+    // `peer_connect_timeout` (15 s) after it was started.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_unanswered_is_given_up_at_the_connect_timeout() {
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            enable_tcp: true,
+            socket_factory: Some(Arc::new(Unanswered)),
+            encryption: EncryptionPolicy::Disabled,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (mut connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        connection.connector = Arc::new(connector);
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let start = Instant::now();
+        let result = connection.manage_peer_outgoing(rx).await;
+        assert!(
+            matches!(result, Err(Error::Timeout("connecting"))),
+            "{result:?}"
+        );
+        assert_eq!(start.elapsed(), DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_keepalive_goes_out_at_half_the_read_timeout_unless_set() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (read_write_timeout, keep_alive_interval, expected) in [
+            (Some(120), None, 60),
+            (None, None, 5),
+            (Some(120), Some(30), 30),
+        ] {
+            let (mut connection, mut dialed) = connection(EncryptionPolicy::Disabled).await;
+            connection.options = PeerConnectionOptions {
+                read_write_timeout: read_write_timeout.map(Duration::from_secs),
+                keep_alive_interval: keep_alive_interval.map(Duration::from_secs),
+                ..Default::default()
+            };
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(async move { connection.manage_peer_outgoing(rx).await });
+            let (_, mut peer) = dialed.recv().await.unwrap();
+            let mut theirs = [0; 68];
+            peer.read_exact(&mut theirs).await.unwrap();
+            let mut ours = [0; 68];
+            let len = Handshake::new(Id20::new(HASH), Id20::new([2; 20]))
+                .serialize_unchecked_len(&mut ours);
+            peer.write_all(&ours[..len]).await.unwrap();
+            // Whatever goes out first, the keepalive is the first empty frame.
+            let start = Instant::now();
+            loop {
+                let frame = peer.read_u32().await.unwrap();
+                if frame == 0 {
+                    break;
+                }
+                let mut body = vec![0; frame as usize];
+                peer.read_exact(&mut body).await.unwrap();
+            }
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(expected),
+                "{read_write_timeout:?} {keep_alive_interval:?}"
+            );
+            task.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_incoming_peer_that_takes_no_handshake_ends_at_the_handshake_timeout() {
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        // The peer reads nothing, so our handshake does not fit.
+        let (ours, _theirs) = tokio::io::duplex(16);
+        let (reader, writer) = halves(ours);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer,
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+        };
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let start = Instant::now();
+        let result = connection.manage_peer_incoming(rx, incoming).await;
+        assert!(
+            matches!(result, Err(Error::Timeout("writing handshake"))),
+            "{result:?}"
+        );
+        assert_eq!(start.elapsed(), DEFAULT_HANDSHAKE_TIMEOUT);
+    }
 
     #[test]
     fn timeouts_serialize_as_rounded_whole_seconds() {
@@ -564,6 +860,7 @@ mod tests {
             connect_timeout: Some(Duration::from_millis(1499)),
             read_write_timeout: Some(Duration::from_millis(1500)),
             keep_alive_interval: None,
+            handshake_timeout: Some(Duration::from_millis(2500)),
             max_request_window: None,
         };
         assert_eq!(
@@ -572,6 +869,7 @@ mod tests {
                 "connect_timeout": 1,
                 "read_write_timeout": 2,
                 "keep_alive_interval": null,
+                "handshake_timeout": 3,
                 "max_request_window": null,
             })
         );

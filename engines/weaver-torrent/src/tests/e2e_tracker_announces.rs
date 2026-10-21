@@ -87,7 +87,9 @@ fn answer_with_peer(peer: SocketAddr) -> anyhow::Result<Vec<u8>> {
 fn tracker_session_opts() -> anyhow::Result<SessionOptions> {
     Ok(SessionOptions {
         disable_trackers: false,
-        http_client: Some(reqwest::Client::builder().no_proxy().build()?),
+        http_client: Some(std::sync::Arc::new(|| {
+            reqwest::Client::builder().no_proxy()
+        })),
         ..isolated_session_opts(false)
     })
 }
@@ -206,7 +208,7 @@ async fn test_announced_port_is_the_one_the_session_listens_on() -> anyhow::Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_partial_selection_announces_only_the_selected_bytes_left() -> anyhow::Result<()> {
+async fn test_partial_selection_announces_what_the_whole_torrent_lacks() -> anyhow::Result<()> {
     setup_test_logging();
     const PIECE_LENGTH: u32 = 1024;
     let dir = create_default_random_dir_with_torrents(3, 4 * PIECE_LENGTH as usize, Some("sel"));
@@ -240,13 +242,15 @@ async fn test_partial_selection_announces_only_the_selected_bytes_left() -> anyh
         .into_handle()
         .context("expected a handle")?;
 
-    // One of three piece-aligned files selected: only its bytes are left.
+    // One of three piece-aligned files selected: `left` is still every byte
+    // of the torrent, as libtorrent's `torrent::bytes_left` counts it, so
+    // finishing the selection never reads as a seed.
     let (conn, query) = read_announce_query(&tracker).await?;
     assert_eq!(param(&query, "event"), Some("started"));
     assert_eq!(param(&query, "downloaded"), Some("0"));
     assert_eq!(
         param(&query, "left"),
-        Some((4 * PIECE_LENGTH).to_string().as_str())
+        Some((3 * 4 * PIECE_LENGTH).to_string().as_str())
     );
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
     Ok(())
@@ -264,7 +268,9 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         out.path().into(),
         SessionOptions {
             disable_trackers: false,
-            http_client: Some(reqwest::Client::builder().no_proxy().build()?),
+            http_client: Some(std::sync::Arc::new(|| {
+                reqwest::Client::builder().no_proxy()
+            })),
             ..isolated_session_opts(false)
         },
     )
@@ -309,7 +315,8 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         answered[0].last.as_ref().context("answered")?.result,
         Ok(AnnounceOk {
             interval: Duration::from_secs(1800),
-            min_interval: None,
+            // Named by none, libtorrent's parse_tracker_response default.
+            min_interval: Duration::from_secs(30),
             seeders: Some(3),
             leechers: Some(5),
         })

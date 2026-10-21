@@ -16,7 +16,7 @@ use weaver_torrent::network::{
     AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket,
     Resolver,
 };
-use weaver_torrent::{SocketFactory, StreamListener};
+use weaver_torrent::{HttpClients, HttpTarget, SocketFactory, StreamListener};
 use weaver_tunnel::bridge::Bridge;
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
 use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Resolution, Target};
@@ -401,26 +401,55 @@ impl DatagramSocket for NoDatagrams {
     }
 }
 
-/// The client for HTTP trackers and metainfo downloads on a leg. A ladder
-/// leg's client rides `bridge`, the leg's own.
+/// The HTTP clients of a session on a leg: the one for no target asks HTTP
+/// trackers and downloads metainfo, and a web seed is asked through one
+/// held to the address its host was checked at. A ladder leg's clients ride
+/// `bridge`, the leg's own.
 pub fn tracker_client(
     kind: &LegKind,
-    bridge: Option<&Bridge>,
+    bridge: Option<Arc<Bridge>>,
     identity: &ClientIdentity,
-) -> Result<reqwest::Client, String> {
-    let builder = reqwest::Client::builder().user_agent(identity.user_agent());
-    let builder = match (kind, bridge) {
-        (LegKind::Ladder, Some(bridge)) => crate::proxies::through_bridge(builder, bridge)?,
-        (LegKind::Ladder, None) => return Err("a ladder leg needs its bridge".into()),
-        (LegKind::System, _) => builder,
-        (LegKind::SourceAddress(address), _) => builder.local_address(*address),
-        (LegKind::Interface(name), _) => bound_to(builder, name)?,
+) -> Result<Arc<dyn HttpClients>, String> {
+    let kind = kind.clone();
+    let user_agent = identity.user_agent();
+    let builder = move || {
+        let builder = reqwest::Client::builder().user_agent(user_agent);
+        Ok(match (&kind, &bridge) {
+            (LegKind::Ladder, Some(bridge)) => crate::proxies::through_bridge(builder, bridge)?,
+            (LegKind::Ladder, None) => return Err("a ladder leg needs its bridge".into()),
+            (LegKind::System, _) => builder,
+            (LegKind::SourceAddress(address), _) => builder.local_address(*address),
+            (LegKind::Interface(name), _) => bound_to(builder, name)?,
+        })
     };
+    // A leg whose clients cannot be built does not open.
+    let _ = builder()?;
+    Ok(Arc::new(LegClients(builder)))
+}
+
+/// A session's HTTP clients, each from the builder its leg gives.
+pub(crate) struct LegClients<F>(pub(crate) F);
+
+impl<F> HttpClients for LegClients<F>
+where
+    F: Fn() -> Result<reqwest::ClientBuilder, String> + Send + Sync + 'static,
+{
     #[expect(
         clippy::disallowed_methods,
-        reason = "a torrent session's tracker client, built for its leg"
+        reason = "a torrent session's client, built for its leg"
     )]
-    builder.build().map_err(|error| error.to_string())
+    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+        let builder = (self.0)().map_err(anyhow::Error::msg)?;
+        let builder = match target {
+            None => builder,
+            // A leg that dials the host itself dials it at the checked
+            // address; a ladder leg's bridge is handed the name, and its
+            // exit reaches it.
+            Some(target) => crate::proxies::pinned(builder, target.host, target.port, target.addrs)
+                .redirect(reqwest::redirect::Policy::none()),
+        };
+        Ok(builder.build()?)
+    }
 }
 
 #[cfg(any(
@@ -812,5 +841,57 @@ mod tests {
         let identity = crate::torrents::identity::IDENTITY;
         assert!(tracker_client(&LegKind::Ladder, None, &identity).is_err());
         assert!(tracker_client(&LegKind::System, None, &identity).is_ok());
+    }
+
+    // A leg's client for a web seed's target dials the host at the checked
+    // address without looking the name up, and hands a redirect back
+    // instead of following it.
+    #[tokio::test(start_paused = true)]
+    async fn a_target_client_dials_the_checked_address_and_follows_nothing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                assert!(read > 0, "the request ended early");
+                head.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://elsewhere.test/\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8(head).unwrap()
+        });
+
+        // A direct leg's builder, kept off any proxy the host names.
+        let clients = LegClients(|| Ok(reqwest::Client::builder().no_proxy()));
+        let client = clients
+            .client(Some(HttpTarget {
+                host: "seed.test",
+                port,
+                addrs: &[IpAddr::from([127, 0, 0, 1])],
+            }))
+            .unwrap();
+        let response = client
+            .get(format!("http://seed.test:{port}/f"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        let head = served.await.unwrap();
+        assert!(head.starts_with("GET /f HTTP/1.1\r\n"), "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("host: seed.test:{port}\r\n")),
+            "{head}"
+        );
     }
 }
