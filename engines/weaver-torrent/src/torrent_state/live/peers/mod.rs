@@ -6,6 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{
@@ -40,8 +41,8 @@ use super::smart_ban::{SentBlock, SmartBan};
 use super::web_seed::is_web_seed;
 
 use super::peer::{
-    EraseRank, IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx,
-    empty_bitfield, listen_address, stats::atomic::PeerCountersAtomic,
+    IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx, empty_bitfield,
+    listen_address, stats::atomic::PeerCountersAtomic,
 };
 
 pub mod availability;
@@ -51,6 +52,32 @@ mod super_seed;
 
 // libtorrent `max_peerlist_size`: the most peers one torrent's peer list holds.
 pub(crate) const MAX_PEERLIST_SIZE: usize = 3000;
+// libtorrent `peer_list::erase_peers`'s low watermark: once the list holds
+// this many, choosing whom to connect to weeds it to fewer
+// (`peer_list::find_connect_candidates`).
+const PEERLIST_LOW_WATERMARK: usize = MAX_PEERLIST_SIZE * 95 / 100;
+// libtorrent `max_paused_peerlist_size`: the most peers a paused torrent's
+// peer list holds.
+pub(crate) const MAX_PAUSED_PEERLIST_SIZE: usize = 1000;
+
+/// Where a peer stands when the list must forget one; the lowest goes first
+/// (libtorrent `peer_list::is_erase_candidate`, then `compare_peer_erase`):
+/// an erase candidate, a peer with no connection that is no connect
+/// candidate and has failed; then the most failures in a row; then one we
+/// cannot connect to; then the least trusted.
+type EraseRank = (bool, Reverse<u32>, bool, i8);
+
+fn erase_rank(peer: &Peer) -> EraseRank {
+    let (_, failcount, _) = peer.connect_rank();
+    let erase_candidate =
+        peer.connected_out().is_none() && !peer.is_connect_candidate() && failcount > 0;
+    (
+        !erase_candidate,
+        Reverse(failcount),
+        peer.outgoing_address == Some(peer.addr),
+        peer.trust().points(),
+    )
+}
 
 pub(crate) struct PeerStates {
     pub session_stats: Arc<AggregatePeerStatsAtomic>,
@@ -104,20 +131,22 @@ pub(crate) struct PeerList {
     smart_ban: SmartBan,
 }
 
-/// What a newcomer may push out of a full peer list.
+/// Whom the list may forget to make room (libtorrent `peer_list::erase_peers`
+/// and its `force_erase` flag). A connected peer is never forgotten.
 #[derive(Clone, Copy)]
 enum Displace {
-    /// Only peers we would not connect to: a peer someone named is worth no
-    /// more than a connect candidate we hold.
-    NonCandidates,
-    /// Any peer we are not connected to: a connected peer outranks them.
+    /// Only erase candidates: a peer someone named is worth no more than one
+    /// we hold that never failed.
+    EraseCandidates,
+    /// Any peer we are not connected to, erase candidates first: a peer that
+    /// connected to us outranks them.
     AnyIdle,
 }
 
 impl Displace {
-    fn allows(self, (candidate, ..): &EraseRank) -> bool {
+    fn allows(self, (kept, ..): &EraseRank) -> bool {
         match self {
-            Displace::NonCandidates => !candidate,
+            Displace::EraseCandidates => !kept,
             Displace::AnyIdle => true,
         }
     }
@@ -194,22 +223,29 @@ impl PeerStates {
         self
     }
 
-    /// The list as a pause leaves it: every peer on it, without its
-    /// connection, the banned addresses, and the records of its peers. Web
-    /// seeds are not on it, so their records stay behind, as they go when a
-    /// web seed leaves the table during a run.
+    /// The list as a pause leaves it: the [`MAX_PAUSED_PEERLIST_SIZE`] peers
+    /// on it that rank highest to keep, as they stand before their
+    /// connections close, each without its connection; the banned addresses;
+    /// and the records of the peers kept. A peer cut, and a web seed, which
+    /// is on no list, leaves its records behind, as it does when it leaves
+    /// the list during a run.
     pub fn idle_list(&self) -> PeerList {
         let mut smart_ban = self.smart_ban.lock().clone();
-        let mut peers = Vec::new();
+        let mut ranked = Vec::new();
         for e in self.states.iter() {
             if is_web_seed(*e.key()) {
                 smart_ban.forget(*e.key());
             } else {
-                peers.push(e.value().idle());
+                ranked.push(((erase_rank(e.value()), *e.key()), e.value().idle()));
             }
         }
+        ranked.sort_unstable_by_key(|(rank, _)| *rank);
+        let cut = ranked.len().saturating_sub(MAX_PAUSED_PEERLIST_SIZE);
+        for ((_, handle), _) in ranked.drain(..cut) {
+            smart_ban.forget(handle);
+        }
         PeerList {
-            peers,
+            peers: ranked.into_iter().map(|(_, peer)| peer).collect(),
             banned: self.banned.read().clone(),
             smart_ban,
         }
@@ -245,7 +281,7 @@ impl PeerStates {
     pub fn add_peer(&self, addr: SocketAddr) {
         self.admit(
             addr,
-            Displace::NonCandidates,
+            Displace::EraseCandidates,
             None,
             |peer| peer.rediscovered(self),
             || Some(Peer::new_with_outgoing_address(addr)),
@@ -259,7 +295,7 @@ impl PeerStates {
     pub fn add_refused_incoming(&self, addr: SocketAddr, kind: ConnectionKind) {
         self.admit(
             addr,
-            Displace::NonCandidates,
+            Displace::EraseCandidates,
             None,
             |peer| {
                 atomic_inc(&peer.stats.counters.incoming_connections);
@@ -318,8 +354,8 @@ impl PeerStates {
     // connection that came to `our_port` first settles who keeps the one
     // connection to its address. A known peer is handed to `known`. A
     // newcomer from `newcomer` joins, first pushing out the peer that ranks
-    // lowest when the list is full; it is refused when nobody `displace`
-    // allows is there.
+    // lowest to keep when the list is full (libtorrent `peer_list::insert_peer`,
+    // `new_connection`); it is refused when nobody `displace` allows is there.
     fn admit<R>(
         &self,
         addr: SocketAddr,
@@ -343,7 +379,7 @@ impl PeerStates {
         let Some(peer) = newcomer() else {
             return Admitted::Refused;
         };
-        if self.listed() >= MAX_PEERLIST_SIZE && !self.erase_one(displace) {
+        if !self.erase_to(displace, MAX_PEERLIST_SIZE) {
             return Admitted::Refused;
         }
         self.count_in(peer.get_state());
@@ -468,29 +504,32 @@ impl PeerStates {
         Some((rx, tx))
     }
 
-    // Forgets the lowest-ranked peer `displace` allows. Connected peers and
-    // web seeds, which are on no peer list, are never forgotten.
-    fn erase_one(&self, displace: Displace) -> bool {
-        let victim = self
+    // Forgets the peers `displace` allows, lowest-ranked first, until the
+    // list holds fewer than `fewer_than`; returns whether it does. Connected
+    // peers and web seeds, which are on no peer list, are never forgotten.
+    // Under the admission lock.
+    fn erase_to(&self, displace: Displace, fewer_than: usize) -> bool {
+        let excess = (self.listed() + 1).saturating_sub(fewer_than);
+        if excess == 0 {
+            return true;
+        }
+        let mut ranked = self
             .states
             .iter()
-            .filter(|e| !is_web_seed(*e.key()))
-            .filter_map(|e| Some((e.value().erase_rank()?, *e.key())))
+            .filter(|e| !is_web_seed(*e.key()) && e.value().connected_out().is_none())
+            .map(|e| (erase_rank(e.value()), *e.key()))
             .filter(|(rank, _)| displace.allows(rank))
-            .min();
-        let Some((_, addr)) = victim else {
-            return false;
-        };
-        match self
-            .states
-            .remove_if(&addr, |_, peer| peer.erase_rank().is_some())
-        {
-            Some((_, peer)) => {
+            .collect::<Vec<_>>();
+        ranked.sort_unstable();
+        for (_, addr) in ranked.into_iter().take(excess) {
+            if let Some((_, peer)) = self
+                .states
+                .remove_if(&addr, |_, peer| peer.connected_out().is_none())
+            {
                 self.erased(addr, &peer);
-                true
             }
-            None => false,
         }
+        self.listed() < fewer_than
     }
 
     // `peer`, at `handle`, left the table: what was counted of it, and the
@@ -571,9 +610,13 @@ impl PeerStates {
 
     /// Starts connecting to the connect candidate due at `now` that failed
     /// least, then longest ago, at an address no connection is at. Under the
-    /// admission lock, so none comes from there meanwhile.
+    /// admission lock, so none comes from there meanwhile. A list grown to
+    /// its low watermark first forgets erase candidates, lowest-ranked
+    /// first, until it is under it (libtorrent
+    /// `peer_list::find_connect_candidates`).
     pub fn connect_next(&self, now: Instant) -> Option<(PeerHandle, PeerRx, PeerTx)> {
         let _admission = self.admission.lock();
+        self.erase_to(Displace::EraseCandidates, PEERLIST_LOW_WATERMARK);
         let connected = self.connected_ips();
         let (_, addr) = self
             .states
@@ -1272,48 +1315,192 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_full_list_forgets_peers_we_would_not_connect_to_most_failed_and_oldest_first() {
+    // Names `addr`, fails a connection to it at `at`, and lets it go: an
+    // erase candidate that failed once.
+    fn failed_once(peers: &PeerStates, addr: SocketAddr, at: Instant) {
+        peers.add_peer(addr);
+        fail_at(peers, addr, at);
+        peers
+            .with_peer_mut(addr, "test", |peer| peer.set_not_needed(peers))
+            .unwrap();
+    }
+
+    // Names `addr` and lets it go before any connection: no connect
+    // candidate, and no erase candidate either, as it never failed.
+    fn never_failed(peers: &PeerStates, addr: SocketAddr) {
+        peers.add_peer(addr);
+        peers
+            .with_peer_mut(addr, "test", |peer| peer.set_not_needed(peers))
+            .unwrap();
+    }
+
+    fn connected_to_us(peers: &PeerStates, addr: SocketAddr) -> Result<PeerRx, IncomingRefused> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        peers
+            .add_incoming(addr, Id20::default(), tx, ConnectionKind::Tcp, OUR_PORT)
+            .map(|_| rx)
+    }
+
+    // libtorrent `peer_list::insert_peer` and `new_connection` at a full
+    // list: `erase_peers` forgets the erase candidate `compare_peer_erase`
+    // ranks lowest, the most failures first, then one we cannot connect to,
+    // then the least trusted; a named peer is refused when there is none,
+    // and a peer that connected to us (`force_erase`) pushes out an idle one.
+    #[tokio::test(start_paused = true)]
+    async fn an_insert_at_full_displaces_by_the_erase_rank() {
         let peers = make_peer_states();
         let t0 = Instant::now();
-
-        let (older, newer, not_needed, live) =
-            (peer_addr(0), peer_addr(1), peer_addr(2), peer_addr(3));
-        for addr in [older, newer, not_needed] {
-            peers.add_peer(addr);
+        let (most_failed, unconnectable, distrusted, trusted, kept) = (
+            peer_addr(0),
+            peer_addr(1),
+            peer_addr(2),
+            peer_addr(3),
+            peer_addr(4),
+        );
+        peers.add_peer(most_failed);
+        fail_out(&peers, most_failed, t0);
+        // It connected over TCP, from no port it listens on, and failed.
+        let _closed_rx = connected_to_us(&peers, unconnectable).unwrap();
+        peers
+            .with_peer_mut(unconnectable, "test", |peer| {
+                peer.take_state(&peers);
+                peers.connection_closed(peer, t0, true, true);
+            })
+            .unwrap();
+        for addr in [distrusted, trusted] {
+            failed_once(&peers, addr, t0);
         }
-        fail_out(&peers, older, t0);
-        fail_out(&peers, newer, t0 + Duration::from_secs(1));
-        peers
-            .with_peer_mut(not_needed, "test", |peer| peer.set_not_needed(&peers))
-            .unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        peers
-            .add_incoming(live, Id20::default(), tx, ConnectionKind::Tcp, OUR_PORT)
-            .unwrap();
-        for i in 4..MAX_PEERLIST_SIZE {
+        assert!(
+            !peers
+                .with_peer_mut(distrusted, "test", |peer| peer.piece_failed(false))
+                .unwrap()
+        );
+        never_failed(&peers, kept);
+        let live = peer_addr(5);
+        let _live_rx = connected_to_us(&peers, live).unwrap();
+        for i in 6..MAX_PEERLIST_SIZE {
             peers.add_peer(peer_addr(i));
         }
-        assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
+        assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
 
         let newcomer = |i| peer_addr(MAX_PEERLIST_SIZE + i);
-        peers.add_peer(newcomer(0));
-        assert_eq!(state_of(&peers, older), None);
-        assert_eq!(state_of(&peers, newer), Some("dead"));
-        peers.add_peer(newcomer(1));
-        assert_eq!(state_of(&peers, newer), None);
-        assert_eq!(state_of(&peers, not_needed), Some("not needed"));
-        peers.add_peer(newcomer(2));
-        assert_eq!(state_of(&peers, not_needed), None);
+        for (i, erased) in [most_failed, unconnectable, distrusted, trusted]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(state_of(&peers, erased).is_some());
+            peers.add_peer(newcomer(i));
+            assert_eq!(state_of(&peers, erased), None);
+            assert_eq!(state_of(&peers, newcomer(i)), Some("queued"));
+        }
 
-        // Only connect candidates and a connected peer are left: a named
-        // peer does not push out a candidate we hold.
-        peers.add_peer(newcomer(3));
-        assert_eq!(state_of(&peers, newcomer(3)), None);
-        assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
+        // No erase candidate is left: a named peer pushes out neither a peer
+        // that never failed nor a connect candidate.
+        peers.add_peer(newcomer(4));
+        assert_eq!(state_of(&peers, newcomer(4)), None);
+        assert_eq!(state_of(&peers, kept), Some("not needed"));
+        assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
+
+        // A peer that connected to us pushes out an idle one, and the
+        // connected peer stays.
+        let _rx = connected_to_us(&peers, newcomer(5)).unwrap();
+        assert_eq!(state_of(&peers, newcomer(5)), Some("live"));
         assert_eq!(state_of(&peers, live), Some("live"));
-        assert_eq!(peers.stats().seen as usize, MAX_PEERLIST_SIZE + 3);
-        assert_eq!(peers.stats().queued as usize, MAX_PEERLIST_SIZE - 1);
+        assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
+    }
+
+    // libtorrent `peer_list::is_erase_candidate`: a peer with no connection
+    // that is no connect candidate goes only once it has failed.
+    #[tokio::test(start_paused = true)]
+    async fn weeding_forgets_a_failed_peer_and_keeps_one_that_never_failed() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let (failed, kept) = (peer_addr(0), peer_addr(1));
+        failed_once(&peers, failed, t0);
+        never_failed(&peers, kept);
+        for i in 2..PEERLIST_LOW_WATERMARK + 5 {
+            peers.add_peer(peer_addr(i));
+        }
+
+        assert!(peers.connect_next(t0).is_some());
+        assert_eq!(state_of(&peers, failed), None);
+        assert_eq!(state_of(&peers, kept), Some("not needed"));
+        assert_eq!(peers.listed(), PEERLIST_LOW_WATERMARK + 4);
+    }
+
+    // libtorrent `peer_list::find_connect_candidates` weeds once the list
+    // holds 95% of `max_peerlist_size`, and `erase_peers` stops under its
+    // low watermark.
+    #[tokio::test(start_paused = true)]
+    async fn weeding_runs_past_95_percent_and_leaves_the_list_under_it() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let failed = (0..100).map(peer_addr).collect::<Vec<_>>();
+        for &addr in &failed {
+            failed_once(&peers, addr, t0);
+        }
+        let mut next = failed.len();
+        let mut fill_to = |listed: usize| {
+            while peers.listed() < listed {
+                peers.add_peer(peer_addr(next));
+                next += 1;
+            }
+        };
+        let failed_left = |peers: &PeerStates| {
+            failed
+                .iter()
+                .filter(|&&addr| state_of(peers, addr).is_some())
+                .count()
+        };
+
+        fill_to(PEERLIST_LOW_WATERMARK - 1);
+        assert!(peers.connect_next(t0).is_some());
+        assert_eq!(peers.listed(), PEERLIST_LOW_WATERMARK - 1);
+        assert_eq!(failed_left(&peers), failed.len());
+
+        fill_to(PEERLIST_LOW_WATERMARK + 50);
+        assert!(peers.connect_next(t0).is_some());
+        assert_eq!(peers.listed(), PEERLIST_LOW_WATERMARK - 1);
+        assert_eq!(failed_left(&peers), failed.len() - 51);
+    }
+
+    // libtorrent `torrent::get_peer_list_state`: a paused torrent's list
+    // holds `max_paused_peerlist_size`; those that go are the ones
+    // `erase_peers` forgets first.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_list_keeps_the_peers_that_rank_highest() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let most_failed = (0..1950).map(peer_addr).collect::<Vec<_>>();
+        let failed = (1950..2100).map(peer_addr).collect::<Vec<_>>();
+        let queued = (2100..2999).map(peer_addr).collect::<Vec<_>>();
+        let live = peer_addr(2999);
+        for &addr in &most_failed {
+            peers.add_peer(addr);
+            fail_out(&peers, addr, t0);
+        }
+        for &addr in &failed {
+            failed_once(&peers, addr, t0);
+        }
+        for &addr in &queued {
+            peers.add_peer(addr);
+        }
+        let _live_rx = connected_to_us(&peers, live).unwrap();
+        assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
+
+        let list = peers.idle_list();
+        assert_eq!(list.peers.len(), MAX_PAUSED_PEERLIST_SIZE);
+        let kept = list.peers.iter().map(|p| p.addr).collect::<HashSet<_>>();
+        assert!(queued.iter().all(|addr| kept.contains(addr)));
+        assert!(kept.contains(&live));
+        assert!(most_failed.iter().all(|addr| !kept.contains(addr)));
+        assert_eq!(
+            failed.iter().filter(|addr| kept.contains(addr)).count(),
+            MAX_PAUSED_PEERLIST_SIZE - queued.len() - 1
+        );
+
+        let next = PeerStates::founded_on(list, Default::default(), TOTAL_PIECES as u32);
+        assert_eq!(next.listed(), MAX_PAUSED_PEERLIST_SIZE);
     }
 
     #[test]

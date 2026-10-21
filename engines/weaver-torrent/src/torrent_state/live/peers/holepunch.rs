@@ -20,7 +20,7 @@ impl PeerStates {
     pub fn holepunch(&self, addr: SocketAddr) {
         self.admit(
             addr,
-            Displace::NonCandidates,
+            Displace::EraseCandidates,
             None,
             |peer| peer.holepunch(self),
             || Some(Peer::new_holepunched(addr)),
