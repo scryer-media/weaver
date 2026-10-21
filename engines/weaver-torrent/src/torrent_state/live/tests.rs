@@ -4653,6 +4653,86 @@ async fn a_peers_yourip_is_its_vote_on_the_sessions_external_address() {
     );
 }
 
+// libtorrent `bt_peer_connection::write_extensions` sends `complete_ago`,
+// the seconds since the torrent last saw a complete copy, -1 for never; a
+// seed sees its own (`torrent::time_since_complete`).
+#[tokio::test(start_paused = true)]
+async fn the_extended_handshake_says_how_long_ago_we_saw_a_complete_copy() {
+    let ours = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.complete_ago
+    };
+    let h = Harness::new("complete_ago_never").await;
+    let (peer, _rx) = h.new_peer("127.0.0.1:6881");
+    assert_eq!(h.complete_ago(), None);
+    assert_eq!(ours(&peer), Some(-1));
+
+    let seed = Harness::seeding("complete_ago_seed").await;
+    let (peer, _rx) = seed.new_peer("127.0.0.1:6881");
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(ours(&peer), Some(0));
+}
+
+// libtorrent `bt_peer_connection::on_extended_handshake` takes a peer's
+// `complete_ago` (`peer_connection::set_last_seen_complete`): the latest
+// sighting stands, and a negative one is none.
+#[tokio::test(start_paused = true)]
+async fn a_peers_complete_ago_is_a_sighting_of_a_complete_copy() {
+    let h = Harness::new("complete_ago_theirs").await;
+    let (first, _first_rx) = h.new_peer("127.0.0.1:6881");
+    let (second, _second_rx) = h.new_peer("127.0.0.2:6881");
+    let says = |ago| ExtendedHandshake {
+        complete_ago: Some(ago),
+        ..Default::default()
+    };
+    (&first).on_extended_handshake(&says(-1)).unwrap();
+    assert_eq!(h.complete_ago(), None);
+    (&first).on_extended_handshake(&says(30)).unwrap();
+    assert_eq!(h.complete_ago(), Some(Duration::from_secs(30)));
+    (&second).on_extended_handshake(&says(100)).unwrap();
+    assert_eq!(h.complete_ago(), Some(Duration::from_secs(30)));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let mut hs = ExtendedHandshake::new();
+    (&first).update_my_extended_handshake(&mut hs).unwrap();
+    assert_eq!(hs.complete_ago, Some(40));
+}
+
+// libtorrent `peer_connection::on_receive_data` and `incoming_have`: a seed
+// that has sent us data is a complete copy seen each time it sends; one
+// that has sent none is only its word.
+#[tokio::test(start_paused = true)]
+async fn a_seed_that_sent_us_data_is_a_complete_copy_seen() {
+    let h = Harness::new("complete_ago_seed_peer").await;
+    let (seed, mut rx) = h.peer("127.0.0.1:6881");
+    (&seed)
+        .on_received_message(Message::KeepAlive)
+        .await
+        .unwrap();
+    assert_eq!(h.complete_ago(), None);
+
+    let mut requester: Task<'_> = Box::pin(seed.request_chunks());
+    seed.on_i_am_unchoked();
+    let (index, begin) = *next_requests(&mut requester, &mut rx, 4)
+        .await
+        .first()
+        .unwrap();
+    let start = (index * PIECE_LENGTH + begin) as usize;
+    let block = &h.content[start..start + CHUNK_SIZE as usize];
+    (&seed)
+        .on_received_message(Message::Piece(Piece::from_data(index, begin, block)))
+        .await
+        .unwrap();
+    assert_eq!(h.complete_ago(), Some(Duration::ZERO));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(h.complete_ago(), Some(Duration::from_secs(10)));
+    (&seed)
+        .on_received_message(Message::KeepAlive)
+        .await
+        .unwrap();
+    assert_eq!(h.complete_ago(), Some(Duration::ZERO));
+}
+
 // libtorrent `piece_picker::inc_refcount` and `dec_refcount`: a HAVE and a
 // peer leaving move the piece in the pick order before the next pick.
 #[tokio::test]

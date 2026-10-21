@@ -262,6 +262,10 @@ pub struct TorrentStateLive {
     // Whether the peers were last told we only upload (libtorrent tells
     // them on each change, `torrent::send_upload_only`).
     told_upload_only: AtomicBool,
+    // When we last saw a complete copy of the torrent: our own, a seed that
+    // sent us data, or one a peer saw (libtorrent
+    // `torrent::m_last_seen_complete`).
+    last_seen_complete: Mutex<Option<tokio::time::Instant>>,
     // The torrent's files as its web seeds serve them.
     web_layout: web_seed::Layout,
 
@@ -383,6 +387,7 @@ impl TorrentStateLive {
             super_seeding,
             // What a handshake of this run's first connections says.
             told_upload_only: AtomicBool::new(finished_at_start && !super_seeding),
+            last_seen_complete: Mutex::new(None),
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
             utp: session.utp,
         });
@@ -1011,6 +1016,27 @@ impl TorrentStateLive {
 
     pub fn get_approx_have_bytes(&self) -> u64 {
         self.stats.have_bytes.load(Ordering::Relaxed)
+    }
+
+    /// How long ago we last saw a complete copy of the torrent, none if we
+    /// never did; no time at all while we have every piece (libtorrent
+    /// `torrent::time_since_complete`).
+    pub fn complete_ago(&self) -> Option<Duration> {
+        let now = tokio::time::Instant::now();
+        if self.get_approx_have_bytes() == self.lengths.total_length() {
+            self.seen_complete(now);
+        }
+        let last = *self.last_seen_complete.lock();
+        last.map(|last| now.saturating_duration_since(last))
+    }
+
+    /// A complete copy of the torrent was seen at `at`; the latest sighting
+    /// stands (libtorrent `torrent::seen_complete`).
+    fn seen_complete(&self, at: tokio::time::Instant) {
+        let mut last = self.last_seen_complete.lock();
+        if last.is_none_or(|last| last < at) {
+            *last = Some(at);
+        }
     }
 
     pub fn get_hns(&self) -> Option<HaveNeededSelected> {
@@ -1774,6 +1800,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 );
             }
         };
+        // A seed that has sent us data is a complete copy seen now; one that
+        // has not may only say it is a seed (libtorrent
+        // `peer_connection::incoming_have` and `on_receive_data`).
+        if self.counters.fetched_bytes.load(Ordering::Relaxed) > 0
+            && self
+                .state
+                .peers
+                .with_live(self.addr, |live| live.seeder)
+                .unwrap_or(false)
+        {
+            self.state.seen_complete(tokio::time::Instant::now());
+        }
         if first {
             // The peer's pieces are known now: its bitfield, or none.
             self.super_seed();
@@ -1862,6 +1900,15 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // says nothing (libtorrent `bt_peer_connection::on_extended_handshake`).
         if hs.upload_only.is_some_and(|upload_only| upload_only != 0) {
             self.on_upload_only(true);
+        }
+        // The peer saw a complete copy `complete_ago` seconds ago; a
+        // negative one says it never did (libtorrent
+        // `bt_peer_connection::on_extended_handshake`, into
+        // `peer_connection::set_last_seen_complete`).
+        if let Some(ago) = hs.complete_ago.and_then(|ago| u64::try_from(ago).ok())
+            && let Some(at) = tokio::time::Instant::now().checked_sub(Duration::from_secs(ago))
+        {
+            self.state.seen_complete(at);
         }
 
         // The peer holds at most its `reqq` requests (libtorrent
@@ -1966,6 +2013,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         handshake.m.ut_holepunch = Some(MY_EXTENDED_UT_HOLEPUNCH);
         // We only upload (libtorrent `bt_peer_connection::write_extensions`).
         handshake.upload_only = self.state.is_upload_only().then_some(1);
+        // Seconds since we last saw a complete copy, -1 for never
+        // (libtorrent `bt_peer_connection::write_extensions`).
+        handshake.complete_ago = Some(
+            self.state
+                .complete_ago()
+                .map_or(-1, |ago| i32::try_from(ago.as_secs()).unwrap_or(i32::MAX)),
+        );
         // Where we listen, on a connection we made: a peer that reached us
         // knows it (libtorrent `bt_peer_connection::write_extensions`, the
         // port `session_impl::listen_port` gives: the one mapped on the
