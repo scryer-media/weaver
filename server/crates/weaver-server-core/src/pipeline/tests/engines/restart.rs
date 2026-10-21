@@ -28,7 +28,9 @@ use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_store_set, header_encrypted_store_set,
 };
-use crate::pipeline::tests::direct_store::{obfuscate_volumes, single_member_store_set};
+use crate::pipeline::tests::direct_store::{
+    obfuscate_volumes, protected_rar4_store_set, protected_store_set, single_member_store_set,
+};
 use crate::pipeline::tests::{
     insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
     pump_pipeline_runtime_queues, retire_pipeline_database,
@@ -670,6 +672,22 @@ async fn a_three_volume_stored_rar_restarted_after_every_article_delivers_its_me
 async fn a_stored_rar_under_par2_restarted_after_every_article_is_repaired_with_no_refetch() {
     let body = payload(8 * ARTICLE + 17, 74);
     let posts = with_par2(volumes(single_member_store_set("beacon.bin", &body, 2)), 2);
+    restart_row(Scenario::new(posts).damaged(0, 2)).await;
+}
+
+#[tokio::test]
+async fn a_rar5_volume_repaired_from_its_recovery_record_restarted_after_every_article_is_repaired_with_no_refetch()
+ {
+    let body = payload(8 * ARTICLE + 17, 76);
+    let posts = volumes(protected_store_set("beacon.bin", &body, 2, 1));
+    restart_row(Scenario::new(posts).damaged(0, 2)).await;
+}
+
+#[tokio::test]
+async fn a_rar4_volume_repaired_from_its_recovery_record_restarted_after_every_article_is_repaired_with_no_refetch()
+ {
+    let body = payload(8 * ARTICLE + 17, 77);
+    let posts = volumes(protected_rar4_store_set("beacon.bin", &body, 2, 1));
     restart_row(Scenario::new(posts).damaged(0, 2)).await;
 }
 

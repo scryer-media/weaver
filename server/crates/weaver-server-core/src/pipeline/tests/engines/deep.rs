@@ -29,8 +29,8 @@ use super::zip::{archive as zip_archive, members as zip_members, stored as zip_s
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
-use crate::pipeline::tests::direct_store::multi_member_store_set;
 use crate::pipeline::tests::direct_store::scenarios::encrypted_store_set;
+use crate::pipeline::tests::direct_store::{multi_member_store_set, protected_store_set};
 
 fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
@@ -405,6 +405,32 @@ async fn a_damaged_7z_two_deep_is_repaired_by_the_par3_set_beside_it_under_graph
         graph.graph().outcomes
     );
     assert!(kinds(&graph).contains(&"par3"), "{:?}", kinds(&graph));
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
+    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
+}
+
+// A RAR5 volume carrying its recovery record, two deep, one article inside
+// its member served damaged: the record repairs the volume at depth, its
+// member is delivered whole and nothing is asked for twice. Classic fails
+// unpacking the outer container.
+#[tokio::test]
+async fn a_rar5_volume_two_deep_is_repaired_from_its_own_recovery_record_under_graph() {
+    let body = beacon();
+    let volume = protected_store_set("beacon.bin", &body, 1, 1).remove(0).1;
+    let outer = two_deep(&[("cinder.rar", volume)]);
+    let damaged = articles_inside(&outer, &body)[0];
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]).damaged(0, damaged);
+    let (classic, graph) = run_both(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(graph.files.get(&delivered("beacon.bin")), Some(&body));
+    assert_eq!(
+        graph.graph().rulings,
+        vec![(
+            "rar_record".to_string(),
+            Some(RepairOutcome::Repaired { slices: 1 })
+        )]
+    );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
     assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
     assert!(classic.files.is_empty(), "{:?}", classic.files.keys());

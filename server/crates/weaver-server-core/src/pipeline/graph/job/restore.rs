@@ -87,7 +87,6 @@ impl GraphJob {
         )
         .capped(storage.caps);
         writer.restore_members(&tree);
-        let mut unusable = Vec::new();
         for ((node, member), state) in &snapshot.files {
             if tree
                 .namespace(*node)
@@ -97,15 +96,8 @@ impl GraphJob {
                 continue;
             }
             writer.restore_file(&tree, *node, *member, *state)?;
-            if let Some(at) = state.unusable_at {
-                unusable.push((at, (*node, *member)));
-            }
         }
-        unusable.sort_unstable();
-        writer.restore_recovery_facts(
-            unusable.into_iter().map(|(_, found)| found).collect(),
-            snapshot.root.read_backs,
-        );
+        writer.restore_read_backs(snapshot.root.read_backs);
         for kept in &snapshot.kept {
             writer.restore_kept(kept)?;
         }

@@ -70,13 +70,10 @@ impl Tree {
 
     // The ranges of the node's volumes held as damage, an article that never
     // came or a range an object said was damaged, in its own volume's
-    // coordinates, unless a recovery object above vouched for what it came
-    // out of.
+    // coordinates, less what a recovery object proved, unless what the
+    // namespace came out of was vouched for above.
     fn lost(&self, node: NodeId) -> Vec<(VolumeIndex, ByteRange)> {
         let Some((parent, volumes)) = self.volumes(node) else {
-            return Vec::new();
-        };
-        let Some(namespace) = self.namespace(parent) else {
             return Vec::new();
         };
         if self.vouched_above(node) {
@@ -84,21 +81,21 @@ impl Tree {
         }
         volumes
             .iter()
-            .filter_map(|(volume, member)| Some((*volume, namespace.get(*member)?)))
             .flat_map(|(volume, member)| {
-                member
-                    .coverage
-                    .damaged_ranges()
-                    .map(move |range| (volume, range))
+                self.unproven(parent, *member)
+                    .into_iter()
+                    .map(move |range| (*volume, range))
             })
             .collect()
     }
 
-    // Some member the namespace came out of, at any depth, is vouched for.
+    // Every member the namespace came out of, at some depth, holds no
+    // damage a recovery object did not prove, and one of them was found
+    // whole or made so.
     fn vouched_above(&self, node: NodeId) -> bool {
         let mut at = node;
         while let Some((parent, volumes)) = self.volumes(at) {
-            let vouched = |member: &MemberId| {
+            let proven = |member: &MemberId| {
                 self.ruled(parent, *member, |outcome| {
                     matches!(
                         outcome,
@@ -106,12 +103,53 @@ impl Tree {
                     )
                 })
             };
-            if volumes.values().any(vouched) {
+            if volumes.values().any(proven)
+                && volumes
+                    .values()
+                    .all(|member| self.unproven(parent, *member).is_empty())
+            {
                 return true;
             }
             at = parent;
         }
         false
+    }
+
+    // The member's damaged ranges past what every recovery object that
+    // found it whole or made it so proves of it: a set vouches only for
+    // the bytes its checks reach.
+    fn unproven(&self, node: NodeId, member: MemberId) -> Vec<ByteRange> {
+        let Some(record) = self
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+        else {
+            return Vec::new();
+        };
+        let proving: Vec<_> = self
+            .recovery_nodes(node)
+            .into_iter()
+            .filter_map(|recovery_node| self.recovery(recovery_node))
+            .filter(|recovery| {
+                recovery.covers(member)
+                    && recovery.outcome().is_some_and(|outcome| {
+                        matches!(
+                            outcome,
+                            RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+                        )
+                    })
+            })
+            .collect();
+        let mut left: Vec<ByteRange> = record.coverage.damaged_ranges().collect();
+        for recovery in proving {
+            left = left
+                .into_iter()
+                .flat_map(|range| {
+                    let length = record.length.unwrap_or(range.end);
+                    without(range, recovery.proves(member, length))
+                })
+                .collect();
+        }
+        left
     }
 
     // A recovery object of the namespace covers the member and ruled on it
@@ -198,4 +236,18 @@ impl Standing for Stood<'_> {
             })
             .collect()
     }
+}
+
+// What of `range` lies outside `proven`.
+fn without(range: ByteRange, proven: ByteRange) -> Vec<ByteRange> {
+    if range.intersect(proven).is_none() {
+        return vec![range];
+    }
+    [
+        ByteRange::new(range.start, proven.start.max(range.start)),
+        ByteRange::new(proven.end.min(range.end), range.end),
+    ]
+    .into_iter()
+    .filter(|piece| !piece.is_empty())
+    .collect()
 }

@@ -352,14 +352,3 @@ fn damage_on_the_volume_is_lost_to_the_window_where_it_falls() {
         .expect("apply");
     assert_eq!(carried.tape().lost, vec![ByteRange::new(0, 2)]);
 }
-
-#[test]
-fn recovery_data_no_object_reads_is_recorded_and_gets_no_window() {
-    let carried = Carried::new(RecoveryKind::Rar);
-    assert!(carried.job.tree.recovery_nodes(NodeId::ROOT).is_empty());
-    assert_eq!(
-        carried.job.writer.unusable_recovery(),
-        &[(NodeId::ROOT, carried.member)]
-    );
-    assert!(carried.tape().bytes.is_empty());
-}

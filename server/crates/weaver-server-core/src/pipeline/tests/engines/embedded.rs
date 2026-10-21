@@ -4,7 +4,7 @@
 // Recovery an archive carries inside itself, and recovery beside an
 // enciphered archive, under both engines: a PAR2 or PAR3 set appended to a
 // stored 7z and repaired through it, a trailing PAR3 that loses one of its
-// own articles, a RAR5 volume carrying a recovery record no object reads,
+// own articles, a RAR5 volume repaired from the recovery record it carries,
 // and an AES 7z repaired through what was posted.
 
 use std::io::Cursor;
@@ -14,11 +14,11 @@ use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMet
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, par3_set, payload, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, par2_set, par3_set, payload, run_both,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::tests::direct_store::recovery_record_store_set;
+use crate::pipeline::tests::direct_store::protected_store_set;
 
 const SECRET: &str = "quill-ember-secret";
 
@@ -231,22 +231,32 @@ async fn a_trailing_par3_losing_its_only_block_fails_for_health_under_classic_an
     );
 }
 
-// The record is the volume's own recovery, which neither engine decodes:
-// the volume streams whole under both and no repair runs from it.
+// The record is the volume's own recovery, and one article of the member
+// is served damaged. The graph reads the volume back through its record,
+// rebuilds the damaged bytes in place and delivers the member whole, asking
+// for nothing twice. Classic reads no record and fails at unpack.
 #[tokio::test]
-async fn a_rar5_volume_carrying_a_recovery_record_is_delivered_under_both_engines_and_neither_repairs_from_it()
+async fn a_rar5_volume_with_a_damaged_article_is_repaired_from_its_recovery_record_under_graph_and_fails_under_classic()
  {
     let body = payload(6 * ARTICLE + 5, 43);
-    let posts = recovery_record_store_set("beacon.bin", &body, 1, 96)
+    let posts = protected_store_set("beacon.bin", &body, 1, 1)
         .into_iter()
         .map(|(name, bytes)| Post::plain(&name, bytes))
         .collect();
-    let (classic, graph) = run_both(&Scenario::new(posts)).await;
-    assert_same(&classic, &graph);
-    assert!(graph.completed(), "{:?}", graph.failure);
+    let (classic, graph) = run_both(&Scenario::new(posts).damaged(0, 2)).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(graph.files.get(&delivered("beacon.bin")), Some(&body));
-    assert!(graph.graph().outcomes.is_empty());
-    assert_eq!(graph.graph().blocks_reachable, 0);
+    assert_eq!(
+        graph.graph().rulings,
+        vec![(
+            "rar_record".to_string(),
+            Some(RepairOutcome::Repaired { slices: 1 })
+        )]
+    );
+    assert!(graph.reads > 0, "the repair read nothing back");
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(!classic.completed(), "{:?}", classic.status);
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
 }
 
 // The second article lies inside the enciphered packed stream. The graph

@@ -144,7 +144,6 @@ fn full() -> Snapshot {
                 FileState {
                     has_file: true,
                     refused: Some(Why::Unrepairable),
-                    unusable_at: None,
                 },
             ),
             (
@@ -152,15 +151,6 @@ fn full() -> Snapshot {
                 FileState {
                     has_file: true,
                     refused: None,
-                    unusable_at: Some(1),
-                },
-            ),
-            (
-                (NodeId(0), MemberId(0)),
-                FileState {
-                    has_file: false,
-                    refused: None,
-                    unusable_at: Some(0),
                 },
             ),
         ]),

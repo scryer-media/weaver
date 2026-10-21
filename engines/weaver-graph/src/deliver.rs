@@ -57,20 +57,17 @@ impl Delivery<'_> {
 pub enum RecoveryKind {
     Par2,
     Par3,
-    // A RAR recovery record: Reed-Solomon over the volume's own bytes, which
-    // only a RAR engine can apply.
+    // A RAR recovery record: parity over the volume's own bytes before it.
     Rar,
 }
 
 impl RecoveryKind {
-    // The recovery object built over the range. A RAR recovery record has
-    // none: nothing in the build decodes one, so it is only known to be
-    // there.
-    pub fn object(self) -> Option<Kind> {
+    // The recovery object built over the range.
+    pub fn object(self) -> Kind {
         match self {
-            RecoveryKind::Par2 => Some(Kind::Par2),
-            RecoveryKind::Par3 => Some(Kind::Par3),
-            RecoveryKind::Rar => None,
+            RecoveryKind::Par2 => Kind::Par2,
+            RecoveryKind::Par3 => Kind::Par3,
+            RecoveryKind::Rar => Kind::RarRecord,
         }
     }
 }

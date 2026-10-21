@@ -526,59 +526,55 @@ fn a_wrong_password_then_the_right_one() {
     posted_whole(&owner);
 }
 
+// RAR5 proves a candidate by its password check; RAR4 lets it through to
+// the walk, whose first header refutes a wrong one by its CRC.
 #[test]
 fn encrypted_headers_open_with_the_password() {
-    let version = Version::Rar5;
-    let volumes = write(&items(), &split_encrypted(version, true));
-    let mut owner = Owner::new(
-        store(),
-        volumes
-            .into_iter()
-            .enumerate()
-            .map(|(index, bytes)| (format!("alpha.part{}.rar", index + 1), bytes))
-            .collect(),
-    );
-    owner.frames(0, 4096);
-    assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
-    assert!(owner.members.is_empty());
-    owner.offer("not-the-passphrase");
-    assert!(owner.members.is_empty());
-    owner.offer(PASSWORD);
-    owner.whole(4096);
-    owner.said.retain(|emit| *emit != Emit::NeedsPassword);
-    no_trouble(&owner);
-    streamed(&owner);
-    posted_whole(&owner);
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split_encrypted(version, true));
+        let mut owner = Owner::new(
+            store(),
+            volumes
+                .into_iter()
+                .enumerate()
+                .map(|(index, bytes)| (format!("alpha.part{}.rar", index + 1), bytes))
+                .collect(),
+        );
+        owner.frames(0, 4096);
+        assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
+        assert!(owner.members.is_empty());
+        owner.offer("not-the-passphrase");
+        assert!(owner.members.is_empty(), "{version:?}");
+        owner.offer(PASSWORD);
+        owner.whole(4096);
+        owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+        no_trouble(&owner);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
 }
 
 #[test]
 fn encrypted_headers_without_the_password_are_refused_at_quiet() {
-    let version = Version::Rar5;
-    let volumes = write(&items(), &encrypted(version, true));
-    let mut owner = Owner::named(store(), volumes);
-    owner.frames(0, 4096);
-    owner.offer("not-the-passphrase");
-    owner.close(0);
-    // The question is still open: a candidate may yet answer it.
-    assert!(!owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)));
-    owner.quiet();
-    assert!(
-        owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
-        "{version:?} {:?}",
-        owner.said
-    );
-}
-
-// RAR4 headers carry no password check, so nothing can prove a candidate
-// before a header is deciphered with it.
-#[test]
-fn rar4_encrypted_headers_go_to_an_engine() {
-    let volumes = write(&items(), &split_encrypted(Version::Rar4, true));
-    let mut owner = Owner::named(store(), volumes);
-    owner.offer(PASSWORD);
-    owner.frames(0, 4096);
-    assert!(owner.members.is_empty());
-    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::EncryptedHeader)]);
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &encrypted(version, true));
+        let mut owner = Owner::named(store(), volumes);
+        owner.frames(0, 4096);
+        owner.offer("not-the-passphrase");
+        owner.close(0);
+        // The question is still open: a candidate may yet answer it.
+        assert!(
+            !owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
+            "{version:?}"
+        );
+        assert!(owner.members.is_empty(), "{version:?}");
+        owner.quiet();
+        assert!(
+            owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
+            "{version:?} {:?}",
+            owner.said
+        );
+    }
 }
 
 #[test]

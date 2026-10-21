@@ -2,10 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // What a checkpoint says of the writer, and the writer a restore puts back:
-// which members have a file of their own and why a member is a leaf, which
-// carry recovery data no object here reads, the kept envelopes, how many
-// member reads the repairs made, and the read of a root member back from
-// wherever its bytes went. Holds are not here: a hold is fetched again.
+// which members have a file of their own and why a member is a leaf, the
+// kept envelopes, how many member reads the repairs made, and the read of a
+// root member back from wherever its bytes went. Holds are not here: a hold is fetched again.
 
 use weaver_graph::{MemberId, NodeId, Tree};
 
@@ -19,10 +18,6 @@ impl NamespaceWriter {
         FileState {
             has_file: files.is_some_and(|files| files.leaves.contains_key(&member)),
             refused: files.and_then(|files| files.refused.get(&member).copied()),
-            unusable_at: self
-                .unusable
-                .iter()
-                .position(|found| *found == (node, member)),
         }
     }
 
@@ -59,14 +54,8 @@ impl NamespaceWriter {
         self.caps.restore_members(tree);
     }
 
-    // The members carrying recovery data no object here reads, in the order
-    // the job found them, and the member reads its repairs made.
-    pub(crate) fn restore_recovery_facts(
-        &mut self,
-        unusable: Vec<(NodeId, MemberId)>,
-        read_backs: u64,
-    ) {
-        self.unusable = unusable;
+    // The member reads the job's repairs made.
+    pub(crate) fn restore_read_backs(&mut self, read_backs: u64) {
         self.read_backs = read_backs;
     }
 
