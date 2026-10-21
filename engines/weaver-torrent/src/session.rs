@@ -1085,7 +1085,11 @@ impl Session {
                     session.spawn(
                         debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
                         "upnp_forward",
-                        Self::task_upnp_port_forwarder(announce_port, bind_device),
+                        Self::task_upnp_port_forwarder(
+                            announce_port,
+                            bind_device,
+                            session.cancellation_token.clone(),
+                        ),
                     );
                 }
             }
@@ -1274,9 +1278,16 @@ impl Session {
     async fn task_upnp_port_forwarder(
         port: u16,
         bind_device: Option<BindDevice>,
+        cancel: CancellationToken,
     ) -> anyhow::Result<()> {
-        let pf = crate::upnp::UpnpPortForwarder::new(vec![port], None, bind_device)?;
-        pf.run_forever().await
+        let request = crate::upnp::PortMapRequest {
+            protocol: crate::upnp::PortmapProtocol::Tcp,
+            local_port: port,
+            external_port: port,
+        };
+        let pf = crate::upnp::UpnpPortForwarder::new(vec![request], None, bind_device)?;
+        pf.run(cancel, tokio::sync::mpsc::unbounded_channel().0)
+            .await
     }
 
     pub fn get_dht(&self) -> Option<&Dht> {
