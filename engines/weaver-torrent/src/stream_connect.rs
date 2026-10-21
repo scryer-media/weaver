@@ -18,6 +18,7 @@ use tracing::debug;
 
 use crate::{
     Error, PeerConnectionOptions, Result,
+    meter::Meter,
     mse::{self, EncryptionPolicy},
     network::{SocketFactory, UtpSocket},
     peer_connection::with_timeout,
@@ -144,7 +145,8 @@ impl StreamConnector {
 
     /// Connect to a peer over `transports` and send it our BitTorrent
     /// `handshake`, through the encrypted handshake when the policy asks for
-    /// it. The returned halves carry the peer's reply.
+    /// it. The returned halves carry the peer's reply, and the meter counts
+    /// every byte they move, the encryption handshake and ours included.
     pub async fn connect_and_send_handshake(
         &self,
         addr: SocketAddr,
@@ -153,31 +155,34 @@ impl StreamConnector {
         handshake: &[u8],
         connect_timeout: Duration,
         rw_timeout: Duration,
-    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
-        let connect = || {
-            with_timeout(
+    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite, Meter)> {
+        let connect = || async {
+            let (kind, r, w) = with_timeout(
                 "connecting",
                 connect_timeout,
                 self.connect(addr, transports),
             )
+            .await?;
+            let (meter, r, w) = Meter::wrap(r, w);
+            Ok::<_, Error>((kind, r, w, meter))
         };
-        let send_plaintext = |kind, r, mut w: BoxAsyncWrite| async move {
+        let send_plaintext = |kind, r, mut w: BoxAsyncWrite, meter| async move {
             with_timeout(
                 "writing",
                 rw_timeout,
                 w.write_all(handshake).map_err(Error::WriteHandshake),
             )
             .await?;
-            Ok((kind, r, w))
+            Ok((kind, r, w, meter))
         };
 
         if self.encryption == EncryptionPolicy::Disabled {
-            let (kind, r, w) = connect().await?;
-            return send_plaintext(kind, r, w).await;
+            let (kind, r, w, meter) = connect().await?;
+            return send_plaintext(kind, r, w, meter).await;
         }
 
         let stats = &self.stats.encryption;
-        let (kind, r, w) = connect().await?;
+        let (kind, r, w, meter) = connect().await?;
         stats.attempts(1);
         let offer = mse::outgoing_offer(self.encryption);
         let encrypted = with_timeout("encryption handshake", rw_timeout, async {
@@ -191,7 +196,7 @@ impl StreamConnector {
                 } else {
                     stats.header_only(1);
                 }
-                return Ok((kind, e.reader, e.writer));
+                return Ok((kind, e.reader, e.writer, meter));
             }
             Err(e) => e,
         };
@@ -204,8 +209,8 @@ impl StreamConnector {
             "encrypted handshake failed, retrying in plaintext: {err:#}"
         );
         stats.plaintext_fallbacks(1);
-        let (kind, r, w) = connect().await?;
-        send_plaintext(kind, r, w).await
+        let (kind, r, w, meter) = connect().await?;
+        send_plaintext(kind, r, w, meter).await
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {

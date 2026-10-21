@@ -46,6 +46,7 @@ pub mod limits;
 mod listen;
 pub mod lsd;
 mod merge_streams;
+mod meter;
 mod mse;
 pub mod natpmp;
 pub mod network;

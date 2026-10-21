@@ -497,6 +497,88 @@ async fn an_overdue_piece_is_free_again_at_the_timeout_and_its_requests_stay() {
     assert!(rx.is_empty());
 }
 
+// A request asks the limits for nothing: a block is paid for as it crosses
+// the socket (libtorrent `peer_connection::send_block_requests` asks no
+// bandwidth; `setup_receive` reads within the quota). Requests that time out
+// or are rejected leave the torrent's and the session's budgets untouched,
+// and a cap of one block a second holds back none of them.
+#[tokio::test]
+async fn a_rejected_or_timed_out_request_leaves_the_budget_untouched() {
+    let h = Harness::new("requests_spend_no_budget").await;
+    let cap = crate::limits::LimitsConfig {
+        upload_bps: LimitKind::Unlimited,
+        download_bps: LimitKind::Bps(std::num::NonZeroU32::new(CHUNK_SIZE).unwrap()),
+    };
+    h.shared.options.ratelimits.set_config(cap);
+    h._session.ratelimits.set_config(cap);
+    let granted = [
+        h.shared.options.ratelimits.watch_download_granted(),
+        h._session.ratelimits.watch_download_granted(),
+    ];
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    peer.on_i_am_unchoked();
+    let asked = next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await;
+    drop(requester);
+
+    // The requests time out: the peer is snubbed and its piece goes back.
+    let mut watcher: Task<'_> = Box::pin(peer.time_out_requests());
+    h.until_released(&mut watcher).await;
+    drop(watcher);
+    assert!(h.snubbed(&peer));
+    // And the peer rejects them.
+    for (index, begin) in asked {
+        (&peer)
+            .on_received_message(Message::Reject(request(index, begin / CHUNK_SIZE)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(h.inflight_count(&peer), 0);
+    for granted in &granted {
+        assert_eq!(*granted.borrow(), 0);
+    }
+}
+
+// libtorrent `peer_connection::second_tick` snubs a peer, or times out its
+// pieces, only while it reads the peer's socket (`bw_network`) with quota
+// held: a peer whose reads wait on the download limits has no deadline, and
+// once they resume its timeouts count from then.
+#[tokio::test]
+async fn a_peer_waiting_on_the_download_limits_is_not_timed_out() {
+    let h = Harness::new("quota_wait_is_not_a_timeout").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    peer.on_i_am_unchoked();
+    next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await;
+    drop(requester);
+    let deadline = || {
+        h.peers
+            .with_live(peer.addr, |live| live.request_deadline())
+            .unwrap()
+    };
+    let timeout = deadline().unwrap() - tokio::time::Instant::now();
+
+    h.shared
+        .options
+        .ratelimits
+        .set_download_bps(LimitKind::Closed);
+    let handler = &peer;
+    let mut read = std::pin::pin!(handler.request_bandwidth(Channel::Download, 100));
+    assert_eq!((&mut read).now_or_never(), None);
+    assert_eq!(deadline(), None);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(deadline(), None);
+
+    h.shared
+        .options
+        .ratelimits
+        .set_download_bps(LimitKind::Unlimited);
+    assert_eq!((&mut read).now_or_never(), Some(100));
+    assert_eq!(deadline(), Some(tokio::time::Instant::now() + timeout));
+}
+
 #[tokio::test]
 async fn a_late_block_for_a_released_piece_completes_its_chunk() {
     // libtorrent `peer_connection::incoming_piece`: a block of a request
@@ -4055,6 +4137,7 @@ impl Harness {
             writer,
             read_buf: crate::read_buf::ReadBuf::new(),
             handshake: Handshake::new(self.shared.info_hash, Id20::new([7; 20])),
+            meter: Default::default(),
         };
         let slot = self._session.connection_slots.try_accept().unwrap();
         (checked, slot, theirs)

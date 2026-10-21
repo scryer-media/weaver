@@ -14,6 +14,10 @@ pub struct AtomicStats {
     pub downloaded_and_checked_pieces: AtomicU64,
     pub uploaded_bytes: AtomicU64,
     pub fetched_bytes: AtomicU64,
+    /// Bytes received and sent that were not block payload (libtorrent
+    /// `stat`, the protocol half of each channel).
+    pub fetched_protocol_bytes: AtomicU64,
+    pub uploaded_protocol_bytes: AtomicU64,
     pub total_piece_download_ms: AtomicU64,
     /// Bytes of the pieces that failed their hash check (libtorrent
     /// `torrent::m_total_failed_bytes`).

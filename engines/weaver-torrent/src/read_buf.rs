@@ -31,6 +31,28 @@ pub struct ReadBuf {
     buf: Box<[u8]>,
     start: usize,
     len: usize,
+    // Bytes of the messages read so far, frames whole.
+    consumed: u64,
+}
+
+/// How much a read may take off the socket: as much as the connection holds
+/// download quota for (libtorrent `peer_connection::setup_receive` reads at
+/// most `m_quota[download_channel]`).
+pub(crate) trait ReadQuota {
+    /// Waits until a read may take a byte or more, and returns how many it
+    /// may take, at most `room`. `need` more bytes complete the frame.
+    async fn admit(&mut self, need: usize, room: usize) -> usize;
+}
+
+/// A read bounded only by the room in the buffer.
+#[cfg(test)]
+pub(crate) struct Unlimited;
+
+#[cfg(test)]
+impl ReadQuota for Unlimited {
+    async fn admit(&mut self, _need: usize, room: usize) -> usize {
+        room
+    }
 }
 
 /// Advance by N bytes. A macro so that existing field-level
@@ -57,7 +79,18 @@ impl ReadBuf {
             buf: vec![0u8; BUFLEN].into_boxed_slice(),
             start: 0,
             len: 0,
+            consumed: 0,
         }
+    }
+
+    /// Bytes received and not yet read as a message.
+    pub fn buffered(&self) -> usize {
+        self.len
+    }
+
+    /// Bytes of the messages read so far.
+    pub fn consumed(&self) -> u64 {
+        self.consumed
     }
 
     // Read the BT handshake.
@@ -149,11 +182,11 @@ impl ReadBuf {
         advance!(self, len);
     }
 
-    /// Get a part of the buffer for reading into.
-    fn unfilled_ioslices(&mut self) -> [IoSliceMut<'_>; 2] {
+    /// Get a part of the buffer for reading into, at most `max` bytes.
+    fn unfilled_ioslices(&mut self, max: usize) -> [IoSliceMut<'_>; 2] {
         let size = self.buf.len();
         let write_start = (self.start.saturating_add(self.len)) % size;
-        let available_len = size.saturating_sub(self.len);
+        let available_len = size.saturating_sub(self.len).min(max);
         let first_len = (size.saturating_sub(write_start)).min(available_len);
         let second_len = available_len.saturating_sub(first_len);
 
@@ -169,12 +202,16 @@ impl ReadBuf {
 
     /// Read a message into the buffer, try to deserialize it and call the callback on it.
     /// `num_pieces` is the torrent's piece count once its metadata is known,
-    /// which sets the length of a bitfield.
+    /// which sets the length of a bitfield. Each read off the socket takes
+    /// what `quota` admits; the timeout runs only while the socket is read,
+    /// not while the quota is waited for (libtorrent
+    /// `peer_connection::second_tick` times out only a peer it reads).
     pub async fn read_message(
         &mut self,
         conn: &mut BoxAsyncReadVectored,
         timeout: Duration,
         num_pieces: Option<u32>,
+        quota: &mut impl ReadQuota,
     ) -> Result<Message<'_>> {
         // The frame that grew the buffer was read.
         if self.buf.len() > BUFLEN && self.len <= BUFLEN {
@@ -200,6 +237,7 @@ impl ReadBuf {
                 match Message::deserialize(first, second, num_pieces) {
                     Ok((msg, size)) => {
                         advance!(this, size);
+                        this.consumed += size as u64;
                         return Ok(msg);
                     }
                     Err(e) => e,
@@ -213,10 +251,12 @@ impl ReadBuf {
                         self.relocate(self.len + need_additional_bytes);
                     }
                     while need_additional_bytes > 0 {
+                        let room = self.buf.len() - self.len;
+                        let admitted = quota.admit(need_additional_bytes, room).await;
                         let size = with_timeout(
                             "reading",
                             timeout,
-                            conn.read_vectored(&mut self.unfilled_ioslices())
+                            conn.read_vectored(&mut self.unfilled_ioslices(admitted))
                                 .map_err(Error::Write),
                         )
                         .await?;
@@ -257,7 +297,7 @@ mod tests {
         vectored_traits::AsyncReadVectoredIntoCompat,
     };
 
-    use super::{BUFLEN, ReadBuf};
+    use super::{BUFLEN, ReadBuf, ReadQuota, Unlimited};
 
     #[test]
     fn test_ringbuf_ranges() {
@@ -350,7 +390,7 @@ mod tests {
             let mut b = ReadBuf::new();
             b.start = start;
             b.len = len;
-            let [f, s] = b.unfilled_ioslices();
+            let [f, s] = b.unfilled_ioslices(usize::MAX);
             let slices = [(f.as_ptr(), f.len()), (s.as_ptr(), s.len())];
             assert_eq!(offsets(&b, slices), ranges)
         }
@@ -460,7 +500,12 @@ mod tests {
 
             for piece in 0..ITERATIONS {
                 let msg = rb
-                    .read_message(&mut reader, Duration::from_millis(1000), None)
+                    .read_message(
+                        &mut reader,
+                        Duration::from_millis(1000),
+                        None,
+                        &mut Unlimited,
+                    )
                     .await
                     .unwrap();
                 let utdata = match msg {
@@ -534,16 +579,59 @@ mod tests {
 
         let mut rb = ReadBuf::new();
         let timeout = Duration::from_secs(10);
-        match rb.read_message(&mut reader, timeout, Some(PIECES)).await {
+        match rb
+            .read_message(&mut reader, timeout, Some(PIECES), &mut Unlimited)
+            .await
+        {
             Ok(Message::Bitfield(b)) => assert_eq!(b.as_ref(), &bits[..]),
             other => panic!("{other:?}"),
         }
         assert!(rb.buf.len() > BUFLEN);
-        match rb.read_message(&mut reader, timeout, Some(PIECES)).await {
+        match rb
+            .read_message(&mut reader, timeout, Some(PIECES), &mut Unlimited)
+            .await
+        {
             Ok(Message::Have(7)) => {}
             other => panic!("{other:?}"),
         }
         assert_eq!(rb.buf.len(), BUFLEN);
+    }
+
+    // Admits `each` bytes a read, and counts the reads.
+    struct Drip {
+        each: usize,
+        reads: usize,
+    }
+
+    impl ReadQuota for Drip {
+        async fn admit(&mut self, _need: usize, room: usize) -> usize {
+            self.reads += 1;
+            self.each.min(room)
+        }
+    }
+
+    // Each read takes off the socket no more than the quota admits, though
+    // the whole message waits there (libtorrent
+    // `peer_connection::setup_receive`).
+    #[tokio::test(start_paused = true)]
+    async fn a_read_takes_only_what_the_quota_admits() {
+        let mut wire = [0u8; 9];
+        let len = Message::Have(7)
+            .serialize(&mut wire, &Default::default)
+            .unwrap();
+        assert_eq!(len, 9);
+        let mut reader = reader_of(&wire).await;
+        let mut rb = ReadBuf::new();
+        let mut quota = Drip { each: 2, reads: 0 };
+        match rb
+            .read_message(&mut reader, Duration::from_secs(10), None, &mut quota)
+            .await
+        {
+            Ok(Message::Have(7)) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(quota.reads, 5);
+        assert_eq!((rb.consumed(), rb.buffered()), (9, 0));
     }
 
     // A frame past the packet limit, or a bitfield of the wrong size for the
@@ -561,7 +649,7 @@ mod tests {
             let mut reader = reader_of(&header).await;
             let mut rb = ReadBuf::new();
             let err = rb
-                .read_message(&mut reader, timeout, num_pieces)
+                .read_message(&mut reader, timeout, num_pieces, &mut Unlimited)
                 .await
                 .unwrap_err();
             assert!(

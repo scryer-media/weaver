@@ -99,34 +99,38 @@ impl Limit {
         }
     }
 
-    // Waits for the current limit to grant `size` bytes. A closed limit grants
-    // nothing; any change to the limit restarts the wait against the new one.
-    async fn acquire(&self, size: NonZeroU32) -> crate::Result<()> {
+    // Waits for the current limit to grant bytes of `want`, at most one
+    // request's worth under a rate, and returns how many. A closed limit
+    // grants nothing; any change to the limit restarts the wait against the
+    // new one.
+    async fn acquire(&self, want: NonZeroU32) -> u64 {
         let mut state = self.state.subscribe();
-        loop {
+        let size = loop {
             let current = state.borrow_and_update().clone();
             let grant = async {
                 if current.kind == LimitKind::Closed {
                     std::future::pending::<()>().await;
                 }
-                if let Some(rl) = current.limiter.as_ref() {
-                    rl.until_n_ready(size).await?;
-                }
-                crate::Result::Ok(())
+                let Some(rl) = current.limiter.as_ref() else {
+                    return want;
+                };
+                let size = want.min(NonZeroU32::new(CHUNK_SIZE).expect("CHUNK_SIZE is not zero"));
+                rl.until_n_ready(size)
+                    .await
+                    .expect("the burst holds a request");
+                size
             };
             tokio::select! {
                 biased;
-                res = grant => {
-                    res?;
-                    break;
-                }
+                size = grant => break size,
                 res = state.changed() => {
                     res.expect("the sender lives as long as the limit");
                 }
             }
-        }
-        self.granted.send_modify(|g| *g += u64::from(size.get()));
-        Ok(())
+        };
+        let size = u64::from(size.get());
+        self.granted.send_modify(|g| *g += size);
+        size
     }
 
     fn set(&self, kind: LimitKind) {
@@ -136,6 +140,14 @@ impl Limit {
     fn get(&self) -> LimitKind {
         self.state.borrow().kind
     }
+}
+
+/// A direction of a peer's socket (libtorrent `peer_connection::upload_channel`,
+/// `download_channel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    Upload,
+    Download,
 }
 
 pub struct Limits {
@@ -157,12 +169,22 @@ impl Limits {
         }
     }
 
-    pub async fn prepare_for_upload(&self, len: NonZeroU32) -> crate::Result<()> {
-        self.up.acquire(len).await
+    fn limit(&self, channel: Channel) -> &Limit {
+        match channel {
+            Channel::Upload => &self.up,
+            Channel::Download => &self.down,
+        }
     }
 
-    pub async fn prepare_for_download(&self, len: NonZeroU32) -> crate::Result<()> {
-        self.down.acquire(len).await
+    /// Waits for `channel` to grant bytes of the `want` a peer asks for, and
+    /// returns how many: all of them when the channel is unlimited, at least
+    /// one when `want` is not zero. A grant pays for bytes that cross a
+    /// peer's socket.
+    pub async fn request(&self, channel: Channel, want: u64) -> u64 {
+        let Some(want) = NonZeroU32::new(u32::try_from(want).unwrap_or(u32::MAX)) else {
+            return 0;
+        };
+        self.limit(channel).acquire(want).await
     }
 
     pub fn set_upload_bps(&self, bps: impl Into<LimitKind>) {
@@ -213,7 +235,7 @@ mod tests {
     use crate::core::constants::CHUNK_SIZE;
     use futures::FutureExt;
 
-    use super::{LimitKind, Limits, LimitsConfig};
+    use super::{Channel, LimitKind, Limits, LimitsConfig};
 
     fn bps(v: u32) -> LimitKind {
         LimitKind::Bps(NonZeroU32::new(v).unwrap())
@@ -235,10 +257,17 @@ mod tests {
         // The first full request drains the burst; the next one has to wait for a
         // refill at 1024 B/s.
         assert!(matches!(
-            limits.prepare_for_download(chunk).now_or_never(),
-            Some(Ok(()))
+            limits
+                .request(Channel::Download, u64::from(chunk.get()))
+                .now_or_never(),
+            Some(_)
         ));
-        assert!(limits.prepare_for_download(chunk).now_or_never().is_none());
+        assert!(
+            limits
+                .request(Channel::Download, u64::from(chunk.get()))
+                .now_or_never()
+                .is_none()
+        );
         assert_eq!(*granted.borrow(), u64::from(CHUNK_SIZE));
 
         // A higher rate is a new limiter with a full burst: the next acquire is
@@ -256,21 +285,28 @@ mod tests {
             }
         );
         assert!(matches!(
-            limits.prepare_for_download(four).now_or_never(),
-            Some(Ok(()))
+            limits
+                .request(Channel::Download, u64::from(four.get()))
+                .now_or_never(),
+            Some(_)
         ));
-        assert_eq!(*granted.borrow(), 5 * u64::from(CHUNK_SIZE));
+        // A grant under a rate is one request's worth at most.
+        assert_eq!(*granted.borrow(), 2 * u64::from(CHUNK_SIZE));
 
         // None is unlimited.
         limits.set_config(LimitsConfig::default());
         let big = NonZeroU32::new(u32::MAX).unwrap();
         assert!(matches!(
-            limits.prepare_for_upload(big).now_or_never(),
-            Some(Ok(()))
+            limits
+                .request(Channel::Upload, u64::from(big.get()))
+                .now_or_never(),
+            Some(_)
         ));
         assert!(matches!(
-            limits.prepare_for_download(big).now_or_never(),
-            Some(Ok(()))
+            limits
+                .request(Channel::Download, u64::from(big.get()))
+                .now_or_never(),
+            Some(_)
         ));
         assert_eq!(limits.get_config(), LimitsConfig::default());
     }
@@ -286,16 +322,30 @@ mod tests {
         let chunk = NonZeroU32::new(CHUNK_SIZE).unwrap();
         for _ in 0..2 {
             assert!(matches!(
-                limits.prepare_for_upload(chunk).now_or_never(),
-                Some(Ok(()))
+                limits
+                    .request(Channel::Upload, u64::from(chunk.get()))
+                    .now_or_never(),
+                Some(_)
             ));
             assert!(matches!(
-                limits.prepare_for_download(chunk).now_or_never(),
-                Some(Ok(()))
+                limits
+                    .request(Channel::Download, u64::from(chunk.get()))
+                    .now_or_never(),
+                Some(_)
             ));
             // The burst is spent: the next full request is pending, not an error.
-            assert!(limits.prepare_for_upload(chunk).now_or_never().is_none());
-            assert!(limits.prepare_for_download(chunk).now_or_never().is_none());
+            assert!(
+                limits
+                    .request(Channel::Upload, u64::from(chunk.get()))
+                    .now_or_never()
+                    .is_none()
+            );
+            assert!(
+                limits
+                    .request(Channel::Download, u64::from(chunk.get()))
+                    .now_or_never()
+                    .is_none()
+            );
             // Independent of the clock: the quota has capacity for a full request
             // (Ok, whether ready now or later), never InsufficientCapacity.
             for limit in [&limits.up, &limits.down] {
@@ -325,18 +375,21 @@ mod tests {
         for open in [bps(CHUNK_SIZE), LimitKind::Unlimited] {
             let limits = Limits::new(closed_down());
             let granted = limits.watch_download_granted();
-            let mut waiting = std::pin::pin!(limits.prepare_for_download(chunk));
+            let mut waiting =
+                std::pin::pin!(limits.request(Channel::Download, u64::from(chunk.get())));
             assert!((&mut waiting).now_or_never().is_none());
             assert!((&mut waiting).now_or_never().is_none());
             assert_eq!(*granted.borrow(), 0);
             // The other direction is untouched.
             assert!(matches!(
-                limits.prepare_for_upload(chunk).now_or_never(),
-                Some(Ok(()))
+                limits
+                    .request(Channel::Upload, u64::from(chunk.get()))
+                    .now_or_never(),
+                Some(_)
             ));
 
             limits.set_download_bps(open);
-            assert!(matches!((&mut waiting).now_or_never(), Some(Ok(()))));
+            assert!(matches!((&mut waiting).now_or_never(), Some(_)));
             assert_eq!(*granted.borrow(), u64::from(CHUNK_SIZE));
             assert_eq!(limits.get_download_bps(), open);
         }
@@ -353,15 +406,17 @@ mod tests {
         let chunk = NonZeroU32::new(CHUNK_SIZE).unwrap();
         let granted = limits.watch_download_granted();
         assert!(matches!(
-            limits.prepare_for_download(chunk).now_or_never(),
-            Some(Ok(()))
+            limits
+                .request(Channel::Download, u64::from(chunk.get()))
+                .now_or_never(),
+            Some(_)
         ));
         // The burst is spent: this one waits inside the governor.
-        let mut first = std::pin::pin!(limits.prepare_for_download(chunk));
+        let mut first = std::pin::pin!(limits.request(Channel::Download, u64::from(chunk.get())));
         assert!((&mut first).now_or_never().is_none());
 
         limits.set_config(closed_down());
-        let mut second = std::pin::pin!(limits.prepare_for_download(chunk));
+        let mut second = std::pin::pin!(limits.request(Channel::Download, u64::from(chunk.get())));
         assert!((&mut first).now_or_never().is_none());
         assert!((&mut second).now_or_never().is_none());
         assert_eq!(*granted.borrow(), u64::from(CHUNK_SIZE));
@@ -369,8 +424,8 @@ mod tests {
 
         // A fresh burst of two requests releases both.
         limits.set_download_bps(bps(2 * CHUNK_SIZE));
-        assert!(matches!((&mut first).now_or_never(), Some(Ok(()))));
-        assert!(matches!((&mut second).now_or_never(), Some(Ok(()))));
+        assert!(matches!((&mut first).now_or_never(), Some(_)));
+        assert!(matches!((&mut second).now_or_never(), Some(_)));
         assert_eq!(*granted.borrow(), 3 * u64::from(CHUNK_SIZE));
     }
 
