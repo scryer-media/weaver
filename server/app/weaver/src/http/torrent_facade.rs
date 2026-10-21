@@ -520,6 +520,12 @@ async fn handle(
             })
             .await
         }
+        ("torrents", "recheck") => {
+            each(&ctx, &params, |torrents, view| async move {
+                torrents.recheck(view.job_id).await
+            })
+            .await
+        }
         ("torrents", "categories") => {
             axum::Json(categories(&*ctx.inner.config.read().await)).into_response()
         }
@@ -541,8 +547,8 @@ async fn handle(
             })
             .await
         }
-        // Tags are not kept; recheck and reannounce have no service action.
-        ("torrents", "addTags" | "removeTags" | "recheck" | "reannounce") => ok(),
+        // Tags are not kept; reannounce has no service action.
+        ("torrents", "addTags" | "removeTags" | "reannounce") => ok(),
         ("torrents", "tags") | ("log", "main") => axum::Json(json!([])).into_response(),
         ("sync", "maindata") => maindata(&ctx).await,
         ("sync", "torrentPeers") => torrent_peers(&ctx, &params).await,

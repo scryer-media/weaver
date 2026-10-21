@@ -411,12 +411,11 @@ impl Peer {
         self.set_state(next, peers);
     }
 
-    /// The peer's connection is closing: what it showed of the peer is kept
-    /// (libtorrent `peer_list::set_seed`, `set_upload_only`).
-    pub(crate) fn connection_closing(&mut self) {
-        if let Some(live) = self.get_live() {
-            self.upload_only = live.is_upload_only();
-        }
+    /// The peer's connection closes at `closed_at`, in an error when
+    /// `failed`; see [`Peer::closed`].
+    pub(crate) fn connection_closing(&mut self, closed_at: Instant, failed: bool) {
+        let shown = self.get_live().map(|live| live.is_upload_only());
+        self.closed(shown, closed_at, failed);
     }
 
     /// How long a connection to the peer may take to open: `base`, and
@@ -555,13 +554,9 @@ impl Peer {
         }
     }
 
-    /// Settles the peer after its connection closed at `closed_at`, in an
-    /// error when `failed`; `needed` says whether we still want the peer.
-    /// Every close starts the wait to reconnect, and a failure lengthens it
-    /// (libtorrent `peer_list::connection_closed`), but for an encrypted
-    /// handshake that did not complete: its close is dated back by the
-    /// longest wait a candidate has, so the next connection is due at once
-    /// (libtorrent `peer_connection::fast_reconnect`).
+    /// The peer's connection closed at `closed_at`, in an error when
+    /// `failed` (see [`Peer::closed`]), and the peer settles; `needed` says
+    /// whether we still want it.
     pub(crate) fn connection_closed(
         &mut self,
         closed_at: Instant,
@@ -569,6 +564,34 @@ impl Peer {
         needed: bool,
         counters: &PeerStates,
     ) {
+        self.connection_closing(closed_at, failed);
+        self.settle_closed(needed, counters);
+    }
+
+    /// The peer, its connection closed, is a connect candidate again when
+    /// `needed`, else not needed.
+    pub(crate) fn settle_closed(&mut self, needed: bool, counters: &PeerStates) {
+        let next = if needed {
+            self.idle_state(counters)
+        } else {
+            PeerState::NotNeeded
+        };
+        self.set_state(next, counters);
+    }
+
+    /// What a connection's close at `closed_at` leaves on the peer, in an
+    /// error when `failed`. Whether the connection `shown` the peer only
+    /// uploads is kept (libtorrent `peer_list::set_seed`, `set_upload_only`,
+    /// as the connection closes). Every close starts the wait to reconnect,
+    /// and a failure lengthens it (libtorrent `peer_list::connection_closed`),
+    /// but for an encrypted handshake that did not complete: its close is
+    /// dated back by the longest wait a candidate has, so the next
+    /// connection is due at once (libtorrent `peer_connection::
+    /// fast_reconnect`). Holepunch mode ends with the connection.
+    fn closed(&mut self, shown: Option<bool>, closed_at: Instant, failed: bool) {
+        if let Some(upload_only) = shown {
+            self.upload_only = upload_only;
+        }
         self.last_connected = if std::mem::take(&mut self.fast_reconnect) {
             self.fast_reconnects += 1;
             closed_at.checked_sub(MIN_RECONNECT_TIME * MAX_FAILCOUNT)
@@ -579,12 +602,6 @@ impl Peer {
             self.failcount = self.failcount.saturating_add(1);
         }
         self.holepunch = false;
-        let next = if needed {
-            self.idle_state(counters)
-        } else {
-            PeerState::NotNeeded
-        };
-        self.set_state(next, counters);
     }
 
     /// We want a peer we let go again.
@@ -629,13 +646,18 @@ impl Peer {
         self.trust.piece_failed(bannable)
     }
 
-    /// The peer as a pause leaves it on the list: where it listens, its
-    /// failures, trust and holepunch support, without its connection or
-    /// this run's counters. Holepunch mode ends with the connection
-    /// (libtorrent `torrent::do_pause` disconnects every peer, and its
-    /// `torrent_peer` stays on `torrent::m_peer_list`).
-    pub(crate) fn idle(&self) -> Peer {
-        Peer {
+    /// The peer as a pause at `now` leaves it on the list: where it listens,
+    /// its failures, trust and holepunch support, without its connection or
+    /// this run's counters. A connection the pause closes is closed at `now`
+    /// and in no error, by the one close rule [`Peer::closed`]: what it
+    /// showed of the peer is kept and its wait to reconnect starts then
+    /// (libtorrent
+    /// `torrent::do_pause` disconnects every peer with `torrent_paused`, an
+    /// error too mild to mark the peer failed, through
+    /// `peer_list::connection_closed`, and its `torrent_peer` stays on
+    /// `torrent::m_peer_list`).
+    pub(crate) fn idle(&self, now: Instant) -> Peer {
+        let mut idle = Peer {
             addr: self.addr,
             state: PeerState::Dead,
             stats: Default::default(),
@@ -645,13 +667,25 @@ impl Peer {
             last_connected: self.last_connected,
             encrypt: self.encrypt,
             fast_reconnects: self.fast_reconnects,
-            fast_reconnect: false,
+            fast_reconnect: self.fast_reconnect,
             last_optimistic_unchoke: self.last_optimistic_unchoke,
             trust: self.trust,
             supports_holepunch: self.supports_holepunch,
             holepunch: false,
             sources: self.sources,
+        };
+        if self.connected_out().is_some() {
+            idle.closed(
+                self.get_live().map(|live| live.is_upload_only()),
+                now,
+                false,
+            );
         }
+        debug_assert!(
+            !idle.fast_reconnect,
+            "a fast reconnect outlived its connection"
+        );
+        idle
     }
 
     /// An idle peer joins the list of a new run: a connect candidate or

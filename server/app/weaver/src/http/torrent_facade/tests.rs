@@ -1054,6 +1054,33 @@ async fn stop_start_and_force_change_the_state() {
     assert_eq!(rig.torrents().await[0]["force_start"], true);
 }
 
+// qBittorrent's `torrents/recheck` reaches the service's recheck for each
+// torrent it names: an unknown hash is skipped, and a torrent the offline
+// rig holds in no session has nothing to check it, which conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recheck_reaches_each_named_torrent() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let unknown = rig
+        .post(
+            "/api/v2/torrents/recheck",
+            &format!("hashes={}", "0".repeat(40)),
+        )
+        .await;
+    assert_eq!(unknown.status, StatusCode::OK);
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let held = rig
+        .post("/api/v2/torrents/recheck", &format!("hashes={hash}"))
+        .await;
+    assert_eq!(
+        (held.status, held.body.as_str()),
+        (
+            StatusCode::CONFLICT,
+            "the torrent is in no session to check it"
+        )
+    );
+}
+
 // Pausing every torrent is one hold, not a pause of each: a torrent's own
 // pause stands under it and outlasts it, and the hold writes no torrent's
 // intent.
@@ -1621,7 +1648,7 @@ async fn the_stub_endpoints_answer_and_a_url_must_be_a_magnet() {
         (top.status, top.body.as_str()),
         (StatusCode::CONFLICT, "queueing is off")
     );
-    for action in ["addTags", "removeTags", "recheck", "reannounce"] {
+    for action in ["addTags", "removeTags", "reannounce"] {
         let reply = rig
             .post(&format!("/api/v2/torrents/{action}"), "hashes=all&tags=x")
             .await;

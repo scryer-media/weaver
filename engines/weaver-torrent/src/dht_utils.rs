@@ -162,7 +162,7 @@ where
     };
     // The connections still asking end here.
     drop(asking);
-    (found, addrs, seen, peers.idle_list())
+    (found, addrs, seen, peers.idle_list(Instant::now()))
 }
 
 #[cfg(test)]

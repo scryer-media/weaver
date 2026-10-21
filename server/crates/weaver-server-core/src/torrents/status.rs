@@ -126,6 +126,13 @@ pub struct Observed {
 /// The state and the reason behind it, when there is one to give.
 pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
     let detail = |text: &str| Some(text.to_owned());
+    // A check shows while it runs, whatever the operator asked or holds the
+    // torrent: a paused, stopped or queued torrent rechecked is being
+    // checked (qBittorrent `TorrentImpl::updateState` decides Checking
+    // before Stopped and Queued).
+    if matches!(seen.engine, Engine::Checking) {
+        return (TorrentState::CheckingFiles, None);
+    }
     match seen.intent {
         TorrentIntent::Paused => return (TorrentState::Paused, None),
         TorrentIntent::Stopped => {
@@ -463,6 +470,28 @@ mod tests {
             project(&seen(Engine::Checking)),
             (TorrentState::CheckingFiles, None)
         );
+        // A recheck shows while it runs, past what holds the torrent.
+        for held in [
+            Observed {
+                intent: TorrentIntent::Paused,
+                ..seen(Engine::Checking)
+            },
+            Observed {
+                intent: TorrentIntent::Stopped,
+                complete: true,
+                ..seen(Engine::Checking)
+            },
+            Observed {
+                queued: true,
+                ..seen(Engine::Checking)
+            },
+            Observed {
+                paused_by: Some(HoldOrigin::Manual),
+                ..seen(Engine::Checking)
+            },
+        ] {
+            assert_eq!(project(&held), (TorrentState::CheckingFiles, None));
+        }
         assert_eq!(
             project(&Observed {
                 complete: true,

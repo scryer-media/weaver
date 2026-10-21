@@ -1273,7 +1273,7 @@ impl TorrentStateLive {
         // The peer list is read before the state lock: a dying peer holds
         // its own entry while it takes the state lock, so the state lock
         // never waits on a peer entry.
-        let peers = self.peers.idle_list();
+        let peers = self.peers.idle_list(tokio::time::Instant::now());
         let mut g = self.lock_write("pause");
 
         // It should be impossible to make a fatal error after pausing.
@@ -2425,7 +2425,8 @@ impl PeerHandler {
             && failed
             && pe.value().supports_holepunch
             && !pe.value().holepunched();
-        pe.value_mut().connection_closing();
+        pe.value_mut()
+            .connection_closing(tokio::time::Instant::now(), failed);
         let prev = pe.value_mut().take_state(peers);
         self.state.layer_fetch.forget(handle);
 
@@ -2488,7 +2489,7 @@ impl PeerHandler {
         let needed = pe
             .value()
             .needed(self.state.is_finished_and_no_active_streams());
-        peers.connection_closed(pe.value_mut(), tokio::time::Instant::now(), failed, needed);
+        peers.settle_closed(pe.value_mut(), needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
         drop(pe);
         if rendezvous && let Some(introducer) = peers.introducer(handle) {

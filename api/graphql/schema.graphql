@@ -2046,6 +2046,10 @@ type MutationRoot {
 	Move the torrent's directory under `path`; it goes on from there.
 	"""
 	setTorrentLocation(id: Int!, path: String!): Boolean!
+	"""
+	Check every piece of the torrent again, trusting nothing saved.
+	"""
+	recheckTorrent(id: Int!): Boolean!
 	setTorrentCategory(id: Int!, category: String): Boolean!
 	"""
 	Ban a peer's address from the torrent: an IP, or an IP and port

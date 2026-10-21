@@ -795,12 +795,16 @@ impl Live {
         if up + down > 0 {
             counters.last_activity_ms = Some(now);
         }
-        // A complete copy is in reach while the torrent runs complete, or
-        // while a seed is connected.
-        let seeds = live.map_or(0, |live| live.snapshot.peer_stats.live_seeders);
-        if matches!(engine, Engine::Live { finished: true, .. }) || seeds > 0 {
-            counters.last_seen_complete_ms = Some(now);
-        }
+        // The session's sighting of a complete copy, ours or a connected
+        // peer's (libtorrent `torrent::status`'s `last_seen_complete`, the
+        // `m_swarm_last_seen_complete` of `second_tick`); the latest kept
+        // stands, as one from a run before or a peer since gone.
+        let seen_complete = attached
+            .handle
+            .live()
+            .and_then(|live| live.swarm_complete_ago())
+            .map(|ago| now.saturating_sub(i64::try_from(ago.as_millis()).unwrap_or(i64::MAX)));
+        counters.last_seen_complete_ms = counters.last_seen_complete_ms.max(seen_complete);
         Reading {
             engine,
             file_have,
@@ -2330,6 +2334,29 @@ impl TorrentService {
                 give_back(&to.to_string_lossy()).await;
                 return Err(error);
             }
+        }
+        self.publish().await;
+        Ok(())
+    }
+
+    /// Check every piece of a torrent again from what the job holds, trusting
+    /// nothing saved (libtorrent `torrent::force_recheck`, qBittorrent's
+    /// `torrents/recheck`). A running torrent runs again once checked, a
+    /// paused one stays paused, and one being checked is left to its check.
+    pub async fn recheck(&self, job_id: JobId) -> Result<(), ActionError> {
+        {
+            // Held across the recheck, as the queue holds it across a pause
+            // or resume, so neither undoes the other halfway.
+            let live = self.inner.live.lock().await;
+            let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            let attached = torrent.attached.as_ref().ok_or_else(|| {
+                ActionError::Invalid("the torrent is in no session to check it".into())
+            })?;
+            attached
+                .session
+                .force_recheck(&attached.handle)
+                .await
+                .map_err(|error| ActionError::State(format!("{error:#}")))?;
         }
         self.publish().await;
         Ok(())

@@ -845,6 +845,10 @@ pub struct SessionOptions {
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
 
+    /// A test's LSD socket in place of the multicast one.
+    #[cfg(test)]
+    pub(crate) lsd_socket: Option<Box<dyn crate::lsd::Socket>>,
+
     /// Leave peer exchange (ut_pex) out: it is not advertised to peers, and
     /// none is sent or read, as in libtorrent without the ut_pex plugin.
     pub disable_pex: bool,
@@ -906,6 +910,8 @@ impl Default for SessionOptions {
             connections_slack: DEFAULT_CONNECTIONS_SLACK,
             connection_speed: DEFAULT_CONNECTION_SPEED,
             disable_local_service_discovery: false,
+            #[cfg(test)]
+            lsd_socket: None,
             disable_pex: false,
             ipv4_only: false,
             socket_factory: None,
@@ -1257,6 +1263,8 @@ impl Session {
                     LocalServiceDiscovery::new(LocalServiceDiscoveryOptions {
                         cancel_token: token.clone(),
                         bind_device: bind_device.as_ref(),
+                        #[cfg(test)]
+                        socket: opts.lsd_socket.take(),
                         ..Default::default()
                     })
                     .await
@@ -2460,21 +2468,26 @@ impl Session {
             })
         };
 
+        // Each source starts when the torrent first asks it for peers, which
+        // is once it is checked and running: trackers and the DHT by their
+        // streams, the LSD by registering here (libtorrent
+        // `torrent::start_announcing` runs only after `files_checked`, never
+        // while paused).
         let lsd_rx = if is_private {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
+                // Local peers reach the listen port itself.
+                let port = if announce {
+                    self.announce_port.configured
+                } else {
+                    None
+                };
                 futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                    lsd.announce(
-                        info_hash,
-                        // Local peers reach the listen port itself.
-                        if announce {
-                            self.announce_port.configured
-                        } else {
-                            None
-                        },
-                    )
-                    .boxed()
+                    let lsd = lsd.clone();
+                    futures::stream::once(async move { lsd.announce(info_hash, port) })
+                        .flatten()
+                        .boxed()
                 }))
             })
         };
@@ -4199,6 +4212,89 @@ mod tests {
             .check_incoming_connection(addr.parse().unwrap(), ConnectionKind::Tcp, reader, writer)
             .now_or_never()
             .map(|checked| format!("{:#}", checked.err().unwrap()))
+    }
+
+    // libtorrent `torrent::start_announcing` runs from `files_checked`: a
+    // torrent announces to the local network only once its check is done,
+    // as it does to its trackers and the DHT.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_announces_on_the_local_network_only_once_checked() -> anyhow::Result<()> {
+        use crate::{
+            lsd::RecordingSocket,
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+        };
+        use anyhow::Context;
+
+        let t = TestTorrent::new("test_lsd_after_check", 2 * 16384, 16384).await?;
+        let (sent_tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let out = TempDir::with_prefix("test_lsd_after_check_out")?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            SessionOptions {
+                disable_local_service_discovery: false,
+                lsd_socket: Some(Box::new(RecordingSocket(sent_tx))),
+                // A loopback listener announces no port unless told one.
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    announce_port: Some(6881),
+                    ..Default::default()
+                }),
+                ..isolated_session_opts(false)
+            },
+        )
+        .await?;
+        let lsd = session.lsd.clone().context("no LSD")?;
+        let checks = session.concurrent_initialize_semaphore.clone();
+        let held = checks
+            .clone()
+            .acquire_many_owned(checks.available_permits() as u32)
+            .await?;
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        let info_hash = handle.info_hash();
+        assert!(!lsd.registered(info_hash), "announced before its check");
+
+        drop(held);
+        let announce = sent.recv().await.context("no announce")?;
+        assert!(announce.contains(&info_hash.as_string()), "{announce}");
+        assert!(lsd.registered(info_hash));
+
+        // A paused torrent is checked, and announces nothing.
+        let paused = TestTorrent::new("test_lsd_paused", 2 * 16384, 16384).await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(paused.torrent.clone()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    paused: true,
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        handle.wait_until_initialized().await?;
+        assert!(handle.is_paused());
+        assert!(!lsd.registered(handle.info_hash()));
+        // Nor once rechecked: it stays paused.
+        session.force_recheck(&handle).await?;
+        handle.wait_until_initialized().await?;
+        assert!(handle.is_paused());
+        assert!(!lsd.registered(handle.info_hash()));
+        session.stop().await;
+        Ok(())
     }
 
     fn blocked_incoming(session: &Session) -> u64 {

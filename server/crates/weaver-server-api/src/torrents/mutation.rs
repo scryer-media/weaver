@@ -163,6 +163,16 @@ impl TorrentsMutation {
         Ok(true)
     }
 
+    /// Check every piece of the torrent again, trusting nothing saved.
+    #[graphql(guard = "ControlGuard")]
+    async fn recheck_torrent(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+        service(ctx)?
+            .recheck(JobId(id))
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
     #[graphql(guard = "ControlGuard")]
     async fn set_torrent_category(
         &self,

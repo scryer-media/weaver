@@ -58,7 +58,7 @@ const RESEND_STEP: Duration = Duration::from_secs(2);
 
 /// What the LSD sends on and receives from: the multicast socket, or a
 /// test's.
-trait Socket: Send + Sync + 'static {
+pub(crate) trait Socket: Send + Sync + 'static {
     fn recv_from<'a>(&'a self, buf: &'a mut [u8])
     -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
 
@@ -96,6 +96,8 @@ impl Socket for MulticastUdpSocket {
 struct Announce {
     tx: UnboundedSender<SocketAddr>,
     port: Option<u16>,
+    /// Which stream registered it; see [`Registry::unregister`].
+    stream: u64,
 }
 
 /// An announce with sends still to go (libtorrent `lsd::resend_announce`).
@@ -121,6 +123,8 @@ struct Registry {
     resends: Vec<Resend>,
     /// When the next hash takes its turn.
     next_at: Instant,
+    /// The number the next registering stream goes by.
+    next_stream: u64,
 }
 
 impl Registry {
@@ -131,6 +135,7 @@ impl Registry {
             rotation: VecDeque::new(),
             resends: Vec::new(),
             next_at: Instant::now() + ANNOUNCE_INTERVAL,
+            next_stream: 0,
         }
     }
 
@@ -151,6 +156,24 @@ impl Registry {
             return true;
         }
         false
+    }
+
+    /// The number a registering stream goes by.
+    fn stream(&mut self) -> u64 {
+        self.next_stream += 1;
+        self.next_stream
+    }
+
+    /// `stream` ends: what it registered for `info_hash` goes, but not a
+    /// later stream's registration for the hash, which replaced it.
+    fn unregister(&mut self, info_hash: Id20, stream: u64) {
+        if self
+            .receivers
+            .get(&info_hash)
+            .is_some_and(|announce| announce.stream == stream)
+        {
+            self.forget(info_hash);
+        }
     }
 
     /// Takes away everything `info_hash` would still announce.
@@ -241,10 +264,21 @@ pub struct LocalServiceDiscoveryOptions<'a> {
     pub cancel_token: CancellationToken,
     pub cookie: Option<u32>,
     pub bind_device: Option<&'a BindDevice>,
+    /// A test's socket in place of the multicast one.
+    #[cfg(test)]
+    pub(crate) socket: Option<Box<dyn Socket>>,
 }
 
 impl LocalServiceDiscovery {
     pub async fn new(opts: LocalServiceDiscoveryOptions<'_>) -> anyhow::Result<Self> {
+        #[cfg(test)]
+        if let Some(socket) = opts.socket {
+            return Ok(Self::with_socket(
+                socket,
+                opts.cookie.unwrap_or_else(rand::random),
+                opts.cancel_token,
+            ));
+        }
         let socket = MulticastUdpSocket::new(
             (Ipv6Addr::UNSPECIFIED, LSD_PORT).into(),
             LSD_IPV4,
@@ -371,6 +405,16 @@ cookie: {cookie}\r
         }
     }
 
+    /// Whether a stream for `info_hash` lives.
+    #[cfg(test)]
+    pub(crate) fn registered(&self, info_hash: Id20) -> bool {
+        self.inner
+            .registry
+            .lock()
+            .receivers
+            .contains_key(&info_hash)
+    }
+
     /// Streams the peers announcing `info_hash`, and announces it on the
     /// schedule as listening on `announce_port`, if given, for as long as
     /// the stream lives.
@@ -378,11 +422,12 @@ cookie: {cookie}\r
         &self,
         info_hash: Id20,
         announce_port: Option<u16>,
-    ) -> impl Stream<Item = SocketAddr> + Send + Sync + 'static {
+    ) -> impl Stream<Item = SocketAddr> + Send + Sync + 'static + use<> {
         let (tx, rx) = unbounded_channel::<SocketAddr>();
 
         struct AddrStream {
             info_hash: Id20,
+            stream: u64,
             rx: UnboundedReceiver<SocketAddr>,
             lsd: LocalServiceDiscovery,
         }
@@ -400,27 +445,61 @@ cookie: {cookie}\r
 
         impl Drop for AddrStream {
             fn drop(&mut self) {
-                self.lsd.inner.registry.lock().forget(self.info_hash);
+                self.lsd
+                    .inner
+                    .registry
+                    .lock()
+                    .unregister(self.info_hash, self.stream);
             }
         }
 
-        let moved_earlier = self.inner.registry.lock().register(
-            info_hash,
-            Announce {
-                tx,
-                port: announce_port,
-            },
-            Instant::now(),
-        );
+        let (stream, moved_earlier) = {
+            let mut registry = self.inner.registry.lock();
+            let stream = registry.stream();
+            let moved_earlier = registry.register(
+                info_hash,
+                Announce {
+                    tx,
+                    port: announce_port,
+                    stream,
+                },
+                Instant::now(),
+            );
+            (stream, moved_earlier)
+        };
         if moved_earlier {
             self.inner.reschedule.notify_one();
         }
 
         AddrStream {
             info_hash,
+            stream,
             rx,
             lsd: self.clone(),
         }
+    }
+}
+
+/// A socket that receives nothing and hands on each announce it sends.
+#[cfg(test)]
+pub(crate) struct RecordingSocket(pub(crate) UnboundedSender<String>);
+
+#[cfg(test)]
+impl Socket for RecordingSocket {
+    fn recv_from<'a>(&'a self, _: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn send_everywhere<'a>(
+        &'a self,
+        msg: &'a (dyn Fn(bool) -> String + Sync),
+    ) -> BoxFuture<'a, ()> {
+        let _ = self.0.send(msg(false));
+        Box::pin(async {})
+    }
+
+    fn nics(&self) -> &[NetworkInterface] {
+        &[]
     }
 }
 
@@ -643,6 +722,20 @@ mod tests {
             [(b, 0), (b, 2), (b, 6), (b, 300)],
             "nothing more for the dropped stream",
         );
+    }
+
+    // A run's stream that ends after the next run registered the hash, as
+    // a cancelled peer task's may, takes nothing of the next run's away.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_drop_of_an_old_stream_keeps_the_new_registration() {
+        let h = Harness::new();
+        let a = hash(1);
+        let old = h.lsd.announce(a, Some(PORT));
+        let new = h.lsd.announce(a, Some(PORT));
+        drop(old);
+        assert!(h.lsd.registered(a));
+        drop(new);
+        assert!(!h.lsd.registered(a));
     }
 
     // A pause drops the stream and a resume makes a new one: the torrent

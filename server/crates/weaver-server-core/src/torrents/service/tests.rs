@@ -1642,6 +1642,207 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     seeding.stop().await;
 }
 
+// A peer on `listener` that says it saw a complete copy `ago` seconds ago,
+// then that it has piece 0: the BitTorrent handshake with the extension
+// bit, an extended handshake carrying `complete_ago` (BEP 10), and a have.
+// Returns once the session says it is interested, which it reads after the
+// extended handshake. A connection that opens encrypted is let go: the
+// session tries plaintext next.
+async fn claims_complete(listener: &tokio::net::TcpListener, ago: u64) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PROTOCOL: &[u8] = b"\x13BitTorrent protocol";
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut theirs = [0u8; 68];
+        if stream.read_exact(&mut theirs).await.is_err() || &theirs[..20] != PROTOCOL {
+            continue;
+        }
+        let mut ours = PROTOCOL.to_vec();
+        ours.extend_from_slice(&[0, 0, 0, 0, 0, 0x10, 0, 0]);
+        ours.extend_from_slice(&theirs[28..48]);
+        ours.extend_from_slice(b"-XX0000-claimscomplt");
+        let extended = format!("d12:complete_agoi{ago}e1:mdee").into_bytes();
+        let mut message = |id: &[u8], payload: &[u8]| {
+            ours.extend_from_slice(
+                &u32::try_from(id.len() + payload.len())
+                    .unwrap()
+                    .to_be_bytes(),
+            );
+            ours.extend_from_slice(id);
+            ours.extend_from_slice(payload);
+        };
+        message(&[20, 0], &extended);
+        message(&[4], &0u32.to_be_bytes());
+        stream.write_all(&ours).await.unwrap();
+        loop {
+            let mut len = [0u8; 4];
+            stream.read_exact(&mut len).await.unwrap();
+            let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            if body.first() == Some(&2) {
+                return stream;
+            }
+        }
+    }
+}
+
+// libtorrent `torrent::second_tick` keeps `m_swarm_last_seen_complete`, the
+// latest of our own sighting and each connected peer's `complete_ago`, and
+// `torrent::status` reports it as `last_seen_complete` (qBittorrent's
+// `seen_complete`). A peer's word that it saw a complete copy dates the
+// torrent's, though nobody connected is a seed; once the peer is gone the
+// date stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let private = metainfo("set", &files, 16_384, true);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(peer) = listener.local_addr().unwrap() else {
+        panic!("the peer listens on IPv4 loopback");
+    };
+    let bytes = announcing(&private, &tracker(peer).await);
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let seen = || {
+        rig.db
+            .get_torrent_counters(job_id)
+            .unwrap()
+            .unwrap()
+            .last_seen_complete_ms
+    };
+    rig.service.tick().await;
+    assert_eq!(seen(), None);
+
+    let connection = claims_complete(&listener, 100).await;
+    rig.service.tick().await;
+    let at = seen().expect("the peer's sighting is the torrent's");
+    assert!(at <= EPOCH_MS - 100_000, "{at}");
+
+    // With the peer gone, as a pause disconnects every peer, nobody is
+    // left to say it: the date kept stands.
+    rig.service.pause(job_id).await.unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    assert!(handle.live().is_none());
+    assert_eq!(rig.service.torrent(job_id).await.unwrap().peers, 0);
+    drop(connection);
+    rig.service.tick().await;
+    assert_eq!(seen(), Some(at));
+    rig.service.stop().await;
+}
+
+// The one file of `dir`'s tree.
+fn only_file(dir: &Path) -> PathBuf {
+    let mut found = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "{found:?}");
+    found.remove(0)
+}
+
+// libtorrent `torrent::force_recheck`: a complete torrent rechecked after
+// its data was damaged forgets the damaged piece, trusting nothing saved,
+// and a running torrent runs again once checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rechecked_torrent_loses_a_damaged_piece_and_runs_again() {
+    use weaver_torrent::TorrentStatsState;
+
+    const PIECE: usize = 16_384;
+    let data: Vec<u8> = (0..4 * PIECE as u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let private = metainfo("set", &files, PIECE, true);
+
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &private, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let bytes = announcing(&private, &tracker(peer).await);
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.wait_until_completed().await.unwrap();
+    // Nobody is left to fetch the damaged piece from again.
+    seeding.stop().await;
+
+    let dir = rig
+        .service
+        .torrent(job_id)
+        .await
+        .unwrap()
+        .storage_dir
+        .unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(only_file(Path::new(&dir)))
+            .unwrap();
+        file.seek(SeekFrom::Start(2 * PIECE as u64 + 100)).unwrap();
+        file.write_all(&[0x5a; 16]).unwrap();
+    }
+    rig.service.recheck(job_id).await.unwrap();
+    handle.wait_until_initialized().await.unwrap();
+
+    let stats = handle.stats();
+    assert!(matches!(stats.state, TorrentStatsState::Live));
+    assert!(!handle.is_paused());
+    assert!(!stats.finished);
+    assert_eq!(stats.progress_bytes, 3 * PIECE as u64);
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().have_bytes,
+        3 * PIECE as u64
+    );
+    rig.service.stop().await;
+}
+
+// A torrent in no session has nothing to check it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_in_no_session_is_not_rechecked() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.routes.set_down(Some("tunnel gone"));
+    rig.service.tick().await;
+    assert!(matches!(
+        rig.service.recheck(job_id).await,
+        Err(ActionError::Invalid(_))
+    ));
+    assert_eq!(
+        rig.service.recheck(JobId(job_id.0 + 1)).await,
+        Err(ActionError::NotFound(JobId(job_id.0 + 1)))
+    );
+    rig.service.stop().await;
+}
+
 // The next announce the tracker on `listener` hears, unanswered.
 async fn heard_announce(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
     use tokio::io::AsyncReadExt;
