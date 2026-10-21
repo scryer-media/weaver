@@ -305,8 +305,7 @@ pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
         },
         last_announce_ms: last.and_then(|last| ms(last.at)),
         next_announce_ms: last.zip(accepted).and_then(|(last, accepted)| {
-            let floor = accepted.min_interval.unwrap_or_default();
-            ms(last.at + accepted.interval.max(floor))
+            ms(last.at + accepted.interval.max(accepted.min_interval))
         }),
         message: last.and_then(|last| last.result.as_ref().err().cloned()),
         seeders: accepted.and_then(|accepted| accepted.seeders),
@@ -784,10 +783,10 @@ mod tests {
         }
     }
 
-    fn accepted(interval: u64, min_interval: Option<u64>) -> AnnounceOk {
+    fn accepted(interval: u64, min_interval: u64) -> AnnounceOk {
         AnnounceOk {
             interval: Duration::from_secs(interval),
-            min_interval: min_interval.map(Duration::from_secs),
+            min_interval: Duration::from_secs(min_interval),
             seeders: Some(3),
             leechers: Some(5),
         }
@@ -805,11 +804,11 @@ mod tests {
             TrackerStatus::Updating
         );
         assert_eq!(
-            tracker_view(0, &announce(true, Some(Ok(accepted(1800, None))))).status,
+            tracker_view(0, &announce(true, Some(Ok(accepted(1800, 30))))).status,
             TrackerStatus::Updating
         );
 
-        let working = tracker_view(0, &announce(false, Some(Ok(accepted(1800, None)))));
+        let working = tracker_view(0, &announce(false, Some(Ok(accepted(1800, 30)))));
         assert_eq!(working.status, TrackerStatus::Working);
         assert_eq!(working.last_announce_ms, Some(1_000_000));
         assert_eq!(working.next_announce_ms, Some(2_800_000));
@@ -817,7 +816,7 @@ mod tests {
         assert_eq!(working.message, None);
         // The tracker's floor holds the next announce back.
         assert_eq!(
-            tracker_view(0, &announce(false, Some(Ok(accepted(60, Some(120)))))).next_announce_ms,
+            tracker_view(0, &announce(false, Some(Ok(accepted(60, 120))))).next_announce_ms,
             Some(1_120_000)
         );
 
@@ -839,7 +838,7 @@ mod tests {
                 Some(Ok(AnnounceOk {
                     seeders,
                     leechers,
-                    ..accepted(interval, None)
+                    ..accepted(interval, 30)
                 })),
             )
         };
@@ -867,7 +866,7 @@ mod tests {
     // next run's first answer.
     #[test]
     fn an_answer_stands_past_its_interval() {
-        let stale = announce(false, Some(Ok(accepted(1, None))));
+        let stale = announce(false, Some(Ok(accepted(1, 30))));
         assert_eq!(tracker_view(0, &stale).status, TrackerStatus::Working);
     }
 

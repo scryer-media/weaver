@@ -564,7 +564,9 @@ struct Announced {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnnounceOk {
     pub interval: Duration,
-    pub min_interval: Option<Duration>,
+    /// The least time between two announces: the tracker's, else the
+    /// protocol's default.
+    pub min_interval: Duration,
     /// Peers with the whole torrent, as the tracker counts them.
     pub seeders: Option<u32>,
     /// Peers still downloading, as the tracker counts them.
@@ -978,7 +980,7 @@ impl InFlight<'_> {
             result: match result {
                 Ok(a) => Ok(AnnounceOk {
                     interval: a.interval,
-                    min_interval: Some(a.min_interval),
+                    min_interval: a.min_interval,
                     seeders: a.seeders,
                     leechers: a.leechers,
                 }),
@@ -2658,7 +2660,7 @@ mod tests {
                 .result,
             Ok(AnnounceOk {
                 interval: Duration::from_secs(1800),
-                min_interval: Some(Duration::from_secs(900)),
+                min_interval: Duration::from_secs(900),
                 seeders: Some(3),
                 leechers: Some(5),
             })
@@ -3129,7 +3131,7 @@ mod tests {
             announce_of(&announces, &url).last.as_ref().unwrap().result,
             Ok(AnnounceOk {
                 interval: Duration::from_secs(1800),
-                min_interval: Some(Duration::from_secs(60)),
+                min_interval: Duration::from_secs(60),
                 seeders: Some(3),
                 leechers: Some(5),
             })
