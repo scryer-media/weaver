@@ -101,9 +101,7 @@ use crate::{
     file_info::FileInfo,
     file_ops::{FileOps, Verdict, inconsistent_hashes},
     limits::LimitKind,
-    peer_connection::{
-        PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
-    },
+    peer_connection::{PeerConnection, PeerConnectionHandler, WriterRequest},
     piece_priority::PiecePriority,
     piece_tracker::{AcquireRequest, AcquireResult, Arrival, PickOptions, PieceTracker},
     session::CheckedIncomingConnection,
@@ -263,7 +261,8 @@ impl TorrentStateLive {
     fn max_request_window(&self) -> usize {
         self.shared
             .options
-            .peer_max_request_window
+            .peer_opts
+            .max_request_window
             .unwrap_or(DEFAULT_PEER_REQUEST_WINDOW)
             .max(1)
     }
@@ -667,11 +666,7 @@ impl TorrentStateLive {
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
-        let options = PeerConnectionOptions {
-            connect_timeout: self.shared.options.peer_connect_timeout,
-            read_write_timeout: self.shared.options.peer_read_write_timeout,
-            ..Default::default()
-        };
+        let options = self.shared.options.peer_opts;
         let peer_connection = PeerConnection::new(
             checked_peer.addr,
             self.shared.info_hashes,
@@ -732,11 +727,7 @@ impl TorrentStateLive {
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
 
-        let options = PeerConnectionOptions {
-            connect_timeout: state.shared.options.peer_connect_timeout,
-            read_write_timeout: state.shared.options.peer_read_write_timeout,
-            ..Default::default()
-        };
+        let options = state.shared.options.peer_opts;
         let peer_connection = PeerConnection::new(
             addr,
             state.shared.info_hashes,

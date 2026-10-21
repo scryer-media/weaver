@@ -3240,3 +3240,126 @@ async fn a_session_at_its_connection_cutoff_turns_over_the_busiest_torrents_peer
             .any(|r| matches!(r, WriterRequest::Disconnect(Ok(()))))
     );
 }
+
+/// Every dial reaches the test as [`Dialed`](crate::peer_info_reader::tests::Dialed)
+/// does; a datagram socket, which only the idle UDP tracker client holds,
+/// is bound on loopback.
+struct DialedTcp(crate::peer_info_reader::tests::Dialed);
+
+impl crate::network::SocketFactory for DialedTcp {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            crate::network::BoxAsyncReadVectored,
+            crate::network::BoxAsyncWrite,
+        )>,
+    > {
+        self.0.connect_tcp(addr)
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        self.0.listen_tcp(addr)
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+    {
+        Box::pin(async {
+            let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+            Ok(Arc::new(socket) as Arc<dyn crate::network::DatagramSocket>)
+        })
+    }
+}
+
+/// A torrent with no piece, of a session whose connections take
+/// `peer_opts`, that dials one peer; the far end of that dial, read past
+/// our handshake.
+async fn dialing_with(
+    name: &str,
+    peer_opts: crate::PeerConnectionOptions,
+) -> (Harness, tokio::io::DuplexStream) {
+    use tokio::io::AsyncReadExt;
+    let (tx, mut dialed) = unbounded_channel();
+    let opts = SessionOptions {
+        socket_factory: Some(Arc::new(DialedTcp(crate::peer_info_reader::tests::Dialed(
+            tx,
+        )))),
+        connect: Some(crate::stream_connect::ConnectionOptions {
+            enable_tcp: true,
+            peer_opts: Some(peer_opts),
+        }),
+        ..isolated_session_opts(false)
+    };
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        initial_peers: Some(vec!["127.0.0.1:6881".parse().unwrap()]),
+        ..Default::default()
+    };
+    let h = Harness::build_added(name, PIECES, 0x00, opts, add).await;
+    let (_, mut peer) = dialed.recv().await.unwrap();
+    let mut ours = [0; 68];
+    peer.read_exact(&mut ours).await.unwrap();
+    (h, peer)
+}
+
+// libtorrent `peer_connection::second_tick`: a torrent's connection still
+// in its handshake ends at the session's handshake timeout, whatever the
+// peer timeout.
+#[tokio::test(start_paused = true)]
+async fn a_torrent_connection_ends_an_unanswered_handshake_at_the_session_timeout() {
+    use tokio::io::AsyncReadExt;
+    let handshake_timeout = Duration::from_secs(3);
+    let (_h, mut peer) = dialing_with(
+        "session_handshake_timeout",
+        crate::PeerConnectionOptions {
+            read_write_timeout: Some(Duration::from_secs(120)),
+            handshake_timeout: Some(handshake_timeout),
+            ..Default::default()
+        },
+    )
+    .await;
+    let start = tokio::time::Instant::now();
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    assert_eq!(start.elapsed(), handshake_timeout);
+}
+
+// libtorrent `peer_connection::keep_alive`: a torrent's connection sends a
+// keepalive at the session's keepalive interval.
+#[tokio::test(start_paused = true)]
+async fn a_torrent_connection_sends_keepalives_at_the_session_interval() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let keep_alive = Duration::from_secs(7);
+    let (h, mut peer) = dialing_with(
+        "session_keep_alive",
+        crate::PeerConnectionOptions {
+            read_write_timeout: Some(Duration::from_secs(120)),
+            keep_alive_interval: Some(keep_alive),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut theirs = [0; 68];
+    let len =
+        Handshake::new(h.shared.info_hash, Id20::new([2; 20])).serialize_unchecked_len(&mut theirs);
+    peer.write_all(&theirs[..len]).await.unwrap();
+    // Whatever goes out first, the keepalive is the first empty frame.
+    let start = tokio::time::Instant::now();
+    loop {
+        let frame = peer.read_u32().await.unwrap();
+        if frame == 0 {
+            break;
+        }
+        let mut body = vec![0; frame as usize];
+        peer.read_exact(&mut body).await.unwrap();
+    }
+    assert_eq!(start.elapsed(), keep_alive);
+}

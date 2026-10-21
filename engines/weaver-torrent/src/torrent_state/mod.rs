@@ -131,9 +131,9 @@ pub(crate) struct ManagedTorrentLocked {
 #[derive(Default)]
 pub(crate) struct ManagedTorrentOptions {
     pub force_tracker_interval: Option<Duration>,
-    pub peer_connect_timeout: Option<Duration>,
-    pub peer_read_write_timeout: Option<Duration>,
-    pub peer_max_request_window: Option<usize>,
+    // The session's peer connection options with the torrent's own over
+    // them; every connection of the torrent takes them whole.
+    pub peer_opts: crate::peer_connection::PeerConnectionOptions,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     // The torrent's own rate limits. Every live run acquires through this one
