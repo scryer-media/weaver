@@ -23,7 +23,7 @@ use crate::dht::{
         self, AnnouncePeer, CompactNodeInfo, CompactNodeInfoOwned, ErrorDescription,
         FindNodeRequest, GetPeersRequest, Message, MessageKind, Node, PingRequest, Response, Want,
     },
-    peer_store::PeerStore,
+    peer_store::{PEER_PURGE_INTERVAL, PeerStore},
     routing_table::{InsertResult, NodeStatus, RoutingTable},
 };
 use backon::{ExponentialBuilder, Retryable};
@@ -606,14 +606,12 @@ pub struct DhtState {
 }
 
 impl DhtState {
-    #[allow(clippy::too_many_arguments)]
     fn new_internal(
         id: Id20,
         sender: UnboundedSender<WorkerSendRequest>,
         routing_table_v4: Option<RoutingTable>,
         routing_table_v6: Option<RoutingTable>,
         listen_addr: SocketAddr,
-        peer_store: PeerStore,
         cancellation_token: CancellationToken,
         client_version: Option<ByteBufOwned>,
     ) -> Self {
@@ -628,7 +626,7 @@ impl DhtState {
             worker_sender: sender,
             listen_addr,
             rate_limiter: make_rate_limiter(),
-            peer_store,
+            peer_store: PeerStore::new(id),
             cancellation_token,
             client_version,
         }
@@ -1285,6 +1283,14 @@ impl DhtWorker {
         result
     }
 
+    async fn peer_store_purger(&self) -> crate::dht::Result<()> {
+        let mut interval = tokio::time::interval(PEER_PURGE_INTERVAL);
+        loop {
+            interval.tick().await;
+            self.dht.peer_store.garbage_collect_peers();
+        }
+    }
+
     async fn start(
         self,
         in_rx: UnboundedReceiver<WorkerSendRequest>,
@@ -1321,6 +1327,10 @@ impl DhtWorker {
             .bucket_refresher(false)
             .instrument(debug_span!("bucket_refresher_v6"));
 
+        let peer_store_purger = self
+            .peer_store_purger()
+            .instrument(debug_span!("peer_store_purger"));
+
         tokio::pin!(framer);
         tokio::pin!(bootstrap);
         tokio::pin!(response_reader);
@@ -1328,6 +1338,7 @@ impl DhtWorker {
         tokio::pin!(bucket_refresher_v4);
         tokio::pin!(pinger_v6);
         tokio::pin!(bucket_refresher_v6);
+        tokio::pin!(peer_store_purger);
 
         loop {
             tokio::select! {
@@ -1352,6 +1363,9 @@ impl DhtWorker {
                 },
                 err = &mut response_reader => {
                     return Error::task_finished(&"response_reader", err);
+                },
+                err = &mut peer_store_purger => {
+                    return Error::task_finished(&"peer_store_purger", err);
                 }
             }
         }
@@ -1365,7 +1379,6 @@ pub struct DhtConfig<'a> {
     pub routing_table: Option<RoutingTable>,
     pub routing_table_v6: Option<RoutingTable>,
     pub listen_addr: Option<SocketAddr>,
-    pub peer_store: Option<PeerStore>,
     pub cancellation_token: Option<CancellationToken>,
     pub bind_device: Option<&'a BindDevice>,
     /// Send and receive DHT traffic through this socket instead of binding a
@@ -1380,8 +1393,8 @@ pub struct DhtConfig<'a> {
     /// are otherwise random). A client puts its BEP 20 peer id fingerprint here
     /// so that one identity covers the peer wire, trackers and the DHT. An
     /// explicit or restored `peer_id` is kept only if it starts with these bytes;
-    /// otherwise a new id is made, and the routing tables and peer store, which
-    /// are built around the old one, are dropped. At most 20 bytes are used.
+    /// otherwise a new id is made, and the routing tables, which are built
+    /// around the old one, are dropped. At most 20 bytes are used.
     /// Defaults to rqbit's own fingerprint.
     pub node_id_prefix: Option<Vec<u8>>,
     /// The BEP 5 client version ("v"): by convention the two BEP 20 client
@@ -1452,11 +1465,10 @@ impl DhtState {
                 }
             };
             info!("starting up DHT with peer id {:?}", peer_id);
-            // A routing table is laid out by distance from its own node's id, and the
-            // peer store hands out tokens for it: neither carries over to another id.
+            // A routing table is laid out by distance from its own node's id: it
+            // does not carry over to another id.
             let routing_table = config.routing_table.filter(|t| t.id() == peer_id);
             let routing_table_v6 = config.routing_table_v6.filter(|t| t.id() == peer_id);
-            let peer_store = config.peer_store.filter(|s| s.self_id == peer_id);
             let bootstrap_addrs = config.bootstrap_addrs.unwrap_or_else(|| {
                 crate::dht::DHT_BOOTSTRAP
                     .iter()
@@ -1473,7 +1485,6 @@ impl DhtState {
                 routing_table,
                 routing_table_v6,
                 listen_addr,
-                peer_store.unwrap_or_else(|| PeerStore::new(peer_id)),
                 token,
                 config.client_version.map(ByteBufOwned::from),
             ));
@@ -1888,7 +1899,6 @@ mod tests {
         DhtState,
         tokio::sync::mpsc::UnboundedReceiver<super::WorkerSendRequest>,
     ) {
-        use crate::dht::peer_store::PeerStore;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let id = crate::core::hash_id::Id20::new([0x11; 20]);
         let dht = DhtState::new_internal(
@@ -1897,7 +1907,6 @@ mod tests {
             None,
             None,
             (Ipv4Addr::LOCALHOST, 0).into(),
-            PeerStore::new(id),
             tokio_util::sync::CancellationToken::new(),
             None,
         );
