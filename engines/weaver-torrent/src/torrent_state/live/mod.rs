@@ -114,7 +114,7 @@ use crate::{
 };
 
 use self::{
-    choker::{CHOKED_REQUEST_GRACE, Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
+    choker::CHOKED_REQUEST_GRACE,
     peer::{
         InflightRequest, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx, PeerState, PeerTx, Refused,
         RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
@@ -236,9 +236,6 @@ pub struct TorrentStateLive {
 
     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<QueuedUpload>,
 
-    // Hands out the upload slots.
-    choker: Choker,
-
     // Whether the torrent speaks ut_pex: advertises it, sends it and reads
     // it. Not on a private torrent, nor in a session without it (libtorrent
     // `ut_pex_plugin::new_connection`, `session::add_extension`).
@@ -330,10 +327,6 @@ impl TorrentStateLive {
                 .map(|_| RwLock::new(()))
                 .collect(),
             ratelimit_upload_tx,
-            choker: Choker::new(
-                session.unchoke_slots_limit,
-                lengths.default_piece_length().into(),
-            ),
             pex: !session.disable_pex && !paused.metadata.info.info().private,
             super_seeding,
             // What a handshake of this run's first connections says.
@@ -382,12 +375,6 @@ impl TorrentStateLive {
             debug_span!(parent: state.shared.span.clone(), "upload_scheduler"),
             format!("[{}]upload_scheduler", state.shared.id),
             state.clone().task_upload_scheduler(ratelimit_upload_rx),
-        );
-
-        state.spawn(
-            debug_span!(parent: state.shared.span.clone(), "choker"),
-            format!("[{}]choker", state.shared.id),
-            state.clone().task_choker(),
         );
 
         state.spawn(
@@ -519,37 +506,6 @@ impl TorrentStateLive {
         }
         drop(permit);
         Ok(())
-    }
-
-    /// Hands the upload slots out every UNCHOKE_INTERVAL and passes the
-    /// optimistic one on every OPTIMISTIC_UNCHOKE_INTERVAL, each at once when
-    /// the choker asks for it sooner. When both fall due the optimistic slot
-    /// passes first, so the round sees its new holder.
-    async fn task_choker(self: Arc<Self>) -> crate::Result<()> {
-        let first = tokio::time::Instant::now() + UNCHOKE_INTERVAL;
-        let mut rounds = tokio::time::interval_at(first, UNCHOKE_INTERVAL);
-        let mut rotations = tokio::time::interval_at(first, OPTIMISTIC_UNCHOKE_INTERVAL);
-        loop {
-            let rotate = tokio::select! {
-                biased;
-                _ = rotations.tick() => true,
-                _ = self.choker.rotation_requested() => {
-                    rotations.reset();
-                    true
-                }
-                _ = self.choker.reshuffle_requested() => {
-                    rounds.reset();
-                    false
-                }
-                _ = rounds.tick() => false,
-            };
-            let now = tokio::time::Instant::now();
-            if rotate {
-                self.choker.rotate_optimistic(&self.peers, now);
-            } else {
-                self.choker.recalculate(&self.peers, now);
-            }
-        }
     }
 
     #[track_caller]
@@ -1454,10 +1410,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::HashRequest(request) => {
                 self.on_hash_request(request).context("on_hash_request")?
             }
-            Message::NotInterested => self
-                .state
-                .choker
-                .peer_not_interested(&self.state.peers, self.addr),
+            Message::NotInterested => {
+                if let Some(session) = self.state.shared.session.upgrade() {
+                    session.choker.peer_not_interested(&self.state, self.addr);
+                }
+            }
             Message::Cancel(request) => self.on_upload_cancelled(request),
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(
                 metadata_piece_id,
@@ -1883,8 +1840,12 @@ impl PeerHandler {
                 ExtendedMessage::UtHolepunch(UtHolepunch::Rendezvous(handle)),
             )));
         }
-        if let Some(held_slot) = held_slot {
-            self.state.choker.peer_gone(handle, held_slot);
+        if let Some(held_slot) = held_slot
+            && let Some(session) = self.state.shared.session.upgrade()
+        {
+            session
+                .choker
+                .peer_gone(self.state.shared.id, handle, held_slot);
         }
         Ok(())
     }
@@ -2024,9 +1985,7 @@ impl PeerHandler {
             .peers
             .with_live(self.addr, |live| live.peer_interested);
         if interested == Some(false) {
-            self.state
-                .choker
-                .peer_interested(&self.state.peers, self.addr);
+            self.tell_choker_interested();
         }
 
         let chunks_per_piece = self.state.lengths.default_chunks_per_piece();
@@ -2110,9 +2069,14 @@ impl PeerHandler {
                     live.send_allowed_fast(self.addr.ip(), info_hash, &self.state.lengths)
                 });
         }
-        self.state
-            .choker
-            .peer_interested(&self.state.peers, self.addr);
+        self.tell_choker_interested();
+    }
+
+    // The session's choker hears that the peer is interested.
+    fn tell_choker_interested(&self) {
+        if let Some(session) = self.state.shared.session.upgrade() {
+            session.peer_interested(&self.state, self.addr);
+        }
     }
 
     /// The peer lets us fetch `index` while it chokes us (libtorrent

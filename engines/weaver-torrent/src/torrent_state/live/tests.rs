@@ -85,11 +85,35 @@ impl Harness {
         opts: SessionOptions,
         add: AddTorrentOptions,
     ) -> Self {
-        let torrent = TestTorrent::new(name, (pieces * PIECE_LENGTH) as usize, PIECE_LENGTH)
-            .await
-            .unwrap();
         let out = TempDir::with_prefix(name).unwrap();
         let session = Session::new_with_opts(out.path().into(), opts)
+            .await
+            .unwrap();
+        Self::added_to(session, out, name, pieces, have, add).await
+    }
+
+    /// Another live torrent of the harness's session, of the harness's
+    /// pieces, `have` the bitfield of those had.
+    async fn sibling(&self, name: &str, have: u8) -> Self {
+        let add = AddTorrentOptions {
+            storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+            ..Default::default()
+        };
+        let out = TempDir::with_prefix(name).unwrap();
+        Self::added_to(self._session.clone(), out, name, PIECES, have, add).await
+    }
+
+    /// A live torrent of `pieces` four-chunk pieces, `have` the bitfield of
+    /// those had, added to `session` with `add`.
+    async fn added_to(
+        session: Arc<Session>,
+        out: TempDir,
+        name: &str,
+        pieces: u32,
+        have: u8,
+        add: AddTorrentOptions,
+    ) -> Self {
+        let torrent = TestTorrent::new(name, (pieces * PIECE_LENGTH) as usize, PIECE_LENGTH)
             .await
             .unwrap();
         let have = BF::from_boxed_slice(vec![have].into_boxed_slice());
@@ -1257,6 +1281,95 @@ async fn the_optimistic_slot_passes_every_30_s_to_a_peer_that_never_held_it() {
     );
     assert_eq!(next_sent(&mut first_rx).await, Sent::Choke);
     assert!(h.choked(&first));
+}
+
+// libtorrent `session_impl::preemptive_unchoke`,
+// `recalculate_optimistic_unchoke_slots`: the upload slots are the
+// session's. A peer of one torrent finds no free slot while a peer of another
+// holds the only one, and the optimistic slot passes between the torrents.
+#[tokio::test]
+async fn a_peer_of_one_torrent_waits_for_the_slot_a_peer_of_another_holds() {
+    // The one slot of the session is the optimistic one.
+    let a = Harness::seeding_with_slots("one_slot_a", 1).await;
+    let b = a.sibling("one_slot_b", 0xc0).await;
+    tokio::time::pause();
+    let (first, mut first_rx) = a.peer("127.0.0.1:6881");
+    let (other, mut other_rx) = b.peer("127.0.0.2:6881");
+
+    (&first)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Unchoke);
+    (&other)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert!(other_rx.is_empty());
+    assert!(b.choked(&other));
+
+    // At the first round the optimistic slot goes to the peer that waited
+    // for it, and the first peer, holding no regular slot, is choked.
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Choke);
+    let other_held_it = tokio::time::Instant::now();
+
+    // The first peer never held the optimistic slot: it takes it next.
+    assert_eq!(next_sent(&mut first_rx).await, Sent::Unchoke);
+    assert_eq!(
+        tokio::time::Instant::now(),
+        other_held_it + choker::OPTIMISTIC_UNCHOKE_INTERVAL
+    );
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Choke);
+    assert!(b.choked(&other));
+}
+
+// libtorrent `session_impl::recalculate_unchoke_slots`: a round ranks the
+// peers of every torrent of the session together.
+#[tokio::test]
+async fn a_peer_of_another_torrent_that_sends_us_more_takes_the_slot_of_one_that_sends_less() {
+    // Two regular slots and the optimistic one, over both torrents.
+    let a = Harness::seeding_with_slots("ranked_together_a", 3).await;
+    let b = a.sibling("ranked_together_b", 0xc0).await;
+    tokio::time::pause();
+    let (slow, mut slow_rx) = a.peer("127.0.0.1:6881");
+    let (steady, mut steady_rx) = a.peer("127.0.0.2:6881");
+    let (optimistic, mut optimistic_rx) = a.peer("127.0.0.3:6881");
+    let (fast, mut fast_rx) = b.peer("127.0.0.4:6881");
+    for (peer, rx) in [
+        (&slow, &mut slow_rx),
+        (&steady, &mut steady_rx),
+        (&optimistic, &mut optimistic_rx),
+    ] {
+        peer.on_received_message(Message::Interested).await.unwrap();
+        assert_eq!(next_sent(rx).await, Sent::Unchoke);
+    }
+
+    // The first round keeps two of the three, none having sent a byte, and
+    // the third comes back on the optimistic slot.
+    assert_eq!(next_sent(&mut optimistic_rx).await, Sent::Choke);
+    assert_eq!(next_sent(&mut optimistic_rx).await, Sent::Unchoke);
+
+    // The other torrent has no peer unchoked, and still no slot is free.
+    (&fast)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert!(fast_rx.is_empty());
+
+    // Over the round the other torrent's peer sends us the most, the slow
+    // one the least: it takes the slow one's slot.
+    for (peer, pieces) in [(&slow, 1u64), (&steady, 2), (&fast, 3)] {
+        peer.counters
+            .fetched_bytes
+            .fetch_add(pieces * u64::from(PIECE_LENGTH), Ordering::Relaxed);
+    }
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut slow_rx).await, Sent::Choke);
+    assert!(steady_rx.is_empty());
+    assert!(!a.choked(&steady));
+    assert!(optimistic_rx.is_empty());
+    assert!(!a.choked(&optimistic));
 }
 
 #[tokio::test]

@@ -36,7 +36,10 @@ use crate::dht::{
 use crate::lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
 use crate::natpmp::{NATPMP_PORT, NatPmpMapper};
 use crate::peer_protocol::Handshake;
-use crate::torrent_state::live::web_seed::WebSeeds;
+use crate::torrent_state::live::{
+    choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
+    web_seed::WebSeeds,
+};
 use crate::tracker::{AutoScrape, ListenPort, StoppedAnnounces, TrackerComms, UdpTrackerClient};
 use crate::upnp::{
     PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, UpnpPortForwarder,
@@ -279,7 +282,8 @@ pub struct Session {
     // Feature flags
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
-    pub(crate) unchoke_slots_limit: usize,
+    // Hands out the session's upload slots to the peers of every torrent.
+    pub(crate) choker: Arc<Choker>,
     pub(crate) disable_pex: bool,
     // Whether the session listens on uTP, and so connects over it.
     pub(crate) utp: bool,
@@ -702,9 +706,9 @@ pub struct SessionOptions {
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
 
-    /// Peers each torrent uploads to at once, one in five of them and at least
-    /// one on optimistic slots (libtorrent `unchoke_slots_limit`). Defaults
-    /// to 8.
+    /// Peers the session uploads to at once, over all its torrents, one in
+    /// five of them and at least one on optimistic slots (libtorrent
+    /// `unchoke_slots_limit`). Defaults to 8.
     pub unchoke_slots_limit: usize,
 
     /// Peer connections, incoming and outgoing, the session holds open at
@@ -1174,7 +1178,7 @@ impl Session {
                 ),
                 auto_scrape: AutoScrape::default(),
                 peer_limit: opts.peer_limit,
-                unchoke_slots_limit: opts.unchoke_slots_limit,
+                choker: Arc::new(Choker::new(opts.unchoke_slots_limit)),
                 disable_pex: opts.disable_pex,
                 allow_multiple_connections_per_ip: opts.allow_multiple_connections_per_ip,
                 blocklist,
@@ -1286,6 +1290,7 @@ impl Session {
 
             session.start_speed_estimator_updater();
             session.start_peer_turnover();
+            session.start_choker();
 
             Ok(session)
         }
@@ -1582,6 +1587,63 @@ impl Session {
         )
     }
 
+    // Hands the upload slots out every UNCHOKE_INTERVAL and passes the
+    // optimistic ones on every OPTIMISTIC_UNCHOKE_INTERVAL, each at once when
+    // the choker asks for it sooner, over every live torrent's peers at once
+    // (libtorrent `session_impl::second_tick`). When both fall due the
+    // optimistic slots pass first, so the round sees their new holders.
+    fn start_choker(self: &Arc<Self>) {
+        let session = Arc::downgrade(self);
+        let choker = self.choker.clone();
+        self.spawn(
+            debug_span!(parent: self.rs(), "choker"),
+            "choker",
+            async move {
+                let first = tokio::time::Instant::now() + UNCHOKE_INTERVAL;
+                let mut rounds = tokio::time::interval_at(first, UNCHOKE_INTERVAL);
+                let mut rotations = tokio::time::interval_at(first, OPTIMISTIC_UNCHOKE_INTERVAL);
+                loop {
+                    let rotate = tokio::select! {
+                        biased;
+                        _ = rotations.tick() => true,
+                        _ = choker.rotation_requested() => {
+                            rotations.reset();
+                            true
+                        }
+                        _ = choker.reshuffle_requested() => {
+                            rounds.reset();
+                            false
+                        }
+                        _ = rounds.tick() => false,
+                    };
+                    let torrents = session
+                        .upgrade()
+                        .context("session is dead")?
+                        .live_torrents();
+                    let now = tokio::time::Instant::now();
+                    if rotate {
+                        choker.rotate_optimistic(&torrents, now);
+                    } else {
+                        choker.recalculate(&torrents, now);
+                    }
+                }
+            },
+        )
+    }
+
+    // The peer at `addr` of `torrent` said it is interested: it takes one of
+    // the session's upload slots when one is free.
+    pub(crate) fn peer_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
+        self.choker
+            .peer_interested(&self.live_torrents(), torrent, addr);
+    }
+
+    // The torrents that are live, so whose peers the session uploads to and
+    // turns over.
+    fn live_torrents(&self) -> Vec<Arc<TorrentStateLive>> {
+        self.with_torrents(|torrents| torrents.filter_map(|(_, t)| t.live()).collect())
+    }
+
     // Makes room for connect candidates when connections run short
     // (libtorrent `session_impl::second_tick`). When the session holds
     // PEER_TURNOVER_CUTOFF percent of its cap, the torrent with the most
@@ -1593,8 +1655,7 @@ impl Session {
         if limit < 6 {
             return;
         }
-        let torrents = self
-            .with_torrents(|torrents| torrents.filter_map(|(_, t)| t.live()).collect::<Vec<_>>());
+        let torrents = self.live_torrents();
         if self.connection_slots.in_use() >= limit * PEER_TURNOVER_CUTOFF / 100 {
             if let Some(most) = torrents.iter().max_by_key(|t| t.connections().0) {
                 most.turn_peers_over();
