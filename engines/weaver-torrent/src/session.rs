@@ -67,7 +67,7 @@ use crate::{
     stream_connect::{ConnectionKind, ConnectionOptions, StreamConnector, StreamConnectorArgs},
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        RunCounters, TorrentMetadata, TorrentStateLive,
+        TorrentMetadata, TorrentStateLive,
         initializing::{TorrentStateInitializing, normalize_initial_have},
     },
     type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerStream},
@@ -2379,22 +2379,31 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         };
         // The running run's counters; once it has ended (its pieces are gone
         // from the live state) the ones recorded as it ended.
+        let last_run = *mt.shared().last_run.lock();
         let run = live
             .as_ref()
-            .and_then(|l| {
-                Some(RunCounters {
-                    uploaded_bytes: l.get_uploaded_bytes(),
-                    downloaded_bytes: l.get_downloaded_bytes(),
-                    left_bytes: l.get_hns()?.needed_bytes,
-                })
-            })
-            .or(*mt.shared().last_run.lock());
+            .map(|l| (l.get_uploaded_bytes(), l.get_downloaded_bytes()))
+            .or(last_run.map(|r| (r.uploaded_bytes, r.downloaded_bytes)));
+        // What the whole torrent still lacks, whatever is selected, so a
+        // torrent that has its selected files but not every piece never reads
+        // as a seed (libtorrent `torrent::bytes_left`). Once the pieces are
+        // gone with the torrent, what its run recorded as it ended.
+        let left_bytes = mt
+            .with_chunk_tracker(|c| c.get_lengths().total_length() - c.get_hns().have_bytes)
+            .ok()
+            .or(last_run.map(|r| r.left_bytes));
         crate::tracker::TrackerCommsStats {
-            uploaded_bytes: run.map_or(0, |r| r.uploaded_bytes),
-            downloaded_bytes: run.map_or(0, |r| r.downloaded_bytes),
-            left_bytes: run.map(|r| r.left_bytes),
+            uploaded_bytes: run.map_or(0, |(uploaded, _)| uploaded),
+            downloaded_bytes: run.map_or(0, |(_, downloaded)| downloaded),
+            left_bytes,
             torrent_state,
-            finished_during_run: live.is_some_and(|l| l.finished_during_run()),
+            // `completed` is for becoming a seed, not for finishing a
+            // selection (libtorrent `torrent::finished` calls `completed`
+            // only when `is_seed`). A run that began finished had every
+            // selected piece, so one that finished during it began short of
+            // a seed too.
+            finished_during_run: live.is_some_and(|l| l.finished_during_run())
+                && left_bytes == Some(0),
         }
     }
 
@@ -2402,8 +2411,11 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         async move {
             loop {
                 if let Some(mt) = self.torrent() {
-                    if mt.wait_until_completed().await.is_err() {
-                        // The torrent errored, so it won't complete in this run.
+                    // The torrent finishes its selection; it completes only if
+                    // that makes it a seed. An error, or a selection that
+                    // finished short of a seed, leaves nothing to wait on in
+                    // this run: a later regular announce reads the state.
+                    if mt.wait_until_completed().await.is_err() || !self.get().is_completed() {
                         futures::future::pending::<()>().await;
                     }
                     return;
@@ -2837,6 +2849,113 @@ mod tests {
             .unwrap();
         handle.wait_until_completed().await.unwrap();
         (dir, session, handle)
+    }
+
+    // What a tracker announce of `handle`'s torrent reports.
+    fn tracker_stats(
+        session: &std::sync::Arc<Session>,
+        handle: &super::ManagedTorrentHandle,
+    ) -> (super::PeerRxTorrentInfo, crate::tracker::TrackerCommsStats) {
+        use crate::tracker::TorrentStatsProvider;
+        let info = super::PeerRxTorrentInfo {
+            info_hashes: handle.info_hashes(),
+            session: session.clone(),
+            torrent: Default::default(),
+        };
+        let stats = info.get();
+        (info, stats)
+    }
+
+    #[tokio::test]
+    async fn a_seed_announces_nothing_left() {
+        use crate::tracker::TorrentStatsProvider;
+        use futures::FutureExt;
+        let (_dir, session, handle) = seeding(8, Default::default()).await;
+        let (info, stats) = tracker_stats(&session, &handle);
+        assert_eq!(stats.left_bytes, Some(0));
+        // Seeding from the start: no `completed`, and nothing to wait for.
+        assert!(!stats.finished_during_run);
+        assert!(info.wait_until_completed().now_or_never().is_some());
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_finished_selection_short_of_a_seed_announces_what_the_torrent_lacks() {
+        // libtorrent torrent::bytes_left counts the whole torrent, and
+        // torrent::finished sends `completed` only when is_seed.
+        use crate::tracker::TorrentStatsProvider;
+        use futures::FutureExt;
+        const PIECE: usize = 16384;
+        let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
+            2,
+            PIECE,
+            Some("partial_selection"),
+        );
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(PIECE as u32),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        std::fs::remove_file(dir.path().join("1.data")).unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        let (_, stats) = tracker_stats(&session, &handle);
+        assert_eq!(stats.left_bytes, Some(PIECE as u64));
+
+        // Drop the missing file from the selection: the selection finishes
+        // during this run, the torrent still lacks that file's piece.
+        let had = handle
+            .with_metadata(|m| {
+                m.file_infos
+                    .iter()
+                    .position(|f| f.relative_filename.ends_with("0.data"))
+                    .unwrap()
+            })
+            .unwrap();
+        handle.update_only_files(&HashSet::from([had])).unwrap();
+        assert!(handle.live().unwrap().finished_during_run());
+
+        let (info, stats) = tracker_stats(&session, &handle);
+        assert_eq!(stats.left_bytes, Some(PIECE as u64));
+        assert!(!stats.finished_during_run);
+        assert!(info.wait_until_completed().now_or_never().is_none());
+
+        // Paused, the pieces still say what the torrent lacks.
+        session.pause(&handle).await.unwrap();
+        let (_, stats) = tracker_stats(&session, &handle);
+        assert_eq!(stats.left_bytes, Some(PIECE as u64));
+        session.stop().await;
     }
 
     // Connects to the session and sends a handshake for `handle`'s torrent.

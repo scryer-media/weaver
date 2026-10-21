@@ -206,7 +206,7 @@ async fn test_announced_port_is_the_one_the_session_listens_on() -> anyhow::Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_partial_selection_announces_only_the_selected_bytes_left() -> anyhow::Result<()> {
+async fn test_partial_selection_announces_what_the_whole_torrent_lacks() -> anyhow::Result<()> {
     setup_test_logging();
     const PIECE_LENGTH: u32 = 1024;
     let dir = create_default_random_dir_with_torrents(3, 4 * PIECE_LENGTH as usize, Some("sel"));
@@ -240,13 +240,15 @@ async fn test_partial_selection_announces_only_the_selected_bytes_left() -> anyh
         .into_handle()
         .context("expected a handle")?;
 
-    // One of three piece-aligned files selected: only its bytes are left.
+    // One of three piece-aligned files selected: `left` is still every byte
+    // of the torrent, as libtorrent's `torrent::bytes_left` counts it, so
+    // finishing the selection never reads as a seed.
     let (conn, query) = read_announce_query(&tracker).await?;
     assert_eq!(param(&query, "event"), Some("started"));
     assert_eq!(param(&query, "downloaded"), Some("0"));
     assert_eq!(
         param(&query, "left"),
-        Some((4 * PIECE_LENGTH).to_string().as_str())
+        Some((3 * 4 * PIECE_LENGTH).to_string().as_str())
     );
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
     Ok(())

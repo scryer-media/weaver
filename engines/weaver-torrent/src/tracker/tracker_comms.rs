@@ -79,14 +79,15 @@ pub struct TrackerCommsStats {
     /// check. Pieces the torrent already had when the run began are not
     /// counted, and neither is a piece that failed its check.
     pub downloaded_bytes: u64,
-    /// Bytes of the selected files still to download, 0 once they are all
-    /// here. None while the torrent's size is unknown (a magnet still
-    /// resolving its metadata).
+    /// Bytes of the whole torrent not yet had, whichever files are selected,
+    /// so 0 only for a seed. None while the torrent's size is unknown (a
+    /// magnet still resolving its metadata).
     pub left_bytes: Option<u64>,
     pub torrent_state: TrackerCommsStatsState,
-    /// The torrent was incomplete when its current run began and has every
-    /// wanted piece now. Each tracker hears `completed` (BEP 3) once for such a
-    /// run; a torrent that was already complete when it started never sends it.
+    /// The torrent was incomplete when its current run began and is a seed
+    /// now. Each tracker hears `completed` (BEP 3) once for such a run; a
+    /// torrent that was already a seed when it started never sends it, and
+    /// neither does one that has only its selected files.
     pub finished_during_run: bool,
 }
 
@@ -106,8 +107,8 @@ impl TrackerCommsStats {
 pub trait TorrentStatsProvider: Send + Sync {
     fn get(&self) -> TrackerCommsStats;
 
-    /// Resolves once the torrent has every wanted piece, at once if it already
-    /// has. Lets the tracker task send `completed` without waiting out the
+    /// Resolves once the torrent is a seed, at once if it already is. Lets
+    /// the tracker task send `completed` without waiting out the
     /// announce interval. The default never resolves, so `completed` goes out
     /// with the next regular announce.
     fn wait_until_completed(&self) -> BoxFuture<'_, ()> {
@@ -761,8 +762,9 @@ impl Default for StoppedAnnounces {
 }
 
 impl StoppedAnnounces {
-    /// How long a `stopped` announce may take by default.
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// How long a `stopped` announce may take by default (libtorrent
+    /// `settings_pack::stop_tracker_timeout`).
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// `timeout` bounds each `stopped` announce.
     pub fn new(timeout: Duration) -> Self {
