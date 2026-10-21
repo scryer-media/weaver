@@ -2345,7 +2345,7 @@ impl Session {
             } else {
                 Arc::new(Vec::new)
             },
-            self.reqwest_client.clone(),
+            self.http_clients.clone(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
         )

@@ -7,7 +7,7 @@
 
 use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
-use crate::core::net::Resolver;
+use crate::core::net::{HttpClients, HttpTarget, Resolver};
 use crate::tracker::ScrapeOk;
 use anyhow::Context;
 use either::Either;
@@ -357,46 +357,70 @@ fn ssrf_refusal(url: &url::Url, ask: Ask, addrs: &[IpAddr]) -> Option<&'static s
         .then_some("a loopback tracker asked at a path no tracker answers")
 }
 
-/// The addresses of `url`'s host: the address it names, or what
-/// `resolver`, else the host's resolver, finds for its name.
-async fn addresses(url: &url::Url, resolver: Option<&dyn Resolver>) -> anyhow::Result<Vec<IpAddr>> {
+/// `url`'s host as a client is told it, and its addresses: the address it
+/// names, or what `resolver`, else the host's resolver, finds for its name.
+async fn addresses(
+    url: &url::Url,
+    resolver: Option<&dyn Resolver>,
+) -> anyhow::Result<(String, Vec<IpAddr>)> {
     let port = url.port_or_known_default().unwrap_or(0);
-    let found = match url.host() {
-        Some(url::Host::Ipv4(ip)) => return Ok(vec![IpAddr::V4(ip)]),
-        Some(url::Host::Ipv6(ip)) => return Ok(vec![IpAddr::V6(ip)]),
-        Some(url::Host::Domain(name)) => match resolver {
-            Some(resolver) => resolver.resolve(name, port).await,
-            None => tokio::net::lookup_host((name, port))
-                .await
-                .map(Iterator::collect),
-        }
-        .with_context(|| format!("error looking up hostname {name}"))?,
+    let name = match url.host() {
+        Some(url::Host::Ipv4(ip)) => return Ok((ip.to_string(), vec![IpAddr::V4(ip)])),
+        Some(url::Host::Ipv6(ip)) => return Ok((ip.to_string(), vec![IpAddr::V6(ip)])),
+        Some(url::Host::Domain(name)) => name,
         None => anyhow::bail!("the tracker URL has no host"),
     };
+    let found: Vec<SocketAddr> = match resolver {
+        Some(resolver) => resolver.resolve(name, port).await,
+        None => tokio::net::lookup_host((name, port))
+            .await
+            .map(Iterator::collect),
+    }
+    .with_context(|| format!("error looking up hostname {name}"))?;
     anyhow::ensure!(!found.is_empty(), "the tracker's name has no address");
-    Ok(found.iter().map(SocketAddr::ip).collect())
+    Ok((name.to_owned(), found.iter().map(SocketAddr::ip).collect()))
 }
 
-/// Refuses a GET of `url` for `ask` that [`ssrf_refusal`] holds back.
-async fn check(url: &url::Url, ask: Ask, resolver: Option<&dyn Resolver>) -> anyhow::Result<()> {
-    let addrs = addresses(url, resolver).await?;
-    match ssrf_refusal(url, ask, &addrs) {
-        Some(why) => anyhow::bail!("SSRF mitigation: {why}"),
-        None => Ok(()),
+/// A client from `clients` for a GET of `url` for `ask`: it reaches the
+/// URL's host at the addresses found for it now, in the order found, and
+/// nowhere else, and follows no redirect. Refused when [`ssrf_refusal`]
+/// holds the GET back from those addresses (libtorrent
+/// `http_connection::on_resolve` hands the endpoints to `on_filter`, then
+/// `connect` tries only those left).
+async fn reach(
+    clients: &dyn HttpClients,
+    url: &url::Url,
+    ask: Ask,
+    resolver: Option<&dyn Resolver>,
+) -> anyhow::Result<reqwest::Client> {
+    let (host, addrs) = addresses(url, resolver).await?;
+    if let Some(why) = ssrf_refusal(url, ask, &addrs) {
+        anyhow::bail!("SSRF mitigation: {why}");
     }
+    clients.client(Some(HttpTarget {
+        host: &host,
+        port: url.port_or_known_default().unwrap_or(0),
+        addrs: &addrs,
+    }))
 }
+
+/// The most redirects one GET follows (libtorrent
+/// `http_tracker_connection::start` hands `http_connection::get` 5).
+const MAX_REDIRECTS: usize = 5;
 
 /// The body of a tracker's answer to a GET for `ask` of `tracker` with
 /// `query` added ahead of the URL's own. The GET is not sent when the
-/// URL's own query already names an announce argument, or when the host,
-/// as `resolver` resolves it, is one the request may not go to (libtorrent
-/// `http_tracker_connection::start`, `on_filter`); a redirect the client
-/// followed is held to the same before its answer is used. The answer fails
-/// when the tracker sends nothing for [`RECEIVE_TIMEOUT`], the status is not
-/// a success, or the body passes [`MAX_RESPONSE_LENGTH`]. The bounds are the
-/// engine's own, so they hold whatever client is used.
+/// URL's own query already names an announce argument (libtorrent
+/// `http_tracker_connection::start`), and goes only where [`reach`] lets it.
+/// A redirect is a GET of where it points, reached the same way before it
+/// is sent, at most [`MAX_REDIRECTS`] of them; past that the redirect is the
+/// answer (libtorrent `http_connection::on_read` restarts `get` at the new
+/// URL with one redirect fewer). The answer fails when the tracker sends
+/// nothing for [`RECEIVE_TIMEOUT`], the status is not a success, or the body
+/// passes [`MAX_RESPONSE_LENGTH`]. The bounds are the engine's own, so they
+/// hold whatever client is used.
 pub(crate) async fn get(
-    client: &reqwest::Client,
+    clients: &dyn HttpClients,
     resolver: Option<&dyn Resolver>,
     tracker: &url::Url,
     ask: Ask,
@@ -411,19 +435,31 @@ pub(crate) async fn get(
         Some(own) => url.set_query(Some(&format!("{query}&{own}"))),
         None => url.set_query(Some(query)),
     }
-    check(&url, ask, resolver).await?;
-    let response = tokio::time::timeout(
-        RECEIVE_TIMEOUT,
-        client
-            .get(url.clone())
-            .header(reqwest::header::USER_AGENT, user_agent)
-            .send(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("the tracker sent nothing for {RECEIVE_TIMEOUT:?}"))??;
-    if response.url() != &url {
-        check(response.url(), ask, resolver).await?;
-    }
+    let mut redirects = 0;
+    let response = loop {
+        let client = reach(clients, &url, ask, resolver).await?;
+        let response = tokio::time::timeout(
+            RECEIVE_TIMEOUT,
+            client
+                .get(url.clone())
+                .header(reqwest::header::USER_AGENT, user_agent)
+                .send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the tracker sent nothing for {RECEIVE_TIMEOUT:?}"))??;
+        if !response.status().is_redirection() || redirects == MAX_REDIRECTS {
+            break response;
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|l| l.to_str().ok())
+            .context("the tracker redirected without a location")?;
+        url = url
+            .join(location)
+            .context("the tracker redirected to no URL")?;
+        redirects += 1;
+    };
     if !response.status().is_success() {
         anyhow::bail!("tracker responded with {:?}", response.status());
     }

@@ -33,7 +33,7 @@ use url::Url;
 
 use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
-use crate::core::net::Resolver;
+use crate::core::net::{HttpClients, Resolver};
 use crate::tracker::tracker_comms_http;
 use crate::tracker::tracker_comms_http::Ask;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
@@ -51,7 +51,7 @@ pub struct TrackerComms {
     announce_port: ListenPort,
     /// Our own addresses an HTTP announce names (see [`AnnounceIps`]).
     announce_ips: AnnounceIps,
-    reqwest_client: reqwest::Client,
+    http_clients: Arc<dyn HttpClients>,
     udp_client: UdpTrackerClient,
     key: u32,
     // The trackers under this hash and what announcing to them has done.
@@ -710,7 +710,7 @@ struct Scraper {
     user_agent: String,
     // In table order, one per URL.
     trackers: Vec<SupportedTracker>,
-    reqwest_client: reqwest::Client,
+    http_clients: Arc<dyn HttpClients>,
     udp_client: UdpTrackerClient,
 }
 
@@ -756,7 +756,7 @@ impl Scraper {
         let url =
             tracker_comms_http::scrape_url(tracker_url).context("the tracker offers no scrape")?;
         let body = tracker_comms_http::get(
-            &self.reqwest_client,
+            &*self.http_clients,
             self.udp_client.resolver(),
             &url,
             Ask::Scrape,
@@ -814,7 +814,7 @@ impl TrackerStatus {
         trackers: impl IntoIterator<Item = &'a SupportedTracker>,
         info_hashes: Vec<Id20>,
         identity: &Identity,
-        reqwest_client: reqwest::Client,
+        http_clients: Arc<dyn HttpClients>,
         udp_client: UdpTrackerClient,
     ) -> Self {
         let mut unique: Vec<SupportedTracker> = Vec::new();
@@ -845,7 +845,7 @@ impl TrackerStatus {
                 info_hashes,
                 user_agent: identity.user_agent.clone(),
                 trackers: unique,
-                reqwest_client,
+                http_clients,
                 udp_client,
             },
         }))
@@ -1196,7 +1196,7 @@ impl TrackerComms {
         force_interval: Option<Duration>,
         listen_port: ListenPort,
         announce_ips: AnnounceIps,
-        reqwest_client: reqwest::Client,
+        http_clients: Arc<dyn HttpClients>,
         udp_client: UdpTrackerClient,
     ) -> Option<TrackerTask> {
         Self::start_with_tiers(
@@ -1207,7 +1207,7 @@ impl TrackerComms {
             force_interval,
             listen_port,
             announce_ips,
-            reqwest_client,
+            http_clients,
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -1241,7 +1241,7 @@ impl TrackerComms {
         force_interval: Option<Duration>,
         listen_port: ListenPort,
         announce_ips: AnnounceIps,
-        reqwest_client: reqwest::Client,
+        http_clients: Arc<dyn HttpClients>,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
     ) -> Option<TrackerTask> {
@@ -1270,7 +1270,7 @@ impl TrackerComms {
             tiers.iter().flatten(),
             info_hashes.ids20().collect(),
             &identity,
-            reqwest_client.clone(),
+            http_clients.clone(),
             udp_client.clone(),
         );
 
@@ -1291,7 +1291,7 @@ impl TrackerComms {
                     tx: tx.clone(),
                     announce_port: listen_port.clone(),
                     announce_ips: announce_ips.clone(),
-                    reqwest_client: reqwest_client.clone(),
+                    http_clients: http_clients.clone(),
                     udp_client: udp_client.clone(),
                     key,
                     list: Mutex::new(TrackerList::new(&tiers, Instant::now())),
@@ -1481,7 +1481,7 @@ impl TrackerComms {
         };
 
         let bytes = tracker_comms_http::get(
-            &self.reqwest_client,
+            &*self.http_clients,
             self.udp_client.resolver(),
             tracker_url,
             Ask::Announce,
@@ -1589,7 +1589,7 @@ impl TrackerComms {
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1599,7 +1599,7 @@ mod tests {
 
     use crate::core::{
         hash_id::{Id20, Id32, InfoHashes},
-        net::{DatagramSocket, Resolver},
+        net::{DatagramSocket, HttpClients, HttpTarget, Resolver},
     };
     use futures::{FutureExt, StreamExt, future::BoxFuture};
     use parking_lot::Mutex;
@@ -2019,7 +2019,7 @@ mod tests {
             None,
             listen_port,
             announce_ips,
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -2075,7 +2075,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
             udp_client,
             stopped.clone(),
         )
@@ -2230,7 +2230,7 @@ mod tests {
             None,
             listen_port,
             no_ips(),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -2282,7 +2282,7 @@ mod tests {
             None,
             listen_port,
             no_ips(),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -2339,7 +2339,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
             udp_client,
             stopped.clone(),
         )
@@ -2414,11 +2414,11 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
-            reqwest::Client::builder()
-                .no_proxy()
-                .user_agent("Session/1.0")
-                .build()
-                .unwrap(),
+            Arc::new(|| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .user_agent("Session/1.0")
+            }),
             udp_client,
             stopped.clone(),
         )
@@ -2478,7 +2478,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
             udp_client,
             stopped.clone(),
         )
@@ -2544,7 +2544,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
-            reqwest::Client::new(),
+            Arc::new(reqwest::Client::builder),
             udp_client,
             stopped.clone(),
         )
@@ -2585,7 +2585,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
             udp_client,
             stopped.clone(),
         )
@@ -2941,7 +2941,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
             udp_client,
             stopped.clone(),
         )
@@ -2968,10 +2968,27 @@ mod tests {
         token.cancel();
     }
 
+    /// Answers an HTTP request with a redirect to `location`.
+    async fn redirect(conn: tokio::net::TcpStream, location: &str) {
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let mut response = response.as_bytes();
+        while !response.is_empty() {
+            conn.writable().await.unwrap();
+            match conn.try_write(response) {
+                Ok(n) => response = &response[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn a_redirect_to_a_loopback_path_no_tracker_answers_is_not_used() {
-        // libtorrent http_connection follows the redirect through on_filter
-        // again: the moved request is held to the same rule.
+    async fn a_redirect_to_a_loopback_path_no_tracker_answers_is_never_fetched() {
+        // libtorrent http_connection::on_read restarts the GET at the
+        // redirect's URL, whose endpoints on_filter holds to the same rule
+        // before connect: the moved request is refused before it is sent.
         let (tracker, url) = http_listener().await;
         let (moved, moved_url) = http_listener().await;
         let stopped = StoppedAnnounces::default();
@@ -2979,21 +2996,7 @@ mod tests {
         let TrackerTask { mut peers, status } = task;
         let serve = async {
             let (conn, _) = read_announce(&tracker).await;
-            let location = moved_url.join("/admin").unwrap();
-            let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-            let mut response = response.as_bytes();
-            while !response.is_empty() {
-                conn.writable().await.unwrap();
-                match conn.try_write(response) {
-                    Ok(n) => response = &response[n..],
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) => panic!("{e}"),
-                }
-            }
-            let (conn, _) = read_request(&moved).await;
-            respond(conn, "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe").await;
+            redirect(conn, moved_url.join("/admin").unwrap().as_str()).await;
             std::future::pending::<()>().await
         };
         let e = tokio::select! {
@@ -3001,8 +3004,105 @@ mod tests {
             e = refusal_of(&status, &mut peers, &url) => e,
         };
         assert!(e.contains("SSRF"), "{e}");
+        // The moved host heard nothing.
+        assert!(moved.accept().now_or_never().is_none());
         drop(peers);
         stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    // A client looks no name up: it reaches a host only at the addresses it
+    // was built for.
+    struct NoNames;
+
+    impl reqwest::dns::Resolve for NoNames {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let name = name.as_str().to_owned();
+            Box::pin(async move { Err(format!("{name}: no lookups in tests").into()) })
+        }
+    }
+
+    /// The session's clients, each looking no name up; records every target
+    /// a client is built for.
+    #[derive(Default)]
+    struct Pinned {
+        built: Mutex<Vec<(String, u16, Vec<IpAddr>)>>,
+    }
+
+    impl HttpClients for Pinned {
+        fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+            if let Some(t) = &target {
+                self.built
+                    .lock()
+                    .push((t.host.to_owned(), t.port, t.addrs.to_vec()));
+            }
+            let builder = reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(Arc::new(NoNames));
+            Ok(crate::core::net::for_target(builder, target).build()?)
+        }
+    }
+
+    #[tokio::test]
+    async fn every_hop_of_a_tracker_get_goes_only_to_the_addresses_checked_for_it() {
+        // libtorrent http_connection::on_resolve hands the endpoints to
+        // on_filter, then connect tries those left; a redirect starts over
+        // at its own URL. The names are known to the engine's resolver
+        // only: a client that looked one up itself would reach nothing.
+        let (tracker, at) = http_listener().await;
+        let (moved, moved_at) = http_listener().await;
+        let (port, moved_port) = (at.port().unwrap(), moved_at.port().unwrap());
+        let url = Url::parse(&format!("http://tracker.invalid:{port}/announce")).unwrap();
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let resolver = Arc::new(FixedResolver {
+            at: Ipv4Addr::LOCALHOST.into(),
+        });
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let clients = Arc::new(Pinned::default());
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            clients.clone(),
+            udp_client,
+            StoppedAnnounces::default(),
+        )
+        .unwrap()
+        .peers;
+
+        let (conn, q) = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = read_announce(&tracker) => r,
+        };
+        redirect(
+            conn,
+            &format!("http://moved.invalid:{moved_port}/announce?{q}"),
+        )
+        .await;
+        let q = answer_with_a_peer(
+            &moved,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        let loopback = vec![IpAddr::from(Ipv4Addr::LOCALHOST)];
+        assert_eq!(
+            *clients.built.lock(),
+            vec![
+                ("tracker.invalid".to_owned(), port, loopback.clone()),
+                ("moved.invalid".to_owned(), moved_port, loopback),
+            ]
+        );
+        drop(peers);
         token.cancel();
     }
 
