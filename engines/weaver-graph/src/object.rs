@@ -290,7 +290,7 @@ pub trait Object: Send + Sync {
 
     // What I want ahead of the normal order, right now. The namespace lifts
     // each one to the parent and answers through `pulled`.
-    fn wants(&mut self, out: &mut Vec<Seek>);
+    fn wants(&self, out: &mut Vec<Seek>);
 
     // The answer to a seek I made.
     fn pulled(&mut self, seek: Seek, pull: crate::seek::Pull, out: &mut Vec<Emit>);

@@ -17,7 +17,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use weaver_graph::{ByteRange, Pull, VolumeIndex};
 
-use super::facts::{Chunk, Marks, of_boundary, of_ordinal};
+use weaver_graph::Marks;
+
+use super::facts::{Chunk, of_boundary, of_ordinal};
 
 // How soon an article is fetched, soonest first: the download queue's
 // dispatch classes, with the unlock window's draw order inside its own.

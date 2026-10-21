@@ -32,7 +32,7 @@ use weaver_graph::Posted;
 use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed};
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
-    Builder, ByteRange, Effect, Emit, Kind, MemberId, NodeId, Object, ObjectId, Placement,
+    Builder, ByteRange, Effect, Emit, Kind, Marked, MemberId, NodeId, Object, ObjectId, Placement,
     Provenance, Segment, Tree, VolumeIndex, Why,
 };
 
@@ -116,7 +116,9 @@ pub(crate) struct NamespaceWriter {
     accountant: Arc<HoldsAccountant>,
     free_disk: CapacityReader,
     caps: Caps,
-    files: BTreeMap<NodeId, Files>,
+    // Each namespace's files, marked as each changes: a checkpoint reads
+    // again only the namespaces marked since it read last.
+    files: Marked<NodeId, Files>,
     envelopes: Envelopes,
     // Member reads the recovery objects made while repairing.
     read_backs: u64,
@@ -141,7 +143,7 @@ impl NamespaceWriter {
             accountant,
             free_disk,
             caps: Caps::unbounded(),
-            files: BTreeMap::new(),
+            files: Marked::default(),
             read_backs: 0,
             unusable: Vec::new(),
             renamed: Vec::new(),
@@ -1238,8 +1240,7 @@ impl NamespaceWriter {
         };
         let accountant = &self.accountant;
         self.files
-            .entry(node)
-            .or_insert_with(|| Files::new(namespace, Arc::clone(accountant)))
+            .get_or_insert_with(node, || Files::new(namespace, Arc::clone(accountant)))
     }
 
     fn leaf(

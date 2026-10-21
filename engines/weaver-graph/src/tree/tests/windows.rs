@@ -52,7 +52,7 @@ impl Object for Tape {
     fn volume_lost(&mut self, _: VolumeIndex, range: ByteRange, _: &mut Vec<Emit>) {
         self.hear(Heard::Lost(range));
     }
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         out.push(Seek::recovery(
             VolumeIndex(0),
             ByteRange::new(5, u64::MAX),
@@ -84,7 +84,7 @@ impl Recovery for Tape {
     }
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
-    fn wants(&mut self, _: &mut Vec<Seek>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn repair(&mut self, _: &mut dyn MemberAccess) -> RepairOutcome {
         RepairOutcome::Clean
     }

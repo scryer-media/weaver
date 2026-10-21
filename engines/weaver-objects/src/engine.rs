@@ -251,7 +251,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // The volumes after the one the run is on, the nearest first: weighed
     // by how many bound volumes lie between, since an index orders the
     // volumes and need not be dense.
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         let Some(reached) = self.reached else {
             return;
         };

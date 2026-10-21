@@ -570,7 +570,11 @@ fn emitted<D: Decoder>(name: &str, bytes: Vec<u8>, piece: usize) -> Vec<usize> {
 fn a_run_hands_its_output_on_in_whole_chunks() {
     let plain = payload(7, 4 * super::run::CHUNK + 1_000);
     let chunks = plain.len().div_ceil(super::run::CHUNK);
-    type Case = (&'static str, Vec<u8>, fn(&str, Vec<u8>, usize) -> Vec<usize>);
+    type Case = (
+        &'static str,
+        Vec<u8>,
+        fn(&str, Vec<u8>, usize) -> Vec<usize>,
+    );
     let cases: [Case; 6] = [
         ("a.gz", gzip(&plain), emitted::<Gzip>),
         ("a.deflate", deflate(&plain), emitted::<Deflate>),

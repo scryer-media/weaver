@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use weaver_graph::{ByteRange, MemberId, NodeId, Provenance, Segment, VolumeIndex};
 
-use super::facts::Marks;
 use crate::pipeline::graph::namespace::{Arrival, Segments};
+use weaver_graph::Marks;
 
 // A decoded article, as the decoder placed it.
 #[derive(Clone, Debug)]

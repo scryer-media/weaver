@@ -26,10 +26,12 @@ use crate::sniff::{Sniff, signed, sniff};
 use crate::volume::{ByteRange, VolumeIndex};
 
 mod lent;
+mod nodes;
 mod quiet;
 mod records;
 
 use lent::{Arrived, Told, Waiting};
+use nodes::Nodes;
 
 // What objects parsed of the members they gave back, by namespace and member.
 type Given = BTreeMap<(NodeId, MemberId), Carried>;
@@ -248,12 +250,7 @@ pub trait Builder {
 }
 
 pub struct Tree {
-    nodes: BTreeMap<NodeId, Node>,
-    // Members given up by a retired object, and what they were to it: which
-    // node, and which of its volumes, until the owner buries them. The entry
-    // outlives the burial, emptied, because a member an object gave up is
-    // settled: no object bound later is offered it.
-    retired: BTreeMap<(NodeId, MemberId), Option<(NodeId, VolumeIndex)>>,
+    nodes: Nodes,
     // What an object parsed of a member it gave back, parked beside the
     // member until an object of its namespace reclaims it and adopts it.
     given: Given,
@@ -284,11 +281,10 @@ impl Default for Tree {
 
 impl Tree {
     pub fn new() -> Self {
-        let mut nodes = BTreeMap::new();
+        let mut nodes = Nodes::default();
         nodes.insert(NodeId::ROOT, Node::new(None, None));
         Self {
             nodes,
-            retired: BTreeMap::new(),
             given: BTreeMap::new(),
             names: NameLedger::new(),
             sets: BTreeSet::new(),
@@ -766,7 +762,7 @@ impl Tree {
     // that retired node, and which of its volumes. The node still answers
     // `locate`, and its namespace and children still stand, until `bury`.
     pub fn retired(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
-        self.retired.get(&(node, member)).copied().flatten()
+        self.nodes.retired().get(&(node, member)).copied().flatten()
     }
 
     // The object that refused a member of `node`'s namespace: the one it
@@ -789,12 +785,16 @@ impl Tree {
     // every member over, so nothing of the node stays. A refused node stays
     // whatever it keeps, to claim the rest of its set.
     pub fn bury(&mut self, node: NodeId, member: MemberId) {
-        let Some((retired, _)) = self.retired.get_mut(&(node, member)).and_then(Option::take)
+        let Some((retired, _)) = self
+            .nodes
+            .retired_mut(&(node, member))
+            .and_then(Option::take)
         else {
             return;
         };
         if self
-            .retired
+            .nodes
+            .retired()
             .values()
             .flatten()
             .any(|(other, _)| *other == retired)
@@ -846,7 +846,7 @@ impl Tree {
             self.remove_node(refuser);
         }
         for volume in &reopened {
-            self.retired.remove(&(node, *volume));
+            self.nodes.unretire(&(node, *volume));
         }
         // The repaired member first: what it binds is offered the rest.
         reopened.sort_by_key(|volume| *volume != member);
@@ -900,12 +900,12 @@ impl Tree {
             found.namespace.unbind(member);
             if open {
                 found.undecided.remove(&member);
-                self.retired.insert((node, member), None);
+                self.nodes.retire((node, member), None);
                 self.names.release((node, member));
             } else if !(whole && own_file) {
                 found.namespace.remove(member);
-                self.retired.remove(&(node, member));
                 found.undecided.remove(&member);
+                self.nodes.unretire(&(node, member));
                 self.names.release((node, member));
             }
         }
@@ -927,7 +927,8 @@ impl Tree {
             .filter(|(_, found)| found.retired)
         {
             if self
-                .retired
+                .nodes
+                .retired()
                 .values()
                 .flatten()
                 .any(|(other, _)| *other == id)
@@ -945,7 +946,8 @@ impl Tree {
     pub fn buried_member(&self, node: NodeId, member: MemberId) -> bool {
         self.buried(node)
             && self
-                .retired
+                .nodes
+                .retired()
                 .get(&(node, member))
                 .is_some_and(Option::is_none)
             && self
@@ -1029,8 +1031,7 @@ impl Tree {
     pub fn deciding(&self, node: NodeId) -> bool {
         self.nodes.get(&node).is_some_and(|found| {
             found.undecided.iter().any(|member| {
-                found.namespace.get(*member).is_some()
-                    && found.namespace.copy_of(*member).is_none()
+                found.namespace.get(*member).is_some() && found.namespace.copy_of(*member).is_none()
             })
         })
     }
@@ -1323,7 +1324,7 @@ impl Tree {
     pub fn rebuild_names(&mut self) {
         self.names.clear();
         let mut members: Vec<(Position, (NodeId, MemberId), String, String)> = Vec::new();
-        for (node, found) in &self.nodes {
+        for (node, found) in self.nodes.iter() {
             // A buried member holds no name.
             for record in found
                 .namespace
@@ -1410,7 +1411,6 @@ impl Tree {
     // moved into its namespace is homed where it was posted again.
     fn remove_node(&mut self, node: NodeId) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
-        self.retired.retain(|(at, _), _| *at != node);
         self.given.retain(|(at, _), _| *at != node);
         for record in removed.namespace.members() {
             self.names.release((node, record.id));
@@ -1667,7 +1667,7 @@ impl Tree {
                 && found.namespace.get(member).is_some_and(Member::is_leaf)
                 && !found.children.contains_key(&member)
                 && !found.undecided.contains(&member)
-                && !self.retired.contains_key(&(node, member))
+                && !self.nodes.retired().contains_key(&(node, member))
         })
     }
 
@@ -1888,7 +1888,7 @@ impl Tree {
                     if let Some(found) = self.nodes.get_mut(&node) {
                         found.undecided.remove(&member);
                     }
-                    self.retired.insert((node, member), None);
+                    self.nodes.retire((node, member), None);
                     effects.push(Effect::Refused { node, member, why });
                 }
             }
@@ -1953,7 +1953,7 @@ impl Tree {
                 true
             }
             None => {
-                self.retired.insert((parent, member), None);
+                self.nodes.retire((parent, member), None);
                 effects.push(Effect::Refused {
                     node: parent,
                     member,
@@ -2338,12 +2338,14 @@ impl Tree {
             self.drop_subtree(child);
             let volumes = self.detach(child);
             if let Some(found) = self.nodes.get_mut(&node) {
+                for volume in &volumes {
+                    found.children.remove(volume);
+                    found.namespace.retract(*volume);
+                    found.undecided.insert(*volume);
+                    self.given.remove(&(node, *volume));
+                }
                 for volume in volumes {
-                    found.children.remove(&volume);
-                    found.namespace.retract(volume);
-                    found.undecided.insert(volume);
-                    self.retired.remove(&(node, volume));
-                    self.given.remove(&(node, volume));
+                    self.nodes.unretire(&(node, volume));
                 }
             }
         }
@@ -2351,7 +2353,7 @@ impl Tree {
         if let Some(found) = self.nodes.get_mut(&node) {
             found.namespace.retract(member);
             found.undecided.insert(member);
-            self.retired.remove(&(node, member));
+            self.nodes.unretire(&(node, member));
             self.given.remove(&(node, member));
         }
         // A window was a range of the member's old bytes.
@@ -2401,12 +2403,13 @@ impl Tree {
         }
         let parent = binding.parent;
         if let Some(found) = self.nodes.get_mut(&parent) {
-            for (volume, member) in &binding.volumes {
+            for member in binding.volumes.values() {
                 found.children.remove(member);
                 found.namespace.unbind(*member);
-                self.retired
-                    .insert((parent, *member), Some((node, *volume)));
             }
+        }
+        for (volume, member) in &binding.volumes {
+            self.nodes.retire((parent, *member), Some((node, *volume)));
         }
         let engine = kind
             .and_then(Kind::engine_for)
@@ -2695,10 +2698,10 @@ impl Tree {
 
     // Every standing seek of every object, lifted. Returns each object's
     // seeks with their answers so the caller can feed `pulled` back.
-    pub fn collect_wants(&mut self, out: &mut Vec<(NodeId, Seek)>) {
+    pub fn collect_wants(&self, out: &mut Vec<(NodeId, Seek)>) {
         let mut seeks = Vec::new();
-        for (id, node) in self.nodes.iter_mut().filter(|(_, node)| !node.retired) {
-            if let Some(object) = node.object.as_mut() {
+        for (id, node) in self.nodes.iter().filter(|(_, node)| !node.retired) {
+            if let Some(object) = node.object.as_ref() {
                 seeks.clear();
                 object.wants(&mut seeks);
                 out.extend(seeks.iter().map(|seek| (*id, *seek)));
@@ -2781,7 +2784,7 @@ mod tests {
         }
         fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
         fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-        fn wants(&mut self, out: &mut Vec<Seek>) {
+        fn wants(&self, out: &mut Vec<Seek>) {
             out.push(Seek::data(
                 VolumeIndex(1),
                 ByteRange::new(0, 10),
@@ -2852,7 +2855,7 @@ mod tests {
         }
         fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
         fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-        fn wants(&mut self, _: &mut Vec<Seek>) {}
+        fn wants(&self, _: &mut Vec<Seek>) {}
         fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
         fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
             out.push(Placement::Envelope {
@@ -2886,7 +2889,7 @@ mod tests {
         }
         fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
         fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-        fn wants(&mut self, _: &mut Vec<Seek>) {}
+        fn wants(&self, _: &mut Vec<Seek>) {}
         fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
         fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
             out.push(Placement::Envelope {
@@ -4070,7 +4073,7 @@ mod tests {
         }
         fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
         fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-        fn wants(&mut self, _: &mut Vec<Seek>) {}
+        fn wants(&self, _: &mut Vec<Seek>) {}
         fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
         fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
             out.push(Placement::Envelope {
@@ -4221,7 +4224,7 @@ mod tests {
         }
         fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
         fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-        fn wants(&mut self, _: &mut Vec<Seek>) {}
+        fn wants(&self, _: &mut Vec<Seek>) {}
         fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
         fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
             out.push(Placement::Envelope {

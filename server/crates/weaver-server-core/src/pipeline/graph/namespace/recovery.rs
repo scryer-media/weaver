@@ -808,6 +808,7 @@ impl NamespaceWriter {
         let Some(object) = kind.object() else {
             if !self.unusable.contains(&(parent, member)) {
                 self.unusable.push((parent, member));
+                self.files.mark(parent);
             }
             return Ok(());
         };

@@ -429,7 +429,7 @@ impl Object for Zip {
         }
     }
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         if self.gone {
             return;
         }

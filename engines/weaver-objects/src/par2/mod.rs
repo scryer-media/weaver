@@ -264,7 +264,7 @@ impl Object for Par2 {
         self.take(volume, found);
     }
 
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         Recovery::wants(self, out);
     }
 
@@ -457,7 +457,7 @@ impl Recovery for Par2 {
 
     // Per set, ask for the volumes that serve it and are not yet in hand,
     // in order, until what they are named to carry covers its shortfall.
-    fn wants(&mut self, out: &mut Vec<Seek>) {
+    fn wants(&self, out: &mut Vec<Seek>) {
         let seen = self.damaged_seen();
         let packet = self.smallest_packet();
         for key in self.ordered() {
@@ -467,7 +467,7 @@ impl Recovery for Par2 {
                 .unwrap_or(0)
                 .max(seen.get(&key).copied().unwrap_or(0));
             let mut shortfall = wanted.saturating_sub(state.recovery.len() as u64);
-            for (index, volume) in self.volumes.iter_mut().enumerate() {
+            for (index, volume) in self.volumes.iter().enumerate() {
                 if shortfall == 0 {
                     break;
                 }
