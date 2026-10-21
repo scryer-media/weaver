@@ -18,6 +18,7 @@ use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
     piece_priority::PiecePriority,
+    storage::TorrentStorage,
     torrent_state::initializing::Checkpoint,
     type_aliases::{BF, BS, FileInfos},
 };
@@ -521,11 +522,21 @@ impl ChunkTracker {
     /// What a checkpoint records of the torrent: the pieces had, and every
     /// block written, those of the pieces not had among them (libtorrent
     /// `torrent::write_resume_data`: `have_pieces`, and `unfinished_pieces`
-    /// with the blocks of each downloading piece that are finished).
-    pub(crate) fn checkpoint(&self) -> Checkpoint {
+    /// with the blocks of each downloading piece that are finished), then
+    /// the stamp of each of the first `file_count` files of `files`. The
+    /// stamps are read after the blocks: a block written in between is
+    /// fetched again, and none is recorded that the files do not hold.
+    pub(crate) fn checkpoint(&self, files: &dyn TorrentStorage, file_count: usize) -> Checkpoint {
+        let have = self.have.as_slice().to_bitvec().into_boxed_bitslice();
+        let blocks = self.chunk_status.clone();
         Checkpoint {
-            have: self.have.as_slice().to_bitvec().into_boxed_bitslice(),
-            blocks: Some(self.chunk_status.clone()),
+            have,
+            blocks: Some(blocks),
+            files: Some(
+                (0..file_count)
+                    .map(|file| files.stamp(file).ok().flatten())
+                    .collect(),
+            ),
         }
     }
 

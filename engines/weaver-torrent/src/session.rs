@@ -2529,6 +2529,24 @@ impl Session {
         Ok(())
     }
 
+    /// Forget every piece of the torrent and check them all again, trusting
+    /// no checkpoint or saved state (libtorrent `torrent::force_recheck`).
+    /// A running torrent runs again once checked; a paused one stays paused.
+    /// Nothing happens while it is being checked already.
+    pub async fn force_recheck(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+    ) -> anyhow::Result<()> {
+        handle.recheck()?;
+        let paused = handle.is_paused();
+        let peer_rx = if paused {
+            None
+        } else {
+            self.peer_source_managed_torrent(handle, true)
+        };
+        handle.start(peer_rx, paused)
+    }
+
     pub async fn update_only_files(
         self: &Arc<Self>,
         handle: &ManagedTorrentHandle,

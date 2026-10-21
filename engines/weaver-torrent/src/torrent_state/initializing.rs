@@ -27,6 +27,7 @@ use crate::{
     chunk_tracker::{ChunkTracker, compute_selected_bytes},
     file_ops::{FileOps, Verdict, inconsistent_hashes},
     piece_priority::PiecePriority,
+    storage::FileStamp,
     type_aliases::{BF, FileStorage},
 };
 
@@ -46,9 +47,12 @@ pub struct TorrentStateInitializing {
     pub(crate) checked_bytes: AtomicU64,
     pause_requested: AtomicBool,
     check_running: AtomicBool,
-    previously_errored: bool,
-    // What the embedder recorded of the data: when set, it is taken as
-    // what the storage holds and no piece is read back to check it.
+    // Every piece is read back and nothing saved is trusted: after an
+    // error, and on a forced recheck.
+    full_check: bool,
+    // What the embedder recorded of the data: when set, and the files are
+    // as it recorded them, it is taken as what the storage holds and no
+    // piece is read back to check it.
     checkpoint: Option<Checkpoint>,
     // The fetch priority of every piece; None while all are Normal.
     piece_priorities: Option<Vec<PiecePriority>>,
@@ -74,12 +78,23 @@ pub struct Checkpoint {
     /// the block count rounded up to whole bytes with the spare bits clear.
     /// None records no block of a piece not had.
     pub blocks: Option<BF>,
+    /// The stamp of every file of the torrent by its index, None for one the
+    /// storage keeps no file for; a file past the end has none. The next run
+    /// trusts the checkpoint only while each file's stamp is the same, and
+    /// checks every piece otherwise. None records no files: the embedder
+    /// vouches for them.
+    pub files: Option<Vec<Option<FileStamp>>>,
 }
 
 impl Checkpoint {
-    /// A checkpoint of the pieces in `have`, no block of any other written.
+    /// A checkpoint of the pieces in `have`, no block of any other written,
+    /// the files vouched for.
     pub fn pieces(have: BF) -> Self {
-        Self { have, blocks: None }
+        Self {
+            have,
+            blocks: None,
+            files: None,
+        }
     }
 }
 
@@ -116,6 +131,7 @@ pub(crate) fn normalize_checkpoint(
             .blocks
             .map(|blocks| normalize_bits(blocks, lengths.total_chunks() as usize, "blocks"))
             .transpose()?,
+        files: checkpoint.files,
     })
 }
 
@@ -125,7 +141,7 @@ impl TorrentStateInitializing {
         metadata: Arc<TorrentMetadata>,
         only_files: Option<Vec<usize>>,
         files: FileStorage,
-        previously_errored: bool,
+        full_check: bool,
         checkpoint: Option<Checkpoint>,
         piece_priorities: Option<Vec<PiecePriority>>,
         peers: PeerList,
@@ -138,7 +154,7 @@ impl TorrentStateInitializing {
             checked_bytes: AtomicU64::new(0),
             pause_requested: AtomicBool::new(false),
             check_running: AtomicBool::new(false),
-            previously_errored,
+            full_check,
             checkpoint,
             piece_priorities,
             peers: parking_lot::Mutex::new(peers),
@@ -324,13 +340,37 @@ impl TorrentStateInitializing {
         Ok(blocks)
     }
 
-    // The have set from fastresume data when it holds up, else from hashing every piece.
+    /// Whether every file is as `checkpoint` recorded it (libtorrent
+    /// `torrent::start_checking`, which has `verify_resume_data` vouch for
+    /// the resume data before trusting it). A stamp that cannot be read is
+    /// no stamp.
+    fn files_match(&self, checkpoint: &Checkpoint) -> bool {
+        let Some(recorded) = checkpoint.files.as_ref() else {
+            return true;
+        };
+        (0..self.metadata.file_infos.len()).all(|file| {
+            let now = self.files.stamp(file).ok().flatten();
+            let then = recorded.get(file).copied().flatten();
+            if now != then {
+                info!(
+                    torrent = ?self.shared.id,
+                    file, ?now, ?then,
+                    "a file changed since the checkpoint, checking every piece"
+                );
+            }
+            now == then
+        })
+    }
+
+    // The have set from fastresume data when it holds up, else from hashing
+    // every piece; every piece when `full`.
     async fn resume_or_check(
         &self,
         bitv_factory: &dyn BitVFactory,
         id: TorrentIdOrHash,
+        full: bool,
     ) -> anyhow::Result<Box<dyn BitV>> {
-        let have_pieces = if self.previously_errored {
+        let have_pieces = if full {
             if let Err(e) = bitv_factory.clear(id).await {
                 warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, error=?e, "error clearing bitfield");
             }
@@ -382,7 +422,13 @@ impl TorrentStateInitializing {
             .bitv_factory
             .clone();
 
-        let (have_pieces, blocks) = match self.checkpoint.as_ref() {
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .filter(|checkpoint| !self.full_check && self.files_match(checkpoint));
+        // A checkpoint the files no longer match vouches for nothing.
+        let full_check = self.full_check || self.checkpoint.is_some();
+        let (have_pieces, blocks) = match checkpoint {
             Some(checkpoint) => {
                 // The embedder vouches for this data, so none is read back
                 // but the pieces it holds every block of. Storing the pieces
@@ -403,7 +449,10 @@ impl TorrentStateInitializing {
                     .context("error storing the supplied have-bitfield")?;
                 (have, blocks)
             }
-            None => (self.resume_or_check(&*bitv_factory, id).await?, None),
+            None => (
+                self.resume_or_check(&*bitv_factory, id, full_check).await?,
+                None,
+            ),
         };
 
         let selected_bytes = compute_selected_bytes(
@@ -566,6 +615,7 @@ mod tests {
             Checkpoint {
                 have: have.clone(),
                 blocks: Some(blocks(19, &[0, 18])),
+                files: None,
             },
             &l,
         )
@@ -580,6 +630,7 @@ mod tests {
                 Checkpoint {
                     have: have.clone(),
                     blocks: Some(blocks(24, &[19])),
+                    files: None,
                 },
                 &l,
             )
@@ -591,12 +642,162 @@ mod tests {
                     Checkpoint {
                         have: have.clone(),
                         blocks: Some(blocks(bits, &[])),
+                        files: None,
                     },
                     &l,
                 )
                 .is_err(),
                 "{bits} bits"
             );
+        }
+    }
+
+    mod files_against_the_checkpoint {
+        use std::sync::Arc;
+
+        use anyhow::Context;
+        use tempfile::TempDir;
+
+        use crate::{
+            AddTorrent, AddTorrentOptions, BF, Checkpoint, ManagedTorrent, ManagedTorrentState,
+            Session,
+            api::TorrentIdOrHash,
+            tests::{
+                embedder_util::{TestTorrent, isolated_session_opts},
+                test_util::setup_test_logging,
+            },
+        };
+
+        const PIECE_LENGTH: u32 = 1024;
+        const PIECES: usize = 8;
+
+        // A session and a torrent whose one file lies in the torrent's own
+        // directory, every piece of it written.
+        async fn torrent(name: &str) -> anyhow::Result<(TestTorrent, TempDir, Arc<Session>)> {
+            setup_test_logging();
+            let t = TestTorrent::new(name, PIECES * PIECE_LENGTH as usize, PIECE_LENGTH).await?;
+            let out = TempDir::with_prefix(name)?;
+            let session =
+                Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+            Ok((t, out, session))
+        }
+
+        // The torrent added on its files, paused unless `run`, from
+        // `checkpoint`, once checked.
+        async fn added(
+            session: &Arc<Session>,
+            t: &TestTorrent,
+            checkpoint: Option<Checkpoint>,
+            run: bool,
+        ) -> anyhow::Result<Arc<ManagedTorrent>> {
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        output_folder: Some(t.dir.path().to_str().unwrap().to_owned()),
+                        overwrite: true,
+                        paused: !run,
+                        checkpoint,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            handle.wait_until_initialized().await?;
+            Ok(handle)
+        }
+
+        fn have(handle: &ManagedTorrent) -> Vec<usize> {
+            handle
+                .with_chunk_tracker(|ct| ct.get_have_pieces().as_slice().iter_ones().collect())
+                .unwrap()
+        }
+
+        // The torrent checked once from its files, then its checkpoint, and
+        // the torrent taken out of the session.
+        async fn checkpointed(
+            session: &Arc<Session>,
+            t: &TestTorrent,
+        ) -> anyhow::Result<Checkpoint> {
+            let handle = added(session, t, None, false).await?;
+            assert_eq!(have(&handle), (0..PIECES).collect::<Vec<_>>());
+            let checkpoint = handle.checkpoint().context("no checkpoint")?;
+            let files = checkpoint.files.as_ref().context("no file stamps")?;
+            assert_eq!(files.len(), 1);
+            assert_eq!(
+                files[0].map(|stamp| stamp.len),
+                Some((PIECES * PIECE_LENGTH as usize) as u64)
+            );
+            session
+                .delete(TorrentIdOrHash::Id(handle.id()), false)
+                .await?;
+            Ok(checkpoint)
+        }
+
+        fn without_piece(mut have: BF, piece: usize) -> BF {
+            have.set(piece, false);
+            have
+        }
+
+        // libtorrent `torrent::start_checking`: resume data the files still
+        // match is taken, and no piece is read back. Here the checkpoint
+        // drops a piece the files hold: trusted, the piece stays not had.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn files_the_checkpoint_matches_start_from_it_with_no_check() -> anyhow::Result<()> {
+            let (t, _out, session) = torrent("files_match_the_checkpoint").await?;
+            let checkpoint = checkpointed(&session, &t).await?;
+
+            let trusted = Checkpoint {
+                have: without_piece(checkpoint.have.clone(), 3),
+                blocks: None,
+                files: checkpoint.files.clone(),
+            };
+            let handle = added(&session, &t, Some(trusted), false).await?;
+            assert_eq!(have(&handle), [0, 1, 2, 4, 5, 6, 7]);
+            Ok(())
+        }
+
+        // libtorrent 1.x `verify_resume_data`: a file whose size is not the
+        // one recorded voids the resume data, and every piece is checked.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_truncated_file_has_every_piece_checked() -> anyhow::Result<()> {
+            let (t, _out, session) = torrent("a_truncated_file").await?;
+            let checkpoint = checkpointed(&session, &t).await?;
+
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(t.dir.path().join("0.data"))?
+                .set_len(3 * PIECE_LENGTH as u64 + 100)?;
+            let handle = added(&session, &t, Some(checkpoint), false).await?;
+            assert_eq!(have(&handle), [0, 1, 2]);
+            Ok(())
+        }
+
+        // libtorrent `torrent::force_recheck`: every piece is forgotten and
+        // checked again from the files, whatever was vouched for, and a
+        // running torrent runs again.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_forced_recheck_checks_every_piece_of_a_complete_torrent() -> anyhow::Result<()> {
+            let (t, _out, session) = torrent("a_forced_recheck").await?;
+            let all = BF::from_boxed_slice(vec![0xff; PIECES.div_ceil(8)].into_boxed_slice());
+            let handle = added(&session, &t, Some(Checkpoint::pieces(all)), true).await?;
+            assert_eq!(have(&handle), (0..PIECES).collect::<Vec<_>>());
+
+            {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(t.dir.path().join("0.data"))?;
+                file.seek(SeekFrom::Start(5 * PIECE_LENGTH as u64))?;
+                file.write_all(&[0x5a; 16])?;
+            }
+            session.force_recheck(&handle).await?;
+            handle.wait_until_initialized().await?;
+            assert!(handle.with_state(|s| matches!(s, ManagedTorrentState::Live(_))));
+            assert_eq!(have(&handle), [0, 1, 2, 3, 4, 6, 7]);
+            assert!(!handle.is_paused());
+            Ok(())
         }
     }
 }

@@ -974,6 +974,14 @@ impl TorrentStateLive {
     pub fn info_hash(&self) -> Id20 {
         self.shared.info_hash
     }
+    /// What a checkpoint of the run records; see
+    /// [`crate::chunk_tracker::ChunkTracker::checkpoint`].
+    pub(crate) fn checkpoint(&self) -> anyhow::Result<super::initializing::Checkpoint> {
+        let g = self.lock_read("checkpoint");
+        Ok(g.get_chunks()?
+            .checkpoint(&*self.files, self.metadata.file_infos.len()))
+    }
+
     /// The peers and bans a restart is to begin with; see
     /// [`peers::ResumePeers`].
     pub(crate) fn resume_peers(&self) -> peers::ResumePeers {

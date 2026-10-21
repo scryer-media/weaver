@@ -36,6 +36,7 @@ use std::{
     io::IoSlice,
     path::Path,
     sync::Arc,
+    time::SystemTime,
 };
 
 use crate::core::lengths::ValidPieceIndex;
@@ -146,6 +147,16 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
     }
 }
 
+/// What a file of the storage is from outside: its length and when it was
+/// last written. A checkpoint records each file's, and the next run trusts
+/// the checkpoint only while every file's is the same (libtorrent 1.x
+/// `file_sizes` in the resume data, which `verify_resume_data` compared).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub len: u64,
+    pub modified: SystemTime,
+}
+
 pub trait TorrentStorage: Send + Sync {
     // Create/open files etc.
     fn init(
@@ -210,6 +221,12 @@ pub trait TorrentStorage: Send + Sync {
     fn reserve_piece(&self, _piece_index: ValidPieceIndex, _room: &Arc<Notify>) -> bool {
         true
     }
+
+    /// The stamp of file `file_id`, or None when the storage keeps no file
+    /// for it. Default implementation keeps no files.
+    fn stamp(&self, _file_id: usize) -> anyhow::Result<Option<FileStamp>> {
+        Ok(None)
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -264,6 +281,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn reserve_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {
         (**self).reserve_piece(piece_id, room)
+    }
+
+    fn stamp(&self, file_id: usize) -> anyhow::Result<Option<FileStamp>> {
+        (**self).stamp(file_id)
     }
 }
 

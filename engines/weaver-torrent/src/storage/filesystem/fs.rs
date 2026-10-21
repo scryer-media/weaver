@@ -19,7 +19,7 @@ use crate::{
     torrent_state::{ManagedTorrentShared, TorrentMetadata},
 };
 
-use crate::storage::{StorageFactory, TorrentStorage};
+use crate::storage::{FileStamp, StorageFactory, TorrentStorage};
 
 use super::opened_file::OpenedFile;
 
@@ -113,6 +113,19 @@ impl TorrentStorage for FilesystemStorage {
                 .map(|f| f.take_clone())
                 .collect::<anyhow::Result<Vec<_>>>()?,
             output_folder: self.output_folder.clone(),
+        }))
+    }
+
+    // A file with none open, a padding file, has no stamp.
+    fn stamp(&self, file_id: usize) -> anyhow::Result<Option<FileStamp>> {
+        let of = self.opened_files.get(file_id).context("no such file")?;
+        let Ok(f) = of.lock_read() else {
+            return Ok(None);
+        };
+        let meta = f.metadata()?;
+        Ok(Some(FileStamp {
+            len: meta.len(),
+            modified: meta.modified()?,
         }))
     }
 
