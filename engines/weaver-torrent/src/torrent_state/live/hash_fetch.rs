@@ -34,7 +34,6 @@ struct Out {
 
 /// A run of a file's piece layer not yet held.
 struct Wanted {
-    file: usize,
     request: HashRequest,
     pieces: Range<u32>,
     /// The peers asked for it whose answer is still due.
@@ -70,7 +69,6 @@ impl LayerFetch {
             .into_iter()
             .flat_map(|v2| {
                 v2.missing_chunks().map(|(file, chunk)| Wanted {
-                    file,
                     request: v2.chunk_request(file, chunk),
                     pieces: v2.chunk_pieces(file, chunk),
                     out: Vec::new(),
@@ -136,13 +134,12 @@ impl LayerFetch {
         }
     }
 
-    /// `peer` answered `request`: returns the file it is for, or `None`
-    /// when no such request is out to it (libtorrent
-    /// `bt_peer_connection::on_hashes` ignores those).
-    fn answered(&self, peer: SocketAddr, request: &HashRequest) -> Option<usize> {
-        let file = self.take_out(peer, request).map(|w| w.file);
+    /// `peer` answered `request`: whether that request was out to it
+    /// (libtorrent `bt_peer_connection::on_hashes` ignores the others).
+    fn answered(&self, peer: SocketAddr, request: &HashRequest) -> bool {
+        let asked = self.take_out(peer, request).is_some();
         self.changed.notify_waiters();
-        file
+        asked
     }
 
     /// The run `request` asks for is held.
@@ -245,15 +242,36 @@ impl PeerHandler {
     /// `torrent::add_hashes`).
     pub(super) fn on_hashes(&self, hashes: Hashes<ByteBuf<'_>>) -> anyhow::Result<()> {
         let fetch = &self.state.layer_fetch;
-        let Some(file) = fetch.answered(self.addr, &hashes.request) else {
+        if !fetch.answered(self.addr, &hashes.request) {
             return Ok(());
-        };
+        }
         self.state
             .metadata
-            .add_layer_chunk(file, &hashes.request, &hashes.hashes())
+            .add_layer_chunk(&hashes.request, &hashes.hashes())
             .context("invalid hashes")?;
         fetch.landed(&hashes.request);
         self.state.new_pieces_notify.notify_waiters();
+        Ok(())
+    }
+
+    /// A peer's request for hashes: answered from the file's tree, or
+    /// rejected when the request is malformed or asks below the piece
+    /// layer or for a file whose layer is not held (libtorrent
+    /// `bt_peer_connection::on_hash_request`). A v1 torrent has no hashes
+    /// to give, and the peer is dropped.
+    pub(super) fn on_hash_request(&self, request: HashRequest) -> anyhow::Result<()> {
+        let v2 = self
+            .state
+            .metadata
+            .v2
+            .as_ref()
+            .context("a hash request for a v1 torrent")?;
+        let reply = match v2.answer(&request) {
+            Some(hashes) => WriterRequest::Hashes(Hashes::new(request, &hashes)),
+            None => WriterRequest::Message(Message::HashReject(request)),
+        };
+        // A closed writer means the peer is gone.
+        let _ = self.tx.send(reply);
         Ok(())
     }
 

@@ -55,6 +55,9 @@ pub struct V2Hashes {
     piece_length: u64,
     /// By first piece.
     files: Vec<V2File>,
+    /// Each file's index in `files`, by root (libtorrent
+    /// `file_storage::file_index_for_root`).
+    by_root: Vec<(Id32, usize)>,
 }
 
 impl V2Hashes {
@@ -94,15 +97,28 @@ impl V2Hashes {
                     tree,
                 })
             })
-            .collect();
+            .collect::<Vec<V2File>>();
+        let mut by_root: Vec<_> = files.iter().enumerate().map(|(i, f)| (f.root, i)).collect();
+        by_root.sort();
         Some(Self {
             piece_length,
             files,
+            by_root,
         })
     }
 
     fn blocks_per_piece(&self) -> u64 {
         self.piece_length / BLOCK_SIZE
+    }
+
+    /// The files whose tree has `root`, the first first: files of the same
+    /// content share one.
+    fn with_root(&self, root: &Id32) -> impl Iterator<Item = (usize, &V2File)> {
+        let start = self.by_root.partition_point(|(r, _)| r < root);
+        self.by_root[start..]
+            .iter()
+            .take_while(move |(r, _)| r == root)
+            .map(|&(_, i)| (i, &self.files[i]))
     }
 
     /// The file `piece` lies in.
@@ -139,12 +155,15 @@ impl V2Hashes {
             .map(|chunk| chunk[(i % LAYER_CHUNK) as usize])
     }
 
-    /// Every run of a piece layer not yet held, as (file, run).
+    /// Every run of a piece layer not yet held, as (file, run), once for
+    /// files that share a root.
     pub fn missing_chunks(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
         self.files
             .iter()
             .enumerate()
-            .filter(|(_, f)| !f.layer_held())
+            .filter(|(file, f)| {
+                !f.layer_held() && self.with_root(&f.root).next().map(|(i, _)| i) == Some(*file)
+            })
             .flat_map(|(file, f)| {
                 f.chunks
                     .iter()
@@ -178,37 +197,65 @@ impl V2Hashes {
         }
     }
 
-    /// Takes the answer to [`Self::chunk_request`] for a run of a file's
-    /// layer: its nodes, then their uncles. They must prove the file's root
-    /// (libtorrent `hash_picker::add_hashes`); once every run is held, the
-    /// file's tree is built. Returns whether every file's layer is then held.
-    pub fn add_chunk(
-        &self,
-        file: usize,
-        request: &HashRequest,
-        hashes: &[Id32],
-    ) -> Result<bool, InvalidHashes> {
-        let f = &self.files[file];
+    /// Takes the answer to a [`Self::chunk_request`] for a run of a piece
+    /// layer: its nodes, then their uncles. They must prove the root asked
+    /// for (libtorrent `hash_picker::add_hashes`), and the run is then held
+    /// by every file of that root; a file's tree is built once all its runs
+    /// are. Returns whether every file's layer is then held.
+    pub fn add_chunk(&self, request: &HashRequest, hashes: &[Id32]) -> Result<bool, InvalidHashes> {
         let (nodes, uncles) = hashes
             .split_at_checked(request.count as usize)
             .ok_or(InvalidHashes)?;
         let pad = merkle::pad_hash(self.blocks_per_piece(), 1);
-        if merkle::proven_root(nodes, request.index.into(), pad, uncles) != f.root {
+        if merkle::proven_root(nodes, request.index.into(), pad, uncles) != request.root {
             return Err(InvalidHashes);
         }
-        let held = (f.pieces - request.index).min(LAYER_CHUNK) as usize;
-        let _ = f.chunks[(request.index / LAYER_CHUNK) as usize].set(nodes[..held].into());
-        if f.tree.get().is_none() && f.chunks.iter().all(|c| c.get().is_some()) {
-            let layer = f
-                .chunks
-                .iter()
-                .flat_map(|c| c.get().into_iter().flatten().copied())
-                .collect();
-            let _ = f
-                .tree
-                .set(PieceTree::from_piece_layer(layer, self.blocks_per_piece()));
+        for (_, f) in self.with_root(&request.root) {
+            let held = f.pieces.saturating_sub(request.index).min(LAYER_CHUNK) as usize;
+            let Some(chunk) = f.chunks.get((request.index / LAYER_CHUNK) as usize) else {
+                continue;
+            };
+            let _ = chunk.set(nodes[..held].into());
+            if f.tree.get().is_none() && f.chunks.iter().all(|c| c.get().is_some()) {
+                let layer = f
+                    .chunks
+                    .iter()
+                    .flat_map(|c| c.get().into_iter().flatten().copied())
+                    .collect();
+                let _ = f
+                    .tree
+                    .set(PieceTree::from_piece_layer(layer, self.blocks_per_piece()));
+            }
         }
         Ok(self.files.iter().all(V2File::layer_held))
+    }
+
+    /// The hashes that answer a peer's request, or `None` to reject it
+    /// (libtorrent `bt_peer_connection::on_hash_request`): a request
+    /// `validate_hash_request` admits, for a file whose tree is held, from
+    /// its piece layer up, of no more nodes than a reply carries. O(count +
+    /// log n), from the tree built once per file.
+    pub fn answer(&self, request: &HashRequest) -> Option<Vec<Id32>> {
+        let (_, f) = self.with_root(&request.root).next()?;
+        // libtorrent `validate_hash_request`.
+        let leafs = merkle::num_leafs(f.length.div_ceil(BLOCK_SIZE));
+        let layers = merkle::num_layers(leafs);
+        let (base, index, count) = (
+            request.base,
+            u64::from(request.index),
+            u64::from(request.count),
+        );
+        if count == 0 || count > u64::from(MAX_HASHES_IN_REPLY) || base >= layers {
+            return None;
+        }
+        let level = leafs >> base;
+        if index >= level || index + count > level || request.proof_layers >= layers - base {
+            return None;
+        }
+        // Weaver keeps no hashes below the piece layer.
+        let above_pieces = base.checked_sub(merkle::num_layers(self.blocks_per_piece()))?;
+        f.tree()?
+            .hashes(above_pieces, index, count, request.proof_layers)
     }
 
     /// The piece layer of every file larger than a piece, by root, when
@@ -398,24 +445,180 @@ mod tests {
         let mut bad_node = hashes.clone();
         bad_node[0].0[0] ^= 1;
         for bad in [&bad_uncle, &bad_node, &hashes[..15].to_vec()] {
-            assert!(v2.add_chunk(0, &last, bad).is_err());
+            assert!(v2.add_chunk(&last, bad).is_err());
         }
         assert_eq!(v2.expected(1024), None);
 
         // The last run first: its pieces are known, the others not yet.
-        assert!(!v2.add_chunk(0, &last, &hashes).unwrap());
+        assert!(!v2.add_chunk(&last, &hashes).unwrap());
         assert_eq!(v2.expected(1028), Some(layer[1028]));
         assert_eq!(v2.expected(0), None);
         assert!(v2.layers().is_none());
 
         let first = v2.chunk_request(0, 0);
-        assert!(!v2.add_chunk(0, &first, &answer(&first)).unwrap());
+        assert!(!v2.add_chunk(&first, &answer(&first)).unwrap());
         let middle = v2.chunk_request(0, 1);
-        assert!(v2.add_chunk(0, &middle, &answer(&middle)).unwrap());
+        assert!(v2.add_chunk(&middle, &answer(&middle)).unwrap());
 
         assert!((0..1029).all(|p| v2.expected(p) == Some(layer[p as usize])));
         assert_eq!(v2.missing_chunks().count(), 0);
         let held = v2.layers().unwrap();
         assert_eq!(held, vec![(tree.root(), layer.as_slice())]);
+    }
+
+    /// [`one_file`] with every run of its layer held, as a seed holds it.
+    fn seeded(layer: &[Id32], piece_length: u64) -> V2Hashes {
+        let v2 = one_file(layer, piece_length);
+        let tree = PieceTree::from_piece_layer(layer.to_vec(), piece_length / BLOCK_SIZE);
+        let runs: Vec<_> = v2.missing_chunks().collect();
+        for (file, chunk) in runs {
+            let r = v2.chunk_request(file, chunk);
+            let hashes = tree
+                .hashes(0, r.index.into(), r.count.into(), r.proof_layers)
+                .unwrap();
+            v2.add_chunk(&r, &hashes).unwrap();
+        }
+        v2
+    }
+
+    #[test]
+    fn hash_requests_are_answered_as_libtorrent_validates_them() {
+        // test_hash_picker.cpp `validate_hash_request`: 16 KiB pieces, a
+        // file of 2048 blocks, so the piece layer is the leaves.
+        let layer = made_up_layer(2048);
+        let v2 = seeded(&layer, 16384);
+        let root = v2.files[0].root;
+        let (leaves, layers) = (2048, 11);
+        let ask = |base, index, count, proof_layers| HashRequest {
+            root,
+            base,
+            index,
+            count,
+            proof_layers,
+        };
+
+        // Admitted: the nodes, then the uncles the request counts; an
+        // aligned range whose proof reaches the root proves it.
+        for r in [
+            ask(0, 0, 1, 0),
+            ask(layers - 1, 0, 1, 0),
+            ask(2, 0, leaves / 4, 0),
+            ask(3, 0, leaves / 8, 0),
+            ask(3, 5, leaves / 8 - 5, 0),
+            ask(0, 0, 1, layers - 1),
+            ask(1, 0, 1, layers - 2),
+            ask(0, 1536, 512, 10),
+        ] {
+            let got = v2.answer(&r).unwrap();
+            assert_eq!(got.len() as u64, u64::from(r.count) + r.uncles(), "{r:?}");
+            if r.base == 0 {
+                let at = r.index as usize;
+                assert_eq!(&got[..r.count as usize], &layer[at..at + r.count as usize]);
+            }
+            let span = merkle::num_leafs(r.count.into());
+            let top = r.base + (r.proof_layers + 1).max(merkle::num_layers(span));
+            if u64::from(r.index) % span == 0 && top == layers {
+                let (nodes, uncles) = got.split_at(r.count as usize);
+                let pad = merkle::pad_hash(1 << r.base, 1);
+                assert_eq!(
+                    merkle::proven_root(nodes, r.index.into(), pad, uncles),
+                    root,
+                    "{r:?}"
+                );
+            }
+        }
+
+        // Refused by libtorrent's checks.
+        for r in [
+            ask(layers, 0, 1, 0),
+            ask(0, 0, 0, 0),
+            ask(0, 0, leaves + 1, 0),
+            ask(0, 100, leaves - 100 + 1, 0),
+            ask(0, 0, 8193, 0),
+            ask(0, 0, u32::MAX, 0),
+            ask(1, 0, leaves / 2 + 1, 0),
+            ask(2, 0, leaves / 4 + 1, 0),
+            ask(3, 0, leaves / 8 + 1, 0),
+            ask(3, 5, leaves / 8 - 5 + 1, 0),
+            ask(0, 0, 1, layers),
+            ask(1, 0, 1, layers),
+            ask(1, 0, 1, u32::MAX),
+            ask(0, u32::MAX, 1, 0),
+        ] {
+            assert_eq!(v2.answer(&r), None, "{r:?}");
+        }
+        // Admitted by libtorrent, but more nodes than a reply carries.
+        for r in [
+            ask(0, 0, leaves, 0),
+            ask(0, 100, leaves - 100, 0),
+            ask(1, 0, leaves / 2, 0),
+        ] {
+            assert_eq!(v2.answer(&r), None, "{r:?}");
+        }
+        // A root of no file.
+        assert_eq!(
+            v2.answer(&HashRequest {
+                root: layer[0],
+                ..ask(0, 0, 1, 0)
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn hashes_below_the_piece_layer_or_of_a_layer_not_held_are_refused() {
+        // `add_piece_hashes`: pieces of four blocks, so the piece layer is
+        // base 2 and the blocks under it are not kept.
+        let layer = made_up_layer(1024);
+        let v2 = seeded(&layer, 65536);
+        let root = v2.files[0].root;
+        let ask = |base| HashRequest {
+            root,
+            base,
+            index: 0,
+            count: 1,
+            proof_layers: 0,
+        };
+        assert_eq!(v2.answer(&ask(0)), None);
+        assert_eq!(v2.answer(&ask(1)), None);
+        assert_eq!(v2.answer(&ask(2)).unwrap(), vec![layer[0], layer[1]]);
+
+        // The same file before its layer is held.
+        assert_eq!(one_file(&layer, 65536).answer(&ask(2)), None);
+    }
+
+    #[test]
+    fn files_that_share_a_root_share_one_fetch_of_their_layer() {
+        // libtorrent `file_storage::file_index_for_root`: one root, one
+        // layer, whichever file it is asked for.
+        let data = payload(3 * 16384, 1);
+        let mut t = TestTorrent::new(vec![("a", data.clone()), ("b", data.clone())], 16384);
+        t.layers = false;
+        let bytes = t.torrent_bytes();
+        let meta = torrent_from_bytes(&bytes).unwrap();
+        let info = meta.info.data.clone().validate().unwrap();
+        let v2 = V2Hashes::new(&info, Vec::new()).unwrap();
+        let (root, layer) = file_hashes(&data, 16384);
+        let (root, layer) = (root.unwrap(), layer.unwrap());
+
+        let runs: Vec<_> = v2.missing_chunks().collect();
+        assert_eq!(runs.len(), 1);
+        let r = v2.chunk_request(runs[0].0, runs[0].1);
+        assert_eq!(r.root, root);
+        let tree = PieceTree::from_piece_layer(layer.clone(), 1);
+        let hashes = tree
+            .hashes(0, r.index.into(), r.count.into(), r.proof_layers)
+            .unwrap();
+        assert!(v2.add_chunk(&r, &hashes).unwrap());
+        assert!((0..6).all(|p| v2.expected(p) == Some(layer[p as usize % 3])));
+        assert_eq!(
+            v2.answer(&HashRequest {
+                count: 1,
+                proof_layers: 0,
+                ..r
+            })
+            .unwrap()[0],
+            layer[0]
+        );
     }
 }

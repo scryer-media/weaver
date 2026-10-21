@@ -1138,6 +1138,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Have(h) => self.on_have(h),
             Message::Hashes(hashes) => self.on_hashes(hashes).context("on_hashes")?,
             Message::HashReject(request) => self.on_hash_reject(request),
+            Message::HashRequest(request) => {
+                self.on_hash_request(request).context("on_hash_request")?
+            }
             Message::NotInterested => {
                 trace!("received \"not interested\", but we don't process it yet")
             }

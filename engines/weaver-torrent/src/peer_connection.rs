@@ -18,7 +18,7 @@ use crate::core::{
     peer_id::try_decode_peer_id,
 };
 use crate::peer_protocol::{
-    Handshake, MAX_MSG_LEN, Message,
+    Handshake, Hashes, MAX_MSG_LEN, Message,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
@@ -73,6 +73,7 @@ pub enum WriterRequest {
     Message(Message<'static>),
     UtMetadata(UtMetadata<ByteBufOwned>),
     UtPex(UtPex<ByteBufOwned>),
+    Hashes(Hashes<ByteBufOwned>),
     ReadChunkRequest(ChunkInfo),
     Disconnect(anyhow::Result<()>),
 }
@@ -422,6 +423,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
                             .serialize(&mut *write_buf, ext_msg_ids)?
                     }
+                    WriterRequest::Hashes(hashes) => Message::Hashes(hashes.as_borrowed())
+                        .serialize(&mut *write_buf, ext_msg_ids)?,
                     WriterRequest::ReadChunkRequest(chunk) => {
                         #[allow(unused_mut)]
                         let mut skip_reading_for_e2e_tests = false;

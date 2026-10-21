@@ -205,12 +205,10 @@ impl TorrentMetadata {
             .clone()
     }
 
-    /// Takes a peer's answer to the request for a run of a file's piece
-    /// layer ([`V2Hashes::add_chunk`]); once every layer is held they go
+    /// Takes a peer's answer to the request for a run of a piece layer ([`V2Hashes::add_chunk`]); once every layer is held they go
     /// into the torrent file.
     pub(crate) fn add_layer_chunk(
         &self,
-        file: usize,
         request: &HashRequest,
         hashes: &[Id32],
     ) -> anyhow::Result<()> {
@@ -218,7 +216,7 @@ impl TorrentMetadata {
             .v2
             .as_ref()
             .context("a v1 torrent has no piece layers")?;
-        if v2.add_chunk(file, request, hashes)?
+        if v2.add_chunk(request, hashes)?
             && let Some(layers) = v2.layers()
         {
             let _ = self

@@ -360,15 +360,16 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
 }
 
 mod v2 {
-    //! The fetch of a v2 torrent's piece layers from peers that speak v2
-    //! (libtorrent `hash_picker`, `bt_peer_connection::on_hashes`,
-    //! `on_hash_reject`).
+    //! The fetch of a v2 torrent's piece layers from peers that speak v2,
+    //! and the answers a seed gives them (libtorrent `hash_picker`,
+    //! `bt_peer_connection::on_hashes`, `on_hash_reject`,
+    //! `on_hash_request`).
 
     use super::*;
     use crate::{
         core::{
             Id32,
-            merkle::PieceTree,
+            merkle::{self, PieceTree},
             v2_test_torrent::{TestTorrent as V2TestTorrent, file_hashes, payload},
         },
         peer_protocol::{HashRequest, Hashes},
@@ -623,5 +624,70 @@ mod v2 {
         slow.on_hashes(answer(&torrent, first).as_borrowed())
             .unwrap();
         assert!(h.expected(0).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_seed_answers_hash_requests_from_its_layers_and_rejects_the_rest() {
+        let mut torrent = layerless();
+        torrent.layers = true;
+        let h = Harness::v2("a_seed_answers_hash_requests", &torrent).await;
+        let (peer, mut rx) = h.peer_speaking("127.0.0.1:6881", true);
+        let tree = tree(&torrent);
+        let ask = |root, base, index, count, proof_layers| HashRequest {
+            root,
+            base,
+            index,
+            count,
+            proof_layers,
+        };
+
+        // The second run as libtorrent's `hash_picker::pick_hashes` asks
+        // for it: 88 pieces padded to 512 nodes, and the uncle that proves
+        // the root (libtorrent
+        // `bt_peer_connection::on_hash_request`).
+        let request = ask(tree.root(), 0, 512, 512, 9);
+        peer.on_hash_request(request).unwrap();
+        let Ok(WriterRequest::Hashes(answer)) = rx.try_recv() else {
+            panic!("expected hashes");
+        };
+        assert_eq!(answer.request, request);
+        let hashes = answer.hashes();
+        let (nodes, uncles) = hashes.split_at(512);
+        let pad = merkle::pad_hash(1, 1);
+        let real = (PIECES - 512) as usize;
+        assert_eq!(&nodes[..real], &tree.pieces()[512..]);
+        assert!(nodes[real..].iter().all(|n| *n == pad));
+        assert_eq!(uncles.len(), 1);
+        assert_eq!(merkle::proven_root(nodes, 512, pad, uncles), tree.root());
+
+        // A malformed request, one for a root of no file, and one for the
+        // one-piece file, which has no layer: each is rejected.
+        let one_piece = file_hashes(&torrent.files[1].1, PIECE).0.unwrap();
+        for bad in [
+            ask(tree.root(), 0, 0, 0, 0),
+            ask(tree.root(), 0, 0, 1, 10),
+            ask(tree.pieces()[0], 0, 0, 1, 0),
+            ask(one_piece, 0, 0, 1, 0),
+        ] {
+            peer.on_hash_request(bad).unwrap();
+            assert!(
+                matches!(rx.try_recv(), Ok(WriterRequest::Message(Message::HashReject(r))) if r == bad),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hash_request_for_a_v1_torrent_drops_the_peer() {
+        let h = Harness::new("a_hash_request_for_a_v1_torrent").await;
+        let (peer, _rx) = h.peer_speaking("127.0.0.1:6881", true);
+        let request = HashRequest {
+            root: Id32::default(),
+            base: 0,
+            index: 0,
+            count: 1,
+            proof_layers: 0,
+        };
+        assert!(peer.on_hash_request(request).is_err());
     }
 }
