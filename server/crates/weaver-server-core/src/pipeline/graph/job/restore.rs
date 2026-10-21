@@ -133,6 +133,8 @@ impl<R: Root> GraphJob<R> {
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.job.reported,
             pending: Pending::default(),
+            moving: None,
+            relocated: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;

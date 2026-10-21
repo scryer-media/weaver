@@ -43,6 +43,7 @@ use crate::pipeline::claim_complete_destination_path;
 use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{Hears, Outside, RunMail, Said};
 use crate::pipeline::graph::job::{GraphJob, Storage};
+use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::PieceLayout;
@@ -641,6 +642,9 @@ struct Live {
     applied: Option<Vec<usize>>,
     speeds: (u64, u64),
     peers: (u32, u32),
+    // The directory claimed for a move, while the move waits or is under
+    // way; the job does the moving.
+    moving: Option<PathBuf>,
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
@@ -694,6 +698,7 @@ impl Live {
             applied: None,
             speeds: (0, 0),
             peers: (0, 0),
+            moving: None,
             file_have: Vec::new(),
         }
     }
@@ -824,6 +829,7 @@ impl Live {
             paused_by: self.paused_by,
             failed: self.refusal(),
             held: self.held.clone(),
+            moving: self.moving.is_some(),
         }
     }
 }
@@ -1285,6 +1291,9 @@ impl TorrentService {
             let Some(job) = job else { continue };
             if let Err(error) = job.lend_handed() {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent job's repair lending failed");
+            }
+            if let Some(outcome) = job.with(GraphJob::relocated) {
+                self.moved(job_id, outcome).await;
             }
             let (refusal, done) = job.with(|job| {
                 (
@@ -2209,6 +2218,108 @@ impl TorrentService {
         Ok(())
     }
 
+    /// Move the torrent's directory under `parent`, where it goes on
+    /// downloading or seeding (qBittorrent `TorrentImpl::setSavePath`,
+    /// libtorrent `torrent::move_storage`). The move waits for the job's
+    /// runs and happens whole; the torrent shows as moving until it did.
+    /// A directory of the torrent's name is claimed under `parent`, so
+    /// nothing there is replaced or kept.
+    pub async fn set_location(&self, job_id: JobId, parent: String) -> Result<(), ActionError> {
+        let parent = PathBuf::from(parent.trim());
+        if !parent.is_absolute() {
+            return Err(ActionError::Invalid(
+                "the location must be an absolute path".to_owned(),
+            ));
+        }
+        let (job, from) = self
+            .with_torrent(job_id, |torrent| {
+                if torrent.moving.is_some() {
+                    return Err(ActionError::Invalid(
+                        "the torrent is already moving".to_owned(),
+                    ));
+                }
+                match (torrent.job.clone(), torrent.record.storage_dir.clone()) {
+                    (Some(job), Some(dir)) => Ok((job, PathBuf::from(dir))),
+                    _ => Err(ActionError::Invalid(
+                        "the torrent has no files to move yet".to_owned(),
+                    )),
+                }
+            })
+            .await?;
+        if from.parent() == Some(parent.as_path()) {
+            return Ok(());
+        }
+        let name = from
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ActionError::State("the torrent's directory has no name".to_owned()))?;
+        // A location the torrent's directory cannot be made under is the
+        // caller's to fix (qBittorrent `TorrentsController::setLocationAction`
+        // answers "Cannot make save path" as a conflict).
+        let to = claim_complete_destination_path(&parent, name, job_id, &HashSet::new())
+            .await
+            .map_err(|error| {
+                ActionError::Invalid(format!("could not make the torrent's directory: {error}"))
+            })?;
+        let started = self
+            .with_torrent(job_id, |torrent| {
+                if torrent.moving.is_some() {
+                    return Err(ActionError::Invalid(
+                        "the torrent is already moving".to_owned(),
+                    ));
+                }
+                torrent.moving = Some(to.clone());
+                Ok(job.with(|job| {
+                    job.relocate(to.clone());
+                    job.relocated()
+                }))
+            })
+            .await;
+        match started {
+            Ok(Some(outcome)) => self.moved(job_id, outcome).await,
+            Ok(None) => {}
+            Err(error) => {
+                give_back(&to.to_string_lossy()).await;
+                return Err(error);
+            }
+        }
+        self.publish().await;
+        Ok(())
+    }
+
+    // The job moved its directory, or could not: the record follows a
+    // move, and a failed one gives its claim back and leaves the torrent
+    // where it was.
+    async fn moved(&self, job_id: JobId, outcome: Result<PathBuf, LeafError>) {
+        let claimed = self
+            .with_torrent(job_id, |torrent| Ok(torrent.moving.take()))
+            .await
+            .ok()
+            .flatten();
+        match outcome {
+            Ok(to) => {
+                let to = to.to_string_lossy().into_owned();
+                let kept = self
+                    .with_torrent(job_id, |torrent| {
+                        torrent.record.storage_dir = Some(to.clone());
+                        Ok(())
+                    })
+                    .await;
+                if kept.is_ok()
+                    && let Err(error) = self.inner.db.set_torrent_storage_dir(job_id, &to)
+                {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's new directory");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's move failed; it stays where it was");
+                if let Some(claimed) = claimed {
+                    give_back(&claimed.to_string_lossy()).await;
+                }
+            }
+        }
+    }
+
     pub async fn set_policy_override(
         &self,
         job_id: JobId,
@@ -2868,6 +2979,7 @@ fn job_status(view: &TorrentView) -> JobStatus {
         TorrentState::Stalled => JobStatus::Stalled,
         TorrentState::Seeding => JobStatus::Seeding,
         TorrentState::Paused => JobStatus::Paused,
+        TorrentState::Moving => JobStatus::Moving,
         // A stop with any reason but its met goal is a failure.
         TorrentState::Stopped => match view.detail.as_deref() {
             None | Some(status::GOAL_MET) if view.completed_at_ms.is_some() => JobStatus::Complete,

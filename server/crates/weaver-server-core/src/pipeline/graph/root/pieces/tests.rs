@@ -517,3 +517,140 @@ fn a_job_that_does_not_unpack_leaves_an_archive_a_leaf() {
     let opened = job(true, dir.path());
     assert!(opened.tree().child_of(NodeId::ROOT, MemberId(0)).is_some());
 }
+
+// libtorrent `torrent::move_storage` and `storage_utils::move_storage`: a
+// torrent moves whole while it is live. The pieces in hand are read from
+// the new directory, the next piece lands there, nothing is left under the
+// old one, and a restore over the new directory finds every piece.
+#[test]
+fn a_torrent_job_moves_its_directory_and_goes_on_from_there() {
+    let layout = layout();
+    let root = tempfile::tempdir().unwrap();
+    let (from, to) = (root.path().join("from"), root.path().join("to"));
+    std::fs::create_dir_all(&from).unwrap();
+    let mut job = torrent_job(&layout, &from);
+    for piece in 0..4 {
+        job.verified(shares(&layout, piece), &mut RepairSlots::default(), 1)
+            .unwrap();
+    }
+    let bytes = torrent_bytes(&layout);
+
+    // The claimed destination, as the service makes it: an empty directory.
+    std::fs::create_dir(&to).unwrap();
+    assert!(!job.relocating());
+    job.relocate(to.clone());
+    assert!(!job.relocating());
+    assert_eq!(job.relocated().unwrap().unwrap(), to);
+    assert!(job.relocated().is_none());
+    assert!(!from.exists());
+    assert_eq!(std::fs::read(to.join("a.bin")).unwrap(), bytes[..1000]);
+    assert!(
+        job.member_files()
+            .iter()
+            .all(|(_, path)| path.starts_with(&to)),
+        "{:?}",
+        job.member_files()
+    );
+
+    // A peer's read comes from the new directory.
+    let mut read = Vec::new();
+    assert!(job.posted(VolumeIndex(1), ByteRange::new(0, 2500), &mut read));
+    assert_eq!(read, bytes[1000..3500]);
+
+    // The last piece completes c, under the new directory.
+    job.verified(shares(&layout, 4), &mut RepairSlots::default(), 1)
+        .unwrap();
+    assert!(job.have().all());
+    assert_eq!(std::fs::read(to.join("c.bin")).unwrap(), bytes[3500..]);
+    assert!(!from.exists());
+
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    let restored =
+        GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(&to), 1).unwrap();
+    assert!(restored.refetched.is_empty());
+    assert!(restored.job.have().all());
+}
+
+// libtorrent `torrent::move_storage` is a fence job: it runs once every disk
+// job before it is done. Here a move asked for while an engine's run is
+// reading waits, and happens at the first step that finds nothing out.
+#[tokio::test]
+async fn a_move_waits_while_a_run_is_out() {
+    let layout = Arc::new(PieceLayout::new(PIECE, vec![file("set.rar", 2000)]).unwrap());
+    let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+    bytes.extend((bytes.len()..2000).map(|at| (at % 251) as u8));
+    let root = tempfile::tempdir().unwrap();
+    let (from, to) = (root.path().join("from"), root.path().join("to"));
+    std::fs::create_dir_all(&from).unwrap();
+    std::fs::create_dir(&to).unwrap();
+    let accountant = accountant();
+    let writer = NamespaceWriter::new(
+        1,
+        from.clone(),
+        Arc::clone(&accountant),
+        CapacityReader::unknown(),
+    );
+    let mut mail = RunMail::default();
+    let runs = Runs::new(1, 1, mail.sender(), accountant);
+    let mut job = GraphJob::torrent(
+        Arc::clone(&layout),
+        Box::new(weaver_objects::Objects),
+        writer,
+        runs,
+        u32::MAX,
+    );
+    let mut slots = RepairSlots::default();
+    // The archive's header starts its run, which reads on as bytes come.
+    job.verified(shares_of(&layout, &bytes, 0), &mut slots, 1)
+        .unwrap();
+    assert!(job.awaits_mail());
+
+    job.relocate(to.clone());
+    assert!(job.relocating());
+    assert!(job.relocated().is_none());
+    // The volume's bytes are kept under the old directory still, and none
+    // has reached the new one.
+    assert!(std::fs::read_dir(&from).unwrap().next().is_some());
+    assert!(std::fs::read_dir(&to).unwrap().next().is_none());
+
+    // The rest of the volume is not an archive: the run ends on it, and
+    // the job hears so. The move happens at the step that finds the job
+    // quiet.
+    job.verified(shares_of(&layout, &bytes, 1), &mut slots, 1)
+        .unwrap();
+    while job.awaits_mail() {
+        let said = mail.recv().await.expect("the run speaks before it ends");
+        job.run_said(said, &mut slots, 1).unwrap();
+        job.try_relocate();
+    }
+    assert!(!job.relocating());
+    assert_eq!(job.relocated().unwrap().unwrap(), to);
+    assert_eq!(std::fs::read(to.join("set.rar")).unwrap(), bytes);
+    assert!(!from.exists());
+}
+
+// A move that fails leaves the job writing where it was, and says why once.
+#[test]
+fn a_failed_move_leaves_the_job_where_it_was() {
+    let layout = layout();
+    let root = tempfile::tempdir().unwrap();
+    let (from, to) = (root.path().join("from"), root.path().join("to"));
+    std::fs::create_dir_all(&from).unwrap();
+    let mut job = torrent_job(&layout, &from);
+    job.verified(shares(&layout, 0), &mut RepairSlots::default(), 1)
+        .unwrap();
+    // No claim was made: nothing is at `to`, so the move has nothing to
+    // make way for and fails there.
+    job.relocate(to.clone());
+    assert!(!job.relocating());
+    assert!(job.relocated().unwrap().is_err());
+    assert!(job.relocated().is_none());
+    let bytes = torrent_bytes(&layout);
+    job.verified(shares(&layout, 1), &mut RepairSlots::default(), 1)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(from.join("b.bin")).unwrap()[..1048],
+        bytes[1000..2048]
+    );
+    assert!(!to.exists());
+}

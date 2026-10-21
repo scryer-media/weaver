@@ -26,7 +26,8 @@ export type TorrentState =
   | "STALLED"
   | "SEEDING"
   | "PAUSED"
-  | "STOPPED";
+  | "STOPPED"
+  | "MOVING";
 
 /** Where a torrent's seeding policy comes from. */
 export type SeedingSource = "CATEGORY" | "GLOBAL" | "TORRENT" | "TRACKER_RULE";

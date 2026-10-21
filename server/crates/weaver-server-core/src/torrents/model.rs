@@ -50,6 +50,8 @@ pub enum TorrentState {
     Paused,
     // Finished seeding, or stopped by its seeding policy.
     Stopped,
+    // Its directory is on the way to another, where it goes on.
+    Moving,
 }
 
 impl TorrentState {
@@ -63,6 +65,7 @@ impl TorrentState {
             Self::Seeding => "seeding",
             Self::Paused => "paused",
             Self::Stopped => "stopped",
+            Self::Moving => "moving",
         }
     }
 
@@ -76,6 +79,7 @@ impl TorrentState {
             "seeding" => Some(Self::Seeding),
             "paused" => Some(Self::Paused),
             "stopped" => Some(Self::Stopped),
+            "moving" => Some(Self::Moving),
             _ => None,
         }
     }

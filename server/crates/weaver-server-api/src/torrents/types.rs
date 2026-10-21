@@ -18,6 +18,7 @@ pub enum TorrentStateGql {
     Seeding,
     Paused,
     Stopped,
+    Moving,
 }
 
 impl From<TorrentState> for TorrentStateGql {
@@ -31,6 +32,7 @@ impl From<TorrentState> for TorrentStateGql {
             TorrentState::Seeding => Self::Seeding,
             TorrentState::Paused => Self::Paused,
             TorrentState::Stopped => Self::Stopped,
+            TorrentState::Moving => Self::Moving,
         }
     }
 }

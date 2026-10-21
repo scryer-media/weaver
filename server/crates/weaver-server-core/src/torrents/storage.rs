@@ -96,7 +96,13 @@ impl TorrentJob {
         step: impl FnOnce(&mut GraphJob<PieceRoot>, &mut RepairSlots, usize) -> Result<(), GraphError>,
     ) -> Result<(), GraphError> {
         let mut repairs = self.repairs.lock().unwrap_or_else(PoisonError::into_inner);
-        let result = self.with(|job| step(job, &mut repairs, limit));
+        let result = self.with(|job| {
+            let result = step(job, &mut repairs, limit);
+            // A move asked for while something was out happens at the first
+            // step that finds nothing out.
+            job.try_relocate();
+            result
+        });
         for woken in repairs.take_woken() {
             self.signal.mark(JobId(woken.0));
         }

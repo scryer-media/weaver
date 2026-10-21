@@ -27,7 +27,7 @@ pub(crate) enum LeafError {
 }
 
 impl LeafError {
-    fn io(path: &Path) -> impl FnOnce(io::Error) -> LeafError + '_ {
+    pub(crate) fn io(path: &Path) -> impl FnOnce(io::Error) -> LeafError + '_ {
         move |source| LeafError::Io {
             path: path.to_path_buf(),
             source,
@@ -141,6 +141,22 @@ impl Leaf {
         }
         self.path = path;
         Ok(())
+    }
+
+    // Let go of the handle ahead of the directory moving: the file stays,
+    // and the next write opens it where it then is.
+    pub(crate) fn release(&mut self) {
+        self.file = None;
+    }
+
+    // The job's directory moved from `from` to `to`, the file with it: the
+    // path follows.
+    pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
+        let rest = self
+            .path
+            .strip_prefix(from)
+            .expect("a leaf lives under its job's directory");
+        self.path = to.join(rest);
     }
 
     // The member is gone with its subtree.
