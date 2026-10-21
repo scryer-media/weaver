@@ -42,6 +42,10 @@ pub struct TrackerRequest<'a> {
     pub uploaded: u64,
     pub downloaded: u64,
     pub left: u64,
+    /// Bytes that failed their hash check.
+    pub corrupt: u64,
+    /// Bytes received and not used.
+    pub redundant: u64,
     pub compact: bool,
     pub no_peer_id: bool,
 
@@ -225,6 +229,8 @@ impl TrackerRequest<'_> {
         write!(s, "&uploaded={}", self.uploaded).unwrap();
         write!(s, "&downloaded={}", self.downloaded).unwrap();
         write!(s, "&left={}", self.left).unwrap();
+        write!(s, "&corrupt={}", self.corrupt).unwrap();
+        write!(s, "&redundant={}", self.redundant).unwrap();
         write!(s, "&compact={}", if self.compact { 1 } else { 0 }).unwrap();
         write!(s, "&no_peer_id={}", if self.no_peer_id { 1 } else { 0 }).unwrap();
         if let Some(ip) = &self.ip {
@@ -476,6 +482,8 @@ mod tests {
             uploaded: 0,
             downloaded: 0,
             left: 1024 * 1024,
+            corrupt: 0,
+            redundant: 0,
             compact: true,
             no_peer_id: false,
             event: Some(TrackerRequestEvent::Started),
@@ -502,6 +510,8 @@ mod tests {
                 uploaded: 0,
                 downloaded: 0,
                 left: 0,
+                corrupt: 0,
+                redundant: 0,
                 compact: true,
                 no_peer_id: false,
                 event: None,
@@ -523,7 +533,7 @@ mod tests {
             assert_eq!(
                 request.as_querystring(),
                 format!(
-                    "info_hash={e}&peer_id={e}&port=1&uploaded=0&downloaded=0&left=0&compact=1&no_peer_id=0&numwant=50"
+                    "info_hash={e}&peer_id={e}&port=1&uploaded=0&downloaded=0&left=0&corrupt=0&redundant=0&compact=1&no_peer_id=0&numwant=50"
                 )
             );
         }
@@ -592,6 +602,8 @@ mod tests {
             uploaded: 0,
             downloaded: 0,
             left: 0,
+            corrupt: 0,
+            redundant: 0,
             compact: true,
             no_peer_id: false,
             event: None,
@@ -625,6 +637,8 @@ mod tests {
             uploaded: 0,
             downloaded: 0,
             left: 0,
+            corrupt: 0,
+            redundant: 0,
             compact: true,
             no_peer_id: false,
             event: None,

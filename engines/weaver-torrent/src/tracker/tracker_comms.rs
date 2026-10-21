@@ -82,6 +82,13 @@ pub struct TrackerCommsStats {
     /// check. Pieces the torrent already had when the run began are not
     /// counted, and neither is a piece that failed its check.
     pub downloaded_bytes: u64,
+    /// Bytes of the pieces downloaded during this run that failed their
+    /// hash check (libtorrent `torrent::m_total_failed_bytes`).
+    pub corrupt_bytes: u64,
+    /// Bytes of the blocks received during this run and not used: a copy
+    /// of a block already had, or one no longer asked of the peer
+    /// (libtorrent `torrent::m_total_redundant_bytes`).
+    pub redundant_bytes: u64,
     /// Bytes of the whole torrent not yet had, whichever files are selected,
     /// so 0 only for a seed. None while the torrent's size is unknown (a
     /// magnet still resolving its metadata).
@@ -1459,6 +1466,8 @@ impl TrackerComms {
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
             left: stats.announced_left(),
+            corrupt: stats.corrupt_bytes,
+            redundant: stats.redundant_bytes,
             compact: true,
             no_peer_id: false,
             event,
@@ -1615,6 +1624,8 @@ mod tests {
         TrackerCommsStats {
             uploaded_bytes: 0,
             downloaded_bytes: downloaded,
+            corrupt_bytes: 0,
+            redundant_bytes: 0,
             left_bytes: Some(left),
             torrent_state: TrackerCommsStatsState::Live,
             finished_during_run,
@@ -2186,6 +2197,63 @@ mod tests {
         };
         assert_eq!(query_param(&second, "port"), Some("40001"));
         assert_eq!(query_param(&second, "event"), None);
+        drop(peers);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_http_announce_reports_the_bytes_that_failed_their_hash_and_the_bytes_we_did_not_need()
+     {
+        // libtorrent torrent::build_tracker_request sends
+        // m_total_failed_bytes as `corrupt` and m_total_redundant_bytes as
+        // `redundant`, read per announce (http_tracker_connection::start).
+        let (listener, url) = http_listener().await;
+        let stats = Arc::new(ManualStats {
+            stats: Mutex::new(TrackerCommsStats {
+                corrupt_bytes: 16384,
+                redundant_bytes: 5,
+                ..live(0, 90, false)
+            }),
+            completed: tokio::sync::watch::channel(false).0,
+        });
+        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(stats.clone()),
+            None,
+            listen_port,
+            no_ips(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            udp_client,
+            StoppedAnnounces::default(),
+        )
+        .unwrap()
+        .peers;
+        let first = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&first, "corrupt"), Some("16384"));
+        assert_eq!(query_param(&first, "redundant"), Some("5"));
+        *stats.stats.lock() = TrackerCommsStats {
+            corrupt_bytes: 32768,
+            redundant_bytes: 21,
+            ..live(0, 90, false)
+        };
+        port.send_replace(Some(40001));
+        let second = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&second, "corrupt"), Some("32768"));
+        assert_eq!(query_param(&second, "redundant"), Some("21"));
         drop(peers);
         token.cancel();
     }

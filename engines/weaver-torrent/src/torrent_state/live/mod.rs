@@ -917,6 +917,23 @@ impl TorrentStateLive {
             .load(Ordering::Acquire)
     }
 
+    /// Bytes of the pieces that failed their hash check this run.
+    pub fn get_failed_bytes(&self) -> u64 {
+        self.stats.failed_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the blocks received this run and not used.
+    pub fn get_redundant_bytes(&self) -> u64 {
+        self.stats.redundant_bytes.load(Ordering::Relaxed)
+    }
+
+    /// A block of `len` bytes arrived that is not used: it was not asked of
+    /// the peer any more, or another copy came first (libtorrent
+    /// `torrent::add_redundant_bytes`, from `peer_connection::incoming_piece`).
+    fn add_redundant_bytes(&self, len: u64) {
+        self.stats.redundant_bytes.fetch_add(len, Ordering::Relaxed);
+    }
+
     pub fn get_approx_have_bytes(&self) -> u64 {
         self.stats.have_bytes.load(Ordering::Relaxed)
     }
@@ -1000,6 +1017,8 @@ impl TorrentStateLive {
         *self.shared.last_run.lock() = Some(RunCounters {
             uploaded_bytes: self.get_uploaded_bytes(),
             downloaded_bytes: self.get_downloaded_bytes(),
+            corrupt_bytes: self.get_failed_bytes(),
+            redundant_bytes: self.get_redundant_bytes(),
             left_bytes: chunk_tracker.get_hns().needed_bytes,
         });
 
@@ -2627,6 +2646,7 @@ impl PeerHandler {
             .context("peer not found")??;
 
         if !should_process {
+            self.state.add_redundant_bytes(piece.len() as u64);
             return Ok(());
         }
 
@@ -2666,6 +2686,7 @@ impl PeerHandler {
                 match g.get_pieces_mut()?.block_arrived(chunk_info, addr) {
                     Arrival::Write { cancel } => (ppl, cancel),
                     Arrival::Discard => {
+                        state.add_redundant_bytes(piece.len() as u64);
                         debug!(
                             "{chunk_info:?} is no longer asked of this peer, or arrived from another first, ignoring"
                         );
@@ -2822,6 +2843,13 @@ impl PeerHandler {
                         info_hash = ?state.shared.info_hash,
                         ?addr,
                         "checksum for piece={} did not validate", index
+                    );
+                    // The whole piece counts as corrupt (libtorrent
+                    // `torrent::piece_failed` calls `add_failed_bytes` with
+                    // the piece size).
+                    state.stats.failed_bytes.fetch_add(
+                        u64::from(state.lengths.piece_length(piece_index)),
+                        Ordering::Relaxed,
                     );
                     // Before the storage lets go of the failed bytes.
                     let blocks =

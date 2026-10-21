@@ -362,6 +362,10 @@ pub(crate) struct RunCounters {
     pub uploaded_bytes: u64,
     /// Bytes of the pieces downloaded during the run that passed their check.
     pub downloaded_bytes: u64,
+    /// Bytes of the pieces downloaded during the run that failed their check.
+    pub corrupt_bytes: u64,
+    /// Bytes of the blocks received during the run and not used.
+    pub redundant_bytes: u64,
     /// Bytes of the selected pieces still missing.
     pub left_bytes: u64,
 }

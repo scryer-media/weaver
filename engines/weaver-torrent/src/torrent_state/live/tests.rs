@@ -1604,6 +1604,34 @@ async fn the_sole_sender_of_a_failed_piece_is_banned_at_once() {
     assert!(!h.refused("127.0.0.2:6881"));
 }
 
+// libtorrent torrent::piece_failed adds the piece's size to the failed
+// bytes; peer_connection::incoming_piece adds a block it has no use for to
+// the redundant bytes. Both reach the tracker as `corrupt` and `redundant`.
+#[tokio::test]
+async fn a_failed_piece_counts_as_corrupt_and_a_block_already_had_as_redundant() {
+    let h = Harness::new("corrupt_and_redundant_bytes").await;
+    tokio::time::pause();
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.take(&peer, 0);
+    h.send(&peer, (0, 0), false).await.unwrap();
+    assert_eq!((h.get_failed_bytes(), h.get_redundant_bytes()), (0, 0));
+    h.send(&peer, (0, 0), false).await.unwrap();
+    assert_eq!(
+        (h.get_failed_bytes(), h.get_redundant_bytes()),
+        (0, u64::from(CHUNK_SIZE))
+    );
+
+    for chunk in 1..CHUNKS_PER_PIECE {
+        h.send(&peer, (0, chunk), chunk == 2).await.unwrap();
+    }
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert_eq!(
+        (h.get_failed_bytes(), h.get_redundant_bytes()),
+        (u64::from(PIECE_LENGTH), u64::from(CHUNK_SIZE))
+    );
+}
+
 #[tokio::test]
 async fn a_peer_in_four_failed_pieces_is_banned_and_a_passed_piece_earns_a_point() {
     let h = Harness::new("trust_floor_ban").await;

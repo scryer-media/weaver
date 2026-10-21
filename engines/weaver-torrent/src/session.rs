@@ -2588,8 +2588,23 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         let last_run = *mt.shared().last_run.lock();
         let run = live
             .as_ref()
-            .map(|l| (l.get_uploaded_bytes(), l.get_downloaded_bytes()))
-            .or(last_run.map(|r| (r.uploaded_bytes, r.downloaded_bytes)));
+            .map(|l| {
+                (
+                    l.get_uploaded_bytes(),
+                    l.get_downloaded_bytes(),
+                    l.get_failed_bytes(),
+                    l.get_redundant_bytes(),
+                )
+            })
+            .or(last_run.map(|r| {
+                (
+                    r.uploaded_bytes,
+                    r.downloaded_bytes,
+                    r.corrupt_bytes,
+                    r.redundant_bytes,
+                )
+            }));
+        let (uploaded, downloaded, corrupt, redundant) = run.unwrap_or_default();
         // What the whole torrent still lacks, whatever is selected, so a
         // torrent that has its selected files but not every piece never reads
         // as a seed (libtorrent `torrent::bytes_left`). Once the pieces are
@@ -2599,8 +2614,10 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             .ok()
             .or(last_run.map(|r| r.left_bytes));
         crate::tracker::TrackerCommsStats {
-            uploaded_bytes: run.map_or(0, |(uploaded, _)| uploaded),
-            downloaded_bytes: run.map_or(0, |(_, downloaded)| downloaded),
+            uploaded_bytes: uploaded,
+            downloaded_bytes: downloaded,
+            corrupt_bytes: corrupt,
+            redundant_bytes: redundant,
             left_bytes,
             torrent_state,
             // `completed` is for becoming a seed, not for finishing a
