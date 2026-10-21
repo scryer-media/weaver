@@ -177,6 +177,7 @@ fn request(source: AddSource) -> AddRequest {
         paused: false,
         forced: false,
         unpack: None,
+        metadata: Vec::new(),
     }
 }
 
@@ -456,6 +457,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         files: Vec::new(),
         trackers: Vec::new(),
         file_have: Vec::new(),
+        metadata: Vec::new(),
         seeding_override: None,
         seeding_inherited: None,
         seeding_policy: SeedingPolicy::default(),
@@ -542,6 +544,39 @@ async fn a_magnet_is_refused_without_a_network_to_fetch_it_on() {
         Err(AddError::NoNetwork(_))
     ));
     assert!(rig.db.list_torrents().unwrap().is_empty());
+}
+
+// The attributes a torrent is added with stay with its job, from the queue
+// to history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_keeps_the_attributes_it_was_added_with_into_history() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let metadata = vec![
+        ("rss.feed_id".to_string(), "4".to_string()),
+        ("tier".to_string(), "gold".to_string()),
+    ];
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            metadata: metadata.clone(),
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().metadata,
+        metadata
+    );
+    let infos = rig.service.job_infos().await;
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].metadata, metadata);
+
+    rig.service.remove(job_id, false, false).await.unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    let kept: Vec<(String, String)> =
+        serde_json::from_str(history.metadata.as_deref().unwrap()).unwrap();
+    assert_eq!(kept, metadata);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1936,6 +1971,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         policy_override: None,
         tracker_rule_id: Some(1),
         unpack: None,
+        metadata: Vec::new(),
     };
     let mut rules = vec![TrackerRule {
         id: 1,

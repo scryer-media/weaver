@@ -1418,6 +1418,7 @@ async fn add_torrent(
             paused,
             forced: false,
             unpack,
+            metadata: Vec::new(),
         },
     )
     .await?;

@@ -27,6 +27,7 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         policy_override: None,
         tracker_rule_id: None,
         unpack: None,
+        metadata: Vec::new(),
     }
 }
 

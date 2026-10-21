@@ -312,6 +312,7 @@ pub(crate) async fn run(
         {
             Ok(torrents) => {
                 watch_folder.use_torrents(torrents.clone());
+                rss.use_torrents(torrents.clone());
                 Some(torrents)
             }
             Err(error) => {

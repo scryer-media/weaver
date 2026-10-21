@@ -12,7 +12,7 @@ use crate::torrents::{
 
 pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
      private, category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
-     policy_override, tracker_rule_id, unpack";
+     policy_override, tracker_rule_id, unpack, metadata";
 
 fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
     StateError::Database(format!("stored torrent {what} is not valid: {value}"))
@@ -44,6 +44,11 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         .opt_text("policy_override")?
         .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("policy", error)))
         .transpose()?;
+    let metadata = row
+        .opt_text("metadata")?
+        .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("metadata", error)))
+        .transpose()?
+        .unwrap_or_default();
     Ok(TorrentRecord {
         job_id: JobId(count(row, "job_id")?),
         infohash_v1: hash(row, "infohash_v1")?,
@@ -61,6 +66,7 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         policy_override,
         tracker_rule_id: opt_u32(row, "tracker_rule_id")?,
         unpack: row.opt_bool("unpack")?,
+        metadata,
     })
 }
 

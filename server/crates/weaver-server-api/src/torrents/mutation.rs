@@ -80,6 +80,7 @@ impl TorrentsMutation {
                 paused: input.paused,
                 forced: input.forced,
                 unpack: input.unpack,
+                metadata: Vec::new(),
             },
         )
         .await?;

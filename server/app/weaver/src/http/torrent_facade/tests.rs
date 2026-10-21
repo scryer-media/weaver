@@ -399,6 +399,7 @@ fn view(state: TorrentState) -> TorrentView {
         files: Vec::new(),
         file_have: Vec::new(),
         trackers: Vec::new(),
+        metadata: Vec::new(),
     }
 }
 

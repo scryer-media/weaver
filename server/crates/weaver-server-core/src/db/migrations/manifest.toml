@@ -936,3 +936,20 @@ kind = "sql"
 file = "migrations/0076_tracker_rule_client/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 77
+description = "a torrent's job keeps the attributes it was added with"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0077_torrent_metadata/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0077_torrent_metadata/postgres.sql"
+engine = "postgres"
+scope = "all"

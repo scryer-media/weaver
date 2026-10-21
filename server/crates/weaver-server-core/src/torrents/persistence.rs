@@ -26,6 +26,10 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         .map(|policy| serde_json::to_string(&policy))
         .transpose()
         .map_err(|error| StateError::Database(error.to_string()))?;
+    let metadata = (!torrent.metadata.is_empty())
+        .then(|| serde_json::to_string(&torrent.metadata))
+        .transpose()
+        .map_err(|error| StateError::Database(error.to_string()))?;
     Ok(vec![
         SqlArg::I64(stored(torrent.job_id.0)?),
         SqlArg::OptBytes(torrent.infohash_v1.map(|hash| hash.to_vec())),
@@ -43,6 +47,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptText(policy_override),
         SqlArg::OptI64(torrent.tracker_rule_id.map(i64::from)),
         SqlArg::OptBool(torrent.unpack),
+        SqlArg::OptText(metadata),
     ])
 }
 
@@ -96,7 +101,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO torrents ({TORRENT_COLUMNS})
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &torrent_args,
                     )

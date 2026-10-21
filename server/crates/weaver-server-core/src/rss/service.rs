@@ -223,7 +223,7 @@ impl RssService {
             return Err("scheduled RSS sync cancelled".to_string().into());
         }
         match fetched {
-            Ok(source) => self.add_torrent(source, category).await,
+            Ok(source) => self.add_torrent(source, category, metadata).await,
             Err((nzb, supplied_password_candidates)) => {
                 weaver_nzb::parse_nzb(&nzb).map_err(|e| format!("invalid NZB: {e}"))?;
                 // Submission owns durable writes. Once started it must finish before shutdown.
@@ -281,6 +281,7 @@ impl RssService {
         &self,
         source: AddSource,
         category: Option<String>,
+        metadata: Vec<(String, String)>,
     ) -> Result<u64, NotAdded> {
         let Some(torrents) = self.inner.torrents.get() else {
             return Err("the torrent client is not running".to_string().into());
@@ -292,6 +293,7 @@ impl RssService {
             paused: false,
             forced: false,
             unpack: None,
+            metadata,
         };
         match torrents.add(request).await {
             Ok(job_id) => Ok(job_id.0),

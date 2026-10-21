@@ -136,6 +136,8 @@ pub struct TorrentRecord {
     // Whether its archives are extracted: the torrent's own value until its
     // job is built, then the value in force.
     pub unpack: Option<bool>,
+    // The attributes its job was added with.
+    pub metadata: Vec<(String, String)>,
 }
 
 impl TorrentRecord {

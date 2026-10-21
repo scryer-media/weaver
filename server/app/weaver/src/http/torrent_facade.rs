@@ -955,6 +955,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
             paused,
             forced: false,
             unpack: None,
+            metadata: Vec::new(),
         };
         match torrents.add(request).await {
             Ok(_) => added += 1,

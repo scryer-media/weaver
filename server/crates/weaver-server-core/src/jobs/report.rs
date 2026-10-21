@@ -30,6 +30,7 @@ pub struct JobReport {
     // Why the job waits, while it does.
     pub wait_reason: Option<String>,
     pub created_at_ms: i64,
+    pub metadata: Vec<(String, String)>,
 }
 
 impl JobReport {
@@ -70,7 +71,7 @@ impl JobReport {
             remaining_par_files: 0,
             password: None,
             category: self.category,
-            metadata: Vec::new(),
+            metadata: self.metadata,
             output_dir: self.output_dir,
             server_attribution: Vec::new(),
             download_wait_reason: self.wait_reason,
@@ -103,7 +104,8 @@ impl JobReport {
             nzb_path: None,
             created_at: self.created_at_ms / 1000,
             completed_at: completed_at_ms / 1000,
-            metadata: None,
+            metadata: (!self.metadata.is_empty())
+                .then(|| serde_json::to_string(&self.metadata).expect("pairs of strings")),
             server_attribution: None,
             protocol: self.protocol,
         }

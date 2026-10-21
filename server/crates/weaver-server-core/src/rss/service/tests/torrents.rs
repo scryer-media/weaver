@@ -78,7 +78,7 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
         min_size_bytes: sizes.map(|(min, _)| min),
         max_size_bytes: sizes.map(|(_, max)| max),
         category_override: None,
-        metadata: vec![],
+        metadata: vec![("tier".to_string(), "gold".to_string())],
     })
     .unwrap();
 
@@ -220,6 +220,20 @@ async fn a_magnet_link_is_added_without_a_fetch() {
     assert_eq!(
         rig.seen(),
         vec![("a".into(), "submitted".into(), Some(jobs[0]), None)]
+    );
+    // The job carries the feed's attributes as an NZB job does.
+    let stored = rig.db.list_torrents().unwrap();
+    assert_eq!(
+        stored[0].metadata,
+        [
+            ("rss.feed_id", "1"),
+            ("rss.feed_name", "Torrent Feed"),
+            ("rss.item_id", "a"),
+            ("rss.item_title", "Silver Horizon a"),
+            ("rss.item_url", magnet().replace("&amp;", "&").as_str()),
+            ("tier", "gold"),
+        ]
+        .map(|(key, value)| (key.to_string(), value.to_string()))
     );
 }
 

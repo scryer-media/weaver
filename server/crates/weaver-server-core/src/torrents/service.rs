@@ -308,6 +308,8 @@ pub struct AddRequest {
     pub forced: bool,
     // Whether its archives are extracted; `None` inherits.
     pub unpack: Option<bool>,
+    // The attributes its job carries.
+    pub metadata: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -407,6 +409,8 @@ pub struct TorrentView {
     /// Each file's bytes in hand, by its index in the torrent.
     pub file_have: Vec<u64>,
     pub trackers: Vec<TorrentTracker>,
+    /// The attributes its job was added with.
+    pub metadata: Vec<(String, String)>,
 }
 
 /// A torrent's pieces: how many, how long each is, and how many verified.
@@ -1609,6 +1613,7 @@ impl TorrentService {
             policy_override: request.policy_override.clone(),
             tracker_rule_id: None,
             unpack: request.unpack,
+            metadata: request.metadata.clone(),
         }
     }
 
@@ -2599,6 +2604,7 @@ impl TorrentService {
             files: Vec::new(),
             file_have: reading.file_have,
             trackers: Vec::new(),
+            metadata: record.metadata.clone(),
         }
     }
 
@@ -2807,5 +2813,6 @@ fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
         output_dir: view.storage_dir,
         wait_reason: view.detail,
         created_at_ms: view.added_at_ms,
+        metadata: view.metadata,
     }
 }
