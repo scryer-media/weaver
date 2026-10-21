@@ -742,6 +742,38 @@ impl Harness {
     fn banned(&self, peer: &PeerHandler) -> bool {
         self.peers.is_banned(peer.addr.ip())
     }
+
+    /// Whether a peer connecting from `addr` is turned away.
+    fn refused(&self, addr: &str) -> bool {
+        let (tx, _rx) = unbounded_channel();
+        self.peers
+            .add_incoming(
+                addr.parse().unwrap(),
+                Id20::default(),
+                tx,
+                ConnectionKind::Tcp,
+            )
+            .is_err()
+    }
+
+    /// The trust points, hash failures and parole of the peer.
+    fn trust(&self, peer: &PeerHandler) -> (i8, u8, bool) {
+        let trust = self.peers.with_peer(peer.addr, |p| p.trust()).unwrap();
+        (trust.points(), trust.hashfails(), trust.on_parole())
+    }
+
+    /// `bad` sends the first half of piece 0, its second block corrupt, and
+    /// chokes us; `good` sends the rest, and the piece fails.
+    async fn fail_shared(&self, bad: &PeerHandler, good: &PeerHandler) {
+        self.take(bad, 0);
+        self.send(bad, (0, 0), false).await.unwrap();
+        self.send(bad, (0, 1), true).await.unwrap();
+        bad.on_i_am_choked().unwrap();
+        self.take(good, 0);
+        self.send(good, (0, 2), false).await.unwrap();
+        self.send(good, (0, 3), false).await.unwrap();
+        assert_eq!(self.missing_chunks(0), vec![0, 1, 2, 3]);
+    }
 }
 
 /// Whether the peer's writer was told to close the connection.
@@ -758,19 +790,15 @@ async fn the_sender_of_a_bad_block_is_banned_once_the_piece_passes_and_the_other
     let (good, mut good_rx) = h.peer("127.0.0.2:6881");
     let (third, mut third_rx) = h.peer("127.0.0.3:6881");
 
-    // The bad peer sends the first half of piece 0, the second block of it
-    // corrupt, and chokes us; the good peer sends the rest.
-    h.take(&bad, 0);
-    h.send(&bad, (0, 0), false).await.unwrap();
-    h.send(&bad, (0, 1), true).await.unwrap();
-    bad.on_i_am_choked().unwrap();
-    h.take(&good, 0);
-    h.send(&good, (0, 2), false).await.unwrap();
-    assert!(h.send(&good, (0, 3), false).await.is_err());
-
-    // The piece failed: it is downloaded again, and neither is blamed yet.
-    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
-    assert!(!h.banned(&bad) && !h.banned(&good));
+    // The piece the two shared failed: it is downloaded again, and each
+    // loses two points and goes on parole, but neither is banned, nor
+    // disconnected, as either may have sent the bad block.
+    h.fail_shared(&bad, &good).await;
+    for peer in [&bad, &good] {
+        assert_eq!(h.trust(peer), (-2, 1, true));
+        assert!(!h.banned(peer));
+    }
+    assert!(!told_to_disconnect(&mut bad_rx) && !told_to_disconnect(&mut good_rx));
 
     // A third peer sends the whole piece and it passes: the block the bad
     // peer sent differs from the one now had.
@@ -783,19 +811,10 @@ async fn the_sender_of_a_bad_block_is_banned_once_the_piece_passes_and_the_other
     assert!(told_to_disconnect(&mut bad_rx));
     assert!(!h.banned(&good) && !told_to_disconnect(&mut good_rx));
     assert!(!h.banned(&third) && !told_to_disconnect(&mut third_rx));
+    assert_eq!(h.trust(&third), (1, 0, false));
 
     // The bad peer is turned away when it connects again.
-    let (tx, _rx) = unbounded_channel();
-    assert!(
-        h.peers
-            .add_incoming(
-                "127.0.0.1:50000".parse().unwrap(),
-                Id20::default(),
-                tx,
-                ConnectionKind::Tcp
-            )
-            .is_err()
-    );
+    assert!(h.refused("127.0.0.1:50000"));
     // The records went with the pass.
     assert!(
         h.lock_write("test")
@@ -803,6 +822,58 @@ async fn the_sender_of_a_bad_block_is_banned_once_the_piece_passes_and_the_other
             .piece_passed(h.piece(0))
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn the_sole_sender_of_a_failed_piece_is_banned_at_once() {
+    let h = Harness::new("sole_sender_banned").await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+
+    h.take(&peer, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&peer, (0, chunk), chunk == 2).await.unwrap();
+    }
+
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert_eq!(h.trust(&peer), (-2, 1, true));
+    assert!(h.banned(&peer));
+    assert!(told_to_disconnect(&mut rx));
+    assert!(h.refused("127.0.0.1:50000"));
+    assert!(!h.refused("127.0.0.2:6881"));
+}
+
+#[tokio::test]
+async fn a_peer_in_four_failed_pieces_is_banned_and_a_passed_piece_earns_a_point() {
+    let h = Harness::new("trust_floor_ban").await;
+    tokio::time::pause();
+    let (a, _a_rx) = h.peer("127.0.0.1:6881");
+    let (b, _b_rx) = h.peer("127.0.0.2:6881");
+    let (c, _c_rx) = h.peer("127.0.0.3:6881");
+
+    // A passed piece: b earns a point.
+    h.take(&b, 1);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&b, (1, chunk), false).await.unwrap();
+    }
+    assert_eq!(h.trust(&b), (1, 0, false));
+    // b chokes us, so no piece it took on the way stays its own.
+    b.on_i_am_choked().unwrap();
+
+    // a shares four failed pieces, two with b and two with c. Each failure
+    // costs both senders two points; a reaches the floor at the fourth and
+    // is banned, the others, in two each, are not.
+    for (failures, other) in [(1, &b), (2, &c), (3, &b)] {
+        h.fail_shared(&a, other).await;
+        assert_eq!(h.trust(&a), (-2 * failures, failures as u8, true));
+        assert!(!h.banned(&a));
+    }
+    h.fail_shared(&a, &c).await;
+    assert_eq!(h.trust(&a), (peer::Trust::MIN_POINTS, 4, true));
+    assert!(h.banned(&a));
+    assert_eq!(h.trust(&b), (-3, 2, true));
+    assert_eq!(h.trust(&c), (-4, 2, true));
+    assert!(!h.banned(&b) && !h.banned(&c));
 }
 
 mod v2 {

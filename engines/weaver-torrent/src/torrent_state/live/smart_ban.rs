@@ -29,6 +29,19 @@ impl<F: FnMut(PeerHandle, &ChunkInfo, &mut [u8]) -> anyhow::Result<()>> ReadBloc
 #[derive(Debug, Default)]
 pub(crate) struct Senders(Vec<Option<PeerHandle>>);
 
+impl Senders {
+    /// The peers that sent a block of the piece, each once.
+    pub fn participants(&self) -> BTreeSet<PeerHandle> {
+        self.0.iter().flatten().copied().collect()
+    }
+
+    /// Whether one peer sent the whole piece. A block of unknown sender
+    /// counts as sent by another (libtorrent `torrent::piece_failed`).
+    pub fn sole_sender(&self) -> bool {
+        self.0.iter().all(Option::is_some) && self.participants().len() == 1
+    }
+}
+
 /// A block of a piece that failed, as `sender` sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SentBlock {
@@ -213,6 +226,27 @@ mod tests {
 
     fn piece() -> ValidPieceIndex {
         lengths().validate_piece_index(0).unwrap()
+    }
+
+    #[test]
+    fn a_piece_has_a_sole_sender_only_when_one_known_peer_sent_every_block() {
+        let (a, b) = (peer(1), peer(2));
+        let mut smart_ban = SmartBan::default();
+        let sole = deliver(&mut smart_ban, [a, a, a, a]);
+        assert!(sole.sole_sender());
+        assert_eq!(sole.participants(), BTreeSet::from([a]));
+
+        let shared = deliver(&mut smart_ban, [a, b, a, a]);
+        assert!(!shared.sole_sender());
+        assert_eq!(shared.participants(), BTreeSet::from([a, b]));
+
+        // A block of unknown sender may have come from another peer.
+        for chunk in lengths().iter_chunk_infos(piece()).skip(1) {
+            smart_ban.block_received(&chunk, a, BLOCKS);
+        }
+        let partly_unknown = smart_ban.take_senders(piece());
+        assert!(!partly_unknown.sole_sender());
+        assert_eq!(partly_unknown.participants(), BTreeSet::from([a]));
     }
 
     #[test]

@@ -263,6 +263,18 @@ impl Peer {
         self.trust
     }
 
+    /// A piece the peer sent a block of passed its hash check.
+    pub(crate) fn piece_passed(&mut self) {
+        self.trust.piece_passed();
+    }
+
+    /// A piece the peer sent a block of failed its hash check, and the peer
+    /// sent all of it when `sole_sender` holds. Returns whether the peer is
+    /// to be banned.
+    pub(crate) fn piece_failed(&mut self, sole_sender: bool) -> bool {
+        self.trust.piece_failed(sole_sender)
+    }
+
     /// Where the peer stands when a full list must forget one; None for a
     /// connected peer, which is never forgotten.
     pub(crate) fn erase_rank(&self) -> Option<EraseRank> {

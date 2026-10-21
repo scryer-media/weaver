@@ -2177,6 +2177,13 @@ impl PeerHandler {
                             .mark_piece_hash_ok(chunk_info.piece_index);
                         g.smart_ban.piece_passed(piece_index)
                     };
+                    // Every peer that sent a block of it earns a point and
+                    // leaves parole (libtorrent `torrent::piece_passed`).
+                    for peer in senders.participants() {
+                        state
+                            .peers
+                            .with_peer_mut(peer, "piece_passed", |p| p.piece_passed());
+                    }
                     // Before the storage is told the piece is complete, while
                     // the good bytes are still there to read back.
                     for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
@@ -2221,7 +2228,7 @@ impl PeerHandler {
                         id = state.shared.id,
                         info_hash = ?state.shared.info_hash,
                         ?addr,
-                        "checksum for piece={} did not validate. disconnecting peer.", index
+                        "checksum for piece={} did not validate", index
                     );
                     // Before the storage lets go of the failed bytes.
                     let blocks =
@@ -2230,16 +2237,26 @@ impl PeerHandler {
                         .lock_write("smart_ban")
                         .smart_ban
                         .piece_failed(piece_index, blocks);
-                    for liar in liars {
-                        state.peers.ban(liar);
+                    // Every peer that sent a block of it loses points and goes
+                    // on parole; one at the floor, or that sent the whole
+                    // piece, is banned (libtorrent `torrent::piece_failed`,
+                    // `torrent::penalize_peers`).
+                    let sole_sender = senders.sole_sender();
+                    for peer in senders.participants() {
+                        let to_ban = state
+                            .peers
+                            .with_peer_mut(peer, "piece_failed", |p| p.piece_failed(sole_sender))
+                            .unwrap_or(sole_sender);
+                        if to_ban || liars.contains(&peer) {
+                            state.peers.ban(peer);
+                        }
                     }
                     state.requeue_piece(piece_index)?;
-                    anyhow::bail!("i am probably a bogus peer. dying.")
                 }
-                Verdict::Unknown => {
-                    state.requeue_piece(piece_index)?;
-                    anyhow::bail!("i am probably a bogus peer. dying.")
-                }
+                // No hash to check the piece against: nobody is to blame
+                // (libtorrent `torrent::on_piece_verified` neither passes nor
+                // fails it).
+                Verdict::Unknown => state.requeue_piece(piece_index)?,
             };
             Ok(())
         }
