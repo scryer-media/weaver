@@ -210,8 +210,9 @@ fn slice_validity(
 // Each described file no member is bound to that an unnamed member holds a
 // slice of, to the first that does: the repair knows it by its content. What
 // no slice named has no intact byte to say what it is, so it is what is
-// left: longest file first, each takes the unnamed member it fits most
-// tightly, and the repair makes every byte of it over.
+// left once nothing still to come can be it: longest file first, each takes
+// the unnamed member it fits most tightly, and the repair makes every byte
+// of it over.
 fn known_by_slices(
     state: &SetState,
     access: &mut dyn MemberAccess,
@@ -240,15 +241,31 @@ fn known_by_slices(
         .filter_map(|file| Some((*file, index.file_description(file)?.length)))
         .collect();
     free.sort_by_key(|(_, long)| Reverse(*long));
-    for (file, long) in free {
-        let fitting = unnamed
+    // A file is a member's by elimination only when it is what is left: the
+    // free files the members that fit it could be are no more than they
+    // are. A file over is one a member still to come may be. Each file taken
+    // leaves less for the rest, so the files are tried again until none is.
+    while let Some((at, file, member)) = free.iter().enumerate().find_map(|(at, (file, long))| {
+        let fitting: Vec<usize> = (0..unnamed.len())
+            .filter(|candidate| unnamed[*candidate].1.fits(*long))
+            .collect();
+        let could_be = free
             .iter()
-            .enumerate()
-            .filter(|(_, (_, length))| length.fits(long))
-            .min_by_key(|(_, (_, length))| length.bound());
-        if let Some((at, _)) = fitting {
-            known.push((file, unnamed.swap_remove(at).0));
-        }
+            .filter(|(_, other)| {
+                fitting
+                    .iter()
+                    .any(|candidate| unnamed[*candidate].1.fits(*other))
+            })
+            .count();
+        let tightest = fitting
+            .iter()
+            .copied()
+            .min_by_key(|candidate| unnamed[*candidate].1.bound())
+            .filter(|_| could_be <= fitting.len())?;
+        Some((at, *file, tightest))
+    }) {
+        free.remove(at);
+        known.push((file, unnamed.swap_remove(member).0));
     }
     known
 }

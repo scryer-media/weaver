@@ -689,6 +689,49 @@ fn a_member_with_no_intact_byte_binds_by_elimination_and_is_mended_in_place() {
     assert!(record.is_complete());
 }
 
+// An all-lost member that could be either of two free files is neither
+// while the other file's member is still to come: elimination binds it only
+// once that member has named itself, and then to the one file left, which
+// the repair mends in place.
+#[test]
+fn elimination_waits_for_the_members_still_to_come() {
+    let first = payload(35, 3 * BLOCK as usize - 24);
+    let second = payload(36, 4 * BLOCK as usize - 8);
+    let files = par2_set(
+        "set",
+        &[
+            ("first.bin", first.as_slice()),
+            ("second.bin", second.as_slice()),
+        ],
+        BLOCK,
+        4,
+        1,
+    );
+    let mut job = job(&files);
+    let lost = vec![0; second.len() + 100];
+    let posted = job.member("5f0c9e2ab1d74c6e", &lost);
+    job.arrive(posted, 0, &lost, Provenance::Damaged);
+    let coming = job
+        .namespace
+        .announce("a91d07e4c3b25f86", Some(second.len() as u64));
+    assert!(bind(&mut job).is_empty());
+
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert!(!job.object.covers(posted));
+    assert!(job.store.members[&posted] == lost);
+
+    job.arrive(coming, 0, &second, Provenance::Fresh);
+    job.store.members.insert(coming, second.clone());
+    assert_eq!(bind(&mut job), vec![coming]);
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 3 }
+    );
+    assert!(job.object.covers(posted));
+    assert!(job.store.members[&posted][..first.len()] == first);
+    assert!(job.store.members[&coming] == second);
+}
+
 // A recovery packet whose payload fails its hash is dropped at the scan, so
 // it is never counted as a block in hand.
 #[test]
