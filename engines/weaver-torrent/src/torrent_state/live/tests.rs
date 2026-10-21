@@ -2396,6 +2396,28 @@ async fn a_session_without_dht_sets_no_dht_bit_and_sends_no_port() {
     assert!(rx.try_recv().is_err());
 }
 
+// libtorrent `peer_connection::incoming_dht_port` adds the named node on
+// each PORT; here a connection's repeat of the port it named last adds
+// nothing, and another port is a node to add.
+#[tokio::test]
+async fn a_repeated_dht_port_names_no_new_node() {
+    let h = Harness::new("dht_port_repeat").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    let port = |port| peer.on_received_message(Message::Port(port));
+    let news = |port| {
+        h.peers
+            .with_live_mut(peer.addr, "test", |live| live.dht_node_named(port))
+            .unwrap()
+    };
+    port(6881).await.unwrap();
+    port(6881).await.unwrap();
+    assert!(!news(6881));
+    port(6882).await.unwrap();
+    assert!(!news(6882));
+    assert!(news(6881));
+}
+
 // libtorrent `bt_peer_connection::write_dht_port` after the handshake to a
 // peer with the DHT bit, `on_dht_port` answering a PORT from a peer
 // without it, once per connection; `peer_connection::incoming_dht_port`

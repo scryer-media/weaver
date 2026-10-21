@@ -696,6 +696,10 @@ pub(crate) struct LivePeerState {
     // first (libtorrent `ut_pex_peer_plugin::m_last_pex`).
     pex_arrivals: [Option<Instant>; PEX_FLOOD_MESSAGES],
 
+    // The port of the DHT node the peer named on this connection (BEP 5
+    // PORT).
+    dht_port: Option<u16>,
+
     // The main channel to send requests to peer.
     pub tx: PeerTx,
 
@@ -765,6 +769,7 @@ impl LivePeerState {
             supports_holepunch: false,
             pex_named: HashSet::new(),
             pex_arrivals: [None; PEX_FLOOD_MESSAGES],
+            dht_port: None,
             tx,
             connection_kind,
             fast: false,
@@ -772,6 +777,12 @@ impl LivePeerState {
             allowed_fast_from_peer: Vec::new(),
             suggested: Vec::new(),
         }
+    }
+
+    /// The peer named its DHT node at `port` (BEP 5 PORT). Whether that is
+    /// news: the port it named last names nothing new, another replaces it.
+    pub fn dht_node_named(&mut self, port: u16) -> bool {
+        self.dht_port.replace(port) != Some(port)
     }
 
     /// A PEX message from the peer arrived at `now`. False when it is one

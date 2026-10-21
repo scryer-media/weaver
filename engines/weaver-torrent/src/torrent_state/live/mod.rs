@@ -1631,11 +1631,17 @@ impl PeerHandler {
     }
 
     /// A peer named its DHT node: the DHT pings it and adds it on reply
-    /// (libtorrent `peer_connection::incoming_dht_port`). A peer that sends
-    /// PORT runs a DHT node even without the handshake bit, so it gets
-    /// ours (`bt_peer_connection::on_dht_port`).
+    /// (libtorrent `peer_connection::incoming_dht_port`), once for each
+    /// port the connection names, so a repeated PORT is no new ping. A peer
+    /// that sends PORT runs a DHT node even without the handshake bit, so
+    /// it gets ours (`bt_peer_connection::on_dht_port`).
     fn on_dht_port(&self, port: u16) {
-        if let Some(dht) = self.dht() {
+        let news = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "dht_port", |live| live.dht_node_named(port))
+            .unwrap_or(false);
+        if news && let Some(dht) = self.dht() {
             dht.add_node(SocketAddr::new(self.addr.ip(), port));
         }
         self.send_dht_port();
