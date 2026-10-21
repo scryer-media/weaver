@@ -78,16 +78,6 @@ impl ValidPieceIndex {
 }
 
 impl Lengths {
-    pub fn from_torrent<ByteBuf: AsRef<[u8]>>(
-        torrent: &crate::core::torrent_metainfo::TorrentMetaV1Info<ByteBuf>,
-    ) -> crate::core::Result<Lengths> {
-        let total_length = torrent
-            .iter_file_details_raw(encoding_rs::UTF_8)?
-            .map(|d| d.len)
-            .sum();
-        Lengths::new(total_length, torrent.piece_length)
-    }
-
     pub fn new(total_length: u64, piece_length: u32) -> crate::core::Result<Self> {
         if total_length == 0 {
             return Err(Error::BadTorrentZeroLength);

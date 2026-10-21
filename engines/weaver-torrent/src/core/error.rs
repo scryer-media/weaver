@@ -28,37 +28,32 @@ pub enum Error {
     #[error("empty filename in torrent")]
     BadTorrentEmptyFilename,
 
-    // BEP 52 (v2) errors
-    #[error("v2 torrent missing file_tree")]
+    #[error("error decoding bencode: {0}")]
+    Bencode(#[from] crate::bencode::DeserializeError),
+
+    // BEP 52 (v2), named after the libtorrent errors they mirror.
+    #[error("unknown meta version {0}")]
+    V2UnknownVersion(i64),
+    #[error("v2 torrent has no file tree")]
     V2MissingFileTree,
-    #[error("v2 torrent file_tree root must be a directory, not a file")]
-    V2FileTreeRootIsFile,
-    #[error("v2 file_tree has \".\" path component")]
-    V2FileTreeDotComponent,
-    #[error("v2 torrent missing meta_version")]
+    #[error("file tree without meta version 2")]
     V2MissingMetaVersion,
-    #[error("unsupported meta_version: {0}")]
-    V2UnsupportedMetaVersion(u32),
-    #[error("v2 torrent missing piece_layers")]
-    V2MissingPieceLayers,
-    #[error("v2 piece_layers missing entry for file: {0}")]
-    V2MissingPieceLayersEntry(String),
-    #[error("v2 piece_layers entry has wrong size: expected {expected}, got {actual}")]
-    V2PieceLayersWrongSize { expected: usize, actual: usize },
-    #[error("v2 piece_layers count mismatch: expected {expected}, got {actual}")]
-    V2PieceLayerCountMismatch { expected: usize, actual: usize },
-    #[error("v2 piece_layers merkle root mismatch for file")]
-    V2PieceLayersRootMismatch,
-    #[error("v2 small file should not have piece_layers entry")]
-    V2SmallFileShouldNotHavePieceLayers,
-    #[error("v2 small file missing pieces_root")]
-    V2SmallFileMissingPiecesRoot,
-    #[error("v2 zero-length file should not have pieces_root")]
-    V2ZeroLengthFileHasPiecesRoot,
-    #[error("invalid v2 piece length {0}: must be power of two and >= 16384")]
+    #[error("invalid v2 piece length {0}: must be a power of two and at least 16 KiB")]
     V2InvalidPieceLength(u32),
-    #[error("invalid v2 torrent: has meta_version but no pieces and no file_tree")]
-    V2InvalidTorrent,
-    #[error("v2 hybrid file list mismatch: {0}")]
-    V2HybridFileListMismatch(String),
+    #[error("torrent with a v1 file listing has no pieces")]
+    MissingPieces,
+    #[error("v2 file tree lists a pad file")]
+    V2InvalidPadFile,
+    #[error("v2 file has an invalid length")]
+    V2InvalidLength,
+    #[error("v2 file has no valid pieces root")]
+    V2MissingPiecesRoot,
+    #[error("v1 and v2 file listings of a hybrid torrent differ")]
+    V2InconsistentFiles,
+    #[error("invalid piece layer")]
+    V2InvalidPieceLayer,
+    #[error("info dict keys out of order or with leading zeros")]
+    InvalidBencoding,
+    #[error("too many pieces in torrent")]
+    TooManyPieces,
 }

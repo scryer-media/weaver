@@ -200,6 +200,37 @@ impl Id32 {
     }
 }
 
+/// A torrent's info hashes: SHA-1 of its info dict when it has a v1
+/// listing, SHA-256 when it is v2 (libtorrent `info_hash_t`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct InfoHashes {
+    pub v1: Option<Id20>,
+    pub v2: Option<Id32>,
+}
+
+impl InfoHashes {
+    /// The 20-byte hash the torrent goes by on the wire, in trackers and
+    /// in the DHT: the v1 hash, else the truncated v2 hash (libtorrent
+    /// `info_hash_t::get_best`).
+    pub fn best(&self) -> Id20 {
+        self.v1
+            .or_else(|| self.v2.map(|v2| v2.truncate_for_dht()))
+            .unwrap_or_default()
+    }
+
+    /// Every 20-byte hash the torrent answers to: v1 and the truncated v2.
+    pub fn ids20(&self) -> impl Iterator<Item = Id20> + use<> {
+        self.v1
+            .into_iter()
+            .chain(self.v2.map(|v2| v2.truncate_for_dht()))
+    }
+
+    /// Whether `id` is one of the 20-byte hashes the torrent answers to.
+    pub fn answers_to(&self, id: Id20) -> bool {
+        self.ids20().any(|own| own == id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

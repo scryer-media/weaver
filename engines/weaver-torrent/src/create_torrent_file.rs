@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use crate::bencode::{WithRawBytes, bencode_serialize_to_writer};
 use crate::buffers::ByteBufOwned;
-use crate::core::Id20;
 use crate::core::magnet::Magnet;
 use crate::core::torrent_metainfo::{TorrentMetaV1File, TorrentMetaV1Info, TorrentMetaV1Owned};
+use crate::core::{Id20, InfoHashes};
 use crate::sha1w::ISha1;
 use anyhow::Context;
 use bytes::Bytes;
@@ -167,8 +167,10 @@ async fn create_torrent_raw<'a>(
     Ok(CreateTorrentRawResult {
         info: TorrentMetaV1Info {
             name: Some(name),
-            pieces: piece_hashes.into(),
+            pieces: Some(piece_hashes.into()),
             piece_length,
+            meta_version: None,
+            file_tree: None,
             length: if single_file_mode { Some(length) } else { None },
             md5sum: None,
             files: if single_file_mode {
@@ -242,7 +244,12 @@ pub async fn create_torrent<'a>(
             publisher: None,
             publisher_url: None,
             creation_date: None,
+            piece_layers: None,
             info_hash,
+            info_hashes: InfoHashes {
+                v1: Some(info_hash),
+                v2: None,
+            },
         },
         output_folder: res.output_folder,
     })

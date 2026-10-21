@@ -1405,7 +1405,7 @@ impl Session {
             .iter_file_details()
             .map(|fd| Ok((fd.filename.to_pathbuf(), fd.len)))
             .collect::<anyhow::Result<Vec<(PathBuf, u64)>>>()?;
-        if files.len() < 2 {
+        if files.len() < 2 || info.is_single_file() {
             return Ok(None);
         }
 

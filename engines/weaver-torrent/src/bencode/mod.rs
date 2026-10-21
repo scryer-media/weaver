@@ -9,6 +9,7 @@ mod bencode_value;
 mod deserialize;
 pub mod raw_value;
 mod serialize;
+mod soft_error;
 
 pub use bencode_value::*;
 pub use deserialize::{
@@ -17,5 +18,6 @@ pub use deserialize::{
     from_bytes_with_rest,
 };
 pub use serialize::{Error as SerializeError, bencode_serialize_to_writer};
+pub use soft_error::has_soft_error;
 
 pub use crate::buffers::{ByteBuf, ByteBufOwned};
