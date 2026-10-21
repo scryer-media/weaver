@@ -807,7 +807,7 @@ fn spawn_peer_adder(live: &Arc<TorrentStateLive>, mut peer_rx: PeerStream) {
                                 Some(live) => live,
                                 None => return Ok(()),
                             };
-                            live.add_peer_if_not_seen(peer)?;
+                            live.add_peer(peer);
                         }
                         Ok(None) => {
                             debug!("peer_rx closed, closing peer adder");

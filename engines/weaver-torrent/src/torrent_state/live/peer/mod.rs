@@ -10,6 +10,7 @@ pub mod stats;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
+use std::time::Duration;
 
 use crate::core::hash_id::Id20;
 use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
@@ -19,7 +20,7 @@ use tokio::sync::{
     Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
-use tracing::debug;
+use tokio::time::Instant;
 
 use crate::peer_connection::WriterRequest;
 use crate::stream_connect::ConnectionKind;
@@ -31,65 +32,118 @@ pub(crate) type InflightRequest = ChunkInfo;
 pub(crate) type PeerRx = UnboundedReceiver<WriterRequest>;
 pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 
+// libtorrent `min_reconnect_time`: the wait unit between connection attempts to one peer.
+pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
+// libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
+pub(crate) const MAX_FAILCOUNT: u32 = 3;
+
 #[derive(Debug)]
 pub(crate) struct Peer {
     pub addr: SocketAddr,
     state: PeerState,
     pub stats: stats::atomic::PeerStats,
+    // Where the peer listens, when we know. We can connect to the peer when it
+    // listens on the address it is listed under.
     pub outgoing_address: Option<SocketAddr>,
+    // Connections that failed in a row; one that delivers data clears it.
+    failcount: u32,
+    // When the last of those failures happened.
+    last_failed: Option<Instant>,
 }
 
 impl Peer {
+    /// A peer that connected to us. The peer list counts it on admission.
     pub fn new_live_for_incoming_connection(
         addr: SocketAddr,
         peer_id: Id20,
         tx: PeerTx,
-        counters: &PeerStates,
         connection_kind: ConnectionKind,
     ) -> Self {
-        let state = PeerState::Live(LivePeerState::new(peer_id, tx, true, connection_kind));
-        for counter in [&counters.session_stats, &counters.stats] {
-            counter.inc(&state);
-        }
         Self {
             addr,
-            state,
+            state: PeerState::Live(LivePeerState::new(peer_id, tx, true, connection_kind)),
             stats: Default::default(),
             outgoing_address: None,
+            failcount: 0,
+            last_failed: None,
         }
     }
 
+    /// A peer a tracker, DHT or PEX named, listening where it was named. The
+    /// peer list counts it on admission.
     pub fn new_with_outgoing_address(addr: SocketAddr) -> Self {
         Self {
             addr,
             outgoing_address: Some(addr),
             stats: Default::default(),
             state: Default::default(),
+            failcount: 0,
+            last_failed: None,
         }
     }
 
-    pub(crate) fn reconnect_not_needed_peer(
-        &mut self,
-        counters: &PeerStates,
-    ) -> Option<SocketAddr> {
-        if let PeerState::NotNeeded = self.get_state() {
-            match self.outgoing_address {
-                None => None,
-                Some(socket_addr) if self.addr == socket_addr => {
-                    self.set_state(PeerState::Queued, counters);
-                    Some(socket_addr)
-                }
-                Some(socket_addr) => {
-                    debug!(
-                        peer = %self.addr,
-                        outgoing_addr = %socket_addr,
-                        "peer will by retried on different address",
-                    );
-                    Some(socket_addr)
-                }
-            }
+    // The state of a peer we want and are not connected to.
+    fn idle_state(&self) -> PeerState {
+        if self.outgoing_address == Some(self.addr) && self.failcount < MAX_FAILCOUNT {
+            PeerState::Queued
         } else {
-            None
+            PeerState::Dead
+        }
+    }
+
+    pub(crate) fn is_connect_candidate(&self) -> bool {
+        matches!(self.state, PeerState::Queued)
+    }
+
+    /// The earliest time we may connect to the peer: `(failcount + 1)`
+    /// reconnect times after its last failure. None when it never failed.
+    pub(crate) fn reconnect_at(&self) -> Option<Instant> {
+        let wait = MIN_RECONNECT_TIME.saturating_mul(self.failcount.saturating_add(1));
+        self.last_failed.map(|at| at + wait)
+    }
+
+    /// Where the peer stands among connect candidates due together; the lowest
+    /// goes first: the fewest failures in a row, then the oldest failure.
+    pub(crate) fn connect_rank(&self) -> (u32, Option<Instant>) {
+        (self.failcount, self.last_failed)
+    }
+
+    /// Whether the peer is a connect candidate we may connect to at `now`.
+    pub(crate) fn is_due(&self, now: Instant) -> bool {
+        self.is_connect_candidate() && self.reconnect_at().is_none_or(|at| at <= now)
+    }
+
+    /// The connection completed its handshake and carried a message, so the
+    /// failures before it no longer count.
+    pub(crate) fn delivered(&mut self) {
+        self.failcount = 0;
+    }
+
+    /// Settles the peer after its connection closed. `failed_at` is set when
+    /// the connection ended in an error; `needed` says whether we still want
+    /// the peer.
+    pub(crate) fn connection_closed(
+        &mut self,
+        failed_at: Option<Instant>,
+        needed: bool,
+        counters: &PeerStates,
+    ) {
+        if let Some(at) = failed_at {
+            self.failcount = self.failcount.saturating_add(1);
+            self.last_failed = Some(at);
+        }
+        let next = if needed {
+            self.idle_state()
+        } else {
+            PeerState::NotNeeded
+        };
+        self.set_state(next, counters);
+    }
+
+    /// We want a peer we let go again.
+    pub(crate) fn needed_again(&mut self, counters: &PeerStates) {
+        if matches!(self.state, PeerState::NotNeeded) {
+            self.set_state(self.idle_state(), counters);
         }
     }
 }
@@ -97,11 +151,13 @@ impl Peer {
 #[derive(Debug, Default)]
 pub(crate) enum PeerState {
     #[default]
-    // Will be tried to be connected as soon as possible.
+    // A connect candidate: connected once a slot is free and its reconnect
+    // time has come.
     Queued,
     Connecting(PeerTx),
     Live(LivePeerState),
-    // There was an error, and it's waiting for exponential backoff.
+    // Not a connect candidate: it failed MAX_FAILCOUNT times in a row, or we do
+    // not know where it listens. Never connected to again.
     Dead,
     // We don't need to do anything with the peer any longer.
     // The peer has the full torrent, and we have the full torrent, so no need
@@ -195,16 +251,19 @@ impl Peer {
         }
     }
 
-    pub fn idle_to_connecting(&mut self, counters: &PeerStates) -> Option<(PeerRx, PeerTx)> {
-        match &self.state {
-            PeerState::Queued | PeerState::NotNeeded => {
-                let (tx, rx) = unbounded_channel();
-                let tx_2 = tx.clone();
-                self.set_state(PeerState::Connecting(tx), counters);
-                Some((rx, tx_2))
-            }
-            _ => None,
+    /// Starts connecting to a connect candidate whose reconnect time has come.
+    pub fn connect_if_due(
+        &mut self,
+        now: Instant,
+        counters: &PeerStates,
+    ) -> Option<(PeerRx, PeerTx)> {
+        if !self.is_due(now) {
+            return None;
         }
+        let (tx, rx) = unbounded_channel();
+        let tx_2 = tx.clone();
+        self.set_state(PeerState::Connecting(tx), counters);
+        Some((rx, tx_2))
     }
 
     pub fn incoming_connection(

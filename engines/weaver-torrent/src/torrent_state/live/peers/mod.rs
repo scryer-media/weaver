@@ -7,21 +7,25 @@
 
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
-use crate::core::lengths::ValidPieceIndex;
+use crate::core::{hash_id::Id20, lengths::ValidPieceIndex};
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use tokio::{sync::Notify, time::Instant};
 
 use crate::{
-    Error,
     peer_connection::WriterRequest,
     peer_protocol::Message,
+    stream_connect::ConnectionKind,
     torrent_state::utils::{TimedExistence, atomic_inc},
     type_aliases::{BF, PeerHandle},
 };
 
 use self::stats::{AggregatePeerStats, AggregatePeerStatsAtomic};
 
-use super::peer::{LivePeerState, Peer, PeerRx, PeerState, PeerTx};
+use super::peer::{
+    IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx,
+    stats::atomic::PeerCountersAtomic,
+};
 
 pub mod stats;
 
@@ -32,6 +36,28 @@ pub(crate) struct PeerStates {
     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
+
+    // Wakes the connect loop when a connect candidate appears or may come due
+    // sooner.
+    candidates_changed: Notify,
+}
+
+enum Admitted<R> {
+    Known(R),
+    New(Arc<PeerCountersAtomic>),
+}
+
+/// When the connect loop may next connect to someone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NextCandidate {
+    Due,
+    At(Instant),
+    None,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IncomingRefused {
+    AlreadyActive,
 }
 
 impl Drop for PeerStates {
@@ -43,25 +69,152 @@ impl Drop for PeerStates {
 }
 
 impl PeerStates {
+    pub fn new(session_stats: Arc<AggregatePeerStatsAtomic>) -> Self {
+        Self {
+            session_stats,
+            live_outgoing_peers: Default::default(),
+            stats: Default::default(),
+            states: Default::default(),
+            candidates_changed: Notify::new(),
+        }
+    }
+
     pub fn stats(&self) -> AggregatePeerStats {
         self.stats.snapshot()
     }
 
-    pub fn add_if_not_seen(&self, addr: SocketAddr) -> Option<PeerHandle> {
-        use dashmap::mapref::entry::Entry;
-        match self.states.entry(addr) {
-            Entry::Occupied(_) => None,
-            Entry::Vacant(vac) => {
-                vac.insert(Peer::new_with_outgoing_address(addr));
-                atomic_inc(&self.stats.queued);
-                atomic_inc(&self.session_stats.queued);
+    /// A tracker, DHT or PEX named `addr`: a new peer joins as a connect
+    /// candidate.
+    pub fn add_peer(&self, addr: SocketAddr) {
+        self.admit(addr, |_| (), || Peer::new_with_outgoing_address(addr));
+        self.candidates_changed.notify_one();
+    }
 
-                atomic_inc(&self.stats.seen);
-                atomic_inc(&self.session_stats.seen);
-                Some(addr)
+    /// A peer connected to us and holds a slot. Returns its counters.
+    pub fn add_incoming(
+        &self,
+        addr: SocketAddr,
+        peer_id: Id20,
+        tx: PeerTx,
+        kind: ConnectionKind,
+    ) -> Result<Arc<PeerCountersAtomic>, IncomingRefused> {
+        let admitted = self.admit(
+            addr,
+            |peer| {
+                peer.incoming_connection(peer_id, tx.clone(), self, kind)
+                    .map(|()| peer.stats.counters.clone())
+            },
+            || Peer::new_live_for_incoming_connection(addr, peer_id, tx.clone(), kind),
+        );
+        match admitted {
+            Admitted::Known(Ok(counters)) | Admitted::New(counters) => Ok(counters),
+            Admitted::Known(Err(IncomingConnectionResult::AlreadyActive)) => {
+                Err(IncomingRefused::AlreadyActive)
             }
         }
     }
+
+    // The one way into the list. A known peer is handed to `known`; a newcomer
+    // from `newcomer` joins.
+    fn admit<R>(
+        &self,
+        addr: SocketAddr,
+        known: impl FnOnce(&mut Peer) -> R,
+        newcomer: impl FnOnce() -> Peer,
+    ) -> Admitted<R> {
+        use dashmap::mapref::entry::Entry;
+        match self.states.entry(addr) {
+            Entry::Occupied(mut occupied) => Admitted::Known(known(occupied.get_mut())),
+            Entry::Vacant(vacant) => {
+                let peer = newcomer();
+                for counter in [&*self.session_stats, &self.stats] {
+                    counter.inc(peer.get_state());
+                    atomic_inc(&counter.seen);
+                }
+                let counters = peer.stats.counters.clone();
+                vacant.insert(peer);
+                Admitted::New(counters)
+            }
+        }
+    }
+
+    /// When the connect loop may next connect to someone.
+    pub fn next_candidate(&self, now: Instant) -> NextCandidate {
+        let mut next = NextCandidate::None;
+        for e in self.states.iter() {
+            let peer = e.value();
+            if !peer.is_connect_candidate() {
+                continue;
+            }
+            match peer.reconnect_at() {
+                Some(at) if at > now => {
+                    if !matches!(next, NextCandidate::At(sooner) if sooner <= at) {
+                        next = NextCandidate::At(at);
+                    }
+                }
+                _ => return NextCandidate::Due,
+            }
+        }
+        next
+    }
+
+    /// Returns once a connect candidate is due.
+    pub async fn wait_for_candidate(&self) {
+        loop {
+            match self.next_candidate(Instant::now()) {
+                NextCandidate::Due => return,
+                NextCandidate::At(at) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(at) => {}
+                        _ = self.candidates_changed.notified() => {}
+                    }
+                }
+                NextCandidate::None => self.candidates_changed.notified().await,
+            }
+        }
+    }
+
+    /// Returns once the connect candidates may have changed.
+    pub async fn candidates_changed(&self) {
+        self.candidates_changed.notified().await
+    }
+
+    /// Starts connecting to the connect candidate due at `now` that failed
+    /// least, then longest ago.
+    pub fn connect_next(&self, now: Instant) -> Option<(PeerHandle, PeerRx, PeerTx)> {
+        let (_, addr) = self
+            .states
+            .iter()
+            .filter(|e| e.value().is_due(now))
+            .map(|e| (e.value().connect_rank(), *e.key()))
+            .min()?;
+        let (rx, tx) = self
+            .with_peer_mut(addr, "connect_next", |peer| peer.connect_if_due(now, self))
+            .flatten()?;
+        Some((addr, rx, tx))
+    }
+
+    /// Settles a peer whose connection closed; see [`Peer::connection_closed`].
+    pub fn connection_closed(&self, peer: &mut Peer, failed_at: Option<Instant>, needed: bool) {
+        peer.connection_closed(failed_at, needed, self);
+        if peer.is_connect_candidate() {
+            self.candidates_changed.notify_one();
+        }
+    }
+
+    /// The peer's connection completed its handshake and carried a message.
+    pub fn connection_delivered(&self, addr: PeerHandle) {
+        self.with_peer_mut(addr, "connection_delivered", Peer::delivered);
+    }
+
+    /// We want the peers we let go again.
+    pub fn requeue_not_needed(&self) {
+        for mut peer in self.states.iter_mut() {
+            peer.value_mut().needed_again(self);
+        }
+        self.candidates_changed.notify_one();
+    }
+
     pub fn with_peer<R>(&self, addr: PeerHandle, f: impl FnOnce(&Peer) -> R) -> Option<R> {
         self.states.get(&addr).map(|e| f(e.value()))
     }
@@ -145,29 +298,6 @@ impl PeerStates {
         self.session_stats.seeder_flag_changed(seeder);
     }
 
-    pub fn mark_peer_connecting(&self, h: PeerHandle) -> crate::Result<(PeerRx, PeerTx)> {
-        let rx = self
-            .with_peer_mut(h, "mark_peer_connecting", |peer| {
-                peer.idle_to_connecting(self)
-                    .ok_or(Error::BugInvalidPeerState)
-            })
-            .ok_or(Error::BugPeerNotFound)??;
-        Ok(rx)
-    }
-
-    pub fn reset_peer_backoff(&self, handle: PeerHandle) {
-        self.with_peer_mut(handle, "reset_peer_backoff", |p| {
-            p.stats.reset_backoff();
-        });
-    }
-
-    pub fn mark_peer_not_needed(&self, handle: PeerHandle) -> Option<PeerState> {
-        let prev = self.with_peer_mut(handle, "mark_peer_not_needed", |peer| {
-            peer.set_not_needed(self)
-        })?;
-        Some(prev)
-    }
-
     pub(crate) fn on_steal(
         &self,
         from_peer: SocketAddr,
@@ -211,10 +341,10 @@ impl PeerStates {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::hash_id::Id20;
+    use std::time::Duration;
 
     use super::*;
-    use crate::stream_connect::ConnectionKind;
+    use crate::torrent_state::live::peer::{MAX_FAILCOUNT, MIN_RECONNECT_TIME};
 
     const TOTAL_PIECES: usize = 8;
 
@@ -227,24 +357,15 @@ mod tests {
     }
 
     fn make_peer_states() -> PeerStates {
-        PeerStates {
-            session_stats: Default::default(),
-            live_outgoing_peers: Default::default(),
-            stats: Default::default(),
-            states: Default::default(),
-        }
+        PeerStates::new(Default::default())
     }
 
     // Returns the peer handle, keeping the receiving end of the peer channel alive.
     fn add_live_peer(peers: &PeerStates, addr: &str) -> (PeerHandle, PeerRx) {
         let addr: SocketAddr = addr.parse().unwrap();
-        peers.add_if_not_seen(addr).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         peers
-            .with_peer_mut(addr, "test", |peer| {
-                peer.incoming_connection(Id20::default(), tx, peers, ConnectionKind::Tcp)
-            })
-            .unwrap()
+            .add_incoming(addr, Id20::default(), tx, ConnectionKind::Tcp)
             .unwrap();
         (addr, rx)
     }
@@ -311,7 +432,9 @@ mod tests {
             .unwrap();
         assert_eq!(live_seeders(&peers), (1, 1));
 
-        peers.mark_peer_not_needed(addr).unwrap();
+        peers
+            .with_peer_mut(addr, "test", |peer| peer.set_not_needed(&peers))
+            .unwrap();
         assert_eq!(live_seeders(&peers), (0, 0));
     }
 
@@ -438,5 +561,152 @@ mod tests {
         }
 
         assert_eq!(haves_queued(&mut slow_rx), (0..PIECES).collect::<Vec<_>>());
+    }
+
+    fn peer_addr(i: usize) -> SocketAddr {
+        SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 6881))
+    }
+
+    fn state_of(peers: &PeerStates, addr: SocketAddr) -> Option<&'static str> {
+        peers.with_peer(addr, |peer| peer.get_state().name())
+    }
+
+    // Connects to `addr`, which must be due at `at`, and fails the connection
+    // at `at`.
+    fn fail_at(peers: &PeerStates, addr: SocketAddr, at: Instant) {
+        peers
+            .with_peer_mut(addr, "test", |peer| {
+                peer.connect_if_due(at, peers).expect("a due candidate");
+                peers.connection_closed(peer, Some(at), true);
+            })
+            .unwrap();
+    }
+
+    fn reconnect_wait(failcount: u32) -> Duration {
+        MIN_RECONNECT_TIME * (failcount + 1)
+    }
+
+    // Fails `addr` MAX_FAILCOUNT times in a row from `t0`, each attempt as soon
+    // as it is due; returns the time of the last failure.
+    fn fail_out(peers: &PeerStates, addr: SocketAddr, t0: Instant) -> Instant {
+        let mut at = t0;
+        for failcount in 0..MAX_FAILCOUNT {
+            if failcount > 0 {
+                at += reconnect_wait(failcount);
+            }
+            fail_at(peers, addr, at);
+        }
+        at
+    }
+
+    #[test]
+    fn a_failed_peer_waits_failcount_plus_one_reconnect_times() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        let t0 = Instant::now();
+        peers.add_peer(a);
+        assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
+
+        let mut failed = t0;
+        for failcount in 1..MAX_FAILCOUNT {
+            fail_at(&peers, a, failed);
+            let due = failed + reconnect_wait(failcount);
+            assert_eq!(state_of(&peers, a), Some("queued"));
+            assert_eq!(peers.next_candidate(failed), NextCandidate::At(due));
+            assert!(peers.connect_next(due - Duration::from_millis(1)).is_none());
+            failed = due;
+        }
+        assert_eq!(peers.connect_next(failed).map(|(addr, ..)| addr), Some(a));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_connect_loop_wakes_when_the_reconnect_time_comes() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a);
+        fail_at(&peers, a, Instant::now());
+
+        let due = peers.wait_for_candidate();
+        tokio::pin!(due);
+        assert!(futures::poll!(&mut due).is_pending());
+        tokio::time::advance(reconnect_wait(1) - Duration::from_secs(1)).await;
+        assert!(futures::poll!(&mut due).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures::poll!(&mut due).is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_connect_loop_wakes_when_a_peer_is_named() {
+        let peers = make_peer_states();
+        let due = peers.wait_for_candidate();
+        tokio::pin!(due);
+        assert!(futures::poll!(&mut due).is_pending());
+        peers.add_peer(peer_addr(1));
+        assert!(futures::poll!(&mut due).is_ready());
+    }
+
+    #[test]
+    fn a_peer_that_failed_max_failcount_times_is_dropped_as_a_candidate() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a);
+        let last = fail_out(&peers, a, Instant::now());
+
+        assert_eq!(state_of(&peers, a), Some("dead"));
+        assert_eq!(peers.next_candidate(last), NextCandidate::None);
+        let much_later = last + Duration::from_secs(365 * 24 * 3600);
+        assert!(peers.connect_next(much_later).is_none());
+    }
+
+    #[test]
+    fn failures_are_forgotten_once_a_connection_delivers() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a);
+        let t0 = Instant::now();
+        fail_at(&peers, a, t0);
+        let t1 = t0 + reconnect_wait(1);
+        fail_at(&peers, a, t1);
+
+        // The next attempt completes its handshake and carries a message.
+        let t2 = t1 + reconnect_wait(2);
+        peers
+            .with_peer_mut(a, "test", |peer| peer.connect_if_due(t2, &peers))
+            .unwrap()
+            .unwrap();
+        peers.connection_delivered(a);
+
+        // Its later failure is the first in a row, not the third.
+        let t3 = t2 + Duration::from_secs(600);
+        peers
+            .with_peer_mut(a, "test", |peer| {
+                peers.connection_closed(peer, Some(t3), true)
+            })
+            .unwrap();
+        assert_eq!(state_of(&peers, a), Some("queued"));
+        assert_eq!(
+            peers.next_candidate(t3),
+            NextCandidate::At(t3 + reconnect_wait(1))
+        );
+    }
+
+    #[test]
+    fn a_connection_we_close_is_not_a_failure() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a);
+        let t0 = Instant::now();
+        peers
+            .with_peer_mut(a, "test", |peer| {
+                peer.connect_if_due(t0, &peers).unwrap();
+                peers.connection_closed(peer, None, false);
+            })
+            .unwrap();
+        assert_eq!(state_of(&peers, a), Some("not needed"));
+        assert_eq!(peers.next_candidate(t0), NextCandidate::None);
+
+        peers.requeue_not_needed();
+        assert_eq!(state_of(&peers, a), Some("queued"));
+        assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
     }
 }
