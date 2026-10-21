@@ -17,7 +17,7 @@ use crate::rss::RssService;
 use crate::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
 
 pub type WeaverSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
-pub const GRAPHQL_MAX_COMPLEXITY: usize = 512;
+pub const GRAPHQL_MAX_COMPLEXITY: usize = 2048;
 pub const GRAPHQL_MAX_DEPTH: usize = 16;
 
 #[derive(Clone)]
