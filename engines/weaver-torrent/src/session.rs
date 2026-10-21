@@ -33,8 +33,13 @@ use crate::dht::{
     Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr,
 };
 use crate::lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
+use crate::natpmp::{NATPMP_PORT, NatPmpMapper};
 use crate::peer_protocol::Handshake;
 use crate::tracker::{StoppedAnnounces, TrackerComms, UdpTrackerClient};
+use crate::upnp::{
+    PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, UpnpPortForwarder,
+    UpnpPortForwarderOptions,
+};
 use crate::{
     ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
     api::TorrentIdOrHash,
@@ -117,6 +122,62 @@ impl SessionDatabase {
     }
 }
 
+/// The port the session announces (libtorrent `listen_socket_t::
+/// tcp_external_port`): the TCP port a mapper got on the gateway, NAT-PMP's
+/// before UPnP's, else the configured one.
+struct AnnouncePort {
+    configured: Option<u16>,
+    mapped: parking_lot::Mutex<MappedPorts>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MappedPorts {
+    natpmp: Option<u16>,
+    upnp: Option<u16>,
+}
+
+impl AnnouncePort {
+    fn new(configured: Option<u16>) -> Self {
+        Self {
+            configured,
+            mapped: Default::default(),
+        }
+    }
+
+    fn get(&self) -> Option<u16> {
+        let configured = self.configured?;
+        let mapped = *self.mapped.lock();
+        Some(mapped.natpmp.or(mapped.upnp).unwrap_or(configured))
+    }
+
+    /// libtorrent `session_impl::on_port_mapping`: a mapper's TCP report,
+    /// a failure included, sets that mapper's port.
+    fn on_port_mapping(&self, event: &PortMapped) {
+        if event.protocol != PortmapProtocol::Tcp {
+            return;
+        }
+        let mut mapped = self.mapped.lock();
+        let port = match event.transport {
+            PortmapTransport::NatPmp => &mut mapped.natpmp,
+            PortmapTransport::Upnp => &mut mapped.upnp,
+        };
+        *port = event.external_port;
+    }
+}
+
+/// The protocols to map: those the session listens on (libtorrent
+/// `session_impl::remap_ports` maps a socket only once it is open).
+fn listening_protocols(listen: &crate::listen::ListenResult) -> Vec<PortmapProtocol> {
+    [
+        (listen.tcp_socket.is_some() || listen.custom_tcp_socket.is_some())
+            .then_some(PortmapProtocol::Tcp),
+        listen.utp_socket.is_some().then_some(PortmapProtocol::Udp),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 pub struct Session {
     // Core state and services
     pub(crate) db: RwLock<SessionDatabase>,
@@ -127,7 +188,7 @@ pub struct Session {
     // Network
     // The DHT's, and every torrent's that names none of its own.
     identity: Identity,
-    announce_port: Option<u16>,
+    announce_port: Arc<AnnouncePort>,
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
@@ -1000,7 +1061,9 @@ impl Session {
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
                 tasks,
-                announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
+                announce_port: Arc::new(AnnouncePort::new(
+                    listen_result.as_ref().and_then(|l| l.announce_port),
+                )),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
@@ -1032,6 +1095,7 @@ impl Session {
             });
 
             if let Some(mut listen) = listen_result {
+                let protocols = listening_protocols(&listen);
                 if let Some(tcp) = listen.tcp_socket.take() {
                     let max_pending_incoming_handshake_checks =
                         listen.max_pending_incoming_handshake_checks;
@@ -1080,16 +1144,18 @@ impl Session {
                 if listen.enable_upnp_port_forwarding
                     && let Some(announce_port) = listen.announce_port
                 {
-                    info!(port = announce_port, "starting UPnP port forwarder");
-                    let bind_device = bind_device.clone();
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
-                        "upnp_forward",
-                        Self::task_upnp_port_forwarder(
-                            announce_port,
-                            bind_device,
-                            session.cancellation_token.clone(),
-                        ),
+                    let requests = protocols
+                        .into_iter()
+                        .map(|protocol| PortMapRequest {
+                            protocol,
+                            local_port: listen.addr.port(),
+                            external_port: announce_port,
+                        })
+                        .collect();
+                    session.start_port_mapping(
+                        requests,
+                        bind_device.clone(),
+                        opts.bind_device_name.as_deref(),
                     );
                 }
             }
@@ -1275,19 +1341,66 @@ impl Session {
         }
     }
 
-    async fn task_upnp_port_forwarder(
-        port: u16,
+    /// Keep the listen port mapped on the gateway over UPnP and over PCP /
+    /// NAT-PMP at once (libtorrent `session_impl::start_upnp` and
+    /// `start_natpmp`), and announce the TCP port a mapper got
+    /// (`on_port_mapping`).
+    fn start_port_mapping(
+        &self,
+        requests: Vec<PortMapRequest>,
         bind_device: Option<BindDevice>,
-        cancel: CancellationToken,
-    ) -> anyhow::Result<()> {
-        let request = crate::upnp::PortMapRequest {
-            protocol: crate::upnp::PortmapProtocol::Tcp,
-            local_port: port,
-            external_port: port,
+        bind_device_name: Option<&str>,
+    ) {
+        info!(?requests, "starting UPnP and NAT-PMP / PCP port mapping");
+        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let upnp_opts = UpnpPortForwarderOptions {
+            description: self.identity.user_agent.clone(),
+            ..Default::default()
         };
-        let pf = crate::upnp::UpnpPortForwarder::new(vec![request], None, bind_device)?;
-        pf.run(cancel, tokio::sync::mpsc::unbounded_channel().0)
-            .await
+        match UpnpPortForwarder::new(requests.clone(), Some(upnp_opts), bind_device) {
+            Ok(upnp) => self.spawn_port_mapper(
+                "upnp_forward",
+                upnp.run(self.cancellation_token.clone(), events_tx.clone()),
+            ),
+            Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
+        }
+        match crate::natpmp::default_gateway(bind_device_name) {
+            Ok(gateway) => {
+                let mapper = NatPmpMapper::new((gateway, NATPMP_PORT).into(), requests, None);
+                self.spawn_port_mapper(
+                    "natpmp_forward",
+                    mapper.run(self.cancellation_token.clone(), events_tx),
+                );
+            }
+            Err(e) => debug!("no gateway for NAT-PMP / PCP: {e:#}"),
+        }
+        let announce_port = self.announce_port.clone();
+        self.spawn_port_mapper("port_mapping", async move {
+            while let Some(event) = events.recv().await {
+                match &event.error {
+                    None => info!(?event, "port mapping"),
+                    Some(error) => {
+                        warn!(?event.transport, ?event.protocol, "port mapping failed: {error}")
+                    }
+                }
+                announce_port.on_port_mapping(&event);
+            }
+            Ok(())
+        });
+    }
+
+    /// A mapper watches the session's token itself, so it is not dropped
+    /// on cancel; `stop` waits for it to finish.
+    fn spawn_port_mapper(
+        &self,
+        name: &'static str,
+        fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) {
+        crate::core::spawn_utils::spawn(
+            debug_span!(parent: self.rs(), "port_mapping", task = name),
+            name,
+            self.tasks.track_future(fut),
+        );
     }
 
     pub fn get_dht(&self) -> Option<&Dht> {
@@ -1899,8 +2012,11 @@ impl Session {
         } else {
             self.dht.as_ref().map(|dht| {
                 futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                    dht.get_peers(info_hash, if announce { self.announce_port } else { None })
-                        .boxed()
+                    dht.get_peers(
+                        info_hash,
+                        if announce { self.announce_port() } else { None },
+                    )
+                    .boxed()
                 }))
             })
         };
@@ -1910,8 +2026,16 @@ impl Session {
         } else {
             self.lsd.as_ref().map(|lsd| {
                 futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                    lsd.announce(info_hash, if announce { self.announce_port } else { None })
-                        .boxed()
+                    lsd.announce(
+                        info_hash,
+                        // Local peers reach the listen port itself.
+                        if announce {
+                            self.announce_port.configured
+                        } else {
+                            None
+                        },
+                    )
+                    .boxed()
                 }))
             })
         };
@@ -1927,7 +2051,7 @@ impl Session {
             self.announce_tiers(tracker_tiers, is_private),
             Box::new(tracker_rx_stats),
             force_tracker_interval,
-            self.announce_port,
+            self.announce_port(),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
@@ -1997,8 +2121,10 @@ impl Session {
         self.listen_addr
     }
 
+    /// The port peers are told to connect to: the one a mapper got on the
+    /// gateway, else the configured one.
     pub fn announce_port(&self) -> Option<u16> {
-        self.announce_port
+        self.announce_port.get()
     }
 
     async fn resolve_magnet(
@@ -2241,6 +2367,68 @@ mod tests {
 
     fn bstr(s: &str) -> String {
         format!("{}:{s}", s.len())
+    }
+
+    #[test]
+    fn the_session_announces_the_tcp_port_a_mapper_got_nat_pmp_before_upnp() {
+        use super::AnnouncePort;
+        use crate::upnp::{
+            PortMapped,
+            PortmapProtocol::{Tcp, Udp},
+            PortmapTransport::{NatPmp, Upnp},
+        };
+        let event = |transport, protocol, external_port| PortMapped {
+            transport,
+            protocol,
+            local_port: 6881,
+            external_port,
+            external_ip: None,
+            error: None,
+        };
+        let port = AnnouncePort::new(Some(6881));
+        assert_eq!(port.get(), Some(6881));
+        port.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
+        assert_eq!(port.get(), Some(40001));
+        // Peers connect over TCP; a UDP mapping does not move the port.
+        port.on_port_mapping(&event(Upnp, Udp, Some(40002)));
+        assert_eq!(port.get(), Some(40001));
+        port.on_port_mapping(&event(NatPmp, Tcp, Some(50000)));
+        assert_eq!(port.get(), Some(50000));
+        // A failed or removed mapping hands the port back.
+        port.on_port_mapping(&event(NatPmp, Tcp, None));
+        assert_eq!(port.get(), Some(40001));
+        port.on_port_mapping(&event(Upnp, Tcp, None));
+        assert_eq!(port.get(), Some(6881));
+        // Nothing to announce stays nothing.
+        let none = AnnouncePort::new(None);
+        none.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
+        assert_eq!(none.get(), None);
+    }
+
+    #[tokio::test]
+    async fn the_session_maps_tcp_and_udp_only_for_the_sockets_it_listens_on() {
+        use super::listening_protocols;
+        use crate::{
+            listen::{ListenerMode, ListenerOptions},
+            upnp::PortmapProtocol::{Tcp, Udp},
+        };
+        for (mode, expected) in [
+            (ListenerMode::TcpOnly, vec![Tcp]),
+            (ListenerMode::UtpOnly, vec![Udp]),
+            (ListenerMode::TcpAndUtp, vec![Tcp, Udp]),
+        ] {
+            let token = tokio_util::sync::CancellationToken::new();
+            let listen = ListenerOptions {
+                mode,
+                listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                ..Default::default()
+            }
+            .start(None, token.clone(), None, None)
+            .await
+            .unwrap();
+            assert_eq!(listening_protocols(&listen), expected, "{mode:?}");
+            token.cancel();
+        }
     }
 
     /// A one-piece torrent whose announce-list is `[[a1, a2], [b1]]`.
