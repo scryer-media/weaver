@@ -69,7 +69,6 @@ use std::{
 };
 
 use crate::buffers::{ByteBuf, ByteBufOwned};
-use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::Id20,
     lengths::{ChunkInfo, Lengths, ValidPieceIndex},
@@ -114,7 +113,8 @@ use crate::{
 use self::{
     choker::{CHOKED_REQUEST_GRACE, Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     peer::{
-        InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult, ingest_bitfield,
+        InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult, empty_bitfield,
+        ingest_bitfield,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -770,6 +770,10 @@ impl TorrentStateLive {
     fn set_peer_live(&self, handle: PeerHandle, h: Handshake, connection_kind: ConnectionKind) {
         self.peers.with_peer_mut(handle, "set_peer_live", |p| {
             p.connecting_to_live(h.peer_id, &self.peers, connection_kind);
+            // An incoming connection is live before its handshake gets here.
+            if let Some(live) = p.get_live_mut() {
+                live.fast = h.supports_fast();
+            }
         });
     }
 
@@ -1193,9 +1197,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 self.on_download_request(request)
                     .context("on_download_request")?;
             }
-            Message::Bitfield(b) => self
-                .on_bitfield(b.clone_to_owned(None))
-                .context("on_bitfield")?,
+            Message::Bitfield(b) => self.on_bitfield(b.as_ref()).context("on_bitfield")?,
+            Message::HaveAll => self.on_have_all_or_none(0xff).context("on_have_all")?,
+            Message::HaveNone => self.on_have_all_or_none(0).context("on_have_none")?,
             Message::Choke => self.on_i_am_choked().context("on_i_am_choked")?,
             Message::Unchoke => self.on_i_am_unchoked(),
             Message::Interested => self
@@ -1260,9 +1264,24 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Ok(())
     }
 
+    /// What we have, as libtorrent `bt_peer_connection::write_bitfield` tells
+    /// it: on a fast connection Have All when we have every piece and Have
+    /// None when we show none, a bitfield otherwise. With upload off we show
+    /// no piece.
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
+        let fast = self.speaks_fast();
+        let total_pieces = self.state.lengths.total_pieces() as usize;
+        let upload = !self.state.torrent().options.disable_upload();
         let g = self.state.lock_read("serialize_bitfield_message_to_buf");
-        let msg = Message::Bitfield(ByteBuf(g.get_chunks()?.get_have_pieces().as_bytes()));
+        let have = g.get_chunks()?.get_have_pieces();
+        let pieces = &have.as_slice()[..total_pieces];
+        let msg = if fast && (!upload || pieces.not_any()) {
+            Message::HaveNone
+        } else if fast && pieces.all() {
+            Message::HaveAll
+        } else {
+            Message::Bitfield(ByteBuf(have.as_bytes()))
+        };
         let len = msg.serialize(buf, &Default::default)?;
         trace!("sending: {:?}, length={}", &msg, len);
         Ok(len)
@@ -1362,7 +1381,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Ok(())
     }
 
+    /// A fast connection always opens with what we have (BEP 6); a plain one
+    /// only when we show a piece (libtorrent
+    /// `bt_peer_connection::write_bitfield`).
     fn should_send_bitfield(&self) -> bool {
+        if self.speaks_fast() {
+            return true;
+        }
         if self.state.torrent().options.disable_upload() {
             return false;
         }
@@ -1674,11 +1699,28 @@ impl PeerHandler {
         Ok(())
     }
 
-    fn on_bitfield(&self, bitfield: ByteBufOwned) -> anyhow::Result<()> {
-        let bf = ingest_bitfield(bitfield.as_ref(), self.state.lengths.total_pieces())?;
+    fn on_bitfield(&self, bitfield: &[u8]) -> anyhow::Result<()> {
+        let bf = ingest_bitfield(bitfield, self.state.lengths.total_pieces())?;
         self.state.peers.update_bitfield(self.addr, bf);
         self.on_bitfield_notify.notify_waiters();
         Ok(())
+    }
+
+    /// Have All and Have None stand for a bitfield of every bit set or none
+    /// (libtorrent `peer_connection::incoming_have_all`,
+    /// `incoming_have_none`), and replace any the peer sent before.
+    fn on_have_all_or_none(&self, byte: u8) -> anyhow::Result<()> {
+        let total_pieces = self.state.lengths.total_pieces();
+        let len = empty_bitfield(total_pieces).as_raw_slice().len();
+        self.on_bitfield(&vec![byte; len])
+    }
+
+    /// Whether the connection speaks the fast extension.
+    fn speaks_fast(&self) -> bool {
+        self.state
+            .peers
+            .with_live(self.addr, |live| live.fast)
+            .unwrap_or(false)
     }
 
     async fn wait_for_any_notify(&self, notify: &Notify, check: impl Fn() -> bool) {

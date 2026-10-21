@@ -538,6 +538,11 @@ pub(crate) struct LivePeerState {
     pub tx: PeerTx,
 
     pub connection_kind: ConnectionKind,
+
+    // The peer set the fast bit in its handshake, as we always do, so the
+    // connection speaks the fast extension (BEP 6; libtorrent
+    // `bt_peer_connection::m_supports_fast`).
+    pub fast: bool,
 }
 
 impl LivePeerState {
@@ -569,6 +574,7 @@ impl LivePeerState {
             invalid_requests: 0,
             tx,
             connection_kind,
+            fast: false,
         }
     }
 

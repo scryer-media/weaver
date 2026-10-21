@@ -129,9 +129,7 @@ impl Harness {
         };
         let mut every_piece = peer::empty_bitfield(self.lengths.total_pieces());
         every_piece[..self.lengths.total_pieces() as usize].fill(true);
-        handler
-            .on_bitfield(ByteBufOwned::from(every_piece.as_raw_slice().to_vec()))
-            .unwrap();
+        handler.on_bitfield(every_piece.as_raw_slice()).unwrap();
         (handler, rx)
     }
 
@@ -452,6 +450,85 @@ async fn a_have_at_or_past_the_piece_count_ends_the_connection() {
         assert!(peer.on_received_message(Message::Have(have)).await.is_err());
     }
     assert_eq!(h.peers.availability.counts(), [0, 1]);
+}
+
+impl Harness {
+    /// The peer set the fast bit in its handshake.
+    fn speak_fast(&self, peer: &PeerHandler) {
+        self.peers
+            .with_live_mut(peer.addr, "test", |live| live.fast = true)
+            .unwrap();
+    }
+}
+
+/// What we open the connection to `peer` with, as it goes on the wire.
+fn opening(peer: &PeerHandler) -> Option<Vec<u8>> {
+    let peer = &peer;
+    peer.should_send_bitfield().then(|| {
+        let mut buf = vec![0u8; 64];
+        let len = peer.serialize_bitfield_message_to_buf(&mut buf).unwrap();
+        buf.truncate(len);
+        buf
+    })
+}
+
+fn wire(msg: Message<'_>) -> Vec<u8> {
+    let mut buf = vec![0u8; 64];
+    let len = msg.serialize(&mut buf, &Default::default).unwrap();
+    buf.truncate(len);
+    buf
+}
+
+#[tokio::test]
+async fn have_all_and_have_none_are_bitfields_of_every_piece_and_of_none() {
+    let h = Harness::new("have_all_and_have_none").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    let bitfield = || {
+        h.peers
+            .with_live(peer.addr, |live| (live.bitfield.clone(), live.seeder))
+            .unwrap()
+    };
+
+    peer.on_received_message(Message::HaveNone).await.unwrap();
+    let (none, seeder) = bitfield();
+    assert_eq!(none.as_raw_slice(), [0]);
+    assert!(!seeder);
+    assert_eq!(h.peers.availability.counts(), [0, 0]);
+
+    // The padding bits stay clear.
+    peer.on_received_message(Message::HaveAll).await.unwrap();
+    let (all, seeder) = bitfield();
+    assert_eq!(all.as_raw_slice(), [0b1100_0000]);
+    assert!(seeder);
+    assert_eq!(h.peers.availability.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn a_fast_connection_opens_with_have_all_have_none_or_a_bitfield() {
+    let seeding = Harness::seeding("opens_seeding").await;
+    let half = Harness::build("opens_half", 0x80, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await;
+    let empty = Harness::new("opens_empty").await;
+    for (h, fast_opening, plain_opening) in [
+        (
+            &seeding,
+            wire(Message::HaveAll),
+            Some(wire(Message::Bitfield(ByteBuf(&[0xc0])))),
+        ),
+        (
+            &half,
+            wire(Message::Bitfield(ByteBuf(&[0x80]))),
+            Some(wire(Message::Bitfield(ByteBuf(&[0x80])))),
+        ),
+        (&empty, wire(Message::HaveNone), None),
+    ] {
+        let (plain, _plain_rx) = h.peer("127.0.0.1:6881");
+        let (fast, _fast_rx) = h.peer("127.0.0.2:6881");
+        h.speak_fast(&fast);
+        assert_eq!(opening(&fast), Some(fast_opening));
+        assert_eq!(opening(&plain), plain_opening);
+    }
 }
 
 /// What the upload side queues for a peer's writer.

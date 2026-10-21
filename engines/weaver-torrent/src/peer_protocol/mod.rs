@@ -745,6 +745,8 @@ impl Handshake {
         let mut reserved: u64 = 0;
         // supports extended messaging
         reserved |= 1 << 20;
+        // supports the fast extension
+        reserved |= u64::from(FAST_BIT);
 
         Handshake {
             reserved,
@@ -1167,10 +1169,25 @@ mod tests {
     }
 
     #[test]
+    fn our_handshake_offers_the_fast_extension() {
+        // libtorrent `bt_peer_connection::write_handshake` always sets it.
+        let ours = Handshake::new(Id20::new([1; 20]), Id20::new([2; 20]));
+        let mut buf = [0u8; 100];
+        let len = ours.serialize_unchecked_len(&mut buf);
+        assert_eq!(buf[20 + 7] & 0x04, 0x04);
+        let (parsed, _) = Handshake::deserialize(&buf[..len]).unwrap();
+        assert!(parsed.supports_fast());
+        let without = Handshake {
+            reserved: ours.reserved & !0x04,
+            ..ours
+        };
+        assert!(!without.supports_fast());
+    }
+
+    #[test]
     fn a_peer_offers_the_fast_extension_in_bit_0x04_of_the_last_reserved_byte() {
-        let plain = Handshake::new(Id20::new([1; 20]), Id20::new([2; 20]));
         let fast = Handshake {
-            reserved: plain.reserved | 0x04,
+            reserved: 0x04,
             ..Handshake::new(Id20::new([1; 20]), Id20::new([2; 20]))
         };
         let mut buf = [0u8; 100];
@@ -1178,7 +1195,8 @@ mod tests {
         assert_eq!(buf[20 + 7] & 0x04, 0x04);
         let (parsed, _) = Handshake::deserialize(&buf[..len]).unwrap();
         assert!(parsed.supports_fast());
-        assert!(fast.supports_extended());
+        assert!(!fast.supports_extended());
+        assert!(!fast.offers_v2());
         assert!(!Message::Have(1).is_fast_only());
         assert!(!Message::Request(Request::new(0, 0, 1)).is_fast_only());
     }
@@ -1325,7 +1343,7 @@ mod tests {
         assert!(offer.offers_v2());
         let mut buf = [0u8; 68];
         offer.serialize_unchecked_len(&mut buf);
-        assert_eq!(buf[20 + 7], 0x10);
+        assert_eq!(buf[20 + 7] & 0x10, 0x10);
         assert_eq!(&buf[20..27], &plain().reserved.to_be_bytes()[..7]);
         assert!(Handshake::deserialize(&buf).unwrap().0.offers_v2());
     }
