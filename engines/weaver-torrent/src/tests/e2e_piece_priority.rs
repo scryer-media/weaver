@@ -5,16 +5,20 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
+use std::net::Ipv4Addr;
+
 use anyhow::Context;
 use tempfile::TempDir;
 
 use crate::{
     AddTorrent, AddTorrentOptions, BF, PiecePriority, Session,
+    core::torrent_metainfo::torrent_from_bytes,
     storage::StorageFactory,
     tests::{
         embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
         test_util::setup_test_logging,
     },
+    torrent_state::live::peer::{ALLOWED_FAST_SET_SIZE, allowed_fast_set},
 };
 
 const PIECE_LENGTH: u32 = 1024;
@@ -22,24 +26,47 @@ const PIECE_LENGTH: u32 = 1024;
 const OUT_OF_RANGE: u32 = 8;
 const PIECES: usize = OUT_OF_RANGE as usize;
 
-// Download the two missing pieces from a loopback seeder and return the order the
-// pieces were written in. One peer over one connection serves requests in the order
-// they were sent, so the write order is the request order.
+// The two pieces the seeder does not let a choked leecher fetch (BEP 6 allowed
+// fast). Missing only these, the leecher waits for the unchoke and then asks in
+// the picker's order alone.
+fn two_not_allowed_fast(t: &TestTorrent) -> anyhow::Result<[u32; 2]> {
+    let hashes = torrent_from_bytes(&t.torrent)?.info_hashes;
+    // Both ends are Weaver, so a torrent with a v2 hash is spoken as v2.
+    let info_hash = hashes.for_peer(hashes.v2.is_some());
+    let allowed = allowed_fast_set(
+        Ipv4Addr::LOCALHOST.into(),
+        info_hash,
+        OUT_OF_RANGE,
+        ALLOWED_FAST_SET_SIZE,
+    );
+    let mut rest = (0..OUT_OF_RANGE).filter(|p| !allowed.contains(p));
+    Ok([
+        rest.next().context("a piece outside the set")?,
+        rest.next().context("a second piece outside the set")?,
+    ])
+}
+
+// Download the two missing pieces from a loopback seeder and return them with the
+// order they were written in, `priority` set on the second. One peer over one
+// connection serves requests in the order they were sent, so the write order is the
+// request order.
 async fn fetch_two_missing(
     name: &str,
-    piece_priorities: Option<Vec<(u32, PiecePriority)>>,
-) -> anyhow::Result<Vec<u32>> {
+    priority: Option<PiecePriority>,
+) -> anyhow::Result<([u32; 2], Vec<u32>)> {
     setup_test_logging();
     let t = TestTorrent::new(name, PIECES * PIECE_LENGTH as usize, PIECE_LENGTH).await?;
     let (_seeder, seeder_addr) = t.seed().await?;
+    let missing = two_not_allowed_fast(&t)?;
+    let piece_priorities = priority.map(|priority| vec![(missing[1], priority)]);
 
     let out = TempDir::with_prefix(name)?;
     let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
     let storage = MemoryStorageFactory::default();
-    // Pieces 0 and 4 are missing.
     let mut have = BF::from_boxed_slice(vec![0xffu8; PIECES.div_ceil(8)].into_boxed_slice());
-    have.set(0, false);
-    have.set(4, false);
+    for piece in missing {
+        have.set(piece as usize, false);
+    }
 
     let handle = session
         .add_torrent(
@@ -59,26 +86,23 @@ async fn fetch_two_missing(
 
     let mut order = storage.log.written_pieces();
     order.dedup();
-    Ok(order)
+    Ok((missing, order))
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_without_priorities_both_missing_pieces_arrive() -> anyhow::Result<()> {
     // As rare as each other, so the picker takes either first.
-    let mut order = fetch_two_missing("test_piece_priority_default", None).await?;
+    let (missing, mut order) = fetch_two_missing("test_piece_priority_default", None).await?;
     order.sort();
-    assert_eq!(order, vec![0, 4]);
+    assert_eq!(order, missing);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_the_high_priority_piece_is_requested_first() -> anyhow::Result<()> {
-    let order = fetch_two_missing(
-        "test_piece_priority_high",
-        Some(vec![(4, PiecePriority::High)]),
-    )
-    .await?;
-    assert_eq!(order, vec![4, 0]);
+    let (missing, order) =
+        fetch_two_missing("test_piece_priority_high", Some(PiecePriority::High)).await?;
+    assert_eq!(order, vec![missing[1], missing[0]]);
     Ok(())
 }
 

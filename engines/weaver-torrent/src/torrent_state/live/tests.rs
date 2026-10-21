@@ -540,6 +540,8 @@ enum Sent {
     Block(u32, u32),
     /// A Reject for the block at (piece, offset).
     Reject(u32, u32),
+    /// An Allowed Fast for the piece.
+    AllowedFast(u32),
 }
 
 fn sent(request: WriterRequest) -> Sent {
@@ -547,6 +549,7 @@ fn sent(request: WriterRequest) -> Sent {
         WriterRequest::Message(Message::Choke) => Sent::Choke,
         WriterRequest::Message(Message::Unchoke) => Sent::Unchoke,
         WriterRequest::Message(Message::Reject(r)) => Sent::Reject(r.index, r.begin),
+        WriterRequest::Message(Message::AllowedFast(piece)) => Sent::AllowedFast(piece),
         WriterRequest::ReadChunkRequest(c) => Sent::Block(c.piece_index.get(), c.offset),
         other => panic!("unexpected writer request {other:?}"),
     }
@@ -756,6 +759,177 @@ async fn a_reject_for_a_block_we_never_asked_for_ends_the_connection() {
             .await
             .is_err()
     );
+}
+
+/// A seed with one upload slot, a fast peer that has piece 1, and a second
+/// peer. Two pieces are fewer than the set's five, so the fast peer's
+/// allowed fast set is every piece it lacks: piece 0.
+async fn allowed_fast_seed(name: &str) -> (Harness, (PeerHandler, PeerRx), (PeerHandler, PeerRx)) {
+    let h = Harness::seeding_with_slots(name, 1).await;
+    tokio::time::pause();
+    let fast = h.peer("127.0.0.1:6881");
+    let other = h.peer("127.0.0.2:6881");
+    h.speak_fast(&fast.0);
+    fast.0.on_bitfield(&[0x40]).unwrap();
+    (h, fast, other)
+}
+
+#[tokio::test]
+async fn a_fast_peer_we_choke_is_still_served_its_allowed_fast_pieces() {
+    let (h, (fast, mut fast_rx), (other, mut other_rx)) =
+        allowed_fast_seed("allowed_fast_served").await;
+    let (fast, other) = (&fast, &other);
+
+    // The set goes out on the first Interested, and not again.
+    fast.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::AllowedFast(0));
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    fast.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    assert!(fast_rx.is_empty());
+
+    for index in [0, 1] {
+        fast.on_received_message(Message::Request(request(index, 0)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(1, 0));
+
+    // The slot passes to the other peer: the Choke rejects the unsent block
+    // of piece 1 and keeps piece 0's.
+    other
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Choke);
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Reject(1, 0));
+    assert!(fast_rx.is_empty());
+    assert!(fast.claim_upload(&h.chunk(0, 0)));
+    assert!(!fast.claim_upload(&h.chunk(1, 0)));
+
+    // Choked, the peer is served piece 0 and refused piece 1.
+    fast.on_received_message(Message::Request(request(0, 1)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(0, CHUNK_SIZE));
+    fast.on_received_message(Message::Request(request(1, 1)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Reject(1, CHUNK_SIZE));
+    assert!(fast_rx.is_empty());
+}
+
+#[tokio::test]
+async fn a_choked_peer_may_ask_for_an_allowed_fast_piece_three_times_over() {
+    let (_h, (fast, mut fast_rx), (other, mut other_rx)) =
+        allowed_fast_seed("allowed_fast_three_times").await;
+    let (fast, other) = (&fast, &other);
+    fast.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::AllowedFast(0));
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Unchoke);
+    other
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Choke);
+
+    for asked in 0..3 * CHUNKS_PER_PIECE {
+        let chunk = asked % CHUNKS_PER_PIECE;
+        fast.on_received_message(Message::Request(request(0, chunk)))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_sent(&mut fast_rx).await,
+            Sent::Block(0, chunk * CHUNK_SIZE)
+        );
+    }
+    assert!(
+        fast.on_received_message(Message::Request(request(0, 0)))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn allowed_fast_from_a_peer_names_only_pieces_we_lack() {
+    // Piece 0 is had.
+    let h = Harness::build(
+        "allowed_fast_ingest",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    for index in [0, PIECES, 1, 1] {
+        peer.on_received_message(Message::AllowedFast(index))
+            .await
+            .unwrap();
+    }
+    let allowed = h
+        .peers
+        .with_live(peer.addr, |live| live.allowed_fast_from_peer.clone())
+        .unwrap();
+    assert_eq!(allowed, vec![h.piece(1)]);
+}
+
+#[tokio::test]
+async fn a_peer_that_chokes_us_is_asked_only_for_its_allowed_fast_pieces() {
+    let h = Harness::new("allowed_fast_requested").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    (&peer)
+        .on_received_message(Message::AllowedFast(1))
+        .await
+        .unwrap();
+    let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(1, 0..CHUNKS_PER_PIECE)
+    );
+    assert!(rx.is_empty());
+    assert_eq!(h.queued_pieces(), vec![0]);
+
+    peer.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(0, 0..CHUNKS_PER_PIECE)
+    );
+}
+
+#[tokio::test]
+async fn a_piece_we_may_not_finish_while_choked_goes_back_and_an_allowed_fast_one_follows() {
+    let h = Harness::new("allowed_fast_after_choke").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    peer.lock_flow_control("test").request_window = 1;
+    let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+    peer.on_i_am_unchoked();
+    let first = next_requests(&mut requester, &mut rx, 1).await;
+    let (taken, _) = *first.first().unwrap();
+    assert_eq!(first, chunks(taken, [0]));
+    let other = 1 - taken;
+
+    // Choked mid piece, with the other piece allowed fast: the rest of the
+    // first piece may not be asked for, so it goes back, and the other
+    // follows.
+    (&peer).on_received_message(Message::Choke).await.unwrap();
+    (&peer)
+        .on_received_message(Message::AllowedFast(other))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, 1).await,
+        chunks(other, [0])
+    );
+    assert_eq!(h.queued_pieces(), vec![taken]);
+    assert_eq!(h.inflight_count(&peer), 1);
 }
 
 impl Harness {

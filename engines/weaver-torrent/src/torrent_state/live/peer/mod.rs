@@ -9,13 +9,14 @@ pub mod stats;
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 
 use crate::core::hash_id::Id20;
-use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
+use crate::core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
 use crate::peer_protocol::{Message, Request};
+use crate::sha1w::{ISha1, Sha1};
 
 use tokio::sync::{
     Notify,
@@ -39,6 +40,56 @@ pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
+
+// libtorrent `settings_pack::allowed_fast_set_size`: how many pieces a peer
+// may fetch while we choke it.
+pub(crate) const ALLOWED_FAST_SET_SIZE: u32 = 5;
+
+/// BEP 6's allowed fast set of `k` of `num_pieces` pieces for the peer at
+/// `ip` on the torrent `info_hash`, in the order it is generated; every piece
+/// when `k` is not less than their count (libtorrent
+/// `peer_connection::send_allowed_set`).
+///
+/// An IPv4 address counts only its /24, as BEP 6 says, so the peers of one
+/// network get one set; libtorrent hashes the whole address. An IPv6 address
+/// counts whole, as libtorrent hashes it.
+pub(crate) fn allowed_fast_set(ip: IpAddr, info_hash: Id20, num_pieces: u32, k: u32) -> Vec<u32> {
+    if k >= num_pieces {
+        return (0..num_pieces).collect();
+    }
+    let mut x = Vec::with_capacity(16 + 20);
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => x.extend_from_slice(&(u32::from(v4) & 0xffff_ff00).to_be_bytes()),
+        IpAddr::V6(v6) => x.extend_from_slice(&v6.octets()),
+    }
+    x.extend_from_slice(&info_hash.0);
+    let sha1 = |data: &[u8]| {
+        let mut h = Sha1::new();
+        h.update(data);
+        h.finish()
+    };
+    let mut hash = sha1(&x);
+    let mut set = Vec::with_capacity(k as usize);
+    // libtorrent's safety net: the loop ends even when the hashes keep
+    // naming pieces already in the set.
+    let mut words = 0;
+    loop {
+        for word in hash.chunks_exact(4) {
+            let piece = u32::from_be_bytes(word.try_into().unwrap()) % num_pieces;
+            if !set.contains(&piece) {
+                set.push(piece);
+                if set.len() == k as usize {
+                    return set;
+                }
+            }
+            words += 1;
+            if words > 500 {
+                return set;
+            }
+        }
+        hash = sha1(&hash);
+    }
+}
 
 /// What the pieces a peer took part in say of it, kept across its
 /// connections (libtorrent `torrent_peer::trust_points`, `hashfails`,
@@ -543,6 +594,25 @@ pub(crate) struct LivePeerState {
     // connection speaks the fast extension (BEP 6; libtorrent
     // `bt_peer_connection::m_supports_fast`).
     pub fast: bool,
+
+    // The pieces we let the peer fetch while we choke it, each with how many
+    // blocks of it the peer asked for (libtorrent `m_accept_fast`,
+    // `m_accept_fast_piece_cnt`). None until we send them, at its first
+    // Interested.
+    allowed_fast_to_peer: Option<Vec<(ValidPieceIndex, u32)>>,
+
+    // The pieces the peer lets us fetch while it chokes us (libtorrent
+    // `m_allowed_fast`).
+    pub allowed_fast_from_peer: Vec<ValidPieceIndex>,
+}
+
+/// Why a request the peer sent us is not queued.
+pub(crate) enum Refused {
+    /// We choke the peer, since this instant, and it may not fetch the piece.
+    Choked(Instant),
+    /// We choke the peer, and it asked for the blocks of a piece it may fetch
+    /// three times over.
+    AllowedFastSpent,
 }
 
 impl LivePeerState {
@@ -575,6 +645,8 @@ impl LivePeerState {
             tx,
             connection_kind,
             fast: false,
+            allowed_fast_to_peer: None,
+            allowed_fast_from_peer: Vec::new(),
         }
     }
 
@@ -706,14 +778,28 @@ impl LivePeerState {
         &self.inflight_requests
     }
 
-    /// The peer asked us for `chunk`. While we choke the peer the request is
-    /// not queued: a fast peer is told so with a Reject (libtorrent
-    /// `peer_connection::incoming_request`), and the error is when we choked
-    /// it.
-    pub fn queue_upload(&mut self, chunk: ChunkInfo) -> Result<(), Instant> {
-        if let Some(choked_at) = self.choked_at {
-            self.reject(&chunk);
-            return Err(choked_at);
+    /// The peer asked us for `chunk`, a block of a piece of `chunks_per_piece`
+    /// blocks (libtorrent `peer_connection::incoming_request`). While we
+    /// choke the peer only a block of a piece it may fetch is queued, until it
+    /// has asked for three times the piece's blocks; any other is refused,
+    /// with a Reject on a fast connection.
+    pub fn queue_upload(&mut self, chunk: ChunkInfo, chunks_per_piece: u32) -> Result<(), Refused> {
+        let allowed = self
+            .allowed_fast_to_peer
+            .iter_mut()
+            .flatten()
+            .find(|(piece, _)| *piece == chunk.piece_index)
+            .map(|(_, asked)| asked);
+        match (self.choked_at, allowed) {
+            (Some(_), Some(asked)) if *asked >= 3 * chunks_per_piece => {
+                return Err(Refused::AllowedFastSpent);
+            }
+            (Some(choked_at), None) => {
+                self.reject(&chunk);
+                return Err(Refused::Choked(choked_at));
+            }
+            (_, Some(asked)) => *asked += 1,
+            (None, None) => {}
         }
         self.upload_queue.insert(chunk);
         Ok(())
@@ -736,6 +822,38 @@ impl LivePeerState {
         true
     }
 
+    /// Whether the peer may fetch `piece` while we choke it.
+    fn allows_fast(&self, piece: ValidPieceIndex) -> bool {
+        self.allowed_fast_to_peer
+            .iter()
+            .flatten()
+            .any(|(allowed, _)| *allowed == piece)
+    }
+
+    /// The peer said it is interested. On a fast connection it is sent, the
+    /// first time, the pieces it may fetch while we choke it: the allowed
+    /// fast set less the pieces it has (libtorrent
+    /// `bt_peer_connection::on_interested`,
+    /// `peer_connection::send_allowed_set`). The peer at `ip` downloads the
+    /// torrent `info_hash` of `lengths`.
+    pub fn send_allowed_fast(&mut self, ip: IpAddr, info_hash: Id20, lengths: &Lengths) {
+        if !self.fast || self.allowed_fast_to_peer.is_some() {
+            return;
+        }
+        let set: Vec<ValidPieceIndex> =
+            allowed_fast_set(ip, info_hash, lengths.total_pieces(), ALLOWED_FAST_SET_SIZE)
+                .into_iter()
+                .filter_map(|piece| lengths.validate_piece_index(piece))
+                .filter(|piece| self.bitfield.get(piece.get_usize()).is_none_or(|has| !*has))
+                .collect();
+        for piece in &set {
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::AllowedFast(piece.get())));
+        }
+        self.allowed_fast_to_peer = Some(set.into_iter().map(|piece| (piece, 0)).collect());
+    }
+
     /// Whether we choke the peer.
     pub fn is_choked(&self) -> bool {
         self.choked_at.is_some()
@@ -755,8 +873,9 @@ impl LivePeerState {
 
     /// Chokes the peer at `now`: a Choke goes out and every block it asked
     /// for and was not sent is dropped (BEP 3), each with a Reject on a fast
-    /// connection (libtorrent `peer_connection::send_choke`). False when it
-    /// was choked already.
+    /// connection, but for the blocks of the pieces it may fetch while choked
+    /// (libtorrent `peer_connection::send_choke`). False when it was choked
+    /// already.
     pub(crate) fn choke(&mut self, now: Instant) -> bool {
         if self.is_choked() {
             return false;
@@ -764,7 +883,11 @@ impl LivePeerState {
         self.choked_at = Some(now);
         self.invalid_requests = 0;
         let _ = self.tx.send(WriterRequest::Message(Message::Choke));
-        for chunk in std::mem::take(&mut self.upload_queue) {
+        let (kept, dropped): (HashSet<_>, HashSet<_>) = std::mem::take(&mut self.upload_queue)
+            .into_iter()
+            .partition(|chunk| self.allows_fast(chunk.piece_index));
+        self.upload_queue = kept;
+        for chunk in dropped {
             self.reject(&chunk);
         }
         true
@@ -887,7 +1010,34 @@ impl BlockTime {
 
 #[cfg(test)]
 mod tests {
-    use super::Trust;
+    use std::net::IpAddr;
+
+    use super::{Trust, allowed_fast_set};
+    use crate::core::hash_id::Id20;
+
+    #[test]
+    fn the_allowed_fast_set_is_bep_6s() {
+        // BEP 6's own example.
+        let ip: IpAddr = "80.4.4.200".parse().unwrap();
+        let info_hash = Id20::new([0xaa; 20]);
+        let seven = [1059, 431, 808, 1217, 287, 376, 1188];
+        assert_eq!(allowed_fast_set(ip, info_hash, 1313, 7), seven);
+        let mut nine = seven.to_vec();
+        nine.extend([353, 508]);
+        assert_eq!(allowed_fast_set(ip, info_hash, 1313, 9), nine);
+
+        // The peers of one /24 get one set, and an IPv4-mapped address is
+        // its IPv4 one.
+        for same in ["80.4.4.1", "::ffff:80.4.4.200"] {
+            let same: IpAddr = same.parse().unwrap();
+            assert_eq!(allowed_fast_set(same, info_hash, 1313, 7), seven);
+        }
+        let other: IpAddr = "80.4.5.200".parse().unwrap();
+        assert_ne!(allowed_fast_set(other, info_hash, 1313, 7), seven);
+
+        // No fewer pieces than the set: every piece.
+        assert_eq!(allowed_fast_set(ip, info_hash, 5, 5), [0, 1, 2, 3, 4]);
+    }
 
     #[test]
     fn a_failed_piece_costs_two_points_and_a_passed_one_earns_one_within_bounds() {
