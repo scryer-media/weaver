@@ -71,6 +71,27 @@ impl EncryptionPolicy {
     }
 }
 
+/// How a connection's handshake went (libtorrent
+/// `bt_peer_connection::m_encrypted` and `m_rc4_encrypted`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Encryption {
+    /// A plain BitTorrent handshake.
+    #[default]
+    None,
+    /// The encrypted handshake, then the plaintext method: only the
+    /// handshake header was encrypted.
+    HeaderOnly,
+    /// The encrypted handshake, then the RC4 method: the whole stream is.
+    Rc4,
+}
+
+impl Encryption {
+    /// Whether the connection used the encrypted handshake.
+    pub fn is_encrypted(self) -> bool {
+        self != Self::None
+    }
+}
+
 /// crypto_provide / crypto_select bit: only the handshake header is encrypted.
 pub(crate) const CRYPTO_PLAINTEXT: u32 = 0x01;
 /// crypto_provide / crypto_select bit: the whole stream is RC4-encrypted.
@@ -253,9 +274,9 @@ fn be_u32(b: &[u8]) -> u32 {
 pub(crate) struct Established {
     pub reader: BoxAsyncReadVectored,
     pub writer: BoxAsyncWrite,
-    /// `CRYPTO_RC4` or `CRYPTO_PLAINTEXT`, or 0 for a plaintext BitTorrent
+    /// What the handshake encrypted: none of it for a plaintext BitTorrent
     /// handshake that never went through the key exchange.
-    pub method: u32,
+    pub encryption: Encryption,
 }
 
 /// The payload-stream halves once the method is settled. `rest` is what was
@@ -275,14 +296,14 @@ fn establish(
         Established {
             reader: Box::new(DecryptingReader::new(prefix, reader, Some(dec))),
             writer: Box::new(EncryptingWriter::new(writer, enc)),
-            method,
+            encryption: Encryption::Rc4,
         }
     } else {
         prefix.append(&mut rest);
         Established {
             reader: DecryptingReader::new(prefix, reader, None).into_boxed(),
             writer,
-            method,
+            encryption: Encryption::HeaderOnly,
         }
     }
 }
@@ -402,7 +423,7 @@ pub(crate) async fn respond(
         return Ok(Established {
             reader: DecryptingReader::new(prefix, reader, None).into_boxed(),
             writer,
-            method: 0,
+            encryption: Encryption::None,
         });
     }
 
@@ -488,9 +509,9 @@ pub(crate) async fn upgrade_incoming(
     writer: &mut BoxAsyncWrite,
     timeout: Duration,
     info_hashes: impl FnOnce() -> Vec<Id20>,
-) -> Result<u32, MseError> {
+) -> Result<Encryption, MseError> {
     if policy == EncryptionPolicy::Disabled {
-        return Ok(0);
+        return Ok(Encryption::None);
     }
     let r = std::mem::replace(reader, Box::new(tokio::io::empty().into_vectored_compat()));
     let w = std::mem::replace(writer, Box::new(tokio::io::sink()));
@@ -503,7 +524,7 @@ pub(crate) async fn upgrade_incoming(
     .map_err(|_| MseError::Timeout)??;
     *reader = established.reader;
     *writer = established.writer;
-    Ok(established.method)
+    Ok(established.encryption)
 }
 
 /// The crypto_provide bitmask an outgoing connection offers under `policy`.

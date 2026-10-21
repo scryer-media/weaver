@@ -25,6 +25,7 @@ use tokio::{
 use tracing::warn;
 
 use crate::{
+    mse::Encryption,
     peer_connection::WriterRequest,
     peer_protocol::{Message, extended::ExtendedMessage},
     stream_connect::ConnectionKind,
@@ -92,7 +93,8 @@ pub(crate) struct PeerStates {
     // Held while a peer joins, so the list never grows past MAX_PEERLIST_SIZE,
     // and while an address is banned, so no peer at it joins meanwhile.
     admission: Mutex<()>,
-    // The addresses banned for sending bad data. One host is one address, as
+    // The banned addresses: for sending bad data, or by the operator. One
+    // host is one address, as
     // libtorrent's peer list keeps one peer per address
     // (`allow_multiple_connections_per_ip` off): a ban covers every port.
     // Taken last, after any other lock.
@@ -147,7 +149,7 @@ impl PeerList {
         let peers = peers
             .into_iter()
             .filter(|addr| !banned.contains(&addr.ip()) && seen.insert(*addr))
-            .map(Peer::new_with_outgoing_address)
+            .map(|addr| Peer::new_with_outgoing_address(addr, PeerSourceFlag::ResumeData.into()))
             .collect();
         Self {
             peers,
@@ -159,6 +161,13 @@ impl PeerList {
     /// The peers and bans a restart is to begin with; see [`ResumePeers`].
     pub fn resume_peers(&self) -> ResumePeers {
         ResumePeers::of(self.peers.iter().map(resume_entry), &self.banned)
+    }
+
+    /// Bans `ip` on a list no run holds: a peer at it rejoins the next run
+    /// as no connect candidate, and is saved as its ban (libtorrent
+    /// `peer_list::ban_peer`).
+    pub fn ban(&mut self, ip: IpAddr) {
+        self.banned.insert(ip);
     }
 }
 
@@ -199,6 +208,16 @@ fn resume_entry(peer: &Peer) -> (IpAddr, Option<(SocketAddr, bool)>) {
 }
 
 impl ResumePeers {
+    /// Bans `ip` on a saved list: its peers leave it, and its ban joins the
+    /// rest, in order (libtorrent `torrent::write_resume_data` saves a
+    /// peer at a banned address as its ban).
+    pub fn ban(&mut self, ip: IpAddr) {
+        self.peers.retain(|addr| addr.ip() != ip);
+        if let Err(at) = self.banned.binary_search(&ip) {
+            self.banned.insert(at, ip);
+        }
+    }
+
     // libtorrent `torrent::write_resume_data`: a peer at a banned address is
     // saved as its ban; every other peer to be saved that we were connected
     // to is; and of those we never were, the first [`RESUME_PEERS`], at
@@ -359,17 +378,17 @@ impl PeerStates {
         self.banned.read().contains(&ip)
     }
 
-    /// Bans the address of `addr`: no peer at it joins the list again, and
-    /// every one there now has its connection closed and is no connect
-    /// candidate (libtorrent `torrent::ban_peer`, `peer_list::ban_peer`).
-    pub fn ban(&self, addr: SocketAddr) {
+    /// Bans `ip`: no peer at it joins the list again, and every one there
+    /// now has its connection closed and is no connect candidate
+    /// (libtorrent `torrent::ban_peer`, `peer_list::ban_peer`).
+    pub fn ban(&self, ip: IpAddr) {
         let _admission = self.admission.lock();
-        if !self.banned.write().insert(addr.ip()) {
+        if !self.banned.write().insert(ip) {
             return;
         }
-        warn!(?addr, "banning the peer for sending bad data");
+        warn!(%ip, "banning the peer's address");
         for mut peer in self.states.iter_mut() {
-            if peer.key().ip() == addr.ip() {
+            if peer.key().ip() == ip {
                 peer.value_mut().ban(self);
             }
         }
@@ -387,7 +406,7 @@ impl PeerStates {
             Displace::EraseCandidates,
             None,
             |peer| peer.rediscovered(source, self),
-            || Some(Peer::new_with_outgoing_address(addr)),
+            || Some(Peer::new_with_outgoing_address(addr, source.into())),
         );
         self.candidates_changed.notify_one();
     }
@@ -408,9 +427,9 @@ impl PeerStates {
 
     /// The connection of the peer at `addr` completed its handshake; see
     /// [`Peer::handshake_encryption`].
-    pub fn handshake_encryption(&self, addr: SocketAddr, encrypted: bool) {
+    pub fn handshake_encryption(&self, addr: SocketAddr, encryption: Encryption) {
         self.with_peer_mut(addr, "handshake_encryption", |peer| {
-            peer.handshake_encryption(encrypted)
+            peer.handshake_encryption(encryption)
         });
     }
 
@@ -430,7 +449,8 @@ impl PeerStates {
             },
             || {
                 listen_address(addr, kind).map(|listen| {
-                    let peer = Peer::new_with_outgoing_address(listen);
+                    let peer =
+                        Peer::new_with_outgoing_address(listen, PeerSourceFlag::Incoming.into());
                     atomic_inc(&peer.stats.counters.incoming_connections);
                     peer
                 })
@@ -622,7 +642,7 @@ impl PeerStates {
             return known.then_some((rx, tx));
         }
         // Not where it listens: a web seed is never a connect candidate.
-        let mut peer = Peer::new_with_outgoing_address(handle);
+        let mut peer = Peer::new_with_outgoing_address(handle, Default::default());
         peer.outgoing_address = None;
         self.count_in(peer.get_state());
         peer.set_state(PeerState::Connecting(tx.clone()), self);
@@ -1837,7 +1857,7 @@ mod tests {
         let peers = make_peer_states();
         let t0 = Instant::now();
         let banned = peer_addr(1);
-        peers.ban(banned);
+        peers.ban(banned.ip());
         let failed = peer_addr(2);
         peers.add_peer(failed, PeerSourceFlag::Tracker);
         fail_at(&peers, failed, t0);
@@ -1882,7 +1902,7 @@ mod tests {
         let other = peer_addr(2);
         peers.add_peer(other, PeerSourceFlag::Tracker);
 
-        peers.ban(live);
+        peers.ban(live.ip());
 
         // The connection is closed; the candidate at the address is one no
         // longer; a peer at another address is untouched.
@@ -2014,7 +2034,7 @@ mod tests {
         peers.holepunch(live);
         assert_eq!(state_of(&peers, live), Some("live"));
         let banned = peer_addr(4);
-        peers.ban(banned);
+        peers.ban(banned.ip());
         peers.holepunch(banned);
         assert_eq!(state_of(&peers, banned), None);
     }
@@ -2225,6 +2245,15 @@ mod tests {
         Closed,
     }
 
+    // The handshake a connection completed: RC4-encrypted when `encrypted`.
+    fn handshake(encrypted: bool) -> Encryption {
+        if encrypted {
+            Encryption::Rc4
+        } else {
+            Encryption::None
+        }
+    }
+
     // Connects to `addr`, due at `at`, where encryption is preferred: asks
     // which handshake the connection tries, which ends as `ends` says, at
     // `at`. Returns whether it tried the encrypted handshake.
@@ -2235,7 +2264,7 @@ mod tests {
                 let encrypted = peer.encrypt_outgoing();
                 if let Ends::Completed = ends {
                     peer.connecting_to_live(Id20::default(), peers, ConnectionKind::Tcp);
-                    peer.handshake_encryption(encrypted);
+                    peer.handshake_encryption(handshake(encrypted));
                 }
                 peers.connection_closed(peer, at, matches!(ends, Ends::Failed), true);
                 encrypted
@@ -2381,7 +2410,7 @@ mod tests {
             peers.with_peer_mut(addr, "test", |peer| {
                 peer.connect_if_due(now, &peers).expect("a due candidate");
                 peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
-                peer.handshake_encryption(encrypt);
+                peer.handshake_encryption(handshake(encrypt));
             });
         }
 
@@ -2405,7 +2434,7 @@ mod tests {
         ] {
             let (addr, rx) = add_live_peer(&peers, addr);
             ends.push(rx);
-            peers.handshake_encryption(addr, encrypted);
+            peers.handshake_encryption(addr, handshake(encrypted));
             let advertised = peers.with_live(addr, |live| live.advertised_pex_flags());
             assert_eq!(advertised.unwrap() & PEX_ENCRYPTION, flag);
 
@@ -2441,7 +2470,7 @@ mod tests {
         let (_, _incoming_rx) = add_live_peer(&peers, "10.0.0.5:50000");
         let banned = peer_addr(6);
         peers.add_peer(banned, PeerSourceFlag::Tracker);
-        peers.ban(banned);
+        peers.ban(banned.ip());
 
         assert_eq!(
             peers.resume_peers(),

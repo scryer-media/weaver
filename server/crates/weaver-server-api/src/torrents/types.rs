@@ -3,7 +3,10 @@
 
 use async_graphql::{Enum, InputObject, SimpleObject};
 use weaver_server_core::torrents::service::{ScheduleSeeding, SeedingSource, TorrentView};
-use weaver_server_core::torrents::{TorrentState, TorrentTracker, TorrentVersion, TrackerStatus};
+use weaver_server_core::torrents::{
+    ConnectionKind, Encryption, PeerInfo, PeerSourceFlag, TorrentState, TorrentTracker,
+    TorrentVersion, TrackerStatus,
+};
 
 use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
 
@@ -294,6 +297,139 @@ impl From<TorrentView> for Torrent {
             route: view.route,
             files,
             trackers: view.trackers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// The transport a peer connection runs over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PeerConnection")]
+pub enum PeerConnectionGql {
+    Tcp,
+    Utp,
+}
+
+/// What of a peer connection is encrypted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PeerEncryption")]
+pub enum PeerEncryptionGql {
+    None,
+    /// The handshake only.
+    HeaderOnly,
+    /// All of it.
+    #[graphql(name = "RC4")]
+    Rc4,
+}
+
+/// A source that named a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PeerSource")]
+pub enum PeerSourceGql {
+    Tracker,
+    Dht,
+    Pex,
+    Lsd,
+    /// The torrent's own list.
+    ResumeData,
+    /// The peer connected to us.
+    Incoming,
+}
+
+impl From<PeerSourceFlag> for PeerSourceGql {
+    fn from(source: PeerSourceFlag) -> Self {
+        match source {
+            PeerSourceFlag::Tracker => Self::Tracker,
+            PeerSourceFlag::Dht => Self::Dht,
+            PeerSourceFlag::Pex => Self::Pex,
+            PeerSourceFlag::Lsd => Self::Lsd,
+            PeerSourceFlag::ResumeData => Self::ResumeData,
+            PeerSourceFlag::Incoming => Self::Incoming,
+        }
+    }
+}
+
+/// What a connection shows of a peer and of us.
+#[derive(Clone, Copy, Debug, SimpleObject)]
+#[graphql(name = "TorrentPeerFlags")]
+pub struct TorrentPeerFlagsGql {
+    /// We want pieces the peer has.
+    pub interesting: bool,
+    /// We choke the peer.
+    pub choked: bool,
+    /// The peer wants pieces we have.
+    pub remote_interested: bool,
+    /// The peer chokes us.
+    pub remote_choked: bool,
+    pub snubbed: bool,
+    pub optimistic_unchoke: bool,
+    pub seed: bool,
+    pub upload_only: bool,
+    pub on_parole: bool,
+    pub holepunched: bool,
+}
+
+/// One connection to a peer of a torrent.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentPeer")]
+pub struct TorrentPeerGql {
+    /// The peer's address and port.
+    pub address: String,
+    pub client: String,
+    /// The peer id, hex.
+    pub peer_id: String,
+    pub connection: PeerConnectionGql,
+    /// We made the connection.
+    pub outgoing: bool,
+    pub encryption: PeerEncryptionGql,
+    pub flags: TorrentPeerFlagsGql,
+    /// Every source that named the peer.
+    pub sources: Vec<PeerSourceGql>,
+    /// How many of the torrent's pieces the peer has.
+    pub pieces: u32,
+    pub progress: f64,
+    pub download_bps: u64,
+    pub upload_bps: u64,
+    /// Bytes over this connection.
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+}
+
+impl From<PeerInfo> for TorrentPeerGql {
+    fn from(peer: PeerInfo) -> Self {
+        let flags = peer.flags;
+        Self {
+            address: peer.addr.to_string(),
+            client: peer.client,
+            peer_id: peer.peer_id.as_string(),
+            connection: match peer.connection {
+                ConnectionKind::Tcp => PeerConnectionGql::Tcp,
+                ConnectionKind::Utp => PeerConnectionGql::Utp,
+            },
+            outgoing: peer.outgoing,
+            encryption: match peer.encryption {
+                Encryption::None => PeerEncryptionGql::None,
+                Encryption::HeaderOnly => PeerEncryptionGql::HeaderOnly,
+                Encryption::Rc4 => PeerEncryptionGql::Rc4,
+            },
+            flags: TorrentPeerFlagsGql {
+                interesting: flags.interesting,
+                choked: flags.choked,
+                remote_interested: flags.remote_interested,
+                remote_choked: flags.remote_choked,
+                snubbed: flags.snubbed,
+                optimistic_unchoke: flags.optimistic_unchoke,
+                seed: flags.seed,
+                upload_only: flags.upload_only,
+                on_parole: flags.on_parole,
+                holepunched: flags.holepunched,
+            },
+            sources: peer.sources.iter().map(PeerSourceGql::from).collect(),
+            pieces: peer.pieces,
+            progress: peer.progress,
+            download_bps: peer.download_rate,
+            upload_bps: peer.upload_rate,
+            downloaded_bytes: peer.downloaded,
+            uploaded_bytes: peer.uploaded,
         }
     }
 }

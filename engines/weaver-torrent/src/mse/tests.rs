@@ -165,8 +165,8 @@ async fn test_handshake_completes_and_carries_the_bt_handshake() {
     .await;
     let a = pair.initiator.unwrap();
     let b = pair.responder.unwrap();
-    assert_eq!(a.method, CRYPTO_RC4);
-    assert_eq!(b.method, CRYPTO_RC4);
+    assert_eq!(a.encryption, Encryption::Rc4);
+    assert_eq!(b.encryption, Encryption::Rc4);
     exchange(a, b, ih).await;
 }
 
@@ -182,8 +182,8 @@ async fn test_header_only_encryption_when_the_responder_selects_plaintext() {
     .await;
     let a = pair.initiator.unwrap();
     let b = pair.responder.unwrap();
-    assert_eq!(a.method, CRYPTO_PLAINTEXT);
-    assert_eq!(b.method, CRYPTO_PLAINTEXT);
+    assert_eq!(a.encryption, Encryption::HeaderOnly);
+    assert_eq!(b.encryption, Encryption::HeaderOnly);
     exchange(a, b, ih).await;
 }
 
@@ -233,7 +233,7 @@ async fn test_no_common_method_is_refused() {
 async fn plaintext_against(
     policy: EncryptionPolicy,
 ) -> (
-    Result<u32, MseError>,
+    Result<Encryption, MseError>,
     BoxAsyncReadVectored,
     (BoxAsyncReadVectored, BoxAsyncWrite),
 ) {
@@ -253,7 +253,7 @@ async fn test_require_responder_drops_plaintext() {
 #[tokio::test]
 async fn test_prefer_responder_accepts_plaintext() {
     let (res, mut reader, _initiator) = plaintext_against(EncryptionPolicy::Prefer).await;
-    assert_eq!(res.unwrap(), 0);
+    assert_eq!(res.unwrap(), Encryption::None);
     let h = read_bt_handshake(&mut reader).await;
     assert_eq!(h.info_hash, Id20::new([7; 20]));
 }
@@ -261,7 +261,7 @@ async fn test_prefer_responder_accepts_plaintext() {
 #[tokio::test]
 async fn test_disabled_responder_reads_nothing() {
     let (res, mut reader, _initiator) = plaintext_against(EncryptionPolicy::Disabled).await;
-    assert_eq!(res.unwrap(), 0);
+    assert_eq!(res.unwrap(), Encryption::None);
     let h = read_bt_handshake(&mut reader).await;
     assert_eq!(h.peer_id, Id20::new([1; 20]));
 }
@@ -278,11 +278,11 @@ async fn test_prefer_and_require_responders_accept_encrypted() {
             initiate(ar, aw, &ih, outgoing_offer(EncryptionPolicy::Require), &ia),
             upgrade_incoming(policy, &mut reader, &mut writer, Duration::MAX, || vec![ih]),
         );
-        assert_eq!(b.unwrap(), CRYPTO_RC4);
+        assert_eq!(b.unwrap(), Encryption::Rc4);
         let b = Established {
             reader,
             writer,
-            method: CRYPTO_RC4,
+            encryption: Encryption::Rc4,
         };
         exchange(a.unwrap(), b, ih).await;
     }

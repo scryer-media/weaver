@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useState } from "react";
-import { useMutation, useSubscription } from "urql";
-import { SET_TORRENT_SEEDING_MUTATION, TORRENT_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
+import { useEffect, useState } from "react";
+import { useMutation, useQuery, useSubscription } from "urql";
+import {
+  BAN_TORRENT_PEER_MUTATION,
+  SET_TORRENT_SEEDING_MUTATION,
+  TORRENT_PEERS_QUERY,
+  TORRENT_UPDATES_SUBSCRIPTION,
+} from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { torrentErrorText, type TorrentData } from "@/lib/torrents";
+import { torrentErrorText, type TorrentData, type TorrentPeerData } from "@/lib/torrents";
 import { DetailBlock, Field } from "@/next/components/chrome";
 import { SecondaryButton } from "@/next/components/controls";
 import { RecordEditor } from "@/next/components/RecordEditor";
@@ -18,6 +23,10 @@ import { EMPTY_SEEDING, durationText, seedingFields, seedingInput, type SeedingP
 
 const TRACKER_COLUMNS = { base: "minmax(0,1fr) 112px", sm: "minmax(0,1fr) 112px minmax(0,1fr)" };
 const FILE_COLUMNS = { base: "minmax(0,1fr) 56px 90px" };
+const PEER_COLUMNS = {
+  base: "minmax(0,1fr) 56px max-content",
+  sm: "minmax(0,1fr) minmax(0,1fr) 56px 90px 90px max-content",
+};
 
 /**
  * A torrent job's torrent, followed while the page shows it. Following it
@@ -87,7 +96,73 @@ function GeneralGrid({ fields }: { fields: TorrentField[] }) {
   );
 }
 
-/** A torrent job's own blocks on the job's screen: its transfer, its information, how it seeds, its trackers and its files. */
+/**
+ * A torrent's peer connections, read again each time the torrent pushes an
+ * update, each with its ban.
+ */
+function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (message: string) => void }) {
+  const t = useTranslate();
+  const [{ data }, reread] = useQuery<{ torrentPeers: TorrentPeerData[] }>({
+    query: TORRENT_PEERS_QUERY,
+    variables: { id: torrent.id },
+    requestPolicy: "network-only",
+  });
+  const [banState, banPeer] = useMutation(BAN_TORRENT_PEER_MUTATION);
+  useEffect(() => {
+    reread({ requestPolicy: "network-only" });
+  }, [torrent, reread]);
+  const peers = data?.torrentPeers ?? [];
+
+  const ban = (address: string) => {
+    void banPeer({ id: torrent.id, address }).then((result) => {
+      if (result.error) {
+        onReport(torrentErrorText(result.error));
+        return;
+      }
+      reread({ requestPolicy: "network-only" });
+    });
+  };
+
+  return (
+    <DetailBlock id="peers" title={t("next.torrent.peers")} note={countLabel(t, "next.torrent.peerCount", peers.length)}>
+      {peers.length === 0 ? (
+        <span className="text-[12.5px] text-wv-muted">{EM_DASH}</span>
+      ) : (
+        peers.map((peer) => (
+          <GridRow
+            key={peer.address}
+            columns={PEER_COLUMNS}
+            gap={14}
+            className="h-[38px] border-t border-wv-hairline"
+            title={peer.address}
+          >
+            <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{peer.address}</span>
+            <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={peer.client}>
+              {peer.client}
+            </span>
+            <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(peer.progress * 100).toFixed(1)}%`}</span>
+            <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+              {`↓ ${formatRate(peer.downloadBps)}`}
+            </span>
+            <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+              {`↑ ${formatRate(peer.uploadBps)}`}
+            </span>
+            <button
+              type="button"
+              disabled={banState.fetching}
+              onClick={() => ban(peer.address)}
+              className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-error disabled:cursor-default"
+            >
+              {t("next.torrent.ban")}
+            </button>
+          </GridRow>
+        ))
+      )}
+    </DetailBlock>
+  );
+}
+
+/** A torrent job's own blocks on the job's screen: its transfer, its information, how it seeds, its trackers, its peers and its files. */
 export function TorrentDetail({
   torrent,
   onChanged,
@@ -176,6 +251,8 @@ export function TorrentDetail({
           ))
         )}
       </DetailBlock>
+
+      <PeersBlock torrent={torrent} onReport={onReport} />
 
       <DetailBlock
         id="torrent-files"

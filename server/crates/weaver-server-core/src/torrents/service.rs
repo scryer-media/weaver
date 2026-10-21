@@ -5,6 +5,7 @@
 //! route, are read back as one state with its reason, and leave as history.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
@@ -18,7 +19,7 @@ use weaver_torrent::core::{Id20, Id32, InfoHashes};
 use weaver_torrent::limits::{LimitKind, LimitsConfig};
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
-    ManagedTorrent, Session, TorrentVersion, TrackerAnnounce, torrent_from_bytes,
+    ManagedTorrent, ResumePeers, Session, TorrentVersion, TrackerAnnounce, torrent_from_bytes,
 };
 
 use crate::SchedulerError;
@@ -59,7 +60,7 @@ use crate::torrents::sessions::{NetworkRoutes, RouteKey, SessionEnv, SessionErro
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::torrents::{
-    Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
+    Infohash, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord,
     TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
 };
 
@@ -1344,15 +1345,18 @@ impl TorrentService {
         let Some(peers) = handle.resume_peers() else {
             return;
         };
+        if let Err(error) = self.write_peers(job_id, peers).await {
+            tracing::warn!(job_id = job_id.0, %error, "could not save a torrent's peers");
+        }
+    }
+
+    // The one writer of a torrent's saved peers and bans.
+    async fn write_peers(&self, job_id: JobId, peers: ResumePeers) -> Result<(), String> {
         let db = self.inner.db.clone();
         match tokio::task::spawn_blocking(move || db.save_torrent_peers(job_id, &peers)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not save a torrent's peers");
-            }
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not save a torrent's peers");
-            }
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(state_error(error)),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -2176,6 +2180,52 @@ impl TorrentService {
             .update_torrent_intent(record.job_id, record.intent, record.completed_at_ms)
             .map(|_| ())
             .map_err(|error| ActionError::State(state_error(error)))
+    }
+
+    // The torrent's place in its session, while it has one.
+    async fn handle_of(&self, job_id: JobId) -> Result<Option<Arc<ManagedTorrent>>, ActionError> {
+        self.with_torrent(job_id, |torrent| {
+            Ok(torrent.attached.as_ref().map(|a| a.handle.clone()))
+        })
+        .await
+    }
+
+    /// The torrent's connections to peers, by address (libtorrent
+    /// `torrent_handle::get_peer_info`); none while it is in no session.
+    pub async fn peers(&self, job_id: JobId) -> Result<Vec<PeerInfo>, ActionError> {
+        Ok(self
+            .handle_of(job_id)
+            .await?
+            .map(|handle| handle.peers())
+            .unwrap_or_default())
+    }
+
+    /// Ban each of `ips` from the torrent: its connections close now and
+    /// none is made or taken from then on (libtorrent `torrent::ban_peer`).
+    /// The bans are written with the peers and bans the torrent's next
+    /// start begins with, so they outlive a restart.
+    pub async fn ban_peers(&self, job_id: JobId, ips: &[IpAddr]) -> Result<(), ActionError> {
+        let held = self
+            .handle_of(job_id)
+            .await?
+            .and_then(|handle| handle.ban_peers(ips));
+        let peers = match held {
+            Some(peers) => peers,
+            // In no session, or stopped by an error: the bans join the list
+            // it saved, which its next start begins with.
+            None => {
+                let db = self.inner.db.clone();
+                let mut saved = tokio::task::spawn_blocking(move || db.torrent_peers(job_id))
+                    .await
+                    .map_err(|error| ActionError::State(error.to_string()))?
+                    .map_err(|error| ActionError::State(state_error(error)))?;
+                ips.iter().for_each(|ip| saved.ban(*ip));
+                saved
+            }
+        };
+        self.write_peers(job_id, peers)
+            .await
+            .map_err(ActionError::State)
     }
 
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {

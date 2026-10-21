@@ -2048,6 +2048,11 @@ type MutationRoot {
 	setTorrentLocation(id: Int!, path: String!): Boolean!
 	setTorrentCategory(id: Int!, category: String): Boolean!
 	"""
+	Ban a peer's address from the torrent: an IP, or an IP and port
+	whose port is ignored.
+	"""
+	banTorrentPeer(id: Int!, address: String!): Boolean!
+	"""
 	The torrent's own seeding policy; null returns it to its category's
 	and the global one.
 	"""
@@ -2339,6 +2344,47 @@ type PathTestResult {
 	connectMillis: Float!
 	resolution: HostResolution
 	p2p: P2pTestResult
+}
+
+"""
+The transport a peer connection runs over.
+"""
+enum PeerConnection {
+	TCP
+	UTP
+}
+
+"""
+What of a peer connection is encrypted.
+"""
+enum PeerEncryption {
+	NONE
+	"""
+	The handshake only.
+	"""
+	HEADER_ONLY
+	"""
+	All of it.
+	"""
+	RC4
+}
+
+"""
+A source that named a peer.
+"""
+enum PeerSource {
+	TRACKER
+	DHT
+	PEX
+	LSD
+	"""
+	The torrent's own list.
+	"""
+	RESUME_DATA
+	"""
+	The peer connected to us.
+	"""
+	INCOMING
 }
 
 type PeerUploadResult {
@@ -2864,6 +2910,10 @@ type QueryRoot {
 	"""
 	diskUsage: [DiskUsage!]!
 	torrent(id: Int!): Torrent
+	"""
+	The torrent's live peer connections, by address.
+	"""
+	torrentPeers(id: Int!): [TorrentPeer!]!
 	"""
 	The torrents the schedule's pause leaves seeding, by the tracker rule
 	that keeps them; empty while no such pause is in force.
@@ -4955,6 +5005,72 @@ type TorrentFile {
 	The share of the file in hand, from 0 to 1.
 	"""
 	progress: Float!
+}
+
+"""
+One connection to a peer of a torrent.
+"""
+type TorrentPeer {
+	"""
+	The peer's address and port.
+	"""
+	address: String!
+	client: String!
+	"""
+	The peer id, hex.
+	"""
+	peerId: String!
+	connection: PeerConnection!
+	"""
+	We made the connection.
+	"""
+	outgoing: Boolean!
+	encryption: PeerEncryption!
+	flags: TorrentPeerFlags!
+	"""
+	Every source that named the peer.
+	"""
+	sources: [PeerSource!]!
+	"""
+	How many of the torrent's pieces the peer has.
+	"""
+	pieces: Int!
+	progress: Float!
+	downloadBps: Int!
+	uploadBps: Int!
+	"""
+	Bytes over this connection.
+	"""
+	downloadedBytes: Int!
+	uploadedBytes: Int!
+}
+
+"""
+What a connection shows of a peer and of us.
+"""
+type TorrentPeerFlags {
+	"""
+	We want pieces the peer has.
+	"""
+	interesting: Boolean!
+	"""
+	We choke the peer.
+	"""
+	choked: Boolean!
+	"""
+	The peer wants pieces we have.
+	"""
+	remoteInterested: Boolean!
+	"""
+	The peer chokes us.
+	"""
+	remoteChoked: Boolean!
+	snubbed: Boolean!
+	optimisticUnchoke: Boolean!
+	seed: Boolean!
+	uploadOnly: Boolean!
+	onParole: Boolean!
+	holepunched: Boolean!
 }
 
 type TorrentSettings {

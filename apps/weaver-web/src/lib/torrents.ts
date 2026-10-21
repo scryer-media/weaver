@@ -62,6 +62,16 @@ export interface TorrentTrackerData {
   leechers: number | null;
 }
 
+/** One connection to a peer of a torrent. */
+export interface TorrentPeerData {
+  address: string;
+  client: string;
+  /** The share of the torrent's pieces the peer has, from 0 to 1. */
+  progress: number;
+  downloadBps: number;
+  uploadBps: number;
+}
+
 /** What the queue reads of a torrent beside its job: enough for the seeding column and the row actions. */
 export interface TorrentSummaryData {
   id: number;

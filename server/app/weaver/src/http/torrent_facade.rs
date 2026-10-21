@@ -35,7 +35,10 @@ use weaver_server_core::settings::{
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, SeedingSource, TorrentService, TorrentSettings, TorrentView,
 };
-use weaver_server_core::torrents::{TorrentState, TorrentTracker, TrackerStatus, status};
+use weaver_server_core::torrents::{
+    ConnectionKind, Encryption, PeerInfo, PeerSourceFlag, TorrentState, TorrentTracker,
+    TrackerStatus, status,
+};
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle};
 
@@ -383,9 +386,10 @@ fn need(group: &str, action: &str) -> Option<Need> {
     Some(match (group, action) {
         ("app", "version" | "webapiVersion" | "buildInfo" | "preferences" | "defaultSavePath")
         | ("torrents", "info" | "properties" | "files" | "trackers" | "categories" | "tags")
-        | ("sync", "maindata")
+        | ("sync", "maindata" | "torrentPeers")
         | ("transfer", "info")
         | ("log", "main") => Need::Read,
+        ("transfer", "banPeers") => Need::Control,
         ("app", "setPreferences")
         | (
             "torrents",
@@ -539,6 +543,8 @@ async fn handle(
         ("torrents", "addTags" | "removeTags" | "recheck" | "reannounce") => ok(),
         ("torrents", "tags") | ("log", "main") => axum::Json(json!([])).into_response(),
         ("sync", "maindata") => maindata(&ctx).await,
+        ("sync", "torrentPeers") => torrent_peers(&ctx, &params).await,
+        ("transfer", "banPeers") => ban_peers(&ctx, &params).await,
         ("transfer", "info") => {
             let views = ctx.views().await;
             let upload = ctx.inner.config.read().await.bandwidth.upload_bps;
@@ -1380,4 +1386,181 @@ async fn maindata(ctx: &TorrentFacadeContext) -> Response {
         "server_state": server_state,
     }))
     .into_response()
+}
+
+// The client's name for a peer from the first eight bytes of its peer id
+// (qBittorrent `PeerInfo::peerIdClient`): empty while the id is all zeros,
+// "Unknown" when those bytes are not printable.
+fn peer_id_client(peer_id: &[u8; 20]) -> String {
+    if peer_id.iter().all(|byte| *byte == 0) {
+        return String::new();
+    }
+    let head = &peer_id[..8];
+    if head.iter().all(|byte| (32..=126).contains(byte)) {
+        head.iter().map(|byte| char::from(*byte)).collect()
+    } else {
+        "Unknown".to_owned()
+    }
+}
+
+// A peer's flags as the client's letters, each with what it stands for
+// (qBittorrent `PeerInfo::determineFlags`).
+fn peer_flags(peer: &PeerInfo) -> (String, String) {
+    let flags = peer.flags;
+    let letters = [
+        (
+            flags.interesting && flags.remote_choked,
+            'd',
+            "interested, choked by the peer",
+        ),
+        (
+            flags.interesting && !flags.remote_choked,
+            'D',
+            "interested, unchoked by the peer",
+        ),
+        (
+            flags.remote_interested && flags.choked,
+            'u',
+            "peer interested, choked by us",
+        ),
+        (
+            flags.remote_interested && !flags.choked,
+            'U',
+            "peer interested, unchoked by us",
+        ),
+        (
+            !flags.remote_choked && !flags.interesting,
+            'K',
+            "not interested, unchoked by the peer",
+        ),
+        (
+            !flags.choked && !flags.remote_interested,
+            '?',
+            "peer not interested, unchoked by us",
+        ),
+        (flags.optimistic_unchoke, 'O', "optimistic unchoke"),
+        (flags.snubbed, 'S', "snubbed"),
+        (!peer.outgoing, 'I', "incoming"),
+        (peer.sources.contains(PeerSourceFlag::Dht), 'H', "from DHT"),
+        (peer.sources.contains(PeerSourceFlag::Pex), 'X', "from PEX"),
+        (peer.sources.contains(PeerSourceFlag::Lsd), 'L', "from LSD"),
+        (peer.encryption == Encryption::Rc4, 'E', "encrypted"),
+        (
+            peer.encryption == Encryption::HeaderOnly,
+            'e',
+            "encrypted handshake",
+        ),
+        (matches!(peer.connection, ConnectionKind::Utp), 'P', "μTP"),
+        (flags.holepunched, 'h', "holepunched"),
+    ];
+    let set: Vec<_> = letters.iter().filter(|(on, ..)| *on).collect();
+    let letters = set
+        .iter()
+        .map(|(_, letter, _)| letter.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let described = set
+        .iter()
+        .map(|(_, letter, meaning)| format!("{letter} = {meaning}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (letters, described)
+}
+
+// One peer as `sync/torrentPeers` lists it (qBittorrent
+// `SyncController::torrentPeersAction`).
+fn peer_json(peer: &PeerInfo, total_bytes: u64) -> Value {
+    let (flags, flags_desc) = peer_flags(peer);
+    // The share of what the peer has that came from us.
+    let contribution = if peer.uploaded == 0 {
+        0.0
+    } else {
+        let total = if total_bytes == 0 {
+            peer.uploaded
+        } else {
+            total_bytes
+        } as f64;
+        let have = peer.progress * total;
+        peer.uploaded as f64 / if have <= 0.0 { total } else { have }
+    };
+    object([
+        ("client", json!(peer.client)),
+        ("peer_id_client", json!(peer_id_client(&peer.peer_id.0))),
+        ("progress", json!(peer.progress)),
+        ("dl_speed", json!(peer.download_rate)),
+        ("up_speed", json!(peer.upload_rate)),
+        ("downloaded", json!(peer.downloaded)),
+        ("uploaded", json!(peer.uploaded)),
+        (
+            "connection",
+            json!(match peer.connection {
+                ConnectionKind::Tcp => "BT",
+                ConnectionKind::Utp => "μTP",
+            }),
+        ),
+        ("flags", json!(flags)),
+        ("flags_desc", json!(flags_desc)),
+        ("contribution", json!(contribution)),
+        ("ip", json!(peer.addr.ip().to_string())),
+        ("port", json!(peer.addr.port())),
+        ("host_name", json!("")),
+        ("country_code", Value::Null),
+        ("country", Value::Null),
+    ])
+}
+
+async fn torrent_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let Some(torrents) = &ctx.inner.torrents else {
+        return not_found();
+    };
+    let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
+        return not_found();
+    };
+    let peers = match torrents.peers(view.job_id).await {
+        Ok(peers) => peers,
+        Err(ActionError::NotFound(_)) => return not_found(),
+        Err(error) => return internal(error),
+    };
+    let rid = ctx.inner.rid.fetch_add(1, Ordering::Relaxed) + 1;
+    let peers: Map<String, Value> = peers
+        .iter()
+        .map(|peer| (peer.addr.to_string(), peer_json(peer, view.total_bytes)))
+        .collect();
+    axum::Json(json!({
+        "rid": rid,
+        "full_update": true,
+        "show_flags": false,
+        "peers": peers,
+    }))
+    .into_response()
+}
+
+// `transfer/banPeers` (qBittorrent `TransferController::banPeersAction`):
+// `|`-separated `ip:port`s, each IP banned from every torrent. qBittorrent's
+// `SessionImpl::banIP` bans session-wide; the bans here go on each
+// torrent's own peer list (libtorrent `torrent::ban_peer`), saved once per
+// torrent. A torrent that fails to save does not stop the others.
+async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let Some(peers) = params.get("peers") else {
+        return text(StatusCode::BAD_REQUEST, "Missing parameter: peers");
+    };
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    let ips: Vec<_> = peers
+        .split('|')
+        .filter_map(|peer| peer.trim().parse::<SocketAddr>().ok())
+        .map(|addr| addr.ip())
+        .collect();
+    if ips.is_empty() {
+        return ok();
+    }
+    let mut failed = None;
+    for view in torrents.torrents(None).await {
+        match torrents.ban_peers(view.job_id, &ips).await {
+            Ok(()) | Err(ActionError::NotFound(_)) => {}
+            Err(error) => failed = Some(internal(error)),
+        }
+    }
+    failed.unwrap_or_else(ok)
 }

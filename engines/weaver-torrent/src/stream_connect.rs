@@ -19,7 +19,7 @@ use tracing::debug;
 use crate::{
     Error, PeerConnectionOptions, Result,
     meter::Meter,
-    mse::{self, EncryptionPolicy},
+    mse::{self, Encryption, EncryptionPolicy},
     network::{SocketFactory, UtpSocket},
     peer_connection::with_timeout,
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
@@ -151,8 +151,7 @@ impl StreamConnector {
     /// handshake that fails ends the connection: the next one to the peer
     /// tries what `encrypt` says then. The returned halves carry the peer's
     /// reply, the meter counts every byte they move, the encryption handshake
-    /// and ours included, and the flag says whether the encrypted handshake
-    /// was used.
+    /// and ours included, and the [`Encryption`] says how the handshake went.
     #[allow(clippy::too_many_arguments)]
     pub async fn connect_and_send_handshake(
         &self,
@@ -168,7 +167,7 @@ impl StreamConnector {
         BoxAsyncReadVectored,
         BoxAsyncWrite,
         Meter,
-        bool,
+        Encryption,
     )> {
         let (kind, r, w) = with_timeout(
             "connecting",
@@ -192,7 +191,7 @@ impl StreamConnector {
                 w.write_all(handshake).map_err(Error::WriteHandshake),
             )
             .await?;
-            return Ok((kind, r, w, meter, false));
+            return Ok((kind, r, w, meter, Encryption::None));
         }
 
         stats.attempts(1);
@@ -205,12 +204,19 @@ impl StreamConnector {
             stats.failures(1);
             debug!(?addr, "encrypted handshake failed: {e:#}");
         })?;
-        if established.method == mse::CRYPTO_RC4 {
+        let encryption = established.encryption;
+        if encryption == Encryption::Rc4 {
             stats.rc4(1);
         } else {
             stats.header_only(1);
         }
-        Ok((kind, established.reader, established.writer, meter, true))
+        Ok((
+            kind,
+            established.reader,
+            established.writer,
+            meter,
+            encryption,
+        ))
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {
@@ -488,7 +494,7 @@ mod tests {
                 Duration::MAX,
             )
             .await
-            .map(|(.., encrypted)| encrypted)
+            .map(|(.., encryption)| encryption.is_encrypted())
     }
 
     // libtorrent `bt_peer_connection::on_connected`: where encryption is

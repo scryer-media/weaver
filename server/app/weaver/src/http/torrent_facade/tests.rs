@@ -1537,3 +1537,143 @@ async fn a_cap_of_nothing_is_never_read_as_no_limit() {
     assert!(transfer.get("dl_rate_limit").is_none());
     assert_eq!(transfer["up_rate_limit"], 0);
 }
+
+#[test]
+fn a_peer_id_reads_as_its_first_eight_bytes() {
+    assert_eq!(peer_id_client(&[0; 20]), "");
+    let mut id = *b"-qB4650-abcdefghijkl";
+    assert_eq!(peer_id_client(&id), "-qB4650-");
+    id[3] = 0x01;
+    assert_eq!(peer_id_client(&id), "Unknown");
+}
+
+// qBittorrent `SyncController::torrentPeersAction` and
+// `PeerInfo::determineFlags`: a peer as the listing shows it, its letters
+// in qBittorrent's order.
+#[test]
+fn a_listed_peer_shows_its_letters_connection_and_contribution() {
+    let peer_id = IDENTITY.peer_id();
+    let peer = PeerInfo {
+        addr: "203.0.113.1:6881".parse().unwrap(),
+        client: "Weaver 1.0".to_owned(),
+        peer_id,
+        connection: ConnectionKind::Utp,
+        outgoing: false,
+        encryption: Encryption::HeaderOnly,
+        flags: weaver_server_core::torrents::PeerFlags {
+            interesting: true,
+            remote_interested: true,
+            optimistic_unchoke: true,
+            holepunched: true,
+            ..Default::default()
+        },
+        sources: [
+            PeerSourceFlag::Dht,
+            PeerSourceFlag::Pex,
+            PeerSourceFlag::Lsd,
+        ]
+        .into_iter()
+        .collect(),
+        pieces: 2,
+        progress: 0.5,
+        download_rate: 10,
+        upload_rate: 20,
+        downloaded: 30,
+        uploaded: 250,
+    };
+    let listed = peer_json(&peer, 1000);
+    assert_eq!(listed["flags"], "D U O I H X L e P h");
+    let described = listed["flags_desc"].as_str().unwrap();
+    assert_eq!(described.lines().count(), 10);
+    assert_eq!(
+        described.lines().next(),
+        Some("D = interested, unchoked by the peer")
+    );
+    assert_eq!(listed["connection"], "μTP");
+    // 250 bytes of the 500 the peer has came from us.
+    assert_eq!(listed["contribution"], 0.5);
+    assert_eq!(
+        listed["peer_id_client"],
+        peer_id_client(&peer_id.0).as_str()
+    );
+    assert_eq!(listed["client"], "Weaver 1.0");
+    assert_eq!(
+        (listed["ip"].as_str(), listed["port"].as_u64()),
+        (Some("203.0.113.1"), Some(6881))
+    );
+    assert_eq!(
+        (listed["dl_speed"].as_u64(), listed["up_speed"].as_u64()),
+        (Some(10), Some(20))
+    );
+
+    // Choked both ways, outgoing, over TCP, plaintext, named by a tracker:
+    // only what qBittorrent marks.
+    let quiet = PeerInfo {
+        connection: ConnectionKind::Tcp,
+        outgoing: true,
+        encryption: Encryption::Rc4,
+        flags: weaver_server_core::torrents::PeerFlags {
+            choked: true,
+            remote_choked: true,
+            snubbed: true,
+            ..Default::default()
+        },
+        sources: PeerSourceFlag::Tracker.into(),
+        uploaded: 0,
+        ..peer
+    };
+    let listed = peer_json(&quiet, 1000);
+    assert_eq!(listed["flags"], "S E");
+    assert_eq!(listed["connection"], "BT");
+    assert_eq!(listed["contribution"], 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peers_are_listed_by_hash_and_a_ban_reaches_every_torrent() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    rig.add_file(&metainfo("two.mkv", 3000, false), &[]).await;
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+
+    let listed = rig
+        .get(&format!("/api/v2/sync/torrentPeers?hash={hash}&rid=0"))
+        .await
+        .json();
+    assert_eq!(listed["full_update"], true);
+    assert_eq!(listed["peers"], serde_json::json!({}));
+    assert_eq!(
+        rig.get("/api/v2/sync/torrentPeers?hash=00").await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    let banned = rig
+        .post(
+            "/api/v2/transfer/banPeers",
+            "peers=127.0.0.3%3A6881%7C%5B%3A%3A1%5D%3A6881%7Cnonsense",
+        )
+        .await;
+    assert_eq!(banned.status, StatusCode::OK);
+    let views = rig.context.views().await;
+    assert_eq!(views.len(), 2);
+    for job in views.iter().map(|view| view.job_id) {
+        let banned: Vec<String> = rig
+            .db
+            .torrent_peers(job)
+            .unwrap()
+            .banned
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(banned, ["127.0.0.3", "::1"], "torrent {job:?}");
+    }
+    assert_eq!(
+        rig.post("/api/v2/transfer/banPeers", "").await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        rig.post_as("/api/v2/transfer/banPeers", "peers=127.0.0.3%3A1", READER)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+}

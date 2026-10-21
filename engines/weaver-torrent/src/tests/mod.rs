@@ -10,6 +10,7 @@ mod e2e_another_local_client;
 mod e2e_dht_identity;
 mod e2e_initial_have;
 mod e2e_mse;
+mod e2e_peers;
 mod e2e_piece_priority;
 mod e2e_ratelimits;
 mod e2e_session_stop;

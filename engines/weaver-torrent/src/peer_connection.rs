@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tracing::{Instrument, trace, trace_span};
 
+use crate::mse::Encryption;
 use crate::{
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
@@ -53,9 +54,9 @@ pub trait PeerConnectionHandler {
         true
     }
     /// The connection, whichever side opened it, completed its handshake,
-    /// the encrypted one when `encrypted` holds; told right after
+    /// as `encryption` says; told right after
     /// [`Self::on_handshake`].
-    fn on_handshake_encryption(&self, _encrypted: bool) {}
+    fn on_handshake_encryption(&self, _encryption: Encryption) {}
     fn should_send_bitfield(&self) -> bool;
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
     /// `speaks_v2`: the peer speaks BEP 52, so it may exchange hashes.
@@ -404,7 +405,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         self.handler
             .on_handshake(incoming.handshake, incoming.kind, speaks_v2)
             .map_err(Error::Anyhow)?;
-        self.handler.on_handshake_encryption(incoming.encrypted);
+        self.handler.on_handshake_encryption(incoming.encryption);
 
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
@@ -440,7 +441,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
         let now = Instant::now();
-        let (ckind, mut read, write, meter, encrypted) = self
+        let (ckind, mut read, write, meter, encryption) = self
             .connector
             .connect_and_send_handshake(
                 self.addr,
@@ -483,7 +484,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 .map_err(Error::Anyhow)?;
             // The peer answered, so the method this connection tried works
             // with it (libtorrent `bt_peer_connection::on_receive_impl`).
-            self.handler.on_handshake_encryption(encrypted);
+            self.handler.on_handshake_encryption(encryption);
 
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
@@ -1000,7 +1001,7 @@ mod tests {
             writer,
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
-            encrypted: false,
+            encryption: crate::mse::Encryption::None,
             meter: Default::default(),
         };
         let (_tx, rx) = mpsc::unbounded_channel();
@@ -1101,7 +1102,7 @@ mod tests {
             writer,
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
-            encrypted: false,
+            encryption: crate::mse::Encryption::None,
             meter: meter.clone(),
         };
         let (tx, rx) = mpsc::unbounded_channel();

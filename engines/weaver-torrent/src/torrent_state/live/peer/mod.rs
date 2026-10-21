@@ -5,6 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
+pub mod info;
 pub mod stats;
 
 use std::cmp::Reverse;
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 use crate::core::hash_id::Id20;
 use crate::core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
+use crate::core::speed_estimator::SpeedEstimator;
 use crate::peer_protocol::{Message, Request};
 use crate::sha1w::{ISha1, Sha1};
 
@@ -24,12 +26,13 @@ use tokio::sync::{
 };
 use tokio::time::Instant;
 
+use crate::mse::Encryption;
 use crate::peer_connection::WriterRequest;
 use crate::peer_protocol::extended::ut_pex::{
     PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo,
 };
 use crate::stream_connect::{ConnectionKind, Transports};
-use crate::type_aliases::{BF, PeerSourceFlag};
+use crate::type_aliases::{BF, PeerSourceFlag, PeerSources};
 
 use super::PeerStates;
 use super::choker::Transfer;
@@ -300,6 +303,8 @@ pub(crate) struct Peer {
     // failures, until the connection closes (libtorrent
     // `peer_connection::set_holepunch_mode`, `torrent::connect_to_peer`).
     holepunch: bool,
+    // Every source that named the peer.
+    sources: PeerSources,
 }
 
 impl Peer {
@@ -332,12 +337,13 @@ impl Peer {
             trust: Trust::default(),
             supports_holepunch: false,
             holepunch: false,
+            sources: PeerSourceFlag::Incoming.into(),
         }
     }
 
-    /// A peer a tracker, DHT or PEX named, listening where it was named. The
-    /// peer list counts it on admission.
-    pub fn new_with_outgoing_address(addr: SocketAddr) -> Self {
+    /// A peer `sources` named, listening where it was named. The peer list
+    /// counts it on admission.
+    pub fn new_with_outgoing_address(addr: SocketAddr, sources: PeerSources) -> Self {
         Self {
             addr,
             outgoing_address: Some(addr),
@@ -353,15 +359,17 @@ impl Peer {
             trust: Trust::default(),
             supports_holepunch: false,
             holepunch: false,
+            sources,
         }
     }
 
-    /// A peer a holepunch introduced us to, at `addr`. The peer list counts
-    /// it on admission.
+    /// A peer a holepunch introduced us to, at `addr`, as PEX names one
+    /// (libtorrent `bt_peer_connection::on_holepunch` adds it with
+    /// `peer_info::pex`). The peer list counts it on admission.
     pub fn new_holepunched(addr: SocketAddr) -> Self {
         Self {
             holepunch: true,
-            ..Self::new_with_outgoing_address(addr)
+            ..Self::new_with_outgoing_address(addr, PeerSourceFlag::Pex.into())
         }
     }
 
@@ -448,6 +456,10 @@ impl Peer {
         self.holepunch
     }
 
+    pub(crate) fn sources(&self) -> PeerSources {
+        self.sources
+    }
+
     /// What a connection to the peer may go over: uTP alone while a
     /// holepunch introduced it (libtorrent `bt_peer_connection::on_holepunch`
     /// marks it `supports_utp`, so `torrent::connect_to_peer` dials it
@@ -485,6 +497,7 @@ impl Peer {
     /// candidate again only once it is under them (libtorrent
     /// `peer_list::update_peer`, `is_connect_candidate`).
     pub(crate) fn rediscovered(&mut self, source: PeerSourceFlag, counters: &PeerStates) {
+        self.sources.insert(source);
         if source == PeerSourceFlag::Tracker {
             self.failcount = self.failcount.saturating_sub(1);
         }
@@ -526,19 +539,19 @@ impl Peer {
         }
     }
 
-    /// The peer's connection completed its handshake, the encrypted one
-    /// when `encrypted`, and says so in our PEX (libtorrent
+    /// The peer's connection completed its handshake as `encryption` says,
+    /// and our PEX says whether it was encrypted (libtorrent
     /// `bt_peer_connection::init_bt_handshake` sets `m_encrypted` either
     /// way round). One we made makes the next we make try that method again
     /// (`init_bt_handshake` and `on_receive_impl` write `pe_support` only
     /// when `is_outgoing()`).
-    pub(crate) fn handshake_encryption(&mut self, encrypted: bool) {
+    pub(crate) fn handshake_encryption(&mut self, encryption: Encryption) {
         if self.connected_out() == Some(true) {
-            self.encrypt = encrypted;
+            self.encrypt = encryption.is_encrypted();
             self.fast_reconnect = false;
         }
         if let Some(live) = self.get_live_mut() {
-            live.encrypted = encrypted;
+            live.encryption = encryption;
         }
     }
 
@@ -637,6 +650,7 @@ impl Peer {
             trust: self.trust,
             supports_holepunch: self.supports_holepunch,
             holepunch: false,
+            sources: self.sources,
         }
     }
 
@@ -653,9 +667,7 @@ impl Peer {
         Some(match &self.state {
             PeerState::Connecting(_) => opening_rank(self.trust),
             PeerState::Live(live) => {
-                let fetched = Transfer::of(&self.stats.counters)
-                    .fetched
-                    .saturating_sub(live.fetched_at_live);
+                let fetched = live.this_connection(&self.stats.counters).fetched;
                 let seconds = now.saturating_duration_since(live.live_since).as_secs();
                 (
                     live.interesting,
@@ -830,7 +842,6 @@ impl Peer {
 
 #[derive(Debug)]
 pub(crate) struct LivePeerState {
-    #[allow(dead_code)]
     peer_id: Id20,
 
     pub client_name: Option<String>,
@@ -844,6 +855,9 @@ pub(crate) struct LivePeerState {
     became_uninterested: Instant,
     // Whether we want to download from the peer, as we last told it.
     interesting: bool,
+    // Whether the peer chokes us, as it last said. Like every connection it
+    // starts choked (BEP 3; libtorrent `peer_connection::m_peer_choked`).
+    pub choked_by_peer: bool,
     // When we last told the peer we are no longer interested; the time the
     // connection went live until we do (libtorrent
     // `m_became_uninteresting`).
@@ -863,11 +877,11 @@ pub(crate) struct LivePeerState {
     // What the peer had sent us and we had sent it when the choker's current
     // round began.
     round_start: Transfer,
-    // When the connection went live, and what the peer had sent us by then
-    // (libtorrent `peer_connection::m_connect`, and the start of its
-    // `total_payload_download`).
+    // When the connection went live, and what the peer had sent us and we
+    // had sent it by then (libtorrent `peer_connection::m_connect`, and the
+    // start of its `total_payload_download` and `total_payload_upload`).
     live_since: Instant,
-    fetched_at_live: u64,
+    at_live: Transfer,
     // Whether we made the connection (libtorrent
     // `peer_connection::is_outgoing`).
     outgoing: bool,
@@ -991,9 +1005,29 @@ pub(crate) struct LivePeerState {
     // `m_suggested_pieces`).
     pub suggested: Vec<ValidPieceIndex>,
 
-    // The connection completed the encrypted handshake (libtorrent
-    // `bt_peer_connection::supports_encryption`, `m_encrypted`).
-    pub encrypted: bool,
+    // How the connection's handshake went (libtorrent
+    // `bt_peer_connection::m_encrypted`, `m_rc4_encrypted`).
+    pub encryption: Encryption,
+
+    // The payload the peer sends us and we send it on this connection, per
+    // second over the last [`RATE_WINDOW`] (libtorrent
+    // `stat::download_payload_rate`, `upload_payload_rate`, the average
+    // `stat_channel::second_tick` keeps).
+    pub download_rate: SpeedEstimator,
+    pub upload_rate: SpeedEstimator,
+}
+
+/// How often the torrent samples each connection's payload rates.
+pub(crate) const RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The span a connection's payload rate averages over: five seconds, as
+/// libtorrent's `stat_channel` does.
+pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(5);
+
+fn rate_estimator() -> SpeedEstimator {
+    // Samples one tick apart span one tick fewer than their count.
+    let samples = RATE_WINDOW.as_millis() / RATE_SAMPLE_INTERVAL.as_millis() + 1;
+    SpeedEstimator::new(samples as usize)
 }
 
 /// Why a request the peer sent us is not queued.
@@ -1027,6 +1061,7 @@ impl LivePeerState {
             peer_interested: false,
             became_uninterested: now,
             interesting: false,
+            choked_by_peer: true,
             became_uninteresting: now,
             last_upload: now,
             choked_at: Some(now),
@@ -1034,7 +1069,7 @@ impl LivePeerState {
             uploaded_at_unchoke: 0,
             round_start: transfer,
             live_since: now,
-            fetched_at_live: transfer.fetched,
+            at_live: transfer,
             outgoing,
             bitfield: BF::default(),
             seeder: false,
@@ -1065,8 +1100,18 @@ impl LivePeerState {
             allowed_fast_to_peer: None,
             allowed_fast_from_peer: Vec::new(),
             suggested: Vec::new(),
-            encrypted: false,
+            encryption: Encryption::None,
+            download_rate: rate_estimator(),
+            upload_rate: rate_estimator(),
         }
+    }
+
+    /// The connection's rates take what moved over it by `now`, given the
+    /// peer's `counters`.
+    pub(crate) fn sample_rates(&self, counters: &PeerCountersAtomic, now: std::time::Instant) {
+        let moved = self.this_connection(counters);
+        self.download_rate.add_snapshot(moved.fetched, None, now);
+        self.upload_rate.add_snapshot(moved.uploaded, None, now);
     }
 
     /// The peer named its DHT node at `port` (BEP 5 PORT). Whether that is
@@ -1121,7 +1166,7 @@ impl LivePeerState {
     /// `ut_pex_plugin::tick`).
     pub fn advertised_pex_flags(&self) -> u8 {
         let mut flags = 0;
-        if self.encrypted {
+        if self.encryption.is_encrypted() {
             flags |= PEX_ENCRYPTION;
         }
         if self.seeder {
@@ -1210,6 +1255,13 @@ impl LivePeerState {
     /// Whether we asked the peer for `chunk` and wait for it still.
     pub fn has_inflight_request(&self, chunk: &ChunkInfo) -> bool {
         self.inflight_requests.contains(chunk)
+    }
+
+    /// What moved over this connection, given the peer's `counters` over
+    /// every connection to it (libtorrent `stat::total_payload_download`,
+    /// `total_payload_upload`).
+    pub(crate) fn this_connection(&self, counters: &PeerCountersAtomic) -> Transfer {
+        Transfer::of(counters).since(self.at_live)
     }
 
     pub fn is_snubbed(&self) -> bool {

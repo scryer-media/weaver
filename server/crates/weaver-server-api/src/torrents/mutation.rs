@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::net::{IpAddr, SocketAddr};
+
 use async_graphql::{Context, Object, Result};
 use base64::Engine;
 use weaver_server_core::SchedulerHandle;
@@ -24,7 +26,7 @@ fn add_error(error: AddError) -> async_graphql::Error {
     graphql_error(code, error.to_string())
 }
 
-fn action_error(error: ActionError) -> async_graphql::Error {
+pub(super) fn action_error(error: ActionError) -> async_graphql::Error {
     let code = match &error {
         ActionError::NotFound(_) => "NOT_FOUND",
         ActionError::UnmetGoal(_) => "SEEDING_GOAL_UNMET",
@@ -170,6 +172,23 @@ impl TorrentsMutation {
     ) -> Result<bool> {
         service(ctx)?
             .set_category(JobId(id), category)
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
+    /// Ban a peer's address from the torrent: an IP, or an IP and port
+    /// whose port is ignored.
+    #[graphql(guard = "ControlGuard")]
+    async fn ban_torrent_peer(&self, ctx: &Context<'_>, id: u64, address: String) -> Result<bool> {
+        let address = address.trim();
+        let ip = address
+            .parse::<SocketAddr>()
+            .map(|addr| addr.ip())
+            .or_else(|_| address.parse::<IpAddr>())
+            .map_err(|_| graphql_error("INVALID_INPUT", "address is not an IP address"))?;
+        service(ctx)?
+            .ban_peers(JobId(id), &[ip])
             .await
             .map_err(action_error)?;
         Ok(true)

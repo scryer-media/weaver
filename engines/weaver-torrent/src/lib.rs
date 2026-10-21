@@ -79,7 +79,7 @@ pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
 pub use listen::{ListenerMode, ListenerOptions};
-pub use mse::{EncryptionPolicy, MseError};
+pub use mse::{Encryption, EncryptionPolicy, MseError};
 pub use network::{SocketFactory, StreamListener};
 pub use peer_connection::PeerConnectionOptions;
 pub use piece_priority::PiecePriority;
@@ -87,12 +87,15 @@ pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
-pub use stream_connect::ConnectionOptions;
+pub use stream_connect::{ConnectionKind, ConnectionOptions};
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
-    TorrentStatsState, initializing::Checkpoint, live::peers::ResumePeers,
+    TorrentStatsState,
+    initializing::Checkpoint,
+    live::peer::info::{PeerFlags, PeerInfo},
+    live::peers::ResumePeers,
 };
-pub use type_aliases::{BF, FileInfos};
+pub use type_aliases::{BF, FileInfos, PeerSourceFlag, PeerSources};
 
 pub use crate::buffers::*;
 pub use crate::clone_to_owned::CloneToOwned;

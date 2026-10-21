@@ -118,8 +118,10 @@ use self::{
     choker::CHOKED_REQUEST_GRACE,
     peer::{
         DisconnectRank, InflightRequest, LivePeerState, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx,
-        PeerState, PeerTx, Refused, RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
-        opening_rank,
+        PeerState, PeerTx, RATE_SAMPLE_INTERVAL, Refused, RemoveInflightRequestResult,
+        empty_bitfield,
+        info::PeerInfo,
+        ingest_bitfield, opening_rank,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -448,7 +450,12 @@ impl TorrentStateLive {
                         state
                             .up_speed_estimator
                             .add_snapshot(stats.uploaded_bytes, None, now);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        for peer in state.peers.states.iter() {
+                            if let Some(live) = peer.value().get_live() {
+                                live.sample_rates(&peer.value().stats.counters, now);
+                            }
+                        }
+                        tokio::time::sleep(RATE_SAMPLE_INTERVAL).await;
                     }
                 }
             },
@@ -988,6 +995,11 @@ impl TorrentStateLive {
         self.peers.resume_peers()
     }
 
+    /// Bans `ip`; see [`PeerStates::ban`].
+    pub(crate) fn ban_peer(&self, ip: std::net::IpAddr) {
+        self.peers.ban(ip);
+    }
+
     pub fn peer_id(&self) -> Id20 {
         self.shared.peer_id
     }
@@ -1217,6 +1229,29 @@ impl TorrentStateLive {
                 .map(|e| (e.key().to_string(), e.value().into()))
                 .collect(),
         }
+    }
+
+    /// The torrent's connections to peers, by address (libtorrent
+    /// `torrent::get_peer_info`). A web seed is no peer of the swarm, and
+    /// is not listed.
+    pub fn peer_infos(&self) -> Vec<PeerInfo> {
+        // The choker's lock goes before the peer table's.
+        let optimistic = self
+            .shared
+            .session
+            .upgrade()
+            .map(|session| session.choker.optimistic(self.shared.id))
+            .unwrap_or_default();
+        let total_pieces = self.lengths.total_pieces();
+        let mut infos: Vec<PeerInfo> = self
+            .peers
+            .states
+            .iter()
+            .filter(|e| !web_seed::is_web_seed(*e.key()))
+            .filter_map(|e| PeerInfo::of(e.value(), total_pieces, optimistic.contains(e.key())))
+            .collect();
+        infos.sort_by_key(|info| info.addr);
+        infos
     }
 
     /// Resolves once the torrent is finished. The wait is taken before the
@@ -1622,7 +1657,7 @@ impl TorrentStateLive {
                 .with_peer_mut(peer, "piece_failed", |p| p.piece_failed(bannable))
                 .unwrap_or(bannable);
             if to_ban {
-                self.peers.ban(peer);
+                self.peers.ban(peer.ip());
             }
         }
     }
@@ -1778,7 +1813,6 @@ const MAX_PEX_MESSAGE_LEN: usize = 500 * 1024;
 const DEFAULT_PEER_REQUEST_WINDOW: usize = 500;
 
 struct PeerFlowControl {
-    i_am_choked: bool,
     // The most requests outstanding to the peer: the session's limit, or
     // the peer's `reqq` when that is lower (libtorrent
     // `peer_connection::m_max_out_request_queue`). How many the peer is
@@ -1790,7 +1824,6 @@ struct PeerFlowControl {
 impl PeerFlowControl {
     fn new(max_request_window: usize) -> Self {
         Self {
-            i_am_choked: true,
             request_window: max_request_window,
         }
     }
@@ -1856,8 +1889,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.peers.encrypt_outgoing(self.addr)
     }
 
-    fn on_handshake_encryption(&self, encrypted: bool) {
-        self.state.peers.handshake_encryption(self.addr, encrypted);
+    fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
+        self.state.peers.handshake_encryption(self.addr, encryption);
     }
 
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {
@@ -2479,7 +2512,7 @@ impl PeerHandler {
     fn acquire_next_piece(&self) -> crate::Result<Option<ValidPieceIndex>> {
         // While the peer chokes us we may fetch only the pieces it allows
         // (libtorrent `request_a_block` masks the peer's bitfield with them).
-        let choked = self.is_choked();
+        let choked = self.choked_by_peer();
 
         // Steal info to process after releasing the peer lock
         let mut steal_info: Option<(SocketAddr, ValidPieceIndex)> = None;
@@ -2667,7 +2700,7 @@ impl PeerHandler {
     /// The peer asked for what we cannot serve. The request is dropped: with
     /// no fast extension there is no Reject to send.
     fn on_invalid_request(&self, request: Request) -> anyhow::Result<()> {
-        let peer_chokes_us = self.is_choked();
+        let peer_chokes_us = self.choked_by_peer();
         let keep = self
             .state
             .peers
@@ -3187,7 +3220,11 @@ impl PeerHandler {
     }
 
     fn on_i_am_choked(&self) -> crate::Result<()> {
-        self.lock_flow_control("i_am_choked = true").i_am_choked = true;
+        self.state
+            .peers
+            .with_live_mut(self.addr, "choked by the peer", |live| {
+                live.choked_by_peer = true;
+            });
         // A plain peer that chokes us drops every request we sent it (BEP 3).
         // A fast one answers each with its block or a Reject (BEP 6), so the
         // requests stay until it does (libtorrent
@@ -3213,7 +3250,7 @@ impl PeerHandler {
         // A piece the peer rejects is no longer one it lets us fetch while
         // it chokes us, or, unchoked, one it suggests (libtorrent
         // `incoming_reject_request`).
-        let choked = self.is_choked();
+        let choked = self.choked_by_peer();
         let Some(answer) =
             self.state
                 .peers
@@ -3275,7 +3312,11 @@ impl PeerHandler {
 
     fn on_i_am_unchoked(&self) {
         trace!("we are unchoked");
-        self.lock_flow_control("i_am_choked = false").i_am_choked = false;
+        self.state
+            .peers
+            .with_live_mut(self.addr, "unchoked by the peer", |live| {
+                live.choked_by_peer = false;
+            });
         self.notify_request_slots_changed();
     }
 
@@ -3454,7 +3495,7 @@ impl PeerHandler {
                     // Before the storage takes the piece, while the good bytes
                     // are still there to read back.
                     for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
-                        state.peers.ban(sender);
+                        state.peers.ban(sender.ip());
                     }
                     // The piece is ours only once the storage has taken it
                     // (libtorrent: the write completes before the hash job,
@@ -3540,7 +3581,7 @@ impl PeerHandler {
                     let blocks =
                         smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
                     for liar in state.peers.piece_failed(piece_index, blocks) {
-                        state.peers.ban(liar);
+                        state.peers.ban(liar.ip());
                     }
                     // Checked by v2, a piece of more than one sender has its
                     // block hashes fetched, which name the senders of its bad
@@ -3642,23 +3683,24 @@ impl PeerHandler {
         Ok(())
     }
 
-    fn is_choked(&self) -> bool {
-        self.lock_flow_control("is_choked").i_am_choked
+    // Whether the peer chokes us; it does until it says otherwise.
+    fn choked_by_peer(&self) -> bool {
+        self.state
+            .peers
+            .with_live(self.addr, |live| live.choked_by_peer)
+            .unwrap_or(true)
     }
 
     /// Whether we may send the peer another request: it has room for one,
     /// and it does not choke us or lets us fetch some piece while it does
     /// (BEP 6).
     fn can_send_request(&self) -> bool {
-        let (i_am_choked, request_window) = {
-            let flow = self.lock_flow_control("can_send_request");
-            (flow.i_am_choked, flow.request_window)
-        };
+        let request_window = self.lock_flow_control("can_send_request").request_window;
 
         self.state
             .peers
             .with_live(self.addr, |live| {
-                (!i_am_choked || !live.allowed_fast_from_peer.is_empty())
+                (!live.choked_by_peer || !live.allowed_fast_from_peer.is_empty())
                     && live.can_hold_another_request(request_window)
             })
             .unwrap_or(false)
@@ -3676,13 +3718,10 @@ impl PeerHandler {
                 return Ok(true);
             };
             let notified = notify.notified();
-            let (i_am_choked, request_window) = {
-                let flow = self.lock_flow_control("wait_to_request");
-                (flow.i_am_choked, flow.request_window)
-            };
+            let request_window = self.lock_flow_control("wait_to_request").request_window;
             let slot = self.state.peers.with_live(self.addr, |live| {
                 (
-                    !i_am_choked || live.allowed_fast_from_peer.contains(&piece),
+                    !live.choked_by_peer || live.allowed_fast_from_peer.contains(&piece),
                     live.can_hold_another_request(request_window),
                 )
             });

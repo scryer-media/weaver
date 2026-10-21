@@ -456,8 +456,8 @@ impl PeerConnectionHandler for Handler {
         self.peers.encrypt_outgoing(self.addr)
     }
 
-    fn on_handshake_encryption(&self, encrypted: bool) {
-        self.peers.handshake_encryption(self.addr, encrypted);
+    fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
+        self.peers.handshake_encryption(self.addr, encryption);
     }
 
     fn on_handshake(

@@ -237,6 +237,16 @@ impl Choker {
         }
     }
 
+    /// The peers of `torrent` holding the optimistic slots.
+    pub fn optimistic(&self, torrent: TorrentId) -> Vec<SocketAddr> {
+        let held = self.held.lock();
+        held.optimistic
+            .iter()
+            .filter(|(id, _)| *id == torrent)
+            .map(|(_, addr)| *addr)
+            .collect()
+    }
+
     /// Returns once the slots are to be handed out before the interval ends.
     pub async fn reshuffle_requested(&self) {
         self.reshuffle.notified().await

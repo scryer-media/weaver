@@ -605,6 +605,40 @@ impl ManagedTorrent {
         })
     }
 
+    /// The torrent's connections to peers, by address (libtorrent
+    /// `torrent_handle::get_peer_info`); none while it is not live.
+    pub fn peers(&self) -> Vec<live::peer::info::PeerInfo> {
+        self.live()
+            .map(|live| live.peer_infos())
+            .unwrap_or_default()
+    }
+
+    /// Bans each of `ips` on the torrent's peer list: a connection to a
+    /// peer at one closes now, and none is made or taken from then on,
+    /// across a pause and a restart (libtorrent `torrent::ban_peer`).
+    /// Returns the peers and bans its next start begins with, to be saved;
+    /// None while the torrent is stopped by an error and holds no list.
+    pub fn ban_peers(&self, ips: &[std::net::IpAddr]) -> Option<live::peers::ResumePeers> {
+        // Under the state lock, so a pause or start moves the list with the
+        // bans in it.
+        let mut g = self.locked.write();
+        match &mut g.state {
+            ManagedTorrentState::Initializing(init) => {
+                ips.iter().for_each(|ip| init.ban_peer(*ip));
+                Some(init.resume_peers())
+            }
+            ManagedTorrentState::Paused(paused) => {
+                ips.iter().for_each(|ip| paused.peers.ban(*ip));
+                Some(paused.peers.resume_peers())
+            }
+            ManagedTorrentState::Live(live) => {
+                ips.iter().for_each(|ip| live.ban_peer(*ip));
+                Some(live.resume_peers())
+            }
+            ManagedTorrentState::Error(_) | ManagedTorrentState::None => None,
+        }
+    }
+
     /// Get the live state if the torrent is live.
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();

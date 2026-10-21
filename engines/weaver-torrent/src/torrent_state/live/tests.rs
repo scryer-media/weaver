@@ -1890,6 +1890,41 @@ async fn the_optimistic_slot_passes_every_30_s_to_a_peer_that_never_held_it() {
     assert!(h.choked(&first));
 }
 
+// libtorrent `peer_connection::get_peer_info`: the listing shows the
+// handshake-only encryption, the peer's unchoke, our optimistic slot, and
+// who named the peer.
+#[tokio::test]
+async fn the_peers_listing_shows_encryption_unchoke_and_the_optimistic_slot() {
+    // The one slot is the optimistic one.
+    let h = Harness::seeding_with_slots("peers_listing_flags", 1).await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.live
+        .peers
+        .handshake_encryption(peer.addr, crate::mse::Encryption::HeaderOnly);
+    (&peer).on_received_message(Message::Unchoke).await.unwrap();
+    (&peer)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    // It takes the free slot, loses it at the first round, as there is no
+    // regular slot, and gets it back as the optimistic one.
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    let [info] = h.live.peer_infos().try_into().unwrap();
+    assert_eq!(info.addr, peer.addr);
+    assert_eq!(info.encryption, crate::mse::Encryption::HeaderOnly);
+    assert!(!info.outgoing);
+    assert!(!info.flags.remote_choked && info.flags.remote_interested);
+    assert!(!info.flags.choked && info.flags.optimistic_unchoke);
+    assert_eq!(
+        info.sources.iter().collect::<Vec<_>>(),
+        [PeerSourceFlag::Incoming]
+    );
+}
+
 // libtorrent `session_impl::preemptive_unchoke`,
 // `recalculate_optimistic_unchoke_slots`: the upload slots are the
 // session's. A peer of one torrent finds no free slot while a peer of another
@@ -4040,7 +4075,7 @@ async fn a_pause_keeps_the_bans_and_the_trust_of_the_peer_list() {
     let h = Harness::new("pause_keeps_peer_list").await;
     let banned = sock("203.0.113.1:6881");
     let (peer, _rx) = h.peer("203.0.113.2:6881");
-    h.peers.ban(banned);
+    h.peers.ban(banned.ip());
     h.peers
         .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false))
         .unwrap();
@@ -4411,7 +4446,7 @@ impl Harness {
             writer,
             read_buf: crate::read_buf::ReadBuf::new(),
             handshake: Handshake::new(self.shared.info_hash, Id20::new([7; 20])),
-            encrypted: false,
+            encryption: crate::mse::Encryption::None,
             meter: Default::default(),
         };
         let slot = self._session.connection_slots.try_accept().unwrap();
@@ -4532,7 +4567,11 @@ async fn an_incoming_encrypted_connection_is_advertised_encrypted_in_our_pex() {
     let mut ends = Vec::new();
     for (addr, encrypted) in [("192.0.2.1:6881", true), ("192.0.2.2:6881", false)] {
         let (mut checked, slot, mut theirs) = h.incoming(addr);
-        checked.encrypted = encrypted;
+        checked.encryption = if encrypted {
+            crate::mse::Encryption::Rc4
+        } else {
+            crate::mse::Encryption::None
+        };
         let added = h.live.add_incoming_peer(checked, slot).unwrap();
         assert!(matches!(added, AddIncomingPeerResult::Added));
         // Our handshake and the first byte after it, which is written once
@@ -5506,7 +5545,7 @@ async fn saved_peers_and_bans_come_back_as_initial_peers_and_bans() {
         .add_incoming(connectable, Id20::default(), tx, ConnectionKind::Utp, 6881)
         .unwrap();
     let banned: SocketAddr = "127.0.0.4:6881".parse().unwrap();
-    h.peers.ban(banned);
+    h.peers.ban(banned.ip());
     let saved = h.handle().resume_peers().unwrap();
     assert_eq!(
         saved,

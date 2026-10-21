@@ -1591,6 +1591,25 @@ export const SET_TORRENT_FORCED_MUTATION = gql`
   }
 `;
 
+/** A torrent's live peer connections, by address. */
+export const TORRENT_PEERS_QUERY = gql`
+  query TorrentPeers($id: Int!) {
+    torrentPeers(id: $id) {
+      address
+      client
+      progress
+      downloadBps
+      uploadBps
+    }
+  }
+`;
+
+export const BAN_TORRENT_PEER_MUTATION = gql`
+  mutation BanTorrentPeer($id: Int!, $address: String!) {
+    banTorrentPeer(id: $id, address: $address)
+  }
+`;
+
 export const SET_TORRENT_SEEDING_MUTATION = gql`
   mutation SetTorrentSeeding($id: Int!, $seeding: SeedingPolicyInput) {
     setTorrentSeeding(id: $id, seeding: $seeding)

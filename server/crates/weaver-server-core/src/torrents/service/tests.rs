@@ -2375,3 +2375,101 @@ async fn a_torrent_moves_under_another_directory_and_its_record_follows() {
     ));
     assert_eq!(stored(&rig), to);
 }
+
+// libtorrent `torrent_handle::get_peer_info` lists a torrent's connections:
+// none while it is paused, and a torrent the service does not hold has none
+// to list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_torrents_peers_are_none_and_an_unknown_ones_are_not_found() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    assert!(rig.service.peers(job_id).await.unwrap().is_empty());
+    let unknown = JobId(job_id.0 + 100);
+    assert!(matches!(
+        rig.service.peers(unknown).await,
+        Err(ActionError::NotFound(id)) if id == unknown
+    ));
+    assert!(matches!(
+        rig.service
+            .ban_peers(unknown, &["127.0.0.3".parse().unwrap()])
+            .await,
+        Err(ActionError::NotFound(id)) if id == unknown
+    ));
+    rig.service.stop().await;
+}
+
+// libtorrent `torrent::ban_peer` bans the address on the torrent's peer
+// list, and `write_resume_data` saves it with the bans: a ban made in a
+// session, and one made while the torrent is in none, are both on the list
+// its next start begins with, its saved peer at a banned address gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_banned_peer_stays_banned_across_a_restart() {
+    use std::net::IpAddr;
+    use weaver_torrent::ResumePeers;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let in_session: IpAddr = "127.0.0.3".parse().unwrap();
+    rig.service.ban_peers(job_id, &[in_session]).await.unwrap();
+    let held = handle_of(&rig.service, job_id)
+        .await
+        .resume_peers()
+        .unwrap();
+    assert_eq!(held.banned, [in_session]);
+    assert_eq!(rig.db.torrent_peers(job_id).unwrap().banned, [in_session]);
+
+    // In no session: torrents are off.
+    let mut settings = rig.service.settings();
+    settings.torrent.enabled = false;
+    rig.service.set_settings(settings).await;
+    assert!(rig.service.peers(job_id).await.unwrap().is_empty());
+    let off: IpAddr = "127.0.0.4".parse().unwrap();
+    assert!(
+        rig.db
+            .save_torrent_peers(
+                job_id,
+                &ResumePeers {
+                    peers: vec![
+                        "127.0.0.4:6881".parse().unwrap(),
+                        "127.0.0.5:6881".parse().unwrap()
+                    ],
+                    banned: vec![in_session],
+                },
+            )
+            .unwrap()
+    );
+    rig.service.ban_peers(job_id, &[off]).await.unwrap();
+    let saved = ResumePeers {
+        peers: vec!["127.0.0.5:6881".parse().unwrap()],
+        banned: vec![in_session, off],
+    };
+    assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(
+        handle_of(&again, job_id).await.resume_peers(),
+        Some(saved.clone())
+    );
+    again.stop().await;
+    assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
+}

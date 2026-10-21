@@ -26,6 +26,14 @@ pub struct SpeedEstimator {
     time_remaining_millis: AtomicU64,
 }
 
+impl std::fmt::Debug for SpeedEstimator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpeedEstimator")
+            .field("bps", &self.bps())
+            .finish()
+    }
+}
+
 impl Default for SpeedEstimator {
     fn default() -> Self {
         Self::new(5)

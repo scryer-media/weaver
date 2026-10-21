@@ -650,3 +650,58 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
         serde_json::json!([])
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_peers_are_listed_and_a_ban_is_kept() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+
+    let listed = rig
+        .execute(&format!(
+            "{{ torrentPeers(id: {id}) {{ address client peerId connection encryption \
+             flags {{ choked remoteChoked }} pieces progress }} }}"
+        ))
+        .await;
+    assert!(listed.errors.is_empty(), "{:?}", listed.errors);
+    assert_eq!(
+        listed.data.into_json().unwrap()["torrentPeers"],
+        Value::Array(Vec::new())
+    );
+
+    for address in ["127.0.0.3:6881", "[::1]:6881", "127.0.0.4"] {
+        let banned = rig
+            .execute(&format!(
+                r#"mutation {{ banTorrentPeer(id: {id}, address: "{address}") }}"#
+            ))
+            .await;
+        assert!(banned.errors.is_empty(), "{:?}", banned.errors);
+    }
+    let saved = rig
+        .harness
+        .db
+        .torrent_peers(weaver_server_core::jobs::ids::JobId(id))
+        .unwrap();
+    let banned: Vec<String> = saved.banned.iter().map(ToString::to_string).collect();
+    assert_eq!(banned, ["127.0.0.3", "127.0.0.4", "::1"]);
+
+    let refused = rig
+        .execute(&format!(
+            r#"mutation {{ banTorrentPeer(id: {id}, address: "somewhere") }}"#
+        ))
+        .await;
+    assert_eq!(code(&refused).as_deref(), Some("INVALID_INPUT"));
+    let unknown = rig
+        .execute(r#"mutation { banTorrentPeer(id: 999999, address: "127.0.0.3") }"#)
+        .await;
+    assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"));
+    let unknown = rig
+        .execute("{ torrentPeers(id: 999999) { address } }")
+        .await;
+    assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"));
+}

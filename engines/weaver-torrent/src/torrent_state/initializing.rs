@@ -166,6 +166,12 @@ impl TorrentStateInitializing {
         self.peers.lock().resume_peers()
     }
 
+    /// Bans `ip` on the list the first run is founded on; see
+    /// [`PeerList::ban`].
+    pub(crate) fn ban_peer(&self, ip: std::net::IpAddr) {
+        self.peers.lock().ban(ip);
+    }
+
     pub fn get_checked_bytes(&self) -> u64 {
         self.checked_bytes
             .load(std::sync::atomic::Ordering::Relaxed)

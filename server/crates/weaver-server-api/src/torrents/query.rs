@@ -4,8 +4,9 @@
 use async_graphql::{Context, Object, Result};
 use weaver_server_core::jobs::ids::JobId;
 
+use super::mutation::action_error;
 use super::service;
-use super::types::{ScheduleSeedingGql, Torrent};
+use super::types::{ScheduleSeedingGql, Torrent, TorrentPeerGql};
 use crate::auth::ReadGuard;
 
 #[derive(Default)]
@@ -16,6 +17,18 @@ impl TorrentsQuery {
     #[graphql(guard = "ReadGuard")]
     async fn torrent(&self, ctx: &Context<'_>, id: u64) -> Result<Option<Torrent>> {
         Ok(service(ctx)?.torrent(JobId(id)).await.map(Into::into))
+    }
+
+    /// The torrent's live peer connections, by address.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_peers(&self, ctx: &Context<'_>, id: u64) -> Result<Vec<TorrentPeerGql>> {
+        Ok(service(ctx)?
+            .peers(JobId(id))
+            .await
+            .map_err(action_error)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     /// The torrents the schedule's pause leaves seeding, by the tracker rule

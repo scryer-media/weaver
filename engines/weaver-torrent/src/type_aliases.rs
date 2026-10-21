@@ -25,7 +25,7 @@ pub type PeerStream = BoxStream<'static, (SocketAddr, PeerSourceFlag)>;
 /// (`peer_info::tracker`, `dht`, `pex`, `lsd`, `resume_data`, `incoming`),
 /// which `torrent::add_peer` and `peer_list::update_peer` take with each
 /// naming.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum PeerSourceFlag {
     /// A tracker's announce reply.
     Tracker,
@@ -40,6 +40,62 @@ pub enum PeerSourceFlag {
     ResumeData,
     /// The peer connected to us.
     Incoming,
+}
+
+impl PeerSourceFlag {
+    const ALL: [Self; 6] = [
+        Self::Tracker,
+        Self::Dht,
+        Self::Pex,
+        Self::Lsd,
+        Self::ResumeData,
+        Self::Incoming,
+    ];
+
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// Every source that named a peer (libtorrent `torrent_peer::source`, which
+/// `peer_list::add_peer` and `update_peer` OR each naming into).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerSources(u8);
+
+impl PeerSources {
+    pub(crate) fn insert(&mut self, source: PeerSourceFlag) {
+        self.0 |= source.bit();
+    }
+
+    pub fn contains(self, source: PeerSourceFlag) -> bool {
+        self.0 & source.bit() != 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = PeerSourceFlag> {
+        PeerSourceFlag::ALL
+            .into_iter()
+            .filter(move |source| self.contains(*source))
+    }
+}
+
+impl From<PeerSourceFlag> for PeerSources {
+    fn from(source: PeerSourceFlag) -> Self {
+        Self(source.bit())
+    }
+}
+
+impl FromIterator<PeerSourceFlag> for PeerSources {
+    fn from_iter<I: IntoIterator<Item = PeerSourceFlag>>(sources: I) -> Self {
+        let mut all = Self::default();
+        sources.into_iter().for_each(|source| all.insert(source));
+        all
+    }
+}
+
+impl serde::Serialize for PeerSources {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
 }
 
 /// Where a torrent's live run gets its peers from, and the announce table of
