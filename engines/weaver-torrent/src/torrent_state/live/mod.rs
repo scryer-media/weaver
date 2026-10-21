@@ -1207,6 +1207,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::AllowedFast(index) => {
                 self.on_allowed_fast(index).context("on_allowed_fast")?
             }
+            Message::Suggest(index) => self.on_suggest(index).context("on_suggest")?,
             Message::Piece(piece) => self
                 .on_received_piece(piece)
                 .await
@@ -1528,8 +1529,10 @@ impl PeerHandler {
 
                 let pieces = g.pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
                 // A piece we have is no longer the peer's to offer (libtorrent
-                // `peer_connection::received_piece`).
+                // `peer_connection::received_piece`, `announce_piece`).
                 live.allowed_fast_from_peer
+                    .retain(|p| !pieces.chunks().is_piece_have(*p));
+                live.suggested
                     .retain(|p| !pieces.chunks().is_piece_have(*p));
                 let bf = &live.bitfield;
                 let allowed_fast = &live.allowed_fast_from_peer;
@@ -1556,6 +1559,7 @@ impl PeerHandler {
                         options: PickOptions {
                             reverse: live.is_snubbed(),
                             on_parole: false,
+                            suggested: &live.suggested,
                         },
                         can_steal: |p| {
                             self.state.per_piece_locks[p.get_usize()]
@@ -1741,6 +1745,28 @@ impl PeerHandler {
                 }
             });
         self.notify_request_slots_changed();
+        Ok(())
+    }
+
+    /// The peer suggests we fetch `index` (libtorrent
+    /// `peer_connection::incoming_suggest`). An index past the last piece,
+    /// or a piece we have, is ignored.
+    fn on_suggest(&self, index: u32) -> anyhow::Result<()> {
+        let Some(piece) = self.state.lengths.validate_piece_index(index) else {
+            trace!(index, "suggest names no piece of the torrent");
+            return Ok(());
+        };
+        if self
+            .state
+            .lock_read("on_suggest")
+            .get_chunks()?
+            .is_piece_have(piece)
+        {
+            return Ok(());
+        }
+        self.state
+            .peers
+            .with_live_mut(self.addr, "on_suggest", |live| live.suggest(piece));
         Ok(())
     }
 
@@ -2077,17 +2103,20 @@ impl PeerHandler {
         let Some(chunk) = self.requested_chunk(&request) else {
             anyhow::bail!("peer rejected {request:?}, which names no block of the torrent");
         };
-        // A piece the peer rejects while it chokes us is no longer one it
-        // lets us fetch (libtorrent `incoming_reject_request`).
+        // A piece the peer rejects is no longer one it lets us fetch while
+        // it chokes us, or, unchoked, one it suggests (libtorrent
+        // `incoming_reject_request`).
         let choked = self.is_choked();
         let Some(answer) =
             self.state
                 .peers
                 .with_live_mut(self.addr, "reject_inflight_request", |live| {
-                    if choked {
-                        live.allowed_fast_from_peer
-                            .retain(|p| *p != chunk.piece_index);
-                    }
+                    let offered = if choked {
+                        &mut live.allowed_fast_from_peer
+                    } else {
+                        &mut live.suggested
+                    };
+                    offered.retain(|p| *p != chunk.piece_index);
                     live.reject_inflight_request(&chunk)
                 })
         else {

@@ -68,7 +68,7 @@ pub enum AcquireResult {
 
 /// How a peer is picked for, besides the pieces it has.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PickOptions {
+pub struct PickOptions<'a> {
     /// The peer is snubbed: it is handed the commonest piece rather than the
     /// rarest, so a rare one does not wait on it (libtorrent `reverse`).
     pub reverse: bool,
@@ -77,10 +77,14 @@ pub struct PickOptions {
     /// fails again has one sender, and it takes no piece another peer is
     /// downloading (libtorrent `on_parole`).
     pub on_parole: bool,
+    /// The pieces the peer suggested, the latest first. After the started
+    /// pieces, the first of them it may take goes before the picker's own
+    /// order (libtorrent `suggested_pieces`).
+    pub suggested: &'a [ValidPieceIndex],
 }
 
 /// Parameters for acquiring a piece.
-pub struct AcquireRequest<I, P, A, S>
+pub struct AcquireRequest<'a, I, P, A, S>
 where
     I: Iterator<Item = ValidPieceIndex>,
     P: Fn(ValidPieceIndex) -> bool,
@@ -104,7 +108,7 @@ where
     pub num_peers: usize,
     /// How many chunk requests the peer has outstanding.
     pub outstanding_requests: usize,
-    pub options: PickOptions,
+    pub options: PickOptions<'a>,
     /// Returns true if the piece can be stolen (e.g., not locked for writing).
     pub can_steal: S,
 }
@@ -171,7 +175,10 @@ impl PieceTracker {
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
     /// the old peer and update counters.
     #[cfg(test)]
-    pub fn acquire_piece<I, P, A, S>(&mut self, req: AcquireRequest<I, P, A, S>) -> AcquireResult
+    pub fn acquire_piece<I, P, A, S>(
+        &mut self,
+        req: AcquireRequest<'_, I, P, A, S>,
+    ) -> AcquireResult
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
@@ -187,7 +194,7 @@ impl PieceTracker {
     /// piece already in flight, so it is never asked.
     pub fn acquire_admitted_piece<I, P, A, S, F>(
         &mut self,
-        mut req: AcquireRequest<I, P, A, S>,
+        mut req: AcquireRequest<'_, I, P, A, S>,
         admit: F,
     ) -> AcquireResult
     where
@@ -246,11 +253,12 @@ impl PieceTracker {
     ///   per connected peer, or more than [`MAX_PARTIAL_CHUNKS`] chunks, or
     ///   while we have fewer than [`INITIAL_PICKER_THRESHOLD`] pieces. The
     ///   rarest goes first, then the one most received.
+    /// - Then the peer's latest suggestion it may take.
     /// - Then, once we have [`INITIAL_PICKER_THRESHOLD`] pieces, the rarest
     ///   piece, a started one before an unstarted one as rare, and a random
     ///   one among those equal. A snubbed peer takes the commonest instead.
     /// - Before that, the first free piece from a random place.
-    fn pick<I, P, A, S>(&mut self, req: &AcquireRequest<I, P, A, S>) -> Option<ValidPieceIndex>
+    fn pick<I, P, A, S>(&mut self, req: &AcquireRequest<'_, I, P, A, S>) -> Option<ValidPieceIndex>
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
@@ -297,6 +305,16 @@ impl PieceTracker {
             };
             if partial.is_some() {
                 return partial;
+            }
+        }
+
+        let suggested = req.options.suggested;
+        if !suggested.is_empty() {
+            let latest = candidates()
+                .filter_map(|p| Some((suggested.iter().position(|s| *s == p)?, p)))
+                .min_by_key(|(at, _)| *at);
+            if let Some((_, piece)) = latest {
+                return Some(piece);
             }
         }
 
@@ -351,7 +369,7 @@ impl PieceTracker {
     /// Try to steal a piece from a slower peer.
     fn try_steal<I, P, A, S>(
         &mut self,
-        req: &AcquireRequest<I, P, A, S>,
+        req: &AcquireRequest<'_, I, P, A, S>,
         threshold: f64,
     ) -> Option<AcquireResult>
     where
@@ -517,7 +535,7 @@ impl PieceTracker {
 fn may_hand(
     chunks: &ChunkTracker,
     peer_has_piece: &impl Fn(ValidPieceIndex) -> bool,
-    options: PickOptions,
+    options: PickOptions<'_>,
     piece: ValidPieceIndex,
 ) -> bool {
     peer_has_piece(piece) && !(options.on_parole && chunks.received_chunks(piece) > 0)
@@ -602,13 +620,13 @@ mod tests {
     }
 
     type NoStream = std::iter::Empty<ValidPieceIndex>;
-    type Ask<P, A> = AcquireRequest<NoStream, P, A, fn(ValidPieceIndex) -> bool>;
+    type Ask<'a, P, A> = AcquireRequest<'a, NoStream, P, A, fn(ValidPieceIndex) -> bool>;
 
     /// A request from `who`, which has the pieces `has` names, when the
     /// pieces have the availability `availability` gives. Many peers are
     /// connected, the peer has no request outstanding, and it has no average
     /// piece time, so it steals nothing.
-    fn ask<P, A>(who: PeerHandle, has: P, availability: A) -> Ask<P, A>
+    fn ask<'a, P, A>(who: PeerHandle, has: P, availability: A) -> Ask<'a, P, A>
     where
         P: Fn(ValidPieceIndex) -> bool,
         A: Fn(ValidPieceIndex) -> u32,
@@ -933,6 +951,29 @@ mod tests {
         let counts = [1, 1, 9, 1];
         let request = ask(peer(1), all, table(&counts));
         assert_eq!(reserved(tracker.acquire_piece(request)), 2);
+    }
+
+    #[test]
+    fn the_latest_suggestion_the_peer_may_take_goes_before_the_rarest() {
+        let mut tracker = rarest_first_tracker(5, 0);
+        let counts = [1, 9, 9, 9, 9];
+        let suggested = [1, 2, 3].map(|i| index(&tracker, i));
+        let suggesting = |has: fn(ValidPieceIndex) -> bool| {
+            let mut request = ask(peer(1), has, table(&counts));
+            request.options.suggested = &suggested;
+            request
+        };
+
+        // Piece 0 is rarest. Piece 1, the latest suggestion, the peer lacks.
+        let first = tracker.acquire_piece(suggesting(|p| p.get() != 1));
+        assert_eq!(reserved(first), 2);
+        // Without suggestions the rarest goes first.
+        let second = tracker.acquire_piece(ask(peer(1), all, table(&counts)));
+        assert_eq!(reserved(second), 0);
+        // A higher priority level goes before a suggestion.
+        pri(&mut tracker, &[(4, PiecePriority::High)]);
+        assert_eq!(reserved(tracker.acquire_piece(suggesting(all))), 4);
+        assert_eq!(reserved(tracker.acquire_piece(suggesting(all))), 1);
     }
 
     #[test]

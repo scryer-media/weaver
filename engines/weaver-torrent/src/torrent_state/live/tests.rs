@@ -932,6 +932,58 @@ async fn a_piece_we_may_not_finish_while_choked_goes_back_and_an_allowed_fast_on
     assert_eq!(h.inflight_count(&peer), 1);
 }
 
+#[tokio::test]
+async fn a_suggestion_names_only_a_piece_we_lack() {
+    // Piece 0 is had.
+    let h = Harness::build("suggest_ingest", 0x80, choker::DEFAULT_UNCHOKE_SLOTS_LIMIT).await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    for index in [0, PIECES, 1] {
+        peer.on_received_message(Message::Suggest(index))
+            .await
+            .unwrap();
+    }
+    let suggested = h
+        .peers
+        .with_live(peer.addr, |live| live.suggested.clone())
+        .unwrap();
+    assert_eq!(suggested, vec![h.piece(1)]);
+}
+
+#[tokio::test]
+async fn the_piece_a_peer_suggests_is_asked_for_first_until_it_rejects_it() {
+    for suggested in 0..PIECES {
+        let h = Harness::new("suggest_requested").await;
+        let (peer, mut rx) = h.peer("127.0.0.1:6881");
+        h.speak_fast(&peer);
+        (&peer)
+            .on_received_message(Message::Suggest(suggested))
+            .await
+            .unwrap();
+        let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+        // Fewer pieces are had than rarest first needs: without the
+        // suggestion the first piece is a random one.
+        peer.on_i_am_unchoked();
+        assert_eq!(
+            next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+            chunks(suggested, 0..CHUNKS_PER_PIECE)
+        );
+        drop(requester);
+
+        (&peer)
+            .on_received_message(Message::Reject(request(suggested, 0)))
+            .await
+            .unwrap();
+        let left = h
+            .peers
+            .with_live(peer.addr, |live| live.suggested.clone())
+            .unwrap();
+        assert!(left.is_empty());
+    }
+}
+
 impl Harness {
     /// Whether we choke the peer.
     fn choked(&self, peer: &PeerHandler) -> bool {

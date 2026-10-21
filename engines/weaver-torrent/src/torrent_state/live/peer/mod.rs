@@ -45,6 +45,10 @@ pub(crate) const MAX_FAILCOUNT: u32 = 3;
 // may fetch while we choke it.
 pub(crate) const ALLOWED_FAST_SET_SIZE: u32 = 5;
 
+// libtorrent `settings_pack::max_suggest_pieces`: how many of a peer's
+// suggestions are kept.
+const MAX_SUGGEST_PIECES: usize = 16;
+
 /// BEP 6's allowed fast set of `k` of `num_pieces` pieces for the peer at
 /// `ip` on the torrent `info_hash`, in the order it is generated; every piece
 /// when `k` is not less than their count (libtorrent
@@ -604,6 +608,10 @@ pub(crate) struct LivePeerState {
     // The pieces the peer lets us fetch while it chokes us (libtorrent
     // `m_allowed_fast`).
     pub allowed_fast_from_peer: Vec<ValidPieceIndex>,
+
+    // The pieces the peer suggested, the latest first (libtorrent
+    // `m_suggested_pieces`).
+    pub suggested: Vec<ValidPieceIndex>,
 }
 
 /// Why a request the peer sent us is not queued.
@@ -647,6 +655,7 @@ impl LivePeerState {
             fast: false,
             allowed_fast_to_peer: None,
             allowed_fast_from_peer: Vec::new(),
+            suggested: Vec::new(),
         }
     }
 
@@ -820,6 +829,16 @@ impl LivePeerState {
         }
         let _ = self.tx.send(WriterRequest::Message(Message::Choke));
         true
+    }
+
+    /// The peer suggests `piece`. The latest suggestion goes first, and the
+    /// oldest is dropped past [`MAX_SUGGEST_PIECES`] (libtorrent
+    /// `peer_connection::incoming_suggest`). A piece suggested again moves
+    /// to the front.
+    pub fn suggest(&mut self, piece: ValidPieceIndex) {
+        self.suggested.retain(|p| *p != piece);
+        self.suggested.truncate(MAX_SUGGEST_PIECES - 1);
+        self.suggested.insert(0, piece);
     }
 
     /// Whether the peer may fetch `piece` while we choke it.
@@ -1012,8 +1031,32 @@ impl BlockTime {
 mod tests {
     use std::net::IpAddr;
 
-    use super::{Trust, allowed_fast_set};
-    use crate::core::hash_id::Id20;
+    use super::{LivePeerState, Trust, allowed_fast_set, stats, unbounded_channel};
+    use crate::{
+        core::{hash_id::Id20, lengths::Lengths},
+        stream_connect::ConnectionKind,
+    };
+
+    #[test]
+    fn the_latest_suggestion_goes_first_and_the_oldest_past_sixteen_is_dropped() {
+        let lengths = Lengths::new(20 * 16384, 16384).unwrap();
+        let piece = |i| lengths.validate_piece_index(i).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let counters = stats::atomic::PeerStats::default().counters;
+        let mut live = LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters);
+
+        for i in 0..17 {
+            live.suggest(piece(i));
+        }
+        let kept: Vec<_> = (1..17).rev().map(piece).collect();
+        assert_eq!(live.suggested, kept);
+
+        // Suggested again, a piece moves to the front, and none is dropped.
+        live.suggest(piece(5));
+        let mut moved = vec![piece(5)];
+        moved.extend(kept.iter().copied().filter(|p| *p != piece(5)));
+        assert_eq!(live.suggested, moved);
+    }
 
     #[test]
     fn the_allowed_fast_set_is_bep_6s() {
