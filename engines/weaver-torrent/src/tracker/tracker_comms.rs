@@ -52,6 +52,7 @@ pub struct TrackerComms {
     /// Our own addresses an HTTP announce names (see [`AnnounceIps`]).
     announce_ips: AnnounceIps,
     http_clients: Arc<dyn HttpClients>,
+    reachable: Reachable,
     udp_client: UdpTrackerClient,
     key: u32,
     // The trackers under this hash and what announcing to them has done.
@@ -144,6 +145,60 @@ pub type ListenPort = tokio::sync::watch::Receiver<Option<u16>>;
 /// read as each announce goes out (libtorrent `torrent::build_tracker_request`
 /// reads the session's listen sockets per request).
 pub type AnnounceIps = Arc<dyn Fn() -> Vec<IpAddr> + Send + Sync>;
+
+/// Why the session may not reach an address. The family is judged first, so
+/// a refusal of every address names the last rule any of them met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Unreachable {
+    /// Of a family the session does not connect over (libtorrent
+    /// `errors::announce_skipped`).
+    Family,
+    /// Blocked by the IP filter (libtorrent `errors::banned_by_ip_filter`).
+    Filtered,
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Unreachable::Family => "of a family the session does not connect over",
+            Unreachable::Filtered => "banned by the IP filter",
+        })
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// The addresses the session may reach (the session's `may_reach`): every
+/// address a tracker is asked at, on every hop, passes it.
+pub type Reachable = Arc<dyn Fn(IpAddr) -> Result<(), Unreachable> + Send + Sync>;
+
+/// The addresses of `found` the session may reach, in the order found
+/// (libtorrent `http_tracker_connection::on_filter` and
+/// `udp_tracker_connection::name_lookup` drop the others before any is
+/// connected to). With none left the tracker is refused for the last rule
+/// they met, and nothing is counted: libtorrent posts no alert and bumps no
+/// counter for a tracker's address, the failed announce is the record.
+pub(crate) fn only_reachable<A>(
+    found: Vec<A>,
+    ip: impl Fn(&A) -> IpAddr,
+    reachable: &Reachable,
+) -> anyhow::Result<Vec<A>> {
+    let mut refused = None;
+    let kept: Vec<A> = found
+        .into_iter()
+        .filter(|a| {
+            let why = reachable(ip(a)).err();
+            refused = refused.max(why);
+            why.is_none()
+        })
+        .collect();
+    match refused {
+        Some(why) if kept.is_empty() => {
+            Err(anyhow::Error::new(why).context("no address of the tracker may be reached"))
+        }
+        _ => Ok(kept),
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 enum SupportedTracker {
@@ -711,6 +766,7 @@ struct Scraper {
     // In table order, one per URL.
     trackers: Vec<SupportedTracker>,
     http_clients: Arc<dyn HttpClients>,
+    reachable: Reachable,
     udp_client: UdpTrackerClient,
 }
 
@@ -758,6 +814,7 @@ impl Scraper {
         let body = tracker_comms_http::get(
             &*self.http_clients,
             self.udp_client.resolver(),
+            &self.reachable,
             &url,
             Ask::Scrape,
             &tracker_comms_http::scrape_querystring(&info_hash),
@@ -778,7 +835,10 @@ impl Scraper {
                 .await
                 .map(ScrapeOk::from)
         };
-        match udp_tracker_to_socket_addrs(host, port, self.udp_client.resolver()).await? {
+        let addrs =
+            udp_tracker_to_socket_addrs(host, port, self.udp_client.resolver(), &self.reachable)
+                .await?;
+        match addrs {
             UdpTrackerResolveResult::One(addr) => scrape(addr).await,
             UdpTrackerResolveResult::Two(v4, v6) => {
                 let (r4, r6) = tokio::join!(scrape(v4.into()), scrape(v6.into()));
@@ -815,6 +875,7 @@ impl TrackerStatus {
         info_hashes: Vec<Id20>,
         identity: &Identity,
         http_clients: Arc<dyn HttpClients>,
+        reachable: Reachable,
         udp_client: UdpTrackerClient,
     ) -> Self {
         let mut unique: Vec<SupportedTracker> = Vec::new();
@@ -846,6 +907,7 @@ impl TrackerStatus {
                 user_agent: identity.user_agent.clone(),
                 trackers: unique,
                 http_clients,
+                reachable,
                 udp_client,
             },
         }))
@@ -1121,43 +1183,41 @@ enum UdpTrackerResolveResult {
     Two(SocketAddrV4, SocketAddrV6),
 }
 
+/// Where a UDP tracker at `host` is asked: of the addresses the session may
+/// reach (see [`only_reachable`]), the first IPv4 and the first IPv6.
 async fn udp_tracker_to_socket_addrs(
     host: url::Host<&str>,
     port: u16,
     resolver: Option<&dyn Resolver>,
+    reachable: &Reachable,
 ) -> anyhow::Result<UdpTrackerResolveResult> {
-    let res = match host {
-        url::Host::Domain(name) => {
-            // Use the first IPv4 and the first IPv6 addresses only.
-
-            let mut v4: Option<SocketAddrV4> = None;
-            let mut v6: Option<SocketAddrV6> = None;
-            let addrs: Vec<SocketAddr> = match resolver {
-                Some(resolver) => resolver.resolve(name, port).await,
-                None => tokio::net::lookup_host((name, port))
-                    .await
-                    .map(Iterator::collect),
-            }
-            .with_context(|| format!("error looking up hostname {name}"))?;
-            for addr in addrs {
-                match (v4, v6, addr) {
-                    (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
-                    (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
-                    _ => continue,
-                }
-            }
-            let res = match (v4, v6) {
-                (Some(v4), Some(v6)) => UdpTrackerResolveResult::Two(v4, v6),
-                (Some(v4), None) => UdpTrackerResolveResult::One(v4.into()),
-                (None, Some(v6)) => UdpTrackerResolveResult::One(v6.into()),
-                _ => anyhow::bail!("zero addresses returned looking up {name}"),
-            };
-            trace!(?res, "resolved");
-            res
+    let found: Vec<SocketAddr> = match host {
+        url::Host::Domain(name) => match resolver {
+            Some(resolver) => resolver.resolve(name, port).await,
+            None => tokio::net::lookup_host((name, port))
+                .await
+                .map(Iterator::collect),
         }
-        url::Host::Ipv4(addr) => UdpTrackerResolveResult::One((addr, port).into()),
-        url::Host::Ipv6(addr) => UdpTrackerResolveResult::One((addr, port).into()),
+        .with_context(|| format!("error looking up hostname {name}"))?,
+        url::Host::Ipv4(addr) => vec![(addr, port).into()],
+        url::Host::Ipv6(addr) => vec![(addr, port).into()],
     };
+    let mut v4: Option<SocketAddrV4> = None;
+    let mut v6: Option<SocketAddrV6> = None;
+    for addr in only_reachable(found, SocketAddr::ip, reachable)? {
+        match (v4, v6, addr) {
+            (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
+            (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
+            _ => continue,
+        }
+    }
+    let res = match (v4, v6) {
+        (Some(v4), Some(v6)) => UdpTrackerResolveResult::Two(v4, v6),
+        (Some(v4), None) => UdpTrackerResolveResult::One(v4.into()),
+        (None, Some(v6)) => UdpTrackerResolveResult::One(v6.into()),
+        _ => anyhow::bail!("zero addresses returned looking up {host}"),
+    };
+    trace!(?res, "resolved");
     Ok(res)
 }
 
@@ -1197,6 +1257,7 @@ impl TrackerComms {
         listen_port: ListenPort,
         announce_ips: AnnounceIps,
         http_clients: Arc<dyn HttpClients>,
+        reachable: Reachable,
         udp_client: UdpTrackerClient,
     ) -> Option<TrackerTask> {
         Self::start_with_tiers(
@@ -1208,6 +1269,7 @@ impl TrackerComms {
             listen_port,
             announce_ips,
             http_clients,
+            reachable,
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -1227,6 +1289,8 @@ impl TrackerComms {
     /// session on, None when it accepts no connections; when it changes, each
     /// tier announces it as soon as its tracker's `min interval` allows.
     /// `announce_ips` gives the addresses each HTTP announce names as ours.
+    /// A tracker, HTTP or UDP, announce or scrape, every hop, is asked only
+    /// at the addresses `reachable` lets through.
     ///
     /// Each of `info_hashes.ids20()` is announced on its own, with its own
     /// events and failover: a hybrid under v1 and the truncated v2, a v2
@@ -1242,6 +1306,7 @@ impl TrackerComms {
         listen_port: ListenPort,
         announce_ips: AnnounceIps,
         http_clients: Arc<dyn HttpClients>,
+        reachable: Reachable,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
     ) -> Option<TrackerTask> {
@@ -1271,6 +1336,7 @@ impl TrackerComms {
             info_hashes.ids20().collect(),
             &identity,
             http_clients.clone(),
+            reachable.clone(),
             udp_client.clone(),
         );
 
@@ -1292,6 +1358,7 @@ impl TrackerComms {
                     announce_port: listen_port.clone(),
                     announce_ips: announce_ips.clone(),
                     http_clients: http_clients.clone(),
+                    reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
                     key,
                     list: Mutex::new(TrackerList::new(&tiers, Instant::now())),
@@ -1483,6 +1550,7 @@ impl TrackerComms {
         let bytes = tracker_comms_http::get(
             &*self.http_clients,
             self.udp_client.resolver(),
+            &self.reachable,
             tracker_url,
             Ask::Announce,
             &request.as_querystring(),
@@ -1515,9 +1583,14 @@ impl TrackerComms {
             url.host().context("missing host")?,
             url.port().context("missing port")?,
         );
-        let addrs = udp_tracker_to_socket_addrs(host.clone(), port, self.udp_client.resolver())
-            .instrument(trace_span!("resolve", ?host))
-            .await?;
+        let addrs = udp_tracker_to_socket_addrs(
+            host.clone(),
+            port,
+            self.udp_client.resolver(),
+            &self.reachable,
+        )
+        .instrument(trace_span!("resolve", ?host))
+        .await?;
 
         match addrs {
             UdpTrackerResolveResult::One(addr) => {
@@ -1589,7 +1662,7 @@ impl TrackerComms {
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1609,10 +1682,11 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{
-        AnnounceOk, AutoScrape, MIN_ANNOUNCE_INTERVAL, ReannounceDelay, Refused, ScrapeOk,
-        StoppedAnnounces, SupportedTracker, TrackerAnnounce, TrackerComms, TrackerCommsStats,
-        TrackerCommsStatsState, TrackerList, TrackerScrape, TrackerTask, UdpTrackerResolveResult,
-        may_complete, read_answer, retry_delay, udp_tracker_to_socket_addrs,
+        AnnounceOk, AutoScrape, MIN_ANNOUNCE_INTERVAL, Reachable, ReannounceDelay, Refused,
+        ScrapeOk, StoppedAnnounces, SupportedTracker, TrackerAnnounce, TrackerComms,
+        TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape, TrackerTask,
+        UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
+        udp_tracker_to_socket_addrs,
     };
     use crate::Identity;
     use crate::tracker::tracker_comms_http::{MAX_INTERVAL, TrackerRequestEvent};
@@ -1995,6 +2069,25 @@ mod tests {
         Arc::new(Vec::new)
     }
 
+    /// The session reaches every address.
+    fn reach_all() -> Reachable {
+        Arc::new(|_| Ok(()))
+    }
+
+    /// The session's rule for one with `blocked` on its blocklist, and no
+    /// IPv6 when `ipv4_only`.
+    fn reach_but(blocked: Vec<IpAddr>, ipv4_only: bool) -> Reachable {
+        Arc::new(move |ip: IpAddr| {
+            if ipv4_only && ip.is_ipv6() {
+                Err(Unreachable::Family)
+            } else if blocked.contains(&ip) {
+                Err(Unreachable::Filtered)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     #[tokio::test]
     async fn an_http_announce_names_our_addresses_as_they_are_when_it_goes_out() {
         // BEP 7; libtorrent torrent::build_tracker_request reads the listen
@@ -2020,6 +2113,7 @@ mod tests {
             listen_port,
             announce_ips,
             Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -2076,6 +2170,7 @@ mod tests {
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -2231,6 +2326,7 @@ mod tests {
             listen_port,
             no_ips(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -2283,6 +2379,7 @@ mod tests {
             listen_port,
             no_ips(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -2340,6 +2437,7 @@ mod tests {
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -2419,6 +2517,7 @@ mod tests {
                     .no_proxy()
                     .user_agent("Session/1.0")
             }),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -2479,6 +2578,7 @@ mod tests {
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -2545,6 +2645,7 @@ mod tests {
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
             Arc::new(reqwest::Client::builder),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -2586,6 +2687,7 @@ mod tests {
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -2942,6 +3044,7 @@ mod tests {
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
             udp_client,
             stopped.clone(),
         )
@@ -3072,6 +3175,7 @@ mod tests {
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
             clients.clone(),
+            reach_all(),
             udp_client,
             StoppedAnnounces::default(),
         )
@@ -3155,6 +3259,7 @@ mod tests {
             url.host().unwrap(),
             url.port().unwrap(),
             client.resolver(),
+            &reach_all(),
         )
         .await
         .unwrap();
@@ -3241,5 +3346,207 @@ mod tests {
         stopped.wait_idle().await;
         serve.abort();
         token.cancel();
+    }
+
+    /// Resolves each name to its own addresses, in the order given, and an
+    /// address written out (a UDP URL's host is a name to `url`) to itself,
+    /// as the host's resolver does.
+    struct Named(Vec<(&'static str, Vec<IpAddr>)>);
+
+    impl Resolver for Named {
+        fn resolve<'a>(
+            &'a self,
+            host: &'a str,
+            port: u16,
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+            Box::pin(async move {
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    return Ok(vec![(ip, port).into()]);
+                }
+                let (_, addrs) =
+                    self.0
+                        .iter()
+                        .find(|(name, _)| *name == host)
+                        .ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::NotFound, host.to_owned())
+                        })?;
+                Ok(addrs.iter().map(|ip| (*ip, port).into()).collect())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tracker_with_no_address_the_session_may_reach_is_never_asked() {
+        // libtorrent http_tracker_connection::on_filter and
+        // udp_tracker_connection::name_lookup drop every endpoint the listen
+        // socket cannot route (an IPv4-only session's IPv6 ones), then every
+        // one the ip_filter blocks; with none left the announce fails,
+        // announce_skipped or banned_by_ip_filter, before anything is sent.
+        let (http, http_at) = http_listener().await;
+        let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let (hp, up) = (http_at.port().unwrap(), udp.local_addr().unwrap().port());
+        let url = |s: &str| {
+            Url::parse(
+                &s.replace("HP", &hp.to_string())
+                    .replace("UP", &up.to_string()),
+            )
+            .unwrap()
+        };
+        let banned = "banned by the IP filter";
+        let family = "of a family the session does not connect over";
+        let refused = [
+            (url("http://127.0.0.1:HP/announce"), banned),
+            (url("udp://127.0.0.1:UP/announce"), banned),
+            (url("http://tracker.invalid:HP/announce"), banned),
+            (url("udp://tracker.invalid:UP/announce"), banned),
+            (url("http://[::1]:HP/announce"), family),
+            (url("udp://[::1]:UP/announce"), family),
+        ];
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let resolver = Arc::new(Named(vec![(
+            "tracker.invalid",
+            vec![Ipv6Addr::LOCALHOST.into(), loopback],
+        )]));
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let clients = Arc::new(Pinned::default());
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            refused.iter().map(|(u, _)| vec![u.clone()]).collect(),
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            clients.clone(),
+            reach_but(vec![loopback], true),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap();
+
+        for (url, why) in &refused {
+            let e = refusal_of(&status, &mut peers, url).await;
+            assert!(e.contains(why), "{url}: {e}");
+        }
+        // No client was built, and neither tracker heard anything.
+        assert!(clients.built.lock().is_empty());
+        assert!(http.accept().now_or_never().is_none());
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            udp.try_recv_from(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn every_hop_of_a_tracker_get_goes_only_to_addresses_the_session_may_reach() {
+        // libtorrent http_tracker_connection::on_filter, on the first
+        // resolve and on each redirect's: the endpoints of a family the
+        // listen socket cannot route and those the ip_filter blocks are
+        // dropped, connect tries those left, and a hop with none left fails
+        // the announce banned_by_ip_filter before it is sent.
+        let (tracker, at) = http_listener().await;
+        let port = at.port().unwrap();
+        let url = Url::parse(&format!("http://tracker.invalid:{port}/announce")).unwrap();
+        let blocked = IpAddr::from(Ipv4Addr::new(127, 0, 0, 3));
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let resolver = Arc::new(Named(vec![
+            (
+                "tracker.invalid",
+                vec![Ipv6Addr::LOCALHOST.into(), blocked, loopback],
+            ),
+            ("moved.invalid", vec![blocked]),
+        ]));
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let clients = Arc::new(Pinned::default());
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url.clone()]],
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            clients.clone(),
+            reach_but(vec![blocked], true),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap();
+
+        let serve = async {
+            let (conn, q) = read_announce(&tracker).await;
+            redirect(conn, &format!("http://moved.invalid:{port}/announce?{q}")).await;
+            std::future::pending::<()>().await
+        };
+        let e = tokio::select! {
+            _ = serve => unreachable!(),
+            e = refusal_of(&status, &mut peers, &url) => e,
+        };
+        assert!(e.contains("banned by the IP filter"), "{e}");
+        // The tracker was reached at the one address left; the moved host
+        // never had a client built for it.
+        assert_eq!(
+            *clients.built.lock(),
+            vec![("tracker.invalid".to_owned(), port, vec![loopback])]
+        );
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_udp_tracker_is_asked_only_at_addresses_the_session_may_reach() {
+        // libtorrent udp_tracker_connection::name_lookup keeps the endpoints
+        // the listen socket can route and the ip_filter lets through, in the
+        // order found, and asks from those.
+        let blocked = IpAddr::from(Ipv4Addr::new(127, 0, 0, 3));
+        let resolver = Named(vec![(
+            "tracker.invalid",
+            vec![
+                Ipv6Addr::LOCALHOST.into(),
+                blocked,
+                Ipv4Addr::LOCALHOST.into(),
+                Ipv4Addr::new(127, 0, 0, 4).into(),
+            ],
+        )]);
+        let host = url::Host::Domain("tracker.invalid");
+        let v4 = (Ipv4Addr::LOCALHOST, 6969).into();
+        let v6 = (Ipv6Addr::LOCALHOST, 6969).into();
+
+        let ipv4_only = reach_but(vec![blocked], true);
+        let found = udp_tracker_to_socket_addrs(host.clone(), 6969, Some(&resolver), &ipv4_only)
+            .await
+            .unwrap();
+        assert!(
+            matches!(found, UdpTrackerResolveResult::One(a) if a == v4),
+            "{found:?}"
+        );
+
+        let both = reach_but(vec![blocked], false);
+        let found = udp_tracker_to_socket_addrs(host, 6969, Some(&resolver), &both)
+            .await
+            .unwrap();
+        assert!(
+            matches!(found, UdpTrackerResolveResult::Two(a, b) if SocketAddr::from(a) == v4 && SocketAddr::from(b) == v6),
+            "{found:?}"
+        );
     }
 }

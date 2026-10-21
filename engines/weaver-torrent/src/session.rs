@@ -41,7 +41,8 @@ use crate::torrent_state::live::{
     web_seed::WebSeeds,
 };
 use crate::tracker::{
-    AnnounceIps, AutoScrape, ListenPort, StoppedAnnounces, TrackerComms, UdpTrackerClient,
+    AnnounceIps, AutoScrape, ListenPort, Reachable, StoppedAnnounces, TrackerComms,
+    UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
     PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, UpnpPortForwarder,
@@ -2276,6 +2277,33 @@ impl Session {
         merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), is_private)
     }
 
+    /// Whether the session may reach `ip`, whoever is there: a peer, a web
+    /// seed, or a tracker at any hop. It must be of a family the session
+    /// connects over, as an IPv4-only session reaches no IPv6 address
+    /// (libtorrent `listen_socket_t::can_route`, which
+    /// `http_tracker_connection::on_filter` and
+    /// `udp_tracker_connection::name_lookup` apply first), and the IP filter,
+    /// the blocklist and the allowlist, must let it through (libtorrent's one
+    /// `ip_filter`: `torrent::add_peer` applies it to a peer,
+    /// `torrent::connect_web_seed` to a web seed, and the two tracker
+    /// functions to a tracker).
+    pub(crate) fn may_reach(&self, ip: IpAddr) -> Result<(), Unreachable> {
+        if self.ipv4_only && ip.is_ipv6() {
+            return Err(Unreachable::Family);
+        }
+        if self.blocklist.has(ip) || self.allowlist.as_ref().is_some_and(|l| !l.has(ip)) {
+            return Err(Unreachable::Filtered);
+        }
+        Ok(())
+    }
+
+    /// [`Session::may_reach`] for the tracker task, which already holds the
+    /// session (its counters).
+    fn reachable(self: &Arc<Self>) -> Reachable {
+        let session = self.clone();
+        Arc::new(move |ip| session.may_reach(ip))
+    }
+
     // Get a peer stream from both DHT and trackers, under every hash the
     // torrent goes by (libtorrent `torrent::dht_announce`, `lsd_announce`
     // and `announce_with_tracker` each loop over `info_hash_t::for_each`).
@@ -2346,6 +2374,7 @@ impl Session {
                 Arc::new(Vec::new)
             },
             self.http_clients.clone(),
+            self.reachable(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
         )

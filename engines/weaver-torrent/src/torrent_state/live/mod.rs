@@ -815,47 +815,39 @@ impl TorrentStateLive {
         }
     }
 
-    // Whether we may open a connection to `addr`. The peer list holds no
-    // address we may not connect to.
+    // Whether we may open a connection to `addr`: a port to connect to
+    // (libtorrent `peer_list::add_peer` takes no port-0 peer), at an
+    // address the session may reach (`Session::may_reach`, the rule
+    // trackers pass too). The peer list holds no address we may not
+    // connect to.
     fn may_connect_to(&self, addr: SocketAddr) -> bool {
+        use crate::tracker::Unreachable;
         let Some(session) = self.shared.session.upgrade() else {
             return false;
         };
-
-        if session.ipv4_only && addr.is_ipv6() {
-            debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
-            return false;
-        }
 
         if addr.port() == 0 {
             debug!(?addr, "skipping peer with port 0");
             return false;
         }
 
-        if session.blocklist.has(addr.ip()) {
-            session
-                .stats
-                .counters
-                .blocked_outgoing
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(?addr, "blocked outgoing connection (by the blacklist)");
-            return false;
+        match session.may_reach(addr.ip()) {
+            Ok(()) => true,
+            Err(Unreachable::Family) => {
+                debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
+                false
+            }
+            // libtorrent posts `peer_blocked_alert` for each.
+            Err(Unreachable::Filtered) => {
+                session
+                    .stats
+                    .counters
+                    .blocked_outgoing
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(?addr, "blocked outgoing connection (by the IP filter)");
+                false
+            }
         }
-
-        if session
-            .allowlist
-            .as_ref()
-            .is_some_and(|l| !l.has(addr.ip()))
-        {
-            session
-                .stats
-                .counters
-                .blocked_outgoing
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(?addr, "blocked outgoing connection (by the allowlist)");
-            return false;
-        }
-        true
     }
 
     pub fn torrent(&self) -> &ManagedTorrentShared {

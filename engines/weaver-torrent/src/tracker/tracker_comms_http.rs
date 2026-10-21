@@ -9,6 +9,7 @@ use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
 use crate::core::net::{HttpClients, HttpTarget, Resolver};
 use crate::tracker::ScrapeOk;
+use crate::tracker::tracker_comms::{Reachable, only_reachable};
 use anyhow::Context;
 use either::Either;
 use futures::StreamExt;
@@ -382,18 +383,25 @@ async fn addresses(
 }
 
 /// A client from `clients` for a GET of `url` for `ask`: it reaches the
-/// URL's host at the addresses found for it now, in the order found, and
-/// nowhere else, and follows no redirect. Refused when [`ssrf_refusal`]
-/// holds the GET back from those addresses (libtorrent
+/// URL's host at the addresses found for it now that the session may reach
+/// (see [`only_reachable`]), in the order found, and nowhere else, and
+/// follows no redirect. Refused when none is left, or when [`ssrf_refusal`]
+/// holds the GET back from those left (libtorrent
 /// `http_connection::on_resolve` hands the endpoints to `on_filter`, then
-/// `connect` tries only those left).
+/// `connect` tries only those left). `on_filter` drops by the family, then by
+/// SSRF, then by the IP filter, each address on its own, so the order changes
+/// only which refusal is named; here [`ssrf_refusal`] refuses the GET for
+/// any loopback address the client may pick, so it judges the addresses the
+/// client is handed, after the filter.
 async fn reach(
     clients: &dyn HttpClients,
     url: &url::Url,
     ask: Ask,
     resolver: Option<&dyn Resolver>,
+    reachable: &Reachable,
 ) -> anyhow::Result<reqwest::Client> {
-    let (host, addrs) = addresses(url, resolver).await?;
+    let (host, found) = addresses(url, resolver).await?;
+    let addrs = only_reachable(found, |ip| *ip, reachable)?;
     if let Some(why) = ssrf_refusal(url, ask, &addrs) {
         anyhow::bail!("SSRF mitigation: {why}");
     }
@@ -422,6 +430,7 @@ const MAX_REDIRECTS: usize = 5;
 pub(crate) async fn get(
     clients: &dyn HttpClients,
     resolver: Option<&dyn Resolver>,
+    reachable: &Reachable,
     tracker: &url::Url,
     ask: Ask,
     query: &str,
@@ -437,7 +446,7 @@ pub(crate) async fn get(
     }
     let mut redirects = 0;
     let response = loop {
-        let client = reach(clients, &url, ask, resolver).await?;
+        let client = reach(clients, &url, ask, resolver, reachable).await?;
         let response = tokio::time::timeout(
             RECEIVE_TIMEOUT,
             client
