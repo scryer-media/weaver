@@ -294,8 +294,9 @@ fn every_chunk() -> BTreeSet<(u32, u32)> {
 impl Harness {
     /// The unchoked `peer` is asked for every chunk, on the paused clock:
     /// the first piece's four at the depth of a peer no block has come from
-    /// yet; then the first of them arrives, at once, which makes room for the
-    /// rest. Returns the piece asked for first.
+    /// yet; then the peer is snubbed, which ends its slow start, and the
+    /// first of them arrives at once, which lifts the snub at a pace that
+    /// makes room for the rest. Returns the piece asked for first.
     async fn request_every_chunk(
         &self,
         peer: &PeerHandler,
@@ -305,6 +306,9 @@ impl Harness {
         let first = next_requests(task, rx, CHUNKS_PER_PIECE as usize).await;
         let (piece, _) = *first.first().unwrap();
         assert_eq!(first, chunks(piece, 0..CHUNKS_PER_PIECE));
+        self.peers
+            .with_live_mut(peer.addr, "test", |live| live.snub())
+            .unwrap();
         self.deliver(peer, (piece, 0)).await;
         let other = 1 - piece;
         assert_eq!(
@@ -316,9 +320,10 @@ impl Harness {
 }
 
 // libtorrent `peer_connection::update_desired_queue_size`: four requests
-// before any block arrives (`m_desired_queue_size`), then the blocks the
-// peer delivers in `request_queue_time` at its pace, between two and the
-// most outstanding; one while it is snubbed.
+// before any block arrives (`m_desired_queue_size`), one more for each block
+// in slow start (`incoming_piece`); once slow start is over (`snub_peer`,
+// `second_tick`), the blocks the peer delivers in `request_queue_time` at
+// its pace, between two and the most outstanding; one while it is snubbed.
 #[tokio::test]
 async fn the_request_depth_follows_the_pace_the_peer_delivers_at() {
     let h = Harness::new("request_depth_follows_pace").await;
@@ -348,9 +353,18 @@ async fn the_request_depth_follows_the_pace_the_peer_delivers_at() {
         .first()
         .unwrap();
 
-    // A block the moment it was asked for: every request we allow, and no
-    // more than the peer's `reqq`.
+    // A block in slow start: one more.
     h.deliver(&fast, (fast_piece, 0)).await;
+    assert_eq!(depth(&fast), 5);
+
+    // Snubbed: one, and slow start is over. A block the moment it was asked
+    // for lifts the snub: every request we allow, and no more than the
+    // peer's `reqq`.
+    h.peers
+        .with_live_mut(fast.addr, "test", |live| live.snub())
+        .unwrap();
+    assert_eq!(depth(&fast), 1);
+    h.deliver(&fast, (fast_piece, CHUNK_SIZE)).await;
     assert_eq!(depth(&fast), DEFAULT_PEER_REQUEST_WINDOW);
     let mut hs = ExtendedHandshake::new();
     hs.reqq = Some(5);
@@ -363,12 +377,13 @@ async fn the_request_depth_follows_the_pace_the_peer_delivers_at() {
         .unwrap();
     assert_eq!(depth(&fast), 1);
 
-    // A block a second: three seconds' worth.
+    // A block after a second, in slow start: one more.
     tokio::time::advance(Duration::from_secs(1)).await;
     h.deliver(&slow, (slow_piece, 0)).await;
-    assert_eq!(depth(&slow), 3);
+    assert_eq!(depth(&slow), 5);
 
-    // A block every two seconds: one and a half, so the least, two.
+    // None in the second after: slow start ends with it. A block every two
+    // seconds: one and a half in three, so the least, two.
     tokio::time::advance(Duration::from_secs(3)).await;
     h.deliver(&slow, (slow_piece, CHUNK_SIZE)).await;
     assert_eq!(depth(&slow), 2);
@@ -1240,13 +1255,18 @@ async fn a_peer_that_chokes_us_is_asked_only_for_its_allowed_fast_pieces() {
     assert!(rx.is_empty());
     assert_eq!(h.queued_pieces(), vec![0]);
 
-    // Unchoked, and a block arrives at once, which deepens the window: the
-    // rest is asked for.
+    // Unchoked, and each block that arrives deepens the window by one in
+    // slow start: the rest is asked for, two at a time.
     peer.on_i_am_unchoked();
     h.deliver(&peer, (1, 0)).await;
     assert_eq!(
-        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
-        chunks(0, 0..CHUNKS_PER_PIECE)
+        next_requests(&mut requester, &mut rx, 2).await,
+        chunks(0, 0..2)
+    );
+    h.deliver(&peer, (1, CHUNK_SIZE)).await;
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, 2).await,
+        chunks(0, 2..4)
     );
 }
 
