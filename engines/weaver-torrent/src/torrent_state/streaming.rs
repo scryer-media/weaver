@@ -22,7 +22,7 @@ use dashmap::DashMap;
 use crate::core::lengths::{CurrentPiece, Lengths, ValidPieceIndex};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
-    sync::OwnedSemaphorePermit,
+    sync::{Notify, OwnedSemaphorePermit},
 };
 use tracing::{debug, trace};
 
@@ -62,6 +62,9 @@ impl StreamState {
 pub(crate) struct TorrentStreams {
     next_stream_id: AtomicUsize,
     streams: DashMap<StreamId, StreamState>,
+    /// Rung once a stream starts or ends: what the torrent wants of its
+    /// peers may have changed with it.
+    pub(crate) changed: Notify,
 }
 
 impl TorrentStreams {
@@ -129,7 +132,9 @@ impl TorrentStreams {
 
     fn drop_stream(&self, stream_id: StreamId) -> Option<StreamState> {
         debug!(stream_id, "dropping stream");
-        self.streams.remove(&stream_id).map(|s| s.1)
+        let dropped = self.streams.remove(&stream_id).map(|s| s.1);
+        self.changed.notify_waiters();
+        dropped
     }
 
     pub(crate) fn streamed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
@@ -379,6 +384,7 @@ impl ManagedTorrent {
                 file_abs_offset: fd_offset,
             },
         );
+        streams.changed.notify_waiters();
 
         debug!(stream_id = s.stream_id, file_id, "started stream");
 

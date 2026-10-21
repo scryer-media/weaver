@@ -638,17 +638,6 @@ impl PeerStates {
         }
     }
 
-    pub fn is_peer_not_interested_and_has_full_torrent(
-        &self,
-        handle: PeerHandle,
-        total_pieces: usize,
-    ) -> bool {
-        self.with_live(handle, |live| {
-            !live.peer_interested && live.has_full_torrent(total_pieces)
-        })
-        .unwrap_or(false)
-    }
-
     /// The peer sent its BITFIELD. A second one replaces the first: the old
     /// pieces leave the availability before the new ones join it.
     pub fn update_bitfield(&self, handle: PeerHandle, bitfield: BF) -> Option<()> {

@@ -188,6 +188,11 @@ const FLUSH_BITV_EVERY_BYTES: u64 = 16 * 1024 * 1024;
 // peers over (libtorrent `peer_turnover`).
 const PEER_TURNOVER: usize = 4;
 
+// How long a peer given nothing to request waits before it picks again,
+// when nothing it waits on changes first (libtorrent
+// `peer_connection::second_tick`: 5 s after the last request).
+const REPICK_INTERVAL: Duration = Duration::from_secs(5);
+
 pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
@@ -1041,6 +1046,11 @@ impl TorrentStateLive {
             .lock_write("update_only_files")
             .get_pieces_mut()?
             .update_only_files(&self.metadata.file_infos, only_files)?;
+        // The peers' requesters look again at what they may ask for, and
+        // whether we want anything at all (libtorrent
+        // `torrent::update_piece_priorities` calls `update_interest` on
+        // every peer).
+        self.new_pieces_notify.notify_waiters();
         // With the state lock released. A dying peer holds its shard of the peer table
         // while it asks whether the torrent is finished (on_peer_died), so touching the
         // table under the state lock is the reverse order, and the two deadlock.
@@ -1059,6 +1069,8 @@ impl TorrentStateLive {
             .lock_write("set_piece_priorities")
             .get_pieces_mut()?
             .set_piece_priorities(priorities);
+        // As in update_only_files().
+        self.new_pieces_notify.notify_waiters();
         // Wanting a skipped piece again may make peers we let go useful. With the
         // state lock released, for the reason given in update_only_files().
         self.update_upload_only();
@@ -2213,6 +2225,26 @@ impl PeerHandler {
         .await;
     }
 
+    /// Resolves once what we want of the peer may have changed: pieces
+    /// were queued again or the wanted ones changed (new_pieces_notify), the
+    /// torrent finished, a stream started or ended, or the peer's pieces
+    /// changed. Each wait is
+    /// taken when this is called, not when it is first polled.
+    fn wants_changed(&self) -> impl Future<Output = ()> + '_ {
+        let pieces = self.state.new_pieces_notify.notified();
+        let finished = self.state.finished_notify.notified();
+        let streams = self.state.streams.changed.notified();
+        let peer_pieces = self.on_bitfield_notify.notified();
+        async move {
+            tokio::select! {
+                () = pieces => {}
+                () = finished => {}
+                () = streams => {}
+                () = peer_pieces => {}
+            }
+        }
+    }
+
     async fn wait_for_request_slot(&self) {
         loop {
             let Some(notify) = self.request_slots_changed() else {
@@ -2347,39 +2379,42 @@ impl PeerHandler {
         };
 
         loop {
+            // Taken before what they guard is read, so no change in between
+            // is missed.
+            let wants_changed = self.wants_changed();
             // If we have full torrent, we don't need to request more pieces.
             // However we might still need to seed them to the peer.
             if self.state.is_finished_and_no_active_streams() {
                 update_interest(self, false)?;
+                // A seed has nothing for us, nor we for it (libtorrent
+                // `peer_connection::disconnect_if_redundant`,
+                // upload_upload_connection, from `do_update_interest`).
                 if self
                     .state
                     .peers
-                    .is_peer_not_interested_and_has_full_torrent(
-                        self.addr,
-                        self.state.lengths.total_pieces() as usize,
-                    )
+                    .with_live(self.addr, |live| {
+                        live.has_full_torrent(self.state.lengths.total_pieces() as usize)
+                    })
+                    .unwrap_or(false)
                 {
                     debug!("nothing left to do, neither of us is interested, disconnecting peer");
                     self.tx
                         .send(WriterRequest::Disconnect(Ok(())))
                         .ok()
                         .ok_or(Error::PeerTaskDead)?;
-                    // wait until the receiver gets the message so that it doesn't finish with an error.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    return Ok(());
-                } else {
-                    // TODO: wait for a notification of interest, e.g. update of selected files or new streams or change
-                    // in peer interest.
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
+                    // The writer sends what was queued before, NotInterested
+                    // among it, then closes the connection, which ends this
+                    // task.
+                    return std::future::pending().await;
                 }
+                aframe!(wants_changed).await;
+                continue;
             }
 
             update_interest(self, true)?;
             aframe!(self.wait_for_request_slot()).await;
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
-            let new_piece_notify = self.state.new_pieces_notify.notified();
             // What the peer lets us request changes too: it unchokes us, or
             // lets us fetch another piece while it chokes us.
             let slots_changed = self.request_slots_changed();
@@ -2394,20 +2429,15 @@ impl PeerHandler {
                             None => std::future::pending().await,
                         }
                     };
-                    match aframe!(tokio::time::timeout(
-                        // Half of default rw timeout not to race with it.
-                        Duration::from_secs(5),
-                        async {
-                            tokio::select! {
-                                () = new_piece_notify => {}
-                                () = slot_changed => {}
-                            }
-                        }
-                    ))
-                    .await
-                    {
-                        Ok(()) => debug!("woken up, new pieces might be available"),
-                        Err(_) => debug!("woken up by sleep timer"),
+                    // Nothing changes while a piece another peer holds grows
+                    // old enough to take over, or blocks asked of others
+                    // become ones to double: the peer picks again after
+                    // REPICK_INTERVAL (libtorrent `peer_connection::second_tick`
+                    // picks again 5 s after the last request in the end game).
+                    tokio::select! {
+                        () = wants_changed => debug!("woken up, new pieces might be available"),
+                        () = slot_changed => debug!("woken up, request slots changed"),
+                        () = tokio::time::sleep(REPICK_INTERVAL) => debug!("picking again"),
                     }
                     continue;
                 }
