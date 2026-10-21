@@ -6,7 +6,6 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
-    cmp::Reverse,
     net::{Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     str::FromStr,
     sync::{
@@ -29,9 +28,7 @@ use crate::dht::{
 };
 use backon::{ExponentialBuilder, Retryable};
 use dashmap::DashMap;
-use futures::{
-    FutureExt, Stream, StreamExt, TryFutureExt, future::BoxFuture, stream::FuturesUnordered,
-};
+use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 
 use crate::core::{
     compact_ip::{CompactSerialize, CompactSerializeFixedLen},
@@ -50,7 +47,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel};
 
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
+use tracing::{Instrument, debug, debug_span, info, trace, warn};
 
 fn now() -> Instant {
     Instant::now()
@@ -76,14 +73,102 @@ pub struct WorkerSendRequest {
     addr: SocketAddr,
 }
 
+// The requests one search keeps in flight: libtorrent's `dht_search_branching`.
+const SEARCH_BRANCHING: usize = 5;
+// The candidates one search keeps, closest first; libtorrent's traversal keeps
+// 100. A candidate pushed past the end is dropped, and since the kept ones only
+// get closer, it never comes back.
+const SEARCH_CANDIDATES: usize = 100;
+// k: a search is complete once the k closest candidates have answered.
+const SEARCH_K: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateState {
+    Fresh,
+    InFlight,
+    Answered,
+    Failed,
+}
+
 #[derive(Debug)]
-struct MaybeUsefulNode {
-    id: Id20,
+struct Candidate {
+    // None for a bootstrap address, whose id we do not know yet.
+    id: Option<Id20>,
     addr: SocketAddr,
-    last_request: Instant,
-    last_response: Option<Instant>,
-    errors_in_a_row: usize,
-    returned_peers: bool,
+    state: CandidateState,
+}
+
+// The nodes one search knows of, closest to its target first, the ones without
+// an id last. Each is asked at most once.
+struct Candidates {
+    target: Id20,
+    list: Vec<Candidate>,
+}
+
+impl Candidates {
+    fn new(target: Id20) -> Self {
+        Self {
+            target,
+            list: Vec::new(),
+        }
+    }
+
+    fn rank(&self, id: Option<Id20>) -> (bool, Option<Id20>) {
+        (id.is_none(), id.map(|id| id.distance(&self.target)))
+    }
+
+    fn offer(&mut self, id: Option<Id20>, addr: SocketAddr) {
+        if self
+            .list
+            .iter()
+            .any(|c| c.addr == addr || (id.is_some() && c.id == id))
+        {
+            return;
+        }
+        let rank = self.rank(id);
+        let pos = self.list.partition_point(|c| self.rank(c.id) <= rank);
+        if pos >= SEARCH_CANDIDATES {
+            return;
+        }
+        self.list.insert(
+            pos,
+            Candidate {
+                id,
+                addr,
+                state: CandidateState::Fresh,
+            },
+        );
+        self.list.truncate(SEARCH_CANDIDATES);
+    }
+
+    // The closest candidate not asked yet, unless the k closest that answered
+    // are all closer than it.
+    fn next_to_ask(&mut self) -> Option<&mut Candidate> {
+        let mut answered = 0;
+        for c in self.list.iter_mut() {
+            if answered == SEARCH_K {
+                return None;
+            }
+            match c.state {
+                CandidateState::Answered => answered += 1,
+                CandidateState::Fresh => return Some(c),
+                CandidateState::InFlight | CandidateState::Failed => {}
+            }
+        }
+        None
+    }
+
+    fn settle(&mut self, addr: SocketAddr, state: CandidateState) {
+        if let Some(c) = self.list.iter_mut().find(|c| c.addr == addr) {
+            c.state = state;
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SearchOutcome {
+    answered: usize,
+    failed: usize,
 }
 
 fn make_rate_limiter() -> RateLimiter {
@@ -199,14 +284,10 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
 }
 
 struct RecursiveRequest<C: RecursiveRequestCallbacks> {
-    max_depth: usize,
-    useful_nodes_limit: usize,
     info_hash: Id20,
     request: Request,
     dht: Arc<DhtState>,
-    useful_nodes: RwLock<Vec<MaybeUsefulNode>>,
     peer_tx: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
-    node_tx: tokio::sync::mpsc::UnboundedSender<(Option<Id20>, SocketAddr, usize)>,
     callbacks: C,
 }
 
@@ -220,25 +301,13 @@ impl RequestPeersStream {
     fn new(dht: Arc<DhtState>, info_hash: Id20, announce_port: Option<u16>) -> Self {
         let (peer_tx, peer_rx) = unbounded_channel();
         let make = |is_v4: bool, dht: Arc<DhtState>, peer_tx: UnboundedSender<SocketAddr>| {
-            let (node_tx, node_rx) = unbounded_channel();
-            let rp = Arc::new(RecursiveRequest {
-                max_depth: 4,
-                info_hash,
-                useful_nodes_limit: 256,
-                request: Request::GetPeers(info_hash),
+            Arc::new(RecursiveRequest::get_peers(
                 dht,
-                useful_nodes: RwLock::new(Vec::new()),
+                info_hash,
+                announce_port,
                 peer_tx,
-                node_tx,
-                callbacks: RecursiveRequestCallbacksGetPeers {
-                    min_distance_to_announce: Id20::from_str(
-                        "0000ffffffffffffffffffffffffffffffffffff",
-                    )
-                    .unwrap(),
-                    announce_port,
-                },
-            });
-            rp.request_peers_forever(node_rx, is_v4)
+            ))
+            .request_peers_forever(is_v4)
         };
 
         let v4 = make(true, dht.clone(), peer_tx.clone());
@@ -277,309 +346,175 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
         target: Id20,
         addrs: impl Iterator<Item = SocketAddr>,
     ) -> crate::dht::Result<()> {
-        let (node_tx, mut node_rx) = unbounded_channel();
         let req = RecursiveRequest {
-            max_depth: 4,
             info_hash: target,
             request: Request::FindNode(target),
             dht,
-            useful_nodes_limit: 32,
-            useful_nodes: RwLock::new(Vec::new()),
             peer_tx: unbounded_channel().0,
-            node_tx,
             callbacks: RecursiveRequestCallbacksFindNodes {},
         };
-
-        let request_one = |id, addr, depth| {
-            req.request_one(id, addr, depth)
-                .map_err(|e| {
-                    debug!("error: {e:#}");
-                    e
-                })
-                .instrument(debug_span!(
-                    "find_node",
-                    target = format!("{target:?}"),
-                    addr = addr.to_string()
-                ))
-        };
-
-        let mut futs = FuturesUnordered::new();
-
-        let mut initial_addrs = 0;
-        for addr in addrs {
-            futs.push(request_one(None, addr, 0));
-            initial_addrs += 1;
-        }
-
-        let mut successes = 0;
-        let mut errors = 0;
-
-        loop {
-            tokio::select! {
-                biased;
-
-                r = node_rx.recv() => {
-                    let (id, addr, depth) = r.unwrap();
-                    futs.push(request_one(id, addr, depth))
-                },
-                f = futs.next() => {
-                    let f = match f {
-                        Some(f) => f,
-                        None => {
-                            // find_node recursion finished.
-                            break;
-                        }
-                    };
-                    if f.is_ok() {
-                        successes += 1;
-                    } else {
-                        errors += 1;
-                    }
-                }
-            }
-        }
-        if successes == 0 {
-            return Err(Error::NoSuccessfulLookups { errors });
+        let outcome = req
+            .search(addrs.map(|addr| (None, addr)))
+            .instrument(debug_span!("find_node", target = format!("{target:?}")))
+            .await?;
+        if outcome.answered == 0 {
+            return Err(Error::NoSuccessfulLookups {
+                errors: outcome.failed,
+            });
         }
         debug!(
-            "finished, successes = {successes}, errors = {errors}, initial_addrs = {initial_addrs}"
+            "finished, answered = {}, failed = {}",
+            outcome.answered, outcome.failed
         );
         Ok(())
     }
 }
 
 impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
-    fn request_peers_forever(
-        self: &Arc<Self>,
-        mut node_rx: tokio::sync::mpsc::UnboundedReceiver<(Option<Id20>, SocketAddr, usize)>,
-        is_v4: bool,
-    ) -> tokio::task::JoinHandle<()> {
-        let this = self.clone();
-        spawn(
+    fn get_peers(
+        dht: Arc<DhtState>,
+        info_hash: Id20,
+        announce_port: Option<u16>,
+        peer_tx: UnboundedSender<SocketAddr>,
+    ) -> Self {
+        RecursiveRequest {
+            info_hash,
+            request: Request::GetPeers(info_hash),
+            dht,
+            peer_tx,
+            callbacks: RecursiveRequestCallbacksGetPeers {
+                min_distance_to_announce: Id20::from_str(
+                    "0000ffffffffffffffffffffffffffffffffffff",
+                )
+                .unwrap(),
+                announce_port,
+            },
+        }
+    }
+
+    // One search at a time, from the closest nodes of the routing table, again
+    // every minute, or sooner while the table is short of nodes.
+    fn request_peers_forever(self: Arc<Self>, is_v4: bool) -> tokio::task::JoinHandle<()> {
+        spawn::<Error>(
             debug_span!(parent: None, "get_peers", is_v4, info_hash = format!("{:?}", self.info_hash)),
             "get_peers",
             async move {
-                let this = &this;
-                // Looper adds root nodes to the queue every 60 seconds.
-                let looper = {
-                    async move {
-                        let mut iteration = 0;
-                        loop {
-                            trace!("iteration {}", iteration);
-                            let sleep = match this.get_peers_root(is_v4) {
-                                Ok(0) => Duration::from_secs(1),
-                                Ok(n) if n < 8 => REQUERY_INTERVAL / 8 * (n as u32),
-                                Ok(_) => REQUERY_INTERVAL,
-                                Err(e) => {
-                                    error!("dht: error in get_peers_root(): {e:#}");
-                                    return Err::<(), crate::dht::Error>(e);
-                                }
-                            };
-                            tokio::time::sleep(sleep).await;
-                            iteration += 1;
-                        }
-                    }
-                };
-                tokio::pin!(looper);
-
-                let mut futs = FuturesUnordered::new();
                 loop {
-                    tokio::select! {
-                        addr = node_rx.recv() => {
-                            let (id, addr, depth) = addr.unwrap();
-                            futs.push(
-                                this.request_one(id, addr, depth)
-                                    .map_err(|e| debug!("error: {e:#}"))
-                                    .instrument(debug_span!("addr", addr=addr.to_string()))
-                            );
-                        }
-                        Some(_) = futs.next(), if !futs.is_empty() => {}
-                        r = &mut looper => {
-                            return r
-                        }
+                    let seeds = self.closest_known(is_v4);
+                    let known = seeds.len();
+                    if known > 0 {
+                        let outcome = self.search(seeds.into_iter()).await?;
+                        trace!(?outcome, "search finished");
                     }
+                    let pause = match known {
+                        0 => Duration::from_secs(1),
+                        n if n < SEARCH_K => REQUERY_INTERVAL / SEARCH_K as u32 * n as u32,
+                        _ => REQUERY_INTERVAL,
+                    };
+                    tokio::time::sleep(pause).await;
                 }
             },
         )
     }
 
-    fn get_peers_root(&self, is_v4: bool) -> crate::dht::Result<usize> {
-        let mut count = 0;
+    fn closest_known(&self, is_v4: bool) -> Vec<(Option<Id20>, SocketAddr)> {
         let table = if is_v4 {
             &self.dht.routing_table_v4
         } else {
             &self.dht.routing_table_v6
         };
-        for (id, addr) in table
+        table
             .read()
             .sorted_by_distance_from(self.info_hash, now())
             .iter()
-            .map(|n| (n.id(), n.addr()))
-            .take(8)
-        {
-            count += 1;
-            self.node_tx
-                .send((Some(id), addr, 0))
-                .ok()
-                .ok_or(Error::DhtDead)?;
-        }
-
-        Ok(count)
+            .map(|n| (Some(n.id()), n.addr()))
+            .take(SEARCH_K)
+            .collect()
     }
 }
 
 impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
-    async fn request_one(
+    // Walk towards the target from `seeds`: ask the closest candidates not asked
+    // yet, at most SEARCH_BRANCHING at a time, and offer the nodes each answer
+    // names as new candidates. A node that fails or does not answer in time is
+    // marked failed and skipped. The search ends when nothing is in flight and
+    // no candidate is left to ask.
+    async fn search(
+        &self,
+        seeds: impl Iterator<Item = (Option<Id20>, SocketAddr)>,
+    ) -> crate::dht::Result<SearchOutcome> {
+        let mut candidates = Candidates::new(self.info_hash);
+        for (id, addr) in seeds {
+            candidates.offer(id, addr);
+        }
+        let mut in_flight = FuturesUnordered::new();
+        let mut outcome = SearchOutcome::default();
+        loop {
+            while in_flight.len() < SEARCH_BRANCHING {
+                let Some(candidate) = candidates.next_to_ask() else {
+                    break;
+                };
+                candidate.state = CandidateState::InFlight;
+                let (id, addr) = (candidate.id, candidate.addr);
+                in_flight.push(
+                    self.ask(id, addr)
+                        .map(move |r| (addr, r))
+                        .instrument(debug_span!("ask", addr = addr.to_string())),
+                );
+            }
+            let Some((addr, answer)) = in_flight.next().await else {
+                return Ok(outcome);
+            };
+            let response = match answer {
+                Ok(response) => response,
+                Err(e) => {
+                    debug!("{addr}: {e:#}");
+                    outcome.failed += 1;
+                    candidates.settle(addr, CandidateState::Failed);
+                    continue;
+                }
+            };
+            outcome.answered += 1;
+            candidates.settle(addr, CandidateState::Answered);
+            for peer in response.values.into_iter().flatten() {
+                self.peer_tx.send(peer.0).ok().ok_or(Error::ReceiverDead)?;
+            }
+            let nodes = response
+                .nodes
+                .iter()
+                .flat_map(|n| n.iter().map(|n| n.as_socketaddr()))
+                .chain(
+                    response
+                        .nodes6
+                        .iter()
+                        .flat_map(|n| n.iter().map(|n| n.as_socketaddr())),
+                )
+                .filter(|node| addr.is_ipv4() == node.addr.is_ipv4());
+            for node in nodes {
+                candidates.offer(Some(node.id), node.addr);
+            }
+        }
+    }
+
+    async fn ask(
         &self,
         id: Option<Id20>,
         addr: SocketAddr,
-        depth: usize,
-    ) -> crate::dht::Result<()> {
+    ) -> crate::dht::Result<Response<ByteBufOwned>> {
         if let Some(id) = id {
             self.callbacks.on_request_start(self, id, addr);
         }
-
-        let response = self
-            .dht
-            .request(self.request.clone(), addr)
-            .await
-            .inspect(|r| {
-                self.mark_node_responded(addr, r);
-            });
+        let response = self.dht.request(self.request.clone(), addr).await;
         if let Some(id) = id {
             self.callbacks.on_request_end(self, id, addr, &response);
         }
-
-        let response = match response {
-            Ok(ResponseOrError::Response(r)) => r,
-            Ok(ResponseOrError::Error(e)) => {
+        match response? {
+            ResponseOrError::Response(r) => Ok(r),
+            ResponseOrError::Error(e) => {
                 debug!("error response: {e:?}");
-                return Err(Error::ErrorResponse);
-            }
-            Err(e) => {
-                self.mark_node_error(addr);
-                return Err(e);
-            }
-        };
-
-        if let Some(peers) = response.values {
-            for peer in peers {
-                self.peer_tx.send(peer.0).ok().ok_or(Error::ReceiverDead)?;
+                Err(Error::ErrorResponse)
             }
         }
-
-        let node_it = response
-            .nodes
-            .iter()
-            .flat_map(|n| n.iter().map(|n| n.as_socketaddr()))
-            .chain(
-                response
-                    .nodes6
-                    .iter()
-                    .flat_map(|n| n.iter().map(|n| n.as_socketaddr())),
-            )
-            .filter(|node| addr.is_ipv4() == node.addr.is_ipv4());
-
-        let now = now();
-
-        for node in node_it {
-            let should_request = self.should_request_node(node.id, node.addr, depth, now);
-            trace!(
-                "should_request={}, id={:?}, addr={}, depth={}/{}",
-                should_request, node.id, node.addr, depth, self.max_depth
-            );
-            if should_request {
-                self.node_tx
-                    .send((Some(node.id), node.addr, depth + 1))
-                    .ok()
-                    .ok_or(Error::ReceiverDead)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn mark_node_error(&self, addr: SocketAddr) -> bool {
-        self.useful_nodes
-            .write()
-            .iter_mut()
-            .find(|n| n.addr == addr)
-            .map(|n| {
-                n.errors_in_a_row += 1;
-            })
-            .is_some()
-    }
-
-    fn mark_node_responded(&self, addr: SocketAddr, response: &ResponseOrError) -> bool {
-        self.useful_nodes
-            .write()
-            .iter_mut()
-            .find(|n| n.addr == addr)
-            .map(|node| {
-                node.last_response = Some(now());
-                node.errors_in_a_row = 0;
-                match response {
-                    ResponseOrError::Response(r) => {
-                        node.returned_peers =
-                            r.values.as_ref().map(|c| !c.is_empty()).unwrap_or(false)
-                    }
-                    ResponseOrError::Error(_) => {
-                        node.returned_peers = false;
-                    }
-                }
-            })
-            .is_some()
-    }
-
-    fn should_request_node(
-        &self,
-        node_id: Id20,
-        addr: SocketAddr,
-        depth: usize,
-        now: Instant,
-    ) -> bool {
-        if depth >= self.max_depth {
-            return false;
-        }
-
-        let mut closest_nodes = self.useful_nodes.write();
-
-        // If recently requested, ignore
-        if let Some(existing) = closest_nodes.iter_mut().find(|n| n.id == node_id) {
-            if now - existing.last_request > Duration::from_secs(60) {
-                existing.last_request = now;
-                return true;
-            }
-            return false;
-        }
-
-        closest_nodes.push(MaybeUsefulNode {
-            id: node_id,
-            addr,
-            last_request: now,
-            last_response: None,
-            returned_peers: false,
-            errors_in_a_row: 0,
-        });
-
-        closest_nodes.sort_by_key(|n| {
-            let has_returned_peers_desc = Reverse(n.returned_peers);
-            let has_responded_desc = Reverse(n.last_response.is_some() as u8);
-            let distance = n.id.distance(&self.info_hash);
-            let freshest_response = n.last_response.map(|r| now - r).unwrap_or(Duration::MAX);
-            (
-                has_returned_peers_desc,
-                has_responded_desc,
-                distance,
-                freshest_response,
-            )
-        });
-        if closest_nodes.len() > self.useful_nodes_limit {
-            let popped = closest_nodes.pop().unwrap();
-            if popped.id == node_id {
-                return false;
-            }
-        }
-        true
     }
 }
 
@@ -1882,5 +1817,85 @@ mod tests {
         }))
         .await;
         assert!(ids.iter().any(|id| !id.0.starts_with(b"-WV")));
+    }
+
+    // A DHT whose outgoing datagrams land in the returned receiver instead of on
+    // a socket: the test sees every request sent, and nothing is ever answered
+    // unless the test answers it.
+    fn fixture_dht() -> (
+        std::sync::Arc<DhtState>,
+        tokio::sync::mpsc::UnboundedReceiver<super::WorkerSendRequest>,
+    ) {
+        use crate::dht::peer_store::PeerStore;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = crate::core::hash_id::Id20::new([0x11; 20]);
+        let dht = DhtState::new_internal(
+            id,
+            tx,
+            None,
+            None,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            PeerStore::new(id),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        );
+        (std::sync::Arc::new(dht), rx)
+    }
+
+    // `n` nodes, each with its own id and address, none of which ever answers.
+    fn silent_nodes(n: u8) -> Vec<(Option<crate::core::hash_id::Id20>, SocketAddr)> {
+        (0..n)
+            .map(|i| {
+                (
+                    Some(crate::core::hash_id::Id20::new([i; 20])),
+                    SocketAddr::from(([10, 0, 0, i], 6881)),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_keeps_at_most_branching_requests_in_flight_and_ends() {
+        use super::{RecursiveRequest, SEARCH_BRANCHING, SearchOutcome};
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::{collections::HashSet, task::Poll};
+
+        let (dht, mut sent) = fixture_dht();
+        let nodes = silent_nodes(20);
+        let req = RecursiveRequest::get_peers(
+            dht.clone(),
+            crate::core::hash_id::Id20::new([0x22; 20]),
+            None,
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        let mut search = std::pin::pin!(req.search(nodes.clone().into_iter()));
+
+        let mut asked = HashSet::new();
+        let mut most_in_flight = 0;
+        let outcome = loop {
+            let polled = futures::poll!(search.as_mut());
+            while let Ok(request) = sent.try_recv() {
+                assert!(asked.insert(request.addr), "{} asked twice", request.addr);
+            }
+            let in_flight = dht.get_stats().outstanding_requests;
+            assert!(in_flight <= SEARCH_BRANCHING, "{in_flight} in flight");
+            most_in_flight = most_in_flight.max(in_flight);
+            if let Poll::Ready(outcome) = polled {
+                break outcome.unwrap();
+            }
+            // Nobody answers: the requests in flight run out their time.
+            tokio::time::advance(RESPONSE_TIMEOUT).await;
+        };
+
+        assert_eq!(most_in_flight, SEARCH_BRANCHING);
+        assert_eq!(asked, nodes.iter().map(|(_, addr)| *addr).collect());
+        assert_eq!(
+            outcome,
+            SearchOutcome {
+                answered: 0,
+                failed: 20
+            }
+        );
+        assert_eq!(dht.get_stats().outstanding_requests, 0);
     }
 }
