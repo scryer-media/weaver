@@ -53,6 +53,11 @@ pub(crate) const ALLOWED_FAST_SET_SIZE: u32 = 5;
 // suggestions are kept.
 const MAX_SUGGEST_PIECES: usize = 16;
 
+/// libtorrent `settings_pack::max_allowed_in_request_queue`: the most
+/// blocks a peer may have asked us for and not been sent. Our extended
+/// handshake advertises it as `reqq`.
+pub(crate) const MAX_ALLOWED_IN_REQUEST_QUEUE: u32 = 2000;
+
 /// BEP 6's allowed fast set of `k` of `num_pieces` pieces for the peer at
 /// `ip` on the torrent `info_hash`, in the order it is generated; every piece
 /// when `k` is not less than their count (libtorrent
@@ -723,6 +728,10 @@ pub(crate) enum Refused {
     /// We choke the peer, and it asked for the blocks of a piece it may fetch
     /// three times over.
     AllowedFastSpent,
+    /// The peer has [`MAX_ALLOWED_IN_REQUEST_QUEUE`] blocks queued already.
+    QueueFull,
+    /// The block is queued already, and goes out once.
+    Queued,
 }
 
 impl LivePeerState {
@@ -953,11 +962,20 @@ impl LivePeerState {
     }
 
     /// The peer asked us for `chunk`, a block of a piece of `chunks_per_piece`
-    /// blocks (libtorrent `peer_connection::incoming_request`). While we
-    /// choke the peer only a block of a piece it may fetch is queued, until it
-    /// has asked for three times the piece's blocks; any other is refused,
-    /// with a Reject on a fast connection.
+    /// blocks (libtorrent `peer_connection::incoming_request`). A block
+    /// queued already stays queued once. Past [`MAX_ALLOWED_IN_REQUEST_QUEUE`]
+    /// queued blocks, any other is refused. While we choke the peer only a
+    /// block of a piece it may fetch is queued, until it has asked for three
+    /// times the piece's blocks; any other is refused. A refused block gets a
+    /// Reject on a fast connection.
     pub fn queue_upload(&mut self, chunk: ChunkInfo, chunks_per_piece: u32) -> Result<(), Refused> {
+        if self.upload_queue.contains(&chunk) {
+            return Err(Refused::Queued);
+        }
+        if self.upload_queue.len() >= MAX_ALLOWED_IN_REQUEST_QUEUE as usize {
+            self.reject(&chunk);
+            return Err(Refused::QueueFull);
+        }
         let allowed = self
             .allowed_fast_to_peer
             .iter_mut()

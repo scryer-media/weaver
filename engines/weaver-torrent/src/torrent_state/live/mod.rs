@@ -115,8 +115,8 @@ use crate::{
 use self::{
     choker::{CHOKED_REQUEST_GRACE, Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     peer::{
-        InflightRequest, LivePeerState, PeerRx, PeerState, PeerTx, Refused,
-        RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
+        InflightRequest, LivePeerState, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx, PeerState, PeerTx,
+        Refused, RemoveInflightRequestResult, empty_bitfield, ingest_bitfield,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -1605,6 +1605,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             handshake.metadata_size = Some(len);
         }
         handshake.m.ut_pex = handshake.m.ut_pex.filter(|_| self.state.pex);
+        // The most blocks the peer may have asked us for and not been sent
+        // (libtorrent `bt_peer_connection::write_extensions`).
+        handshake.reqq = Some(MAX_ALLOWED_IN_REQUEST_QUEUE);
         // Every connection speaks it; we act on `connect` only over uTP
         // (libtorrent `bt_peer_connection::write_extensions`).
         handshake.m.ut_holepunch = Some(MY_EXTENDED_UT_HOLEPUNCH);
@@ -1980,6 +1983,11 @@ impl PeerHandler {
             Err(Refused::AllowedFastSpent) => anyhow::bail!(
                 "received {request:?} while choked, past three times the blocks of the piece"
             ),
+            Err(Refused::QueueFull) => {
+                trace!(?request, "ignoring a request past the peer's request queue");
+                return Ok(());
+            }
+            Err(Refused::Queued) => return Ok(()),
         }
         self.state
             .ratelimit_upload_tx

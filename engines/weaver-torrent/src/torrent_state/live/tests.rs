@@ -861,7 +861,7 @@ async fn a_fast_peer_we_choke_is_still_served_its_allowed_fast_pieces() {
 
 #[tokio::test]
 async fn a_choked_peer_may_ask_for_an_allowed_fast_piece_three_times_over() {
-    let (_h, (fast, mut fast_rx), (other, mut other_rx)) =
+    let (h, (fast, mut fast_rx), (other, mut other_rx)) =
         allowed_fast_seed("allowed_fast_three_times").await;
     let (fast, other) = (&fast, &other);
     fast.on_received_message(Message::Interested).await.unwrap();
@@ -883,6 +883,8 @@ async fn a_choked_peer_may_ask_for_an_allowed_fast_piece_three_times_over() {
             next_sent(&mut fast_rx).await,
             Sent::Block(0, chunk * CHUNK_SIZE)
         );
+        // The writer sends it, so the peer may ask for it again.
+        assert!(fast.claim_upload(&h.chunk(0, chunk)));
     }
     assert!(
         fast.on_received_message(Message::Request(request(0, 0)))
@@ -1802,6 +1804,78 @@ async fn a_request_for_any_block_inside_a_had_piece_is_served() {
     }
     assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 1));
     assert_eq!(next_sent(&mut rx).await, Sent::Block(1, PIECE_LENGTH - 10));
+}
+
+// libtorrent `peer_connection::incoming_request`: past
+// `max_allowed_in_request_queue` blocks asked for and not sent, a request is
+// rejected on a fast connection and the connection stays;
+// `bt_peer_connection::write_extensions` advertises the limit as `reqq`.
+#[tokio::test]
+async fn a_request_past_the_queue_limit_is_rejected_and_reqq_advertises_the_limit() {
+    let h = Harness::seeding("request_queue_limit").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    let mut hs = ExtendedHandshake::new();
+    peer.update_my_extended_handshake(&mut hs).unwrap();
+    assert_eq!(hs.reqq, Some(MAX_ALLOWED_IN_REQUEST_QUEUE));
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    // Distinct one-byte blocks of piece 0, every one a block a peer may ask
+    // for; the writer sends none, so all stay queued.
+    let byte = |begin| Request {
+        index: 0,
+        begin,
+        length: 1,
+    };
+    for begin in 0..MAX_ALLOWED_IN_REQUEST_QUEUE {
+        peer.on_received_message(Message::Request(byte(begin)))
+            .await
+            .unwrap();
+    }
+    // A block asked for again is queued once and goes out once.
+    peer.on_received_message(Message::Request(byte(0)))
+        .await
+        .unwrap();
+    // The queue is full: the next is rejected, and the peer kept.
+    let past = byte(MAX_ALLOWED_IN_REQUEST_QUEUE);
+    peer.on_received_message(Message::Request(past))
+        .await
+        .unwrap();
+    let past_chunk = h
+        .lengths
+        .requested_block(h.piece(0), past.begin, past.length)
+        .unwrap();
+    assert!(!peer.claim_upload(&past_chunk));
+
+    // A cancel makes room, and the same request is queued now.
+    peer.on_received_message(Message::Cancel(byte(1)))
+        .await
+        .unwrap();
+    peer.on_received_message(Message::Request(past))
+        .await
+        .unwrap();
+
+    // Everything queued for the writer up to that last block: each block
+    // once, the first Reject the one past the limit.
+    let mut blocks = Vec::new();
+    let mut rejects = Vec::new();
+    loop {
+        match next_sent(&mut rx).await {
+            Sent::Block(0, begin) => {
+                blocks.push(begin);
+                if begin == past.begin {
+                    break;
+                }
+            }
+            Sent::Reject(0, begin) => rejects.push(begin),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(rejects, [past.begin, 1]);
+    assert_eq!(blocks.iter().filter(|&&b| b == 0).count(), 1);
+    assert_eq!(blocks.last(), Some(&past.begin));
 }
 
 /// A request for what the torrent of [`Harness::build`] with only piece 0
