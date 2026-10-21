@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use weaver_graph::VolumeIndex;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_torrent::api::TorrentIdOrHash;
@@ -1191,6 +1191,12 @@ impl TorrentService {
         self.inner.sessions.stop_all().await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
+        // libtorrent `torrent::abort` waits out the disk jobs outstanding:
+        // every save queued before here, a stopped task's among them, has
+        // landed when stop returns.
+        if let Err(error) = self.inner.db.flush_write_queue().await {
+            tracing::warn!(error = %error, "could not wait for the torrents' saves");
+        }
     }
 
     fn stop_tick(&self) {
@@ -1354,12 +1360,37 @@ impl TorrentService {
 
     // The one writer of a torrent's saved peers and bans.
     async fn write_peers(&self, job_id: JobId, peers: ResumePeers) -> Result<(), String> {
-        let db = self.inner.db.clone();
-        match tokio::task::spawn_blocking(move || db.save_torrent_peers(job_id, &peers)).await {
+        let landed = self.queue_save(job_id, "torrent_peers", move |db| {
+            db.save_torrent_peers(job_id, &peers)
+        });
+        match landed.await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(error)) => Err(state_error(error)),
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    // Queue a save of a torrent's state on its job's lane of the database's
+    // ordered writer (libtorrent sends every resume-data write of a torrent
+    // through its disk job queue). The caller takes the state it saves in
+    // the same step, with no await between, so saves land in the order
+    // their states were taken: one taken later lands later, and the save of
+    // a task stopped while it waits still lands before the next one. The
+    // receiver has what the save returned once it has landed.
+    fn queue_save<T: Send + 'static>(
+        &self,
+        job_id: JobId,
+        label: &'static str,
+        save: impl FnOnce(&Database) -> Result<T, StateError> + Send + 'static,
+    ) -> oneshot::Receiver<Result<T, StateError>> {
+        let (landed, receiver) = oneshot::channel();
+        if let Err(error) = self.inner.db.try_queue_job_write(job_id, label, move |db| {
+            let _ = landed.send(save(db));
+            Ok(())
+        }) {
+            tracing::warn!(job_id = job_id.0, label, error = %error, "could not queue a torrent's save");
+        }
+        receiver
     }
 
     async fn save_checkpoint(&self, job_id: JobId, job: &TorrentJob) {
@@ -1367,8 +1398,10 @@ impl TorrentService {
         // A torrent job's checkpoint is written whole: its rows change little
         // and seldom.
         let rows = Arc::new(Delta::between(None, &checkpoint::rows(&snapshot)));
-        let db = self.inner.db.clone();
-        match tokio::task::spawn_blocking(move || db.save_graph_checkpoint(job_id, rows)).await {
+        let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
+            db.save_graph_checkpoint(job_id, rows)
+        });
+        match landed.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent job");
@@ -2684,12 +2717,19 @@ impl TorrentService {
                 }
             }
         }
-        for (job_id, counters) in changed {
-            let db = self.inner.db.clone();
-            let saved =
-                tokio::task::spawn_blocking(move || db.update_torrent_counters(job_id, &counters))
-                    .await;
-            match saved {
+        // Every ledger is queued before any is waited on, each in the step
+        // that took it.
+        let landed: Vec<_> = changed
+            .into_iter()
+            .map(|(job_id, counters)| {
+                let landed = self.queue_save(job_id, "torrent_ledger", move |db| {
+                    db.update_torrent_counters(job_id, &counters)
+                });
+                (job_id, landed)
+            })
+            .collect();
+        for (job_id, landed) in landed {
+            match landed.await {
                 Ok(Ok(_)) => self
                     .inner
                     .written

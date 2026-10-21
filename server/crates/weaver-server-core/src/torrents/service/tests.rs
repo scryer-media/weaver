@@ -2519,6 +2519,58 @@ async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
 }
 
+// libtorrent sends every resume-data write of a torrent through its disk job
+// queue, and `torrent::abort` waits out the jobs outstanding: a save already
+// on its way when the torrent stops lands before stop's own, never after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
+    use std::task::Poll;
+    use weaver_torrent::ResumePeers;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let current = handle_of(&rig.service, job_id)
+        .await
+        .resume_peers()
+        .unwrap();
+    // An older save of the torrent on its way: the writer runs it, held
+    // until the test lets it go.
+    let older = ResumePeers {
+        peers: vec!["127.0.0.2:6881".parse().unwrap()],
+        banned: vec!["127.0.0.3".parse().unwrap()],
+    };
+    assert_ne!(older, current);
+    let (running, run) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    rig.db
+        .try_queue_job_write(job_id, "older_peers", move |db| {
+            let _ = running.send(());
+            let _ = held.recv();
+            db.save_torrent_peers(job_id, &older).map(drop)
+        })
+        .unwrap();
+    run.await.unwrap();
+
+    let mut stopping = std::pin::pin!(rig.service.stop());
+    let waiting =
+        std::future::poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_pending())).await;
+    assert!(waiting);
+    // Stop's save waits behind the one on its way.
+    assert_eq!(rig.db.queued_writes(), 1);
+    release.send(()).unwrap();
+    stopping.await;
+    assert_eq!(rig.db.torrent_peers(job_id).unwrap(), current);
+}
+
 // qBittorrent `TorrentImpl::setSavePath`: the torrent's directory moves
 // under the new path and the torrent goes on from there; the record follows
 // the move, a move to where it already is does nothing, and a relative path

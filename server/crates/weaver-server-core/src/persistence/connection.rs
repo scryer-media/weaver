@@ -1570,14 +1570,19 @@ impl Database {
         }
     }
 
-    // Stamp a command with its enqueue instant and sample how full the ordered
-    // writer queue already is. Depth is derived from the channel rather than a
-    // separate counter so it cannot drift from reality.
-    fn enqueue_write(&self, command: DbWriteCommand) -> QueuedWrite {
-        let depth = self
-            .writer_tx
+    // How many commands wait in the ordered writer queue, the one it is
+    // running not counted. Derived from the channel rather than a separate
+    // counter so it cannot drift from reality.
+    pub(crate) fn queued_writes(&self) -> usize {
+        self.writer_tx
             .max_capacity()
-            .saturating_sub(self.writer_tx.capacity());
+            .saturating_sub(self.writer_tx.capacity())
+    }
+
+    // Stamp a command with its enqueue instant and sample how full the ordered
+    // writer queue already is.
+    fn enqueue_write(&self, command: DbWriteCommand) -> QueuedWrite {
+        let depth = self.queued_writes();
         crate::runtime::perf_probe::record_value("db.writer_queue.depth_at_submit", depth as u64);
         QueuedWrite {
             queued_at: Instant::now(),
