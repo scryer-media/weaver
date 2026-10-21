@@ -42,7 +42,7 @@ impl SentBlock {
 
 /// The records of the peer list's peers: each names a peer on the list, and
 /// leaves with it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct SmartBan {
     // Every block of each piece that failed and has not passed since, one
     // per block and sender (libtorrent `smart_ban_plugin::m_block_hashes`).

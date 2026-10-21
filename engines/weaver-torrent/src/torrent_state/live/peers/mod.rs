@@ -85,19 +85,23 @@ pub(crate) struct PeerStates {
     allow_multiple_connections_per_ip: bool,
     // What the peers sent of the pieces that failed. A record names a peer
     // on the list: it leaves with the peer (libtorrent `torrent::peers_erased`
-    // tells `smart_ban_plugin::on_erase_peers`), and goes with the list
-    // (`on_clear_peers`). Never taken while an entry of `states` is held.
+    // tells `smart_ban_plugin::on_erase_peers`), goes with the list
+    // (`on_clear_peers`), and crosses a pause with it in [`PeerList`]. Never
+    // taken while an entry of `states` is held.
     smart_ban: Mutex<SmartBan>,
 }
 
-/// The peer list as a pause leaves it: every peer on it, idle, and the
-/// banned addresses. The next run's list is founded on it, so bans, trust
-/// and failures outlive a pause, as libtorrent keeps `torrent::m_peer_list`
-/// across one (`torrent::do_pause` only disconnects).
+/// The peer list as a pause leaves it: every peer on it, idle, the banned
+/// addresses, and the smart-ban records of its peers. The next run's list
+/// is founded on it, so bans, trust, failures and records outlive a pause,
+/// as libtorrent keeps `torrent::m_peer_list` across one, and the smart-ban
+/// plugin's `m_block_hashes` with the torrent (`torrent::do_pause` only
+/// disconnects).
 #[derive(Debug, Default)]
 pub(crate) struct PeerList {
     peers: Vec<Peer>,
     banned: HashSet<IpAddr>,
+    smart_ban: SmartBan,
 }
 
 /// What a newcomer may push out of a full peer list.
@@ -174,7 +178,7 @@ impl PeerStates {
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
             allow_multiple_connections_per_ip: false,
-            smart_ban: Mutex::default(),
+            smart_ban: Mutex::new(list.smart_ban),
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
@@ -191,16 +195,23 @@ impl PeerStates {
     }
 
     /// The list as a pause leaves it: every peer on it, without its
-    /// connection, and the banned addresses. Web seeds are not on it.
+    /// connection, the banned addresses, and the records of its peers. Web
+    /// seeds are not on it, so their records stay behind, as they go when a
+    /// web seed leaves the table during a run.
     pub fn idle_list(&self) -> PeerList {
+        let mut smart_ban = self.smart_ban.lock().clone();
+        let mut peers = Vec::new();
+        for e in self.states.iter() {
+            if is_web_seed(*e.key()) {
+                smart_ban.forget(*e.key());
+            } else {
+                peers.push(e.value().idle());
+            }
+        }
         PeerList {
-            peers: self
-                .states
-                .iter()
-                .filter(|e| !is_web_seed(*e.key()))
-                .map(|e| e.value().idle())
-                .collect(),
+            peers,
             banned: self.banned.read().clone(),
+            smart_ban,
         }
     }
 
@@ -1415,6 +1426,40 @@ mod tests {
             senders_recorded(peers.piece_passed(piece)),
             BTreeSet::from([closed])
         );
+    }
+
+    // libtorrent's smart-ban plugin lives with the torrent: its
+    // `m_block_hashes` cross `torrent::do_pause`, which only disconnects,
+    // and the next failure of the piece names the sender that sent other
+    // bytes before the pause.
+    #[test]
+    fn a_smart_ban_record_made_before_a_pause_names_its_sender_after_it() {
+        use crate::core::{
+            constants::CHUNK_SIZE,
+            lengths::{ChunkInfo, Lengths},
+        };
+        use crate::piece_tracker::Senders;
+        use crate::torrent_state::live::smart_ban::read_back;
+
+        let lengths = Lengths::new(u64::from(CHUNK_SIZE) * 4, CHUNK_SIZE * 4).unwrap();
+        let piece = lengths.validate_piece_index(0).unwrap();
+        let peers = make_peer_states();
+        let sender = peer_addr(1);
+        peers.add_peer(sender);
+        let senders: Senders = [sender; 4].map(Some).into_iter().collect();
+        let filled = |byte: u8| {
+            move |_, _: &ChunkInfo, buf: &mut [u8]| {
+                buf.fill(byte);
+                Ok(())
+            }
+        };
+        let failed = read_back(&lengths, piece, &senders, filled(0));
+        assert!(peers.piece_failed(piece, failed).is_empty());
+
+        let next =
+            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        let failed = read_back(&lengths, piece, &senders, filled(1));
+        assert_eq!(next.piece_failed(piece, failed), BTreeSet::from([sender]));
     }
 
     // libtorrent `torrent::do_pause` disconnects every peer and keeps
