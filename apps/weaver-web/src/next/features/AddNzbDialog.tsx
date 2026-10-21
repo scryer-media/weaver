@@ -56,7 +56,7 @@ export function AddNzbDialog({
   // the link is a magnet or an infohash.
   const torrent =
     upload.entries.some((entry) => entry.kind === "TORRENT") ||
-    /^(magnet:|[0-9a-f]{40}$|[a-z2-7]{32}$)/i.test(upload.text.trim());
+    /^(magnet:|[0-9a-f]{40}$|[0-9a-f]{64}$|[a-z2-7]{32}$)/i.test(upload.text.trim());
   // Set once a submit has answered, so its verdict is read from the entries it updated.
   const [awaitingVerdict, setAwaitingVerdict] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);

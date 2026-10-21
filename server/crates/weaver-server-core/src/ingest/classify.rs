@@ -64,8 +64,8 @@ pub fn classify(bytes: &[u8]) -> Kind {
     {
         return Kind::Magnet(text.to_owned());
     }
-    if let Some(infohash) = infohash(text) {
-        return Kind::Magnet(format!("magnet:?xt=urn:btih:{infohash}"));
+    if let Some(topic) = topic(text) {
+        return Kind::Magnet(format!("magnet:?xt=urn:{topic}"));
     }
     match reqwest::Url::parse(text) {
         Ok(url) if matches!(url.scheme(), "http" | "https") => Kind::Url(url),
@@ -73,16 +73,19 @@ pub fn classify(bytes: &[u8]) -> Kind {
     }
 }
 
-// A v1 infohash: 40 hex digits, or 32 base32 characters, which a magnet
-// carries in upper case.
-fn infohash(text: &str) -> Option<String> {
+// The magnet topic a bare infohash names. A v1 hash is 40 hex digits, or 32
+// base32 characters, which a magnet carries in upper case. A v2 hash is 64 hex
+// digits, which a magnet carries as a SHA-256 multihash.
+fn topic(text: &str) -> Option<String> {
+    let hex = text.bytes().all(|byte| byte.is_ascii_hexdigit());
     match text.len() {
-        40 if text.bytes().all(|byte| byte.is_ascii_hexdigit()) => Some(text.to_owned()),
+        40 if hex => Some(format!("btih:{text}")),
+        64 if hex => Some(format!("btmh:1220{text}")),
         32 if text
             .bytes()
             .all(|byte| byte.is_ascii_alphabetic() || (b'2'..=b'7').contains(&byte)) =>
         {
-            Some(text.to_ascii_uppercase())
+            Some(format!("btih:{}", text.to_ascii_uppercase()))
         }
         _ => None,
     }
@@ -94,6 +97,7 @@ mod tests {
 
     const HEX: &str = "0123456789abcdef0123456789abcdef01234567";
     const BASE32: &str = "aerukz4jvpg66ajdivtytk6n54asgrlh";
+    const V2: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn text_is_a_magnet_an_infohash_or_a_url() {
@@ -105,6 +109,10 @@ mod tests {
         assert_eq!(
             classify(HEX.as_bytes()),
             Kind::Magnet(format!("magnet:?xt=urn:btih:{HEX}"))
+        );
+        assert_eq!(
+            classify(V2.as_bytes()),
+            Kind::Magnet(format!("magnet:?xt=urn:btmh:1220{V2}"))
         );
         assert_eq!(
             classify(BASE32.as_bytes()),
