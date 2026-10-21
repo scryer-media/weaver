@@ -123,6 +123,11 @@ pub struct PeerConnectionOptions {
 /// dropped (`peer_connection::second_tick`).
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// libtorrent `settings_pack::peer_connect_timeout`: an outgoing connection
+/// not made this long after it was started is given up
+/// (`peer_connection::second_tick`, while `m_connecting`).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The read and write timeout when none is set.
 const DEFAULT_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -304,7 +309,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let connect_timeout = self
             .options
             .connect_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
         let mut write_buf = self.frame_buf();
         // Every peer is greeted as v1 first, which a hybrid's v2 peers
@@ -620,12 +625,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc, time::Duration};
+    use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
     use tokio::{sync::mpsc, time::Instant};
 
     use super::{
-        DEFAULT_HANDSHAKE_TIMEOUT, PeerConnection, PeerConnectionHandler, PeerConnectionOptions,
+        DEFAULT_CONNECT_TIMEOUT, DEFAULT_HANDSHAKE_TIMEOUT, PeerConnection, PeerConnectionHandler,
+        PeerConnectionOptions,
     };
     use crate::{
         Error,
@@ -635,6 +641,10 @@ mod tests {
             lengths::ChunkInfo,
         },
         mse::EncryptionPolicy,
+        network::{
+            BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket, SocketFactory,
+            StreamListener,
+        },
         peer_info_reader::tests::{Dialed, halves},
         peer_protocol::{Handshake, Message, extended::handshake::ExtendedHandshake},
         read_buf::ReadBuf,
@@ -728,6 +738,56 @@ mod tests {
 
     // libtorrent `peer_connection::keep_alive` sends a keepalive once
     // nothing has gone out for half the peer timeout.
+    /// Connects that never complete.
+    struct Unanswered;
+
+    impl SocketFactory for Unanswered {
+        fn connect_tcp<'a>(
+            &'a self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+            Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+            Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+        }
+    }
+
+    // libtorrent `peer_connection::second_tick` gives up a connect
+    // `peer_connect_timeout` (15 s) after it was started.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_unanswered_is_given_up_at_the_connect_timeout() {
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            enable_tcp: true,
+            socket_factory: Some(Arc::new(Unanswered)),
+            encryption: EncryptionPolicy::Disabled,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (mut connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        connection.connector = Arc::new(connector);
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let start = Instant::now();
+        let result = connection.manage_peer_outgoing(rx).await;
+        assert!(
+            matches!(result, Err(Error::Timeout("connecting"))),
+            "{result:?}"
+        );
+        assert_eq!(start.elapsed(), DEFAULT_CONNECT_TIMEOUT);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_keepalive_goes_out_at_half_the_read_timeout_unless_set() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
