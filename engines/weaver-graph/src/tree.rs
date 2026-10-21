@@ -464,13 +464,16 @@ impl Tree {
     }
 
     // Every node bound in `node`'s namespace, once each: the owners of its
-    // members, then the windows on them.
+    // members, then the windows on them. A namespace's member is identified
+    // against everything bound beside it, so this costs what is bound, not
+    // its square.
     fn bound_below(&self, node: NodeId) -> Vec<NodeId> {
         let mut found = Vec::new();
         if let Some(parent) = self.nodes.get(&node) {
+            let mut seen = BTreeSet::new();
             let owners = parent.children.values().map(|(child, _)| child);
             for child in owners.chain(parent.windows.values().flatten()) {
-                if !found.contains(child) {
+                if seen.insert(*child) {
                     found.push(*child);
                 }
             }

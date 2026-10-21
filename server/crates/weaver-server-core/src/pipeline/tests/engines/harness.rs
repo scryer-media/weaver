@@ -486,6 +486,8 @@ pub(super) struct GraphView {
     // The most the live namespaces objects produced kept resident for their
     // members at any look, summed from the tree.
     pub(super) resident: u64,
+    // The time the looks themselves took, which a run's time is not.
+    pub(super) observed: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -652,7 +654,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
     let (_temp_dir, mut pipeline, complete_dir) = admit(scenario, engine).await;
     // Events the run sends are heard from admission on; nothing sent before
     // the job was admitted belongs to it.
-    let mut sent = pipeline.event_tx.subscribe();
+    let (heard, kept) = hear(pipeline.event_tx.subscribe());
     let mut refused = BTreeSet::new();
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
@@ -787,14 +789,8 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         .filter(|post| post.role.counts_toward_health())
         .map(|post| (post.name.clone(), delivered_claim(&files, post)))
         .collect();
-    let mut events = Vec::new();
-    loop {
-        match sent.try_recv() {
-            Ok(event) => events.push(event),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-            Err(error) => panic!("the run's events were not all kept: {error}"),
-        }
-    }
+    drop(heard);
+    let events = kept.await.expect("every event the run sent is kept");
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         engine,
@@ -824,6 +820,42 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             .collect(),
         events,
     })
+}
+
+// Every event the run sends, kept as it is sent: a task beside the run
+// hears each one as the run yields, so the channel's bound never drops one
+// however many the run sends. Once the returned sender is dropped, what is
+// still in the channel is kept and the list is handed back.
+fn hear(
+    mut sent: tokio::sync::broadcast::Receiver<PipelineEvent>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Vec<PipelineEvent>>,
+) {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let (heard, mut done) = tokio::sync::oneshot::channel::<()>();
+    let kept = tokio::spawn(async move {
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                biased;
+                event = sent.recv() => match event {
+                    Ok(event) => events.push(event),
+                    Err(RecvError::Closed) => return events,
+                    Err(error) => panic!("the run's events were not all kept: {error}"),
+                },
+                _ = &mut done => break,
+            }
+        }
+        loop {
+            match sent.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return events,
+                Err(error) => panic!("the run's events were not all kept: {error}"),
+            }
+        }
+    });
+    (heard, kept)
 }
 
 // A graph run whose completion gate runs only when the pipeline itself
@@ -1103,6 +1135,7 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
     ) else {
         return;
     };
+    let looked = std::time::Instant::now();
     let tree = job.tree();
     view.kinds.extend(
         tree.live()
@@ -1155,6 +1188,7 @@ fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
         .sum();
     view.resident = view.resident.max(resident);
     *reads = job.writer().read_backs();
+    view.observed += looked.elapsed();
 }
 
 fn delivered_claim(files: &BTreeMap<String, Vec<u8>>, post: &Post) -> Claim {
