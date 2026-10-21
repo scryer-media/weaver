@@ -24,14 +24,14 @@ const MEMBER: &str = "beacon.bin";
 const SECRET: &str = "quill-ember-secret";
 
 // Enough articles that each of four volumes holds several.
-fn body() -> Vec<u8> {
+pub(super) fn body() -> Vec<u8> {
     payload(11 * ARTICLE + 29, 61)
 }
 
 // RAR5's recovery volumes over `volumes`, as RAR writes them: a header
 // naming the set's geometry, every data volume's size and CRC32, and each
 // one's Cauchy rows over GF(2^16), the volumes zero-padded to the longest.
-fn rar5_revs(base: &str, volumes: &[&[u8]], count: usize) -> Vec<Post> {
+pub(super) fn rar5_revs(base: &str, volumes: &[&[u8]], count: usize) -> Vec<Post> {
     let data = volumes.len();
     // unrar-rs reads an odd-width set's last parity word short, so a
     // fixture keeps the longest volume even.
