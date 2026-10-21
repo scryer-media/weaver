@@ -31,6 +31,7 @@ use crate::type_aliases::BF;
 
 use super::PeerStates;
 use super::choker::Transfer;
+use super::peers::holepunch::is_local;
 use stats::atomic::PeerCountersAtomic;
 
 pub(crate) type InflightRequest = ChunkInfo;
@@ -41,6 +42,9 @@ pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 pub(crate) const MIN_RECONNECT_TIME: Duration = Duration::from_secs(60);
 // libtorrent `max_failcount`: failures in a row that end a peer's candidacy.
 pub(crate) const MAX_FAILCOUNT: u32 = 3;
+// libtorrent `peer_connection::second_tick`: each failure in a row gives the
+// next connection to the peer this much longer to open.
+const CONNECT_TIMEOUT_PER_FAILURE: Duration = Duration::from_secs(3);
 // libtorrent `settings_pack::max_pex_peers`: the most peers of each address
 // family a connection's PEX messages are remembered to have named, and so
 // the most it adds to our peer list.
@@ -245,6 +249,10 @@ pub(crate) struct Peer {
     pub outgoing_address: Option<SocketAddr>,
     // Connections that failed in a row; one that delivers data clears it.
     failcount: u32,
+    // What its last connection showed: it has every piece, or said it only
+    // uploads (libtorrent `torrent_peer::seed` and `upload_only`, which
+    // `peer_list::set_seed` and `set_upload_only` keep past the connection).
+    upload_only: bool,
     // When its last connection closed, failed or not (libtorrent
     // `torrent_peer::last_connected`, set in `peer_list::connection_closed`).
     last_connected: Option<Instant>,
@@ -283,6 +291,7 @@ impl Peer {
             stats,
             outgoing_address: listen_address(addr, connection_kind),
             failcount: 0,
+            upload_only: false,
             last_connected: None,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
@@ -300,6 +309,7 @@ impl Peer {
             stats: Default::default(),
             state: Default::default(),
             failcount: 0,
+            upload_only: false,
             last_connected: None,
             last_optimistic_unchoke: None,
             trust: Trust::default(),
@@ -335,6 +345,42 @@ impl Peer {
         matches!(self.state, PeerState::Queued)
     }
 
+    /// Whether we want the peer while we are `finished`: one known to only
+    /// upload is no connect candidate once we only upload too (libtorrent
+    /// `peer_list::is_connect_candidate`, `(p.seed || p.upload_only) &&
+    /// m_finished`).
+    pub(crate) fn needed(&self, finished: bool) -> bool {
+        !(finished && self.upload_only)
+    }
+
+    /// Whether we are `finished` changed, or may have: the peer we are not
+    /// connected to is a connect candidate or not as [`Peer::needed`] says
+    /// now (libtorrent `peer_list::recalculate_connect_candidates`).
+    pub(crate) fn finished(&mut self, finished: bool, peers: &PeerStates) {
+        let next = match self.state {
+            PeerState::Queued | PeerState::Dead if !self.needed(finished) => PeerState::NotNeeded,
+            PeerState::NotNeeded if self.needed(finished) => self.idle_state(peers),
+            _ => return,
+        };
+        self.set_state(next, peers);
+    }
+
+    /// The peer's connection is closing: what it showed of the peer is kept
+    /// (libtorrent `peer_list::set_seed`, `set_upload_only`).
+    pub(crate) fn connection_closing(&mut self) {
+        if let Some(live) = self.get_live() {
+            self.upload_only = live.seeder || live.is_upload_only();
+        }
+    }
+
+    /// How long a connection to the peer may take to open: `base`, and
+    /// [`CONNECT_TIMEOUT_PER_FAILURE`] more for each failure in a row
+    /// (libtorrent `peer_connection::second_tick`, `peer_connect_timeout +
+    /// 3 * failcount`).
+    pub(crate) fn connect_timeout(&self, base: Duration) -> Duration {
+        base + CONNECT_TIMEOUT_PER_FAILURE * self.failcount
+    }
+
     /// The earliest time we may connect to the peer: `(failcount + 1)`
     /// reconnect times after its last connection closed (libtorrent
     /// `peer_list::find_connect_candidates`). None when we never connected
@@ -348,9 +394,14 @@ impl Peer {
 
     /// Where the peer stands among connect candidates due together; the lowest
     /// goes first: a holepunched peer, then the fewest failures in a row,
-    /// then the connection that closed longest ago.
-    pub(crate) fn connect_rank(&self) -> (bool, u32, Option<Instant>) {
-        (!self.holepunch, self.failcount, self.last_connected)
+    /// then one on a local network, then the connection that closed longest
+    /// ago (libtorrent `peer_list::compare_peer`).
+    pub(crate) fn connect_rank(&self) -> (bool, u32, (bool, Option<Instant>)) {
+        (
+            !self.holepunch,
+            self.failcount,
+            (!is_local(self.addr.ip()), self.last_connected),
+        )
     }
 
     /// Whether a holepunch introduced the peer and the connection it asked
@@ -483,6 +534,7 @@ impl Peer {
             stats: Default::default(),
             outgoing_address: self.outgoing_address,
             failcount: self.failcount,
+            upload_only: self.upload_only,
             last_connected: self.last_connected,
             last_optimistic_unchoke: self.last_optimistic_unchoke,
             trust: self.trust,
@@ -554,9 +606,9 @@ pub(crate) enum PeerState {
     // not know where it listens. Kept until someone names it again or the list
     // needs the room.
     Dead,
-    // We don't need to do anything with the peer any longer.
-    // The peer has the full torrent, and we have the full torrent, so no need
-    // to keep talking to it.
+    // Not a connect candidate while we only upload: its last connection
+    // showed it only uploads too (Peer::needed). A candidate again when we
+    // want pieces.
     NotNeeded,
 }
 
@@ -574,13 +626,6 @@ impl PeerState {
             PeerState::Live(_) => "live",
             PeerState::Dead => "dead",
             PeerState::NotNeeded => "not needed",
-        }
-    }
-
-    pub fn take_live_no_counters(self) -> Option<LivePeerState> {
-        match self {
-            PeerState::Live(l) => Some(l),
-            _ => None,
         }
     }
 }
@@ -679,6 +724,9 @@ impl Peer {
         }
     }
 
+    /// Lets the peer go whatever it showed of itself, as the peer list's
+    /// tests do.
+    #[cfg(test)]
     pub fn set_not_needed(&mut self, counters: &PeerStates) -> PeerState {
         self.set_state(PeerState::NotNeeded, counters)
     }
@@ -963,6 +1011,12 @@ impl LivePeerState {
 
     pub fn has_full_torrent(&self, total_pieces: usize) -> bool {
         self.bitfield.get(0..total_pieces).is_some_and(|s| s.all())
+    }
+
+    /// Whether the peer said it only uploads (BEP 21 `upload_only`); not
+    /// read yet, so never.
+    pub fn is_upload_only(&self) -> bool {
+        false
     }
 
     pub fn request_slots_changed(&self) -> Arc<Notify> {

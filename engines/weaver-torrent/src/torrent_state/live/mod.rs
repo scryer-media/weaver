@@ -101,7 +101,10 @@ use crate::{
     file_info::FileInfo,
     file_ops::{FileOps, Verdict, inconsistent_hashes},
     limits::LimitKind,
-    peer_connection::{PeerConnection, PeerConnectionHandler, WriterRequest},
+    peer_connection::{
+        DEFAULT_CONNECT_TIMEOUT, PeerConnection, PeerConnectionHandler, PeerConnectionOptions,
+        WriterRequest,
+    },
     piece_priority::PiecePriority,
     piece_tracker::{AcquireRequest, AcquireResult, Arrival, PickOptions, PieceTracker},
     session::CheckedIncomingConnection,
@@ -714,9 +717,17 @@ impl TorrentStateLive {
         _slot: ConnectionSlot,
     ) -> crate::Result<()> {
         let state = self;
-        let (counters, transports) = state
+        let options = state.shared.options.peer_opts;
+        let base_timeout = options.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let (counters, transports, connect_timeout) = state
             .peers
-            .with_peer(addr, |p| (p.stats.counters.clone(), p.transports()))
+            .with_peer(addr, |p| {
+                (
+                    p.stats.counters.clone(),
+                    p.transports(),
+                    p.connect_timeout(base_timeout),
+                )
+            })
             .ok_or(Error::BugPeerNotFound)?;
 
         let handler = PeerHandler {
@@ -735,7 +746,10 @@ impl TorrentStateLive {
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
 
-        let options = state.shared.options.peer_opts;
+        let options = PeerConnectionOptions {
+            connect_timeout: Some(connect_timeout),
+            ..options
+        };
         let peer_connection = PeerConnection::new(
             addr,
             state.shared.info_hashes,
@@ -782,6 +796,9 @@ impl TorrentStateLive {
 
     async fn task_peer_adder(self: Arc<Self>) -> crate::Result<()> {
         let state = self;
+        // Whether we were finished when the connect candidates were last
+        // looked over; None before they ever were.
+        let mut candidates_finished = None;
         loop {
             if !state.wants_peers() {
                 // Nothing to fetch and nothing to give: connect to no one until
@@ -803,6 +820,16 @@ impl TorrentStateLive {
             // torrent in turn.
             let permit = state.peer_semaphore.clone().acquire_owned().await?;
             let slot = slots.open().await?;
+            // Whether we are finished decides who is a connect candidate:
+            // when it changed, every peer is looked at again (libtorrent
+            // `peer_list::connect_one_peer`, `recalculate_connect_candidates`).
+            let finished = state.is_finished_and_no_active_streams();
+            if candidates_finished != Some(finished) {
+                for mut peer in state.peers.states.iter_mut() {
+                    peer.value_mut().finished(finished, &state.peers);
+                }
+                candidates_finished = Some(finished);
+            }
             // The slots may have taken a while; connect to whoever is due now.
             let Some((addr, rx, tx)) = state.peers.connect_next(tokio::time::Instant::now()) else {
                 continue;
@@ -1260,16 +1287,11 @@ impl TorrentStateLive {
     }
 
     fn disconnect_all_peers_that_have_full_torrent(&self) {
-        for mut pe in self.peers.states.iter_mut() {
+        for pe in self.peers.states.iter() {
             if let PeerState::Live(l) = pe.value().get_state()
                 && l.has_full_torrent(self.lengths.total_pieces() as usize)
             {
-                let prev = pe.value_mut().set_not_needed(&self.peers);
-                let _ = prev
-                    .take_live_no_counters()
-                    .unwrap()
-                    .tx
-                    .send(WriterRequest::Disconnect(Ok(())));
+                pe.value().disconnect();
             }
         }
     }
@@ -1849,6 +1871,7 @@ impl PeerHandler {
             && failed
             && pe.value().supports_holepunch
             && !pe.value().holepunched();
+        pe.value_mut().connection_closing();
         let prev = pe.value_mut().take_state(peers);
         self.state.layer_fetch.forget(handle);
 
@@ -1887,12 +1910,7 @@ impl PeerHandler {
                     self.state.new_pieces_notify.notify_waiters();
                 }
             }
-            PeerState::NotNeeded => {
-                // Restore it as std::mem::take() replaced it above.
-                pe.value_mut().set_state(PeerState::NotNeeded, peers);
-                return Ok(());
-            }
-            s @ PeerState::Queued | s @ PeerState::Dead => {
+            s @ (PeerState::Queued | PeerState::Dead | PeerState::NotNeeded) => {
                 warn!(
                     id = self.state.shared.id,
                     info_hash = ?self.state.shared.info_hash,
@@ -1908,12 +1926,14 @@ impl PeerHandler {
 
         // A connection that ended in an error counts against the peer; one we
         // closed ourselves does not. Either way the peer stays a connect
-        // candidate while we want pieces (libtorrent
-        // `peer_list::connection_closed`).
+        // candidate unless it only uploads and so do we (libtorrent
+        // `peer_list::connection_closed`, `is_connect_candidate`).
         if failed {
             self.counters.errors.fetch_add(1, Ordering::Relaxed);
         }
-        let needed = !self.state.is_finished_and_no_active_streams();
+        let needed = pe
+            .value()
+            .needed(self.state.is_finished_and_no_active_streams());
         peers.connection_closed(pe.value_mut(), tokio::time::Instant::now(), failed, needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
         drop(pe);

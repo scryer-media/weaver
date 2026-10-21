@@ -3422,6 +3422,117 @@ async fn a_connection_we_asked_to_close_counts_no_failure() {
     assert_eq!(failcounts, [(0, 0), (1, 1)]);
 }
 
+// libtorrent `peer_list::is_connect_candidate`: once we only upload, a peer
+// whose connection showed it to be a seed is no connect candidate, and any
+// other still is (`settings_pack::seeding_outgoing_connections`, on by
+// default).
+#[tokio::test]
+async fn a_finished_torrent_still_dials_a_leecher_and_not_a_seed() {
+    let h = Harness::seeding("finished_dials").await;
+    let listens = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        hs.p = Some(u32::from(peer.addr.port()));
+        peer.on_extended_handshake(&hs).unwrap();
+    };
+    let (leecher, _leecher_rx) = h.new_peer("127.0.0.1:6881");
+    leecher.on_bitfield(&bitfield_of(&[])).unwrap();
+    listens(&leecher);
+    let (seed, _seed_rx) = h.peer("127.0.0.2:6881");
+    listens(&seed);
+    leecher.on_peer_died(None).unwrap();
+    seed.on_peer_died(None).unwrap();
+
+    let due = tokio::time::Instant::now() + peer::MIN_RECONNECT_TIME;
+    assert_eq!(
+        h.peers.connect_next(due).map(|(addr, ..)| addr),
+        Some(sock("127.0.0.1:6881"))
+    );
+    assert!(h.peers.connect_next(due).is_none());
+}
+
+// libtorrent `peer_list::compare_peer`: among candidates that failed as
+// often, one on a local network is dialed first.
+#[tokio::test]
+async fn a_local_peer_is_dialed_before_a_global_one() {
+    let h = Harness::new("local_first").await;
+    h.peers.add_peer(sock("1.1.1.1:6881"));
+    h.peers.add_peer(sock("192.168.1.1:6881"));
+    let now = tokio::time::Instant::now();
+    let dialed: Vec<_> =
+        std::iter::from_fn(|| h.peers.connect_next(now).map(|(addr, ..)| addr)).collect();
+    assert_eq!(dialed, [sock("192.168.1.1:6881"), sock("1.1.1.1:6881")]);
+}
+
+/// Every dial is reported to the test with when it began, and none is
+/// answered; a datagram socket is bound on loopback, as for [`DialedTcp`].
+struct UnansweredDials(tokio::sync::mpsc::UnboundedSender<tokio::time::Instant>);
+
+impl crate::network::SocketFactory for UnansweredDials {
+    fn connect_tcp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            crate::network::BoxAsyncReadVectored,
+            crate::network::BoxAsyncWrite,
+        )>,
+    > {
+        Box::pin(async move {
+            let _ = self.0.send(tokio::time::Instant::now());
+            std::future::pending().await
+        })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        Box::pin(async { Err(std::io::ErrorKind::Unsupported.into()) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+    {
+        Box::pin(async {
+            let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+            Ok(Arc::new(socket) as Arc<dyn crate::network::DatagramSocket>)
+        })
+    }
+}
+
+// libtorrent `peer_connection::second_tick`: a connect is given up after
+// `peer_connect_timeout` and 3 s more for each failure in a row; the peer
+// is dialed again (failcount + 1) reconnect times after that
+// (`peer_list::find_connect_candidates`).
+#[tokio::test(start_paused = true)]
+async fn the_connect_timeout_grows_by_three_seconds_per_failure() {
+    let (tx, mut dials) = unbounded_channel();
+    let opts = SessionOptions {
+        socket_factory: Some(Arc::new(UnansweredDials(tx))),
+        ..isolated_session_opts(false)
+    };
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        initial_peers: Some(vec![sock("127.0.0.1:6881")]),
+        ..Default::default()
+    };
+    let _h = Harness::build_added("connect_timeout_grows", PIECES, 0x00, opts, add).await;
+    let mut at = Vec::new();
+    for _ in 0..3 {
+        at.push(dials.recv().await.unwrap());
+    }
+    let timeout = crate::peer_connection::DEFAULT_CONNECT_TIMEOUT;
+    assert_eq!(at[1] - at[0], timeout + peer::MIN_RECONNECT_TIME * 2);
+    assert_eq!(
+        at[2] - at[1],
+        timeout + Duration::from_secs(3) + peer::MIN_RECONNECT_TIME * 3
+    );
+}
+
 /// A torrent of at most `peer_limit` connections in a session of at most
 /// `connections_limit`.
 async fn turnover_harness(name: &str, peer_limit: usize, connections_limit: usize) -> Harness {
