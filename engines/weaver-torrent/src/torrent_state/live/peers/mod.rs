@@ -41,8 +41,8 @@ use super::smart_ban::{SentBlock, SmartBan};
 use super::web_seed::is_web_seed;
 
 use super::peer::{
-    IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx, empty_bitfield,
-    listen_address, stats::atomic::PeerCountersAtomic,
+    IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx, listen_address,
+    stats::atomic::PeerCountersAtomic,
 };
 
 pub mod availability;
@@ -748,9 +748,6 @@ impl PeerStates {
     /// nothing.
     pub fn peer_has(&self, handle: PeerHandle, piece: ValidPieceIndex) -> Option<()> {
         self.with_live_mut(handle, "peer_has", |live| {
-            if live.bitfield.is_empty() {
-                live.bitfield = empty_bitfield(self.total_pieces);
-            }
             if live.bitfield.replace(piece.get_usize(), true) {
                 return;
             }
@@ -1019,15 +1016,6 @@ mod tests {
         peers.peer_has(a, piece(TOTAL_PIECES as u32, 5)).unwrap();
         peers.peer_has(a, piece(TOTAL_PIECES as u32, 0)).unwrap();
         assert_eq!(availability(&peers), [1, 0, 0, 0, 0, 1, 0, 0]);
-    }
-
-    #[test]
-    fn a_have_before_any_bitfield_counts() {
-        let peers = make_peer_states();
-        let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
-
-        peers.peer_has(a, piece(TOTAL_PIECES as u32, 2)).unwrap();
-        assert_eq!(availability(&peers), [0, 0, 1, 0, 0, 0, 0, 0]);
     }
 
     #[test]
