@@ -6,9 +6,9 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -17,7 +17,7 @@ use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::core::{
     constants::CHUNK_SIZE,
     hash_id::{Id20, InfoHashes},
-    lengths::{ChunkInfo, last_element_size},
+    lengths::ChunkInfo,
     torrent_metainfo::TorrentMetaV1Info,
 };
 use crate::peer_protocol::{
@@ -29,7 +29,7 @@ use crate::peer_protocol::{
     },
 };
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio::time::Instant;
 use tracing::trace;
@@ -45,7 +45,7 @@ use crate::{
 pub(crate) async fn read_metainfo_from_peer(
     addr: SocketAddr,
     peer_id: Id20,
-    info_hashes: InfoHashes,
+    fetch: Arc<MetadataFetch>,
     peer_connection_options: Option<PeerConnectionOptions>,
     spawner: BlockingSpawner,
     connector: Arc<StreamConnector>,
@@ -57,12 +57,13 @@ pub(crate) async fn read_metainfo_from_peer(
     let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel::<WriterRequest>();
     let requests = Arc::new(Requests::new());
     let request_tx = writer_tx.clone();
+    let info_hashes = fetch.info_hashes;
     let handler = Handler {
         addr,
-        info_hashes,
+        fetch,
         writer_tx,
         result_tx: Mutex::new(Some(result_tx)),
-        locked: RwLock::new(None),
+        set: Mutex::new(None),
         requests: requests.clone(),
         client_name_and_version,
     };
@@ -89,15 +90,142 @@ pub(crate) async fn read_metainfo_from_peer(
     }
 }
 
+/// The largest metadata a fetch takes in (libtorrent
+/// `settings_pack::max_metadata_size`, checked in
+/// `ut_metadata_plugin::received_metadata`).
+pub(crate) const MAX_METADATA_SIZE: u32 = 30 * 1024 * 1024;
+
 /// How long a peer that rejected a metadata request is left alone
 /// (libtorrent `ut_metadata_peer_plugin::on_extended`, `dont_have`).
 const REJECTED_WAIT: Duration = Duration::from_secs(60);
 
+/// One torrent's metadata as its peers send it in. The buffer belongs to
+/// the fetch, not to a peer (libtorrent `ut_metadata_plugin::m_metadata`):
+/// every peer that names the same size fills the one buffer of that size,
+/// which lives while a peer filling it does.
+pub(crate) struct MetadataFetch {
+    info_hashes: InfoHashes,
+    sets: Mutex<HashMap<u32, Weak<Mutex<PieceSet>>>>,
+}
+
+impl MetadataFetch {
+    pub(crate) fn new(info_hashes: InfoHashes) -> Arc<Self> {
+        Arc::new(Self {
+            info_hashes,
+            sets: Default::default(),
+        })
+    }
+
+    /// The buffer of the metadata size a peer names, made when no peer
+    /// filling one of that size is left.
+    fn join(&self, metadata_size: u32) -> anyhow::Result<Arc<Mutex<PieceSet>>> {
+        anyhow::ensure!(
+            metadata_size > 0 && metadata_size <= MAX_METADATA_SIZE,
+            "metadata size {metadata_size} is out of range"
+        );
+        let mut sets = self.sets.lock();
+        sets.retain(|_, set| set.strong_count() > 0);
+        if let Some(set) = sets.get(&metadata_size).and_then(Weak::upgrade) {
+            return Ok(set);
+        }
+        let set = Arc::new(Mutex::new(PieceSet::new(metadata_size)));
+        sets.insert(metadata_size, Arc::downgrade(&set));
+        Ok(set)
+    }
+}
+
+/// The pieces of metadata of one size, each with the peer that sent it
+/// (libtorrent `ut_metadata_plugin::m_requested_metadata`, whose entries
+/// name their `source`).
+struct PieceSet {
+    buffer: Vec<u8>,
+    /// For each piece, the requests of the peer that sent it; None while
+    /// the piece is missing.
+    pieces: Vec<Option<Weak<Requests>>>,
+}
+
+/// What a received piece of metadata made of its set.
+enum Recorded {
+    Incomplete,
+    /// Every piece is in, and they hash to the torrent.
+    Complete(Vec<u8>),
+    /// Every piece is in, and they do not hash to the torrent. Every piece
+    /// is missing again; these are the peers that sent them.
+    FailedHashCheck(Vec<Arc<Requests>>),
+}
+
+impl PieceSet {
+    fn new(metadata_size: u32) -> Self {
+        let total_pieces = metadata_size.div_ceil(CHUNK_SIZE) as usize;
+        Self {
+            buffer: vec![0u8; metadata_size as usize],
+            pieces: vec![None; total_pieces],
+        }
+    }
+
+    fn total_pieces(&self) -> u32 {
+        self.pieces.len() as u32
+    }
+
+    fn missing(&self) -> impl Iterator<Item = u32> + '_ {
+        (0u32..)
+            .zip(&self.pieces)
+            .filter(|(_, sent_by)| sent_by.is_none())
+            .map(|(piece, _)| piece)
+    }
+
+    /// Records piece `d` as sent by `source`, and gives the whole metadata
+    /// once its last piece is in and it hashes to the torrent. A piece
+    /// another peer sent first is not written again. Metadata that does not
+    /// hash right leaves every piece missing again and names the peers that
+    /// sent them (libtorrent `ut_metadata_plugin::received_metadata` clears
+    /// every piece's request count and penalises each piece's source).
+    fn record(
+        &mut self,
+        d: &UtMetadataData<ByteBuf>,
+        source: &Arc<Requests>,
+        info_hashes: &InfoHashes,
+    ) -> anyhow::Result<Recorded> {
+        let piece = d.piece();
+        match self.pieces.get(piece as usize) {
+            None => anyhow::bail!("metadata piece {piece} is past the end"),
+            Some(Some(_)) => return Ok(Recorded::Incomplete),
+            Some(None) => {}
+        }
+        let start = piece as usize * CHUNK_SIZE as usize;
+        let range = start..self.buffer.len().min(start + CHUNK_SIZE as usize);
+        anyhow::ensure!(
+            d.len() == range.len(),
+            "expected length of piece {piece} to be {}, but got {}",
+            range.len(),
+            d.len()
+        );
+        d.copy_to_slice(&mut self.buffer[range]);
+        self.pieces[piece as usize] = Some(Arc::downgrade(source));
+
+        if self.missing().next().is_some() {
+            return Ok(Recorded::Incomplete);
+        }
+        if info_hashes.matches_info(&self.buffer) {
+            return Ok(Recorded::Complete(std::mem::take(&mut self.buffer)));
+        }
+        let mut senders: Vec<Arc<Requests>> = Vec::new();
+        for sent_by in &mut self.pieces {
+            if let Some(sender) = sent_by.take().and_then(|w| w.upgrade())
+                && !senders.iter().any(|s| Arc::ptr_eq(s, &sender))
+            {
+                senders.push(sender);
+            }
+        }
+        Ok(Recorded::FailedHashCheck(senders))
+    }
+}
+
 /// The metadata requests owed to one peer, and when they may go out
-/// (libtorrent `ut_metadata_peer_plugin::m_request_limit` and
-/// `maybe_send_request`). A peer that rejects a request, or whose metadata
-/// fails its hash check, is asked again on the same connection once its
-/// limit has passed.
+/// (libtorrent `ut_metadata_peer_plugin::m_request_limit`,
+/// `m_sent_requests` and `maybe_send_request`). A peer that rejects a
+/// request, or whose metadata fails its hash check, is asked again on the
+/// same connection once its limit has passed.
 struct Requests {
     state: Mutex<RequestsState>,
     changed: Notify,
@@ -129,8 +257,11 @@ impl Requests {
         self.changed.notify_one();
     }
 
-    fn answered(&self, piece: u32) {
-        self.state.lock().sent.remove(&piece);
+    /// Whether a request for `piece` was outstanding, which the peer's Data
+    /// for it now answers (libtorrent `ut_metadata_peer_plugin::on_extended`:
+    /// a piece not in `m_sent_requests` is unwanted, and ignored).
+    fn answered(&self, piece: u32) -> bool {
+        self.state.lock().sent.remove(&piece)
     }
 
     /// libtorrent `on_extended` with `dont_have`: no request for a minute,
@@ -164,24 +295,29 @@ impl Requests {
         self.changed.notify_one();
     }
 
+    /// The wanted pieces, once the limit lets them go; they are outstanding
+    /// from here.
+    async fn next(&self) -> BTreeSet<u32> {
+        self.changed.notified().await;
+        loop {
+            let limit = {
+                let mut state = self.state.lock();
+                if Instant::now() >= state.limit {
+                    let pieces = std::mem::take(&mut state.wanted);
+                    state.sent.extend(pieces.iter().copied());
+                    return pieces;
+                }
+                state.limit
+            };
+            tokio::time::sleep_until(limit).await;
+        }
+    }
+
     /// Sends the wanted pieces' requests each time the limit lets them go.
     /// Ends only when the connection's writer is gone.
     async fn send(&self, writer_tx: &UnboundedSender<WriterRequest>) -> anyhow::Error {
         loop {
-            self.changed.notified().await;
-            let pieces = loop {
-                let limit = {
-                    let mut state = self.state.lock();
-                    if Instant::now() >= state.limit {
-                        let pieces = std::mem::take(&mut state.wanted);
-                        state.sent.extend(pieces.iter().copied());
-                        break pieces;
-                    }
-                    state.limit
-                };
-                tokio::time::sleep_until(limit).await;
-            };
-            for piece in pieces {
+            for piece in self.next().await {
                 let request = WriterRequest::Message(Message::Extended(
                     ExtendedMessage::UtMetadata(UtMetadata::Request(piece)),
                 ));
@@ -193,90 +329,11 @@ impl Requests {
     }
 }
 
-/// What a received piece of metadata made of it.
-enum Recorded {
-    Incomplete,
-    Complete,
-    /// Every piece is in, and they do not hash to the torrent's info hash.
-    /// The pieces are dropped, to be asked for again.
-    FailedHashCheck,
-}
-
-#[derive(Default)]
-struct HandlerLocked {
-    metadata_size: u32,
-    total_pieces: usize,
-    buffer: Vec<u8>,
-    received_pieces: Vec<bool>,
-}
-
-impl HandlerLocked {
-    fn new(metadata_size: u32) -> anyhow::Result<Self> {
-        if metadata_size > 32 * 1024 * 1024 {
-            anyhow::bail!("metadata size {} is too big", metadata_size);
-        }
-        let buffer = vec![0u8; metadata_size as usize];
-        let total_pieces: usize = (metadata_size as u64)
-            .div_ceil(CHUNK_SIZE as u64)
-            .try_into()?;
-        let received_pieces = vec![false; total_pieces];
-        Ok(Self {
-            metadata_size,
-            received_pieces,
-            buffer,
-            total_pieces,
-        })
-    }
-    fn piece_size(&self, index: u32) -> usize {
-        if index as usize == self.total_pieces - 1 {
-            last_element_size(self.metadata_size as u64, CHUNK_SIZE as u64)
-                .try_into()
-                .unwrap()
-        } else {
-            CHUNK_SIZE as usize
-        }
-    }
-    fn record_piece(
-        &mut self,
-        d: &UtMetadataData<ByteBuf>,
-        info_hashes: &InfoHashes,
-    ) -> anyhow::Result<Recorded> {
-        let piece = d.piece();
-        if piece as usize >= self.total_pieces {
-            anyhow::bail!("wrong index");
-        }
-        let offset = (piece * CHUNK_SIZE) as usize;
-        let size = self.piece_size(piece);
-        if d.len() != size {
-            anyhow::bail!(
-                "expected length of piece {} to be {}, but got {}",
-                piece,
-                size,
-                d.len()
-            );
-        }
-        if self.received_pieces[piece as usize] {
-            anyhow::bail!("already received piece {}", piece);
-        }
-        d.copy_to_slice(&mut self.buffer[offset..offset + d.len()]);
-        self.received_pieces[piece as usize] = true;
-
-        if !self.received_pieces.iter().all(|p| *p) {
-            Ok(Recorded::Incomplete)
-        } else if info_hashes.matches_info(&self.buffer) {
-            Ok(Recorded::Complete)
-        } else {
-            self.received_pieces.fill(false);
-            Ok(Recorded::FailedHashCheck)
-        }
-    }
-}
-
 pub type TorrentAndInfoBytes = (TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned);
 
 struct Handler {
     addr: SocketAddr,
-    info_hashes: InfoHashes,
+    fetch: Arc<MetadataFetch>,
     writer_tx: UnboundedSender<WriterRequest>,
     result_tx: Mutex<
         Option<
@@ -285,7 +342,8 @@ struct Handler {
             >,
         >,
     >,
-    locked: RwLock<Option<HandlerLocked>>,
+    /// The buffer the peer fills, None until its extended handshake.
+    set: Mutex<Option<Arc<Mutex<PieceSet>>>>,
     requests: Arc<Requests>,
     client_name_and_version: String,
 }
@@ -322,48 +380,56 @@ impl PeerConnectionHandler for Handler {
 
         let utdata = match msg {
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(utdata))) => utdata,
+            // A Reject answers its request: the piece is not coming yet.
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Reject(piece))) => {
                 self.requests.rejected(piece);
                 return Ok(());
             }
             _ => return Ok(()),
         };
-        self.requests.answered(utdata.piece());
-        let (recorded, total_pieces) = {
-            let mut locked = self.locked.write();
-            let locked = locked.as_mut().unwrap();
-            let recorded = locked.record_piece(&utdata, &self.info_hashes)?;
-            (recorded, locked.total_pieces)
-        };
-        match recorded {
-            Recorded::Incomplete => {}
-            Recorded::FailedHashCheck => {
-                trace!("{}: the metadata failed its hash check", self.addr);
-                self.requests.failed_hash_check(total_pieces.try_into()?);
-            }
-            Recorded::Complete => {
-                let buf = Bytes::from(self.locked.write().take().unwrap().buffer);
-                let info = from_bytes::<TorrentMetaV1Info<ByteBuf>>(&buf)
-                    .map(|i| {
-                        use crate::clone_to_owned::CloneToOwned;
-                        i.clone_to_owned(Some(&buf))
-                    })
-                    .map_err(|e| {
-                        trace!("error deserializing TorrentMetaV1Info: {e:#}");
-                        e.into_kind()
-                    })
-                    .map(|i| (i, ByteBufOwned(buf)));
-
-                self.result_tx
-                    .lock()
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("oneshot is consumed"))?
-                    .send(info)
-                    .map_err(|_| {
-                        anyhow::anyhow!("torrent info deserialized, but consumer closed")
-                    })?;
-            }
+        // Data no request is outstanding for is unwanted, and ignored;
+        // nothing is outstanding before the extended handshake.
+        if !self.requests.answered(utdata.piece()) {
+            trace!(piece = utdata.piece(), "unwanted metadata piece");
+            return Ok(());
         }
+        let set = self.set.lock().clone();
+        let Some(set) = set else {
+            return Ok(());
+        };
+        let recorded = set
+            .lock()
+            .record(&utdata, &self.requests, &self.fetch.info_hashes)?;
+        let buf = match recorded {
+            Recorded::Incomplete => return Ok(()),
+            Recorded::FailedHashCheck(senders) => {
+                trace!("{}: the metadata failed its hash check", self.addr);
+                let total_pieces = set.lock().total_pieces();
+                for sender in senders {
+                    sender.failed_hash_check(total_pieces);
+                }
+                return Ok(());
+            }
+            Recorded::Complete(buf) => buf,
+        };
+        let buf = Bytes::from(buf);
+        let info = from_bytes::<TorrentMetaV1Info<ByteBuf>>(&buf)
+            .map(|i| {
+                use crate::clone_to_owned::CloneToOwned;
+                i.clone_to_owned(Some(&buf))
+            })
+            .map_err(|e| {
+                trace!("error deserializing TorrentMetaV1Info: {e:#}");
+                e.into_kind()
+            })
+            .map(|i| (i, ByteBufOwned(buf)));
+
+        self.result_tx
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("oneshot is consumed"))?
+            .send(info)
+            .map_err(|_| anyhow::anyhow!("torrent info deserialized, but consumer closed"))?;
         Ok(())
     }
 
@@ -377,6 +443,16 @@ impl PeerConnectionHandler for Handler {
         &self,
         extended_handshake: &ExtendedHandshake<ByteBuf>,
     ) -> anyhow::Result<()> {
+        // A peer fills one buffer, from its first extended handshake on; a
+        // later one changes nothing (libtorrent `ut_metadata_plugin::
+        // metadata_size` sizes the torrent's one buffer, and a size it
+        // already has leaves it as it is).
+        let mut set = self.set.lock();
+        if set.is_some() {
+            trace!("repeated extended handshake");
+            return Ok(());
+        }
+
         let metadata_size = match extended_handshake.metadata_size {
             Some(metadata_size) => metadata_size,
             None => anyhow::bail!("peer does not have metadata_size"),
@@ -386,16 +462,15 @@ impl PeerConnectionHandler for Handler {
             anyhow::bail!("peer does not support ut_metadata");
         }
 
+        let joined = self.fetch.join(metadata_size)?;
         self.writer_tx
             .send(WriterRequest::Message(Message::Unchoke))?;
         self.writer_tx
             .send(WriterRequest::Message(Message::Interested))?;
-
-        let inner = HandlerLocked::new(metadata_size)?;
-        let total_pieces: u32 = inner.total_pieces.try_into()?;
-
-        self.locked.write().replace(inner);
-        self.requests.want(0..total_pieces);
+        // libtorrent `maybe_send_request`: the pieces still missing, once
+        // the peer's limit lets them go.
+        self.requests.want(joined.lock().missing());
+        *set = Some(joined);
         Ok(())
     }
 
@@ -405,184 +480,4 @@ impl PeerConnectionHandler for Handler {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{net::SocketAddr, sync::Arc, time::Duration};
-
-    use parking_lot::{Mutex, RwLock};
-    use tokio::{
-        sync::{mpsc::UnboundedReceiver, oneshot},
-        time::Instant,
-    };
-
-    use super::{Handler, REJECTED_WAIT, Requests, TorrentAndInfoBytes};
-    use crate::buffers::ByteBuf;
-    use crate::core::{
-        constants::CHUNK_SIZE,
-        hash_id::{Id20, InfoHashes},
-    };
-    use crate::peer_connection::{PeerConnectionHandler, WriterRequest};
-    use crate::peer_protocol::{
-        Message,
-        extended::{
-            ExtendedMessage, PeerExtendedMessageIds,
-            handshake::ExtendedHandshake,
-            ut_metadata::{UtMetadata, UtMetadataData},
-        },
-    };
-
-    /// A valid info dict of `pieces` pieces, so its metadata is about
-    /// `pieces * 20` bytes long.
-    fn info_bytes(pieces: usize) -> Vec<u8> {
-        let mut info = format!(
-            "d6:lengthi{}e4:name1:a12:piece lengthi16384e6:pieces{}:",
-            pieces * 16384,
-            pieces * 20
-        )
-        .into_bytes();
-        info.extend(std::iter::repeat_n(7u8, pieces * 20));
-        info.push(b'e');
-        info
-    }
-
-    type Found = oneshot::Receiver<Result<TorrentAndInfoBytes, crate::bencode::DeserializeError>>;
-
-    /// A reader for `info`'s metadata past the extended handshake of a peer
-    /// that has it, sending requests through `Requests::send`.
-    fn reader(info: &[u8]) -> (Handler, UnboundedReceiver<WriterRequest>, Found) {
-        use crate::sha1w::{ISha1, Sha1};
-        let mut sha1 = Sha1::new();
-        sha1.update(info);
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (result_tx, result_rx) = oneshot::channel();
-        let requests = Arc::new(Requests::new());
-        let sender = requests.clone();
-        let request_tx = writer_tx.clone();
-        tokio::spawn(async move { sender.send(&request_tx).await });
-        let handler = Handler {
-            addr: SocketAddr::from(([127, 0, 0, 1], 6881)),
-            info_hashes: InfoHashes {
-                v1: Some(Id20::new(sha1.finish())),
-                v2: None,
-            },
-            writer_tx,
-            result_tx: Mutex::new(Some(result_tx)),
-            locked: RwLock::new(None),
-            requests,
-            client_name_and_version: "Test 1.0".into(),
-        };
-        handler
-            .on_extended_handshake(&ExtendedHandshake {
-                m: PeerExtendedMessageIds::my(),
-                metadata_size: Some(info.len().try_into().unwrap()),
-                ..Default::default()
-            })
-            .unwrap();
-        (handler, writer_rx, result_rx)
-    }
-
-    /// The pieces of the next metadata requests sent, all sent at once, and
-    /// when.
-    async fn next_requests(sent: &mut UnboundedReceiver<WriterRequest>) -> (Vec<u32>, Instant) {
-        let mut pieces = Vec::new();
-        loop {
-            match sent.recv().await.unwrap() {
-                WriterRequest::Message(Message::Extended(ExtendedMessage::UtMetadata(
-                    UtMetadata::Request(piece),
-                ))) => pieces.push(piece),
-                WriterRequest::Message(Message::Unchoke | Message::Interested) => continue,
-                other => panic!("sent {other:?}"),
-            }
-            while let Ok(request) = sent.try_recv() {
-                match request {
-                    WriterRequest::Message(Message::Extended(ExtendedMessage::UtMetadata(
-                        UtMetadata::Request(piece),
-                    ))) => pieces.push(piece),
-                    other => panic!("sent {other:?}"),
-                }
-            }
-            return (pieces, Instant::now());
-        }
-    }
-
-    async fn answer(handler: &Handler, info: &[u8], piece: u32) {
-        let start = (piece * CHUNK_SIZE) as usize;
-        let end = info.len().min(start + CHUNK_SIZE as usize);
-        let data = UtMetadataData::from_bytes(
-            piece,
-            info.len().try_into().unwrap(),
-            ByteBuf(&info[start..end]),
-        );
-        handler
-            .on_received_message(Message::Extended(ExtendedMessage::UtMetadata(
-                UtMetadata::Data(data),
-            )))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_peer_that_rejects_a_metadata_request_is_asked_again_a_minute_later() {
-        // libtorrent ut_metadata_peer_plugin::on_extended, dont_have:
-        // m_request_limit = now + 1 minute, on the same connection.
-        let info = info_bytes(1);
-        let (handler, mut sent, result) = reader(&info);
-        let (pieces, asked) = next_requests(&mut sent).await;
-        assert_eq!(pieces, [0]);
-
-        handler
-            .on_received_message(Message::Extended(ExtendedMessage::UtMetadata(
-                UtMetadata::Reject(0),
-            )))
-            .await
-            .unwrap();
-        let (pieces, asked_again) = next_requests(&mut sent).await;
-        assert_eq!(pieces, [0]);
-        assert!(asked_again >= asked + REJECTED_WAIT);
-
-        answer(&handler, &info, 0).await;
-        let (_, info_bytes) = result.await.unwrap().unwrap();
-        assert_eq!(info_bytes.as_ref(), &info[..]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn metadata_that_fails_its_hash_check_is_asked_for_again_after_20_seconds_or_more() {
-        // libtorrent ut_metadata_plugin::received_metadata: a peer whose
-        // metadata failed is not asked for 20 to 70 seconds.
-        let info = info_bytes(1000);
-        assert!(info.len() > CHUNK_SIZE as usize);
-        let (handler, mut sent, result) = reader(&info);
-        let (pieces, _) = next_requests(&mut sent).await;
-        assert_eq!(pieces, [0, 1]);
-
-        let mut corrupt = info.clone();
-        corrupt[CHUNK_SIZE as usize] ^= 1;
-        answer(&handler, &corrupt, 0).await;
-        answer(&handler, &corrupt, 1).await;
-        let failed = Instant::now();
-        let (pieces, asked_again) = next_requests(&mut sent).await;
-        assert_eq!(pieces, [0, 1]);
-        assert!(asked_again >= failed + Duration::from_secs(20));
-
-        answer(&handler, &info, 0).await;
-        answer(&handler, &info, 1).await;
-        let (_, info_bytes) = result.await.unwrap().unwrap();
-        assert_eq!(info_bytes.as_ref(), &info[..]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn metadata_of_one_piece_that_fails_its_hash_check_waits_five_minutes_more() {
-        // libtorrent ut_metadata_plugin::received_metadata: with one piece,
-        // failed_hash_check(now + 5 minutes), so other peers come first.
-        let info = info_bytes(1);
-        let (handler, mut sent, _result) = reader(&info);
-        next_requests(&mut sent).await;
-
-        let mut corrupt = info.clone();
-        corrupt[0] ^= 1;
-        answer(&handler, &corrupt, 0).await;
-        let failed = Instant::now();
-        let (pieces, asked_again) = next_requests(&mut sent).await;
-        assert_eq!(pieces, [0]);
-        assert!(asked_again >= failed + Duration::from_secs(5 * 60 + 20));
-    }
-}
+mod tests;
