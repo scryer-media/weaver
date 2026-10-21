@@ -989,11 +989,17 @@ impl LivePeerState {
         self.inflight_requests.len()
     }
 
+    /// Whether we asked the peer for `chunk` and wait for it still.
+    pub fn has_inflight_request(&self, chunk: &ChunkInfo) -> bool {
+        self.inflight_requests.contains(chunk)
+    }
+
     pub fn is_snubbed(&self) -> bool {
         self.snubbed
     }
 
-    /// The peer went its request timeout without delivering a block.
+    /// The peer went its request timeout without delivering a block. Its
+    /// requests stay outstanding.
     pub fn snub(&mut self) {
         self.snubbed = true;
     }
@@ -1058,7 +1064,10 @@ impl LivePeerState {
     /// cancelled late, is the block the wait was for: its time is sampled
     /// and the wait for the next starts now (libtorrent
     /// `peer_connection::incoming_piece`, `m_request_time.add_sample` and
-    /// `m_requested` on both its paths). Only one still wanted lifts a snub.
+    /// `m_requested` on both its paths). Only one still wanted, and within
+    /// the request timeout, lifts a snub: a request still outstanding after
+    /// a snub that is answered late leaves the peer snubbed (libtorrent
+    /// `incoming_piece` unsnubs only within `request_timeout()`).
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
         let answer = if self.inflight_requests.remove(chunk) {
             RemoveInflightRequestResult::Expected
@@ -1069,12 +1078,15 @@ impl LivePeerState {
             return answer;
         }
         let now = Instant::now();
-        self.block_time.add(now - self.waiting_since);
-        self.waiting_since = now;
-        self.last_piece = now;
-        if matches!(answer, RemoveInflightRequestResult::Expected) {
+        let waited = now - self.waiting_since;
+        if matches!(answer, RemoveInflightRequestResult::Expected)
+            && waited < self.block_time.request_timeout()
+        {
             self.snubbed = false;
         }
+        self.block_time.add(waited);
+        self.waiting_since = now;
+        self.last_piece = now;
         self.request_slots_changed.notify_waiters();
         answer
     }

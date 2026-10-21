@@ -189,6 +189,11 @@ const PEER_TURNOVER: usize = 4;
 // `peer_connection::second_tick`: 5 s after the last request).
 const REPICK_INTERVAL: Duration = Duration::from_secs(5);
 
+// How often a peer whose requests are overdue is snubbed again, each time
+// giving back the pieces that came to wait on it alone (libtorrent
+// `peer_connection::second_tick`, once a second).
+const SNUB_INTERVAL: Duration = Duration::from_secs(1);
+
 pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
@@ -2361,10 +2366,12 @@ impl PeerHandler {
         }
     }
 
-    /// Returns the requests outstanding to this peer when it goes its request
-    /// timeout (LivePeerState::request_deadline) without delivering a block.
+    /// Snubs this peer when it goes its request timeout
+    /// (LivePeerState::request_deadline) without delivering a block, and
+    /// again every [`SNUB_INTERVAL`] while its requests stay overdue.
     async fn time_out_requests(&self) -> crate::Result<()> {
         self.wait_for_bitfield().await;
+        let mut next_snub = None;
         loop {
             let Some(notify) = self.request_slots_changed() else {
                 return Ok(());
@@ -2381,30 +2388,52 @@ impl PeerHandler {
                 changed.await;
                 continue;
             };
+            let deadline = next_snub.map_or(deadline, |at: tokio::time::Instant| deadline.max(at));
             tokio::select! {
                 // A block that arrived moved the deadline.
                 biased;
                 _ = changed => {}
-                _ = tokio::time::sleep_until(deadline) => self.on_requests_timed_out()?,
+                _ = tokio::time::sleep_until(deadline) => {
+                    self.on_requests_timed_out()?;
+                    next_snub = Some(tokio::time::Instant::now() + SNUB_INTERVAL);
+                }
             }
         }
     }
 
+    /// The peer is snubbed, and the pieces it owns that wait on it alone go
+    /// back to the queue for other peers to fetch. Its requests stay
+    /// outstanding, so a block it still sends is kept. A peer on parole is
+    /// left its pieces: it was handed only pieces no one else had started
+    /// (libtorrent `peer_connection::snub_peer` returns early on parole).
     fn on_requests_timed_out(&self) -> crate::Result<()> {
-        self.state
+        let on_parole = self
+            .state
             .peers
-            .with_live_mut(self.addr, "snub", |live| live.snub());
-        let timed_out = self.return_requests()?;
-        debug!(requests = timed_out.len(), "requests timed out");
-        for request in timed_out {
-            // The chunk is for whoever takes its piece next to fetch.
-            let _ = self
-                .tx
-                .send(WriterRequest::Message(Message::Cancel(Request {
-                    index: request.piece_index.get(),
-                    begin: request.offset,
-                    length: request.size,
-                })));
+            .with_peer(self.addr, |peer| peer.trust().on_parole())
+            .unwrap_or(false);
+        let released = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "snub", |live| {
+                live.snub();
+                if on_parole {
+                    return Ok(0);
+                }
+                Ok::<_, Error>(
+                    self.state
+                        .lock_write("snub")
+                        .get_pieces_mut()?
+                        .release_pieces_blocked_by(self.addr, |chunk| {
+                            live.has_inflight_request(chunk)
+                        }),
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        debug!(released, on_parole, "requests timed out");
+        if released > 0 {
+            self.state.new_pieces_notify.notify_waiters();
         }
         Ok(())
     }
@@ -2695,15 +2724,17 @@ impl PeerHandler {
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
         self.counters.fetched_chunks.fetch_add(1, Ordering::Relaxed);
 
-        let should_process = self
-            .state
+        // A block we had stopped waiting for is data all the same: whether
+        // it is written is the piece tracker's call (libtorrent
+        // `peer_connection::incoming_piece`).
+        self.state
             .peers
             .with_live_mut(self.addr, "inflight_requests.remove", |h| {
                 match h.remove_inflight_request(&chunk_info) {
-                    RemoveInflightRequestResult::Expected => Ok(true),
+                    RemoveInflightRequestResult::Expected => Ok(()),
                     RemoveInflightRequestResult::LateCanceled => {
-                        trace!(?piece, "peer sent us a chunk we did not ask for");
-                        Ok(false)
+                        trace!(?piece, "peer sent a block after we cancelled it");
+                        Ok(())
                     }
                     RemoveInflightRequestResult::Unexpected => anyhow::bail!(
                         "peer sent us a piece we did not ask. Inflight requests: {:?}. Got: {:?}",
@@ -2713,11 +2744,6 @@ impl PeerHandler {
                 }
             })
             .context("peer not found")??;
-
-        if !should_process {
-            self.state.add_redundant_bytes(piece.len() as u64);
-            return Ok(());
-        }
 
         // This one is used to calculate download speed.
         self.state
@@ -2739,11 +2765,10 @@ impl PeerHandler {
         ) -> anyhow::Result<()> {
             let index = piece.index;
 
-            // If someone stole the piece by now, ignore it.
-            // However if they didn't, don't let them steal it while we are writing.
-            // So that by the time we are done writing AND if it was the last piece,
-            // we can actually checksum etc.
-            // Otherwise it might get into some weird state.
+            // A block we lack is written, whoever owns its piece now. While
+            // it is, no one steals the piece, so that by the time we are done
+            // writing AND if it was the last block, we can actually checksum
+            // etc.
             let (ppl_guard, cancel) = {
                 let mut g = state.lock_write("check_steal");
 
@@ -2756,16 +2781,14 @@ impl PeerHandler {
                     Arrival::Write { cancel } => (ppl, cancel),
                     Arrival::Discard => {
                         state.add_redundant_bytes(piece.len() as u64);
-                        debug!(
-                            "{chunk_info:?} is no longer asked of this peer, or arrived from another first, ignoring"
-                        );
+                        debug!("{chunk_info:?} is had, or arrived from another first, ignoring");
                         return Ok(());
                     }
                 }
             };
-            // The block was asked of another peer too, in the end game: it
-            // need not send it (libtorrent `torrent::cancel_block`).
-            if let Some(other) = cancel {
+            // The block was asked of other peers too: they need not send it
+            // (libtorrent `torrent::cancel_block`).
+            for other in cancel {
                 state
                     .peers
                     .with_live_mut(other, "cancel_duplicate", |live| {
@@ -2799,8 +2822,9 @@ impl PeerHandler {
                 match chunk_marking_result {
                     Some(ChunkMarkingResult::Completed) => {
                         trace!("piece={} done, will write and checksum", piece.index);
-                        // Remove from inflight to prevent others from stealing it during hash check.
-                        g.get_pieces_mut()?.take_inflight(piece_index)
+                        // Out of flight and the queue, so no one takes it during
+                        // its hash check.
+                        Some(g.get_pieces_mut()?.take_inflight(piece_index))
                     }
                     Some(ChunkMarkingResult::PreviouslyCompleted) => {
                         // TODO: we might need to send cancellations here.
@@ -2821,6 +2845,8 @@ impl PeerHandler {
             // It shouldn't impact perf anyway, but dropping just in case.
             drop(ppl_guard);
 
+            // The time is known when the piece was in flight: one whose last
+            // block came after it was given back has none.
             let Some((full_piece_download_time, senders)) = full_piece_download else {
                 return Ok(());
             };
@@ -2888,14 +2914,16 @@ impl PeerHandler {
                         .stats
                         .have_bytes
                         .fetch_add(piece_len, Ordering::Relaxed);
-                    #[allow(clippy::cast_possible_truncation)]
-                    state.stats.total_piece_download_ms.fetch_add(
-                        full_piece_download_time.as_millis() as u64,
-                        Ordering::Relaxed,
-                    );
+                    if let Some(time) = full_piece_download_time {
+                        #[allow(clippy::cast_possible_truncation)]
+                        state
+                            .stats
+                            .total_piece_download_ms
+                            .fetch_add(time.as_millis() as u64, Ordering::Relaxed);
 
-                    // Per-peer piece counters.
-                    counters.on_piece_completed(piece_len, full_piece_download_time);
+                        // Per-peer piece counters.
+                        counters.on_piece_completed(piece_len, time);
+                    }
 
                     trace!(piece = index, "successfully downloaded and verified");
 
