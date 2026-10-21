@@ -25,7 +25,7 @@ use crate::core::{
     Error, Id32, InfoHashes,
     hash_id::Id20,
     lengths::Lengths,
-    merkle::BLOCK_SIZE,
+    merkle::{self, BLOCK_SIZE},
     v2_tree::{FileTree, sanitize_component},
 };
 
@@ -535,7 +535,7 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
     /// The piece layers a torrent carries, one entry per file of
     /// [`Self::iter_file_details`]: each key must be the root of a file
     /// larger than a piece, claimed once, and each layer that file's piece
-    /// count of hashes. A file with no layer is allowed, and a value that
+    /// count of hashes, whose tree has that root. A file with no layer is allowed, and a value that
     /// is not a dict counts as no layers (libtorrent `parse_piece_layers`).
     pub fn piece_layers<B: AsRef<[u8]>>(
         &self,
@@ -570,6 +570,9 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
                 .chunks_exact(32)
                 .map(|h| Id32::new(h.try_into().unwrap()))
                 .collect();
+            if merkle::layer_root(&hashes, piece_length / BLOCK_SIZE) != root {
+                return Err(Error::V2InvalidPieceLayer);
+            }
             out[index] = Some(hashes);
         }
         Ok(out)
@@ -1360,6 +1363,140 @@ mod tests {
         assert_eq!(layers, vec![None]);
     }
 
+    /// The pieces root of `data` and, for a file of more than one piece,
+    /// its piece layer, from blocks hashed in the test.
+    fn file_root(data: &[u8], piece_length: u64) -> (Option<Id32>, Option<Vec<Id32>>) {
+        if data.is_empty() {
+            return (None, None);
+        }
+        let layer: Vec<Id32> = data
+            .chunks(piece_length as usize)
+            .map(|piece| {
+                let blocks: Vec<Id32> = piece
+                    .chunks(BLOCK_SIZE as usize)
+                    .map(merkle::hash_block)
+                    .collect();
+                merkle::piece_root(&blocks, data.len() as u64, piece_length)
+            })
+            .collect();
+        match layer.len() {
+            1 => (Some(layer[0]), None),
+            _ => (
+                Some(merkle::layer_root(&layer, piece_length / BLOCK_SIZE)),
+                Some(layer),
+            ),
+        }
+    }
+
+    fn bstr(bytes: &[u8]) -> Vec<u8> {
+        let mut out = format!("{}:", bytes.len()).into_bytes();
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    #[test]
+    fn a_multi_file_tree_built_here_loads_with_its_layers() {
+        // The roots come from merkle.rs, which matches libtorrent's roots
+        // for test_torrents/v2.torrent and v2_only.torrent.
+        let piece_length = 65536u64;
+        let payload = |len: usize, seed: u8| -> Vec<u8> {
+            (0..len)
+                .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+                .collect()
+        };
+        // Under a block, between a block and a piece, many pieces, empty,
+        // exactly one piece.
+        let files: Vec<(&[&str], Vec<u8>)> = vec![
+            (&["a", "x"], payload(100, 1)),
+            (&["a", "y"], payload(40000, 2)),
+            (&["b"], payload(3 * 65536 + 5, 3)),
+            (&["c"], Vec::new()),
+            (&["d"], payload(65536, 4)),
+        ];
+        let roots: Vec<_> = files
+            .iter()
+            .map(|(_, data)| file_root(data, piece_length))
+            .collect();
+        let leaf = |index: usize| {
+            let (_, data) = &files[index];
+            let mut out = b"d0:d6:length".to_vec();
+            out.extend_from_slice(format!("i{}e", data.len()).as_bytes());
+            if let Some(root) = roots[index].0 {
+                out.extend_from_slice(&bstr(b"pieces root"));
+                out.extend_from_slice(&bstr(&root.0));
+            }
+            out.extend_from_slice(b"ee");
+            out
+        };
+        let mut tree = b"d1:ad1:x".to_vec();
+        tree.extend(leaf(0));
+        tree.extend_from_slice(b"1:y");
+        tree.extend(leaf(1));
+        tree.extend_from_slice(b"e1:b");
+        tree.extend(leaf(2));
+        tree.extend_from_slice(b"1:c");
+        tree.extend(leaf(3));
+        tree.extend_from_slice(b"1:d");
+        tree.extend(leaf(4));
+        tree.extend_from_slice(b"e");
+        let mut info = b"d9:file tree".to_vec();
+        info.extend(tree);
+        info.extend_from_slice(b"12:meta versioni2e4:name4:tree12:piece lengthi65536ee");
+        let layer: Vec<u8> = roots[2]
+            .1
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flat_map(|h| h.0)
+            .collect();
+        let torrent = |layer: &[u8]| {
+            let mut out = b"d4:info".to_vec();
+            out.extend_from_slice(&info);
+            out.extend_from_slice(b"12:piece layersd");
+            out.extend(bstr(&roots[2].0.unwrap().0));
+            out.extend(bstr(layer));
+            out.extend_from_slice(b"ee");
+            out
+        };
+
+        let bytes = torrent(&layer);
+        let (meta, validated) = load(&bytes).unwrap();
+        assert_eq!(validated.version(), TorrentVersion::V2);
+        assert!(!validated.is_single_file());
+        let real: Vec<_> = validated
+            .v2_files()
+            .unwrap()
+            .iter()
+            .filter(|f| !f.is_pad())
+            .collect();
+        assert_eq!(real.len(), 5);
+        for ((file, (_, data)), (root, _)) in real.iter().zip(&files).zip(&roots) {
+            assert_eq!(file.length, data.len() as u64);
+            assert_eq!(file.pieces_root, *root);
+            assert_eq!(file.offset % piece_length, 0);
+        }
+        let layers = validated
+            .piece_layers(meta.piece_layers.as_ref().unwrap())
+            .unwrap();
+        let held: Vec<_> = layers.iter().map(Option::is_some).collect();
+        let at_b = validated
+            .v2_files()
+            .unwrap()
+            .iter()
+            .position(|f| f.path == ["b"])
+            .unwrap();
+        assert!(held[at_b]);
+        assert_eq!(held.iter().filter(|h| **h).count(), 1);
+
+        // A layer that does not hash to its root is refused.
+        let mut wrong = layer.clone();
+        wrong[0] ^= 1;
+        assert!(matches!(
+            load(&torrent(&wrong)),
+            Err(Error::V2InvalidPieceLayer)
+        ));
+    }
+
     #[test]
     fn libtorrents_bad_v2_torrents_are_refused() {
         // libtorrent test_torrents/<name>.torrent, each with the error
@@ -1394,6 +1531,7 @@ mod tests {
         // torrent_invalid_piece_layer
         refused!("v2_invalid_piece_layer", Error::V2InvalidPieceLayer);
         refused!("v2_invalid_piece_layer_size", Error::V2InvalidPieceLayer);
+        refused!("v2_invalid_piece_layer_root", Error::V2InvalidPieceLayer);
         // This one ends in a newline past the torrent, ignored as
         // libtorrent's bdecode ignores it.
         refused!("v2_unknown_piece_layer_entry", Error::V2InvalidPieceLayer);
