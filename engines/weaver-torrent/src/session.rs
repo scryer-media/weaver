@@ -167,6 +167,7 @@ pub struct Session {
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
     pub(crate) unchoke_slots_limit: usize,
+    pub(crate) disable_pex: bool,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -591,6 +592,10 @@ pub struct SessionOptions {
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
 
+    /// Leave peer exchange (ut_pex) out: it is not advertised to peers, and
+    /// none is sent or read, as in libtorrent without the ut_pex plugin.
+    pub disable_pex: bool,
+
     /// Force IPv4 only.
     pub ipv4_only: bool,
 
@@ -638,6 +643,7 @@ impl Default for SessionOptions {
             connections_limit: DEFAULT_CONNECTIONS_LIMIT,
             connection_speed: DEFAULT_CONNECTION_SPEED,
             disable_local_service_discovery: false,
+            disable_pex: false,
             ipv4_only: false,
             socket_factory: None,
             http_client: None,
@@ -1019,6 +1025,7 @@ impl Session {
                 ),
                 peer_limit: opts.peer_limit,
                 unchoke_slots_limit: opts.unchoke_slots_limit,
+                disable_pex: opts.disable_pex,
                 blocklist,
                 allowlist,
                 lsd,

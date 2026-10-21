@@ -228,6 +228,11 @@ pub struct TorrentStateLive {
 
     // Hands out the upload slots.
     choker: Choker,
+
+    // Whether the torrent speaks ut_pex: advertises it, sends it and reads
+    // it. Not on a private torrent, nor in a session without it (libtorrent
+    // `ut_pex_plugin::new_connection`, `session::add_extension`).
+    pex: bool,
 }
 
 // A block a peer asked for, on its way through the upload rate limits to the
@@ -299,6 +304,7 @@ impl TorrentStateLive {
                 session.unchoke_slots_limit,
                 lengths.default_piece_length().into(),
             ),
+            pex: !session.disable_pex && !paused.metadata.info.info().private,
         });
 
         state.spawn(
@@ -1232,15 +1238,15 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 }
             }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
-                if self.state.metadata.info.info().private {
+                if self.state.pex {
+                    self.on_pex_message(pex);
+                } else {
                     warn!(
                         id = self.state.shared.id,
                         info_hash = ?self.state.shared.info_hash,
-                        "received noncompliant PEX message from {}, ignoring",
+                        "received a PEX message from {} we did not advertise, ignoring",
                         self.addr
                     );
-                } else {
-                    self.on_pex_message(pex);
                 }
             }
             message => {
@@ -1323,7 +1329,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
         }
 
-        if !self.state.metadata.info.info().private && hs.m.ut_pex.is_some() {
+        if self.state.pex && hs.m.ut_pex.is_some() {
             spawn_with_cancel(
                 debug_span!(
                     parent: self.state.shared.span.clone(),
@@ -1374,6 +1380,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         {
             handshake.metadata_size = Some(len);
         }
+        handshake.m.ut_pex = handshake.m.ut_pex.filter(|_| self.state.pex);
 
         Ok(())
     }

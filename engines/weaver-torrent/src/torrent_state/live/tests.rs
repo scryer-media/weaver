@@ -47,25 +47,31 @@ impl Harness {
 
     // `have` is the bitfield of the pieces had, `slots` the upload slots.
     async fn build(name: &str, have: u8, slots: usize) -> Self {
+        let opts = SessionOptions {
+            unchoke_slots_limit: slots,
+            ..isolated_session_opts(false)
+        };
         Self::build_on(
             name,
             have,
-            slots,
+            opts,
             MemoryStorageFactory::default().clone_box(),
         )
         .await
     }
 
-    /// As [`Harness::build`], on the storage `storage` makes.
-    async fn build_on(name: &str, have: u8, slots: usize, storage: BoxStorageFactory) -> Self {
+    /// As [`Harness::build`], in a session of `opts`, on the storage
+    /// `storage` makes.
+    async fn build_on(
+        name: &str,
+        have: u8,
+        opts: SessionOptions,
+        storage: BoxStorageFactory,
+    ) -> Self {
         let torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
             .await
             .unwrap();
         let out = TempDir::with_prefix(name).unwrap();
-        let opts = SessionOptions {
-            unchoke_slots_limit: slots,
-            ..isolated_session_opts(false)
-        };
         let session = Session::new_with_opts(out.path().into(), opts)
             .await
             .unwrap();
@@ -1512,7 +1518,7 @@ async fn a_piece_the_storage_refuses_is_not_had_and_is_downloaded_again() {
     let h = Harness::build_on(
         "storage_refuses",
         0x00,
-        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+        isolated_session_opts(false),
         storage.clone_box(),
     )
     .await;
@@ -1564,4 +1570,73 @@ fn a_piece_is_counted_into_every_file_past_an_empty_one() {
     assert_eq!(names(1), vec![2, 3, 4]);
     assert_eq!(names(2), vec![4]);
     assert_eq!(names(3), vec![5]);
+}
+
+/// A PEX message adding `added` and dropping `dropped`.
+fn pex(added: &[&str], dropped: &[&str]) -> UtPex<ByteBufOwned> {
+    let addrs = |a: &[&str]| -> Vec<SocketAddr> { a.iter().map(|a| a.parse().unwrap()).collect() };
+    let (added, dropped) = (addrs(added), addrs(dropped));
+    UtPex::from_addrs(added.iter().copied(), dropped.iter().copied())
+}
+
+impl Harness {
+    /// Whether the peer at `addr` is in the torrent's peer list.
+    fn knows(&self, addr: &str) -> bool {
+        self.peers
+            .with_peer(addr.parse().unwrap(), |_| ())
+            .is_some()
+    }
+
+    /// The extension ids we advertise to `peer`.
+    fn advertised(&self, peer: &PeerHandler) -> extended::PeerExtendedMessageIds {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.m
+    }
+}
+
+// libtorrent `ut_pex_peer_plugin::on_extended`: the added peers are
+// candidates, the dropped ones are only forgotten by the sender.
+#[tokio::test]
+async fn a_pex_message_adds_its_added_peers_and_not_its_dropped_ones() {
+    let h = Harness::new("pex_added_and_dropped").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    assert!(h.advertised(&peer).ut_pex.is_some());
+
+    let msg = pex(&["10.0.0.1:6881", "[2001:db8::1]:6881"], &["10.0.0.2:6881"]);
+    (&peer)
+        .on_received_message(Message::Extended(ExtendedMessage::UtPex(msg.as_borrowed())))
+        .await
+        .unwrap();
+    assert!(h.knows("10.0.0.1:6881"));
+    assert!(h.knows("[2001:db8::1]:6881"));
+    assert!(!h.knows("10.0.0.2:6881"));
+}
+
+// libtorrent `session::add_extension`: a session without the ut_pex plugin
+// does not advertise it, and takes no peers from it.
+#[tokio::test]
+async fn a_session_without_pex_does_not_advertise_it_nor_take_peers_from_it() {
+    let opts = SessionOptions {
+        disable_pex: true,
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "pex_disabled",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let advertised = h.advertised(&peer);
+    assert!(advertised.ut_pex.is_none());
+    assert!(advertised.ut_metadata.is_some());
+
+    let msg = pex(&["10.0.0.1:6881"], &[]);
+    (&peer)
+        .on_received_message(Message::Extended(ExtendedMessage::UtPex(msg.as_borrowed())))
+        .await
+        .unwrap();
+    assert!(!h.knows("10.0.0.1:6881"));
 }
