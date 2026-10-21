@@ -73,6 +73,29 @@ const MIN_REQUEST_QUEUE: usize = 2;
 // requests outstanding to a peer before any block has arrived from it.
 const INITIAL_REQUEST_QUEUE: usize = 4;
 
+// libtorrent `peer_connection::second_tick`: how long a seed waits on an
+// interested peer it unchoked to ask for a block, or to be sent the last one
+// it asked for, before it ends the connection.
+pub(crate) const NO_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+// libtorrent `inactivity_timeout`: how long two peers that want nothing of
+// each other stay connected while connections run short.
+pub(crate) const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Why a connection has gone idle long enough to end
+/// (libtorrent `peer_connection::second_tick`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimedOut {
+    /// We seed, the peer is interested and unchoked, and it has asked for
+    /// nothing and been sent nothing for [`NO_REQUEST_TIMEOUT`]
+    /// (`timed_out_no_request`).
+    NoRequest,
+    /// Neither of us has wanted anything of the other for
+    /// [`INACTIVITY_TIMEOUT`], and connections run short
+    /// (`timed_out_no_interest`).
+    NoInterest,
+}
+
 /// BEP 6's allowed fast set of `k` of `num_pieces` pieces for the peer at
 /// `ip` on the torrent `info_hash`, in the order it is generated; every piece
 /// when `k` is not less than their count (libtorrent
@@ -626,6 +649,20 @@ pub(crate) struct LivePeerState {
     // Whether the peer wants to download from us. Like every connection it
     // starts not interested (BEP 3); the choker records the peer's word.
     pub peer_interested: bool,
+    // When the peer last said it is no longer interested; the time the
+    // connection went live until it does (libtorrent
+    // `m_became_uninterested`).
+    became_uninterested: Instant,
+    // Whether we want to download from the peer, as we last told it.
+    interesting: bool,
+    // When we last told the peer we are no longer interested; the time the
+    // connection went live until we do (libtorrent
+    // `m_became_uninteresting`).
+    became_uninteresting: Instant,
+    // When we last queued a block the peer asked for, or took one off its
+    // queue to send; the time the connection went live until we do
+    // (libtorrent `m_last_incoming_request`, `m_last_sent_payload`).
+    last_upload: Instant,
 
     // When we choked the peer; None while we do not. It starts choked when
     // the connection goes live (BEP 3), and only the choker unchokes it.
@@ -751,6 +788,10 @@ impl LivePeerState {
             peer_id,
             client_name: None,
             peer_interested: false,
+            became_uninterested: now,
+            interesting: false,
+            became_uninteresting: now,
+            last_upload: now,
             choked_at: Some(now),
             last_unchoke: now,
             uploaded_at_unchoke: 0,
@@ -1038,6 +1079,7 @@ impl LivePeerState {
             (None, None) => {}
         }
         self.upload_queue.insert(chunk);
+        self.last_upload = Instant::now();
         Ok(())
     }
 
@@ -1194,7 +1236,66 @@ impl LivePeerState {
     /// Takes `chunk` off the queue to send it. False when it is no longer
     /// there, and it is not sent.
     pub fn claim_upload(&mut self, chunk: &ChunkInfo) -> bool {
-        self.upload_queue.remove(chunk)
+        let claimed = self.upload_queue.remove(chunk);
+        if claimed {
+            self.last_upload = Instant::now();
+        }
+        claimed
+    }
+
+    /// The peer said at `now` whether it is interested
+    /// (libtorrent `peer_connection::incoming_interested`,
+    /// `incoming_not_interested`).
+    pub(crate) fn peer_interest(&mut self, interested: bool, now: Instant) {
+        if self.peer_interested && !interested {
+            self.became_uninterested = now;
+        }
+        self.peer_interested = interested;
+    }
+
+    /// We want to download from the peer, or no longer do, at `now`. True
+    /// when that changed, and the peer is to be told
+    /// (libtorrent `peer_connection::send_interested`,
+    /// `send_not_interested`).
+    pub(crate) fn interest(&mut self, interesting: bool, now: Instant) -> bool {
+        if self.interesting == interesting {
+            return false;
+        }
+        if !interesting {
+            self.became_uninteresting = now;
+        }
+        self.interesting = interesting;
+        true
+    }
+
+    /// Whether the connection is idle enough at `now` to end, with
+    /// `upload_only` when we only seed the torrent and `full` when
+    /// connections run short (libtorrent `peer_connection::second_tick`).
+    pub(crate) fn timed_out(
+        &self,
+        now: Instant,
+        upload_only: bool,
+        full: bool,
+    ) -> Option<TimedOut> {
+        let served = self.last_unchoke.max(self.last_upload);
+        if upload_only
+            && self.peer_interested
+            && !self.is_choked()
+            && self.upload_queue.is_empty()
+            && now.saturating_duration_since(served) > NO_REQUEST_TIMEOUT
+        {
+            return Some(TimedOut::NoRequest);
+        }
+        let idle = |since: Instant| now.saturating_duration_since(since) > INACTIVITY_TIMEOUT;
+        if full
+            && !self.interesting
+            && !self.peer_interested
+            && idle(self.became_uninterested)
+            && idle(self.became_uninteresting)
+        {
+            return Some(TimedOut::NoInterest);
+        }
+        None
     }
 }
 
@@ -1267,7 +1368,14 @@ impl BlockTime {
 mod tests {
     use std::net::IpAddr;
 
-    use super::{LivePeerState, Trust, allowed_fast_set, stats, unbounded_channel};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::{
+        INACTIVITY_TIMEOUT, LivePeerState, NO_REQUEST_TIMEOUT, TimedOut, Trust, allowed_fast_set,
+        stats, unbounded_channel,
+    };
     use crate::{
         core::{hash_id::Id20, lengths::Lengths},
         stream_connect::ConnectionKind,
@@ -1292,6 +1400,83 @@ mod tests {
         let mut moved = vec![piece(5)];
         moved.extend(kept.iter().copied().filter(|p| *p != piece(5)));
         assert_eq!(live.suggested, moved);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unchoked_peer_of_a_seed_times_out_a_minute_after_it_was_last_served() {
+        let lengths = Lengths::new(2 * 16384, 16384).unwrap();
+        let chunk = lengths
+            .chunk_info_from_received_data(lengths.validate_piece_index(0).unwrap(), 0, 16384)
+            .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let counters = stats::atomic::PeerStats::default().counters;
+        let mut live = LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters);
+        let start = Instant::now();
+        let minute = start + NO_REQUEST_TIMEOUT;
+        let past = |t: Instant| t + Duration::from_secs(1);
+
+        // Not interested, or choked: never.
+        assert_eq!(live.timed_out(past(minute), true, false), None);
+        live.peer_interest(true, start);
+        assert_eq!(live.timed_out(past(minute), true, false), None);
+
+        // Unchoked a minute ago and asking for nothing, it times out while we
+        // seed, and not while we still download.
+        live.unchoke(start, 0);
+        assert_eq!(live.timed_out(minute, true, false), None);
+        let timed_out = Some(TimedOut::NoRequest);
+        assert_eq!(live.timed_out(past(minute), true, false), timed_out);
+        assert_eq!(live.timed_out(past(minute), false, false), None);
+
+        // A block it asked for holds the connection until it is sent, and
+        // the minute runs from then.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(live.queue_upload(chunk, 1).is_ok());
+        assert_eq!(live.timed_out(past(past(minute)), true, false), None);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(live.claim_upload(&chunk));
+        let sent = Instant::now();
+        assert_eq!(live.timed_out(sent + NO_REQUEST_TIMEOUT, true, false), None);
+        assert_eq!(
+            live.timed_out(past(sent + NO_REQUEST_TIMEOUT), true, false),
+            timed_out
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mutually_uninterested_peers_time_out_after_ten_minutes_when_slots_run_short() {
+        let (tx, _rx) = unbounded_channel();
+        let counters = stats::atomic::PeerStats::default().counters;
+        let mut live = LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters);
+        let start = Instant::now();
+        let secs = |s| start + Duration::from_secs(s);
+        let ten = INACTIVITY_TIMEOUT.as_secs();
+        let timed_out = Some(TimedOut::NoInterest);
+
+        // From the start neither wants anything; ten minutes on, the
+        // connection times out only while connections run short.
+        assert_eq!(live.timed_out(secs(ten), false, true), None);
+        assert_eq!(live.timed_out(secs(ten + 1), false, true), timed_out);
+        assert_eq!(live.timed_out(secs(ten + 1), false, false), None);
+
+        // We want something of the peer from minute one to minute two: the
+        // ten minutes run from when we no longer do, and only a change is
+        // told to the peer.
+        assert!(live.interest(true, secs(60)));
+        assert!(!live.interest(true, secs(90)));
+        assert_eq!(live.timed_out(secs(ten + 1), false, true), None);
+        assert!(live.interest(false, secs(120)));
+        assert!(!live.interest(false, secs(150)));
+        assert_eq!(live.timed_out(secs(120 + ten), false, true), None);
+        assert_eq!(live.timed_out(secs(121 + ten), false, true), timed_out);
+
+        // The peer wants something of us until minute three, and the ten
+        // minutes run from when it no longer does.
+        live.peer_interest(true, secs(150));
+        assert_eq!(live.timed_out(secs(1000), false, true), None);
+        live.peer_interest(false, secs(180));
+        assert_eq!(live.timed_out(secs(180 + ten), false, true), None);
+        assert_eq!(live.timed_out(secs(181 + ten), false, true), timed_out);
     }
 
     #[test]

@@ -2186,6 +2186,41 @@ impl PeerHandler {
             r = self.request_chunks() => r,
             r = self.time_out_requests() => r,
             r = self.fetch_layers() => r,
+            r = self.time_out_idle() => r,
+        }
+    }
+
+    /// Returns, ending the connection with no fault of the peer's, once it
+    /// is idle long enough (LivePeerState::timed_out), looked at each second
+    /// from the peer's first message on (libtorrent
+    /// `peer_connection::second_tick`). Connections run short within five of
+    /// the torrent's limit or the session's.
+    async fn time_out_idle(&self) -> crate::Result<()> {
+        self.wait_for_bitfield().await;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let upload_only = self.state.is_finished_and_no_active_streams();
+            let full = self.state.peer_semaphore.available_permits() <= 5
+                || self
+                    .state
+                    .shared
+                    .session
+                    .upgrade()
+                    .is_some_and(|session| session.connection_slots.free() <= 5);
+            let now = tokio::time::Instant::now();
+            let Some(timed_out) = self
+                .state
+                .peers
+                .with_live(self.addr, |live| live.timed_out(now, upload_only, full))
+            else {
+                return Ok(());
+            };
+            if let Some(why) = timed_out {
+                debug!(?why, "idle, disconnecting peer");
+                return Ok(());
+            }
         }
     }
 
@@ -2241,21 +2276,25 @@ impl PeerHandler {
         let handle = self.addr;
         self.wait_for_bitfield().await;
 
-        let mut update_interest = {
-            let mut current = false;
-            move |h: &PeerHandler, new_value: bool| -> crate::Result<()> {
-                if new_value != current {
-                    h.tx.send(if new_value {
-                        WriterRequest::Message(Message::Interested)
-                    } else {
-                        WriterRequest::Message(Message::NotInterested)
-                    })
-                    .ok()
-                    .ok_or(Error::PeerTaskDead)?;
-                    current = new_value;
-                }
-                Ok(())
+        let update_interest = |h: &PeerHandler, new_value: bool| -> crate::Result<()> {
+            let now = tokio::time::Instant::now();
+            let changed = h
+                .state
+                .peers
+                .with_live_mut(h.addr, "update_interest", |live| {
+                    live.interest(new_value, now)
+                })
+                .unwrap_or(false);
+            if changed {
+                h.tx.send(if new_value {
+                    WriterRequest::Message(Message::Interested)
+                } else {
+                    WriterRequest::Message(Message::NotInterested)
+                })
+                .ok()
+                .ok_or(Error::PeerTaskDead)?;
             }
+            Ok(())
         };
 
         loop {

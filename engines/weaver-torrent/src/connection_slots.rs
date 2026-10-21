@@ -63,6 +63,12 @@ impl ConnectionSlots {
         Some(ConnectionSlot { _permit: permit })
     }
 
+    /// How many more connections the session may open now (libtorrent
+    /// `connections_limit` less `session_impl::num_connections`).
+    pub(crate) fn free(&self) -> usize {
+        self.open.available_permits()
+    }
+
     /// A place for an outgoing connection, once one is free.
     pub(crate) async fn open(&self) -> Result<ConnectionSlot, AcquireError> {
         let permit = self.open.clone().acquire_owned().await?;

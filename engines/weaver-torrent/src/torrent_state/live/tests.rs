@@ -2895,3 +2895,65 @@ async fn a_pause_keeps_the_bans_and_the_trust_of_the_peer_list() {
         Some(trust)
     );
 }
+
+#[tokio::test]
+async fn a_seed_ends_a_connection_whose_unchoked_peer_asks_for_nothing_for_a_minute() {
+    let h = Harness::seeding("no_request").await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    // Forty seconds on the peer asks for a block, and the minute runs again
+    // from when the block is taken to be sent.
+    tokio::time::advance(Duration::from_secs(40)).await;
+    peer.on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+    let chunk = h.chunk(0, 0);
+    let sent = tokio::time::Instant::now();
+    let claimed = h
+        .peers
+        .with_live_mut(peer.addr, "send", |live| live.claim_upload(&chunk));
+    assert_eq!(claimed, Some(true));
+
+    peer.time_out_idle().await.unwrap();
+    assert!(tokio::time::Instant::now().duration_since(sent) > peer::NO_REQUEST_TIMEOUT);
+}
+
+#[tokio::test]
+async fn peers_that_want_nothing_of_each_other_part_after_ten_minutes_when_connections_run_short() {
+    // Five connections in all: the torrent's connections run short.
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        peer_limit: Some(5),
+        ..Default::default()
+    };
+    let h = Harness::build_added(
+        "no_interest",
+        PIECES,
+        0xc0,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+
+    // Five minutes on the peer is interested a while; the ten minutes run
+    // from when it no longer is.
+    tokio::time::advance(Duration::from_secs(300)).await;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    peer.on_received_message(Message::NotInterested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+    let uninterested = tokio::time::Instant::now();
+
+    peer.time_out_idle().await.unwrap();
+    assert!(tokio::time::Instant::now().duration_since(uninterested) > peer::INACTIVITY_TIMEOUT);
+}

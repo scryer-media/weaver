@@ -137,7 +137,7 @@ impl Choker {
             let Some(live) = peer.get_live_mut() else {
                 return;
             };
-            live.peer_interested = true;
+            live.peer_interest(true, now);
             if !live.is_choked() {
                 live.repeat_unchoke();
             } else if free {
@@ -153,7 +153,7 @@ impl Choker {
         let now = Instant::now();
         let held_slot = peers
             .with_live_mut(addr, "peer_not_interested", |live| {
-                live.peer_interested = false;
+                live.peer_interest(false, now);
                 live.choke(now)
             })
             .unwrap_or(false);
