@@ -45,8 +45,9 @@ pub struct TrackerComms {
     stats: Arc<dyn TorrentStatsProvider>,
     force_tracker_interval: Option<Duration>,
     tx: Sender,
-    /// The `port` every announce carries (see [`announced_port`]).
-    announce_port: u16,
+    /// The port peers reach this session on, read when each announce goes
+    /// out (see [`announced_port`]).
+    announce_port: ListenPort,
     reqwest_client: reqwest::Client,
     udp_client: UdpTrackerClient,
     key: u32,
@@ -121,6 +122,12 @@ impl TorrentStatsProvider for () {
 }
 
 type Sender = tokio::sync::mpsc::Sender<SocketAddr>;
+
+/// The port peers reach this session on, None when it accepts no
+/// connections. It can change while a torrent runs (a gateway mapping that
+/// lands after start), so each announce reads it as it goes out (libtorrent
+/// `session_impl::queue_tracker_request` sets `req.listen_port` per request).
+pub type ListenPort = tokio::sync::watch::Receiver<Option<u16>>;
 
 #[derive(Clone, PartialEq, Eq)]
 enum SupportedTracker {
@@ -916,7 +923,7 @@ impl TrackerComms {
         trackers: HashSet<Url>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        listen_port: Option<u16>,
+        listen_port: ListenPort,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
     ) -> Option<TrackerTask> {
@@ -942,7 +949,8 @@ impl TrackerComms {
     /// and `stopped` when the returned stream is dropped. `stopped` is bounded
     /// and tracked by `stopped`. Each regular announce is recorded in the
     /// returned [`TrackerStatus`]. `listen_port` is the port peers reach this
-    /// session on, None when it accepts no connections.
+    /// session on, None when it accepts no connections; when it changes, each
+    /// tier announces it as soon as its tracker's `min interval` allows.
     ///
     /// Each of `info_hashes.ids20()` is announced on its own, with its own
     /// events and failover: a hybrid under v1 and the truncated v2, a v2
@@ -955,7 +963,7 @@ impl TrackerComms {
         tiers: Vec<Vec<Url>>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        listen_port: Option<u16>,
+        listen_port: ListenPort,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
@@ -1004,7 +1012,7 @@ impl TrackerComms {
                     stats: stats.clone(),
                     force_tracker_interval: force_interval,
                     tx: tx.clone(),
-                    announce_port: announced_port(listen_port),
+                    announce_port: listen_port.clone(),
                     reqwest_client: reqwest_client.clone(),
                     udp_client: udp_client.clone(),
                     key,
@@ -1059,10 +1067,14 @@ impl TrackerComms {
     async fn task_tier(&self, idx: usize, mut tier: Tier) -> anyhow::Result<()> {
         let mut state = AnnounceState::default();
         let mut retry: Option<backon::ExponentialBackoff> = None;
+        let mut port = self.announce_port.clone();
         loop {
             let stats = self.stats.get();
             let event = state.next_event(&stats);
             let tracker = tier.current().clone();
+            // The announce reads the port as it goes out; from here a change
+            // is one this tier has not announced.
+            port.mark_unchanged();
             let in_flight = self.status.begin(&tracker);
             let result = self.announce(&tracker, event, &stats).await;
             in_flight.finish(&result);
@@ -1086,15 +1098,21 @@ impl TrackerComms {
                     debug!(?delay, "sleeping after calling tracker");
                     tokio::time::sleep(delay.floor).await;
                     let rest = delay.regular - delay.floor;
-                    if state.awaits_completion(&self.stats.get()) {
-                        tokio::select! {
-                            _ = tokio::time::sleep(rest) => {}
-                            _ = self.stats.wait_until_completed() => {
-                                trace!("torrent completed, announcing early");
-                            }
+                    let completed = async {
+                        if state.awaits_completion(&self.stats.get()) {
+                            self.stats.wait_until_completed().await
+                        } else {
+                            futures::future::pending().await
                         }
-                    } else {
-                        tokio::time::sleep(rest).await;
+                    };
+                    tokio::select! {
+                        _ = tokio::time::sleep(rest) => {}
+                        _ = completed => {
+                            trace!("torrent completed, announcing early");
+                        }
+                        Ok(()) = port.changed() => {
+                            trace!("announce port changed, announcing early");
+                        }
                     }
                 }
                 Err(e) => {
@@ -1148,7 +1166,7 @@ impl TrackerComms {
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
-            port: self.announce_port,
+            port: announced_port(*self.announce_port.borrow()),
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
             left: stats.announced_left(),
@@ -1265,7 +1283,7 @@ impl TrackerComms {
             event: udp_event(event),
             key: self.key,
             num_want: numwant(event),
-            port: self.announce_port,
+            port: announced_port(*self.announce_port.borrow()),
         };
 
         match self.udp_client.announce(addr, request).await {
@@ -1509,7 +1527,7 @@ mod tests {
             vec![vec![url]],
             Box::new(()),
             None,
-            Some(6881),
+            tokio::sync::watch::channel(Some(6881)).1,
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -1624,6 +1642,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_port_that_changes_is_announced_without_waiting_out_the_interval() {
+        // libtorrent session_impl::queue_tracker_request reads the listen
+        // port per request. The tracker's interval is 1800 s on the real
+        // clock, so only the port change brings the second announce.
+        let (listener, url) = http_listener().await;
+        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            listen_port,
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            udp_client,
+            StoppedAnnounces::default(),
+        )
+        .unwrap()
+        .peers;
+        let first = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&first, "port"), Some("6881"));
+        assert_eq!(query_param(&first, "event"), Some("started"));
+        port.send_replace(Some(40001));
+        let second = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&second, "port"), Some("40001"));
+        assert_eq!(query_param(&second, "event"), None);
+        drop(peers);
+        token.cancel();
+    }
+
+    #[tokio::test]
     async fn test_http_tracker_hears_started_completed_and_stopped() {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1650,7 +1710,7 @@ mod tests {
             vec![vec![tracker]],
             Box::new(stats.clone()),
             None,
-            Some(6881),
+            tokio::sync::watch::channel(Some(6881)).1,
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -1715,7 +1775,7 @@ mod tests {
             vec![vec![url]],
             Box::new(()),
             None,
-            Some(6881),
+            tokio::sync::watch::channel(Some(6881)).1,
             reqwest::Client::builder()
                 .no_proxy()
                 .user_agent("Session/1.0")
@@ -1778,7 +1838,7 @@ mod tests {
             vec![vec![url]],
             Box::new(stats.clone()),
             None,
-            Some(6881),
+            tokio::sync::watch::channel(Some(6881)).1,
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -1838,7 +1898,7 @@ mod tests {
             vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]],
             Box::new(()),
             None,
-            Some(6881),
+            tokio::sync::watch::channel(Some(6881)).1,
             reqwest::Client::new(),
             udp_client,
             stopped.clone(),
@@ -1878,7 +1938,7 @@ mod tests {
             tiers,
             Box::new(()),
             None,
-            Some(6881),
+            tokio::sync::watch::channel(Some(6881)).1,
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),

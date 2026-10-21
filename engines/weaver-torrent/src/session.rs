@@ -36,7 +36,7 @@ use crate::lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
 use crate::natpmp::{NATPMP_PORT, NatPmpMapper};
 use crate::peer_protocol::Handshake;
 use crate::torrent_state::live::web_seed::WebSeeds;
-use crate::tracker::{AutoScrape, StoppedAnnounces, TrackerComms, UdpTrackerClient};
+use crate::tracker::{AutoScrape, ListenPort, StoppedAnnounces, TrackerComms, UdpTrackerClient};
 use crate::upnp::{
     PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, UpnpPortForwarder,
     UpnpPortForwarderOptions,
@@ -125,10 +125,13 @@ impl SessionDatabase {
 
 /// The port the session announces (libtorrent `listen_socket_t::
 /// tcp_external_port`): the TCP port a mapper got on the gateway, NAT-PMP's
-/// before UPnP's, else the configured one.
+/// before UPnP's, else the configured one. Announces subscribe to it and
+/// read it as they go out, so a mapping that lands after a torrent starts
+/// is announced by that torrent.
 struct AnnouncePort {
     configured: Option<u16>,
     mapped: parking_lot::Mutex<MappedPorts>,
+    port: tokio::sync::watch::Sender<Option<u16>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -142,13 +145,16 @@ impl AnnouncePort {
         Self {
             configured,
             mapped: Default::default(),
+            port: tokio::sync::watch::channel(configured).0,
         }
     }
 
     fn get(&self) -> Option<u16> {
-        let configured = self.configured?;
-        let mapped = *self.mapped.lock();
-        Some(mapped.natpmp.or(mapped.upnp).unwrap_or(configured))
+        *self.port.borrow()
+    }
+
+    fn subscribe(&self) -> ListenPort {
+        self.port.subscribe()
     }
 
     /// libtorrent `session_impl::on_port_mapping`: a mapper's TCP report,
@@ -163,7 +169,37 @@ impl AnnouncePort {
             PortmapTransport::Upnp => &mut mapped.upnp,
         };
         *port = event.external_port;
+        let announced = self
+            .configured
+            .map(|configured| mapped.natpmp.or(mapped.upnp).unwrap_or(configured));
+        self.port.send_if_modified(|port| {
+            let changed = *port != announced;
+            *port = announced;
+            changed
+        });
     }
+}
+
+/// The peers the DHT finds for `info_hash`, announcing `port` to the nodes
+/// closest to it. The DHT search reads the port when it starts, so a new
+/// port starts a new search, which announces it (libtorrent
+/// `torrent::dht_announce` reads the port at each announce).
+fn dht_peers(dht: Dht, info_hash: Id20, mut port: ListenPort) -> BoxStream<'static, SocketAddr> {
+    async_stream::stream! {
+        loop {
+            let mut peers = dht.get_peers(info_hash, *port.borrow_and_update());
+            loop {
+                tokio::select! {
+                    peer = peers.next() => match peer {
+                        Some(peer) => yield peer,
+                        None => return,
+                    },
+                    Ok(()) = port.changed() => break,
+                }
+            }
+        }
+    }
+    .boxed()
 }
 
 /// The protocols to map: those the session listens on (libtorrent
@@ -2046,11 +2082,15 @@ impl Session {
         } else {
             self.dht.as_ref().map(|dht| {
                 futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                    dht.get_peers(
+                    dht_peers(
+                        dht.clone(),
                         info_hash,
-                        if announce { self.announce_port() } else { None },
+                        if announce {
+                            self.announce_port.subscribe()
+                        } else {
+                            tokio::sync::watch::channel(None).1
+                        },
                     )
-                    .boxed()
                 }))
             })
         };
@@ -2085,7 +2125,7 @@ impl Session {
             self.announce_tiers(tracker_tiers, is_private),
             Box::new(tracker_rx_stats),
             force_tracker_interval,
-            self.announce_port(),
+            self.announce_port.subscribe(),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
@@ -2433,10 +2473,97 @@ mod tests {
         assert_eq!(port.get(), Some(40001));
         port.on_port_mapping(&event(Upnp, Tcp, None));
         assert_eq!(port.get(), Some(6881));
+        // An announce hears of a change of the port, and only of a change.
+        let mut announce = port.subscribe();
+        port.on_port_mapping(&event(Upnp, Udp, Some(40002)));
+        port.on_port_mapping(&event(NatPmp, Tcp, None));
+        assert!(!announce.has_changed().unwrap());
+        port.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
+        assert!(announce.has_changed().unwrap());
+        assert_eq!(*announce.borrow_and_update(), Some(40001));
         // Nothing to announce stays nothing.
         let none = AnnouncePort::new(None);
         none.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
         assert_eq!(none.get(), None);
+    }
+
+    #[tokio::test]
+    async fn the_dht_announces_a_port_that_changes_while_it_searches() {
+        // libtorrent torrent::dht_announce reads the port at each announce.
+        // A node run by hand on 127.0.0.1 answers ping, find_node and
+        // get_peers, giving a token, and reports each announce_peer port.
+        use crate::bencode::{BencodeValue, ByteBufOwned, dyn_from_bytes};
+        use crate::dht::{DhtConfig, DhtState, Id20};
+        use futures::StreamExt;
+        use std::net::Ipv4Addr;
+        use tokio::net::UdpSocket;
+
+        const NODE_ID: [u8; 20] = [0x42; 20];
+
+        fn get<'a>(v: &'a BencodeValue<ByteBufOwned>, key: &str) -> &'a BencodeValue<ByteBufOwned> {
+            match v {
+                BencodeValue::Dict(d) => &d[&ByteBufOwned::from(key.as_bytes())],
+                _ => panic!("not a dict: {v:?}"),
+            }
+        }
+        fn bytes(v: &BencodeValue<ByteBufOwned>) -> &[u8] {
+            match v {
+                BencodeValue::Bytes(b) => b.as_ref(),
+                _ => panic!("not bytes: {v:?}"),
+            }
+        }
+
+        // The port of the next announce_peer the node hears, answering
+        // every query before it.
+        async fn next_announced(node: &UdpSocket) -> i64 {
+            let mut buf = [0u8; 2048];
+            loop {
+                let (len, from) = node.recv_from(&mut buf).await.unwrap();
+                let msg = dyn_from_bytes::<ByteBufOwned>(&buf[..len]).unwrap();
+                if bytes(get(&msg, "y")) != b"q" {
+                    continue;
+                }
+                let tid = bytes(get(&msg, "t"));
+                let mut reply = b"d1:rd2:id20:".to_vec();
+                reply.extend_from_slice(&NODE_ID);
+                reply.extend_from_slice(b"5:token2:tke1:t");
+                reply.extend_from_slice(format!("{}:", tid.len()).as_bytes());
+                reply.extend_from_slice(tid);
+                reply.extend_from_slice(b"1:y1:re");
+                node.send_to(&reply, from).await.unwrap();
+                if bytes(get(&msg, "q")) == b"announce_peer" {
+                    match get(get(&msg, "a"), "port") {
+                        BencodeValue::Integer(port) => return *port,
+                        other => panic!("port is {other:?}"),
+                    }
+                }
+            }
+        }
+
+        let node = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let node_addr = node.local_addr().unwrap();
+        let dht = DhtState::with_config(DhtConfig {
+            listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            bootstrap_addrs: Some(vec![node_addr.to_string()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        dht.add_node(node_addr);
+        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        // The node is the closest there is to the hash: its own id.
+        let mut peers = super::dht_peers(dht, Id20::new(NODE_ID), listen_port);
+        let first = tokio::select! {
+            _ = peers.next() => panic!("the node gave no peers"),
+            port = next_announced(&node) => port,
+        };
+        assert_eq!(first, 6881);
+        port.send_replace(Some(40001));
+        let second = tokio::select! {
+            _ = peers.next() => panic!("the node gave no peers"),
+            port = next_announced(&node) => port,
+        };
+        assert_eq!(second, 40001);
     }
 
     #[tokio::test]
