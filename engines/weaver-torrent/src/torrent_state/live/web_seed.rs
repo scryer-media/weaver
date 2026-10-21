@@ -35,7 +35,7 @@ use crate::{
         hash_id::Id20,
         lengths::Lengths,
         magnet::Escaped,
-        net::Resolver,
+        net::{HttpClients, HttpTarget, Resolver},
         torrent_metainfo::{WebSeed, WebSeedKind, escape_path},
     },
     peer_connection::{PeerConnectionHandler, WriterRequest},
@@ -79,6 +79,9 @@ const BLOCKS_BUFFERED: usize = 64;
 /// How long a seed whose host name did not resolve is left (libtorrent
 /// `settings_pack::web_seed_name_lookup_retry`).
 const WEB_SEED_NAME_LOOKUP_RETRY: Duration = Duration::from_secs(1800);
+/// The most redirects one request follows (libtorrent `http_connection`
+/// `m_redirects`).
+const MAX_REDIRECTS: usize = 5;
 
 /// How often the torrent tries its web seeds (libtorrent
 /// `torrent::second_tick` calls `maybe_connect_web_seeds`).
@@ -366,21 +369,41 @@ fn check_url(url: &str, banned: bool) -> Result<Option<SocketAddr>, Refused> {
     Ok(Some(SocketAddr::new(ip, port)))
 }
 
-/// Why a URL whose host resolved to `addrs` may not be asked, if it may
-/// not (libtorrent `ssrf_mitigation`): a URL with a query is not asked of a
-/// local address (`torrent::connect_web_seed`), and where a server at a
-/// global address moved a file is asked at global addresses only
-/// (`web_peer_connection::handle_redirect` sets `no_local_ips`, after which
-/// `torrent::on_name_lookup` keeps only the global addresses). The client
-/// picks the address it connects to, so every address must pass.
-fn ssrf_refusal(addrs: &[IpAddr], query: bool, no_local_ips: bool) -> Option<&'static str> {
-    if no_local_ips && addrs.iter().any(|a| !is_global(*a)) {
-        return Some("moved from a global address to a local one");
+/// Why a request may not go to where its URL's host resolved.
+enum Unreachable {
+    /// The URL may not be asked there (libtorrent `ssrf_mitigation`).
+    Refused(&'static str),
+    /// The session's IP filter blocks the address.
+    Blocked(IpAddr),
+}
+
+/// The one address a request for `target`, whose host resolved to `addrs`
+/// at `port`, goes to (libtorrent `torrent::on_name_lookup`,
+/// `connect_web_seed`): the first left once a target held to global
+/// addresses drops the others (`web_peer_connection::handle_redirect` sets
+/// `no_local_ips`), which the IP filter `allowed` lets through, and which is
+/// not local when the URL carries a query.
+fn endpoint(
+    addrs: &[IpAddr],
+    port: u16,
+    target: &Target,
+    allowed: &dyn Fn(SocketAddr) -> bool,
+) -> Result<IpAddr, Unreachable> {
+    let Some(&addr) = addrs
+        .iter()
+        .find(|a| !target.no_local_ips || is_global(**a))
+    else {
+        return Err(Unreachable::Refused(
+            "moved from a global address to a local one",
+        ));
+    };
+    if !allowed(SocketAddr::new(addr, port)) {
+        return Err(Unreachable::Blocked(addr));
     }
-    if query && addrs.iter().any(|a| is_local(*a)) {
-        return Some("a query to a local address");
+    if target.query && is_local(addr) {
+        return Err(Unreachable::Refused("a query to a local address"));
     }
-    None
+    Ok(addr)
 }
 
 /// The open connection to one web seed. Dropping it lets the seed be
@@ -570,53 +593,56 @@ struct Run {
     requests: VecDeque<Request>,
 }
 
-/// How a connection ends.
-enum End {
-    /// We closed it, or the server moved what we asked for.
-    Closed,
-    Failed(anyhow::Error),
-}
-
-impl From<anyhow::Error> for End {
-    fn from(e: anyhow::Error) -> Self {
-        End::Failed(e)
-    }
-}
-
 /// Where one request goes, and what the hosts it may be asked of are held
 /// to.
 struct Target {
     url: Url,
     // The URL is the seed's own, and carries a query.
     query: bool,
-    // A server at a global address moved the file here.
+    // A server at a global address moved what is asked for here.
     no_local_ips: bool,
     // The file moved here, when it did.
     moved: Option<usize>,
 }
 
+/// Where a request goes: the address its host was checked at, and a client
+/// that reaches the host there and nowhere else.
+struct Reached {
+    addr: IpAddr,
+    client: reqwest::Client,
+}
+
 /// A connection to one web seed.
 pub(crate) struct WebSeedConnection<'a> {
-    client: reqwest::Client,
+    // Builds a client for each address a request is checked at.
+    clients: Arc<dyn HttpClients>,
     // Resolves the seeds' host names, so their addresses are known before
     // they are asked.
     resolver: Arc<dyn Resolver>,
+    // The session's IP filter: whether a connection may go to an address.
+    allowed: &'a (dyn Fn(SocketAddr) -> bool + Send + Sync),
     layout: &'a Layout,
     link: &'a SeedLink,
+    // The clients built for this connection, by host, port and address, so
+    // its requests to one address share their connections.
+    pinned: Mutex<HashMap<(String, u16, IpAddr), reqwest::Client>>,
 }
 
 impl<'a> WebSeedConnection<'a> {
     pub fn new(
-        client: reqwest::Client,
+        clients: Arc<dyn HttpClients>,
         resolver: Arc<dyn Resolver>,
+        allowed: &'a (dyn Fn(SocketAddr) -> bool + Send + Sync),
         layout: &'a Layout,
         link: &'a SeedLink,
     ) -> Self {
         Self {
-            client,
+            clients,
             resolver,
+            allowed,
             layout,
             link,
+            pinned: Mutex::default(),
         }
     }
 
@@ -690,16 +716,13 @@ impl<'a> WebSeedConnection<'a> {
                         msg = rx.try_recv().ok();
                     }
                 }
-                Some(end) = fetches.next(), if !fetches.is_empty() => {
-                    if let Err(end) = end {
-                        // The blocks read before the end are good.
+                Some(fetched) = fetches.next(), if !fetches.is_empty() => {
+                    if let Err(e) = fetched {
+                        // The blocks read before the failure are good.
                         while let Ok(block) = blocks_rx.try_recv() {
                             deliver(block).await?;
                         }
-                        return match end {
-                            End::Closed => Ok(()),
-                            End::Failed(e) => Err(anyhow(e)),
-                        };
+                        return Err(anyhow(e));
                     }
                 }
             }
@@ -730,7 +753,7 @@ impl<'a> WebSeedConnection<'a> {
         Some(run)
     }
 
-    async fn fetch(&self, run: Run, out: mpsc::Sender<(Request, Bytes)>) -> Result<(), End> {
+    async fn fetch(&self, run: Run, out: mpsc::Sender<(Request, Bytes)>) -> anyhow::Result<()> {
         let first = *run.requests.front().context("bug: an empty run")?;
         let mut blocks = Blocks {
             requests: run.requests,
@@ -785,18 +808,19 @@ impl<'a> WebSeedConnection<'a> {
         })
     }
 
-    // The addresses of `target`'s host, once its URL may be asked of them
-    // (libtorrent `torrent::connect_to_url_seed`, `on_name_lookup`,
-    // `connect_web_seed`). A seed that may not is disabled; a file moved
-    // where it may not is lost to the seed. A name that does not resolve
+    // Where `target` is asked: the one address of its host its URL may be
+    // asked at, and a client held to it (libtorrent
+    // `torrent::connect_to_url_seed`, `on_name_lookup`, `connect_web_seed`).
+    // A seed that may not be asked there is disabled; a file moved where it
+    // may not be asked is lost to the seed. A name that does not resolve
     // leaves the seed for WEB_SEED_NAME_LOOKUP_RETRY.
-    async fn checked(&self, target: &Target) -> Result<Vec<IpAddr>, End> {
+    async fn reach(&self, target: &Target) -> anyhow::Result<Reached> {
         let url = &target.url;
-        let addrs = match url.host() {
-            Some(url::Host::Ipv4(ip)) => vec![IpAddr::V4(ip)],
-            Some(url::Host::Ipv6(ip)) => vec![IpAddr::V6(ip)],
+        let port = url.port_or_known_default().unwrap_or(0);
+        let (host, addrs) = match url.host() {
+            Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![IpAddr::V4(ip)]),
+            Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![IpAddr::V6(ip)]),
             Some(url::Host::Domain(name)) => {
-                let port = url.port_or_known_default().unwrap_or(0);
                 let found =
                     tokio::time::timeout(URLSEED_TIMEOUT, self.resolver.resolve(name, port))
                         .await
@@ -807,96 +831,116 @@ impl<'a> WebSeedConnection<'a> {
                             Ok(a)
                         });
                 match found {
-                    Ok(found) => found.iter().map(SocketAddr::ip).collect(),
+                    Ok(found) => (name.to_owned(), found.iter().map(SocketAddr::ip).collect()),
                     Err(e) => {
                         self.link.retry_after(Some(WEB_SEED_NAME_LOOKUP_RETRY));
-                        return Err(e.into());
+                        return Err(e);
                     }
                 }
             }
             None => return Err(anyhow!("{url}: no host").into()),
         };
-        if let Some(why) = ssrf_refusal(&addrs, target.query, target.no_local_ips) {
-            match target.moved {
-                Some(file) => self.link.file_missing(file),
-                None => self.link.disable(),
+        let addr = match endpoint(&addrs, port, target, self.allowed) {
+            Ok(addr) => addr,
+            Err(Unreachable::Blocked(addr)) => {
+                return Err(anyhow!("{url}: the IP filter blocks {addr}"));
             }
-            return Err(anyhow!("{url}: {why}").into());
+            Err(Unreachable::Refused(why)) => {
+                match target.moved {
+                    Some(file) => self.link.file_missing(file),
+                    None => self.link.disable(),
+                }
+                return Err(anyhow!("{url}: {why}"));
+            }
+        };
+        let key = (host, port, addr);
+        if let Some(client) = self.pinned.lock().get(&key) {
+            return Ok(Reached {
+                addr,
+                client: client.clone(),
+            });
         }
-        Ok(addrs)
+        let client = self
+            .clients
+            .client(Some(HttpTarget {
+                host: &key.0,
+                port,
+                addrs: &[addr],
+            }))
+            .with_context(|| format!("{url}: building its client"))?;
+        self.pinned.lock().insert(key, client.clone());
+        Ok(Reached { addr, client })
     }
 
-    // The client followed a redirect from a host at `from` to `to`: where
-    // it went is held to what a moved file is (libtorrent
-    // `web_peer_connection::handle_redirect`) before its answer is used.
-    // `file` moved there; with none, the seed itself did.
-    async fn followed(
+    // Asks for `target`, its bytes in `range` when set, and follows where
+    // it moves: each redirect is a target of its own, held to global
+    // addresses when a server at one moved it (libtorrent
+    // `web_peer_connection::handle_redirect`), and reached as the first was,
+    // at most MAX_REDIRECTS of them (`http_connection`). `file` is what
+    // moves; with none, the seed itself. The answer, and the target that
+    // gave it.
+    async fn get(
         &self,
-        from: &[IpAddr],
-        to: &Url,
+        mut target: Target,
+        range: Option<(u64, u64)>,
         file: Option<usize>,
-    ) -> Result<Redirect, End> {
-        let no_local_ips = from.iter().any(|a| is_global(*a));
-        self.checked(&Target {
-            url: to.clone(),
-            query: false,
-            no_local_ips,
-            moved: file,
-        })
-        .await?;
-        Ok(Redirect {
-            url: to.to_string(),
-            no_local_ips,
-        })
+    ) -> anyhow::Result<(reqwest::Response, Target)> {
+        for _ in 0..=MAX_REDIRECTS {
+            let reached = self.reach(&target).await?;
+            let mut request = reached.client.get(target.url.clone());
+            if let Some((first, last)) = range {
+                request = request.header(header::RANGE, format!("bytes={first}-{last}"));
+            }
+            let response = self.send(request).await?;
+            let status = response.status();
+            if !status.is_redirection() {
+                return Ok((response, target));
+            }
+            let Some(to) = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .and_then(|l| target.url.join(l).ok())
+            else {
+                self.link.disable();
+                return Err(anyhow!("{}: {status} without a location", target.url));
+            };
+            target = Target {
+                url: to,
+                query: false,
+                no_local_ips: is_global(reached.addr),
+                moved: file,
+            };
+        }
+        Err(anyhow!("{}: more than {MAX_REDIRECTS} redirects", target.url).into())
     }
 
     // BEP 19: the slice's bytes of its file, by range (libtorrent
     // `web_peer_connection::write_request`, `on_receive`).
-    async fn fetch_slice(&self, slice: &Slice, blocks: &mut Blocks) -> Result<(), End> {
-        let target = self.file_target(slice.file)?;
-        let url = target.url.clone();
-        let addrs = self.checked(&target).await?;
+    async fn fetch_slice(&self, slice: &Slice, blocks: &mut Blocks) -> anyhow::Result<()> {
+        let asked = self.file_target(slice.file)?;
+        let first_url = asked.url.clone();
         let last = slice.offset + slice.len - 1;
-        let response = self
-            .send(
-                self.client
-                    .get(url.clone())
-                    .header(header::RANGE, format!("bytes={}-{last}", slice.offset)),
-            )
+        let (response, target) = self
+            .get(asked, Some((slice.offset, last)), Some(slice.file))
             .await?;
+        let url = target.url;
         let status = response.status();
         if !is_ok_status(status) {
             // The server lacks the file, or cannot serve it now.
             self.link.file_missing(slice.file);
             self.link.retry_after(retry_after(&response));
-            return Err(anyhow!("{url}: {status}").into());
+            return Err(anyhow!("{url}: {status}"));
         }
-        if status.is_redirection() {
-            let Some(to) = response
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|l| l.to_str().ok())
-                .and_then(|l| url.join(l).ok())
-            else {
-                self.link.disable();
-                return Err(anyhow!("{url}: {status} without a location").into());
-            };
+        if url != first_url {
+            // The file moved: it is asked for where it went from now on.
             self.link.redirected(
                 slice.file,
                 Redirect {
-                    url: to.into(),
-                    no_local_ips: addrs.iter().any(|a| is_global(*a)),
+                    url: url.to_string(),
+                    no_local_ips: target.no_local_ips,
                 },
             );
-            return Err(End::Closed);
-        }
-        if response.url() != &url {
-            // The client followed a redirect: the file is asked for there
-            // from now on.
-            let to = self
-                .followed(&addrs, response.url(), Some(slice.file))
-                .await?;
-            self.link.redirected(slice.file, to);
         }
         let range = if status == StatusCode::PARTIAL_CONTENT {
             content_range(&response)
@@ -905,21 +949,27 @@ impl<'a> WebSeedConnection<'a> {
         };
         let Some((start, end)) = range else {
             self.link.disable();
-            return Err(anyhow!("{url}: {status} names no range").into());
+            return Err(anyhow!("{url}: {status} names no range"));
         };
         if (start, end) != (slice.offset, slice.offset + slice.len) {
             return Err(anyhow!(
                 "{url}: range {start}..{end} answers {}..{}",
                 slice.offset,
                 slice.offset + slice.len
-            )
-            .into());
+            ));
         }
         self.read_body(response, slice.len, blocks).await
     }
 
-    // BEP 17: the run's bytes of its piece, by `piece` and `ranges`.
-    async fn fetch_piece(&self, first: Request, len: u64, blocks: &mut Blocks) -> Result<(), End> {
+    // BEP 17: the run's bytes of its piece, by `piece` and `ranges`. A
+    // moved seed is held to what a moved file is; the seed itself is what
+    // is lost.
+    async fn fetch_piece(
+        &self,
+        first: Request,
+        len: u64,
+        blocks: &mut Blocks,
+    ) -> anyhow::Result<()> {
         let piece = self
             .layout
             .lengths
@@ -936,15 +986,8 @@ impl<'a> WebSeedConnection<'a> {
             let begin = u64::from(first.begin);
             url += &format!("&ranges={begin}-{}", begin + len - 1);
         }
-        let target = self.seed_target(url)?;
-        let url = target.url.clone();
-        let addrs = self.checked(&target).await?;
-        let response = self.send(self.client.get(url.clone())).await?;
-        if response.url() != &url {
-            // A moved seed is held to what a moved file is; the seed itself
-            // is what is lost.
-            self.followed(&addrs, response.url(), None).await?;
-        }
+        let (response, target) = self.get(self.seed_target(url)?, None, None).await?;
+        let url = target.url;
         let status = response.status();
         if status == StatusCode::SERVICE_UNAVAILABLE {
             // The body is how many seconds to wait.
@@ -958,11 +1001,11 @@ impl<'a> WebSeedConnection<'a> {
                 .and_then(wait_seconds)
                 .unwrap_or(HTTPSEED_DEFAULT_RETRY);
             self.link.retry_after(Some(wait));
-            return Err(anyhow!("{url}: {status}").into());
+            return Err(anyhow!("{url}: {status}"));
         }
         if status != StatusCode::OK {
             self.link.remove();
-            return Err(anyhow!("{url}: {status}").into());
+            return Err(anyhow!("{url}: {status}"));
         }
         self.read_body(response, len, blocks).await
     }
@@ -982,7 +1025,7 @@ impl<'a> WebSeedConnection<'a> {
         mut response: reqwest::Response,
         len: u64,
         blocks: &mut Blocks,
-    ) -> Result<(), End> {
+    ) -> anyhow::Result<()> {
         let url = response.url().clone();
         let mut left = len;
         loop {
@@ -994,13 +1037,13 @@ impl<'a> WebSeedConnection<'a> {
                 break;
             };
             if chunk.len() as u64 > left {
-                return Err(anyhow!("{url}: the body is longer than the range").into());
+                return Err(anyhow!("{url}: the body is longer than the range"));
             }
             left -= chunk.len() as u64;
             blocks.push(&chunk).await?;
         }
         if left > 0 {
-            return Err(anyhow!("{url}: the body ended {left} bytes short").into());
+            return Err(anyhow!("{url}: the body ended {left} bytes short"));
         }
         Ok(())
     }
@@ -1367,21 +1410,65 @@ mod tests {
             .collect()
     }
 
-    fn client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
+    // Every address may be connected to.
+    const ALL: &(dyn Fn(SocketAddr) -> bool + Send + Sync) = &|_| true;
+
+    // A client looks no name up: it reaches a host only at the addresses it
+    // was built for.
+    struct NoNames;
+
+    impl reqwest::dns::Resolve for NoNames {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let name = name.as_str().to_owned();
+            Box::pin(async move { Err(format!("{name}: no lookups in tests").into()) })
+        }
     }
 
-    // A client that reaches `names` at `at`, and follows redirects when
-    // `follow`.
-    fn client_resolving(names: &[&str], at: SocketAddr, follow: bool) -> reqwest::Client {
-        let mut builder = reqwest::Client::builder().no_proxy();
-        for name in names {
-            builder = builder.resolve(name, at);
+    fn builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(NoNames))
+    }
+
+    // The session's own clients.
+    fn direct() -> Arc<dyn HttpClients> {
+        Arc::new(builder)
+    }
+
+    // The clients of a network where every address is the server at `at`:
+    // a client built for an address reaches the server there. Records the
+    // addresses clients were built for.
+    struct Wired {
+        at: SocketAddr,
+        built: Mutex<Vec<IpAddr>>,
+    }
+
+    impl Wired {
+        fn new(at: SocketAddr) -> Arc<Self> {
+            Arc::new(Self {
+                at,
+                built: Mutex::default(),
+            })
         }
-        if !follow {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
+
+        fn built(&self) -> Vec<IpAddr> {
+            self.built.lock().clone()
         }
-        builder.build().unwrap()
+    }
+
+    impl HttpClients for Wired {
+        fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+            let at = [self.at.ip()];
+            let target = target.map(|t| {
+                self.built.lock().extend(t.addrs);
+                HttpTarget { addrs: &at, ..t }
+            });
+            Ok(crate::core::net::for_target(builder(), target).build()?)
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
     }
 
     // A resolver that knows `names` and no other.
@@ -1460,7 +1547,7 @@ mod tests {
             ("b", 30000, false),
         ]);
         let (_seeds, link) = one_seed(server.url("/seed"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
         let fake = Fake::default();
 
         let requests = blocks(&layout, 0..3);
@@ -1508,7 +1595,7 @@ mod tests {
             ("b", 30000, false),
         ]);
         let (seeds, link) = one_seed(server.url("/seed/"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
         let fake = Fake::default();
 
         let failed = drive(&conn, &fake, &blocks(&layout, 2..3), 1).await;
@@ -1542,7 +1629,7 @@ mod tests {
             let server = Server::start(move |_| reply.lock().take().unwrap());
             let (seeds, link) = one_seed(server.url("/f"), WebSeedKind::Url);
             let layout = super::tests::layout(&[("f", 100, false)]);
-            let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
             assert!(
                 drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
                     .await
@@ -1571,7 +1658,7 @@ mod tests {
             let server = Server::start(move |_| Reply::status(503).header("Retry-After", value));
             let (seeds, link) = one_seed(server.url("/f"), WebSeedKind::Url);
             let layout = super::tests::layout(&[("f", 100, false)]);
-            let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
             assert!(
                 drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
                     .await
@@ -1601,7 +1688,7 @@ mod tests {
         });
         let layout = layout(&[("a", 40000, false), ("b", 10, false)]);
         let (seeds, link) = one_seed(server.url("/seed/"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
         let fake = Fake::default();
 
         drive(&conn, &fake, &blocks(&layout, 0..1), 2)
@@ -1628,10 +1715,11 @@ mod tests {
         assert_eq!(fake.pieces.lock()[0].2, [&a[32768..], &b[..]].concat());
     }
 
-    // The address a seed is asked at is known before it is asked: a seed
-    // whose URL carries a query is not asked at a local address, by IP or
-    // by a name that resolves to one, and is disabled; at a global address
-    // it is asked (libtorrent `torrent::connect_web_seed`,
+    // The address a seed is asked at is known before it is asked, and is
+    // the first its host resolves to: a seed whose URL carries a query is
+    // not asked at a local address, by IP or by a name whose first address
+    // is one, and is disabled; at a global address it is asked, there only
+    // (libtorrent `torrent::on_name_lookup`, `connect_web_seed`,
     // `ssrf_mitigation`).
     #[tokio::test(start_paused = true)]
     async fn a_query_is_not_asked_of_a_local_address() {
@@ -1639,37 +1727,41 @@ mod tests {
         let server = Server::start(move |head| Reply::ranged(&f, head));
         let port = server.addr.port();
         let layout = layout(&[("f", 100, false)]);
-        let by_name = client_resolving(&["seed.test"], server.addr, true);
+        let clients = Wired::new(server.addr);
         for (url, resolver) in [
             (server.url("/f?x=1"), names(&[])),
             (
                 format!("http://seed.test:{port}/f?x=1"),
-                names(&[("seed.test", "8.8.8.8"), ("seed.test", "10.0.0.1")]),
+                names(&[("seed.test", "10.0.0.1"), ("seed.test", "8.8.8.8")]),
             ),
         ] {
             let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
-            let conn = WebSeedConnection::new(by_name.clone(), resolver, &layout, &link);
+            let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
             let failed = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1).await;
             assert!(failed.is_err(), "{url}");
             assert!(entry(&seeds, |e| e.disabled), "{url}");
         }
         assert!(server.seen().is_empty());
+        assert!(clients.built().is_empty());
 
         let (seeds, link) = one_seed(format!("http://seed.test:{port}/f?x=1"), WebSeedKind::Url);
-        let resolver = names(&[("seed.test", "8.8.8.8")]);
-        let conn = WebSeedConnection::new(by_name, resolver, &layout, &link);
+        let resolver = names(&[("seed.test", "8.8.8.8"), ("seed.test", "10.0.0.1")]);
+        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
         drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
             .await
             .unwrap();
         assert!(!entry(&seeds, |e| e.disabled));
         assert_eq!(server.seen().len(), 1);
+        assert_eq!(clients.built(), [ip("8.8.8.8")]);
     }
 
     // A seed at a global address may not move a file to a local one: the
-    // file is lost to the seed and the local address never asked
+    // engine follows the redirect itself, and the local address is never
+    // asked, nor a client built for it; the file is lost to the seed
     // (libtorrent `web_peer_connection::handle_redirect` sets
-    // `no_local_ips`, `torrent::on_name_lookup`). A client that follows
-    // the redirect itself has asked it already; its answer is not used.
+    // `no_local_ips`, `torrent::on_name_lookup`). Moved to a global address,
+    // the file is fetched there and asked for there, at global addresses
+    // only, from then on.
     #[tokio::test(start_paused = true)]
     async fn a_global_seed_may_not_move_a_file_to_a_local_address() {
         let a = content(100, 6);
@@ -1678,37 +1770,14 @@ mod tests {
         let server = Server::start(move |head| match head.target.as_str() {
             "/seed/f" => Reply::status(302).header(
                 "Location",
-                format!("http://local.test:{}/moved/f", location.lock()),
+                format!("http://moved.test:{}/moved/f", location.lock()),
             ),
             _ => Reply::ranged(&a, head),
         });
         *port.lock() = server.addr.port();
         let url = format!("http://seed.test:{}/seed/", server.addr.port());
         let layout = layout(&[("f", 100, false)]);
-        let resolver = || names(&[("seed.test", "8.8.8.8"), ("local.test", "192.168.1.2")]);
-
-        // The engine follows the redirect.
-        let client = client_resolving(&["seed.test", "local.test"], server.addr, false);
-        let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(client.clone(), resolver(), &layout, &link);
         let requests = blocks(&layout, 0..1);
-        drive(&conn, &Fake::default(), &requests, 1).await.unwrap();
-        assert_eq!(
-            entry(&seeds, |e| e.redirects.clone()),
-            HashMap::from([(
-                0,
-                Redirect {
-                    url: format!("http://local.test:{}/moved/f", server.addr.port()),
-                    no_local_ips: true,
-                }
-            )])
-        );
-        assert!(drive(&conn, &Fake::default(), &requests, 1).await.is_err());
-        assert_eq!(
-            entry(&seeds, |e| e.missing_files.clone()),
-            HashSet::from([0])
-        );
-        assert!(!entry(&seeds, |e| e.disabled));
         let targets = || {
             server
                 .seen()
@@ -1716,19 +1785,160 @@ mod tests {
                 .map(|h| h.target)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(targets(), ["/seed/f"]);
 
-        // The client follows it.
-        let client = client_resolving(&["seed.test", "local.test"], server.addr, true);
-        let (seeds, link) = one_seed(url, WebSeedKind::Url);
-        let conn = WebSeedConnection::new(client, resolver(), &layout, &link);
+        let clients = Wired::new(server.addr);
+        let resolver = names(&[("seed.test", "8.8.8.8"), ("moved.test", "192.168.1.2")]);
+        let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
+        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
         assert!(drive(&conn, &Fake::default(), &requests, 1).await.is_err());
         assert_eq!(
             entry(&seeds, |e| e.missing_files.clone()),
             HashSet::from([0])
         );
+        assert!(!entry(&seeds, |e| e.disabled));
         assert!(entry(&seeds, |e| e.redirects.is_empty()));
+        assert_eq!(targets(), ["/seed/f"]);
+        assert_eq!(clients.built(), [ip("8.8.8.8")]);
+
+        let clients = Wired::new(server.addr);
+        let resolver = names(&[("seed.test", "8.8.8.8"), ("moved.test", "9.9.9.9")]);
+        let (seeds, link) = one_seed(url, WebSeedKind::Url);
+        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+        drive(&conn, &Fake::default(), &requests, 1).await.unwrap();
+        assert_eq!(
+            entry(&seeds, |e| e.redirects.clone()),
+            HashMap::from([(
+                0,
+                Redirect {
+                    url: format!("http://moved.test:{}/moved/f", server.addr.port()),
+                    no_local_ips: true,
+                }
+            )])
+        );
         assert_eq!(targets(), ["/seed/f", "/seed/f", "/moved/f"]);
+        assert_eq!(clients.built(), [ip("8.8.8.8"), ip("9.9.9.9")]);
+    }
+
+    // A request goes to the address its host was checked at, and only
+    // there: the client looks no name up of its own, so a host it was not
+    // built for is reached nowhere; a redirect's host is checked and reached
+    // the same way. The connection's requests to one address share a client.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_goes_to_the_address_its_host_was_checked_at() {
+        let (a, b) = (content(40000, 7), content(10, 8));
+        let (sa, sb) = (a.clone(), b.clone());
+        let port = Arc::new(Mutex::new(0u16));
+        let location = port.clone();
+        let server = Server::start(move |head| match head.target.as_str() {
+            "/seed/t/a" => Reply::ranged(&sa, head),
+            "/seed/t/b" => Reply::status(307).header(
+                "Location",
+                format!("http://moved.test:{}/b", location.lock()),
+            ),
+            "/b" => Reply::ranged(&sb, head),
+            _ => Reply::status(404),
+        });
+        *port.lock() = server.addr.port();
+        let url = format!("http://seed.test:{}/seed/", server.addr.port());
+        let layout = layout(&[("a", 40000, false), ("b", 10, false)]);
+        let resolver = names(&[("seed.test", "127.0.0.1"), ("moved.test", "127.0.0.1")]);
+        let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
+        let conn = WebSeedConnection::new(direct(), resolver, ALL, &layout, &link);
+        let fake = Fake::default();
+        let requests = blocks(&layout, 0..2);
+        drive(&conn, &fake, &requests, requests.len())
+            .await
+            .unwrap();
+
+        let mut torrent = a;
+        torrent.extend(b);
+        assert_eq!(fake.bytes(&layout), torrent);
+        let mut targets: Vec<_> = server.seen().into_iter().map(|h| h.target).collect();
+        targets.sort();
+        assert_eq!(targets, ["/b", "/seed/t/a", "/seed/t/b"]);
+        assert_eq!(
+            entry(&seeds, |e| e.redirects.clone()),
+            HashMap::from([(
+                1,
+                Redirect {
+                    url: format!("http://moved.test:{}/b", server.addr.port()),
+                    no_local_ips: false,
+                }
+            )])
+        );
+        let mut pinned: Vec<_> = conn.pinned.lock().keys().cloned().collect();
+        pinned.sort();
+        let at = ip("127.0.0.1");
+        let port = server.addr.port();
+        assert_eq!(
+            pinned,
+            [
+                ("moved.test".into(), port, at),
+                ("seed.test".into(), port, at)
+            ]
+        );
+        // The same factory's client for no target reaches no such host.
+        let unpinned = direct().client(None).unwrap();
+        assert!(unpinned.get(url).send().await.is_err());
+    }
+
+    // A request follows at most MAX_REDIRECTS redirects; one more fails the
+    // connection, and the seed and its file are kept for a later one
+    // (libtorrent `http_connection`, `m_redirects`).
+    #[tokio::test(start_paused = true)]
+    async fn a_request_follows_at_most_five_redirects() {
+        let f = content(100, 9);
+        for (served_at, ok) in [(MAX_REDIRECTS, true), (MAX_REDIRECTS + 1, false)] {
+            let sf = f.clone();
+            let server = Server::start(move |head| {
+                let hop: usize = head.target.strip_prefix("/r").unwrap().parse().unwrap();
+                if hop == served_at {
+                    Reply::ranged(&sf, head)
+                } else {
+                    Reply::status(302).header("Location", format!("/r{}", hop + 1))
+                }
+            });
+            let layout = layout(&[("f", 100, false)]);
+            let (seeds, link) = one_seed(server.url("/r0"), WebSeedKind::Url);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+            let fake = Fake::default();
+            let fetched = drive(&conn, &fake, &blocks(&layout, 0..1), 1).await;
+            assert_eq!(fetched.is_ok(), ok, "{fetched:?}");
+            let hops: Vec<_> = (0..=MAX_REDIRECTS).map(|i| format!("/r{i}")).collect();
+            let targets: Vec<_> = server.seen().into_iter().map(|h| h.target).collect();
+            assert_eq!(targets, hops);
+            assert!(!entry(&seeds, |e| e.disabled));
+            assert!(entry(&seeds, |e| e.missing_files.is_empty()));
+            let moved = entry(&seeds, |e| e.redirects.get(&0).map(|r| r.url.clone()));
+            assert_eq!(moved, ok.then(|| server.url(&format!("/r{MAX_REDIRECTS}"))));
+        }
+    }
+
+    // The session's IP filter holds for the address a seed's name resolves
+    // to: a blocked address is not asked, and the seed is tried again later
+    // (libtorrent `torrent::connect_web_seed`, `m_ip_filter`).
+    #[tokio::test(start_paused = true)]
+    async fn the_ip_filter_holds_for_the_address_a_name_resolves_to() {
+        let f = content(100, 10);
+        let server = Server::start(move |head| Reply::ranged(&f, head));
+        let url = format!("http://seed.test:{}/f", server.addr.port());
+        let layout = layout(&[("f", 100, false)]);
+        let resolver = || names(&[("seed.test", "127.0.0.1")]);
+        let (seeds, link) = one_seed(url, WebSeedKind::Url);
+
+        let blocked = |a: SocketAddr| a.ip() != ip("127.0.0.1");
+        let conn = WebSeedConnection::new(direct(), resolver(), &blocked, &layout, &link);
+        let failed = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1).await;
+        assert!(failed.is_err());
+        assert!(server.seen().is_empty());
+        assert!(!entry(&seeds, |e| e.disabled));
+        assert!(entry(&seeds, |e| e.missing_files.is_empty()));
+
+        let conn = WebSeedConnection::new(direct(), resolver(), ALL, &layout, &link);
+        drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
+            .await
+            .unwrap();
+        assert_eq!(server.seen().len(), 1);
     }
 
     // A body cut short fails the connection; the whole blocks it carried
@@ -1742,7 +1952,7 @@ mod tests {
         });
         let layout = layout(&[("a", u64::from(PIECE), false)]);
         let (seeds, link) = one_seed(server.url("/a"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
         let fake = Fake::default();
 
         let failed = drive(&conn, &fake, &blocks(&layout, 0..1), 2).await;
@@ -1779,7 +1989,7 @@ mod tests {
             let reply = Mutex::new(Some(reply));
             let server = Server::start(move |_| reply.lock().take().unwrap());
             let (seeds, link) = one_seed(server.url("/a"), WebSeedKind::Url);
-            let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
             let fake = Fake::default();
             assert!(
                 drive(&conn, &fake, &blocks(&layout, 0..1), 1)
@@ -1793,7 +2003,7 @@ mod tests {
         let sa = a.clone();
         let server = Server::start(move |_| Reply::status(200).body(sa.clone()));
         let (_seeds, link) = one_seed(server.url("/a"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
         let fake = Fake::default();
         drive(&conn, &fake, &blocks(&layout, 0..1), 2)
             .await
@@ -1832,7 +2042,7 @@ mod tests {
         });
         let layout = layout(&[("f", 40000, false)]);
         let (seeds, link) = one_seed(server.url("/s.php"), WebSeedKind::Http);
-        let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
 
         let fake = Fake::default();
         let requests = blocks(&layout, 0..2);
@@ -1870,7 +2080,7 @@ mod tests {
         ] {
             let server = Server::start(move |_| Reply::status(503).body(body.clone()));
             let (seeds, link) = one_seed(server.url("/s.php"), WebSeedKind::Http);
-            let conn = WebSeedConnection::new(client(), names(&[]), &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
             assert!(
                 drive(&conn, &Fake::default(), &requests[..1], 1)
                     .await
@@ -1886,8 +2096,9 @@ mod tests {
         let url = format!("http://seed.test:{}/s.php?k=v", server.addr.port());
         let (seeds, link) = one_seed(url, WebSeedKind::Http);
         let conn = WebSeedConnection::new(
-            client_resolving(&["seed.test"], server.addr, true),
+            Wired::new(server.addr),
             names(&[("seed.test", "8.8.8.8")]),
+            ALL,
             &layout,
             &link,
         );
@@ -1922,7 +2133,7 @@ mod tests {
                 kind,
             }]));
             let link = seeds.link(0).unwrap();
-            let conn = WebSeedConnection::new(reqwest::Client::new(), names(&[]), &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
             let mut queue = VecDeque::from(requests);
             std::iter::from_fn(|| conn.take_run(&mut queue))
                 .map(|r| (r.offset, r.len))
@@ -1966,7 +2177,7 @@ mod tests {
                 kind: WebSeedKind::Url,
             }]));
             let link = seeds.link(0).unwrap();
-            WebSeedConnection::new(reqwest::Client::new(), names(&[]), &layout, &link)
+            WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link)
                 .file_target(file)
                 .unwrap()
                 .url

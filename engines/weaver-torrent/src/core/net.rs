@@ -20,7 +20,7 @@
 use std::{
     future::Future,
     io::{self, IoSlice},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -125,4 +125,55 @@ impl Resolver for SystemResolver {
     ) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
         Box::pin(async move { Ok(tokio::net::lookup_host((host, port)).await?.collect()) })
     }
+}
+
+/// Where one HTTP request goes: the host its URL names, its port, and the
+/// addresses the engine checked for that host.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpTarget<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub addrs: &'a [IpAddr],
+}
+
+/// Builds the session's HTTP clients.
+pub trait HttpClients: Send + Sync + 'static {
+    /// With no target, the client for requests it resolves and redirects
+    /// itself: HTTP trackers, metainfo, the block and allow lists. With a
+    /// target, a client that reaches `target.host` at `target.addrs` and
+    /// nowhere else, and follows no redirect; through a proxy that is handed
+    /// the name, the proxy reaches it.
+    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client>;
+}
+
+/// The clients a builder makes, each held to its target.
+impl<F> HttpClients for F
+where
+    F: Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
+{
+    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+        Ok(for_target(self(), target).build()?)
+    }
+}
+
+/// `builder` held to `target`: it follows no redirect, and dials the
+/// target's host at the target's addresses only.
+pub fn for_target(
+    builder: reqwest::ClientBuilder,
+    target: Option<HttpTarget<'_>>,
+) -> reqwest::ClientBuilder {
+    let Some(target) = target else {
+        return builder;
+    };
+    let builder = builder.redirect(reqwest::redirect::Policy::none());
+    // An address in the URL is dialed as it is.
+    if target.host.parse::<IpAddr>().is_ok() {
+        return builder;
+    }
+    let addrs: Vec<SocketAddr> = target
+        .addrs
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, target.port))
+        .collect();
+    builder.resolve_to_addrs(target.host, &addrs)
 }

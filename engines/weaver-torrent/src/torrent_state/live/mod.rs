@@ -73,7 +73,7 @@ use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::core::{
     hash_id::Id20,
     lengths::{ChunkInfo, Lengths, ValidPieceIndex},
-    net::Resolver,
+    net::{HttpClients, Resolver},
     spawn_utils::spawn_with_cancel,
     speed_estimator::SpeedEstimator,
     torrent_metainfo::ValidatedTorrentMetaV1Info,
@@ -437,7 +437,7 @@ impl TorrentStateLive {
             let Some((rx, tx)) = self.peers.admit_web_seed(link.handle()) else {
                 continue;
             };
-            let client = session.reqwest_client.clone();
+            let clients = session.http_clients.clone();
             let resolver = session.resolver.clone();
             self.spawn(
                 debug_span!(parent: self.shared.span.clone(), "web_seed", seed = ?link.handle()),
@@ -448,7 +448,7 @@ impl TorrentStateLive {
                 ),
                 aframe!(
                     self.clone()
-                        .task_manage_web_seed(link, client, resolver, rx, tx, permit, slot)
+                        .task_manage_web_seed(link, clients, resolver, rx, tx, permit, slot)
                 ),
             );
         }
@@ -460,7 +460,7 @@ impl TorrentStateLive {
     async fn task_manage_web_seed(
         self: Arc<Self>,
         link: SeedLink,
-        client: reqwest::Client,
+        clients: Arc<dyn HttpClients>,
         resolver: Arc<dyn Resolver>,
         rx: PeerRx,
         tx: PeerTx,
@@ -490,7 +490,10 @@ impl TorrentStateLive {
             .counters
             .outgoing_connection_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let connection = WebSeedConnection::new(client, resolver, &self.web_layout, &link);
+        // The session's IP filter, on the address the seed's host resolved to.
+        let allowed = |addr| self.may_connect_to(addr);
+        let connection =
+            WebSeedConnection::new(clients, resolver, &allowed, &self.web_layout, &link);
         let res = tokio::select! {
             r = handler.task_peer_chunk_requester() => r,
             r = connection.run(&handler, rx) => r,

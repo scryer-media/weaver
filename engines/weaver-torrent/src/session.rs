@@ -26,7 +26,7 @@ use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
-    net::{Resolver, SystemResolver},
+    net::{HttpClients, Resolver, SystemResolver},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
 };
@@ -247,6 +247,9 @@ pub struct Session {
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) reqwest_client: reqwest::Client,
+    // Builds the clients web seeds are asked through, each held to the
+    // address its request was checked at.
+    pub(crate) http_clients: Arc<dyn HttpClients>,
     // Resolves web seeds' host names, so their addresses are known before
     // they are asked: the socket factory's resolver, or the host's.
     pub(crate) resolver: Arc<dyn Resolver>,
@@ -795,14 +798,18 @@ pub struct SessionOptions {
     /// sockets. See [`SocketFactory`] for what it covers.
     pub socket_factory: Option<Arc<dyn SocketFactory>>,
 
-    /// Use this HTTP client (HTTP trackers, torrent, blocklist and allowlist
-    /// downloads) instead of building one. When set, `bind_device_name` and the identity's User-Agent do not apply to HTTP
-    /// requests; configure them on the client.
+    /// Build the HTTP clients with this instead of the session's own builder.
+    /// Its client for no target asks HTTP trackers and downloads torrents and
+    /// the block and allow lists; a web seed is asked through a client for
+    /// the address the session checked its host at. When set,
+    /// `bind_device_name` and the identity's User-Agent do not apply to HTTP
+    /// requests; configure them on the clients.
     ///
-    /// The client also does its own DNS lookups: [`SocketFactory::resolver`]
-    /// does not apply to it. If HTTP hostname lookups must be routed too, build
-    /// the client with its own resolver (`reqwest::ClientBuilder::dns_resolver`).
-    pub http_client: Option<reqwest::Client>,
+    /// The client for no target does its own DNS lookups:
+    /// [`SocketFactory::resolver`] does not apply to it. If HTTP hostname
+    /// lookups must be routed too, build it with its own resolver
+    /// (`reqwest::ClientBuilder::dns_resolver`).
+    pub http_client: Option<Arc<dyn HttpClients>>,
 
     /// Message stream encryption for peer connections, outgoing and incoming.
     /// Defaults to [`EncryptionPolicy::Disabled`](crate::EncryptionPolicy::Disabled).
@@ -1106,21 +1113,25 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let reqwest_client = if let Some(client) = opts.http_client.take() {
-                client
-            } else {
-                #[allow(unused_mut)]
-                let mut builder = reqwest::Client::builder();
-                #[cfg(not(windows))]
-                if let Some(bd) = opts.bind_device_name.as_ref() {
-                    builder = builder.interface(bd);
+            let http_clients: Arc<dyn HttpClients> = match opts.http_client.take() {
+                Some(clients) => clients,
+                None => {
+                    let user_agent = identity.user_agent.clone();
+                    let bind_device = opts.bind_device_name.clone();
+                    Arc::new(move || {
+                        #[allow(unused_mut)]
+                        let mut builder = reqwest::Client::builder().user_agent(&user_agent);
+                        #[cfg(not(windows))]
+                        if let Some(bd) = bind_device.as_ref() {
+                            builder = builder.interface(bd);
+                        }
+                        builder
+                    })
                 }
-
-                builder
-                    .user_agent(&identity.user_agent)
-                    .build()
-                    .context("error building HTTP(S) client")?
             };
+            let reqwest_client = http_clients
+                .client(None)
+                .context("error building HTTP(S) client")?;
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
@@ -1216,6 +1227,7 @@ impl Session {
                     .is_some_and(|l| l.utp_socket.is_some()),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
+                http_clients,
                 resolver: opts
                     .socket_factory
                     .as_ref()

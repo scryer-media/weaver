@@ -87,7 +87,9 @@ fn answer_with_peer(peer: SocketAddr) -> anyhow::Result<Vec<u8>> {
 fn tracker_session_opts() -> anyhow::Result<SessionOptions> {
     Ok(SessionOptions {
         disable_trackers: false,
-        http_client: Some(reqwest::Client::builder().no_proxy().build()?),
+        http_client: Some(std::sync::Arc::new(|| {
+            reqwest::Client::builder().no_proxy()
+        })),
         ..isolated_session_opts(false)
     })
 }
@@ -266,7 +268,9 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         out.path().into(),
         SessionOptions {
             disable_trackers: false,
-            http_client: Some(reqwest::Client::builder().no_proxy().build()?),
+            http_client: Some(std::sync::Arc::new(|| {
+                reqwest::Client::builder().no_proxy()
+            })),
             ..isolated_session_opts(false)
         },
     )
