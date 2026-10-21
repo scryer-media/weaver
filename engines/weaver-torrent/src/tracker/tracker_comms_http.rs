@@ -51,6 +51,8 @@ pub struct TrackerRequest<'a> {
     pub key: Option<u32>,
     /// The `tracker id` this tracker gave in an earlier answer.
     pub trackerid: Option<&'a [u8]>,
+    /// Our own addresses, each sent as `ipv4=` or `ipv6=` (BEP 7).
+    pub ips: &'a [IpAddr],
 }
 
 #[derive(Deserialize, Debug)]
@@ -235,6 +237,22 @@ impl TrackerRequest<'_> {
         if let Some(trackerid) = self.trackerid {
             s.push_str("&trackerid=");
             s.extend(percent_encode(trackerid, QUERY_VALUE));
+        }
+        // Every IPv4 address, then every IPv6 one (libtorrent
+        // `http_tracker_connection::start`).
+        let v4 = self
+            .ips
+            .iter()
+            .filter(|ip| ip.is_ipv4())
+            .map(|ip| ("ipv4", ip));
+        let v6 = self
+            .ips
+            .iter()
+            .filter(|ip| ip.is_ipv6())
+            .map(|ip| ("ipv6", ip));
+        for (key, ip) in v4.chain(v6) {
+            write!(s, "&{key}=").unwrap();
+            s.extend(percent_encode(ip.to_string().as_bytes(), QUERY_VALUE));
         }
         s
     }
@@ -465,6 +483,7 @@ mod tests {
             numwant: 50,
             key: None,
             trackerid: None,
+            ips: &[],
         };
         dbg!(request.as_querystring());
     }
@@ -490,6 +509,7 @@ mod tests {
                 numwant: 50,
                 key: None,
                 trackerid: None,
+                ips: &[],
             };
             let e: String =
                 id.0.iter()
@@ -579,11 +599,45 @@ mod tests {
             numwant: 200,
             key: None,
             trackerid: id,
+            ips: &[],
         };
         assert!(
             request
                 .as_querystring()
                 .ends_with("&numwant=200&trackerid=a%20b%26"),
+            "{}",
+            request.as_querystring()
+        );
+    }
+
+    #[test]
+    fn our_addresses_go_out_as_ipv4_then_ipv6() {
+        // BEP 7, as libtorrent http_tracker_connection::start sends them.
+        let hash = Id20::new([0x61; 20]);
+        let ips: Vec<IpAddr> = ["2001:db8::1", "198.51.100.7", "2001:db8::2"]
+            .iter()
+            .map(|ip| ip.parse().unwrap())
+            .collect();
+        let request = TrackerRequest {
+            info_hash: &hash,
+            peer_id: &hash,
+            port: 1,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            compact: true,
+            no_peer_id: false,
+            event: None,
+            ip: None,
+            numwant: 200,
+            key: None,
+            trackerid: None,
+            ips: &ips,
+        };
+        assert!(
+            request.as_querystring().ends_with(
+                "&numwant=200&ipv4=198.51.100.7&ipv6=2001%3Adb8%3A%3A1&ipv6=2001%3Adb8%3A%3A2"
+            ),
             "{}",
             request.as_querystring()
         );

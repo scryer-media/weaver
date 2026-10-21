@@ -9,7 +9,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{
@@ -40,7 +40,9 @@ use crate::torrent_state::live::{
     choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     web_seed::WebSeeds,
 };
-use crate::tracker::{AutoScrape, ListenPort, StoppedAnnounces, TrackerComms, UdpTrackerClient};
+use crate::tracker::{
+    AnnounceIps, AutoScrape, ListenPort, StoppedAnnounces, TrackerComms, UdpTrackerClient,
+};
 use crate::upnp::{
     PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, UpnpPortForwarder,
     UpnpPortForwarderOptions,
@@ -240,6 +242,8 @@ pub struct Session {
     identity: Identity,
     announce_port: Arc<AnnouncePort>,
     listen_addr: Option<SocketAddr>,
+    // Our own addresses a private torrent's HTTP announces name.
+    own_ips: AnnounceIps,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) reqwest_client: reqwest::Client,
@@ -287,6 +291,62 @@ pub struct Session {
     pub(crate) disable_pex: bool,
     // Whether the session listens on uTP, and so connects over it.
     pub(crate) utp: bool,
+}
+
+/// Our own addresses as an announce names them (BEP 7 `ipv4=`/`ipv6=`),
+/// read when each announce goes out: the listen address, or for one that
+/// is unspecified, the addresses of the host's interfaces of the families
+/// it accepts (libtorrent `expand_unspecified_address`, re-run as the
+/// interfaces change), each neither local nor loopback
+/// (`torrent::build_tracker_request`). A listener of a socket factory
+/// stands where libtorrent's proxy listen socket does: unspecified, it is
+/// never expanded, since the host's interfaces are not where peers reach
+/// it.
+fn own_ips(listen: Option<SocketAddr>, socket_factory: bool) -> AnnounceIps {
+    let Some(listen) = listen else {
+        return Arc::new(Vec::new);
+    };
+    if !listen.ip().is_unspecified() || socket_factory {
+        let ips = announced_ips(listen.ip(), std::iter::empty());
+        return Arc::new(move || ips.clone());
+    }
+    Arc::new(move || {
+        use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+        let interfaces = match NetworkInterface::show() {
+            Ok(nics) => nics,
+            Err(e) => {
+                debug!("error listing network interfaces: {e:#}");
+                Vec::new()
+            }
+        };
+        announced_ips(
+            listen.ip(),
+            interfaces
+                .iter()
+                .flat_map(|nic| nic.addr.iter().map(|a| a.ip())),
+        )
+    })
+}
+
+/// The addresses of `listen`, or for one that is unspecified, of the
+/// `interfaces` of the families it accepts (an IPv6 one is dual-stack), that
+/// an announce may name: neither unspecified, local nor loopback.
+fn announced_ips(listen: IpAddr, interfaces: impl Iterator<Item = IpAddr>) -> Vec<IpAddr> {
+    use crate::torrent_state::live::peers::holepunch::is_local;
+    let ips: Vec<IpAddr> = if listen.is_unspecified() {
+        interfaces
+            .filter(|ip| listen.is_ipv6() || ip.is_ipv4())
+            .collect()
+    } else {
+        vec![listen]
+    };
+    let mut named = Vec::new();
+    for ip in ips.into_iter().map(|ip| ip.to_canonical()) {
+        if !ip.is_unspecified() && !ip.is_loopback() && !is_local(ip) && !named.contains(&ip) {
+            named.push(ip);
+        }
+    }
+    named
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -1147,6 +1207,10 @@ impl Session {
                     listen_result.as_ref().and_then(|l| l.announce_port),
                 )),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
+                own_ips: own_ips(
+                    listen_result.as_ref().map(|l| l.addr),
+                    opts.socket_factory.is_some(),
+                ),
                 utp: listen_result
                     .as_ref()
                     .is_some_and(|l| l.utp_socket.is_some()),
@@ -2261,6 +2325,13 @@ impl Session {
             Box::new(tracker_rx_stats),
             force_tracker_interval,
             self.announce_port.subscribe(),
+            // Only a private torrent tells its trackers our addresses
+            // (libtorrent `torrent::build_tracker_request`).
+            if is_private {
+                self.own_ips.clone()
+            } else {
+                Arc::new(Vec::new)
+            },
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
@@ -2588,6 +2659,50 @@ mod tests {
 
     fn bstr(s: &str) -> String {
         format!("{}:{s}", s.len())
+    }
+
+    #[test]
+    fn an_announce_names_the_listeners_addresses_that_are_on_the_internet() {
+        // libtorrent expand_unspecified_address and
+        // torrent::build_tracker_request.
+        use super::{announced_ips, own_ips};
+        use std::net::{IpAddr, SocketAddr};
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let nics = || {
+            [
+                "127.0.0.1",
+                "192.168.1.9",
+                "198.51.100.7",
+                "::1",
+                "fe80::1",
+                "fd00::1",
+                "2001:db8::7",
+                "::ffff:203.0.113.5",
+            ]
+            .into_iter()
+            .map(ip)
+        };
+        // A listener on one address names it, whatever the interfaces.
+        assert_eq!(
+            announced_ips(ip("203.0.113.9"), nics()),
+            [ip("203.0.113.9")]
+        );
+        assert_eq!(announced_ips(ip("10.0.0.2"), nics()), [] as [IpAddr; 0]);
+        assert_eq!(announced_ips(ip("::1"), nics()), [] as [IpAddr; 0]);
+        // Unspecified: the interfaces of its families, neither local nor
+        // loopback; an IPv6 listener takes IPv4 too.
+        assert_eq!(announced_ips(ip("0.0.0.0"), nics()), [ip("198.51.100.7")]);
+        assert_eq!(
+            announced_ips(ip("::"), nics()),
+            [ip("198.51.100.7"), ip("2001:db8::7"), ip("203.0.113.5")]
+        );
+        // A socket factory's unspecified listener is never expanded; no
+        // listener names nothing.
+        let any: SocketAddr = "[::]:6881".parse().unwrap();
+        assert_eq!(own_ips(Some(any), true)(), [] as [IpAddr; 0]);
+        assert_eq!(own_ips(None, false)(), [] as [IpAddr; 0]);
+        let one: SocketAddr = "198.51.100.8:6881".parse().unwrap();
+        assert_eq!(own_ips(Some(one), true)(), [ip("198.51.100.8")]);
     }
 
     #[test]

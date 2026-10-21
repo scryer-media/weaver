@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
@@ -48,6 +49,8 @@ pub struct TrackerComms {
     /// The port peers reach this session on, read when each announce goes
     /// out (see [`announced_port`]).
     announce_port: ListenPort,
+    /// Our own addresses an HTTP announce names (see [`AnnounceIps`]).
+    announce_ips: AnnounceIps,
     reqwest_client: reqwest::Client,
     udp_client: UdpTrackerClient,
     key: u32,
@@ -129,6 +132,11 @@ type Sender = tokio::sync::mpsc::Sender<SocketAddr>;
 /// lands after start), so each announce reads it as it goes out (libtorrent
 /// `session_impl::queue_tracker_request` sets `req.listen_port` per request).
 pub type ListenPort = tokio::sync::watch::Receiver<Option<u16>>;
+
+/// Our own addresses an HTTP announce names as `ipv4=` and `ipv6=` (BEP 7),
+/// read as each announce goes out (libtorrent `torrent::build_tracker_request`
+/// reads the session's listen sockets per request).
+pub type AnnounceIps = Arc<dyn Fn() -> Vec<IpAddr> + Send + Sync>;
 
 #[derive(Clone, PartialEq, Eq)]
 enum SupportedTracker {
@@ -1178,6 +1186,7 @@ impl TrackerComms {
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
         listen_port: ListenPort,
+        announce_ips: AnnounceIps,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
     ) -> Option<TrackerTask> {
@@ -1188,6 +1197,7 @@ impl TrackerComms {
             stats,
             force_interval,
             listen_port,
+            announce_ips,
             reqwest_client,
             udp_client,
             StoppedAnnounces::default(),
@@ -1207,6 +1217,7 @@ impl TrackerComms {
     /// returned [`TrackerStatus`]. `listen_port` is the port peers reach this
     /// session on, None when it accepts no connections; when it changes, each
     /// tier announces it as soon as its tracker's `min interval` allows.
+    /// `announce_ips` gives the addresses each HTTP announce names as ours.
     ///
     /// Each of `info_hashes.ids20()` is announced on its own, with its own
     /// events and failover: a hybrid under v1 and the truncated v2, a v2
@@ -1220,6 +1231,7 @@ impl TrackerComms {
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
         listen_port: ListenPort,
+        announce_ips: AnnounceIps,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
@@ -1269,6 +1281,7 @@ impl TrackerComms {
                     force_tracker_interval: force_interval,
                     tx: tx.clone(),
                     announce_port: listen_port.clone(),
+                    announce_ips: announce_ips.clone(),
                     reqwest_client: reqwest_client.clone(),
                     udp_client: udp_client.clone(),
                     key,
@@ -1438,6 +1451,7 @@ impl TrackerComms {
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
+        let ips = (self.announce_ips)();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
@@ -1452,6 +1466,7 @@ impl TrackerComms {
             numwant: numwant(event),
             key: Some(self.key),
             trackerid: trackerid.as_deref(),
+            ips: &ips,
         };
 
         let bytes = tracker_comms_http::get(
@@ -1912,6 +1927,60 @@ mod tests {
         token.cancel();
     }
 
+    /// A torrent that names none of its own addresses.
+    fn no_ips() -> super::AnnounceIps {
+        Arc::new(Vec::new)
+    }
+
+    #[tokio::test]
+    async fn an_http_announce_names_our_addresses_as_they_are_when_it_goes_out() {
+        // BEP 7; libtorrent torrent::build_tracker_request reads the listen
+        // sockets per request.
+        let (listener, url) = http_listener().await;
+        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        let ips = Arc::new(Mutex::new(vec![std::net::IpAddr::from([198, 51, 100, 7])]));
+        let announce_ips: super::AnnounceIps = {
+            let ips = ips.clone();
+            Arc::new(move || ips.lock().clone())
+        };
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            listen_port,
+            announce_ips,
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            udp_client,
+            StoppedAnnounces::default(),
+        )
+        .unwrap()
+        .peers;
+        let first = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&first, "ipv4"), Some("198.51.100.7"));
+        assert_eq!(query_param(&first, "ipv6"), None);
+
+        *ips.lock() = vec!["2001:db8::1".parse().unwrap()];
+        port.send_replace(Some(40001));
+        let second = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = next_announce(&listener) => q,
+        };
+        assert_eq!(query_param(&second, "ipv4"), None);
+        assert_eq!(query_param(&second, "ipv6"), Some("2001%3Adb8%3A%3A1"));
+        drop(peers);
+        token.cancel();
+    }
+
     fn v1_hash() -> InfoHashes {
         InfoHashes {
             v1: Some(Id20::new([1; 20])),
@@ -1942,6 +2011,7 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -2096,6 +2166,7 @@ mod tests {
             Box::new(()),
             None,
             listen_port,
+            no_ips(),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             StoppedAnnounces::default(),
@@ -2147,6 +2218,7 @@ mod tests {
             Box::new(stats.clone()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -2221,6 +2293,7 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
             reqwest::Client::builder()
                 .no_proxy()
                 .user_agent("Session/1.0")
@@ -2284,6 +2357,7 @@ mod tests {
             Box::new(stats.clone()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -2349,6 +2423,7 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
             reqwest::Client::new(),
             udp_client,
             stopped.clone(),
@@ -2389,6 +2464,7 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -2744,6 +2820,7 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
