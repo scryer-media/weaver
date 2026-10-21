@@ -207,7 +207,9 @@ async fn unexpected_nntp_eof_cools_only_the_connection_route_and_retries() {
     route.revoke().await;
 }
 
-#[tokio::test]
+// The paused clock lets only the stalled primary's establishment budget move
+// time, so a loaded runner cannot spend the fallback's soft budget.
+#[tokio::test(start_paused = true)]
 async fn fallback_establishment_preserves_article_and_lane_soft_budgets() {
     // Primary establishment exceeds the article budget. Each operation starts
     // with a fresh route so a previous request cannot hide the timeout gap.

@@ -430,10 +430,11 @@ async fn completion_critical_work_orders_a_job_but_never_outranks_the_hot_job() 
     );
 }
 
-// Rule 7: soft byte pressure narrows the field to the hot job and clamps the
-// handout to a single article, with no spill while memory drains.
+// Rule 6: soft byte pressure clamps the handout to a single article and
+// changes nothing else. The hot job still leads, and a blocked hot job still
+// passes the server down the walk.
 #[tokio::test]
-async fn soft_pressure_clamps_to_one_article_of_the_hot_job() {
+async fn soft_pressure_clamps_to_one_article_and_still_spills() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let hot = JobId(71071);
@@ -450,19 +451,55 @@ async fn soft_pressure_clamps_to_one_article_of_the_hot_job() {
     assert_eq!(works.len(), 1);
     assert_eq!(single_job(&works), hot);
 
-    // With the hot job blocked as well, soft pressure refuses to open a
-    // second job rather than spilling into it.
+    // The hot job blocked on this server passes it to the next job, still
+    // one article at a time.
     block_on_checkpoint(&mut pipeline, hot);
-    assert!(matches!(
-        ask(&mut pipeline, SERVER_A, 8, None),
-        Handout::Idle
-    ));
-    assert_eq!(queued(&pipeline, next), 200);
+    let works = taken(ask(&mut pipeline, SERVER_A, 8, None));
+    assert_eq!(works.len(), 1);
+    assert_eq!(single_job(&works), next);
+    assert_eq!(queued(&pipeline, next), 199);
+    assert_eq!(idle_with_servable(&pipeline), 0);
+}
+
+// The wedge of issue 97: the hot job's own buffered bytes hold the link at
+// soft pressure while a clause refuses it on every server, and the bytes
+// wait on articles that clause holds back. Nothing else may idle: the next
+// job takes the server, one article at a time, so the link keeps carrying
+// and the backlog has something running to drain it.
+#[tokio::test]
+async fn soft_pressure_raised_by_a_hot_job_blocked_everywhere_does_not_idle_the_link() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let hot = JobId(71097);
+    add_job(&mut pipeline, hot, "Buffered Reel", 40).await;
+    for index in 1..6 {
+        add_job(&mut pipeline, JobId(hot.0 + index), "Waiting Reel", 40).await;
+    }
+    // The hot job's remaining articles are refused on both servers.
+    rewrite_queue(&mut pipeline, hot, |work| {
+        work.exclude_servers = vec![SERVER_A, SERVER_B];
+    });
+    // Its reorder buffers alone put the write backlog at the soft mark.
+    let (_, _, write_soft, _) = pipeline.download_pressure_limits();
+    pipeline
+        .metrics
+        .write_buffered_bytes
+        .store(write_soft, Ordering::Relaxed);
     assert_eq!(
-        idle_with_servable(&pipeline),
-        0,
-        "a listed gate is not an unexplained idle slot"
+        pipeline.refresh_download_pressure().state,
+        DownloadPressureState::Soft
     );
+
+    for server in [SERVER_A, SERVER_B] {
+        let works = taken(ask(&mut pipeline, server, 8, None));
+        assert_eq!(works.len(), 1, "server {server} was sent away empty");
+        assert_eq!(single_job(&works), JobId(hot.0 + 1));
+    }
+    assert_eq!(queued(&pipeline, hot), 40);
+    assert_eq!(queued(&pipeline, JobId(hot.0 + 1)), 38);
+    assert_eq!(handouts_hot(&pipeline), 0);
+    assert_eq!(handouts_spill(&pipeline), 2);
+    assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
 #[tokio::test(start_paused = true)]

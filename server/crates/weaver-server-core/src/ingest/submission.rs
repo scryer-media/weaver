@@ -39,6 +39,8 @@ pub struct SubmittedJob {
     pub summary: SubmittedJobSummary,
     pub created_at_epoch_ms: f64,
     pub duplicate_outcome: SubmissionDuplicateOutcome,
+    // Whether the job was added paused: asked for, or a duplicate held back.
+    pub paused: bool,
 }
 
 #[derive(Clone)]
@@ -379,6 +381,7 @@ async fn submit_prepared_nzb(
                 summary: submitted_summary,
                 created_at_epoch_ms: created_at as f64 * 1000.0,
                 duplicate_outcome: SubmissionDuplicateOutcome::Parked { decision, semantic },
+                paused: false,
             });
         }
         DuplicateAdmission::Idempotent { job_id, created_at } => {
@@ -389,6 +392,7 @@ async fn submit_prepared_nzb(
                 summary: submitted_summary,
                 created_at_epoch_ms: created_at as f64 * 1000.0,
                 duplicate_outcome: SubmissionDuplicateOutcome::IdempotentReplay,
+                paused: false,
             });
         }
         DuplicateAdmission::IdempotencyConflict { job_id } => {
@@ -423,6 +427,7 @@ async fn submit_prepared_nzb(
     // Captured before `spec` moves into the scheduler; the submission origin is
     // only knowable here, so this is where the submitted counter is recorded.
     let submitted_category = spec.category.clone();
+    let paused = options.add_paused || duplicate_pause;
 
     if let Err(error) = handle
         .add_job_with_options(
@@ -431,7 +436,7 @@ async fn submit_prepared_nzb(
             nzb_path.clone(),
             nzb_zstd,
             crate::jobs::AddJobOptions {
-                initially_paused: options.add_paused || duplicate_pause,
+                initially_paused: paused,
                 semantic_materialization_generation,
                 semantic_promotion_generation: None,
                 supplied_password_candidates: options.supplied_password_candidates.clone(),
@@ -456,6 +461,7 @@ async fn submit_prepared_nzb(
                     decision: materialization_decision,
                     semantic,
                 },
+                paused: false,
             });
         }
         rollback_accepted_submission(db, job_id, superseded_job_id).await;
@@ -490,6 +496,7 @@ async fn submit_prepared_nzb(
         summary: submitted_summary,
         created_at_epoch_ms,
         duplicate_outcome,
+        paused,
     })
 }
 

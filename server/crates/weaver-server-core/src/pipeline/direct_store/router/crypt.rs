@@ -470,7 +470,7 @@ impl HeaderKeyRing {
 // One member's derived key material. Copied out of `unrar-rs`'s zeroizing
 // carrier deliberately: the router needs the key for the life of the set, and
 // the alternative is re-running a 2^n PBKDF2 per span.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct MemberKeys {
     // The cipher and its key: AES-256 for RAR5, AES-128 for RAR4. Carrying the
     // width in the value is what lets every transform below be written once.
@@ -1730,7 +1730,7 @@ impl MemberCrypt {
         covered: &ByteRanges,
     ) -> Option<MemberCipher> {
         Some(MemberCipher {
-            key: self.keys.key,
+            key: self.keys.key.clone(),
             iv: self.iv,
             unpacked_size,
             cipher_size: self.cipher_size?,
@@ -1886,7 +1886,7 @@ mod tests {
             let mut ring = KeyRing::new();
             ring.set_sevenz_password(secret, sevenz_turbo::Password::new(secret));
             let keys = ring.admit_sevenz(&facts).unwrap();
-            let mut crypt = MemberCrypt::new_sevenz(keys, &facts, length as u64);
+            let mut crypt = MemberCrypt::new_sevenz(keys.clone(), &facts, length as u64);
             let mut decoded = vec![0; posted.len()];
             for start in (0..posted.len()).step_by(64 * 1024).rev() {
                 let end = (start + 64 * 1024).min(posted.len());
@@ -1940,11 +1940,11 @@ mod tests {
     // Key equality without a `Debug` bound: [`MemberCipherKey`] deliberately
     // has none, so `assert_eq!` cannot be used on one — a key that reaches a
     // panic message is a key in a log.
-    fn assert_same_key(left: MemberCipherKey, right: MemberCipherKey, what: &str) {
+    fn assert_same_key(left: &MemberCipherKey, right: &MemberCipherKey, what: &str) {
         assert!(left == right, "{what}: keys must match");
     }
 
-    fn assert_different_key(left: MemberCipherKey, right: MemberCipherKey, what: &str) {
+    fn assert_different_key(left: &MemberCipherKey, right: &MemberCipherKey, what: &str) {
         assert!(left != right, "{what}: keys must differ");
     }
 
@@ -2058,7 +2058,7 @@ mod tests {
         ring.set_password(Some("right"));
         let first = ring.admit(&keying(None)).expect("admitted");
         let second = ring.admit(&keying(None)).expect("admitted");
-        assert_same_key(first.key, second.key, "one tuple, one derivation");
+        assert_same_key(&first.key, &second.key, "one tuple, one derivation");
         assert_eq!(ring.keys.len(), 1);
     }
 
@@ -2429,14 +2429,14 @@ mod tests {
         let other_salt = ring
             .admit(&rar4_keying(Some([0x11u8; 8])))
             .expect("admitted");
-        assert_different_key(right.key, other_salt.key, "a different salt");
+        assert_different_key(&right.key, &other_salt.key, "a different salt");
         assert_ne!(right.iv, other_salt.iv);
         assert_eq!(ring.keys.len(), 2);
 
         // And a saltless header is a third, complete description rather than a
         // missing one.
         let saltless = ring.admit(&rar4_keying(None)).expect("admitted");
-        assert_different_key(right.key, saltless.key, "a saltless header");
+        assert_different_key(&right.key, &saltless.key, "a saltless header");
         assert_eq!(ring.keys.len(), 3);
 
         // The same salt twice is one derivation, which is the whole point of the
@@ -2444,7 +2444,7 @@ mod tests {
         let again = ring
             .admit(&rar4_keying(Some([0x9Bu8; 8])))
             .expect("admitted");
-        assert_same_key(again.key, right.key, "the same salt twice");
+        assert_same_key(&again.key, &right.key, "the same salt twice");
         assert_eq!(again.iv, right.iv);
         assert_eq!(ring.keys.len(), 3);
     }
@@ -2462,8 +2462,8 @@ mod tests {
         let (expected_key, expected_iv) =
             unrar_rs::rar4_derive_key("moonlit-harbour", Some(&[0x9Bu8; 8]));
         assert_same_key(
-            keys.key,
-            MemberCipherKey::Aes128(expected_key),
+            &keys.key,
+            &MemberCipherKey::Aes128(expected_key),
             "the router's key is the library's derivation",
         );
         assert_eq!(keys.iv, expected_iv);

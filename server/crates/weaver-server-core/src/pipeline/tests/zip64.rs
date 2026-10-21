@@ -49,7 +49,7 @@ fn zip64_fixture_with_compression(
         let packed_len = packed.len() as u64;
         let offset = archive.len() as u64;
         let len = bytes.len() as u64;
-        let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32;
+        let crc = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32;
         archive.extend(0x04034b50u32.to_le_bytes());
         for v in [45u16, flags, method, 0, 0] {
             archive.extend(v.to_le_bytes());

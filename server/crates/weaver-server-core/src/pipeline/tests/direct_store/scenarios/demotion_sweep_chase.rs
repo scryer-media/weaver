@@ -91,6 +91,7 @@ async fn hand_back_next_swept_message(pipeline: &mut Pipeline) -> Option<u32> {
         crate::pipeline::DirectDemotionProgress::Finished { .. } => None,
     };
     pipeline.handle_direct_demotion_done(done).await;
+    settle_segment_write_work(pipeline).await;
     reported
 }
 

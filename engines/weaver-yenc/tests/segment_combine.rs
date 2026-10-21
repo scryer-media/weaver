@@ -7,9 +7,8 @@
 // re-reading the file.
 //
 // The pipeline requires one combine, not three. `weaver_yenc::crc32_combine` forwards to
-// `crc-fast`'s `checksum_combine` (already in this crate's dependency set,
-// same Mark Adler GF(2) zeros-operator construction) rather than pulling the
-// PAR2 library down into the yEnc codec. This differential is what makes that
+// `crc-turbo`'s `checksum_combine` (already in this crate's dependency set)
+// rather than pulling the PAR2 library down into the yEnc codec. This differential is what makes that
 // substitution safe: the segments produced here are consumed by the evidence
 // collector, which folds them with `Crc32CombineOp`, so the two must agree on
 // every input, not merely be "both correct by construction".

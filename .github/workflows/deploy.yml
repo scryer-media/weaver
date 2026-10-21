@@ -16,6 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   NODE_VERSION: "25"
   RUST_TOOLCHAIN: "1.97.1"
   WEAVER_ENABLE_DIAGNOSTICS: "0"
@@ -175,15 +176,33 @@ jobs:
 
   rust-audit:
     name: rust-audit
-    needs: [changes]
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    needs: [changes, verify-release-tag]
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
         with:
           tool: cargo-audit
@@ -199,6 +218,7 @@ jobs:
     timeout-minutes: 20
     needs: [changes, verify-release-tag, web-build]
     env:
+      RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -217,7 +237,6 @@ jobs:
         with:
           cache-bin: false
       - name: Install sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
@@ -355,6 +374,11 @@ jobs:
     timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
       CARGO_INCREMENTAL: "0"
       AWS_LC_SYS_USE_SYSTEM: "0"
       AWS_LC_SYS_STATIC: "1"
@@ -400,6 +424,18 @@ jobs:
         with:
           cache-bin: false
           key: clippy-windows-x86_64
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-pc-windows-msvc/
       - name: Download embedded web artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -415,6 +451,11 @@ jobs:
     timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
       CARGO_INCREMENTAL: "0"
       AWS_LC_SYS_USE_SYSTEM: "0"
       AWS_LC_SYS_STATIC: "1"
@@ -464,6 +505,18 @@ jobs:
         with:
           cache-bin: false
           key: test-windows-x86_64
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-pc-windows-msvc/
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
         with:
           tool: nextest
@@ -479,15 +532,33 @@ jobs:
 
   rust-test-arm:
     name: rust-test-arm-yenc
-    needs: [changes]
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    needs: [changes, verify-release-tag]
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/aarch64-unknown-linux-gnu/
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: false
@@ -513,10 +584,16 @@ jobs:
 
   rust-test-sde:
     name: rust-test-sde-yenc-${{ matrix.name }}
-    needs: [changes]
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    needs: [changes, verify-release-tag]
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -540,6 +617,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: false
@@ -640,10 +729,16 @@ jobs:
 
   rust-yenc-simd-targets:
     name: rust-yenc-simd-${{ matrix.name }}
-    needs: [changes]
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    needs: [changes, verify-release-tag]
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -659,6 +754,18 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add ${{ matrix.target }}
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/${{ matrix.target }}/
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: false
@@ -689,6 +796,7 @@ jobs:
       AWS_LC_SYS_CMAKE_BUILDER: "0"
       CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       CXXFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -710,7 +818,6 @@ jobs:
           cache-on-failure: false
           key: package-linux-x86_64-portable
       - name: Install sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
@@ -741,6 +848,8 @@ jobs:
           # built for a smaller page than the kernel it runs on will not work.
           # Pinned per target so the artifact never inherits a runner's page size.
           export JEMALLOC_SYS_WITH_LG_PAGE=12
+          entropy_headers="$(bash .github/scripts/prepare-musl-entropy.sh "$RUNNER_TEMP")"
+          export AWS_LC_SYS_CFLAGS="${CFLAGS_x86_64_unknown_linux_musl} -idirafter ${entropy_headers}"
           mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
@@ -786,6 +895,7 @@ jobs:
       # and any configure probe using atomics reports the feature missing.
       CFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
       CXXFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
+      RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -807,7 +917,6 @@ jobs:
           cache-on-failure: false
           key: package-linux-arm64-portable
       - name: Install sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
@@ -839,6 +948,8 @@ jobs:
           # Linux ships both 4 KiB and 64 KiB kernels, so this portable artifact
           # is built for the larger one, which runs correctly on both.
           export JEMALLOC_SYS_WITH_LG_PAGE=16
+          entropy_headers="$(bash .github/scripts/prepare-musl-entropy.sh "$RUNNER_TEMP")"
+          export AWS_LC_SYS_CFLAGS="${CFLAGS_aarch64_unknown_linux_musl} -idirafter ${entropy_headers}"
           mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
@@ -881,6 +992,7 @@ jobs:
       AWS_LC_SYS_CMAKE_BUILDER: "0"
       CFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       CXXFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -900,7 +1012,6 @@ jobs:
           cache-on-failure: false
           key: package-darwin-x86_64-portable
       - name: Install sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
@@ -1150,6 +1261,7 @@ jobs:
       AWS_LC_SYS_CMAKE_BUILDER: "0"
       CFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       CXXFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -1167,7 +1279,6 @@ jobs:
           cache-on-failure: false
           key: package-darwin-arm64-portable
       - name: Install sccache
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
@@ -2443,8 +2554,29 @@ jobs:
       contents: write
       id-token: write
     environment: release-credentials
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Install SLSA verifier

@@ -47,7 +47,7 @@ serde = { workspace = true }
 blake3 = { workspace = true }
 unicode-normalization = { workspace = true }
 unicase = { version = "2.9.0", default-features = false }
-crc-fast = { workspace = true }
+crc-turbo = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }

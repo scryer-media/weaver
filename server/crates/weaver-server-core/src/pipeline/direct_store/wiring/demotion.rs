@@ -114,6 +114,9 @@ impl Pipeline {
         reason: DemotionReason,
         handoffs: &[SegmentId],
     ) {
+        // A batch of the job's files still out to the disk owner would land
+        // over the sweep's image: it lands first.
+        self.settle_segment_writes_for_job(job_id).await;
         // Read before the claim, so the set being demoted is counted among the
         // sets that were sharing the holds limits when it gave up.
         let live_sets = self.direct_store.live_set_count();
@@ -1370,17 +1373,8 @@ impl Pipeline {
         }
 
         for (file_id, ready, contiguous_end) in unblocked {
-            if let Err(error) = self
-                .persist_ready_segments(file_id, ready, contiguous_end)
-                .await
-            {
-                warn!(
-                    job_id = job_id.0,
-                    file_index = file_id.file_index,
-                    error = %error,
-                    "failed to write the articles a demoted volume's handback unblocked"
-                );
-            }
+            self.persist_ready_segments(file_id, ready, contiguous_end)
+                .await;
         }
 
         // Only files the sweep rebuilt nothing for: everything else has legacy

@@ -670,6 +670,15 @@ async fn uu_missing_spool_file_fails_job_without_leaking_accounting() {
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Failed { .. })
     ));
+    // The failed job's write still out is the disk owner's until it answers.
+    while !pipeline.orphaned_segment_writes.is_empty() {
+        let done = pipeline
+            .segment_write_done_rx
+            .recv()
+            .await
+            .expect("the segment write channel stays open");
+        pipeline.handle_segment_write_done(done).await;
+    }
     assert_eq!(pipeline.uu_spooled_bytes, 0);
     assert_eq!(pipeline.uu_spooled_segments, 0);
     assert_eq!(

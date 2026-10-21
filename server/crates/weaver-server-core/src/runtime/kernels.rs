@@ -52,8 +52,8 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             KernelComponent::YencCrc32,
             "weaver-yenc",
             crc_ladder(),
-            yenc_crc_kernel,
-            &[],
+            crc_kernel,
+            &[crc_turbo::TIER_ENV],
         ),
         selection(
             KernelComponent::Par2Repair,
@@ -78,8 +78,8 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             KernelComponent::Par2Crc32,
             "par2-rs",
             crc_ladder(),
-            rarpar_crc_kernel,
-            &[RARPAR_CRC_ENV],
+            crc_kernel,
+            &[crc_turbo::TIER_ENV],
         ),
         selection(
             KernelComponent::RarRecovery,
@@ -92,8 +92,8 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
             KernelComponent::RarCrc32,
             "unrar-rs",
             crc_ladder(),
-            rarpar_crc_kernel,
-            &[RARPAR_CRC_ENV],
+            crc_kernel,
+            &[crc_turbo::TIER_ENV],
         ),
         selection(
             KernelComponent::RarSha1,
@@ -194,10 +194,6 @@ const CRC_PMULL_SHA3: &str = "PMULL + SHA3";
 const CRC_PMULL: &str = "PMULL";
 const CRC_TABLES: &str = "Lookup tables";
 
-// `RARPAR_CRC32_VPCLMUL`: `0` stands the 256-bit fold down, `1` engages it
-// alongside AVX-512VL too. It never enables the fold on a CPU without it.
-const RARPAR_CRC_ENV: &str = "RARPAR_CRC32_VPCLMUL";
-
 fn crc_ladder() -> Vec<&'static str> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -219,45 +215,57 @@ fn crc_ladder() -> Vec<&'static str> {
     }
 }
 
-// The tier `crc-fast` runs for everything the 256-bit fold does not take.
-fn crc_fast_kernel() -> &'static str {
-    match crc_fast::get_calculator_target(crc_fast::CrcAlgorithm::Crc32IsoHdlc).as_str() {
+// The tier `crc-turbo` runs.
+fn crc_turbo_kernel() -> &'static str {
+    match crc_turbo::get_calculator_target(crc_turbo::CrcAlgorithm::Crc32IsoHdlc).as_str() {
         "x86_64-avx512-vpclmulqdq" => CRC_VPCLMUL_512,
         "x86_64-avx512-pclmulqdq" => CRC_PCLMUL_512,
-        "x86_64-sse-pclmulqdq" => CRC_PCLMUL_128,
+        "x86_64-avx2-vpclmulqdq" => CRC_VPCLMUL_256,
+        "x86_64-sse-pclmulqdq" | "x86-sse-pclmulqdq" => CRC_PCLMUL_128,
         "aarch64-neon-pmull-sha3" => CRC_PMULL_SHA3,
         "aarch64-neon-pmull" => CRC_PMULL,
         _ => CRC_TABLES,
     }
 }
 
-fn yenc_crc_kernel(_read_env: bool) -> &'static str {
-    if weaver_yenc::crc::wide_fold_selected() {
-        CRC_VPCLMUL_256
-    } else {
-        crc_fast_kernel()
+// weaver-yenc, par2-rs and unrar-rs all hash through crc-turbo. Its tier
+// gate is private, so the CPU's own pick mirrors its probes; the live tier is
+// the one `crc_turbo::TIER_ENV` may have narrowed it to.
+fn crc_kernel(read_env: bool) -> &'static str {
+    if read_env {
+        return crc_turbo_kernel();
     }
-}
-
-// par2-rs and unrar-rs carry the same fold behind the same gate.
-fn rarpar_crc_kernel(read_env: bool) -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        let capable = is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("pclmulqdq")
-            && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("vpclmulqdq");
-        let fold = if env_is(read_env, RARPAR_CRC_ENV, "0") || !capable {
-            false
-        } else {
-            env_is(read_env, RARPAR_CRC_ENV, "1") || !is_x86_feature_detected!("avx512vl")
-        };
-        if fold {
+        let pclmul = is_x86_feature_detected!("sse4.1") && is_x86_feature_detected!("pclmulqdq");
+        let avx512 =
+            pclmul && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx512bw");
+        let vpclmul = pclmul && is_x86_feature_detected!("vpclmulqdq");
+        if avx512 && vpclmul {
+            return CRC_VPCLMUL_512;
+        }
+        if avx512 {
+            return CRC_PCLMUL_512;
+        }
+        if vpclmul && is_x86_feature_detected!("avx2") {
             return CRC_VPCLMUL_256;
         }
+        if pclmul {
+            return CRC_PCLMUL_128;
+        }
     }
-    let _ = read_env;
-    crc_fast_kernel()
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("aes") {
+            return if is_aarch64_feature_detected!("sha3") {
+                CRC_PMULL_SHA3
+            } else {
+                CRC_PMULL
+            };
+        }
+    }
+    CRC_TABLES
 }
 
 // --- GF(2^16) --------------------------------------------------------------
