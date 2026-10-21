@@ -1387,20 +1387,18 @@ impl Session {
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
         let handshake_timeout = self.peer_opts.handshake_timeout();
 
-        let incoming_ip = addr.ip();
-        if self.blocklist.has(incoming_ip) {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is in blocklist");
-        }
-        if self.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is not in allowlist");
+        // The session's one address rule, whichever direction the connection
+        // goes (libtorrent `session_impl::incoming_connection` refuses a
+        // filtered endpoint with `peer_blocked_alert::ip_filter`; it never
+        // sees one of a family it has no listen socket for).
+        if let Err(why) = self.may_reach(addr.ip()) {
+            if why == Unreachable::Filtered {
+                self.stats
+                    .counters
+                    .blocked_incoming
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            bail!("incoming connection refused: {} is {why}", addr.ip());
         }
 
         // With encryption enabled, an encrypted connection is unwrapped here
@@ -3763,5 +3761,110 @@ mod tests {
             assert_eq!(start.elapsed(), DEFAULT_HANDSHAKE_TIMEOUT, "{encryption:?}");
             session.stop().await;
         }
+    }
+
+    // A session for the incoming-connection rule tests, with nothing that
+    // reaches out.
+    async fn quiet_session(dir: &TempDir, opts: SessionOptions) -> std::sync::Arc<Session> {
+        Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..opts
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    // Writes an IP list holding `range` into `dir`; returns its file URL.
+    fn ip_list(dir: &TempDir, name: &str, range: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("test:{range}\n")).unwrap();
+        url::Url::from_file_path(path).unwrap().to_string()
+    }
+
+    // Hands the session an incoming connection from `addr` whose peer stays
+    // open and sends nothing, and polls the check once: the refusal when it
+    // refuses without reading, `None` while it waits on the peer's handshake.
+    fn check_once(session: &std::sync::Arc<Session>, addr: &str) -> Option<String> {
+        use crate::{peer_info_reader::tests::halves, stream_connect::ConnectionKind};
+        use futures::FutureExt;
+        let (ours, _theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = halves(ours);
+        session
+            .clone()
+            .check_incoming_connection(addr.parse().unwrap(), ConnectionKind::Tcp, reader, writer)
+            .now_or_never()
+            .map(|checked| format!("{:#}", checked.err().unwrap()))
+    }
+
+    fn blocked_incoming(session: &Session) -> u64 {
+        session
+            .stats
+            .counters
+            .blocked_incoming
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // An incoming connection passes the rule an outgoing one does: libtorrent
+    // `session_impl::incoming_connection` refuses an endpoint its one
+    // `ip_filter` blocks (`peer_blocked_alert::ip_filter`) before reading a
+    // byte, and the blocklist and the allowlist are that one filter.
+    #[tokio::test(start_paused = true)]
+    async fn an_incoming_connection_from_a_filtered_address_is_refused_unread() {
+        let dir = TempDir::with_prefix("incoming_filtered").unwrap();
+        let session = quiet_session(
+            &dir,
+            SessionOptions {
+                blocklist_url: Some(ip_list(&dir, "block.txt", "10.0.0.1-10.0.0.1")),
+                allowlist_url: Some(ip_list(&dir, "allow.txt", "10.0.0.0-10.0.0.255")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // On the blocklist, then off the allowlist: each refused unread, and
+        // counted.
+        for (counted, addr) in [(1, "10.0.0.1:6881"), (2, "192.0.2.1:6881")] {
+            let refusal = check_once(&session, addr).expect("refused unread");
+            assert!(refusal.contains("banned by the IP filter"), "{refusal}");
+            assert_eq!(blocked_incoming(&session), counted);
+        }
+
+        // Let through, the check waits on the peer's handshake.
+        assert_eq!(check_once(&session, "10.0.0.2:6881"), None);
+        assert_eq!(blocked_incoming(&session), 2);
+        session.stop().await;
+    }
+
+    // An IPv4-only session refuses an IPv6 peer whichever way the connection
+    // goes. libtorrent's session has no listen socket of a family it does not
+    // connect over, so `incoming_connection` never sees such a peer and posts
+    // no `peer_blocked_alert` for it: the refusal is not counted as blocked.
+    #[tokio::test(start_paused = true)]
+    async fn an_ipv6_incoming_connection_on_an_ipv4_only_session_is_refused() {
+        let dir = TempDir::with_prefix("incoming_family").unwrap();
+        let session = quiet_session(
+            &dir,
+            SessionOptions {
+                ipv4_only: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let refusal = check_once(&session, "[2001:db8::1]:6881").expect("refused unread");
+        assert!(
+            refusal.contains("of a family the session does not connect over"),
+            "{refusal}"
+        );
+        assert_eq!(blocked_incoming(&session), 0);
+
+        assert_eq!(check_once(&session, "192.0.2.1:6881"), None);
+        session.stop().await;
     }
 }
