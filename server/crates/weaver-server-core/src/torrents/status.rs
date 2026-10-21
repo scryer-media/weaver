@@ -33,6 +33,8 @@ pub enum Engine {
     Live {
         finished: bool,
         peers: u32,
+        /// A write found no room: it fetches nothing and keeps seeding.
+        upload_mode: bool,
     },
     Paused {
         finished: bool,
@@ -50,6 +52,7 @@ impl Engine {
                     .live
                     .as_ref()
                     .map_or(0, |live| live.snapshot.peer_stats.live),
+                upload_mode: stats.live.as_ref().is_some_and(|live| live.upload_mode),
             },
             TorrentStatsState::Paused => Self::Paused {
                 finished: stats.finished,
@@ -116,7 +119,6 @@ pub struct Observed {
     /// Why unpacking refused the torrent's output, while that stands.
     pub failed: Option<String>,
     pub held: Option<Held>,
-    pub disk_full: bool,
 }
 
 /// The state and the reason behind it, when there is one to give.
@@ -141,9 +143,6 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
     if let Some(held) = &seen.held {
         return (held.state(), Some(held.detail(seen.complete)));
     }
-    if seen.disk_full {
-        return (TorrentState::Stalled, detail(DISK_FULL));
-    }
     if !seen.has_metadata {
         return (TorrentState::FetchingMetadata, None);
     }
@@ -156,6 +155,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         Engine::Live { .. } | Engine::Paused { .. } if seen.complete => {
             (TorrentState::Seeding, None)
         }
+        Engine::Live {
+            upload_mode: true, ..
+        } => (TorrentState::Stalled, detail(DISK_FULL)),
         Engine::Live { peers: 0, .. } => (TorrentState::Stalled, None),
         Engine::Live { .. } => (TorrentState::Downloading, None),
         Engine::Paused { .. } => (TorrentState::Paused, None),
@@ -400,7 +402,6 @@ mod tests {
             paused_by: None,
             failed: None,
             held: None,
-            disk_full: false,
         }
     }
 
@@ -409,6 +410,7 @@ mod tests {
         let live = Engine::Live {
             finished: false,
             peers: 3,
+            upload_mode: false,
         };
         assert_eq!(
             project(&seen(live.clone())),
@@ -417,7 +419,8 @@ mod tests {
         assert_eq!(
             project(&seen(Engine::Live {
                 finished: false,
-                peers: 0
+                peers: 0,
+                upload_mode: false,
             })),
             (TorrentState::Stalled, None)
         );
@@ -484,11 +487,13 @@ mod tests {
                 Some(format!("{ROUTE_DOWN_FETCHING} (tunnel gone)"))
             )
         );
+        // A full disk: the session fetches nothing and keeps seeding.
         assert_eq!(
-            project(&Observed {
-                disk_full: true,
-                ..seen(live.clone())
-            }),
+            project(&seen(Engine::Live {
+                finished: false,
+                peers: 3,
+                upload_mode: true,
+            })),
             (TorrentState::Stalled, Some(DISK_FULL.into()))
         );
         assert_eq!(

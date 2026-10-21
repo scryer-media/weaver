@@ -634,6 +634,12 @@ impl PieceTracker {
         Arrival::Write { cancel }
     }
 
+    /// The write of `chunk` failed: it is no longer being written, and a
+    /// later copy is taken (libtorrent `piece_picker::write_failed`).
+    pub fn write_failed(&mut self, chunk: &ChunkInfo) {
+        self.writing.remove(&chunk.absolute_index);
+    }
+
     // === QUERIES ===
 
     /// Get the inflight info for a piece, if it's currently being downloaded.

@@ -43,6 +43,23 @@ use tokio::sync::Notify;
 
 use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
 
+/// Whether a write failed in a way later writes likely will too while reads
+/// still work: no space, a quota, a read-only or forbidding file system, a
+/// file past its size limit. The torrent stops downloading and keeps seeding
+/// (libtorrent `torrent::handle_disk_error` enters upload mode on these write
+/// errors).
+pub fn write_refused(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                StorageFull | QuotaExceeded | ReadOnlyFilesystem | PermissionDenied | FileTooLarge
+            )
+        })
+    })
+}
+
 pub trait StorageFactory: Send + Sync + Any {
     type Storage: TorrentStorage;
 

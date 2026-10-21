@@ -690,8 +690,16 @@ impl Live {
         })
     }
 
-    fn holding(&self) -> bool {
-        self.intake.as_ref().is_some_and(|intake| intake.holding())
+    // A write found no room: the session fetches nothing for the torrent
+    // and keeps seeding it, as it last reported.
+    fn upload_mode(&self) -> bool {
+        matches!(
+            self.engine,
+            Engine::Live {
+                upload_mode: true,
+                ..
+            }
+        )
     }
 
     // The pieces, and how many of them the job holds verified.
@@ -783,7 +791,6 @@ impl Live {
             paused_by: self.paused_by,
             failed: self.refusal(),
             held: self.held.clone(),
-            disk_full: self.holding(),
         }
     }
 }
@@ -1221,7 +1228,7 @@ impl TorrentService {
 
     // What the jobs that spoke did: a write the job could not take fails
     // its torrent, a refusal found while unpacking stops it, and a job that
-    // is done completes it. A held piece stops the selection at once.
+    // is done completes it.
     async fn settle(&self) {
         let dirty = self.inner.signal.take();
         for job_id in dirty {
@@ -1380,7 +1387,6 @@ impl TorrentService {
         let intake = Arc::new(Intake::new(
             Arc::clone(&job) as Arc<dyn Pieces>,
             Room::new(Arc::clone(&env.limits), env.free_disk.clone()),
-            self.resident(job_id),
             Box::new(move |heard| signal.heard(job_id, heard)),
         ));
         (job, intake)
@@ -2300,7 +2306,6 @@ impl TorrentService {
             elapsed
         };
         self.follow_routes().await;
-        self.retry_holds().await;
         self.read(now, elapsed_s).await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
@@ -2360,23 +2365,6 @@ impl TorrentService {
         }
         for job_id in unresolved {
             self.resolve(job_id).await;
-        }
-    }
-
-    async fn retry_holds(&self) {
-        let intakes: Vec<(JobId, Arc<Intake>)> = self
-            .inner
-            .live
-            .lock()
-            .await
-            .values()
-            .filter_map(|torrent| Some((torrent.record.job_id, torrent.intake.clone()?)))
-            .filter(|(_, intake)| intake.holding())
-            .collect();
-        for (job_id, intake) in intakes {
-            if let Err(error) = tokio::task::spawn_blocking(move || intake.retry()).await {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's held pieces were not retried");
-            }
         }
     }
 
@@ -2468,26 +2456,18 @@ impl TorrentService {
         }
     }
 
-    // The files the job wants now, or none while the disk is full.
+    // The files the job wants now. A full disk leaves them as they are: the
+    // session stops fetching in upload mode, not by a narrower selection.
     async fn apply_selection(&self) {
         let mut live = self.inner.live.lock().await;
         for torrent in live.values_mut() {
             let (Some(attached), Some(job)) = (&torrent.attached, &torrent.job) else {
                 continue;
             };
-            let holding = torrent
-                .intake
-                .as_ref()
-                .is_some_and(|intake| intake.holding());
-            let wanted = if holding {
-                Vec::new()
-            } else {
-                let selection = job.with(|job| job.selection());
-                if selection.is_empty() {
-                    continue;
-                }
-                selection
-            };
+            let wanted = job.with(|job| job.selection());
+            if wanted.is_empty() {
+                continue;
+            }
             if torrent.applied.as_ref() == Some(&wanted) {
                 continue;
             }
@@ -2541,7 +2521,7 @@ impl TorrentService {
         let live = self.inner.live.lock().await;
         let waiting: Vec<&str> = live
             .values()
-            .filter(|torrent| torrent.holding())
+            .filter(|torrent| torrent.upload_mode())
             .map(|torrent| torrent.record.name.as_str())
             .collect();
         if waiting.is_empty() {
@@ -2819,8 +2799,8 @@ fn on_disk(layout: Option<&PieceLayout>, file_have: &[u64]) -> u64 {
 }
 
 // Every file's bytes in hand. The session's progress counts only the files
-// selected now, and the selection narrows as files finish or while the disk
-// is full. While the session checks the files, the checkpoint's figure stands.
+// selected now, and the selection narrows as files finish. While the session
+// checks the files, the checkpoint's figure stands.
 fn take_file_have(kept: &mut Vec<u64>, engine: &Engine, reported: &[u64]) {
     if *engine != Engine::Checking && !reported.is_empty() {
         kept.clear();

@@ -2986,16 +2986,33 @@ async fn choking_a_peer_starts_its_count_of_unservable_requests_again() {
     assert_eq!(next_sent(&mut rx).await, Sent::Choke);
 }
 
-/// A memory storage that refuses the next `refusals` pieces it is handed.
+/// A memory storage that refuses the next `refusals` pieces it is handed,
+/// then the next `no_room` for want of space, and the next `no_room_writes`
+/// block writes for want of space.
 #[derive(Clone, Default)]
 struct RefusingStorageFactory {
     inner: MemoryStorageFactory,
     refusals: Arc<AtomicU32>,
+    no_room: Arc<AtomicU32>,
+    no_room_writes: Arc<AtomicU32>,
 }
 
 struct RefusingStorage {
     inner: Box<dyn TorrentStorage>,
     refusals: Arc<AtomicU32>,
+    no_room: Arc<AtomicU32>,
+    no_room_writes: Arc<AtomicU32>,
+}
+
+/// Whether `count` was above zero, taking one off it when it was.
+fn take_one(count: &AtomicU32) -> bool {
+    count
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+fn no_room() -> anyhow::Error {
+    anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull)).context("writing")
 }
 
 impl StorageFactory for RefusingStorageFactory {
@@ -3009,6 +3026,8 @@ impl StorageFactory for RefusingStorageFactory {
         Ok(RefusingStorage {
             inner: Box::new(self.inner.create(shared, metadata)?),
             refusals: self.refusals.clone(),
+            no_room: self.no_room.clone(),
+            no_room_writes: self.no_room_writes.clone(),
         })
     }
 
@@ -3031,6 +3050,9 @@ impl TorrentStorage for RefusingStorage {
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        if take_one(&self.no_room_writes) {
+            return Err(no_room());
+        }
         self.inner.pwrite_all(file_id, offset, buf)
     }
 
@@ -3050,15 +3072,16 @@ impl TorrentStorage for RefusingStorage {
         Ok(Box::new(RefusingStorage {
             inner: self.inner.take()?,
             refusals: self.refusals.clone(),
+            no_room: self.no_room.clone(),
+            no_room_writes: self.no_room_writes.clone(),
         }))
     }
 
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
-        let refuse = self
-            .refusals
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
-        anyhow::ensure!(!refuse, "no room for piece {piece:?}");
+        anyhow::ensure!(!take_one(&self.refusals), "refused piece {piece:?}");
+        if take_one(&self.no_room) {
+            return Err(no_room());
+        }
         self.inner.on_piece_completed(piece)
     }
 }
@@ -3109,6 +3132,148 @@ async fn a_piece_the_storage_refuses_is_not_had_and_is_downloaded_again() {
     assert!(h.have(0));
     assert_eq!(h.trust(&peer), (1, 0, false));
     assert_eq!(storage.inner.log.completed_pieces(), vec![0]);
+}
+
+impl Harness {
+    /// A peer at `addr` with the pieces `pieces`, whose handshake names
+    /// upload_only.
+    async fn peer_taking_upload_only(&self, addr: &str, pieces: &[u32]) -> (PeerHandler, PeerRx) {
+        let (peer, rx) = self.peer_with(addr, pieces).await;
+        let mut names_it = ExtendedHandshake::new();
+        names_it.m.upload_only = Some(3);
+        (&peer).on_extended_handshake(&names_it).unwrap();
+        (peer, rx)
+    }
+}
+
+/// The messages queued for the peer, draining its queue.
+fn messages_sent(rx: &mut PeerRx) -> Vec<Message<'static>> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|r| match r {
+            WriterRequest::Message(msg) => Some(msg),
+            _ => None,
+        })
+        .collect()
+}
+
+// libtorrent `torrent::handle_disk_error`: a write that finds no room puts
+// the torrent in upload mode, where `torrent::set_upload_mode` cancels every
+// request (`peer_connection::cancel_all_requests`) and tells the peers it
+// only uploads (`send_upload_only`); `do_update_interest` is interested in
+// no peer and `send_block_requests` asks for nothing, while a request is
+// served as ever (`incoming_request` does not read upload mode). Once it
+// lasted `optimistic_disk_retry`, `torrent::second_tick` leaves it, and the
+// torrent asks again.
+#[tokio::test]
+async fn a_full_disk_puts_the_torrent_in_upload_mode_and_it_keeps_seeding() {
+    let storage = RefusingStorageFactory::default();
+    storage.no_room.store(1, Ordering::SeqCst);
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        ..Default::default()
+    };
+    // Three pieces, the last had.
+    let h = Harness::build_added("full_disk", 3, 0x20, isolated_session_opts(false), add).await;
+    tokio::time::pause();
+    let (fetcher, _fetcher_rx) = h.peer_with("127.0.0.1:6881", &[0]).await;
+    let (asked, mut asked_rx) = h.peer_taking_upload_only("127.0.0.2:6881", &[1]).await;
+    let (leecher, mut leecher_rx) = h.peer_with("127.0.0.3:6881", &[]).await;
+    let leecher = &leecher;
+
+    // `asked` is asked for all of piece 1.
+    let mut requester: Task<'_> = Box::pin(asked.request_chunks());
+    asked.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut asked_rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(1, 0..CHUNKS_PER_PIECE)
+    );
+
+    // The fetcher sends piece 0, which the storage has no room for.
+    h.take(&fetcher, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&fetcher, (0, chunk), false).await.unwrap();
+    }
+    let entered = tokio::time::Instant::now();
+    assert!(h.upload_mode());
+    assert!(!h.have(0));
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+    assert_eq!(h.inflight_count(&asked), 0);
+    let mut told = messages_sent(&mut asked_rx);
+    assert!(matches!(
+        told.pop(),
+        Some(Message::Extended(ExtendedMessage::UploadOnly(true)))
+    ));
+    let cancelled: BTreeSet<(u32, u32)> = told
+        .into_iter()
+        .map(|msg| match msg {
+            Message::Cancel(r) => (r.index, r.begin),
+            other => panic!("expected a cancel, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(cancelled, chunks(1, 0..CHUNKS_PER_PIECE));
+    assert_eq!(asked.acquire_next_piece().unwrap(), None);
+
+    // The piece it has is served.
+    leecher
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leecher_rx).await, Sent::Unchoke);
+    leecher
+        .on_received_message(Message::Request(request(2, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leecher_rx).await, Sent::Block(2, 0));
+
+    // The requester finds us interested in nothing; once upload mode ends,
+    // the peers are told, and the requester is interested and asks again.
+    assert!(matches!(
+        next_message(&mut requester, &mut asked_rx).await,
+        Message::NotInterested
+    ));
+    assert!(matches!(
+        next_message(&mut requester, &mut asked_rx).await,
+        Message::Extended(ExtendedMessage::UploadOnly(false))
+    ));
+    assert!(tokio::time::Instant::now().duration_since(entered) >= OPTIMISTIC_DISK_RETRY);
+    assert!(!h.upload_mode());
+    // Two at first: telling the peer we were not interested ended its slow
+    // start, and no block came to pace it by
+    // (`peer_connection::send_not_interested`).
+    assert_eq!(
+        next_requests(&mut requester, &mut asked_rx, 2).await,
+        chunks(1, 0..2)
+    );
+}
+
+// libtorrent `peer_connection::on_disk_write_complete`: a block whose write
+// failed is no longer being written (`piece_picker::write_failed`), and one
+// that found no room puts the torrent in upload mode
+// (`torrent::handle_disk_error`); a later copy of the block is written.
+#[tokio::test]
+async fn a_block_write_that_finds_no_room_is_fetched_again_after_upload_mode() {
+    let storage = RefusingStorageFactory::default();
+    storage.no_room_writes.store(1, Ordering::SeqCst);
+    let h = Harness::build_on(
+        "full_disk_write",
+        0x00,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    tokio::time::pause();
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.take(&peer, 0);
+    h.send(&peer, (0, 0), false).await.unwrap();
+    assert!(h.upload_mode());
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+
+    h.wait_for_upload_mode(false).await;
+    h.take(&peer, 0);
+    h.send(&peer, (0, 0), false).await.unwrap();
+    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
 }
 
 // A piece is counted into every file with bytes in it, an empty file among

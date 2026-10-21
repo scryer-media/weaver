@@ -90,7 +90,7 @@ use crate::peer_protocol::{
 use anyhow::Context;
 use futures::FutureExt;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc::unbounded_channel};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc::unbounded_channel, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 
@@ -198,6 +198,11 @@ const REPICK_INTERVAL: Duration = Duration::from_secs(5);
 // `peer_connection::second_tick`, once a second).
 const SNUB_INTERVAL: Duration = Duration::from_secs(1);
 
+// How long upload mode lasts before the torrent tries to download again, in
+// case the disk has room by then (libtorrent `optimistic_disk_retry`, ten
+// minutes, read by `torrent::second_tick`).
+const OPTIMISTIC_DISK_RETRY: Duration = Duration::from_secs(600);
+
 pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
@@ -268,6 +273,10 @@ pub struct TorrentStateLive {
     // that sent us data (libtorrent `torrent::m_last_seen_complete`). It is
     // what we send as `complete_ago`; a peer's word never moves it.
     last_seen_complete: Mutex<Option<tokio::time::Instant>>,
+    // When the torrent entered upload mode, while it is in it: a write
+    // found no room, so it fetches nothing and keeps seeding (libtorrent
+    // `torrent::m_upload_mode`, `m_upload_mode_time`).
+    upload_mode: watch::Sender<Option<tokio::time::Instant>>,
     // The torrent's files as its web seeds serve them.
     web_layout: web_seed::Layout,
 
@@ -386,9 +395,34 @@ impl TorrentStateLive {
             // What a handshake of this run's first connections says.
             told_upload_only: AtomicBool::new(finished_at_start && !super_seeding),
             last_seen_complete: Mutex::new(None),
+            upload_mode: watch::Sender::new(None),
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
             utp: session.utp,
         });
+
+        // Upload mode ends once it lasted OPTIMISTIC_DISK_RETRY (libtorrent
+        // `torrent::second_tick`).
+        state.spawn(
+            debug_span!(parent: state.shared.span.clone(), "upload_mode_retry"),
+            format!("[{}]upload_mode_retry", state.shared.id),
+            {
+                let mut entered = state.upload_mode.subscribe();
+                let state = Arc::downgrade(&state);
+                async move {
+                    loop {
+                        let Ok(Some(at)) = entered.wait_for(Option::is_some).await.map(|at| *at)
+                        else {
+                            return Ok(());
+                        };
+                        tokio::time::sleep_until(at + OPTIMISTIC_DISK_RETRY).await;
+                        let Some(state) = state.upgrade() else {
+                            return Ok(());
+                        };
+                        state.set_upload_mode(false);
+                    }
+                }
+            },
+        );
 
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "speed_estimator_updater"),
@@ -1063,11 +1097,12 @@ impl TorrentStateLive {
     }
 
     /// Our interest in the peer `live` is whether it has a piece we want and
-    /// lack: a selected one we do not have, or one a stream reads next. The
-    /// peer is told when that changes. Returns it (libtorrent
-    /// `peer_connection::do_update_interest`).
+    /// lack: a selected one we do not have, or one a stream reads next; none
+    /// in upload mode. The peer is told when that changes. Returns it
+    /// (libtorrent `peer_connection::do_update_interest`, not interested in
+    /// a torrent that only uploads).
     fn update_interest(&self, live: &mut LivePeerState) -> bool {
-        let interesting = {
+        let interesting = !self.upload_mode() && {
             let g = self.lock_read("update_interest");
             g.get_chunks().is_ok_and(|chunks| {
                 let has = |p: ValidPieceIndex| live.bitfield.get(p.get_usize()).is_some_and(|b| *b);
@@ -1282,12 +1317,75 @@ impl TorrentStateLive {
         }
     }
 
-    // We only upload the torrent: it has every piece it wants, and no
-    // stream wants more; a super-seed never says so, as a peer may take it
-    // to have one piece and leave (libtorrent `torrent::is_upload_only`,
-    // `bt_peer_connection::write_extensions`).
+    // We only upload the torrent: it is in upload mode, or has every piece
+    // it wants and no stream wants more; a super-seed never says so, as a
+    // peer may take it to have one piece and leave (libtorrent
+    // `torrent::is_upload_only`, `bt_peer_connection::write_extensions`).
     fn is_upload_only(&self) -> bool {
-        !self.super_seeding && self.is_finished_and_no_active_streams()
+        !self.super_seeding && (self.upload_mode() || self.is_finished_and_no_active_streams())
+    }
+
+    /// Whether the torrent is in upload mode: a write found no room, so it
+    /// fetches nothing and keeps seeding (libtorrent `torrent::upload_mode`).
+    pub fn upload_mode(&self) -> bool {
+        self.upload_mode.borrow().is_some()
+    }
+
+    /// Resolves once the torrent is in upload mode, when `on` holds, or out
+    /// of it.
+    pub async fn wait_for_upload_mode(&self, on: bool) {
+        let mut mode = self.upload_mode.subscribe();
+        let _ = mode.wait_for(|at| at.is_some() == on).await;
+    }
+
+    /// Enters or leaves upload mode (libtorrent `torrent::set_upload_mode`).
+    /// Entering, every request outstanding is cancelled and every piece in
+    /// flight goes back to the queue, each under its peer's lock, under
+    /// which a requester picks and asks; leaving, the requesters ask again.
+    /// Either way each requester looks at its interest again, and the peers
+    /// are told whether we only upload.
+    fn set_upload_mode(&self, on: bool) {
+        let now = tokio::time::Instant::now();
+        let changed = self.upload_mode.send_if_modified(|at| {
+            let changed = at.is_some() != on;
+            if changed {
+                *at = on.then_some(now);
+            }
+            changed
+        });
+        if !changed {
+            return;
+        }
+        debug!(id = self.shared.id, on, "upload mode");
+        if on {
+            for mut entry in self.peers.states.iter_mut() {
+                let addr = *entry.key();
+                if let Some(live) = entry.value_mut().get_live_mut() {
+                    if let Ok(pieces) = self.lock_write("set_upload_mode").get_pieces_mut() {
+                        pieces.release_pieces_owned_by(addr);
+                    }
+                    live.cancel_all_requests();
+                }
+            }
+        }
+        self.new_pieces_notify.notify_waiters();
+        self.update_upload_only();
+    }
+
+    /// A write failed. One that later writes will likely repeat puts the
+    /// torrent in upload mode; returns whether it was one (libtorrent
+    /// `torrent::handle_disk_error`).
+    fn handle_disk_error(&self, error: &anyhow::Error) -> bool {
+        let refused = crate::storage::write_refused(error);
+        if refused {
+            warn!(
+                id = self.shared.id,
+                info_hash = ?self.shared.info_hash,
+                "a write found no room, only uploading: {error:#}"
+            );
+            self.set_upload_mode(true);
+        }
+        refused
     }
 
     // If we have all selected pieces but not necessarily all pieces.
@@ -2378,6 +2476,14 @@ impl PeerHandler {
             .with_live_mut(self.addr, "acquire_next_piece", |live| {
                 let mut g = self.state.lock_write("acquire_next_piece");
 
+                // Nothing is asked in upload mode (libtorrent
+                // `peer_connection::send_block_requests`, `add_request`).
+                // Read under the peer's lock, which set_upload_mode takes to
+                // give back the peer's pieces: a piece is picked before and
+                // given back there, or not picked.
+                if self.state.upload_mode() {
+                    return Ok(None);
+                }
                 let pieces = g.pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
                 // A piece we have is no longer the peer's to offer (libtorrent
                 // `peer_connection::received_piece`, `announce_piece`).
@@ -3251,17 +3357,25 @@ impl PeerHandler {
             // the write is finished.
             //
 
-            match state.file_ops().write_chunk(addr, piece, chunk_info) {
-                Ok(()) => {}
-                Err(e) => {
-                    error!(
-                        id = state.shared.id,
-                        info_hash = ?state.shared.info_hash,
-                        "FATAL: error writing chunk to disk: {e:#}"
-                    );
-                    return state.on_fatal_error(e);
+            // A block whose write failed is no longer being written, and is
+            // fetched again (libtorrent `peer_connection::on_disk_write_complete`
+            // calls `piece_picker::write_failed`, then
+            // `torrent::handle_disk_error`).
+            if let Err(e) = state.file_ops().write_chunk(addr, piece, chunk_info) {
+                state
+                    .lock_write("write_failed")
+                    .get_pieces_mut()?
+                    .write_failed(chunk_info);
+                if state.handle_disk_error(&e) {
+                    return Ok(());
                 }
-            };
+                error!(
+                    id = state.shared.id,
+                    info_hash = ?state.shared.info_hash,
+                    "FATAL: error writing chunk to disk: {e:#}"
+                );
+                return state.on_fatal_error(e);
+            }
 
             let piece_index = chunk_info.piece_index;
             let full_piece_download = {
@@ -3326,13 +3440,16 @@ impl PeerHandler {
                     // is downloaded again, and its senders are neither
                     // credited nor blamed: on a disk error libtorrent
                     // `torrent::on_piece_verified` calls neither
-                    // `piece_passed` nor `piece_failed`.
+                    // `piece_passed` nor `piece_failed`. A refusal for want
+                    // of room puts the torrent in upload mode
+                    // (`torrent::handle_disk_error`).
                     if let Err(e) = state.files.on_piece_completed(piece_index) {
                         warn!(
                             id = state.shared.id,
                             info_hash = ?state.shared.info_hash,
                             "the storage refused piece={index}: {e:#}"
                         );
+                        state.handle_disk_error(&e);
                         return state.requeue_piece(piece_index);
                     }
                     state

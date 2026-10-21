@@ -1321,6 +1321,19 @@ impl LivePeerState {
         taken
     }
 
+    /// Stops waiting for every request outstanding to the peer, and tells
+    /// it so. A block the peer already had on its way is let through as
+    /// late (libtorrent `peer_connection::cancel_all_requests`).
+    pub fn cancel_all_requests(&mut self) {
+        for request in self.take_inflight_requests() {
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::Cancel(wire_request(
+                    &request,
+                ))));
+        }
+    }
+
     pub fn inflight_requests(&self) -> impl Iterator<Item = &InflightRequest> {
         self.inflight_requests.iter()
     }
