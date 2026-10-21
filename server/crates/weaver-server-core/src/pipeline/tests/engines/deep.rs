@@ -44,7 +44,7 @@ use crate::pipeline::tests::direct_store::{
     multi_member_store_set, obfuscate_volumes, protected_store_set, single_member_store_set,
 };
 
-fn delivered(name: &str) -> String {
+pub(super) fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
 }
 
@@ -60,13 +60,13 @@ fn sevenz(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 
 // `entries` in a stored RAR, `level.rar`, in a stored 7z posted as
 // `lantern.7z`: what they hold sits two deep.
-fn two_deep(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub(super) fn two_deep(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     sevenz(&[("level.rar", rar(entries))])
 }
 
 // Every article of `outer` lying wholly inside the bytes of `inner`, past
 // its front, so what the member is can still be told from its first bytes.
-fn articles_inside(outer: &[u8], inner: &[u8]) -> Vec<u32> {
+pub(super) fn articles_inside(outer: &[u8], inner: &[u8]) -> Vec<u32> {
     let at = outer
         .windows(inner.len())
         .position(|window| window == inner)
