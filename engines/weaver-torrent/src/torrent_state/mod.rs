@@ -24,7 +24,7 @@ use crate::buffers::ByteBufOwned;
 use crate::core::hash_id::{Id20, Id32, InfoHashes};
 use crate::core::lengths::{Lengths, ValidPieceIndex};
 use crate::core::magnet::Magnet;
-use crate::core::torrent_metainfo::{TorrentMetaV1Owned, TorrentVersion, WebSeed};
+use crate::core::torrent_metainfo::{TorrentMetaV1Owned, TorrentVersion, WebSeed, WebSeedKind};
 use crate::peer_protocol::HashRequest;
 use crate::v2_hashes::V2Hashes;
 use anyhow::Context;
@@ -448,7 +448,33 @@ impl ManagedTorrent {
             .flatten()
             .map(|t| t.to_string())
             .collect();
-        Magnet::of(self.info_hashes(), self.name(), trackers)
+        let mut magnet = Magnet::of(self.info_hashes(), self.name(), trackers);
+        magnet.web_seeds = self
+            .web_seeds()
+            .into_iter()
+            .filter(|s| s.kind == WebSeedKind::Url)
+            .map(|s| s.url)
+            .collect();
+        magnet
+    }
+
+    /// The torrent's web seeds, but those banned for sending bad data
+    /// (libtorrent `torrent_handle::url_seeds`).
+    pub fn web_seeds(&self) -> Vec<WebSeed> {
+        self.shared.web_seeds.list()
+    }
+
+    /// Adds a web seed, as given; false when the torrent has it (libtorrent
+    /// `torrent_handle::add_url_seed`, `add_http_seed`).
+    pub fn add_web_seed(&self, seed: WebSeed) -> bool {
+        self.shared.web_seeds.add(seed)
+    }
+
+    /// Removes a web seed and closes its connection; false when the torrent
+    /// has no such seed (libtorrent `torrent_handle::remove_url_seed`,
+    /// `remove_http_seed`).
+    pub fn remove_web_seed(&self, seed: &WebSeed) -> bool {
+        self.shared.web_seeds.remove(seed)
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {

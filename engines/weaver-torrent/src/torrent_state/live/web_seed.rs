@@ -1700,6 +1700,78 @@ mod tests {
         assert!(seeds.list().is_empty());
     }
 
+    // A torrent whose only source is a web seed downloads from it, the
+    // seed's bytes counted as any peer's; the seed is listed, added and
+    // removed through the torrent, and a magnet link names it as `ws`.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_downloads_from_its_web_seed_alone() -> anyhow::Result<()> {
+        use crate::{
+            AddTorrent, AddTorrentOptions, Session,
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+        };
+
+        let t = TestTorrent::new("test_web_seed", 3 * 16384 + 100, 16384).await?;
+        let content = t.content.clone();
+        let server = Server::start(move |head| {
+            if head.target.ends_with("/0.data") {
+                Reply::ranged(&content, head)
+            } else {
+                Reply::status(404)
+            }
+        });
+        let seed = WebSeed {
+            url: server.url("/seed/"),
+            kind: WebSeedKind::Url,
+        };
+        let out = tempfile::TempDir::with_prefix("test_web_seed_out")?;
+        let session =
+            Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+        let storage = MemoryStorageFactory::default();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(storage.clone_box()),
+                    web_seeds: vec![seed.clone()],
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        handle.wait_until_completed().await?;
+
+        assert!(storage.log.file_contents(0) == t.content, "content differs");
+        let total = t.content.len() as u64;
+        let live = handle.stats().live.context("expected a live torrent")?;
+        assert_eq!(live.snapshot.fetched_bytes, total);
+        assert_eq!(
+            session
+                .stats
+                .counters
+                .fetched_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total
+        );
+        assert!(!server.seen().is_empty());
+        assert!(server.seen().iter().all(|h| h.target.ends_with("/0.data")));
+
+        assert_eq!(handle.web_seeds(), [seed.clone()]);
+        assert!(!handle.add_web_seed(seed.clone()));
+        let http_seed = WebSeed {
+            url: "http://h.example/s.php".into(),
+            kind: WebSeedKind::Http,
+        };
+        assert!(handle.add_web_seed(http_seed.clone()));
+        assert_eq!(handle.magnet().web_seeds, [seed.url.clone()]);
+        assert!(handle.remove_web_seed(&seed));
+        assert!(!handle.remove_web_seed(&seed));
+        assert_eq!(handle.web_seeds(), [http_seed]);
+        assert!(handle.magnet().web_seeds.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn a_web_seed_handle_is_no_peers() {
         assert!(is_web_seed(handle_of(0)));
