@@ -4,8 +4,9 @@
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
-import { Client, CombinedError, Provider } from "urql";
-import { fromValue, mergeMap, pipe } from "wonka";
+import { Client, CombinedError, Provider, useSubscription } from "urql";
+import { empty, fromValue, make, mergeMap, pipe } from "wonka";
+import { TORRENT_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import type { JobData } from "@/lib/job-types";
@@ -15,7 +16,7 @@ import { AddNzbDialog } from "@/next/features/AddNzbDialog";
 import { TorrentDetail } from "@/next/features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
 import { DownloadRow } from "@/next/pages/downloads/DownloadRow";
-import type { SeedingPolicyData, SeedingSource, TorrentData } from "@/lib/torrents";
+import type { SeedingPolicyData, SeedingSource, TorrentData, TorrentFileData } from "@/lib/torrents";
 import { nextEn } from "@/next/i18n/en";
 import "@/next/fonts.css";
 import "@/next/theme.css";
@@ -29,15 +30,51 @@ const status = document.getElementById("status")!;
 
 // Every mutation the page sends, and the refusals the daemon gives: a duplicate magnet, a file it cannot read, and a remove whose goal is unmet.
 const sent: { name: string; variables: Record<string, unknown> }[] = [];
-Object.assign(window, { torrentsFixture: { sent } });
 const refusal = (message: string, code: string) =>
   new CombinedError({ graphQLErrors: [{ message, extensions: { code } }] });
+
+// The torrent the files screen follows. Each mutation changes what the daemon will hold; the change is read,
+// by a follower new or old, only once the test publishes it, so the page can show nothing but what it was sent.
+let held: TorrentData | null = null;
+let pending: TorrentData | null = null;
+// A follower stays for the page's life: one the page has stopped following answers for an operation it no
+// longer reads, which changes nothing it shows.
+const followers = new Set<(torrent: TorrentData) => void>();
+const publish = () => {
+  held = pending;
+  for (const follower of followers) follower(held!);
+};
+Object.assign(window, { torrentsFixture: { sent, publish } });
+const holdChange = (name: string, variables: Record<string, unknown>) => {
+  if (pending === null) return;
+  if (name === "SetTorrentSequential") pending = { ...pending, sequential: variables.sequential as boolean };
+  if (name === "SetTorrentFirstLastPieceFirst") pending = { ...pending, firstLastPieceFirst: variables.firstLastPieceFirst as boolean };
+  if (name === "SetTorrentFilePriorities") {
+    const levels = new Map((variables.priorities as { index: number; priority: TorrentFileData["priority"] }[]).map((entry) => [entry.index, entry.priority]));
+    pending = { ...pending, files: pending.files.map((file) => ({ ...file, priority: levels.get(file.index) ?? file.priority })) };
+  }
+};
 
 const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [() => (operations) => pipe(operations, mergeMap((operation) => {
   const definition = operation.query.definitions.find((entry) => entry.kind === "OperationDefinition");
   const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
   const variables = operation.variables as Record<string, unknown>;
-  if (operation.kind === "mutation") sent.push({ name, variables });
+  if (operation.kind === "teardown") return empty;
+  if (operation.kind === "mutation") {
+    sent.push({ name, variables });
+    holdChange(name, variables);
+  }
+  if (name === "TorrentUpdates") {
+    // A subscription's answers go on while each says another may follow.
+    return make<{ operation: typeof operation; data: { torrentUpdates: TorrentData[] }; hasNext: boolean }>((observer) => {
+      const follower = (torrent: TorrentData) =>
+        observer.next({ operation, data: { torrentUpdates: [torrent] }, hasNext: true });
+      followers.add(follower);
+      // A daemon answers once the page is listening, never inside the request.
+      queueMicrotask(() => follower(held!));
+      return () => followers.delete(follower);
+    });
+  }
   if (name === "RemoveTorrent") {
     return fromValue(
       variables.confirmUnmetGoal
@@ -151,7 +188,9 @@ const torrent = (id: number, source: SeedingSource, override: SeedingPolicyData 
   seedingPolicy: override ?? policy({ ratioGoal: source === "CATEGORY" ? 1.5 : 1 }),
   seedingSource: source,
   seedingRule: null,
-  files: [{ index: 0, path: "fixture.mkv", length: 2048, selected: true, progress: 0.25 }],
+  files: [{ index: 0, path: "fixture.mkv", length: 2048, selected: true, priority: "NORMAL", progress: 0.25 }],
+  sequential: false,
+  firstLastPieceFirst: false,
   trackers: [],
 });
 
@@ -177,6 +216,22 @@ function Seeding() {
   );
 }
 
+const file = (index: number, path: string, priority: TorrentFileData["priority"]): TorrentFileData => ({
+  index, path, length: 1024 * (index + 1), selected: priority !== "IGNORED", priority, progress: 0,
+});
+
+/** One torrent's detail as the job page shows it: read from its subscription, and read again on each change. */
+function Files() {
+  const [{ data }, follow] = useSubscription<{ torrentUpdates: TorrentData[] }>({
+    query: TORRENT_UPDATES_SUBSCRIPTION,
+    variables: { id: 4 },
+  });
+  const live = data?.torrentUpdates[0];
+  return live ? (
+    <TorrentDetail torrent={live} onChanged={() => follow()} onReport={(message) => { status.textContent = message; }} />
+  ) : null;
+}
+
 function Fixture() {
   if (screen === "tag") {
     return (
@@ -198,6 +253,15 @@ function Fixture() {
   if (screen === "remove") return <Remove />;
   if (screen === "queue") return <Queue />;
   if (screen === "seeding") return <Seeding />;
+  if (screen === "files") {
+    held ??= {
+      ...torrent(4, "GLOBAL", null),
+      state: "DOWNLOADING",
+      files: [file(0, "set/a.mkv", "NORMAL"), file(1, "set/b.nfo", "NORMAL"), file(2, "set/c.srt", "IGNORED")],
+    };
+    pending ??= held;
+    return <Files />;
+  }
   return <AddNzbDialog open onClose={() => { status.textContent = "closed"; }} />;
 }
 

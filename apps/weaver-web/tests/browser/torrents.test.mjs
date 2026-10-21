@@ -211,3 +211,80 @@ test("the override dialog starts from the override, and Use inherited clears onl
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
+
+// What the page has sent by one mutation, once it has sent `count` of them.
+async function sentAs(page, name, count) {
+  await page.waitForFunction(
+    ([wanted, total]) => window.torrentsFixture.sent.filter((entry) => entry.name === wanted).length >= total,
+    [name, count],
+  );
+  return (await sent(page)).filter((entry) => entry.name === name).map((entry) => entry.variables);
+}
+const publish = (page) => page.evaluate(() => window.torrentsFixture.publish());
+
+test("a file's priority set on its row is sent for that file alone, and shown once the torrent pushes it", async () => {
+  const { page, errors } = await open("files");
+  const files = page.getByRole("region", { name: "Files", exact: true });
+  const level = files.getByRole("button", { name: "Priority of set/a.mkv", exact: true });
+  await level.getByText("Normal", { exact: true }).waitFor();
+  await level.click();
+  await page.getByRole("menu", { name: "Priority of set/a.mkv", exact: true }).getByRole("menuitemradio", { name: "High", exact: true }).click();
+  assert.deepEqual(await sentAs(page, "SetTorrentFilePriorities", 1), [{ id: 4, priorities: [{ index: 0, priority: "HIGH" }] }]);
+  await publish(page);
+  await level.getByText("High", { exact: true }).waitFor();
+  // The other files keep their levels.
+  await files.getByRole("button", { name: "Priority of set/b.nfo", exact: true }).getByText("Normal", { exact: true }).waitFor();
+  await files.getByRole("button", { name: "Priority of set/c.srt", exact: true }).getByText("Ignored", { exact: true }).waitFor();
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+test("a priority set over the ticked files is one request naming every one of them", async () => {
+  const { page, errors } = await open("files");
+  const files = page.getByRole("region", { name: "Files", exact: true });
+  await files.getByRole("checkbox", { name: "Select set/b.nfo", exact: true }).click();
+  await files.getByRole("checkbox", { name: "Select set/c.srt", exact: true }).click();
+  await files.getByText("2 selected", { exact: true }).waitFor();
+  await files.getByRole("button", { name: "Set priority", exact: true }).click();
+  await page.getByRole("menu", { name: "Set priority", exact: true }).getByRole("menuitemradio", { name: "Maximum", exact: true }).click();
+  assert.deepEqual(await sentAs(page, "SetTorrentFilePriorities", 1), [
+    { id: 4, priorities: [{ index: 1, priority: "MAXIMUM" }, { index: 2, priority: "MAXIMUM" }] },
+  ]);
+  await publish(page);
+  await files.getByRole("button", { name: "Priority of set/b.nfo", exact: true }).getByText("Maximum", { exact: true }).waitFor();
+  await files.getByRole("button", { name: "Priority of set/c.srt", exact: true }).getByText("Maximum", { exact: true }).waitFor();
+  await files.getByRole("button", { name: "Priority of set/a.mkv", exact: true }).getByText("Normal", { exact: true }).waitFor();
+
+  // Select every file ticks the whole torrent, and its change goes as one request too.
+  await files.getByRole("checkbox", { name: "Select every file", exact: true }).click();
+  await files.getByText("3 selected", { exact: true }).waitFor();
+  await files.getByRole("button", { name: "Set priority", exact: true }).click();
+  await page.getByRole("menu", { name: "Set priority", exact: true }).getByRole("menuitemradio", { name: "Ignored", exact: true }).click();
+  assert.deepEqual((await sentAs(page, "SetTorrentFilePriorities", 2))[1], {
+    id: 4,
+    priorities: [0, 1, 2].map((index) => ({ index, priority: "IGNORED" })),
+  });
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+test("the picking switches send their mutations and show what the torrent pushes back", async () => {
+  const { page, errors } = await open("files");
+  const files = page.getByRole("region", { name: "Files", exact: true });
+  const switches = [
+    ["Sequential download", "SetTorrentSequential", { id: 4, sequential: true }],
+    ["First and last pieces first", "SetTorrentFirstLastPieceFirst", { id: 4, firstLastPieceFirst: true }],
+  ];
+  for (const [label, name, variables] of switches) {
+    const toggle = files.getByRole("switch", { name: label, exact: true });
+    await toggle.and(page.locator('[aria-checked="false"]')).waitFor();
+    await toggle.click();
+    assert.deepEqual(await sentAs(page, name, 1), [variables]);
+    // Nothing is pushed yet, so the switch still shows the torrent's own state.
+    assert.equal(await toggle.getAttribute("aria-checked"), "false");
+    await publish(page);
+    await toggle.and(page.locator('[aria-checked="true"]')).waitFor();
+  }
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});

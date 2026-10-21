@@ -1682,6 +1682,25 @@ export const SET_TORRENT_SEEDING_MUTATION = gql`
   }
 `;
 
+/** Set each named file's level; the torrent's other files keep theirs. */
+export const SET_TORRENT_FILE_PRIORITIES_MUTATION = gql`
+  mutation SetTorrentFilePriorities($id: Int!, $priorities: [TorrentFilePriorityInput!]!) {
+    setTorrentFilePriorities(id: $id, priorities: $priorities)
+  }
+`;
+
+export const SET_TORRENT_SEQUENTIAL_MUTATION = gql`
+  mutation SetTorrentSequential($id: Int!, $sequential: Boolean!) {
+    setTorrentSequential(id: $id, sequential: $sequential)
+  }
+`;
+
+export const SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION = gql`
+  mutation SetTorrentFirstLastPieceFirst($id: Int!, $firstLastPieceFirst: Boolean!) {
+    setTorrentFirstLastPieceFirst(id: $id, firstLastPieceFirst: $firstLastPieceFirst)
+  }
+`;
+
 // --- Hardware profile ---
 
 const HARDWARE_PROFILE_FIELDS = gql`

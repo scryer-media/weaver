@@ -10,7 +10,10 @@ import {
   REANNOUNCE_TORRENT_MUTATION,
   REMOVE_TORRENT_TRACKERS_MUTATION,
   REPLACE_TORRENT_TRACKERS_MUTATION,
+  SET_TORRENT_FILE_PRIORITIES_MUTATION,
+  SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION,
   SET_TORRENT_SEEDING_MUTATION,
+  SET_TORRENT_SEQUENTIAL_MUTATION,
   SET_TORRENT_UPLOAD_LIMIT_MUTATION,
   TORRENT_PEERS_QUERY,
   TORRENT_UPDATES_SUBSCRIPTION,
@@ -20,11 +23,13 @@ import {
   torrentErrorText,
   type TorrentActionError,
   type TorrentData,
+  type TorrentFilePriority,
   type TorrentPeerData,
   type TorrentTrackerData,
 } from "@/lib/torrents";
 import { DetailBlock, Field } from "@/next/components/chrome";
-import { SecondaryButton } from "@/next/components/controls";
+import { BulkCluster, BulkMenu } from "@/next/components/BulkBar";
+import { CheckBox, SecondaryButton, Select, Toggle } from "@/next/components/controls";
 import { RecordEditor } from "@/next/components/RecordEditor";
 import { GridRow } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
@@ -38,7 +43,10 @@ const TRACKER_COLUMNS = {
   base: "minmax(0,1fr) 112px max-content",
   sm: "minmax(0,1fr) 112px 96px minmax(0,1fr) max-content",
 };
-const FILE_COLUMNS = { base: "minmax(0,1fr) 56px 90px" };
+const FILE_COLUMNS = {
+  base: "14px minmax(0,1fr) 72px 120px",
+  sm: "14px minmax(0,1fr) 90px 72px 120px",
+};
 const LIMIT_COLUMNS = { base: "minmax(0,1fr) max-content" };
 const PEER_COLUMNS = {
   base: "minmax(0,1fr) 56px max-content",
@@ -403,6 +411,171 @@ function TrackersBlock({
   );
 }
 
+/** A file's four levels, by the daemon's own names. */
+const PRIORITY_KEYS: Record<TorrentFilePriority, string> = {
+  IGNORED: "next.torrent.priority.IGNORED",
+  NORMAL: "next.torrent.priority.NORMAL",
+  HIGH: "next.torrent.priority.HIGH",
+  MAXIMUM: "next.torrent.priority.MAXIMUM",
+};
+
+const isPriority = (value: string): value is TorrentFilePriority => Object.hasOwn(PRIORITY_KEYS, value);
+
+/**
+ * How the torrent's pieces are picked, and its files, each with its level.
+ * A level set on one row is sent for that file alone; a level set over the
+ * ticked rows is one request naming every one of them. What is shown is what
+ * the torrent pushes back, never the level just sent.
+ */
+function FilesBlock({
+  torrent,
+  onChanged,
+  onReport,
+}: {
+  torrent: TorrentData;
+  onChanged: () => void;
+  onReport: (message: string) => void;
+}) {
+  const t = useTranslate();
+  const [prioritiesState, setPriorities] = useMutation(SET_TORRENT_FILE_PRIORITIES_MUTATION);
+  const [sequentialState, setSequential] = useMutation(SET_TORRENT_SEQUENTIAL_MUTATION);
+  const [firstLastState, setFirstLast] = useMutation(SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION);
+  const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
+  // Only files the torrent still lists count as ticked.
+  const pickedFiles = torrent.files.filter((file) => picked.has(file.index));
+  const allPicked = torrent.files.length > 0 && pickedFiles.length === torrent.files.length;
+
+  const settle = (result: { error?: TorrentActionError }) => {
+    if (result.error) {
+      onReport(torrentErrorText(result.error));
+      return false;
+    }
+    onChanged();
+    return true;
+  };
+
+  const prioritize = (indexes: readonly number[], priority: TorrentFilePriority) =>
+    setPriorities({ id: torrent.id, priorities: indexes.map((index) => ({ index, priority })) }).then(settle);
+
+  const prioritizePicked = (value: string) => {
+    if (!isPriority(value)) return;
+    void prioritize(
+      pickedFiles.map((file) => file.index),
+      value,
+    ).then((done) => {
+      if (done) setPicked(new Set());
+    });
+  };
+
+  const pick = (index: number) =>
+    setPicked((current) => {
+      const next = new Set(current);
+      if (next.has(index)) {
+        next.delete(index);
+      } else {
+        next.add(index);
+      }
+      return next;
+    });
+
+  const levels = (Object.keys(PRIORITY_KEYS) as TorrentFilePriority[]).map((value) => ({
+    value,
+    label: t(PRIORITY_KEYS[value]),
+  }));
+
+  const toggles = [
+    {
+      label: t("next.torrent.sequential"),
+      checked: torrent.sequential,
+      busy: sequentialState.fetching,
+      set: (sequential: boolean) => void setSequential({ id: torrent.id, sequential }).then(settle),
+    },
+    {
+      label: t("next.torrent.firstLastPieceFirst"),
+      checked: torrent.firstLastPieceFirst,
+      busy: firstLastState.fetching,
+      set: (firstLastPieceFirst: boolean) =>
+        void setFirstLast({ id: torrent.id, firstLastPieceFirst }).then(settle),
+    },
+  ];
+
+  const heading = "truncate font-wv-mono text-[10.5px] uppercase tracking-[0.12em] text-wv-note";
+
+  return (
+    <DetailBlock
+      id="torrent-files"
+      title={t("next.common.files")}
+      note={countLabel(t, "next.job.fileCount", torrent.files.length)}
+    >
+      {toggles.map((toggle) => (
+        <GridRow key={toggle.label} columns={LIMIT_COLUMNS} gap={14} className="min-h-[46px] border-t border-wv-hairline">
+          <span className="min-w-0 truncate text-[12.5px] text-wv-fg">{toggle.label}</span>
+          <Toggle label={toggle.label} checked={toggle.checked} disabled={toggle.busy} onChange={toggle.set} />
+        </GridRow>
+      ))}
+      {torrent.files.length === 0 ? (
+        <span className="border-t border-wv-hairline pt-3 text-[12.5px] text-wv-muted">{EM_DASH}</span>
+      ) : (
+        <>
+          <GridRow columns={FILE_COLUMNS} gap={14} className="h-[38px] border-t border-wv-hairline">
+            <CheckBox
+              label={t("next.torrent.selectFiles")}
+              checked={allPicked}
+              onChange={() => setPicked(allPicked ? new Set() : new Set(torrent.files.map((file) => file.index)))}
+            />
+            {pickedFiles.length === 0 ? (
+              <span className={heading}>{t("table.name")}</span>
+            ) : (
+              <BulkCluster count={pickedFiles.length} onClear={() => setPicked(new Set())}>
+                <BulkMenu
+                  label={t("next.downloads.setPriority")}
+                  options={levels}
+                  onSelect={prioritizePicked}
+                  disabled={prioritiesState.fetching}
+                >
+                  {t("next.downloads.setPriority")}
+                </BulkMenu>
+              </BulkCluster>
+            )}
+            <span className={`hidden text-right sm:block ${heading}`}>{t("table.size")}</span>
+            <span className={`text-right ${heading}`}>{t("table.progress")}</span>
+            <span className={heading}>{t("table.priority")}</span>
+          </GridRow>
+          {torrent.files.map((file) => (
+            <GridRow
+              key={file.index}
+              columns={FILE_COLUMNS}
+              gap={14}
+              selected={picked.has(file.index)}
+              className="h-[38px] border-t border-wv-hairline"
+              title={file.path}
+            >
+              <CheckBox
+                label={t("next.common.selectItem", { name: file.path })}
+                checked={picked.has(file.index)}
+                onChange={() => pick(file.index)}
+              />
+              <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{file.path}</span>
+              <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                {formatSize(file.length)}
+              </span>
+              <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(file.progress * 100).toFixed(1)}%`}</span>
+              <Select
+                label={t("next.torrent.filePriority", { name: file.path })}
+                value={file.priority}
+                options={levels}
+                disabled={prioritiesState.fetching}
+                onChange={(priority) => void prioritize([file.index], priority)}
+                className="h-[28px] w-full min-w-0 text-[12.5px]"
+              />
+            </GridRow>
+          ))}
+        </>
+      )}
+    </DetailBlock>
+  );
+}
+
 /** A torrent job's own blocks on the job's screen: its transfer, its limits, its information, how it seeds, its trackers, its peers and its files. */
 export function TorrentDetail({
   torrent,
@@ -471,29 +644,7 @@ export function TorrentDetail({
 
       <PeersBlock torrent={torrent} onReport={onReport} />
 
-      <DetailBlock
-        id="torrent-files"
-        title={t("next.common.files")}
-        note={countLabel(t, "next.job.fileCount", torrent.files.length)}
-      >
-        {torrent.files.length === 0 ? (
-          <span className="text-[12.5px] text-wv-muted">{EM_DASH}</span>
-        ) : (
-          torrent.files.map((file) => (
-            <GridRow
-              key={file.index}
-              columns={FILE_COLUMNS}
-              gap={14}
-              className="h-[38px] border-t border-wv-hairline"
-              title={file.path}
-            >
-              <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{file.path}</span>
-              <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(file.progress * 100).toFixed(1)}%`}</span>
-              <span className="text-right font-wv-mono text-[12px] text-wv-muted">{formatSize(file.length)}</span>
-            </GridRow>
-          ))
-        )}
-      </DetailBlock>
+      <FilesBlock torrent={torrent} onChanged={onChanged} onReport={onReport} />
 
       <RecordEditor
         open={editing !== null}
