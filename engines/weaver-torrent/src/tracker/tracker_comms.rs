@@ -34,6 +34,7 @@ use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
 use crate::core::net::Resolver;
 use crate::tracker::tracker_comms_http;
+use crate::tracker::tracker_comms_http::Ask;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
 use crate::tracker::tracker_comms_udp;
 use crate::tracker::tracker_comms_udp::UdpTrackerClient;
@@ -735,14 +736,17 @@ impl Scraper {
     }
 
     async fn scrape_http(&self, tracker_url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
-        let mut url =
+        let url =
             tracker_comms_http::scrape_url(tracker_url).context("the tracker offers no scrape")?;
-        let mut query = tracker_comms_http::scrape_querystring(&info_hash);
-        if let Some(url_query) = url.query() {
-            query.push_str(&format!("&{url_query}"));
-        }
-        url.set_query(Some(&query));
-        let body = tracker_comms_http::get(&self.reqwest_client, url, &self.user_agent).await?;
+        let body = tracker_comms_http::get(
+            &self.reqwest_client,
+            self.udp_client.resolver(),
+            &url,
+            Ask::Scrape,
+            &tracker_comms_http::scrape_querystring(&info_hash),
+            &self.user_agent,
+        )
+        .await?;
         tracker_comms_http::parse_scrape(&body, &info_hash)
     }
 
@@ -1450,16 +1454,15 @@ impl TrackerComms {
             trackerid: trackerid.as_deref(),
         };
 
-        let mut url = tracker_url.clone();
-
-        let mut queries = request.as_querystring();
-        if let Some(url_query) = url.query() {
-            queries.push_str(&format!("&{}", url_query));
-        }
-        url.set_query(Some(&queries));
-
-        let bytes =
-            tracker_comms_http::get(&self.reqwest_client, url, &self.identity.user_agent).await?;
+        let bytes = tracker_comms_http::get(
+            &self.reqwest_client,
+            self.udp_client.resolver(),
+            tracker_url,
+            Ask::Announce,
+            &request.as_querystring(),
+            &self.identity.user_agent,
+        )
+        .await?;
         let response = read_answer(&bytes)?;
         if let Some(id) = &response.tracker_id {
             self.tracker_ids
@@ -2668,6 +2671,142 @@ mod tests {
             assert_eq!(at.len(), 2, "{scrapes:?}");
             assert!(at[1] - at[0] >= AutoScrape::INTERVAL, "{scrapes:?}");
         }
+    }
+
+    /// Resolves every name to `at`'s address.
+    struct FixedResolver {
+        at: std::net::IpAddr,
+    }
+
+    impl Resolver for FixedResolver {
+        fn resolve<'a>(
+            &'a self,
+            _host: &'a str,
+            port: u16,
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+            Box::pin(async move { Ok(vec![(self.at, port).into()]) })
+        }
+    }
+
+    /// The error the announce table records for `url`, once it has one.
+    async fn refusal_of(
+        status: &super::TrackerStatus,
+        peers: &mut (impl futures::Stream<Item = SocketAddr> + Unpin),
+        url: &Url,
+    ) -> String {
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("a refused tracker gave peers"),
+            r = rx.wait_for(|a| announce_of(a, url).last.is_some()) => r.unwrap(),
+        };
+        announce_of(&status.announces(), url)
+            .last
+            .clone()
+            .unwrap()
+            .result
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_tracker_url_that_could_forge_a_request_is_never_asked() {
+        // libtorrent ssrf_mitigation: http_tracker_connection::start refuses
+        // a URL whose query names an announce argument, on_filter a loopback
+        // tracker at a path other than /announce, whatever name it is
+        // reached by. Each is refused before any request; the next tier's
+        // tracker is asked.
+        let (refused, at) = http_listener().await;
+        let port = at.port().unwrap();
+        let named = |s: &str| Url::parse(&s.replace("PORT", &port.to_string())).unwrap();
+        let forged = [
+            named("http://127.0.0.1:PORT/announce?passkey=k&INFO_HASH=x"),
+            named("http://127.0.0.1:PORT/x?y=1"),
+            named("http://[::1]:PORT/api"),
+            named("http://tracker.invalid:PORT/announce/../admin"),
+        ];
+        let (ok, ok_url) = http_listener().await;
+        let mut tiers: Vec<Vec<Url>> = forged.iter().map(|u| vec![u.clone()]).collect();
+        tiers.push(vec![ok_url]);
+
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let resolver = Arc::new(FixedResolver {
+            at: Ipv4Addr::LOCALHOST.into(),
+        });
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            tiers,
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap();
+
+        for url in &forged {
+            let e = refusal_of(&status, &mut peers, url).await;
+            assert!(e.contains("SSRF"), "{url}: {e}");
+        }
+        let q = answer_with_a_peer(
+            &ok,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        // The forged trackers' host heard nothing.
+        assert!(refused.accept().now_or_never().is_none());
+
+        drop(peers);
+        let q = next_announce(&ok).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_loopback_path_no_tracker_answers_is_not_used() {
+        // libtorrent http_connection follows the redirect through on_filter
+        // again: the moved request is held to the same rule.
+        let (tracker, url) = http_listener().await;
+        let (moved, moved_url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let serve = async {
+            let (conn, _) = read_announce(&tracker).await;
+            let location = moved_url.join("/admin").unwrap();
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let mut response = response.as_bytes();
+            while !response.is_empty() {
+                conn.writable().await.unwrap();
+                match conn.try_write(response) {
+                    Ok(n) => response = &response[n..],
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            let (conn, _) = read_request(&moved).await;
+            respond(conn, "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe").await;
+            std::future::pending::<()>().await
+        };
+        let e = tokio::select! {
+            _ = serve => unreachable!(),
+            e = refusal_of(&status, &mut peers, &url) => e,
+        };
+        assert!(e.contains("SSRF"), "{e}");
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
     }
 
     struct CountingResolver {

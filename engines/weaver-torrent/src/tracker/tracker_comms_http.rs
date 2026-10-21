@@ -7,7 +7,9 @@
 
 use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
+use crate::core::net::Resolver;
 use crate::tracker::ScrapeOk;
+use anyhow::Context;
 use either::Either;
 use futures::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
@@ -246,24 +248,118 @@ pub(crate) const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (libtorrent `settings_pack::tracker_maximum_response_length`).
 pub(crate) const MAX_RESPONSE_LENGTH: usize = 1024 * 1024;
 
-/// The body of a tracker's answer to a GET of `url`. The answer fails when
-/// the tracker sends nothing for [`RECEIVE_TIMEOUT`], the status is not a
-/// success, or the body passes [`MAX_RESPONSE_LENGTH`]. The bounds are the
+/// What a GET to a tracker asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ask {
+    Announce,
+    Scrape,
+}
+
+/// The arguments an announce carries. A tracker URL whose own query names
+/// one already is refused (libtorrent `has_tracker_query_string`, the names
+/// compared as given, ignoring case).
+const TRACKER_ARGS: [&str; 9] = [
+    "info_hash",
+    "event",
+    "port",
+    "left",
+    "key",
+    "uploaded",
+    "downloaded",
+    "corrupt",
+    "peer_id",
+];
+
+fn has_tracker_query(query: &str) -> bool {
+    query.split('&').any(|arg| {
+        let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+        TRACKER_ARGS.iter().any(|a| a.eq_ignore_ascii_case(name))
+    })
+}
+
+/// Why a GET of `url` for `ask`, whose host resolved to `addrs`, may not be
+/// sent (libtorrent `ssrf_mitigation`, `http_tracker_connection::on_filter`):
+/// a tracker at a loopback address is asked only what a standard BitTorrent
+/// tracker answers, at a path starting `/announce`, or `/scrape` for a
+/// scrape. The client picks the address it connects to, so every address
+/// must pass.
+fn ssrf_refusal(url: &url::Url, ask: Ask, addrs: &[IpAddr]) -> Option<&'static str> {
+    let path = match ask {
+        Ask::Announce => "/announce",
+        Ask::Scrape => "/scrape",
+    };
+    let loopback = addrs.iter().any(|a| a.to_canonical().is_loopback());
+    (loopback && !url.path().starts_with(path))
+        .then_some("a loopback tracker asked at a path no tracker answers")
+}
+
+/// The addresses of `url`'s host: the address it names, or what
+/// `resolver`, else the host's resolver, finds for its name.
+async fn addresses(url: &url::Url, resolver: Option<&dyn Resolver>) -> anyhow::Result<Vec<IpAddr>> {
+    let port = url.port_or_known_default().unwrap_or(0);
+    let found = match url.host() {
+        Some(url::Host::Ipv4(ip)) => return Ok(vec![IpAddr::V4(ip)]),
+        Some(url::Host::Ipv6(ip)) => return Ok(vec![IpAddr::V6(ip)]),
+        Some(url::Host::Domain(name)) => match resolver {
+            Some(resolver) => resolver.resolve(name, port).await,
+            None => tokio::net::lookup_host((name, port))
+                .await
+                .map(Iterator::collect),
+        }
+        .with_context(|| format!("error looking up hostname {name}"))?,
+        None => anyhow::bail!("the tracker URL has no host"),
+    };
+    anyhow::ensure!(!found.is_empty(), "the tracker's name has no address");
+    Ok(found.iter().map(SocketAddr::ip).collect())
+}
+
+/// Refuses a GET of `url` for `ask` that [`ssrf_refusal`] holds back.
+async fn check(url: &url::Url, ask: Ask, resolver: Option<&dyn Resolver>) -> anyhow::Result<()> {
+    let addrs = addresses(url, resolver).await?;
+    match ssrf_refusal(url, ask, &addrs) {
+        Some(why) => anyhow::bail!("SSRF mitigation: {why}"),
+        None => Ok(()),
+    }
+}
+
+/// The body of a tracker's answer to a GET for `ask` of `tracker` with
+/// `query` added ahead of the URL's own. The GET is not sent when the
+/// URL's own query already names an announce argument, or when the host,
+/// as `resolver` resolves it, is one the request may not go to (libtorrent
+/// `http_tracker_connection::start`, `on_filter`); a redirect the client
+/// followed is held to the same before its answer is used. The answer fails
+/// when the tracker sends nothing for [`RECEIVE_TIMEOUT`], the status is not
+/// a success, or the body passes [`MAX_RESPONSE_LENGTH`]. The bounds are the
 /// engine's own, so they hold whatever client is used.
 pub(crate) async fn get(
     client: &reqwest::Client,
-    url: url::Url,
+    resolver: Option<&dyn Resolver>,
+    tracker: &url::Url,
+    ask: Ask,
+    query: &str,
     user_agent: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    let mut url = tracker.clone();
+    match tracker.query() {
+        Some(own) if has_tracker_query(own) => {
+            anyhow::bail!("SSRF mitigation: the tracker URL's query names an announce argument")
+        }
+        Some(own) => url.set_query(Some(&format!("{query}&{own}"))),
+        None => url.set_query(Some(query)),
+    }
+    check(&url, ask, resolver).await?;
     let response = tokio::time::timeout(
         RECEIVE_TIMEOUT,
         client
-            .get(url)
+            .get(url.clone())
             .header(reqwest::header::USER_AGENT, user_agent)
             .send(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the tracker sent nothing for {RECEIVE_TIMEOUT:?}"))??;
+    if response.url() != &url {
+        check(response.url(), ask, resolver).await?;
+    }
     if !response.status().is_success() {
         anyhow::bail!("tracker responded with {:?}", response.status());
     }
@@ -551,6 +647,65 @@ mod tests {
         assert!(parse_scrape(b"d8:intervali1800ee", &hash).is_err());
         let e = parse_scrape(b"d14:failure reason4:nopee", &hash).unwrap_err();
         assert!(format!("{e:#}").contains("nope"), "{e:#}");
+    }
+
+    #[test]
+    fn a_query_naming_an_announce_argument_is_one_a_tracker_url_may_not_carry() {
+        // libtorrent has_tracker_query_string: the names, ignoring case.
+        for q in [
+            "info_hash=x",
+            "a=1&Peer_ID=2",
+            "port",
+            "left=&b",
+            "key=k",
+            "uploaded=0",
+            "downloaded=0",
+            "corrupt=0",
+            "event=started",
+        ] {
+            assert!(has_tracker_query(q), "{q}");
+        }
+        for q in ["passkey=info_hash", "", "info_hashes=1", "numwant=1&ip=1"] {
+            assert!(!has_tracker_query(q), "{q}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_tracker_is_asked_only_at_a_tracker_path() {
+        // libtorrent http_tracker_connection::on_filter.
+        let url = |s: &str| url::Url::parse(s).unwrap();
+        let loopback: [IpAddr; 2] = ["127.0.0.2".parse().unwrap(), "::1".parse().unwrap()];
+        let lan: IpAddr = "192.168.1.2".parse().unwrap();
+        let global: IpAddr = "93.184.216.34".parse().unwrap();
+        for a in loopback {
+            for (u, ask) in [
+                ("http://h/announce", Ask::Announce),
+                ("http://h/announce.php?x=1", Ask::Announce),
+                ("http://h/scrape.php", Ask::Scrape),
+            ] {
+                assert_eq!(ssrf_refusal(&url(u), ask, &[a]), None, "{u} {a}");
+            }
+            for (u, ask) in [
+                ("http://h/x/announce", Ask::Announce),
+                ("http://h/", Ask::Announce),
+                ("http://h/scrape", Ask::Announce),
+                ("http://h/announce", Ask::Scrape),
+            ] {
+                assert!(ssrf_refusal(&url(u), ask, &[a]).is_some(), "{u} {a}");
+                // One loopback address among others is enough.
+                assert!(
+                    ssrf_refusal(&url(u), ask, &[global, a]).is_some(),
+                    "{u} {a}"
+                );
+            }
+        }
+        // A v4 loopback written as v6 is loopback.
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(ssrf_refusal(&url("http://h/x"), Ask::Announce, &[mapped]).is_some());
+        // Elsewhere any path is asked.
+        for a in [lan, global] {
+            assert_eq!(ssrf_refusal(&url("http://h/x"), Ask::Announce, &[a]), None);
+        }
     }
 
     /// A body sent as `chunks`, each `gap` after the one before.
