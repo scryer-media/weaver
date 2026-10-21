@@ -227,6 +227,44 @@ opt-level = 3
 [profile.test.package.sevenz-turbo]
 opt-level = 3
 
+# Backup key derivation and encryption, SQLite, and the bzip2, zstd and lz4
+# codecs run in tests at full size; unoptimised they dominate the suite.
+[profile.test.package.argon2]
+opt-level = 3
+
+[profile.test.package.blake2]
+opt-level = 3
+
+[profile.test.package.libbz2-rs-sys]
+opt-level = 3
+
+[profile.test.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.test.package.aes]
+opt-level = 3
+
+[profile.test.package.aes-gcm]
+opt-level = 3
+
+[profile.test.package.ghash]
+opt-level = 3
+
+[profile.test.package.polyval]
+opt-level = 3
+
+[profile.test.package.zstd-sys]
+opt-level = 3
+
+[profile.test.package.lz4_flex]
+opt-level = 3
+
+[profile.test.package.crc32fast]
+opt-level = 3
+
+[profile.test.package.aws-lc-sys]
+opt-level = 3
+
 [profile.matrix]
 inherits = "test"
 opt-level = 3
