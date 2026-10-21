@@ -1039,9 +1039,10 @@ fn spawn_fatal_errors_receiver(
     );
 }
 
-/// Hands each peer the trackers, the DHT and the initial list find to the
-/// live run, as each comes (libtorrent `torrent::add_peer`, called from
-/// `tracker_response`, `on_dht_announce_response` and `ut_pex`). The run's
+/// Hands each peer the trackers, the DHT, local service discovery and the
+/// initial list find to the live run, as each comes, with who found it
+/// (libtorrent `torrent::add_peer`, called from `tracker_response` and
+/// `on_dht_announce_response` with their `peer_source_flags_t`). The run's
 /// cancellation token ends it (`TorrentStateLive::spawn`), as does the
 /// stream closing; it holds the run weakly, as libtorrent's DHT callback
 /// holds the torrent (`on_dht_announce_response_disp`).
@@ -1052,12 +1053,12 @@ fn spawn_peer_adder(live: &Arc<TorrentStateLive>, mut peer_rx: PeerStream) {
         {
             let live = Arc::downgrade(live);
             async move {
-                while let Some(peer) = peer_rx.next().await {
-                    trace!(?peer, "received peer");
+                while let Some((peer, source)) = peer_rx.next().await {
+                    trace!(?peer, ?source, "received peer");
                     let Some(live) = live.upgrade() else {
                         return Ok(());
                     };
-                    live.add_peer(peer);
+                    live.add_peer(peer, source);
                 }
                 debug!("peer_rx closed, closing peer adder");
                 Ok(())

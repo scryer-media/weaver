@@ -111,7 +111,7 @@ use crate::{
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
     torrent_state::utils::atomic_inc,
-    type_aliases::{FileStorage, PeerHandle},
+    type_aliases::{FileStorage, PeerHandle, PeerSourceFlag},
 };
 
 use self::{
@@ -1068,10 +1068,10 @@ impl TorrentStateLive {
         }
     }
 
-    /// A tracker, DHT or PEX named `addr`.
-    pub(crate) fn add_peer(&self, addr: SocketAddr) {
+    /// `source` named `addr` (libtorrent `torrent::add_peer`).
+    pub(crate) fn add_peer(&self, addr: SocketAddr, source: PeerSourceFlag) {
         if self.may_connect_to(addr) {
-            self.peers.add_peer(addr);
+            self.peers.add_peer(addr, source);
         }
     }
 
@@ -1661,10 +1661,17 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         if first {
             // The connection works, so the failures before it no longer count.
             self.state.peers.connection_delivered(self.addr);
-            // The first message must be "bitfield", but if it's not sent,
-            // assume the bitfield is all zeroes and was sent.
-            if !matches!(&message, Message::Bitfield(..)) {
-                self.on_bitfield_notify.notify_waiters();
+            // The peer's pieces are known from its first message. One that
+            // is not a bitfield, Have All or Have None means the bitfield
+            // was omitted, which is the same as Have None (libtorrent
+            // `peer_connection::incoming_have`, `incoming_request`,
+            // `incoming_piece`). It is taken before the message is, so a
+            // first HAVE lands in pieces of the torrent's size.
+            if !matches!(
+                &message,
+                Message::Bitfield(..) | Message::HaveAll | Message::HaveNone
+            ) {
+                self.on_have_all_or_none(0).context("on_have_none")?;
             }
         }
 
@@ -2530,6 +2537,8 @@ impl PeerHandler {
         }
     }
 
+    /// Resolves once the peer's pieces are known: its first message was
+    /// read, and its bitfield sized to the torrent.
     async fn wait_for_bitfield(&self) {
         self.wait_for_any_notify(&self.on_bitfield_notify, || {
             self.state
@@ -3280,7 +3289,7 @@ impl PeerHandler {
             .transpose()?
             .unwrap_or_default();
         for peer in news {
-            self.state.add_peer(peer.addr);
+            self.state.add_peer(peer.addr, PeerSourceFlag::Pex);
             self.state.peers.pex_flags(peer.addr, peer.flags);
         }
         Ok(())
