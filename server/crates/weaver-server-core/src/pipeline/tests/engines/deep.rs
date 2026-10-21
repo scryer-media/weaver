@@ -166,6 +166,11 @@ async fn an_enciphered_rar_and_an_aes_7z_two_deep_are_repaired_by_the_set_beside
     assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
 }
 
+#[tokio::test]
+async fn the_broad_set_two_deep_restarted_after_every_article_is_repaired_with_no_refetch() {
+    restart_row(broad_two_deep()).await;
+}
+
 // Two sets two deep: `ember.bin` under one recovery block with two of its
 // articles damaged, `quill.bin` under two with one; an article two deep
 // spans two slices of its member. The short set's file is listed

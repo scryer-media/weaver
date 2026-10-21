@@ -296,6 +296,10 @@ impl Object for RarRecovery {
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
     // The volume stays in its member's own file, where the restore reads it.
+    // The front and footer it copies out are in its facts, which a restart
+    // keeps: it says nothing of the posted bytes.
+    fn unposted(&mut self, _volume: VolumeIndex, _range: ByteRange) {}
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
             envelope: volume.0,

@@ -320,6 +320,11 @@ pub trait Object: Send + Sync {
             && placements.iter().all(|placement| read(placement, into))
     }
 
+    // The bytes posted at this range of my volume are not here: a restart
+    // could not read them back, and they will be posted again. I forget what
+    // I said of them, so I say it again as they come.
+    fn unposted(&mut self, volume: VolumeIndex, range: ByteRange);
+
     // What `posted` answers for these ranges of my volumes, as I stand now,
     // owned and apart from me. An object that rebuilds its posted bytes
     // itself hands out what that rebuilding needs, shared rather than

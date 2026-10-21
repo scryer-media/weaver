@@ -111,6 +111,9 @@ impl Store {
 }
 
 impl Object for Store {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::RarStore
     }
@@ -254,6 +257,9 @@ struct LockedEngine {
 }
 
 impl Object for LockedEngine {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::RarEngine
     }

@@ -412,6 +412,21 @@ impl Namespace {
         every
     }
 
+    // Bytes of `posting` over `range` are not in hand: a restart could not
+    // read them back, and they come again. Neither the posting nor the
+    // member it is holds them, and the member is open until they come.
+    // Returns the member.
+    pub fn uncover(&mut self, posting: MemberId, range: ByteRange) -> MemberId {
+        let member = self.resolve(posting);
+        for id in [posting, member] {
+            if let Some(record) = self.members.get_mut(&id) {
+                record.coverage.erase(range);
+                record.closed = false;
+            }
+        }
+        member
+    }
+
     // Bytes of `posting` arrived over `range` with `provenance`. The
     // posting records them, and the member it is takes them except where
     // they are damaged and another posting brought those bytes clean: a

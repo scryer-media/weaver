@@ -26,6 +26,9 @@ struct Store {
 }
 
 impl Object for Store {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::RarStore
     }
@@ -116,6 +119,9 @@ struct Late {
 }
 
 impl Object for Late {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::SevenZipStore
     }
@@ -289,6 +295,9 @@ struct Par {
 }
 
 impl Object for Par {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
     fn kind(&self) -> Kind {
         Kind::Par2
     }

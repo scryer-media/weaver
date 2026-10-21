@@ -157,9 +157,10 @@ impl GraphJob {
     // next is read: an object's inverse map for a later article can lean on
     // what the earlier ones rebuilt, as a cipher's chain does. What does not
     // read is the root's to fetch again: the article waits, and the bytes
-    // it covered are no longer covered. A restore starts with no holds, so
-    // any it reads through are bytes an earlier article's delivery moved
-    // there from disk, as a member bound by its bytes moves its file.
+    // it covered are no longer covered, or said at any depth they reached.
+    // A restore starts with no holds, so any it reads through are bytes an
+    // earlier article's delivery moved there from disk, as a member bound
+    // by its bytes moves its file.
     fn read_back(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
         let mut missing = Vec::new();
         let mut bytes = Vec::new();
@@ -191,14 +192,14 @@ impl GraphJob {
         let mut refetched = Vec::with_capacity(missing.len());
         for (volume, ordinal, range) in missing {
             self.root.map.unarrive(volume, ordinal);
+            if let Some(range) = range {
+                self.tree.uncover(NodeId::ROOT, volume, range);
+            }
             if let Some(found) = self
                 .tree
                 .namespace_mut(NodeId::ROOT)
                 .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
             {
-                if let Some(range) = range {
-                    found.coverage.erase(range);
-                }
                 found.closed = false;
             }
             refetched.push((volume, ordinal));
