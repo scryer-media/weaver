@@ -97,6 +97,30 @@ pub(crate) fn listen_address(addr: SocketAddr, kind: ConnectionKind) -> Option<S
     }
 }
 
+/// A peer bitfield holding no piece, shaped as BITFIELD carries one: a bit
+/// per piece, padded to whole bytes.
+pub(crate) fn empty_bitfield(total_pieces: u32) -> BF {
+    BF::from_boxed_slice(vec![0; total_pieces.div_ceil(8) as usize].into_boxed_slice())
+}
+
+/// The pieces a BITFIELD message says the peer has (BEP 3): one bit per
+/// piece, padded to whole bytes. A payload of any other length ends the
+/// connection, and the padding bits are cleared here, so no reader of a peer
+/// bitfield sees a piece past the torrent's last.
+pub(crate) fn ingest_bitfield(payload: &[u8], total_pieces: u32) -> anyhow::Result<BF> {
+    let mut bitfield = empty_bitfield(total_pieces);
+    if payload.len() != bitfield.as_raw_slice().len() {
+        anyhow::bail!(
+            "bitfield of {} bytes, expected {} for {total_pieces} pieces",
+            payload.len(),
+            bitfield.as_raw_slice().len(),
+        );
+    }
+    bitfield.as_raw_mut_slice().copy_from_slice(payload);
+    bitfield[total_pieces as usize..].fill(false);
+    Ok(bitfield)
+}
+
 /// Where a peer stands when a full peer list must forget one; the lowest goes
 /// first. Peers we would not connect to go before connect candidates, then the
 /// most failures in a row, then the oldest failure.
@@ -346,18 +370,15 @@ impl Peer {
     }
 
     pub fn destroy(self, counters: &PeerStates) {
-        for counter in [&counters.session_stats, &counters.stats] {
-            counter.dec(&self.state);
-        }
+        counters.count_out(&self.state);
         if let (Some(addr), PeerState::Live(..)) = (self.outgoing_address, &self.state) {
             counters.live_outgoing_peers.write().remove(&addr);
         }
     }
 
     pub fn set_state(&mut self, new: PeerState, counters: &PeerStates) -> PeerState {
-        for counter in [&counters.session_stats, &counters.stats] {
-            counter.incdec(&self.state, &new);
-        }
+        counters.count_out(&self.state);
+        counters.count_in(&new);
         if let Some(addr) = self.outgoing_address {
             if matches!(&self.state, PeerState::Live(..)) {
                 counters.live_outgoing_peers.write().remove(&addr);

@@ -75,11 +75,6 @@ impl AggregatePeerStatsAtomic {
         }
     }
 
-    pub(crate) fn incdec(&self, old: &PeerState, new: &PeerState) {
-        self.dec(old);
-        self.inc(new);
-    }
-
     pub fn inc_steals(&self) {
         atomic_inc(&self.steals);
     }

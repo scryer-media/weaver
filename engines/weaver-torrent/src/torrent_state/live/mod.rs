@@ -113,7 +113,7 @@ use crate::{
 use self::{
     choker::{CHOKED_REQUEST_GRACE, Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     peer::{
-        InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
+        InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult, ingest_bitfield,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -130,10 +130,6 @@ use super::{
     streaming::TorrentStreams,
     utils::{TimedExistence, timeit},
 };
-
-fn make_piece_bitfield(lengths: &Lengths) -> BF {
-    BF::from_boxed_slice(vec![0; lengths.piece_bitfield_bytes()].into_boxed_slice())
-}
 
 pub(crate) struct TorrentStateLocked {
     // Coordinates piece state: what chunks we have, need, and what pieces are in-flight.
@@ -286,7 +282,7 @@ impl TorrentStateLive {
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
             metadata: paused.metadata.clone(),
-            peers: PeerStates::new(session_stats.peers.clone()),
+            peers: PeerStates::new(session_stats.peers.clone(), lengths.total_pieces()),
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 file_priorities,
@@ -1221,7 +1217,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::KeepAlive => {
                 trace!("keepalive received");
             }
-            Message::Have(h) => self.on_have(h),
+            Message::Have(h) => self.on_have(h).context("on_have")?,
             Message::Hashes(hashes) => self.on_hashes(hashes).context("on_hashes")?,
             Message::HashReject(request) => self.on_hash_reject(request),
             Message::HashRequest(request) => {
@@ -1650,57 +1646,24 @@ impl PeerHandler {
             });
     }
 
-    fn on_have(&self, have: u32) {
-        self.state
-            .peers
-            .with_live_mut(self.addr, "on_have", |live| {
-                // If bitfield wasn't allocated yet, let's do it. Some clients start empty so they never
-                // send bitfields.
-                if live.bitfield.is_empty() {
-                    live.bitfield = make_piece_bitfield(&self.state.lengths);
-                }
-                match live.bitfield.get_mut(have as usize) {
-                    Some(mut v) => *v = true,
-                    None => {
-                        warn!(
-                            id = self.state.shared.id,
-                            info_hash = ?self.state.shared.info_hash,
-                            addr = ?self.addr,
-                            "received have {} out of range",
-                            have
-                        );
-                        return;
-                    }
-                };
-                trace!("updated bitfield with have={}", have);
-                self.state
-                    .peers
-                    .update_seeder_flag(live, self.state.lengths.total_pieces() as usize);
-                if live.seeder {
-                    debug!("peer has full torrent");
-                }
-            });
+    /// A HAVE names a piece the peer now has; one at or past the piece count
+    /// ends the connection.
+    fn on_have(&self, have: u32) -> anyhow::Result<()> {
+        let Some(piece) = self.state.lengths.validate_piece_index(have) else {
+            anyhow::bail!(
+                "have {have} is past the last of {} pieces",
+                self.state.lengths.total_pieces()
+            );
+        };
+        trace!(have, "peer has piece");
+        self.state.peers.peer_has(self.addr, piece);
         self.on_bitfield_notify.notify_waiters();
+        Ok(())
     }
 
     fn on_bitfield(&self, bitfield: ByteBufOwned) -> anyhow::Result<()> {
-        if bitfield.as_ref().len() != self.state.lengths.piece_bitfield_bytes() {
-            anyhow::bail!(
-                "dropping peer as its bitfield has unexpected size. Got {}, expected {}",
-                bitfield.as_ref().len(),
-                self.state.lengths.piece_bitfield_bytes(),
-            );
-        }
-        let bf = BF::from_boxed_slice(bitfield.0.to_vec().into_boxed_slice());
-        if let Some(true) = bf
-            .get(..self.state.lengths.total_pieces() as usize)
-            .map(|s| s.all())
-        {
-            debug!("peer has full torrent");
-        }
-        self.state
-            .peers
-            .update_bitfield(self.addr, bf, self.state.lengths.total_pieces() as usize);
+        let bf = ingest_bitfield(bitfield.as_ref(), self.state.lengths.total_pieces())?;
+        self.state.peers.update_bitfield(self.addr, bf);
         self.on_bitfield_notify.notify_waiters();
         Ok(())
     }

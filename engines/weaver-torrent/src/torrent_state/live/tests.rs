@@ -109,7 +109,7 @@ impl Harness {
             cancel_token: self.live.cancellation_token.child_token(),
             client_name_and_version: String::new(),
         };
-        let mut every_piece = make_piece_bitfield(&self.lengths);
+        let mut every_piece = peer::empty_bitfield(self.lengths.total_pieces());
         every_piece[..self.lengths.total_pieces() as usize].fill(true);
         handler
             .on_bitfield(ByteBufOwned::from(every_piece.as_raw_slice().to_vec()))
@@ -383,6 +383,57 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
 
     assert_eq!(snubbed.acquire_next_piece().unwrap(), None);
     assert!(fast.acquire_next_piece().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn the_padding_bits_of_a_bitfield_are_cleared_at_ingest() {
+    let h = Harness::new("bitfield_padding_cleared").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+
+    // Piece 1 and every padding bit.
+    peer.on_received_message(Message::Bitfield(ByteBuf(&[0b0111_1111])))
+        .await
+        .unwrap();
+    let bitfield = h
+        .peers
+        .with_live(peer.addr, |live| live.bitfield.clone())
+        .unwrap();
+    assert_eq!(bitfield.as_raw_slice(), [0b0100_0000]);
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+}
+
+#[tokio::test]
+async fn a_bitfield_that_is_not_one_bit_per_piece_ends_the_connection() {
+    let h = Harness::new("bitfield_wrong_length").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+
+    for payload in [&[][..], &[0b1100_0000, 0][..]] {
+        assert!(
+            peer.on_received_message(Message::Bitfield(ByteBuf(payload)))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(h.peers.availability.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn a_have_at_or_past_the_piece_count_ends_the_connection() {
+    let h = Harness::new("have_past_piece_count").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Bitfield(ByteBuf(&[0])))
+        .await
+        .unwrap();
+
+    peer.on_received_message(Message::Have(1)).await.unwrap();
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+    for have in [PIECES, 7, u32::MAX] {
+        assert!(peer.on_received_message(Message::Have(have)).await.is_err());
+    }
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
 }
 
 /// What the upload side queues for a peer's writer.
