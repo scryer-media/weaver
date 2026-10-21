@@ -85,6 +85,7 @@ impl Default for NatPmpOptions {
 enum Action {
     None,
     Add,
+    Delete,
 }
 
 /// One mapping on the gateway (libtorrent `natpmp::mapping_t`).
@@ -309,6 +310,38 @@ impl State {
         }
     }
 
+    /// Ask the gateway to drop every mapping it may hold, with a lifetime-0
+    /// MAP each, sent once without waiting for an answer, and report each
+    /// gone (libtorrent `natpmp::close_impl`; `send_map_request` under
+    /// `m_abort`).
+    async fn close(&mut self, socket: &UdpSocket, events: &PortMapEvents) {
+        self.in_flight = None;
+        for i in 0..self.mappings.len() {
+            let m = &mut self.mappings[i];
+            // A mapping never asked for, or one the gateway closed, is not
+            // there to remove.
+            if !(m.live && m.map_sent) {
+                continue;
+            }
+            m.action = Action::Delete;
+            let packet = self.map_request(&self.mappings[i]);
+            if let Err(e) = socket.send(&packet).await {
+                debug!("error sending a port unmap request: {e:#}");
+            }
+            let m = &mut self.mappings[i];
+            m.live = false;
+            trace!(protocol = ?m.request.protocol, external_port = m.external_port, "port mapping removed");
+            let _ = events.send(PortMapped {
+                transport: PortmapTransport::NatPmp,
+                protocol: m.request.protocol,
+                local_port: m.request.local_port,
+                external_port: None,
+                external_ip: None,
+                error: None,
+            });
+        }
+    }
+
     /// Whether the gateway lost its mappings: its epoch went back, or moved
     /// on by less than our own clock did (RFC 6886 section 3.6).
     fn gateway_lost_state(&mut self, epoch: u32) -> bool {
@@ -474,7 +507,7 @@ impl NatPmpMapper {
         }
     }
 
-    /// Keep every port mapped until cancelled.
+    /// Keep every port mapped until cancelled, then remove the mappings.
     pub async fn run(self, cancel: CancellationToken, events: PortMapEvents) -> anyhow::Result<()> {
         let unspecified: IpAddr = match self.gateway {
             SocketAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
@@ -519,6 +552,7 @@ impl NatPmpMapper {
                 _ = timer => state.on_timer(&socket).await,
             }
         }
+        state.close(&socket, &events).await;
         Ok(())
     }
 }
@@ -873,7 +907,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pcp_maps_tcp_and_udp_and_refreshes_at_three_quarters_of_the_granted_lifetime() {
+    async fn pcp_maps_tcp_and_udp_refreshes_at_three_quarters_of_the_granted_lifetime_and_removes_them_on_close()
+     {
         let _hold = hold_clock();
         let mut gateway = Gateway::new().await;
         let mut running = run_mapper(&gateway, &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
@@ -901,11 +936,33 @@ mod tests {
         gateway
             .send(&pcp_answer(&refresh, 0, 7200, 1000 + 5400, 6881))
             .await;
+        assert_eq!(
+            running.events.recv().await.unwrap(),
+            mapped(PortmapProtocol::Tcp, EXTERNAL)
+        );
         let refresh = gateway.recv().await;
         assert_pcp_map(&refresh, 17, 3600, EXTERNAL);
         assert_eq!(&refresh[24..36], &udp[24..36]);
 
+        // Closing sends a lifetime-0 MAP for each, the UDP refresh still
+        // unanswered included, under the mapping's own nonce.
         running.cancel.cancel();
+        for (protocol, number, request) in [
+            (PortmapProtocol::Tcp, 6, &tcp),
+            (PortmapProtocol::Udp, 17, &udp),
+        ] {
+            let delete = gateway.recv().await;
+            assert_pcp_map(&delete, number, 0, EXTERNAL);
+            assert_eq!(&delete[24..36], &request[24..36]);
+            assert_eq!(
+                running.events.recv().await.unwrap(),
+                PortMapped {
+                    external_port: None,
+                    external_ip: None,
+                    ..mapped(protocol, EXTERNAL)
+                }
+            );
+        }
         running.task.await.unwrap().unwrap();
     }
 
@@ -946,6 +1003,11 @@ mod tests {
         );
 
         running.cancel.cancel();
+        let mut delete = vec![0, 2, 0, 0];
+        delete.extend_from_slice(&6881u16.to_be_bytes());
+        delete.extend_from_slice(&6881u16.to_be_bytes());
+        delete.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(gateway.recv().await, delete);
         running.task.await.unwrap().unwrap();
     }
 

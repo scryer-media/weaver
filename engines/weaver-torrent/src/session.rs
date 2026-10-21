@@ -1389,8 +1389,8 @@ impl Session {
         });
     }
 
-    /// A mapper watches the session's token itself, so it is not dropped
-    /// on cancel; `stop` waits for it to finish.
+    /// A mapper watches the session's token itself and removes its mappings
+    /// on the way out, so it is not dropped on cancel; `stop` waits for it.
     fn spawn_port_mapper(
         &self,
         name: &'static str,

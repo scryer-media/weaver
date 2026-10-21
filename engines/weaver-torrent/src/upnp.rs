@@ -422,6 +422,8 @@ struct GatewayMapping {
     /// When to (re)send `AddPortMapping`; `None` for a permanent, failed or
     /// given-up mapping.
     next_add: Option<Instant>,
+    /// The external port the gateway last granted: what closing removes.
+    granted: Option<u16>,
 }
 
 impl GatewayMapping {
@@ -431,6 +433,7 @@ impl GatewayMapping {
             external_port: request.external_port,
             failcount: 0,
             next_add: Some(Instant::now()),
+            granted: None,
         }
     }
 }
@@ -677,6 +680,7 @@ impl UpnpPortForwarder {
                         "port mapped"
                     );
                     mapping.failcount = 0;
+                    mapping.granted = Some(mapping.external_port);
                     // libtorrent `on_upnp_map_response`: renew at three
                     // quarters of the lease; a permanent mapping stays.
                     if !lease.is_zero() {
@@ -705,8 +709,53 @@ impl UpnpPortForwarder {
         Ok(())
     }
 
+    /// Remove every mapping the gateway granted (libtorrent `upnp::close`,
+    /// `delete_port_mapping`, `on_upnp_unmap_response`) and report each
+    /// gone, with the gateway's error if it refused.
+    async fn delete_port_mappings(
+        &self,
+        gateway: &Gateway,
+        mappings: &mut [GatewayMapping],
+        events: &PortMapEvents,
+    ) {
+        for mapping in mappings {
+            let Some(external_port) = mapping.granted.take() else {
+                continue;
+            };
+            let arguments = format!(
+                "<NewRemoteHost></NewRemoteHost>\
+                 <NewExternalPort>{}</NewExternalPort>\
+                 <NewProtocol>{}</NewProtocol>",
+                external_port,
+                mapping.request.protocol.upnp_name(),
+            );
+            let error = match self.soap(gateway, "DeletePortMapping", &arguments).await {
+                Ok((status, body)) => match soap_error_code(&body) {
+                    Some(code) => Some(format!("UPnP error {code}")),
+                    None if !status.is_success() => Some(format!("HTTP {status}")),
+                    None => None,
+                },
+                Err(e) => Some(format!("{e:#}")),
+            };
+            debug!(
+                protocol = ?mapping.request.protocol,
+                external_port,
+                ?error,
+                "port mapping removed"
+            );
+            let _ = events.send(PortMapped {
+                transport: PortmapTransport::Upnp,
+                protocol: mapping.request.protocol,
+                local_port: mapping.request.local_port,
+                external_port: None,
+                external_ip: None,
+                error,
+            });
+        }
+    }
+
     /// Map every port on one gateway and keep the mappings renewed until
-    /// cancelled.
+    /// cancelled, then remove them.
     async fn manage_gateway(
         &self,
         found: UpnpDiscoverResponse,
@@ -727,7 +776,7 @@ impl UpnpPortForwarder {
         loop {
             tokio::select! {
                 r = self.add_due_mappings(&mut gateway, &mut mappings, events) => r?,
-                _ = cancel.cancelled() => return Ok(()),
+                _ = cancel.cancelled() => break,
             }
             let next_add = mappings.iter().filter_map(|m| m.next_add).min();
             let renew = match next_add {
@@ -736,9 +785,12 @@ impl UpnpPortForwarder {
             };
             tokio::select! {
                 _ = renew => {},
-                _ = cancel.cancelled() => return Ok(()),
+                _ = cancel.cancelled() => break,
             }
         }
+        self.delete_port_mappings(&gateway, &mut mappings, events)
+            .await;
+        Ok(())
     }
 
     /// Manage every gateway discovery finds until cancelled. A gateway that
@@ -779,7 +831,8 @@ impl UpnpPortForwarder {
         Ok(())
     }
 
-    /// Discover gateways and keep the ports mapped on each until cancelled.
+    /// Discover gateways and keep the ports mapped on each until cancelled,
+    /// then remove them.
     pub async fn run(self, cancel: CancellationToken, events: PortMapEvents) -> anyhow::Result<()> {
         let (found_tx, found_rx) = unbounded_channel();
         tokio::select! {
@@ -1126,7 +1179,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_wanipconnection_2_gateway_maps_tcp_and_udp_and_renews_at_three_quarters_of_the_lease()
+    async fn a_wanipconnection_2_gateway_maps_tcp_and_udp_renews_at_three_quarters_of_the_lease_and_removes_them_on_close()
      {
         let _hold = hold_clock();
         let service = "urn:schemas-upnp-org:service:WANIPConnection:2";
@@ -1171,7 +1224,28 @@ pub(crate) mod tests {
             assert_eq!(call.arg("NewProtocol"), protocol);
             assert_eq!(call.arg("NewLeaseDuration"), "3600");
         }
+        running.events.recv().await.unwrap();
+        running.events.recv().await.unwrap();
+
         running.cancel.cancel();
+        for (protocol, name) in [(PortmapProtocol::Tcp, "TCP"), (PortmapProtocol::Udp, "UDP")] {
+            let call = calls.recv().await.unwrap();
+            assert_eq!(call.soap_action, format!("\"{service}#DeletePortMapping\""));
+            assert!(call.body.contains("<NewRemoteHost></NewRemoteHost>"));
+            assert_eq!(call.arg("NewExternalPort"), "6881");
+            assert_eq!(call.arg("NewProtocol"), name);
+            assert_eq!(
+                running.events.recv().await.unwrap(),
+                PortMapped {
+                    transport: PortmapTransport::Upnp,
+                    protocol,
+                    local_port: 6881,
+                    external_port: None,
+                    external_ip: None,
+                    error: None,
+                }
+            );
+        }
         running.task.await.unwrap().unwrap();
     }
 
@@ -1251,6 +1325,9 @@ pub(crate) mod tests {
             mapped(PortmapProtocol::Tcp, 6881, port)
         );
         running.cancel.cancel();
+        let delete = calls.recv().await.unwrap();
+        assert_eq!(delete.action(), "DeletePortMapping");
+        assert_eq!(delete.arg("NewExternalPort"), port.to_string());
         running.task.await.unwrap().unwrap();
     }
 
@@ -1267,7 +1344,7 @@ pub(crate) mod tests {
             },
             Arc::new(|call: &SoapCall| match call.action() {
                 "GetExternalIPAddress" => external_ip_answer(),
-                _ if call.arg("NewLeaseDuration") != "0" => fault(725),
+                "AddPortMapping" if call.arg("NewLeaseDuration") != "0" => fault(725),
                 _ => ok(""),
             }),
         )
@@ -1336,6 +1413,9 @@ pub(crate) mod tests {
         );
         running.cancel.cancel();
         running.task.await.unwrap().unwrap();
+        // Nothing was granted, so closing removes nothing.
+        assert!(calls.try_recv().is_err());
+        assert!(running.events.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]
