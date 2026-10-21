@@ -532,18 +532,21 @@ async fn a_fast_connection_opens_with_have_all_have_none_or_a_bitfield() {
 }
 
 /// What the upload side queues for a peer's writer.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Sent {
     Choke,
     Unchoke,
     /// The block at (piece, offset), handed to the writer to send.
     Block(u32, u32),
+    /// A Reject for the block at (piece, offset).
+    Reject(u32, u32),
 }
 
 fn sent(request: WriterRequest) -> Sent {
     match request {
         WriterRequest::Message(Message::Choke) => Sent::Choke,
         WriterRequest::Message(Message::Unchoke) => Sent::Unchoke,
+        WriterRequest::Message(Message::Reject(r)) => Sent::Reject(r.index, r.begin),
         WriterRequest::ReadChunkRequest(c) => Sent::Block(c.piece_index.get(), c.offset),
         other => panic!("unexpected writer request {other:?}"),
     }
@@ -598,6 +601,161 @@ async fn a_cancel_takes_an_unsent_block_off_the_upload_queue() {
         .await
         .unwrap();
     assert_eq!(next_sent(&mut rx).await, Sent::Block(1, CHUNK_SIZE));
+}
+
+#[tokio::test]
+async fn a_cancel_of_an_unsent_block_is_answered_with_a_reject_on_a_fast_connection() {
+    let h = Harness::seeding("a_fast_cancel_is_rejected").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    peer.on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+    peer.on_received_message(Message::Cancel(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Reject(0, 0));
+    assert!(!peer.claim_upload(&h.chunk(0, 0)));
+
+    // A block already sent stays sent, and its cancel has no answer.
+    peer.on_received_message(Message::Request(request(0, 1)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, CHUNK_SIZE));
+    assert!(peer.claim_upload(&h.chunk(0, 1)));
+    peer.on_received_message(Message::Cancel(request(0, 1)))
+        .await
+        .unwrap();
+    assert!(rx.is_empty());
+}
+
+#[tokio::test]
+async fn a_fast_peer_we_choke_is_sent_a_reject_for_every_block_it_will_not_get() {
+    let h = Harness::seeding_with_slots("a_fast_choke_rejects", 1).await;
+    tokio::time::pause();
+    let (held, mut held_rx) = h.peer("127.0.0.1:6881");
+    let (other, mut other_rx) = h.peer("127.0.0.2:6881");
+    h.speak_fast(&held);
+    let (held, other) = (&held, &other);
+
+    held.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Unchoke);
+    for chunk in [0, 1] {
+        held.on_received_message(Message::Request(request(0, chunk)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
+
+    // The slot passes to the other peer. The Choke goes first, then a Reject
+    // for each unsent block.
+    other
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Choke);
+    let rejects = BTreeSet::from([next_sent(&mut held_rx).await, next_sent(&mut held_rx).await]);
+    assert_eq!(
+        rejects,
+        BTreeSet::from([Sent::Reject(0, 0), Sent::Reject(0, CHUNK_SIZE)])
+    );
+    assert!(!held.claim_upload(&h.chunk(0, 0)));
+    assert!(!held.claim_upload(&h.chunk(0, 1)));
+
+    // What the choked peer asks for now is rejected at once, and within the
+    // grace the connection stays.
+    held.on_received_message(Message::Request(request(1, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Reject(1, 0));
+    assert!(held_rx.is_empty());
+
+    // A cancel for a block already rejected has no answer.
+    held.on_received_message(Message::Cancel(request(0, 0)))
+        .await
+        .unwrap();
+    assert!(held_rx.is_empty());
+}
+
+#[tokio::test]
+async fn a_fast_peer_that_chokes_us_keeps_our_requests_until_it_rejects_one() {
+    let h = Harness::new("a_fast_choke_keeps_requests").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let mut requester: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+
+    peer.on_i_am_unchoked();
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, every_chunk().len()).await,
+        every_chunk()
+    );
+    drop(requester);
+
+    // The peer answers every request with its block or a Reject, so the
+    // Choke leaves them all in flight, and a block still counts.
+    (&peer).on_received_message(Message::Choke).await.unwrap();
+    assert_eq!(h.inflight_count(&peer), every_chunk().len());
+    assert!(h.queued_pieces().is_empty());
+    h.deliver(&peer, (0, 0)).await;
+    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
+
+    // One Reject gives back both pieces and every request, the delivered
+    // chunk kept.
+    (&peer)
+        .on_received_message(Message::Reject(request(0, 1)))
+        .await
+        .unwrap();
+    assert_eq!(h.inflight_count(&peer), 0);
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+    assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
+
+    // The Rejects for the rest answer requests we no longer wait for.
+    let mut rest = every_chunk();
+    rest.remove(&(0, 0));
+    rest.remove(&(0, CHUNK_SIZE));
+    for (index, begin) in rest {
+        (&peer)
+            .on_received_message(Message::Reject(request(index, begin / CHUNK_SIZE)))
+            .await
+            .unwrap();
+    }
+    // One more answers nothing we asked for.
+    assert!(
+        (&peer)
+            .on_received_message(Message::Reject(request(1, 0)))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_reject_for_a_block_we_never_asked_for_ends_the_connection() {
+    let h = Harness::new("a_reject_never_requested").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.speak_fast(&peer);
+    let peer = &peer;
+    assert!(
+        peer.on_received_message(Message::Reject(request(0, 0)))
+            .await
+            .is_err()
+    );
+    let past_the_end = Request {
+        index: PIECES,
+        begin: 0,
+        length: CHUNK_SIZE,
+    };
+    assert!(
+        peer.on_received_message(Message::Reject(past_the_end))
+            .await
+            .is_err()
+    );
 }
 
 impl Harness {

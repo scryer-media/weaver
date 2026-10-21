@@ -1201,6 +1201,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::HaveAll => self.on_have_all_or_none(0xff).context("on_have_all")?,
             Message::HaveNone => self.on_have_all_or_none(0).context("on_have_none")?,
             Message::Choke => self.on_i_am_choked().context("on_i_am_choked")?,
+            Message::Reject(request) => self.on_rejected(request).context("on_rejected")?,
             Message::Unchoke => self.on_i_am_unchoked(),
             Message::Interested => self
                 .state
@@ -1976,11 +1977,51 @@ impl PeerHandler {
 
     fn on_i_am_choked(&self) -> crate::Result<()> {
         self.lock_flow_control("i_am_choked = true").i_am_choked = true;
-        // A peer that chokes us drops every request we sent it (BEP 3). We
-        // do not speak the fast extension (BEP 6), so no allowed-fast piece
-        // keeps its requests.
-        self.return_requests()?;
+        // A plain peer that chokes us drops every request we sent it (BEP 3).
+        // A fast one answers each with its block or a Reject (BEP 6), so the
+        // requests stay until it does (libtorrent
+        // `bt_peer_connection::on_choke` takes them as rejected only without
+        // the fast extension).
+        if !self.speaks_fast() {
+            self.return_requests()?;
+        }
         self.notify_request_slots_changed();
+        Ok(())
+    }
+
+    /// The peer will not send the block `request` names (BEP 6). The peer
+    /// gives back every piece it owns and every request, as when its
+    /// requests time out: a piece has one owner, which must be able to
+    /// deliver all of it (libtorrent `peer_connection::incoming_reject_request`
+    /// gives back only the block). A Reject for a request we never sent ends
+    /// the connection (BEP 6: the peer should close it).
+    fn on_rejected(&self, request: Request) -> anyhow::Result<()> {
+        let Some(chunk) = self.requested_chunk(&request) else {
+            anyhow::bail!("peer rejected {request:?}, which names no block of the torrent");
+        };
+        let Some(answer) =
+            self.state
+                .peers
+                .with_live_mut(self.addr, "reject_inflight_request", |live| {
+                    live.reject_inflight_request(&chunk)
+                })
+        else {
+            return Ok(());
+        };
+        match answer {
+            RemoveInflightRequestResult::Expected => {
+                self.return_requests()?;
+            }
+            RemoveInflightRequestResult::LateCanceled => {
+                trace!(
+                    ?request,
+                    "peer rejected a request we had stopped waiting for"
+                );
+            }
+            RemoveInflightRequestResult::Unexpected => {
+                anyhow::bail!("peer rejected {request:?}, which we never asked it for")
+            }
+        }
         Ok(())
     }
 

@@ -639,7 +639,23 @@ impl LivePeerState {
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
         }
+        self.answer_to_no_request()
+    }
 
+    /// The peer rejected our request for `chunk` (BEP 6). That answers the
+    /// request as a block would, but says nothing of how fast the peer
+    /// delivers.
+    pub fn reject_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
+        if self.inflight_requests.remove(chunk) {
+            self.request_slots_changed.notify_waiters();
+            return RemoveInflightRequestResult::Expected;
+        }
+        self.answer_to_no_request()
+    }
+
+    /// The peer answered a request that is not outstanding: late when we had
+    /// stopped waiting for it, unexpected when we never sent it.
+    fn answer_to_no_request(&mut self) -> RemoveInflightRequestResult {
         if self.late_cancelled_request_tolerance > 0 {
             // This may be any unexpected chunk, not necessarily the exact canceled
             // one, but the tolerance is bounded by cancels we sent.
@@ -656,11 +672,7 @@ impl LivePeerState {
         let before = self.inflight_requests.len();
         self.inflight_requests.retain(|req| {
             if req.piece_index == piece {
-                let _ = tx.send(WriterRequest::Message(Message::Cancel(Request {
-                    index: piece.get(),
-                    begin: req.offset,
-                    length: req.size,
-                })));
+                let _ = tx.send(WriterRequest::Message(Message::Cancel(wire_request(req))));
                 *late_cancelled_request_tolerance += 1;
                 false
             } else {
@@ -695,9 +707,12 @@ impl LivePeerState {
     }
 
     /// The peer asked us for `chunk`. While we choke the peer the request is
-    /// not queued, and the error is when we choked it.
+    /// not queued: a fast peer is told so with a Reject (libtorrent
+    /// `peer_connection::incoming_request`), and the error is when we choked
+    /// it.
     pub fn queue_upload(&mut self, chunk: ChunkInfo) -> Result<(), Instant> {
         if let Some(choked_at) = self.choked_at {
+            self.reject(&chunk);
             return Err(choked_at);
         }
         self.upload_queue.insert(chunk);
@@ -739,17 +754,31 @@ impl LivePeerState {
     }
 
     /// Chokes the peer at `now`: a Choke goes out and every block it asked
-    /// for and was not sent is dropped (BEP 3). False when it was choked
-    /// already.
+    /// for and was not sent is dropped (BEP 3), each with a Reject on a fast
+    /// connection (libtorrent `peer_connection::send_choke`). False when it
+    /// was choked already.
     pub(crate) fn choke(&mut self, now: Instant) -> bool {
         if self.is_choked() {
             return false;
         }
         self.choked_at = Some(now);
-        self.upload_queue.clear();
         self.invalid_requests = 0;
         let _ = self.tx.send(WriterRequest::Message(Message::Choke));
+        for chunk in std::mem::take(&mut self.upload_queue) {
+            self.reject(&chunk);
+        }
         true
+    }
+
+    /// Tells a fast peer we will not send the block `chunk`. A plain
+    /// connection has no word for it (libtorrent
+    /// `bt_peer_connection::write_reject_request`).
+    fn reject(&self, chunk: &ChunkInfo) {
+        if self.fast {
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::Reject(wire_request(chunk))));
+        }
     }
 
     /// Unchokes the peer at `now`, when we have uploaded `uploaded` to it in
@@ -779,9 +808,13 @@ impl LivePeerState {
     }
 
     /// The peer cancelled its request for `chunk`. A block already sent is
-    /// not in the queue, and stays sent.
+    /// not in the queue, and stays sent; one still queued is dropped, with a
+    /// Reject on a fast connection (libtorrent
+    /// `peer_connection::incoming_cancel`).
     pub fn cancel_upload(&mut self, chunk: &ChunkInfo) {
-        self.upload_queue.remove(chunk);
+        if self.upload_queue.remove(chunk) {
+            self.reject(chunk);
+        }
     }
 
     /// Whether the peer still wants `chunk` and has not been sent it.
@@ -793,6 +826,15 @@ impl LivePeerState {
     /// there, and it is not sent.
     pub fn claim_upload(&mut self, chunk: &ChunkInfo) -> bool {
         self.upload_queue.remove(chunk)
+    }
+}
+
+/// The request for `chunk` as it goes on the wire.
+fn wire_request(chunk: &ChunkInfo) -> Request {
+    Request {
+        index: chunk.piece_index.get(),
+        begin: chunk.offset,
+        length: chunk.size,
     }
 }
 
