@@ -6,7 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Weak},
     time::Duration,
@@ -63,7 +63,6 @@ pub(crate) async fn read_metainfo_from_peer(
         fetch,
         writer_tx,
         result_tx: Mutex::new(Some(result_tx)),
-        set: Mutex::new(None),
         requests: requests.clone(),
         client_name_and_version,
     };
@@ -98,6 +97,16 @@ pub(crate) const MAX_METADATA_SIZE: u32 = 30 * 1024 * 1024;
 /// How long a peer that rejected a metadata request is left alone
 /// (libtorrent `ut_metadata_peer_plugin::on_extended`, `dont_have`).
 const REJECTED_WAIT: Duration = Duration::from_secs(60);
+
+/// The most metadata requests outstanding to one peer (libtorrent
+/// `ut_metadata_peer_plugin::maybe_send_request`: `m_sent_requests.size()
+/// < 2`).
+const MAX_OUTSTANDING: usize = 2;
+
+/// How long a metadata request may go unanswered before the peer's
+/// connection ends (libtorrent `settings_pack::request_timeout`, the
+/// longest `peer_connection::request_timeout`).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One torrent's metadata as its peers send it in. The buffer belongs to
 /// the fetch, not to a peer (libtorrent `ut_metadata_plugin::m_metadata`):
@@ -134,14 +143,24 @@ impl MetadataFetch {
     }
 }
 
-/// The pieces of metadata of one size, each with the peer that sent it
-/// (libtorrent `ut_metadata_plugin::m_requested_metadata`, whose entries
-/// name their `source`).
+/// The pieces of metadata of one size: how often each was asked for, and
+/// the peer that sent it (libtorrent `ut_metadata_plugin::
+/// m_requested_metadata`).
 struct PieceSet {
     buffer: Vec<u8>,
-    /// For each piece, the requests of the peer that sent it; None while
-    /// the piece is missing.
-    pieces: Vec<Option<Weak<Requests>>>,
+    pieces: Vec<MetadataPiece>,
+    /// The peers filling the set, woken when every piece is missing again.
+    peers: Vec<Weak<Requests>>,
+}
+
+/// libtorrent `ut_metadata_plugin::metadata_piece`.
+#[derive(Clone, Default)]
+struct MetadataPiece {
+    /// How many requests went out for the piece since it was last missing.
+    requests: u32,
+    /// The requests of the peer that sent it; None while the piece is
+    /// missing.
+    source: Option<Weak<Requests>>,
 }
 
 /// What a received piece of metadata made of its set.
@@ -159,7 +178,8 @@ impl PieceSet {
         let total_pieces = metadata_size.div_ceil(CHUNK_SIZE) as usize;
         Self {
             buffer: vec![0u8; metadata_size as usize],
-            pieces: vec![None; total_pieces],
+            pieces: vec![MetadataPiece::default(); total_pieces],
+            peers: Vec::new(),
         }
     }
 
@@ -170,16 +190,37 @@ impl PieceSet {
     fn missing(&self) -> impl Iterator<Item = u32> + '_ {
         (0u32..)
             .zip(&self.pieces)
-            .filter(|(_, sent_by)| sent_by.is_none())
+            .filter(|(_, p)| p.source.is_none())
             .map(|(piece, _)| piece)
+    }
+
+    /// `peer` fills the set from now on.
+    fn join(&mut self, peer: &Arc<Requests>) {
+        self.peers.retain(|p| p.strong_count() > 0);
+        self.peers.push(Arc::downgrade(peer));
+    }
+
+    /// The missing piece asked for least, the first of those, which a peer
+    /// with requests `outstanding` is asked for next (libtorrent
+    /// `ut_metadata_plugin::metadata_request`: any peer takes the least
+    /// requested piece, whoever was asked for it before).
+    fn pick(&mut self, outstanding: &HashMap<u32, Instant>) -> Option<u32> {
+        let piece = (0u32..)
+            .zip(&self.pieces)
+            .filter(|(piece, p)| p.source.is_none() && !outstanding.contains_key(piece))
+            .min_by_key(|(_, p)| p.requests)
+            .map(|(piece, _)| piece)?;
+        self.pieces[piece as usize].requests += 1;
+        Some(piece)
     }
 
     /// Records piece `d` as sent by `source`, and gives the whole metadata
     /// once its last piece is in and it hashes to the torrent. A piece
     /// another peer sent first is not written again. Metadata that does not
-    /// hash right leaves every piece missing again and names the peers that
-    /// sent them (libtorrent `ut_metadata_plugin::received_metadata` clears
-    /// every piece's request count and penalises each piece's source).
+    /// hash right leaves every piece missing and unasked again, wakes every
+    /// peer filling the set and names the peers that sent the pieces
+    /// (libtorrent `ut_metadata_plugin::received_metadata` clears every
+    /// piece's request count and penalises each piece's source).
     fn record(
         &mut self,
         d: &UtMetadataData<ByteBuf>,
@@ -189,8 +230,8 @@ impl PieceSet {
         let piece = d.piece();
         match self.pieces.get(piece as usize) {
             None => anyhow::bail!("metadata piece {piece} is past the end"),
-            Some(Some(_)) => return Ok(Recorded::Incomplete),
-            Some(None) => {}
+            Some(p) if p.source.is_some() => return Ok(Recorded::Incomplete),
+            Some(_) => {}
         }
         let start = piece as usize * CHUNK_SIZE as usize;
         let range = start..self.buffer.len().min(start + CHUNK_SIZE as usize);
@@ -201,7 +242,7 @@ impl PieceSet {
             d.len()
         );
         d.copy_to_slice(&mut self.buffer[range]);
-        self.pieces[piece as usize] = Some(Arc::downgrade(source));
+        self.pieces[piece as usize].source = Some(Arc::downgrade(source));
 
         if self.missing().next().is_some() {
             return Ok(Recorded::Incomplete);
@@ -210,22 +251,29 @@ impl PieceSet {
             return Ok(Recorded::Complete(std::mem::take(&mut self.buffer)));
         }
         let mut senders: Vec<Arc<Requests>> = Vec::new();
-        for sent_by in &mut self.pieces {
-            if let Some(sender) = sent_by.take().and_then(|w| w.upgrade())
+        for p in &mut self.pieces {
+            p.requests = 0;
+            if let Some(sender) = p.source.take().and_then(|w| w.upgrade())
                 && !senders.iter().any(|s| Arc::ptr_eq(s, &sender))
             {
                 senders.push(sender);
             }
         }
+        for peer in self.peers.iter().filter_map(Weak::upgrade) {
+            peer.changed.notify_one();
+        }
         Ok(Recorded::FailedHashCheck(senders))
     }
 }
 
-/// The metadata requests owed to one peer, and when they may go out
+/// The metadata requests of one peer, and when they may go out
 /// (libtorrent `ut_metadata_peer_plugin::m_request_limit`,
-/// `m_sent_requests` and `maybe_send_request`). A peer that rejects a
-/// request, or whose metadata fails its hash check, is asked again on the
-/// same connection once its limit has passed.
+/// `m_sent_requests` and `maybe_send_request`). Once its limit has passed
+/// the peer is asked for the set's least requested pieces, at most
+/// MAX_OUTSTANDING at a time. A peer that rejects a request, or whose
+/// metadata fails its hash check, is asked again on the same connection
+/// once its limit has passed; one that leaves a request unanswered for
+/// REQUEST_TIMEOUT loses its connection.
 struct Requests {
     state: Mutex<RequestsState>,
     changed: Notify,
@@ -234,10 +282,10 @@ struct Requests {
 struct RequestsState {
     /// No request goes out before this.
     limit: Instant,
-    /// Pieces to request once the limit has passed.
-    wanted: BTreeSet<u32>,
-    /// Pieces requested and not yet answered.
-    sent: HashSet<u32>,
+    /// Pieces requested and not yet answered, and when they were.
+    sent: HashMap<u32, Instant>,
+    /// The metadata the peer fills, from its extended handshake on.
+    set: Option<Arc<Mutex<PieceSet>>>,
 }
 
 impl Requests {
@@ -245,41 +293,48 @@ impl Requests {
         Self {
             state: Mutex::new(RequestsState {
                 limit: Instant::now(),
-                wanted: BTreeSet::new(),
-                sent: HashSet::new(),
+                sent: HashMap::new(),
+                set: None,
             }),
             changed: Notify::new(),
         }
     }
 
-    fn want(&self, pieces: impl IntoIterator<Item = u32>) {
-        self.state.lock().wanted.extend(pieces);
+    fn set(&self) -> Option<Arc<Mutex<PieceSet>>> {
+        self.state.lock().set.clone()
+    }
+
+    /// The peer fills `set` from now on (libtorrent `on_extension_handshake`
+    /// calls `maybe_send_request`).
+    fn join(self: &Arc<Self>, set: Arc<Mutex<PieceSet>>) {
+        set.lock().join(self);
+        self.state.lock().set = Some(set);
         self.changed.notify_one();
     }
 
     /// Whether a request for `piece` was outstanding, which the peer's Data
     /// for it now answers (libtorrent `ut_metadata_peer_plugin::on_extended`:
-    /// a piece not in `m_sent_requests` is unwanted, and ignored).
+    /// a piece not in `m_sent_requests` is unwanted, and ignored; an
+    /// answered one makes room for the next request).
     fn answered(&self, piece: u32) -> bool {
-        self.state.lock().sent.remove(&piece)
+        let answered = self.state.lock().sent.remove(&piece).is_some();
+        self.changed.notify_one();
+        answered
     }
 
-    /// libtorrent `on_extended` with `dont_have`: no request for a minute,
-    /// then the rejected piece is asked for again.
+    /// libtorrent `on_extended` with `dont_have`: no request for a minute.
     fn rejected(&self, piece: u32) {
         let mut state = self.state.lock();
         state.limit = state.limit.max(Instant::now() + REJECTED_WAIT);
-        if state.sent.remove(&piece) {
-            state.wanted.insert(piece);
-        }
+        state.sent.remove(&piece);
         drop(state);
         self.changed.notify_one();
     }
 
     /// libtorrent `ut_metadata_plugin::received_metadata` and
-    /// `failed_hash_check`: every piece is asked for again after 20 to 70
-    /// seconds, and five minutes later when the metadata is one piece, so
-    /// that other peers are tried first.
+    /// `failed_hash_check`: no request for 20 to 70 seconds, and five
+    /// minutes more when the metadata is one piece, so that other peers
+    /// are tried first.
     fn failed_hash_check(&self, total_pieces: u32) {
         let from = if total_pieces == 1 {
             Instant::now() + Duration::from_secs(5 * 60)
@@ -287,37 +342,67 @@ impl Requests {
             Instant::now()
         };
         let wait = 20 + rand::RngExt::random_range(&mut rand::rng(), 0..=50);
-        let mut state = self.state.lock();
-        state.limit = from + Duration::from_secs(wait);
-        state.sent.clear();
-        state.wanted = (0..total_pieces).collect();
-        drop(state);
+        self.state.lock().limit = from + Duration::from_secs(wait);
         self.changed.notify_one();
     }
 
-    /// The wanted pieces, once the limit lets them go; they are outstanding
-    /// from here.
-    async fn next(&self) -> BTreeSet<u32> {
-        self.changed.notified().await;
+    /// The pieces to ask for now, outstanding from here, once there are
+    /// any. An error once a request has gone unanswered for
+    /// REQUEST_TIMEOUT.
+    async fn next(&self) -> anyhow::Result<Vec<u32>> {
         loop {
-            let limit = {
+            let wake = {
                 let mut state = self.state.lock();
-                if Instant::now() >= state.limit {
-                    let pieces = std::mem::take(&mut state.wanted);
-                    state.sent.extend(pieces.iter().copied());
-                    return pieces;
+                let now = Instant::now();
+                let oldest = state.sent.values().min().copied();
+                if let Some(oldest) = oldest
+                    && now >= oldest + REQUEST_TIMEOUT
+                {
+                    anyhow::bail!("a metadata request went unanswered for {REQUEST_TIMEOUT:?}");
                 }
-                state.limit
+                let mut pieces = Vec::new();
+                if let Some(set) = state.set.clone()
+                    && now >= state.limit
+                {
+                    let mut set = set.lock();
+                    while state.sent.len() < MAX_OUTSTANDING
+                        && let Some(piece) = set.pick(&state.sent)
+                    {
+                        state.sent.insert(piece, now);
+                        pieces.push(piece);
+                    }
+                }
+                if !pieces.is_empty() {
+                    return Ok(pieces);
+                }
+                let limit = (state.set.is_some() && state.limit > now).then_some(state.limit);
+                oldest
+                    .map(|oldest| oldest + REQUEST_TIMEOUT)
+                    .into_iter()
+                    .chain(limit)
+                    .min()
             };
-            tokio::time::sleep_until(limit).await;
+            match wake {
+                Some(at) => {
+                    tokio::select! {
+                        () = self.changed.notified() => {}
+                        () = tokio::time::sleep_until(at) => {}
+                    }
+                }
+                None => self.changed.notified().await,
+            }
         }
     }
 
-    /// Sends the wanted pieces' requests each time the limit lets them go.
-    /// Ends only when the connection's writer is gone.
+    /// Sends the peer's requests as they may go out. Ends when a request
+    /// times out or the connection's writer is gone.
     async fn send(&self, writer_tx: &UnboundedSender<WriterRequest>) -> anyhow::Error {
         loop {
-            for piece in self.next().await {
+            let pieces = match self.next().await {
+                Ok(pieces) => pieces,
+                Err(e) => return e,
+            };
+            for piece in pieces {
                 let request = WriterRequest::Message(Message::Extended(
                     ExtendedMessage::UtMetadata(UtMetadata::Request(piece)),
                 ));
@@ -342,8 +427,8 @@ struct Handler {
             >,
         >,
     >,
-    /// The buffer the peer fills, None until its extended handshake.
-    set: Mutex<Option<Arc<Mutex<PieceSet>>>>,
+    /// The peer's requests, and the buffer it fills from its extended
+    /// handshake on.
     requests: Arc<Requests>,
     client_name_and_version: String,
 }
@@ -393,8 +478,7 @@ impl PeerConnectionHandler for Handler {
             trace!(piece = utdata.piece(), "unwanted metadata piece");
             return Ok(());
         }
-        let set = self.set.lock().clone();
-        let Some(set) = set else {
+        let Some(set) = self.requests.set() else {
             return Ok(());
         };
         let recorded = set
@@ -447,8 +531,7 @@ impl PeerConnectionHandler for Handler {
         // later one changes nothing (libtorrent `ut_metadata_plugin::
         // metadata_size` sizes the torrent's one buffer, and a size it
         // already has leaves it as it is).
-        let mut set = self.set.lock();
-        if set.is_some() {
+        if self.requests.set().is_some() {
             trace!("repeated extended handshake");
             return Ok(());
         }
@@ -467,10 +550,9 @@ impl PeerConnectionHandler for Handler {
             .send(WriterRequest::Message(Message::Unchoke))?;
         self.writer_tx
             .send(WriterRequest::Message(Message::Interested))?;
-        // libtorrent `maybe_send_request`: the pieces still missing, once
+        // libtorrent `maybe_send_request`: the least requested pieces, once
         // the peer's limit lets them go.
-        self.requests.want(joined.lock().missing());
-        *set = Some(joined);
+        self.requests.join(joined);
         Ok(())
     }
 

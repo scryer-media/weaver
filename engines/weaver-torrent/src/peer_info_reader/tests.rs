@@ -18,8 +18,8 @@ use tokio::{
 };
 
 use super::{
-    Handler, MAX_METADATA_SIZE, MetadataFetch, REJECTED_WAIT, Requests, TorrentAndInfoBytes,
-    read_metainfo_from_peer,
+    Handler, MAX_METADATA_SIZE, MetadataFetch, REJECTED_WAIT, REQUEST_TIMEOUT, Requests,
+    TorrentAndInfoBytes, read_metainfo_from_peer,
 };
 use crate::{
     buffers::ByteBuf,
@@ -291,7 +291,6 @@ fn handler(fetch: &Arc<MetadataFetch>) -> (Handler, mpsc::UnboundedReceiver<Writ
         fetch: fetch.clone(),
         writer_tx,
         result_tx: Mutex::new(None),
-        set: Mutex::new(None),
         requests: Arc::new(Requests::new()),
         client_name_and_version: "test".to_owned(),
     };
@@ -311,12 +310,12 @@ fn requested(handler: &Handler) -> Vec<u32> {
         .requests
         .next()
         .now_or_never()
-        .map(|pieces| pieces.into_iter().collect())
+        .map(|pieces| pieces.unwrap())
         .unwrap_or_default()
 }
 
 fn set_of(handler: &Handler) -> Arc<Mutex<super::PieceSet>> {
-    handler.set.lock().as_ref().unwrap().clone()
+    handler.requests.set().unwrap()
 }
 
 #[tokio::test]
@@ -338,7 +337,7 @@ async fn a_repeated_extended_handshake_asks_for_nothing_again() {
 
     peer.on_extended_handshake(&naming(40_000)).unwrap();
     let set = set_of(&peer);
-    assert_eq!(requested(&peer), [0, 1, 2]);
+    assert_eq!(requested(&peer), [0, 1]);
 
     peer.on_extended_handshake(&naming(40_000)).unwrap();
     peer.on_extended_handshake(&naming(80_000)).unwrap();
@@ -437,7 +436,6 @@ fn reader(info: &Bytes) -> (Handler, mpsc::UnboundedReceiver<WriterRequest>, Fou
         fetch: MetadataFetch::new(hashes_of(info)),
         writer_tx,
         result_tx: Mutex::new(Some(result_tx)),
-        set: Mutex::new(None),
         requests,
         client_name_and_version: "test".to_owned(),
     };
@@ -566,16 +564,69 @@ async fn metadata_that_fails_its_hash_check_penalises_every_peer_that_sent_a_pie
     for peer in [&a, &b] {
         // Nothing goes out before the penalty has passed.
         assert!(requested(peer).is_empty());
-        assert_eq!(
-            peer.requests
-                .state
-                .lock()
-                .wanted
-                .iter()
-                .copied()
-                .collect::<Vec<_>>(),
-            [0, 1]
-        );
         assert!(peer.requests.state.lock().limit >= Instant::now() + Duration::from_secs(20));
     }
+}
+
+#[tokio::test]
+async fn any_peer_is_asked_for_the_least_requested_missing_piece() {
+    // libtorrent ut_metadata_plugin::metadata_request: whoever asks gets
+    // the least requested missing piece, two at a time per peer
+    // (maybe_send_request), whoever was asked for it before.
+    let info = info_bytes(2000);
+    assert_eq!(info.len().div_ceil(CHUNK_SIZE as usize), 3);
+    let fetch = MetadataFetch::new(hashes_of(&info));
+    let size = info.len().try_into().unwrap();
+    let (a, _a_writes) = handler(&fetch);
+    let (b, _b_writes) = handler(&fetch);
+    let (c, _c_writes) = handler(&fetch);
+    a.on_extended_handshake(&naming(size)).unwrap();
+    b.on_extended_handshake(&naming(size)).unwrap();
+    assert_eq!(requested(&a), [0, 1]);
+    assert_eq!(requested(&b), [2, 0]);
+    answer(&a, &info, 0).await;
+    answer(&a, &info, 1).await;
+    assert_eq!(requested(&a), [2]);
+    // Only piece 2 is missing: a peer that joins now is asked for it, and
+    // for nothing more while it is the only one.
+    c.on_extended_handshake(&naming(size)).unwrap();
+    assert_eq!(requested(&c), [2]);
+    assert!(requested(&c).is_empty());
+
+    // The metadata fails its hash check: the peer that sent nothing is
+    // asked for the pieces missing again at once; the senders wait.
+    let mut corrupt = info.to_vec();
+    corrupt[2 * CHUNK_SIZE as usize] ^= 1;
+    answer(&b, &Bytes::from(corrupt), 2).await;
+    assert_eq!(set_of(&c).lock().missing().collect::<Vec<_>>(), [0, 1, 2]);
+    assert_eq!(requested(&c), [0]);
+    assert!(requested(&a).is_empty());
+    assert!(requested(&b).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_metadata_request_left_unanswered_ends_the_connection() {
+    // A peer that answers nothing ends its fetch once a request has waited
+    // REQUEST_TIMEOUT, so whatever holds the connection lets it go.
+    let (metadata, hashes) = metadata(10);
+    let (connector, mut dials) = connector().await;
+    let peer = async {
+        let (_, stream) = dials.recv().await.unwrap();
+        let mut peer = MockPeer::greet(stream, hashes).await;
+        peer.send_extended_handshake(metadata.len() as u32).await;
+        assert_eq!(peer.next_request().await, Some(0));
+        let asked = Instant::now();
+        // Keeps reading, so the connection stays up from our side.
+        while peer.next_request().await.is_some() {}
+        asked
+    };
+
+    let (fetched, asked) = tokio::join!(fetch_from(addr(1), hashes, connector), peer);
+
+    let error = fetched.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("went unanswered"),
+        "{error:#}"
+    );
+    assert!(Instant::now() >= asked + REQUEST_TIMEOUT);
 }
