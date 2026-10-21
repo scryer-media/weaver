@@ -262,9 +262,9 @@ pub struct TorrentStateLive {
     // Whether the peers were last told we only upload (libtorrent tells
     // them on each change, `torrent::send_upload_only`).
     told_upload_only: AtomicBool,
-    // When we last saw a complete copy of the torrent: our own, a seed that
-    // sent us data, or one a peer saw (libtorrent
-    // `torrent::m_last_seen_complete`).
+    // When we last saw a complete copy of the torrent: our own, or a seed
+    // that sent us data (libtorrent `torrent::m_last_seen_complete`). It is
+    // what we send as `complete_ago`; a peer's word never moves it.
     last_seen_complete: Mutex<Option<tokio::time::Instant>>,
     // The torrent's files as its web seeds serve them.
     web_layout: web_seed::Layout,
@@ -1020,14 +1020,37 @@ impl TorrentStateLive {
 
     /// How long ago we last saw a complete copy of the torrent, none if we
     /// never did; no time at all while we have every piece (libtorrent
-    /// `torrent::time_since_complete`).
+    /// `torrent::time_since_complete`). The `complete_ago` we send.
     pub fn complete_ago(&self) -> Option<Duration> {
         let now = tokio::time::Instant::now();
+        self.last_seen_complete(now)
+            .map(|last| now.saturating_duration_since(last))
+    }
+
+    /// How long ago anyone connected to us saw a complete copy: we, or a
+    /// peer by its `complete_ago`, the latest sighting standing; none if
+    /// none did (libtorrent `torrent::second_tick`'s
+    /// `m_swarm_last_seen_complete`). For status only, never sent.
+    pub fn swarm_complete_ago(&self) -> Option<Duration> {
+        let now = tokio::time::Instant::now();
+        let theirs = self
+            .peers
+            .states
+            .iter()
+            .filter_map(|e| e.value().get_live()?.last_seen_complete)
+            .max();
+        self.last_seen_complete(now)
+            .max(theirs)
+            .map(|last| now.saturating_duration_since(last))
+    }
+
+    // Our last sighting of a complete copy, which is now while we have
+    // every piece.
+    fn last_seen_complete(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
         if self.get_approx_have_bytes() == self.lengths.total_length() {
             self.seen_complete(now);
         }
-        let last = *self.last_seen_complete.lock();
-        last.map(|last| now.saturating_duration_since(last))
+        *self.last_seen_complete.lock()
     }
 
     /// A complete copy of the torrent was seen at `at`; the latest sighting
@@ -1904,11 +1927,16 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // The peer saw a complete copy `complete_ago` seconds ago; a
         // negative one says it never did (libtorrent
         // `bt_peer_connection::on_extended_handshake`, into
-        // `peer_connection::set_last_seen_complete`).
+        // `peer_connection::set_last_seen_complete`). Its word is the
+        // swarm's status, never our own sighting.
         if let Some(ago) = hs.complete_ago.and_then(|ago| u64::try_from(ago).ok())
             && let Some(at) = tokio::time::Instant::now().checked_sub(Duration::from_secs(ago))
         {
-            self.state.seen_complete(at);
+            self.state
+                .peers
+                .with_live_mut(self.addr, "complete_ago", |live| {
+                    live.last_seen_complete = Some(at)
+                });
         }
 
         // The peer holds at most its `reqq` requests (libtorrent

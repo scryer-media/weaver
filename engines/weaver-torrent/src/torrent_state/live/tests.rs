@@ -4675,10 +4675,12 @@ async fn the_extended_handshake_says_how_long_ago_we_saw_a_complete_copy() {
 }
 
 // libtorrent `bt_peer_connection::on_extended_handshake` takes a peer's
-// `complete_ago` (`peer_connection::set_last_seen_complete`): the latest
-// sighting stands, and a negative one is none.
+// `complete_ago` (`peer_connection::set_last_seen_complete`), a negative
+// one none, and `torrent::second_tick` keeps the latest of ours and the
+// peers' as the swarm's (`m_swarm_last_seen_complete`), for status only:
+// what we send is our own sighting (`torrent::time_since_complete`).
 #[tokio::test(start_paused = true)]
-async fn a_peers_complete_ago_is_a_sighting_of_a_complete_copy() {
+async fn a_peers_complete_ago_is_the_swarms_status_never_what_we_send() {
     let h = Harness::new("complete_ago_theirs").await;
     let (first, _first_rx) = h.new_peer("127.0.0.1:6881");
     let (second, _second_rx) = h.new_peer("127.0.0.2:6881");
@@ -4686,16 +4688,26 @@ async fn a_peers_complete_ago_is_a_sighting_of_a_complete_copy() {
         complete_ago: Some(ago),
         ..Default::default()
     };
+    let ours = || {
+        let mut hs = ExtendedHandshake::new();
+        (&first).update_my_extended_handshake(&mut hs).unwrap();
+        hs.complete_ago
+    };
     (&first).on_extended_handshake(&says(-1)).unwrap();
-    assert_eq!(h.complete_ago(), None);
+    assert_eq!(h.swarm_complete_ago(), None);
     (&first).on_extended_handshake(&says(30)).unwrap();
-    assert_eq!(h.complete_ago(), Some(Duration::from_secs(30)));
     (&second).on_extended_handshake(&says(100)).unwrap();
-    assert_eq!(h.complete_ago(), Some(Duration::from_secs(30)));
+    assert_eq!(h.swarm_complete_ago(), Some(Duration::from_secs(30)));
     tokio::time::advance(Duration::from_secs(10)).await;
-    let mut hs = ExtendedHandshake::new();
-    (&first).update_my_extended_handshake(&mut hs).unwrap();
-    assert_eq!(hs.complete_ago, Some(40));
+    assert_eq!(h.swarm_complete_ago(), Some(Duration::from_secs(40)));
+    assert_eq!(h.complete_ago(), None);
+    assert_eq!(ours(), Some(-1));
+
+    // A seed's own copy is the swarm's latest too.
+    let seed = Harness::seeding("complete_ago_theirs_seed").await;
+    let (peer, _rx) = seed.new_peer("127.0.0.1:6881");
+    (&peer).on_extended_handshake(&says(30)).unwrap();
+    assert_eq!(seed.swarm_complete_ago(), Some(Duration::ZERO));
 }
 
 // libtorrent `peer_connection::on_receive_data` and `incoming_have`: a seed
