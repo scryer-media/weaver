@@ -1538,6 +1538,29 @@ impl DhtState {
         self.listen_addr
     }
 
+    /// Pings a node a peer named (BEP 5 PORT) and, when it answers, adds it
+    /// to the routing table under the id it answered with (libtorrent
+    /// `node::add_node`: "ping the node, and if we get a reply, it will be
+    /// added to the routing table").
+    pub fn add_node(self: &Arc<Self>, addr: SocketAddr) {
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        let dht = self.clone();
+        spawn_with_cancel(
+            debug_span!("dht_add_node", %addr),
+            "dht_add_node",
+            self.cancellation_token.clone(),
+            async move {
+                if let ResponseOrError::Response(r) = dht.request(Request::Ping, addr).await? {
+                    let mut table = dht.get_table_for_addr(addr).write();
+                    if !matches!(table.add_node(r.id, addr), InsertResult::Ignored) {
+                        table.mark_response(&r.id, now());
+                    }
+                }
+                Ok::<_, Error>(())
+            },
+        );
+    }
+
     pub fn stats(&self) -> DhtStats {
         self.get_stats()
     }

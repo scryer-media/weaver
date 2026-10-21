@@ -77,6 +77,11 @@ pub trait PeerConnectionHandler {
     fn num_pieces(&self) -> Option<u32> {
         None
     }
+    /// The UDP port of the session's DHT node, when it runs one: the
+    /// handshake then sets the DHT bit (BEP 5).
+    fn dht_port(&self) -> Option<u16> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -343,6 +348,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
     fn greeting(&self, speaks_v2: bool) -> Handshake {
         Handshake::new(self.info_hashes.for_peer(speaks_v2), self.peer_id)
             .offering_v2(!speaks_v2 && self.info_hashes.v2.is_some())
+            .offering_dht(self.handler.dht_port().is_some())
     }
 
     async fn manage_peer(&self, args: ManagePeerArgs) -> Result<()> {

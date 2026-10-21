@@ -529,6 +529,7 @@ impl TorrentStateLive {
             incoming: true,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
+            sent_dht_port: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
@@ -592,6 +593,7 @@ impl TorrentStateLive {
             incoming: false,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
+            sent_dht_port: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
             state: state.clone(),
             tx,
@@ -1147,6 +1149,9 @@ struct PeerHandler {
     // The peer speaks v2 on this connection, and so exchanges hashes.
     speaks_v2: AtomicBool,
 
+    // Our DHT port went to the peer on this connection (BEP 5 PORT).
+    sent_dht_port: AtomicBool,
+
     addr: SocketAddr,
     incoming: bool,
     tx: PeerTx,
@@ -1216,6 +1221,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 trace!("keepalive received");
             }
             Message::Have(h) => self.on_have(h).context("on_have")?,
+            Message::Port(port) => self.on_dht_port(port),
             Message::Hashes(hashes) => self.on_hashes(hashes).context("on_hashes")?,
             Message::HashReject(request) => self.on_hash_reject(request),
             Message::HashRequest(request) => {
@@ -1296,6 +1302,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         speaks_v2: bool,
     ) -> anyhow::Result<()> {
         self.speaks_v2.store(speaks_v2, Ordering::Relaxed);
+        if handshake.supports_dht() {
+            self.send_dht_port();
+        }
         self.state.set_peer_live(self.addr, handshake, ckind);
         Ok(())
     }
@@ -1419,9 +1428,39 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     fn num_pieces(&self) -> Option<u32> {
         Some(self.state.lengths.total_pieces())
     }
+
+    fn dht_port(&self) -> Option<u16> {
+        self.dht().map(|dht| dht.listen_addr().port())
+    }
 }
 
 impl PeerHandler {
+    fn dht(&self) -> Option<crate::dht::Dht> {
+        self.state.shared.session.upgrade()?.get_dht().cloned()
+    }
+
+    /// Sends our DHT port, once per connection (libtorrent
+    /// `bt_peer_connection::write_dht_port`). The writer sends the bitfield
+    /// before anything queued, so a port queued at the handshake follows it.
+    fn send_dht_port(&self) {
+        let Some(port) = self.dht().map(|dht| dht.listen_addr().port()) else {
+            return;
+        };
+        if !self.sent_dht_port.swap(true, Ordering::Relaxed) {
+            let _ = self.tx.send(WriterRequest::Message(Message::Port(port)));
+        }
+    }
+
+    /// A peer named its DHT node: the DHT pings it and adds it on reply
+    /// (libtorrent `peer_connection::incoming_dht_port`). A peer that sends
+    /// PORT runs a DHT node even without the handshake bit, so it gets
+    /// ours (`bt_peer_connection::on_dht_port`).
+    fn on_dht_port(&self, port: u16) {
+        if let Some(dht) = self.dht() {
+            dht.add_node(SocketAddr::new(self.addr.ip(), port));
+        }
+        self.send_dht_port();
+    }
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
         let peers = &self.state.peers;
         let handle = self.addr;

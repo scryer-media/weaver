@@ -119,6 +119,7 @@ impl Harness {
             incoming: true,
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(speaks_v2),
+            sent_dht_port: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,
@@ -2100,4 +2101,104 @@ async fn a_session_without_pex_does_not_advertise_it_nor_take_peers_from_it() {
         .await
         .unwrap();
     assert!(!h.knows("10.0.0.1:6881"));
+}
+
+/// A handshake from a peer, with the DHT bit when `dht` holds.
+fn handshake(dht: bool) -> Handshake {
+    Handshake::new(Id20::default(), Id20::new([9; 20])).offering_dht(dht)
+}
+
+/// A DHT node on 127.0.0.1 that knows no other node.
+async fn local_dht(silent: SocketAddr) -> crate::dht::Dht {
+    crate::dht::DhtState::with_config(crate::dht::DhtConfig {
+        listen_addr: Some((std::net::Ipv4Addr::LOCALHOST, 0).into()),
+        bootstrap_addrs: Some(vec![silent.to_string()]),
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
+// libtorrent `bt_peer_connection::write_handshake` sets the DHT bit only
+// when the session runs a DHT node; `write_dht_port` sends nothing without
+// one.
+#[tokio::test]
+async fn a_session_without_dht_sets_no_dht_bit_and_sends_no_port() {
+    let h = Harness::new("dht_port_no_dht").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    assert_eq!((&peer).dht_port(), None);
+    (&peer)
+        .on_handshake(handshake(true), ConnectionKind::Tcp, false)
+        .unwrap();
+    (&peer)
+        .on_received_message(Message::Port(6881))
+        .await
+        .unwrap();
+    assert!(rx.try_recv().is_err());
+}
+
+// libtorrent `bt_peer_connection::write_dht_port` after the handshake to a
+// peer with the DHT bit, `on_dht_port` answering a PORT from a peer
+// without it, once per connection; `peer_connection::incoming_dht_port`
+// and `node::add_node`: the named node is pinged and, on its reply, joins
+// the routing table.
+#[tokio::test]
+async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
+    let silent = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let silent = silent.local_addr().unwrap();
+    let opts = SessionOptions {
+        dht: Some(crate::DhtSessionConfig {
+            bootstrap_addrs: Some(vec![silent.to_string()]),
+            ..Default::default()
+        }),
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "dht_port",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let ours = h._session.get_dht().unwrap().clone();
+    let our_port = ours.listen_addr().port();
+
+    let (bit, mut bit_rx) = h.peer("127.0.0.1:6881");
+    assert_eq!((&bit).dht_port(), Some(our_port));
+    (&bit)
+        .on_handshake(handshake(true), ConnectionKind::Tcp, false)
+        .unwrap();
+    assert!(matches!(
+        bit_rx.try_recv(),
+        Ok(WriterRequest::Message(Message::Port(p))) if p == our_port
+    ));
+
+    let (no_bit, mut no_bit_rx) = h.peer("127.0.0.1:6882");
+    (&no_bit)
+        .on_handshake(handshake(false), ConnectionKind::Tcp, false)
+        .unwrap();
+    assert!(no_bit_rx.try_recv().is_err());
+
+    let theirs = local_dht(silent).await;
+    let their_id = theirs.stats().id;
+    (&no_bit)
+        .on_received_message(Message::Port(theirs.listen_addr().port()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        no_bit_rx.try_recv(),
+        Ok(WriterRequest::Message(Message::Port(p))) if p == our_port
+    ));
+    (&no_bit)
+        .on_received_message(Message::Port(theirs.listen_addr().port()))
+        .await
+        .unwrap();
+    assert!(no_bit_rx.try_recv().is_err());
+
+    while !ours.with_routing_tables(|v4, _| v4.iter().any(|n| n.id() == their_id)) {
+        tokio::task::yield_now().await;
+    }
+    theirs.cancellation_token().cancel();
 }

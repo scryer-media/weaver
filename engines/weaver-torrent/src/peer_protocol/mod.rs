@@ -88,6 +88,10 @@ const V2_UPGRADE_BIT: u8 = 0x10;
 // extension" (BEP 6), in the last reserved byte.
 const FAST_BIT: u8 = 0x04;
 
+// libtorrent `bt_peer_connection::write_handshake`: "we support DHT
+// messages", the low bit of the last reserved byte (BEP 5).
+const DHT_BIT: u8 = 0x01;
+
 type MsgId = u8;
 
 const MSGID_CHOKE: MsgId = 0;
@@ -105,6 +109,7 @@ const MSGID_HAVE_ALL: MsgId = 0x0E;
 const MSGID_HAVE_NONE: MsgId = 0x0F;
 const MSGID_REJECT: MsgId = 0x10;
 const MSGID_ALLOWED_FAST: MsgId = 0x11;
+const MSGID_PORT: MsgId = 9;
 const MSGID_EXTENDED: MsgId = 20;
 // BEP 52 (libtorrent `bt_peer_connection::msg_hash_request` and on).
 const MSGID_HASH_REQUEST: MsgId = 21;
@@ -139,6 +144,7 @@ impl MsgIdDebug {
             MSGID_HAVE_NONE => "have_none",
             MSGID_REJECT => "reject",
             MSGID_ALLOWED_FAST => "allowed_fast",
+            MSGID_PORT => "port",
             MSGID_EXTENDED => "extended",
             MSGID_HASH_REQUEST => "hash_request",
             MSGID_HASHES => "hashes",
@@ -384,6 +390,8 @@ pub enum Message<'a> {
     Bitfield(ByteBuf<'a>),
     KeepAlive,
     Have(u32),
+    /// BEP 5: the UDP port of the sender's DHT node.
+    Port(u16),
     Choke,
     Unchoke,
     Interested,
@@ -533,6 +541,12 @@ impl Message<'_> {
                 out[5..9].copy_from_slice(&v.to_be_bytes());
                 Ok(9)
             }
+            Message::Port(p) => {
+                check_len!(PREAMBLE_LEN + 2);
+                write_preamble!(2, MSGID_PORT);
+                out[5..7].copy_from_slice(&p.to_be_bytes());
+                Ok(7)
+            }
             Message::Extended(e) => {
                 check_len!(PREAMBLE_LEN + 2);
                 let msg_len = e.serialize(&mut out[PREAMBLE_LEN..], peer_extended_messages)?;
@@ -574,6 +588,9 @@ impl Message<'_> {
             MSGID_CHOKE | MSGID_UNCHOKE | MSGID_INTERESTED | MSGID_NOT_INTERESTED => (0, 0),
             MSGID_HAVE_ALL | MSGID_HAVE_NONE => (0, 0),
             MSGID_HAVE | MSGID_SUGGEST | MSGID_ALLOWED_FAST => (INTEGER_LEN, INTEGER_LEN),
+            // libtorrent `bt_peer_connection::on_dht_port`: exactly a
+            // 2-byte port.
+            MSGID_PORT => (2, 2),
             // Without the metadata the size cannot be checked (`on_bitfield`).
             MSGID_BITFIELD => match num_pieces {
                 Some(n) => (bitfield_len(n), bitfield_len(n)),
@@ -648,6 +665,10 @@ impl Message<'_> {
             }
             MSGID_HAVE_ALL => Ok((Message::HaveAll, total_len)),
             MSGID_HAVE_NONE => Ok((Message::HaveNone, total_len)),
+            MSGID_PORT => {
+                let port = buf.consume::<2>().unwrap();
+                Ok((Message::Port(u16::from_be_bytes(port)), total_len))
+            }
             MSGID_BITFIELD => {
                 // In practice, as bitfield is always (almost) the first message, it should be contiguous.
                 let data = buf
@@ -791,6 +812,22 @@ impl Handshake {
     /// `bt_peer_connection::write_handshake`).
     pub fn offers_v2(&self) -> bool {
         self.reserved.to_be_bytes()[7] & V2_UPGRADE_BIT > 0
+    }
+
+    /// Whether the peer runs a DHT node and takes a PORT message: bit 0x01
+    /// of the last reserved byte (libtorrent
+    /// `bt_peer_connection::on_receive_handshake`, BEP 5).
+    pub fn supports_dht(&self) -> bool {
+        self.reserved.to_be_bytes()[7] & DHT_BIT > 0
+    }
+
+    /// This handshake, saying we run a DHT node when `dht` holds.
+    #[must_use]
+    pub fn offering_dht(mut self, dht: bool) -> Self {
+        if dht {
+            self.reserved |= u64::from(DHT_BIT);
+        }
+        self
     }
 
     /// This handshake, offering a move to v2 when `offer` holds.
@@ -1411,5 +1448,47 @@ mod tests {
             refused(5, 99),
             Some(MessageDeserializeError::UnsupportedMessageId(99))
         ));
+    }
+
+    // libtorrent `bt_peer_connection::write_handshake` sets 0x01 in the
+    // last reserved byte when it runs a DHT node.
+    #[test]
+    fn the_dht_bit_is_0x01_of_the_last_reserved_byte() {
+        let plain = || Handshake::new(Id20::new([1; 20]), Id20::new([2; 20]));
+        assert!(!plain().supports_dht());
+        assert_eq!(plain().offering_dht(false), plain());
+
+        let dht = plain().offering_dht(true).offering_v2(true);
+        let mut buf = [0u8; 68];
+        let _ = dht.serialize_unchecked_len(&mut buf);
+        assert_eq!(buf[20 + 7], 0x11);
+        let back = Handshake::deserialize(&buf).unwrap().0;
+        assert!(back.supports_dht() && back.offers_v2() && back.supports_extended());
+    }
+
+    // libtorrent `bt_peer_connection::write_dht_port` writes
+    // `{0,0,0,3, 9, port hi, port lo}`; `on_dht_port` refuses any other
+    // length.
+    #[test]
+    fn a_port_message_is_id_9_with_a_2_byte_port() {
+        let mut out = [0u8; 16];
+        let len = Message::Port(6881)
+            .serialize(&mut out, &|| Default::default())
+            .unwrap();
+        assert_eq!(&out[..len], &[0, 0, 0, 3, 9, 0x1a, 0xe1]);
+        for split in 0..len {
+            let (a, b) = out[..len].split_at(split);
+            let (back, back_len) = Message::deserialize(a, b, None).unwrap();
+            assert_eq!(back_len, len);
+            assert!(matches!(back, Message::Port(6881)));
+        }
+        for wrong in [2u32, 4] {
+            let mut frame = wrong.to_be_bytes().to_vec();
+            frame.extend([MSGID_PORT, 0, 0, 0]);
+            assert!(matches!(
+                Message::deserialize(&frame, &[], None).err(),
+                Some(MessageDeserializeError::IncorrectMsgLen { .. })
+            ));
+        }
     }
 }
