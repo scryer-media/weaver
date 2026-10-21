@@ -75,9 +75,10 @@ pub trait PeerConnectionHandler {
     /// handshakes and every message but a piece's block (libtorrent
     /// `stat::sent_bytes`, `received_bytes`, the protocol half).
     fn on_protocol_bytes(&self, _channel: Channel, _bytes: u64) {}
-    /// Takes `chunk` off the peer's upload queue to send it. False when a
-    /// Cancel or a Choke took it off first, and the block is not sent. A
-    /// handler that queues no uploads has none to take.
+    /// Takes the block `chunk` the writer was handed, to send it, which
+    /// makes room for the peer's next. False when a Cancel or a Choke
+    /// dropped it first, and the block is not sent. A handler that queues
+    /// no uploads has none to take.
     fn claim_upload(&self, _chunk: &ChunkInfo) -> bool {
         false
     }

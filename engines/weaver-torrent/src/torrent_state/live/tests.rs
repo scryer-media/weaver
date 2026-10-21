@@ -89,7 +89,7 @@ impl Harness {
         let session = Session::new_with_opts(out.path().into(), opts)
             .await
             .unwrap();
-        Self::added_to(session, out, name, pieces, have, add).await
+        Self::added_to(session, out, name, pieces, &[have], add).await
     }
 
     /// Another live torrent of the harness's session, of the harness's
@@ -100,7 +100,22 @@ impl Harness {
             ..Default::default()
         };
         let out = TempDir::with_prefix(name).unwrap();
-        Self::added_to(self._session.clone(), out, name, PIECES, have, add).await
+        Self::added_to(self._session.clone(), out, name, PIECES, &[have], add).await
+    }
+
+    /// A live torrent of `bytes` eight times four-chunk pieces, all had, and
+    /// no peers.
+    async fn seeding_bytes(name: &str, bytes: usize) -> Self {
+        let add = AddTorrentOptions {
+            storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+            ..Default::default()
+        };
+        let out = TempDir::with_prefix(name).unwrap();
+        let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+            .await
+            .unwrap();
+        let pieces = 8 * bytes as u32;
+        Self::added_to(session, out, name, pieces, &vec![0xff; bytes], add).await
     }
 
     /// A live torrent of `pieces` four-chunk pieces, `have` the bitfield of
@@ -110,13 +125,13 @@ impl Harness {
         out: TempDir,
         name: &str,
         pieces: u32,
-        have: u8,
+        have: &[u8],
         add: AddTorrentOptions,
     ) -> Self {
         let torrent = TestTorrent::new(name, (pieces * PIECE_LENGTH) as usize, PIECE_LENGTH)
             .await
             .unwrap();
-        let have = BF::from_boxed_slice(vec![have].into_boxed_slice());
+        let have = BF::from_boxed_slice(have.into());
         let handle = session
             .add_torrent(
                 AddTorrent::from_bytes(torrent.torrent.clone()),
@@ -1219,17 +1234,18 @@ async fn a_cancel_takes_an_unsent_block_off_the_upload_queue() {
             .unwrap();
     }
     assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
-    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, CHUNK_SIZE));
 
-    // Both blocks are with the writer, unsent: the cancelled one is not sent.
+    // The first block is with the writer, unsent: cancelled, it is not
+    // sent, and the writer is handed the next.
     peer.on_received_message(Message::Cancel(request(0, 0)))
         .await
         .unwrap();
     assert!(!peer.claim_upload(&h.chunk(0, 0)));
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, CHUNK_SIZE));
     assert!(peer.claim_upload(&h.chunk(0, 1)));
 
-    // A block cancelled before the rate limits let it through never reaches
-    // the writer: the next one does.
+    // A block cancelled before its turn never reaches the writer: the next
+    // one does.
     peer.on_received_message(Message::Request(request(1, 0)))
         .await
         .unwrap();
@@ -1273,6 +1289,55 @@ async fn a_cancel_of_an_unsent_block_is_answered_with_a_reject_on_a_fast_connect
     assert!(rx.is_empty());
 }
 
+// libtorrent `peer_connection::fill_send_buffer`: each peer is served from
+// its own send buffer, held to its watermark, so however many blocks one
+// peer asked for, the next peer waits one block of it.
+#[tokio::test]
+async fn a_deep_upload_queue_on_one_peer_never_holds_up_the_next() {
+    // 32 pieces of four blocks, all had.
+    let h = Harness::seeding_bytes("upload_turns", 4).await;
+    let (deep, mut deep_rx) = h.peer("127.0.0.1:6881");
+    let (light, mut light_rx) = h.peer("127.0.0.2:6881");
+    let (deep, light) = (&deep, &light);
+    for (peer, rx) in [(deep, &mut deep_rx), (light, &mut light_rx)] {
+        peer.on_received_message(Message::Interested).await.unwrap();
+        assert_eq!(next_sent(rx).await, Sent::Unchoke);
+    }
+
+    // The deep peer asks for 100 blocks, then the light peer for one.
+    let asked: Vec<(u32, u32)> = (0..100)
+        .map(|n| (n / CHUNKS_PER_PIECE, n % CHUNKS_PER_PIECE))
+        .collect();
+    for &(index, chunk) in &asked {
+        deep.on_received_message(Message::Request(request(index, chunk)))
+            .await
+            .unwrap();
+    }
+    light
+        .on_received_message(Message::Request(request(31, 0)))
+        .await
+        .unwrap();
+
+    // One round hands each peer one block: the light peer's goes out
+    // alongside the deep peer's first, and the deep peer gets no second
+    // until its writer takes the first.
+    assert_eq!(next_sent(&mut light_rx).await, Sent::Block(31, 0));
+    assert_eq!(next_sent(&mut deep_rx).await, Sent::Block(0, 0));
+    assert!(deep_rx.is_empty());
+
+    // The writer takes each in turn, and the rest follow in the order asked.
+    for (n, &(index, chunk)) in asked.iter().enumerate() {
+        if n > 0 {
+            assert_eq!(
+                next_sent(&mut deep_rx).await,
+                Sent::Block(index, chunk * CHUNK_SIZE)
+            );
+        }
+        assert!(deep.claim_upload(&h.chunk(index, chunk)));
+    }
+    assert!(deep_rx.is_empty());
+}
+
 #[tokio::test]
 async fn a_fast_peer_we_choke_is_sent_a_reject_for_every_block_it_will_not_get() {
     let h = Harness::seeding_with_slots("a_fast_choke_rejects", 1).await;
@@ -1289,8 +1354,8 @@ async fn a_fast_peer_we_choke_is_sent_a_reject_for_every_block_it_will_not_get()
             .await
             .unwrap();
     }
+    // The first is with the writer, the second waits for it.
     assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
-    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
 
     // The slot passes to the other peer. The Choke goes first, then a Reject
     // for each unsent block.
@@ -1427,8 +1492,8 @@ async fn a_fast_peer_we_choke_is_still_served_its_allowed_fast_pieces() {
             .await
             .unwrap();
     }
+    // Piece 0's block is with the writer, piece 1's waits for it.
     assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(0, 0));
-    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(1, 0));
 
     // The slot passes to the other peer: the Choke rejects the unsent block
     // of piece 1 and keeps piece 0's.
@@ -1922,7 +1987,6 @@ async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
             .unwrap();
     }
     assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
-    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
 
     // The one slot is the optimistic one: at the first round it passes to
     // the other peer, which never held it.
@@ -1933,7 +1997,8 @@ async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
     assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
     assert_eq!(next_sent(&mut held_rx).await, Sent::Choke);
 
-    // Both blocks were with the writer, unsent: neither goes out.
+    // One block was with the writer and one waited for it, both unsent:
+    // neither goes out.
     assert!(!held.claim_upload(&h.chunk(0, 0)));
     assert!(!held.claim_upload(&h.chunk(0, 1)));
 
@@ -2726,6 +2791,8 @@ async fn a_request_for_any_block_inside_a_had_piece_is_served() {
         peer.on_received_message(Message::Request(r)).await.unwrap();
     }
     assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 1));
+    let unaligned = h.lengths.requested_block(h.piece(0), 1, 100).unwrap();
+    assert!(peer.claim_upload(&unaligned));
     assert_eq!(next_sent(&mut rx).await, Sent::Block(1, PIECE_LENGTH - 10));
 }
 
@@ -2746,7 +2813,7 @@ async fn a_request_past_the_queue_limit_is_rejected_and_reqq_advertises_the_limi
     assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
 
     // Distinct one-byte blocks of piece 0, every one a block a peer may ask
-    // for; the writer sends none, so all stay queued.
+    // for; the writer takes none, so all stay unsent.
     let byte = |begin| Request {
         index: 0,
         begin,
@@ -2780,13 +2847,16 @@ async fn a_request_past_the_queue_limit_is_rejected_and_reqq_advertises_the_limi
         .await
         .unwrap();
 
-    // Everything queued for the writer up to that last block: each block
-    // once, the first Reject the one past the limit.
+    // Everything queued for the writer up to that last block, the writer
+    // taking each in turn: each block once, the first Reject the one past
+    // the limit.
     let mut blocks = Vec::new();
     let mut rejects = Vec::new();
     loop {
         match next_sent(&mut rx).await {
             Sent::Block(0, begin) => {
+                let block = h.lengths.requested_block(h.piece(0), begin, 1).unwrap();
+                assert!(peer.claim_upload(&block));
                 blocks.push(begin);
                 if begin == past.begin {
                     break;
@@ -3417,6 +3487,7 @@ async fn a_super_seeded_peer_is_served_only_the_pieces_it_was_handed() {
             .await
             .unwrap();
         assert_eq!(next_sent(&mut rx).await, Sent::Block(piece, 0));
+        assert!(peer.claim_upload(&h.chunk(piece, 0)));
     }
 }
 

@@ -8,7 +8,7 @@
 pub mod stats;
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -841,10 +841,14 @@ pub(crate) struct LivePeerState {
 
     request_slots_changed: Arc<Notify>,
 
-    // The blocks the peer asked us for that we have not sent yet. The writer
-    // sends a block only by taking it from here, so a Cancel or a Choke that
-    // removes it first keeps it from going out.
-    upload_queue: HashSet<ChunkInfo>,
+    // The blocks the peer asked us for and that are not handed to the
+    // writer yet, in the order asked (libtorrent `m_requests`).
+    upload_queue: VecDeque<ChunkInfo>,
+    // The block handed to the writer and not yet taken by it: the peer's
+    // send buffer, one block deep (libtorrent `send_buffer_low_watermark`).
+    // The writer sends a block only by taking it from here, so a Cancel or
+    // a Choke that drops it first keeps it from going out.
+    upload_handed: Option<ChunkInfo>,
 
     // The requests the peer sent that we could not serve since we last
     // choked it (libtorrent `peer_connection::m_num_invalid_requests`).
@@ -963,6 +967,7 @@ impl LivePeerState {
             snubbed: false,
             request_slots_changed: Default::default(),
             upload_queue: Default::default(),
+            upload_handed: None,
             invalid_requests: 0,
             super_seeded: [None; 2],
             supports_holepunch: false,
@@ -1330,12 +1335,18 @@ impl LivePeerState {
     /// queued blocks, any other is refused. While we choke the peer only a
     /// block of a piece it may fetch is queued, until it has asked for three
     /// times the piece's blocks; any other is refused. A refused block gets a
-    /// Reject on a fast connection.
-    pub fn queue_upload(&mut self, chunk: ChunkInfo, chunks_per_piece: u32) -> Result<(), Refused> {
-        if self.upload_queue.contains(&chunk) {
+    /// Reject on a fast connection. True when the block makes the peer
+    /// [ready to be handed one](Self::hand_upload), which it was not.
+    pub fn queue_upload(
+        &mut self,
+        chunk: ChunkInfo,
+        chunks_per_piece: u32,
+    ) -> Result<bool, Refused> {
+        if self.upload_handed == Some(chunk) || self.upload_queue.contains(&chunk) {
             return Err(Refused::Queued);
         }
-        if self.upload_queue.len() >= MAX_ALLOWED_IN_REQUEST_QUEUE as usize {
+        let unsent = self.upload_queue.len() + usize::from(self.upload_handed.is_some());
+        if unsent >= MAX_ALLOWED_IN_REQUEST_QUEUE as usize {
             self.reject(&chunk);
             return Err(Refused::QueueFull);
         }
@@ -1356,9 +1367,30 @@ impl LivePeerState {
             (_, Some(asked)) => *asked += 1,
             (None, None) => {}
         }
-        self.upload_queue.insert(chunk);
+        let was_ready = self.ready_to_hand();
+        self.upload_queue.push_back(chunk);
         self.last_upload = Instant::now();
-        Ok(())
+        Ok(!was_ready && self.ready_to_hand())
+    }
+
+    /// Whether the writer has room for a block and the peer asked for one:
+    /// the upload scheduler owes the peer a turn.
+    pub(crate) fn ready_to_hand(&self) -> bool {
+        self.upload_handed.is_none() && !self.upload_queue.is_empty()
+    }
+
+    /// The peer's turn with the upload scheduler: the block it asked for
+    /// first goes to the writer when the writer holds none of the peer's
+    /// already (libtorrent `peer_connection::fill_send_buffer`, the send
+    /// buffer held to one block). The block handed, if any.
+    pub(crate) fn hand_upload(&mut self) -> Option<ChunkInfo> {
+        if self.upload_handed.is_some() {
+            return None;
+        }
+        let chunk = self.upload_queue.pop_front()?;
+        self.upload_handed = Some(chunk);
+        let _ = self.tx.send(WriterRequest::ReadChunkRequest(chunk));
+        Some(chunk)
     }
 
     /// The peer sent a request we cannot serve, which is dropped; with
@@ -1459,11 +1491,15 @@ impl LivePeerState {
         self.choked_at = Some(now);
         self.invalid_requests = 0;
         let _ = self.tx.send(WriterRequest::Message(Message::Choke));
-        let (kept, dropped): (HashSet<_>, HashSet<_>) = std::mem::take(&mut self.upload_queue)
+        let handed = match self.upload_handed {
+            Some(chunk) if !self.allows_fast(chunk.piece_index) => self.upload_handed.take(),
+            _ => None,
+        };
+        let (kept, dropped): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.upload_queue)
             .into_iter()
             .partition(|chunk| self.allows_fast(chunk.piece_index));
         self.upload_queue = kept;
-        for chunk in dropped {
+        for chunk in handed.into_iter().chain(dropped) {
             self.reject(&chunk);
         }
         true
@@ -1506,25 +1542,27 @@ impl LivePeerState {
         round
     }
 
-    /// The peer cancelled its request for `chunk`. A block already sent is
-    /// not in the queue, and stays sent; one still queued is dropped, with a
-    /// Reject on a fast connection (libtorrent
+    /// The peer cancelled its request for `chunk`. A block the writer took
+    /// already stays sent; one queued or handed and not taken is dropped,
+    /// with a Reject on a fast connection (libtorrent
     /// `peer_connection::incoming_cancel`).
     pub fn cancel_upload(&mut self, chunk: &ChunkInfo) {
-        if self.upload_queue.remove(chunk) {
+        let handed = self.upload_handed.take_if(|handed| handed == chunk);
+        let queued = self.upload_queue.iter().position(|queued| queued == chunk);
+        let queued = queued.and_then(|at| self.upload_queue.remove(at));
+        if handed.or(queued).is_some() {
             self.reject(chunk);
         }
     }
 
-    /// Whether the peer still wants `chunk` and has not been sent it.
-    pub fn is_upload_queued(&self, chunk: &ChunkInfo) -> bool {
-        self.upload_queue.contains(chunk)
-    }
-
-    /// Takes `chunk` off the queue to send it. False when it is no longer
-    /// there, and it is not sent.
+    /// The writer takes the handed `chunk` to send it. False when a Cancel or
+    /// a Choke dropped it first, and it is not sent. Either way the writer
+    /// has room for the peer's next block.
     pub fn claim_upload(&mut self, chunk: &ChunkInfo) -> bool {
-        let claimed = self.upload_queue.remove(chunk);
+        let claimed = self
+            .upload_handed
+            .take_if(|handed| handed == chunk)
+            .is_some();
         if claimed {
             self.last_upload = Instant::now();
         }
@@ -1582,6 +1620,7 @@ impl LivePeerState {
             && self.peer_interested
             && !self.is_choked()
             && self.upload_queue.is_empty()
+            && self.upload_handed.is_none()
             && now.saturating_duration_since(served) > NO_REQUEST_TIMEOUT
         {
             return Some(TimedOut::NoRequest);
@@ -1862,6 +1901,8 @@ mod tests {
         // the minute runs from then.
         tokio::time::advance(Duration::from_secs(30)).await;
         assert!(live.queue_upload(chunk, 1).is_ok());
+        assert_eq!(live.timed_out(past(past(minute)), true, false), None);
+        assert_eq!(live.hand_upload(), Some(chunk));
         assert_eq!(live.timed_out(past(past(minute)), true, false), None);
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(live.claim_upload(&chunk));

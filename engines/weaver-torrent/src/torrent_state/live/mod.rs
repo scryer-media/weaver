@@ -248,7 +248,9 @@ pub struct TorrentStateLive {
 
     pub(crate) streams: Arc<TorrentStreams>,
 
-    ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<QueuedUpload>,
+    // The peers owed a turn with the upload scheduler, in the order they
+    // became ready for one.
+    upload_turns: tokio::sync::mpsc::UnboundedSender<PeerHandle>,
 
     // Whether the torrent speaks ut_pex: advertises it, sends it and reads
     // it. Not on a private torrent, nor in a session without it (libtorrent
@@ -272,10 +274,6 @@ pub struct TorrentStateLive {
     // Whether the session connects over uTP, which a holepunch needs.
     utp: bool,
 }
-
-// A block a peer asked for, on its way through the upload rate limits to the
-// peer's writer.
-type QueuedUpload = (PeerHandle, PeerTx, ChunkInfo);
 
 // One connection's place under the torrent's cap and under the session's.
 struct Place {
@@ -345,7 +343,7 @@ impl TorrentStateLive {
             paused.shared.options.super_seeding && have_bytes == lengths.total_length();
         let peer_limit = paused.shared.options.peer_limit.unwrap_or(128);
 
-        let (ratelimit_upload_tx, ratelimit_upload_rx) = unbounded_channel::<QueuedUpload>();
+        let (upload_turns, upload_turns_rx) = unbounded_channel::<PeerHandle>();
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -382,7 +380,7 @@ impl TorrentStateLive {
             per_piece_locks: (0..lengths.total_pieces())
                 .map(|_| RwLock::new(()))
                 .collect(),
-            ratelimit_upload_tx,
+            upload_turns,
             pex: !session.disable_pex && !paused.metadata.info.info().private,
             super_seeding,
             // What a handshake of this run's first connections says.
@@ -431,7 +429,7 @@ impl TorrentStateLive {
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "upload_scheduler"),
             format!("[{}]upload_scheduler", state.shared.id),
-            state.clone().task_upload_scheduler(ratelimit_upload_rx),
+            state.clone().task_upload_scheduler(upload_turns_rx),
         );
 
         state.spawn(
@@ -688,21 +686,26 @@ impl TorrentStateLive {
 
     async fn task_upload_scheduler(
         self: Arc<Self>,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<QueuedUpload>,
+        mut turns: tokio::sync::mpsc::UnboundedReceiver<PeerHandle>,
     ) -> crate::Result<()> {
-        while let Some((addr, tx, ci)) = rx.recv().await {
-            // A block the peer no longer wants spends none of the upload budget.
-            let queued = self
-                .peers
-                .with_live(addr, |live| live.is_upload_queued(&ci))
-                .unwrap_or(false);
-            if !queued {
-                continue;
-            }
-            // The writer pays for the block as it sends it.
-            let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
+        // The peers take turns in the order they became ready for one, and a
+        // turn hands one block. A peer is ready again only once its writer
+        // takes the block, and then waits behind every peer that became
+        // ready meanwhile: however many blocks one peer asked for, the next
+        // peer waits one block of it (libtorrent `fill_send_buffer`, one
+        // send buffer per peer, each held to its watermark). The writer pays
+        // for the block as it sends it.
+        while let Some(addr) = turns.recv().await {
+            self.peers
+                .with_live_mut(addr, "hand_upload", |live| live.hand_upload());
         }
         Ok(())
+    }
+
+    /// `addr` became ready to be handed a block: it takes its turn behind
+    /// those that became ready before it.
+    fn upload_turn(&self, addr: PeerHandle) {
+        let _ = self.upload_turns.send(addr);
     }
 
     async fn task_manage_incoming_peer(
@@ -1953,10 +1956,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn claim_upload(&self, chunk: &ChunkInfo) -> bool {
-        self.state
+        let (claimed, ready) = self
+            .state
             .peers
-            .with_live_mut(self.addr, "claim_upload", |live| live.claim_upload(chunk))
-            .unwrap_or(false)
+            .with_live_mut(self.addr, "claim_upload", |live| {
+                (live.claim_upload(chunk), live.ready_to_hand())
+            })
+            .unwrap_or_default();
+        // The writer has room again: the peer's next block waits its turn.
+        if ready {
+            self.state.upload_turn(self.addr);
+        }
+        claimed
     }
 
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
@@ -2500,28 +2511,29 @@ impl PeerHandler {
             return Ok(());
         };
         match queued {
-            Ok(()) => {}
+            Ok(ready) => {
+                if ready {
+                    self.state.upload_turn(self.addr);
+                }
+                Ok(())
+            }
             Err(Refused::Choked(choked_at)) => {
                 let since = tokio::time::Instant::now().saturating_duration_since(choked_at);
                 if since > CHOKED_REQUEST_GRACE {
                     anyhow::bail!("received {request:?} {since:?} after we choked the peer");
                 }
                 trace!(?request, "ignoring a request from a peer we choke");
-                return Ok(());
+                Ok(())
             }
             Err(Refused::AllowedFastSpent) => anyhow::bail!(
                 "received {request:?} while choked, past three times the blocks of the piece"
             ),
             Err(Refused::QueueFull) => {
                 trace!(?request, "ignoring a request past the peer's request queue");
-                return Ok(());
+                Ok(())
             }
-            Err(Refused::Queued) => return Ok(()),
+            Err(Refused::Queued) => Ok(()),
         }
-        self.state
-            .ratelimit_upload_tx
-            .send((self.addr, self.tx.clone(), chunk_info))?;
-        Ok(())
     }
 
     /// The peer asked for what we cannot serve. The request is dropped: with
