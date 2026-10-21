@@ -47,6 +47,18 @@ impl Magnet {
         self.select_only.clone()
     }
 
+    /// The link to a torrent: its hashes, name and trackers (libtorrent
+    /// `make_magnet_uri`).
+    pub fn of(info_hashes: InfoHashes, name: Option<String>, trackers: Vec<String>) -> Self {
+        Self {
+            id20: info_hashes.v1,
+            id32: info_hashes.v2,
+            trackers,
+            name,
+            select_only: None,
+        }
+    }
+
     pub fn from_id20(id20: Id20, trackers: Vec<String>, select_only: Option<Vec<usize>>) -> Self {
         Self {
             id20: Some(id20),
@@ -158,6 +170,26 @@ impl Magnet {
     }
 }
 
+/// A value as libtorrent escapes it into a link: alphanumerics and
+/// `-_!.~*()` as they are, every other byte as `%` and two lowercase hex
+/// digits (libtorrent `escape_string`).
+struct Escaped<'a>(&'a str);
+
+impl std::fmt::Display for Escaped<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in self.0.bytes() {
+            if b.is_ascii_alphanumeric() || b"-_!.~*()".contains(&b) {
+                write!(f, "{}", b as char)?;
+            } else {
+                write!(f, "%{b:02x}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The link in libtorrent's order (`make_magnet_uri`): btih, btmh, dn,
+/// then each tr; a file selection, which libtorrent does not write, last.
 impl std::fmt::Display for Magnet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "magnet:")?;
@@ -181,9 +213,13 @@ impl std::fmt::Display for Magnet {
             write_ampersand(f)?;
             write!(f, "xt=urn:btmh:1220{}", id32.as_string(),)?;
         }
+        if let Some(name) = self.name.as_deref().filter(|n| !n.is_empty()) {
+            write_ampersand(f)?;
+            write!(f, "dn={}", Escaped(name))?;
+        }
         for tracker in self.trackers.iter() {
             write_ampersand(f)?;
-            write!(f, "tr={tracker}")?;
+            write!(f, "tr={}", Escaped(tracker))?;
         }
         if let Some(select_only) = &self.select_only
             && !select_only.is_empty()
@@ -275,5 +311,57 @@ mod tests {
             &Magnet::from_id20(id20, Default::default(), Some(vec![1, 2, 3])).to_string(),
             "magnet:?xt=urn:btih:a621779b5e3d486e127c3efbca9b6f8d135f52e5&so=1,2,3"
         );
+    }
+
+    #[test]
+    fn a_torrents_link_is_written_as_libtorrent_writes_it() {
+        use crate::core::{Id32, InfoHashes};
+        // test_magnet.cpp `hybrid_info_hashes`, `v2_info_hashes`.
+        let v1 = Id20::new([b'a'; 20]);
+        let v2 = Id32::new([b'b'; 32]);
+        let link =
+            |v1, v2, name, trackers| Magnet::of(InfoHashes { v1, v2 }, name, trackers).to_string();
+        assert_eq!(
+            link(Some(v1), Some(v2), None, vec![]),
+            "magnet:?xt=urn:btih:6161616161616161616161616161616161616161\
+             &xt=urn:btmh:12206262626262626262626262626262626262626262626262626262626262626262"
+        );
+        assert_eq!(
+            link(None, Some(Id32::new([b'a'; 32])), None, vec![]),
+            "magnet:?xt=urn:btmh:12206161616161616161616161616161616161616161616161616161616161616161"
+        );
+        // `torrent_info_hash`: trackers escaped after the hashes; and the
+        // name before them, escaped the same way (`make_magnet_uri2`).
+        assert_eq!(
+            link(
+                Some(v1),
+                None,
+                Some("a b/c's (1).mkv".to_owned()),
+                vec![
+                    "http://foo.bar".to_owned(),
+                    "udp://foo.bar/announce".to_owned()
+                ]
+            ),
+            "magnet:?xt=urn:btih:6161616161616161616161616161616161616161\
+             &dn=a%20b%2fc%27s%20(1).mkv\
+             &tr=http%3a%2f%2ffoo.bar&tr=udp%3a%2f%2ffoo.bar%2fannounce"
+        );
+        // What is written reads back.
+        let m = Magnet::parse(&link(
+            Some(v1),
+            Some(v2),
+            Some("a b".to_owned()),
+            vec!["udp://foo.bar/announce".to_owned()],
+        ))
+        .unwrap();
+        assert_eq!(
+            m.info_hashes(),
+            InfoHashes {
+                v1: Some(v1),
+                v2: Some(v2)
+            }
+        );
+        assert_eq!(m.name.as_deref(), Some("a b"));
+        assert_eq!(m.trackers, vec!["udp://foo.bar/announce"]);
     }
 }

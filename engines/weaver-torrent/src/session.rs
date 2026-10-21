@@ -2583,6 +2583,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_handle_gives_its_version_both_hashes_and_its_magnet() {
+        // libtorrent `torrent_handle::info_hashes`, `torrent_info::v1`/`v2`
+        // and `make_magnet_uri(torrent_handle)`: btih, then btmh, then dn.
+        use crate::core::torrent_metainfo::TorrentVersion;
+        for (hybrid, version) in [(true, TorrentVersion::Hybrid), (false, TorrentVersion::V2)] {
+            let (_dir, session, handle) = seeding_v2(&v2_torrent(hybrid)).await;
+            let hashes = handle.info_hashes();
+            assert_eq!(hashes.v1.is_some(), hybrid);
+            assert_eq!(handle.version(), Some(version));
+            let v2 = format!("xt=urn:btmh:1220{}", hashes.v2.unwrap().as_string());
+            let expected = match hashes.v1 {
+                Some(v1) => format!("magnet:?xt=urn:btih:{}&{v2}&dn=test", v1.as_string()),
+                None => format!("magnet:?{v2}&dn=test"),
+            };
+            let magnet = handle.magnet();
+            assert_eq!(magnet.to_string(), expected);
+            assert_eq!(magnet.info_hashes(), hashes);
+            session.stop().await;
+        }
+    }
+
+    #[tokio::test]
     async fn a_v2_torrent_goes_by_its_truncated_hash() {
         // libtorrent info_hash_t::get_best and peer_connection::associated_info_hash
         // for a torrent without v1.

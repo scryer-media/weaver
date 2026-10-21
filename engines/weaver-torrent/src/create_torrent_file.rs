@@ -208,7 +208,14 @@ impl CreateTorrentResult {
             .iter_announce()
             .map(|i| std::str::from_utf8(i.as_ref()).unwrap().to_owned())
             .collect();
-        Magnet::from_id20(self.info_hash(), trackers, None)
+        let name = self
+            .meta
+            .info
+            .data
+            .name
+            .as_ref()
+            .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned());
+        Magnet::of(self.meta.info_hashes, name, trackers)
     }
 
     pub fn as_bytes(&self) -> anyhow::Result<Bytes> {

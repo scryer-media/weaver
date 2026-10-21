@@ -23,7 +23,8 @@ use std::time::Duration;
 use crate::buffers::ByteBufOwned;
 use crate::core::hash_id::{Id20, Id32, InfoHashes};
 use crate::core::lengths::{Lengths, ValidPieceIndex};
-use crate::core::torrent_metainfo::TorrentMetaV1Owned;
+use crate::core::magnet::Magnet;
+use crate::core::torrent_metainfo::{TorrentMetaV1Owned, TorrentVersion};
 use crate::peer_protocol::HashRequest;
 use crate::v2_hashes::V2Hashes;
 use anyhow::Context;
@@ -203,6 +204,11 @@ impl TorrentMetadata {
             .get()
             .unwrap_or(&self.torrent_file)
             .clone()
+    }
+
+    /// Which hashes verify the torrent's pieces.
+    pub fn version(&self) -> TorrentVersion {
+        self.info.version()
     }
 
     /// Takes a peer's answer to the request for a run of a piece layer ([`V2Hashes::add_chunk`]); once every layer is held they go
@@ -390,6 +396,25 @@ impl ManagedTorrent {
     /// The torrent's v1 and v2 hashes.
     pub fn info_hashes(&self) -> InfoHashes {
         self.shared.info_hashes
+    }
+
+    /// Which hashes verify the torrent's pieces; `None` until its metadata
+    /// is known.
+    pub fn version(&self) -> Option<TorrentVersion> {
+        self.with_metadata(|m| m.version()).ok()
+    }
+
+    /// The link to the torrent: both its hashes, its name and its trackers
+    /// in tier order (libtorrent `make_magnet_uri(torrent_handle)`).
+    pub fn magnet(&self) -> Magnet {
+        let trackers = self
+            .shared
+            .tracker_tiers
+            .iter()
+            .flatten()
+            .map(|t| t.to_string())
+            .collect();
+        Magnet::of(self.info_hashes(), self.name(), trackers)
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {
