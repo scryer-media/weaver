@@ -220,6 +220,54 @@ fn a_hybrid_torrent_is_found_by_either_hash() {
 }
 
 #[test]
+fn the_hosts_a_torrent_announces_to_outlive_it() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_torrent(&torrent(5, Some([5; 20]), None), &files(), &trackers())
+        .unwrap();
+    // A magnet's metainfo names its trackers again, spelled otherwise, and
+    // more: each host is stored once, as a rule matches it.
+    let tracker = |tier, url: &str| TrackerEntry {
+        tier,
+        url: url.to_string(),
+    };
+    let more = [
+        tracker(0, "UDP://Tracker.Invalid.:6969/announce"),
+        tracker(1, "https://BACKUP.invalid/other/announce"),
+        tracker(2, "https://Private.Invalid./a1b2c3/announce"),
+        tracker(2, "udp://private.invalid:80/a1b2c3"),
+        tracker(3, "udp://bücher.invalid:80"),
+        tracker(3, "udp://0x7f.1:6969"),
+        tracker(4, "not a url"),
+    ];
+    assert!(
+        db.set_torrent_metainfo(
+            JobId(5),
+            Some([5; 20]),
+            None,
+            "torrent 5",
+            b"d4:infodee",
+            true,
+            "/data/t5",
+            &files(),
+            &more
+        )
+        .unwrap()
+    );
+    assert!(db.delete_torrent(JobId(5)).unwrap());
+
+    assert_eq!(
+        db.list_tracker_hosts().unwrap(),
+        [
+            "127.0.0.1",
+            "backup.invalid",
+            "private.invalid",
+            "tracker.invalid",
+            "xn--bcher-kva.invalid"
+        ]
+    );
+}
+
+#[test]
 fn deleting_a_torrent_removes_its_rows() {
     let db = Database::open_in_memory().unwrap();
     db.insert_torrent(&torrent(5, Some([5; 20]), None), &files(), &trackers())

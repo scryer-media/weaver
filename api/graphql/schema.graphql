@@ -2788,6 +2788,11 @@ type QueryRoot {
 	"""
 	securityUpgradeNotice: SecurityUpgradeNotice!
 	trackerRules: [TrackerRule!]!
+	"""
+	Every host a torrent has announced to, which a tracker rule's host is
+	picked from.
+	"""
+	trackerHosts: [String!]!
 	schedules: [Schedule!]!
 	"""
 	The running weaver binary version.

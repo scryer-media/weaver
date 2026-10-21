@@ -377,11 +377,14 @@ export function Select<T extends string>({
   className,
   menuClassName,
   disabled = false,
+  placeholder,
 }: {
   value: T;
   options: readonly { value: T; label: string; icon?: ReactNode }[];
   onChange: (next: T) => void;
   label: string;
+  /** What the trigger says while the value is none of the options. */
+  placeholder?: string;
   /** Shown before the current choice, for a control without a visible label. */
   icon?: IconName;
   className?: string;
@@ -410,7 +413,9 @@ export function Select<T extends string>({
       >
         {icon ? <Icon name={icon} size={13} className="-mr-1 flex-none text-wv-muted" /> : null}
         {current?.icon}
-        <span className="min-w-0 flex-1 truncate text-left">{current?.label ?? value}</span>
+        <span className={cn("min-w-0 flex-1 truncate text-left", !current && placeholder && "text-wv-muted")}>
+          {current?.label ?? placeholder ?? value}
+        </span>
         <Icon name="dropdown" size={13} className="flex-none text-wv-muted" />
       </button>
       <Menu

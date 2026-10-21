@@ -1004,3 +1004,25 @@ kind = "sql"
 file = "migrations/0080_torrent_peers/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 81
+description = "the hosts torrents announce to are kept after the torrents"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0081_tracker_hosts/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0081_tracker_hosts/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_tracker_hosts_v81"
+scope = "upgrade_only"
