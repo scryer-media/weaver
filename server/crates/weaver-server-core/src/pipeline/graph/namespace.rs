@@ -573,6 +573,15 @@ impl NamespaceWriter {
         let mut placements = std::mem::take(&mut self.placements);
         placements.clear();
         tree.locate(child, volume, arrival.range(), &mut placements);
+        // An object that gave the volume back in this delivery places none
+        // of it. What no piece covers is held for the member, as any bytes
+        // whose place is not known, and goes to its own file with the rest.
+        let placed: u64 = placements.iter().map(Placement::len).sum();
+        if placed < arrival.range().len() {
+            placements.push(Placement::Held {
+                range: ByteRange::new(arrival.offset + placed, arrival.range().end),
+            });
+        }
         let kept = self
             .envelopes
             .capture(child, &placements, &arrival.bytes, arrival.provenance);

@@ -463,6 +463,29 @@ async fn nameless_volumes_renamed_by_par2_deliver_under_both_engines() {
     );
 }
 
+// Nameless header-encrypted volumes under a PAR2 set posted first that
+// names them. Each volume is bound to a store of its own before the set
+// renames it; once the password opens the first, the others give their
+// volumes back to its store, and every byte each one held is the volume's
+// still.
+#[tokio::test]
+async fn nameless_header_encrypted_volumes_under_par2_posted_first_deliver() {
+    let body = body();
+    let volumes = header_encrypted_store_set(MEMBER, &body, 4, SECRET, HeaderCheck::For(SECRET));
+    let files: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut set = par2_set("silver.horizon", &files, 2);
+    let mut out = vec![set.remove(0)];
+    out.extend(posts(obfuscate_volumes(&volumes)));
+    out.extend(set);
+    let scenario = Scenario::new(out).framed(64 * 1024).password(SECRET);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_member(&graph, &body);
+    assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+}
+
 // Nameless and posted last volume first, so the store is built on the
 // set's last volume and every earlier one arrives after it, and nothing but
 // the headers says where each goes. A named set is fetched in its names'

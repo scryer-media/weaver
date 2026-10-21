@@ -28,7 +28,7 @@ use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_store_set, header_encrypted_store_set,
 };
-use crate::pipeline::tests::direct_store::single_member_store_set;
+use crate::pipeline::tests::direct_store::{obfuscate_volumes, single_member_store_set};
 use crate::pipeline::tests::{
     insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
     pump_pipeline_runtime_queues, retire_pipeline_database,
@@ -49,9 +49,9 @@ fn buffers() -> crate::runtime::buffers::BufferPoolConfig {
 pub(super) struct Restarted {
     pub(super) status: Option<JobStatus>,
     pub(super) files: BTreeMap<String, Vec<u8>>,
-    pub(super) requests: BTreeMap<(u32, u32), usize>,
-    // Every article some restart found in memory.
-    pub(super) in_memory: BTreeSet<(u32, u32)>,
+    // Every article asked for again though no restart since it was last
+    // served found it in memory: its bytes were on disk when asked.
+    pub(super) from_disk: BTreeSet<(u32, u32)>,
     pub(super) restarts: usize,
 }
 
@@ -69,7 +69,9 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
     assert!(pipeline.is_graph_job(JOB));
 
     let mut requests = BTreeMap::new();
-    let mut in_memory = BTreeSet::new();
+    // What some restart found in memory since the article was last served.
+    let mut owed = BTreeSet::new();
+    let mut from_disk = BTreeSet::new();
     let mut restarts = 0;
     let mut quiet = 0;
     loop {
@@ -81,6 +83,9 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
             let asked = requests.entry(article).or_insert(0usize);
             *asked += 1;
             let first = *asked == 1;
+            if !owed.remove(&article) && !first {
+                from_disk.insert(article);
+            }
             serve(&mut pipeline, scenario, article).await;
             if finished(&pipeline) {
                 break;
@@ -90,7 +95,7 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
             // A live run is no reason to wait: the checkpoint describes what
             // is on disk, never how far a run has read.
             if first {
-                pipeline = restart(&temp_dir, pipeline, scenario, &mut in_memory, inspect).await;
+                pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, inspect).await;
                 restarts += 1;
             }
         }
@@ -144,23 +149,40 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
     Restarted {
         status,
         files,
-        requests,
-        in_memory,
+        from_disk,
         restarts,
     }
 }
 
-// The next article the download queue hands out: its next, or with
-// `together` the one whose turn comes first, a turn of each named post at
-// a time; the rest stay queued.
+// The next article the download queue hands out: the earliest of the
+// scenario's `first` it holds, else its next, or with `together` the one
+// whose turn comes first, a turn of each named post at a time; the rest stay
+// queued.
 fn next_work(pipeline: &mut Pipeline, scenario: &Scenario) -> Option<DownloadWork> {
     let queue = &mut pipeline.jobs.get_mut(&JOB)?.download_queue;
-    if scenario.together.is_empty() {
+    if scenario.together.is_empty() && scenario.first.is_empty() {
         return queue.pop();
     }
     let mut queued = Vec::new();
     while let Some(work) = queue.pop() {
         queued.push(work);
+    }
+    let article = |work: &DownloadWork| {
+        (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        )
+    };
+    let early = scenario
+        .first
+        .iter()
+        .find_map(|wanted| queued.iter().position(|work| article(work) == *wanted));
+    if early.is_some() || scenario.together.is_empty() {
+        let next = (!queued.is_empty()).then(|| queued.remove(early.unwrap_or(0)));
+        for work in queued {
+            queue.push(work);
+        }
+        return next;
     }
     let turn = |work: &DownloadWork| {
         let file = work.segment_id.file_id.file_index;
@@ -248,7 +270,7 @@ async fn restart_heard(
 }
 
 // The restarted run finished as the uninterrupted one did, and asked again
-// only for what it had in memory.
+// only for what some restart since it last fetched it had in memory.
 fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
     assert!(restarted.restarts > 0, "the run restarted");
     assert_eq!(restarted.status, whole.status, "status");
@@ -260,13 +282,11 @@ fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
     for (name, bytes) in &whole.files {
         assert!(restarted.files[name] == *bytes, "{name}: delivered bytes");
     }
-    let again: Vec<_> = restarted
-        .requests
-        .iter()
-        .filter(|(article, count)| **count > 1 && !restarted.in_memory.contains(article))
-        .map(|(article, _)| *article)
-        .collect();
-    assert!(again.is_empty(), "fetched again though on disk: {again:?}");
+    assert!(
+        restarted.from_disk.is_empty(),
+        "fetched again though on disk: {:?}",
+        restarted.from_disk
+    );
 }
 
 pub(super) async fn restart_row(scenario: Scenario) {
@@ -785,6 +805,32 @@ async fn obfuscated_members_under_par3_restarted_after_every_article_are_renamed
         "e81b6d3f0a4c9725",
     );
     restart_row(Scenario::new(posts).damaged(0, 1)).await;
+}
+
+// A stored 7z in hex-named parts that say nothing of which part they are,
+// under a PAR2 set that names them, its index posted first. Its verify run
+// is out from the index on, so no part is bound by its bytes before a
+// restart; the restore binds each one as it reads the part back, and the
+// articles of that part it has not read yet are on disk all the same.
+#[tokio::test]
+async fn obfuscated_7z_parts_under_par2_restarted_after_every_article_are_bound_with_no_refetch() {
+    let entries = [Entry::file("ember.bin", payload(70_001, 88))];
+    let parts = split_volumes(
+        &build_7z_shaped(&entries, EncoderMethod::COPY, None, false),
+        2,
+    );
+    let named: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut set = par2_set("lantern", &named, 2);
+    let mut posts = vec![set.remove(0)];
+    posts.extend(volumes(obfuscate_volumes(&parts)));
+    posts.extend(set);
+    let scenario = Scenario::new(posts)
+        .framed(20 * 1024)
+        .first(&[(0, 0), (0, 1), (1, 1), (1, 0)]);
+    restart_row(scenario).await;
 }
 
 // One stored member in a zip of its own.

@@ -279,6 +279,9 @@ pub(super) struct Scenario {
     // Every batch the download queue hands out is served as workers fetching
     // these posts at once: one article of each in turn, in this order.
     pub(super) together: Vec<u32>,
+    // A restarted run serves these articles first, in this order, each once
+    // the queue holds it.
+    pub(super) first: Vec<(u32, u32)>,
     // Every article is uuencoded: it says nothing of where its bytes go,
     // so they are placed in order.
     pub(super) uuencoded: bool,
@@ -304,6 +307,7 @@ impl Scenario {
             article: ARTICLE,
             backwards: false,
             together: Vec::new(),
+            first: Vec::new(),
             uuencoded: false,
             leased: false,
             limits: None,
@@ -357,6 +361,13 @@ impl Scenario {
     // order, then the second of each, and so on.
     pub(super) fn together(mut self, posts: &[u32]) -> Self {
         self.together = posts.to_vec();
+        self
+    }
+
+    // A restarted run serves these articles before any other, in this
+    // order, so a restart lands between two of them.
+    pub(super) fn first(mut self, articles: &[(u32, u32)]) -> Self {
+        self.first = articles.to_vec();
         self
     }
 

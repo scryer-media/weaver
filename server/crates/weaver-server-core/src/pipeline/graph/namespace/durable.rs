@@ -7,7 +7,7 @@
 // member reads the repairs made, and the read of a root member back from
 // wherever its bytes went. Holds are not here: a hold is fetched again.
 
-use weaver_graph::{ByteRange, MemberId, NodeId, Tree};
+use weaver_graph::{MemberId, NodeId, Tree};
 
 use super::{NamespaceWriter, WriteError};
 use crate::pipeline::graph::checkpoint::FileState;
@@ -76,12 +76,13 @@ impl NamespaceWriter {
 
     // The posted bytes of a root member's range, read back through the
     // inverse map of whatever owns it, as a repair reads them, from what is
-    // on disk only: a restart has no holds.
+    // on disk only: what a restart now would find.
+    #[cfg(test)]
     pub(crate) fn read_posted(
         &self,
         tree: &Tree,
         member: MemberId,
-        range: ByteRange,
+        range: weaver_graph::ByteRange,
         into: &mut Vec<u8>,
     ) -> bool {
         let mut access = self.access(tree);
