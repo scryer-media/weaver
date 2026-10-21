@@ -66,15 +66,11 @@ impl Harness {
     fn peer(&self, addr: &str) -> (PeerHandler, PeerRx) {
         let addr: SocketAddr = addr.parse().unwrap();
         let (tx, rx) = unbounded_channel();
-        let peer = Peer::new_live_for_incoming_connection(
-            addr,
-            Id20::default(),
-            tx.clone(),
-            &self.live.peers,
-            ConnectionKind::Tcp,
-        );
-        let counters = peer.stats.counters.clone();
-        self.live.peers.states.insert(addr, peer);
+        let counters = self
+            .live
+            .peers
+            .add_incoming(addr, Id20::default(), tx.clone(), ConnectionKind::Tcp)
+            .unwrap();
         let handler = PeerHandler {
             addr,
             incoming: true,
