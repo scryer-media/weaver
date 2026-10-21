@@ -157,6 +157,9 @@ pub(crate) async fn with_timeout<T>(
 struct ManagePeerArgs {
     handshake_supports_extended: bool,
     speaks_v2: bool,
+    /// The peer set the fast bit in its handshake (libtorrent
+    /// `bt_peer_connection::m_supports_fast`).
+    supports_fast: bool,
     read_buf: ReadBuf,
     write_buf: Box<[u8]>,
     read: BoxAsyncReadVectored,
@@ -232,6 +235,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         // What the peer supports is in the peer's handshake, not in ours.
         let handshake_supports_extended = incoming.handshake.supports_extended();
+        let supports_fast = incoming.handshake.supports_fast();
 
         self.handler
             .on_handshake(incoming.handshake, incoming.kind, speaks_v2)
@@ -240,6 +244,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
             speaks_v2,
+            supports_fast,
             read_buf: incoming.read_buf,
             write_buf,
             read: incoming.reader,
@@ -290,6 +295,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             let mut read_buf = ReadBuf::new();
             let h = read_buf.read_handshake(&mut read, rwtimeout).await?;
             let handshake_supports_extended = h.supports_extended();
+            let supports_fast = h.supports_fast();
             trace!(
                 peer_id=?h.peer_id,
                 decoded_id=?try_decode_peer_id(h.peer_id),
@@ -313,6 +319,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
                 speaks_v2,
+                supports_fast,
                 read_buf,
                 write_buf,
                 read,
@@ -342,6 +349,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let ManagePeerArgs {
             handshake_supports_extended,
             speaks_v2,
+            supports_fast,
             mut read_buf,
             mut write_buf,
             mut read,
@@ -522,6 +530,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 // and `on_hash_reject` disconnect a peer that does not speak v2.
                 if message.is_v2_only() && !speaks_v2 {
                     return Err(Error::HashMessageFromV1Peer);
+                }
+                // libtorrent `bt_peer_connection::on_suggest_piece`,
+                // `on_have_all`, `on_have_none`, `on_reject_request` and
+                // `on_allowed_fast` disconnect a peer that did not set the
+                // fast bit.
+                if message.is_fast_only() && !supports_fast {
+                    return Err(Error::Anyhow(anyhow::anyhow!(
+                        "fast extension message from a peer without it: {message:?}"
+                    )));
                 }
 
                 tokio::task::yield_now().await;
