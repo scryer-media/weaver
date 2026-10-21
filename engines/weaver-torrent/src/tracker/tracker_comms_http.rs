@@ -64,7 +64,26 @@ pub struct TrackerError<'a> {
     #[serde(rename = "failure reason", borrow)]
     pub failure_reason: ByteBuf<'a>,
     /// How long until the tracker may be asked again, when it says.
-    pub interval: Option<u64>,
+    #[serde(default, deserialize_with = "optional_interval")]
+    pub interval: Option<Duration>,
+}
+
+/// The longest interval a tracker may ask for. libtorrent holds a
+/// tracker's intervals as `seconds32` (`tracker_response`,
+/// `parse_tracker_response`), so none is longer than this; a longer one is
+/// taken as this, and no announce time reckoned from it can overflow.
+pub(crate) const MAX_INTERVAL: Duration = Duration::from_secs(i32::MAX as u64);
+
+/// A tracker's interval, in seconds, at most [`MAX_INTERVAL`].
+fn interval<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
+    let secs: u64 = serde::Deserialize::deserialize(de)?;
+    Ok(Duration::from_secs(secs).min(MAX_INTERVAL))
+}
+
+/// As [`interval`], for one the tracker may leave out.
+fn optional_interval<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Duration>, D::Error> {
+    let secs: Option<u64> = serde::Deserialize::deserialize(de)?;
+    Ok(secs.map(|secs| Duration::from_secs(secs).min(MAX_INTERVAL)))
 }
 
 pub enum Peers<'a, AddrType> {
@@ -176,9 +195,14 @@ pub struct TrackerResponse<'a> {
     #[serde(rename = "warning message", borrow)]
     pub warning_message: Option<ByteBuf<'a>>,
     pub complete: Option<u64>,
-    pub interval: u64,
-    #[serde(rename = "min interval")]
-    pub min_interval: Option<u64>,
+    #[serde(deserialize_with = "interval")]
+    pub interval: Duration,
+    #[serde(
+        rename = "min interval",
+        default,
+        deserialize_with = "optional_interval"
+    )]
+    pub min_interval: Option<Duration>,
     /// To be sent back as `trackerid` on every later announce to this tracker.
     #[serde(rename = "tracker id", borrow)]
     pub tracker_id: Option<ByteBuf<'a>>,

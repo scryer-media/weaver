@@ -464,8 +464,8 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 impl Refused {
-    fn new(reason: String, interval: Option<u64>) -> anyhow::Error {
-        let interval = interval.map_or(DEFAULT_INTERVAL, Duration::from_secs);
+    fn new(reason: String, interval: Option<Duration>) -> anyhow::Error {
+        let interval = interval.unwrap_or(DEFAULT_INTERVAL);
         anyhow::Error::new(Self {
             reason,
             retry_interval: interval.max(MIN_ANNOUNCE_INTERVAL),
@@ -1496,8 +1496,8 @@ impl TrackerComms {
 
         Ok(Announced {
             peers: response.iter_peers().collect(),
-            interval: Duration::from_secs(response.interval),
-            min_interval: response.min_interval.map(Duration::from_secs),
+            interval: response.interval,
+            min_interval: response.min_interval,
             seeders: response.complete.map(saturating_u32),
             leechers: response.incomplete.map(saturating_u32),
         })
@@ -1611,7 +1611,7 @@ mod tests {
         may_complete, read_answer, retry_delay, udp_tracker_to_socket_addrs,
     };
     use crate::Identity;
-    use crate::tracker::tracker_comms_http::TrackerRequestEvent;
+    use crate::tracker::tracker_comms_http::{MAX_INTERVAL, TrackerRequestEvent};
     use crate::tracker::tracker_comms_udp::{
         ACTION_CONNECT, CONNECTION_ID_MAGIC, UdpTrackerClient,
     };
@@ -1689,6 +1689,35 @@ mod tests {
         let e = anyhow::anyhow!("connection refused");
         assert_eq!(Refused::retry_interval(&e), Duration::ZERO);
         assert!(read_answer(b"d8:intervali1800e5:peers0:e").is_ok());
+    }
+
+    #[test]
+    fn an_interval_too_long_to_reckon_with_is_the_longest_libtorrent_holds() {
+        // libtorrent keeps a tracker's intervals as seconds32
+        // (parse_tracker_response); torrent::tracker_response adds them to
+        // the time of the answer.
+        let t0 = Instant::now();
+        for secs in [u64::MAX, i64::MAX as u64] {
+            let answer =
+                format!("d8:intervali{secs}e12:min intervali{secs}e5:peers0:e").into_bytes();
+            let response = read_answer(&answer).unwrap();
+            assert_eq!(
+                (response.interval, response.min_interval),
+                (MAX_INTERVAL, Some(MAX_INTERVAL))
+            );
+            let mut list = list(&[&["a"]], t0);
+            list.start_due(t0, None, &live(0, 90, false));
+            let delay = ReannounceDelay::new(response.interval, response.min_interval, None);
+            list.on_success(&http("a"), STARTED, t0, &delay);
+            assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL));
+
+            let refusal = format!("d14:failure reason4:nope8:intervali{secs}ee").into_bytes();
+            let retry = Refused::retry_interval(&read_answer(&refusal).unwrap_err());
+            assert_eq!(retry, MAX_INTERVAL);
+            list.start_due(t0 + MAX_INTERVAL, None, &live(0, 90, false));
+            list.on_failure(&http("a"), t0 + MAX_INTERVAL, retry);
+            assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL + MAX_INTERVAL));
+        }
     }
 
     #[test]
