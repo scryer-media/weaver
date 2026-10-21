@@ -80,7 +80,23 @@ fn interval<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
     Ok(Duration::from_secs(secs).min(MAX_INTERVAL))
 }
 
-/// As [`interval`], for one the tracker may leave out.
+/// The `interval` of an answer that names none (libtorrent
+/// `parse_tracker_response`).
+pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(1800);
+
+fn default_interval() -> Duration {
+    DEFAULT_INTERVAL
+}
+
+/// The `min interval` of an answer that names none (libtorrent
+/// `parse_tracker_response`).
+const DEFAULT_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+fn default_min_interval() -> Duration {
+    DEFAULT_MIN_INTERVAL
+}
+
+/// As [`interval`], for one a refusal may leave out.
 fn optional_interval<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Duration>, D::Error> {
     let secs: Option<u64> = serde::Deserialize::deserialize(de)?;
     Ok(secs.map(|secs| Duration::from_secs(secs).min(MAX_INTERVAL)))
@@ -195,14 +211,14 @@ pub struct TrackerResponse<'a> {
     #[serde(rename = "warning message", borrow)]
     pub warning_message: Option<ByteBuf<'a>>,
     pub complete: Option<u64>,
-    #[serde(deserialize_with = "interval")]
+    #[serde(default = "default_interval", deserialize_with = "interval")]
     pub interval: Duration,
     #[serde(
         rename = "min interval",
-        default,
-        deserialize_with = "optional_interval"
+        default = "default_min_interval",
+        deserialize_with = "interval"
     )]
-    pub min_interval: Option<Duration>,
+    pub min_interval: Duration,
     /// To be sent back as `trackerid` on every later announce to this tracker.
     #[serde(rename = "tracker id", borrow)]
     pub tracker_id: Option<ByteBuf<'a>>,

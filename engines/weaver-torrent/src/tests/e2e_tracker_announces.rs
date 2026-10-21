@@ -311,7 +311,8 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         answered[0].last.as_ref().context("answered")?.result,
         Ok(AnnounceOk {
             interval: Duration::from_secs(1800),
-            min_interval: None,
+            // Named by none, libtorrent's parse_tracker_response default.
+            min_interval: Some(Duration::from_secs(30)),
             seeders: Some(3),
             leechers: Some(5),
         })

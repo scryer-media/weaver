@@ -440,10 +440,6 @@ fn retry_delay(fails: u8, retry_interval: Duration) -> Duration {
     retry_interval.max(Duration::from_secs(backoff.min(RETRY_DELAY_MAX)))
 }
 
-/// The interval of an HTTP tracker's answer that names none (libtorrent
-/// `parse_tracker_response`, and the `tracker_response` default).
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(1800);
-
 /// An HTTP tracker answered the announce without accepting it: a `failure
 /// reason`, or an answer that does not parse. libtorrent tries it again no
 /// sooner than the answer's interval, raised to the minimum announce
@@ -465,7 +461,7 @@ impl std::error::Error for Refused {}
 
 impl Refused {
     fn new(reason: String, interval: Option<Duration>) -> anyhow::Error {
-        let interval = interval.unwrap_or(DEFAULT_INTERVAL);
+        let interval = interval.unwrap_or(tracker_comms_http::DEFAULT_INTERVAL);
         anyhow::Error::new(Self {
             reason,
             retry_interval: interval.max(MIN_ANNOUNCE_INTERVAL),
@@ -511,6 +507,10 @@ fn read_answer(bytes: &[u8]) -> anyhow::Result<tracker_comms_http::TrackerRespon
 /// the transport (libtorrent `settings_pack::tracker_completion_timeout`).
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The `min interval` of a UDP tracker, which sends none (libtorrent
+/// `udp_tracker_connection::on_announce_response`).
+const UDP_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The shortest re-announce interval a tracker may ask for, a guard against
 /// hammering a misconfigured one (libtorrent
 /// `settings_pack::min_announce_interval`).
@@ -539,9 +539,9 @@ impl ReannounceDelay {
     /// `interval` is the tracker's, raised to [`MIN_ANNOUNCE_INTERVAL`]
     /// (libtorrent `http_tracker_connection::on_response`,
     /// `udp_tracker_connection::on_announce_response`); a `forced` interval
-    /// is the session's own and replaces it as given.
-    fn new(interval: Duration, min_interval: Option<Duration>, forced: Option<Duration>) -> Self {
-        let floor = min_interval.unwrap_or_default();
+    /// is the session's own and replaces it as given. `floor` is the
+    /// tracker's min interval.
+    fn new(interval: Duration, floor: Duration, forced: Option<Duration>) -> Self {
         Self {
             floor,
             regular: forced
@@ -555,7 +555,7 @@ impl ReannounceDelay {
 struct Announced {
     peers: Vec<SocketAddr>,
     interval: Duration,
-    min_interval: Option<Duration>,
+    min_interval: Duration,
     seeders: Option<u32>,
     leechers: Option<u32>,
 }
@@ -978,7 +978,7 @@ impl InFlight<'_> {
             result: match result {
                 Ok(a) => Ok(AnnounceOk {
                     interval: a.interval,
-                    min_interval: a.min_interval,
+                    min_interval: Some(a.min_interval),
                     seeders: a.seeders,
                     leechers: a.leechers,
                 }),
@@ -1567,9 +1567,11 @@ impl TrackerComms {
                 trace!(len = response.addrs.len(), "received announce response");
                 Ok(Announced {
                     peers: response.addrs,
-                    // UDP trackers (BEP 15) send only an interval.
+                    // UDP trackers (BEP 15) send only an interval; libtorrent
+                    // takes 60 s as the min interval
+                    // (`udp_tracker_connection::on_announce_response`).
                     interval: Duration::from_secs(response.interval.into()),
-                    min_interval: None,
+                    min_interval: UDP_MIN_INTERVAL,
                     seeders: Some(response.seeders),
                     leechers: Some(response.leechers),
                 })
@@ -1703,7 +1705,7 @@ mod tests {
             let response = read_answer(&answer).unwrap();
             assert_eq!(
                 (response.interval, response.min_interval),
-                (MAX_INTERVAL, Some(MAX_INTERVAL))
+                (MAX_INTERVAL, MAX_INTERVAL)
             );
             let mut list = list(&[&["a"]], t0);
             list.start_due(t0, None, &live(0, 90, false));
@@ -1718,6 +1720,19 @@ mod tests {
             list.on_failure(&http("a"), t0 + MAX_INTERVAL, retry);
             assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL + MAX_INTERVAL));
         }
+    }
+
+    #[test]
+    fn an_http_answer_naming_no_interval_takes_libtorrents_defaults() {
+        // libtorrent parse_tracker_response: interval 1800 s, min interval
+        // 30 s; an answer that names neither is still an answer.
+        let s = Duration::from_secs;
+        let response = read_answer(b"d5:peers0:e").unwrap();
+        assert_eq!((response.interval, response.min_interval), (s(1800), s(30)));
+        let response = read_answer(b"d8:intervali900e5:peers0:e").unwrap();
+        assert_eq!((response.interval, response.min_interval), (s(900), s(30)));
+        let response = read_answer(b"d12:min intervali0e5:peers0:e").unwrap();
+        assert_eq!((response.interval, response.min_interval), (s(1800), s(0)));
     }
 
     #[test]
@@ -1884,7 +1899,7 @@ mod tests {
     fn test_min_interval_is_a_floor() {
         let s = Duration::from_secs;
         assert_eq!(
-            ReannounceDelay::new(s(1800), Some(s(900)), None),
+            ReannounceDelay::new(s(1800), s(900), None),
             ReannounceDelay {
                 floor: s(900),
                 regular: s(1800)
@@ -1892,7 +1907,7 @@ mod tests {
         );
         // A forced interval below the tracker's min interval is raised to it.
         assert_eq!(
-            ReannounceDelay::new(s(1800), Some(s(900)), Some(s(60))),
+            ReannounceDelay::new(s(1800), s(900), Some(s(60))),
             ReannounceDelay {
                 floor: s(900),
                 regular: s(900)
@@ -1900,14 +1915,14 @@ mod tests {
         );
         // An interval below min interval is raised too.
         assert_eq!(
-            ReannounceDelay::new(s(600), Some(s(900)), None),
+            ReannounceDelay::new(s(600), s(900), None),
             ReannounceDelay {
                 floor: s(900),
                 regular: s(900)
             }
         );
         assert_eq!(
-            ReannounceDelay::new(s(1800), None, Some(s(60))),
+            ReannounceDelay::new(s(1800), Duration::ZERO, Some(s(60))),
             ReannounceDelay {
                 floor: s(0),
                 regular: s(60)
@@ -1922,13 +1937,19 @@ mod tests {
         let s = Duration::from_secs;
         for interval in [s(0), s(5), s(299)] {
             assert_eq!(
-                ReannounceDelay::new(interval, None, None).regular,
+                ReannounceDelay::new(interval, Duration::ZERO, None).regular,
                 MIN_ANNOUNCE_INTERVAL
             );
         }
-        assert_eq!(ReannounceDelay::new(s(301), None, None).regular, s(301));
+        assert_eq!(
+            ReannounceDelay::new(s(301), Duration::ZERO, None).regular,
+            s(301)
+        );
         // The session's forced interval is its own choice, not the tracker's.
-        assert_eq!(ReannounceDelay::new(s(0), None, Some(s(60))).regular, s(60));
+        assert_eq!(
+            ReannounceDelay::new(s(0), Duration::ZERO, Some(s(60))).regular,
+            s(60)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3060,6 +3081,63 @@ mod tests {
 
         let (connection_id, ()) = tokio::join!(client.get_connection_id(addr), fake_tracker);
         assert_eq!(connection_id.unwrap(), CONNECTION_ID);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_udp_answer_has_libtorrents_min_interval() {
+        // libtorrent udp_tracker_connection::on_announce_response: BEP 15
+        // carries no min interval, so it is 60 s.
+        let tracker = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = Url::parse(&format!("udp://{}/announce", tracker.local_addr().unwrap())).unwrap();
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        // Answers every connect and announce, the stopped one included.
+        let serve = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                let (len, from) = tracker.recv_from(&mut buf).await.unwrap();
+                let tid = &buf[12..16];
+                let mut reply = Vec::new();
+                if len == 16 {
+                    reply.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+                    reply.extend_from_slice(tid);
+                    reply.extend_from_slice(&1u64.to_be_bytes());
+                } else {
+                    reply.extend_from_slice(&1u32.to_be_bytes()); // announce
+                    reply.extend_from_slice(tid);
+                    reply.extend_from_slice(&1800u32.to_be_bytes()); // interval
+                    reply.extend_from_slice(&5u32.to_be_bytes()); // leechers
+                    reply.extend_from_slice(&3u32.to_be_bytes()); // seeders
+                }
+                tracker.send_to(&reply, from).await.unwrap();
+            }
+        });
+
+        let mut rx = status.subscribe();
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|announces| announces.iter().all(|a| a.last.is_some())) => {
+                r.unwrap();
+            }
+        }
+        let announces = status.announces();
+        assert_eq!(
+            announce_of(&announces, &url).last.as_ref().unwrap().result,
+            Ok(AnnounceOk {
+                interval: Duration::from_secs(1800),
+                min_interval: Some(Duration::from_secs(60)),
+                seeders: Some(3),
+                leechers: Some(5),
+            })
+        );
+
+        drop(peers);
+        stopped.wait_idle().await;
+        serve.abort();
         token.cancel();
     }
 }
