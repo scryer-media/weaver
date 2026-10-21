@@ -1182,7 +1182,12 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Ok(len)
     }
 
-    fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()> {
+    fn on_handshake(
+        &self,
+        handshake: Handshake,
+        ckind: ConnectionKind,
+        _speaks_v2: bool,
+    ) -> anyhow::Result<()> {
         self.state.set_peer_live(self.addr, handshake, ckind);
         Ok(())
     }

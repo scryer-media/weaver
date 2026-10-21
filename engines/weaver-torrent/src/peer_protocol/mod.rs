@@ -16,7 +16,12 @@ use std::hint::unreachable_unchecked;
 
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::clone_to_owned::CloneToOwned;
-use crate::core::{constants::CHUNK_SIZE, hash_id::Id20, lengths::ChunkInfo};
+use crate::core::{
+    constants::CHUNK_SIZE,
+    hash_id::{Id20, Id32},
+    lengths::ChunkInfo,
+    merkle,
+};
 use byteorder::{BE, ByteOrder};
 use bytes::Bytes;
 use extended::PeerExtendedMessageIds;
@@ -32,15 +37,37 @@ const PREAMBLE_LEN: usize = INTEGER_LEN + MSGID_LEN;
 const PIECE_MESSAGE_PREAMBLE_LEN: usize = PREAMBLE_LEN + INTEGER_LEN * 2;
 pub const PIECE_MESSAGE_DEFAULT_LEN: usize = PIECE_MESSAGE_PREAMBLE_LEN + CHUNK_SIZE as usize;
 
-// extended message ut_metadata request is the largest known message.
 const MAX_MSG_LEN_LEN_JUST_IN_CASE_EXTRA: usize = 64;
-pub const MAX_MSG_LEN: usize = PREAMBLE_LEN
+// An extended ut_metadata data message.
+const MAX_UT_METADATA_MSG_LEN: usize = PREAMBLE_LEN
     + 1
     + b"d8:msg_typei1e5:piecei42e10:total_sizei16384ee".len()
-    + CHUNK_SIZE as usize
-    + MAX_MSG_LEN_LEN_JUST_IN_CASE_EXTRA;
+    + CHUNK_SIZE as usize;
+
+/// The most hashes a hashes message carries for a range, the piece-layer
+/// chunk libtorrent asks for (`hash_picker::pick_hashes`).
+pub const MAX_HASHES_IN_REPLY: u32 = 512;
+// The most uncle hashes a reply carries: one per layer of the tallest file
+// tree, of 2^64 bytes in 16 KiB blocks.
+const MAX_UNCLES_IN_REPLY: usize = 64 - 14;
+// A hashes message answering a request for the most hashes, proven to the
+// root.
+const MAX_HASHES_MSG_LEN: usize =
+    PREAMBLE_LEN + HASH_REQUEST_LEN + (MAX_HASHES_IN_REPLY as usize + MAX_UNCLES_IN_REPLY) * 32;
+
+/// The largest message read or written: a hashes message or a ut_metadata
+/// data message, whichever is longer.
+pub const MAX_MSG_LEN: usize = if MAX_HASHES_MSG_LEN > MAX_UT_METADATA_MSG_LEN {
+    MAX_HASHES_MSG_LEN
+} else {
+    MAX_UT_METADATA_MSG_LEN
+} + MAX_MSG_LEN_LEN_JUST_IN_CASE_EXTRA;
 
 const PSTR_BT1: &str = "BitTorrent protocol";
+
+// libtorrent `bt_peer_connection::write_handshake`: "indicate that we
+// support upgrading to v2".
+const V2_UPGRADE_BIT: u8 = 0x10;
 
 type MsgId = u8;
 
@@ -54,6 +81,13 @@ const MSGID_REQUEST: MsgId = 6;
 const MSGID_PIECE: MsgId = 7;
 const MSGID_CANCEL: MsgId = 8;
 const MSGID_EXTENDED: MsgId = 20;
+// BEP 52 (libtorrent `bt_peer_connection::msg_hash_request` and on).
+const MSGID_HASH_REQUEST: MsgId = 21;
+const MSGID_HASHES: MsgId = 22;
+const MSGID_HASH_REJECT: MsgId = 23;
+
+// pieces root, base, index, length, proof layers.
+const HASH_REQUEST_LEN: usize = 32 + INTEGER_LEN * 4;
 
 pub const EXTENDED_UT_METADATA_KEY: &[u8] = b"ut_metadata";
 pub const MY_EXTENDED_UT_METADATA: u8 = 3;
@@ -76,6 +110,9 @@ impl MsgIdDebug {
             MSGID_PIECE => "piece",
             MSGID_CANCEL => "cancel",
             MSGID_EXTENDED => "extended",
+            MSGID_HASH_REQUEST => "hash_request",
+            MSGID_HASHES => "hashes",
+            MSGID_HASH_REJECT => "hash_reject",
             _ => return None,
         };
         Some(n)
@@ -223,6 +260,91 @@ impl<'a> Piece<ByteBuf<'a>> {
     }
 }
 
+/// A BEP 52 hash request: `count` nodes of the layer `base` above the
+/// blocks of the file whose tree has `root`, from `index`, and the uncles
+/// that prove them up to `proof_layers` above `base`. A hash reject repeats
+/// it (libtorrent `hash_request`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HashRequest {
+    pub root: Id32,
+    pub base: u32,
+    pub index: u32,
+    pub count: u32,
+    pub proof_layers: u32,
+}
+
+impl HashRequest {
+    /// The uncle hashes an answer carries after the `count` nodes: those
+    /// above the subtree the nodes span (libtorrent
+    /// `bt_peer_connection::on_hashes`).
+    pub fn uncles(&self) -> u64 {
+        (u64::from(self.proof_layers) + 1).saturating_sub(u64::from(merkle::num_layers(
+            merkle::num_leafs(self.count.into()),
+        )))
+    }
+
+    /// The bytes of the hashes of an answer.
+    fn hashes_len(&self) -> u64 {
+        (u64::from(self.count) + self.uncles()) * 32
+    }
+
+    fn serialize_unchecked_len(&self, buf: &mut [u8]) -> usize {
+        buf[..32].copy_from_slice(&self.root.0);
+        for (i, n) in [self.base, self.index, self.count, self.proof_layers]
+            .into_iter()
+            .enumerate()
+        {
+            BE::write_u32(&mut buf[32 + i * 4..36 + i * 4], n);
+        }
+        HASH_REQUEST_LEN
+    }
+
+    fn deserialize(b: [u8; HASH_REQUEST_LEN]) -> Self {
+        Self {
+            root: Id32::new(b[..32].try_into().unwrap()),
+            base: BE::read_u32(&b[32..36]),
+            index: BE::read_u32(&b[36..40]),
+            count: BE::read_u32(&b[40..44]),
+            proof_layers: BE::read_u32(&b[44..48]),
+        }
+    }
+}
+
+/// A BEP 52 hashes message: the request it answers, then its `count`
+/// nodes and their uncles, lowest first.
+#[derive(Debug)]
+pub struct Hashes<B> {
+    pub request: HashRequest,
+    pub hashes: B,
+}
+
+impl<B: AsRef<[u8]>> Hashes<B> {
+    pub fn hashes(&self) -> Vec<Id32> {
+        self.hashes
+            .as_ref()
+            .chunks_exact(32)
+            .map(|h| Id32::new(h.try_into().unwrap()))
+            .collect()
+    }
+}
+
+impl Hashes<ByteBufOwned> {
+    /// The answer to `request`: its nodes, then their uncles.
+    pub fn new(request: HashRequest, hashes: &[Id32]) -> Self {
+        Self {
+            request,
+            hashes: ByteBufOwned::from(hashes.iter().flat_map(|h| h.0).collect::<Vec<u8>>()),
+        }
+    }
+
+    pub fn as_borrowed(&self) -> Hashes<ByteBuf<'_>> {
+        Hashes {
+            request: self.request,
+            hashes: ByteBuf(self.hashes.as_ref()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Message<'a> {
     Request(Request),
@@ -236,6 +358,21 @@ pub enum Message<'a> {
     NotInterested,
     Piece(Piece<ByteBuf<'a>>),
     Extended(ExtendedMessage<ByteBuf<'a>>),
+    HashRequest(HashRequest),
+    Hashes(Hashes<ByteBuf<'a>>),
+    HashReject(HashRequest),
+}
+
+impl Message<'_> {
+    /// Whether this is a BEP 52 hash message, which only a peer that
+    /// speaks v2 may send (libtorrent `bt_peer_connection::on_hash_request`,
+    /// `on_hashes`, `on_hash_reject`).
+    pub fn is_v2_only(&self) -> bool {
+        matches!(
+            self,
+            Message::HashRequest(..) | Message::Hashes(..) | Message::HashReject(..)
+        )
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -334,6 +471,25 @@ impl Message<'_> {
                 check_len!(PREAMBLE_LEN + 2);
                 let msg_len = e.serialize(&mut out[PREAMBLE_LEN..], peer_extended_messages)?;
                 write_preamble!(msg_len as u32, MSGID_EXTENDED);
+                Ok(PREAMBLE_LEN + msg_len)
+            }
+            Message::HashRequest(r) | Message::HashReject(r) => {
+                check_len!(PREAMBLE_LEN + HASH_REQUEST_LEN);
+                let msg_id = match self {
+                    Message::HashRequest(..) => MSGID_HASH_REQUEST,
+                    _ => MSGID_HASH_REJECT,
+                };
+                write_preamble!(HASH_REQUEST_LEN as u32, msg_id);
+                Ok(PREAMBLE_LEN + r.serialize_unchecked_len(&mut out[PREAMBLE_LEN..]))
+            }
+            Message::Hashes(h) => {
+                let hashes = h.hashes.as_ref();
+                let msg_len = HASH_REQUEST_LEN + hashes.len();
+                check_len!(PREAMBLE_LEN + msg_len);
+                write_preamble!(msg_len as u32, MSGID_HASHES);
+                h.request.serialize_unchecked_len(&mut out[PREAMBLE_LEN..]);
+                out[PREAMBLE_LEN + HASH_REQUEST_LEN..PREAMBLE_LEN + msg_len]
+                    .copy_from_slice(hashes);
                 Ok(PREAMBLE_LEN + msg_len)
             }
         }
@@ -466,6 +622,41 @@ impl Message<'_> {
                 Message::Extended(ExtendedMessage::deserialize(buf.with_max_len(msg_len))?),
                 PREAMBLE_LEN + msg_len,
             )),
+            MSGID_HASH_REQUEST | MSGID_HASH_REJECT => {
+                check_msg_len!(48); // HASH_REQUEST_LEN
+                let r = HashRequest::deserialize(buf.consume::<HASH_REQUEST_LEN>().unwrap());
+                let msg = if msg_id == MSGID_HASH_REQUEST {
+                    Message::HashRequest(r)
+                } else {
+                    Message::HashReject(r)
+                };
+                Ok((msg, total_len))
+            }
+            MSGID_HASHES => {
+                check_msg_len!(min 48); // HASH_REQUEST_LEN
+                let request = HashRequest::deserialize(buf.consume::<HASH_REQUEST_LEN>().unwrap());
+                // Exactly the nodes asked for and their uncles
+                // (libtorrent `bt_peer_connection::on_hashes`).
+                if (msg_len - HASH_REQUEST_LEN) as u64 != request.hashes_len() {
+                    return Err(MessageDeserializeError::IncorrectMsgLen {
+                        received: len_prefix - 1,
+                        expected: (HASH_REQUEST_LEN as u64 + request.hashes_len())
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                        msg_id: MsgIdDebug(msg_id),
+                    });
+                }
+                let hashes = buf
+                    .get_contiguous(msg_len - HASH_REQUEST_LEN)
+                    .ok_or(MessageDeserializeError::NeedContiguous)?;
+                Ok((
+                    Message::Hashes(Hashes {
+                        request,
+                        hashes: ByteBuf::from(hashes),
+                    }),
+                    total_len,
+                ))
+            }
             msg_id => Err(MessageDeserializeError::UnsupportedMessageId(msg_id)),
         }
     }
@@ -515,6 +706,22 @@ impl Handshake {
 
     pub fn supports_extended(&self) -> bool {
         self.reserved.to_be_bytes()[5] & 0x10 > 0
+    }
+
+    /// Whether the peer offers to move a hybrid's connection to v2: bit
+    /// 0x10 of the last reserved byte (libtorrent
+    /// `bt_peer_connection::write_handshake`).
+    pub fn offers_v2(&self) -> bool {
+        self.reserved.to_be_bytes()[7] & V2_UPGRADE_BIT > 0
+    }
+
+    /// This handshake, offering a move to v2 when `offer` holds.
+    #[must_use]
+    pub fn offering_v2(mut self, offer: bool) -> Self {
+        if offer {
+            self.reserved |= u64::from(V2_UPGRADE_BIT);
+        }
+        self
     }
 
     #[must_use]
@@ -801,5 +1008,152 @@ mod tests {
                 assert_eq!(buf[..len], tmp[..len]);
             }
         }
+    }
+
+    fn hash_request(count: u32, proof_layers: u32) -> HashRequest {
+        HashRequest {
+            root: Id32::new([7; 32]),
+            base: 2,
+            index: 1024,
+            count,
+            proof_layers,
+        }
+    }
+
+    // libtorrent `bt_peer_connection::write_hash_request`: a 4-byte length
+    // of 49, the id, the pieces root, then base, index, count and proof
+    // layers as big-endian u32s; `write_hash_reject` differs in the id.
+    #[test]
+    fn hash_requests_and_rejects_lay_out_as_libtorrent_writes_them() {
+        let mut want = Vec::new();
+        want.extend_from_slice(&49u32.to_be_bytes());
+        want.push(0);
+        want.extend_from_slice(&[7; 32]);
+        for n in [2u32, 1024, 8, 10] {
+            want.extend_from_slice(&n.to_be_bytes());
+        }
+
+        for (id, msg) in [
+            (21, Message::HashRequest(hash_request(8, 10))),
+            (23, Message::HashReject(hash_request(8, 10))),
+        ] {
+            want[4] = id;
+            let mut out = [0u8; 100];
+            let len = msg.serialize(&mut out, &Default::default).unwrap();
+            assert_eq!(&out[..len], &want[..]);
+
+            for split_point in 0..want.len() {
+                let (first, second) = want.split_at(split_point);
+                let (back, back_len) = Message::deserialize(first, second).unwrap();
+                assert_eq!(back_len, want.len());
+                match (msg_id_of(&back), back) {
+                    (21, Message::HashRequest(r)) | (23, Message::HashReject(r)) => {
+                        assert_eq!(r, hash_request(8, 10))
+                    }
+                    other => panic!("{id}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    fn msg_id_of(msg: &Message<'_>) -> u8 {
+        match msg {
+            Message::HashRequest(..) => 21,
+            Message::Hashes(..) => 22,
+            Message::HashReject(..) => 23,
+            _ => 0,
+        }
+    }
+
+    // libtorrent test_hash_picker.cpp `add_piece_hashes` and
+    // `add_piece_hashes_padded`: 512 nodes proven 9 layers up carry one
+    // uncle, 8 (or 5, padded to 8) nodes proven 10 layers up carry 8.
+    #[test]
+    fn a_hashes_reply_carries_the_uncles_libtorrent_counts() {
+        assert_eq!(hash_request(512, 9).uncles(), 1);
+        assert_eq!(hash_request(8, 10).uncles(), 8);
+        assert_eq!(hash_request(5, 10).uncles(), 8);
+        assert_eq!(hash_request(4, 0).uncles(), 0);
+        assert_eq!(hash_request(1, 0).uncles(), 1);
+    }
+
+    // libtorrent `bt_peer_connection::write_hashes`: the request header,
+    // then the nodes and uncles; `on_hashes` refuses any other length.
+    #[test]
+    fn a_hashes_reply_round_trips_and_its_length_must_match() {
+        let request = hash_request(5, 10);
+        let hashes: Vec<Id32> = (0..13u8).map(|i| Id32::new([i; 32])).collect();
+        let owned = Hashes::new(request, &hashes);
+        let mut out = vec![0u8; MAX_MSG_LEN];
+        let len = Message::Hashes(owned.as_borrowed())
+            .serialize(&mut out, &Default::default)
+            .unwrap();
+        assert_eq!(len, 5 + 48 + 13 * 32);
+        assert_eq!(&out[..4], &((1 + 48 + 13 * 32) as u32).to_be_bytes());
+        assert_eq!(out[4], 22);
+        assert_eq!(&out[53..85], &[0; 32]);
+
+        for split_point in 0..len {
+            let (first, second) = out[..len].split_at(split_point);
+            match Message::deserialize(first, second) {
+                Ok((Message::Hashes(h), got)) => {
+                    assert_eq!(got, len);
+                    assert_eq!(h.request, request);
+                    assert_eq!(h.hashes(), hashes);
+                }
+                // The hashes are borrowed whole, so a split inside them
+                // waits for the buffer to be made contiguous.
+                Err(MessageDeserializeError::NeedContiguous) => {
+                    assert!(split_point > 53 && split_point < len, "{split_point}")
+                }
+                other => panic!("{split_point}: {other:?}"),
+            }
+        }
+
+        // One hash short of the request's nodes and uncles.
+        let short = len - 32;
+        out[..4].copy_from_slice(&((short - 4) as u32).to_be_bytes());
+        assert!(matches!(
+            Message::deserialize(&out[..short], &[]),
+            Err(MessageDeserializeError::IncorrectMsgLen { .. })
+        ));
+    }
+
+    // The largest reply Weaver asks for, libtorrent's 512-node chunk proven
+    // to the root of the tallest tree, fits one frame.
+    #[test]
+    fn the_largest_hashes_reply_fits_a_frame() {
+        let request = HashRequest {
+            count: MAX_HASHES_IN_REPLY,
+            proof_layers: 9 + MAX_UNCLES_IN_REPLY as u32 - 1,
+            ..hash_request(0, 0)
+        };
+        assert_eq!(request.uncles(), MAX_UNCLES_IN_REPLY as u64);
+        let hashes = vec![Id32::new([1; 32]); 512 + MAX_UNCLES_IN_REPLY];
+        let owned = Hashes::new(request, &hashes);
+        let mut out = vec![0u8; MAX_MSG_LEN];
+        let len = Message::Hashes(owned.as_borrowed())
+            .serialize(&mut out, &Default::default)
+            .unwrap();
+        let (back, back_len) = Message::deserialize(&out[..len], &[]).unwrap();
+        assert_eq!(back_len, len);
+        assert!(matches!(back, Message::Hashes(h) if h.hashes() == hashes));
+    }
+
+    // libtorrent `bt_peer_connection::write_handshake` sets 0x10 in the
+    // last reserved byte to offer v2.
+    #[test]
+    fn the_v2_offer_is_bit_0x10_of_the_last_reserved_byte() {
+        let plain = || Handshake::new(Id20::new([1; 20]), Id20::new([2; 20]));
+        assert!(!plain().offers_v2());
+        assert_eq!(plain().offering_v2(false), plain());
+
+        let offer = plain().offering_v2(true);
+        assert!(offer.offers_v2());
+        let mut buf = [0u8; 68];
+        offer.serialize_unchecked_len(&mut buf);
+        assert_eq!(buf[20 + 7], 0x10);
+        assert_eq!(&buf[20..27], &plain().reserved.to_be_bytes()[..7]);
+        assert!(Handshake::deserialize(&buf).unwrap().0.offers_v2());
     }
 }

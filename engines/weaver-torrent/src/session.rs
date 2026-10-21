@@ -2420,6 +2420,17 @@ mod tests {
     // Connects to the session and sends a handshake for `info_hash`; returns
     // what [`answer`] returns.
     async fn greet(session: &Session, info_hash: super::Id20) -> Vec<u8> {
+        greet_with(session, info_hash, false).await.1
+    }
+
+    // Connects to the session and sends a handshake for `info_hash`,
+    // offering v2 when `offer_v2` holds; returns the connection and what
+    // [`answer`] returns.
+    async fn greet_with(
+        session: &Session,
+        info_hash: super::Id20,
+        offer_v2: bool,
+    ) -> (tokio::net::TcpStream, Vec<u8>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut stream = tokio::net::TcpStream::connect(session.listen_addr().unwrap())
@@ -2427,13 +2438,22 @@ mod tests {
             .unwrap();
         let mut handshake = [0u8; 68];
         let len = crate::peer_protocol::Handshake::new(info_hash, super::Id20::new([7; 20]))
+            .offering_v2(offer_v2)
             .serialize_unchecked_len(&mut handshake);
         // A refused connection may be closed before or while this is written,
         // and reset after: either way nothing comes back.
         let _ = stream.write_all(&handshake[..len]).await;
         let mut answer = Vec::new();
         let _ = (&mut stream).take(68).read_to_end(&mut answer).await;
-        answer
+        (stream, answer)
+    }
+
+    // Whether a 68-byte handshake answer offers v2.
+    fn offers_v2(answer: &[u8]) -> bool {
+        crate::peer_protocol::Handshake::deserialize(answer)
+            .unwrap()
+            .0
+            .offers_v2()
     }
 
     fn is_handshake_for(answer: &[u8], handle: &super::ManagedTorrentHandle) -> bool {
@@ -2572,6 +2592,74 @@ mod tests {
         let v2 = hashes.v2.unwrap().truncate_for_dht();
         assert_eq!(handle.info_hash(), v2);
         assert_eq!(answered_hash(&greet(&session, v2).await), Some(v2));
+
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_hybrid_moves_a_peer_offering_v2_to_its_v2_hash() {
+        // libtorrent bt_peer_connection::on_receive_handshake: an incoming
+        // peer setting 0x10 of reserved byte 7 on a hybrid is v2 and is
+        // answered with the truncated v2; write_handshake offers the move
+        // only to a peer that is not v2.
+        let (_dir, session, handle) = seeding_v2(&v2_torrent(true)).await;
+        let hashes = handle.info_hashes();
+        let v1 = hashes.v1.unwrap();
+        let v2 = hashes.v2.unwrap().truncate_for_dht();
+
+        let (_stream, moved) = greet_with(&session, v1, true).await;
+        assert_eq!(answered_hash(&moved), Some(v2));
+        assert!(!offers_v2(&moved));
+
+        let (_stream, stayed) = greet_with(&session, v1, false).await;
+        assert_eq!(answered_hash(&stayed), Some(v1));
+        assert!(offers_v2(&stayed));
+
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_v1_torrent_refuses_a_peer_offering_v2() {
+        // libtorrent bt_peer_connection::on_receive_handshake: the v2 bit on
+        // a torrent without v2 disconnects with invalid_info_hash.
+        let (_dir, session, handle) = seeding(200, crate::limits::LimitKind::Unlimited).await;
+        let (_stream, refused) = greet_with(&session, handle.info_hash(), true).await;
+        assert!(refused.is_empty());
+        let (_stream, taken) = greet_with(&session, handle.info_hash(), false).await;
+        assert!(is_handshake_for(&taken, &handle));
+        assert!(!offers_v2(&taken));
+
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_does_not_speak_v2_is_dropped_for_a_hash_request() {
+        // libtorrent bt_peer_connection::on_hash_request: a hash message
+        // from a peer that is not protocol_v2 disconnects it.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let torrent = v2_torrent(true);
+        let (_dir, session, handle) = seeding_v2(&torrent).await;
+        let (mut stream, answer) =
+            greet_with(&session, handle.info_hashes().v1.unwrap(), false).await;
+        assert_eq!(answered_hash(&answer), handle.info_hashes().v1);
+
+        let request =
+            crate::peer_protocol::Message::HashRequest(crate::peer_protocol::HashRequest {
+                root: crate::core::v2_test_torrent::file_hashes(&torrent.files[0].1, 16384)
+                    .0
+                    .unwrap(),
+                base: 0,
+                index: 0,
+                count: 2,
+                proof_layers: 0,
+            });
+        let mut frame = [0u8; 53];
+        let len = request.serialize(&mut frame, &Default::default).unwrap();
+        stream.write_all(&frame[..len]).await.unwrap();
+
+        // The session closes the connection: the read ends.
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest).await;
 
         session.stop().await;
     }

@@ -175,7 +175,12 @@ impl PeerConnectionHandler for Handler {
         Ok(0)
     }
 
-    fn on_handshake(&self, handshake: Handshake, _kind: ConnectionKind) -> anyhow::Result<()> {
+    fn on_handshake(
+        &self,
+        handshake: Handshake,
+        _kind: ConnectionKind,
+        _speaks_v2: bool,
+    ) -> anyhow::Result<()> {
         if !handshake.supports_extended() {
             anyhow::bail!(
                 "this peer does not support extended handshaking, which is a prerequisite to download metadata"
@@ -186,6 +191,10 @@ impl PeerConnectionHandler for Handler {
 
     async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()> {
         trace!("{}: received message: {:?}", self.addr, msg);
+        // There are no file trees to exchange hashes over before the
+        // metadata is in (libtorrent `bt_peer_connection::on_hash_request`:
+        // `!t->valid_metadata()`).
+        anyhow::ensure!(!msg.is_v2_only(), "a hash message before the metadata");
 
         if let Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(utdata))) = msg {
             let piece_ready = self
