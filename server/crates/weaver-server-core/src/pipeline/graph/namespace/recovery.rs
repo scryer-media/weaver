@@ -467,11 +467,12 @@ impl NamespaceWriter {
     }
 
     // A set that found what it covers whole, or made it so, has proven
-    // every byte of it, the ones that arrived marked damaged and were good
-    // after all among them: it rewrites only the slices that were bad. Every
-    // byte still marked damaged is delivered again as repaired, read back
-    // from wherever it went, so the marks here and in every namespace below
-    // it say what the set proved. Returns the members it delivered again.
+    // every byte its checks reach, the ones that arrived marked damaged and
+    // were good after all among them: it rewrites only the slices that were
+    // bad. Every byte still marked damaged there is delivered again as
+    // repaired, read back from wherever it went, so the marks here and in
+    // every namespace below it say what the set proved; damage past what it
+    // proves stays marked. Returns the members it delivered again.
     fn vouched(
         &mut self,
         tree: &mut Tree,
@@ -489,6 +490,11 @@ impl NamespaceWriter {
                     .filter(|(member, _)| {
                         self.covering(tree, &sets, *member)
                             .any(|covering| covering == set)
+                    })
+                    .filter_map(|(member, range)| {
+                        let length = namespace.get(member)?.length.unwrap_or(range.end);
+                        let proves = tree.recovery(set)?.proves(member, length);
+                        Some((member, range.intersect(proves)?))
                     })
                     .collect()
             })
@@ -788,8 +794,7 @@ impl NamespaceWriter {
     // set for it is built over that range of the member the volume is, as a
     // window beside the object, so it lives in the namespace of the members
     // it covers. What of the range has passed is read back through the
-    // inverse map and handed to it; the rest reaches it as it passes. Data
-    // no object here reads is only recorded.
+    // inverse map and handed to it; the rest reaches it as it passes.
     pub(super) fn recovery_at(
         &mut self,
         tree: &mut Tree,
@@ -805,12 +810,7 @@ impl NamespaceWriter {
         else {
             return Ok(());
         };
-        let Some(object) = kind.object() else {
-            if !self.unusable.contains(&(parent, member)) {
-                self.unusable.push((parent, member));
-            }
-            return Ok(());
-        };
+        let object = kind.object();
         let runs: Vec<(ByteRange, Provenance)> = tree
             .namespace(parent)
             .and_then(|namespace| namespace.get(member))

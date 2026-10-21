@@ -11,9 +11,6 @@ use weaver_graph::{Kind, NodeId};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RecoverySummary {
     pub(crate) sets: Vec<SetSummary>,
-    // Members that carry recovery data nothing here reads, by name: it is
-    // there, and no repair counts on it.
-    pub(crate) unusable: Vec<String>,
 }
 
 // One recovery object of the namespace.

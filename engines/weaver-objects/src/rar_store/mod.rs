@@ -257,7 +257,7 @@ impl RarStore {
                         self.say_damaged(volume, range, crc, out);
                     }
                 }
-                Step::Locked(encryption) => self.open_headers(&encryption, out),
+                Step::Locked(encryption) => self.open_headers(volume, &encryption, out),
                 Step::Broken(range) => {
                     if found.kept.verified(range) {
                         return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);

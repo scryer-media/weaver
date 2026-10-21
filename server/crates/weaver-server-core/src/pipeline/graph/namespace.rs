@@ -131,8 +131,6 @@ pub(crate) struct NamespaceWriter {
     kept: BTreeMap<(NodeId, VolumeIndex), Vec<KeptRun>>,
     // Member reads the recovery objects made while repairing.
     read_backs: u64,
-    // Members carrying recovery data no object here reads, by namespace.
-    unusable: Vec<(NodeId, MemberId)>,
     renamed: Vec<MemberId>,
     segments: Vec<Segment>,
     placements: Vec<Placement>,
@@ -155,7 +153,6 @@ impl NamespaceWriter {
             caps: Caps::unbounded(),
             files: BTreeMap::new(),
             read_backs: 0,
-            unusable: Vec::new(),
             renamed: Vec::new(),
             segments: Vec::new(),
             placements: Vec::new(),
@@ -178,12 +175,6 @@ impl NamespaceWriter {
     // bytes passed settles the rest without one.
     pub(crate) fn read_backs(&self) -> u64 {
         self.read_backs
-    }
-
-    // Members whose object said they carry recovery data that no object
-    // here can read: health says it is there, and no repair counts on it.
-    pub(crate) fn unusable_recovery(&self) -> &[(NodeId, MemberId)] {
-        &self.unusable
     }
 
     // Every member of the namespace with a file of its own, and its path.

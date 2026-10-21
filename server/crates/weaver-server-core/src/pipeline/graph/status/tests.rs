@@ -125,10 +125,7 @@ fn ruled(mut set: SetSummary, outcome: RepairOutcome) -> SetSummary {
 }
 
 fn summary(sets: Vec<SetSummary>) -> RecoverySummary {
-    RecoverySummary {
-        sets,
-        unusable: Vec::new(),
-    }
+    RecoverySummary { sets }
 }
 
 fn member(namespace: &Namespace, id: u32) -> &Member {

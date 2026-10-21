@@ -14,8 +14,8 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_model::files::FileRole;
 
 use super::harness::{
-    ARTICLE, Claim, JOB, Outcome, Post, Scenario, Stall, admit, assert_same, par2_set, payload,
-    run, run_both, run_unprompted, serve_job, try_run,
+    ARTICLE, Claim, JOB, Outcome, Post, Scenario, Stall, admit, assert_same, kinds, par2_set,
+    payload, run, run_both, run_unprompted, serve_job, try_run,
 };
 use crate::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY;
 use crate::history::HistoryFailureKind;
@@ -27,8 +27,8 @@ use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_rar4_store_set, encrypted_store_set, header_encrypted_store_set,
 };
 use crate::pipeline::tests::direct_store::{
-    obfuscate_volumes, recovery_record_store_set, single_member_rar4_store_set_numbered,
-    single_member_store_set,
+    obfuscate_volumes, protected_rar4_store_set, protected_sealed_rar4_store_set,
+    protected_store_set, single_member_rar4_store_set_numbered, single_member_store_set,
 };
 use crate::pipeline::tests::{
     debug_job_state, insert_active_job, job_status_for_assert, retire_pipeline_database,
@@ -816,17 +816,16 @@ async fn an_xz_stream_inside_a_stored_rar_volume_streams_under_both_engines() {
     );
 }
 
-// Each volume carries a recovery record and there is no PAR2. Neither
-// engine decodes the record, so nothing can repair the damaged article.
-// Both engines fail the job. Classic fails it at unpack and delivers
-// nothing. The graph rules that nothing will repair the set: the store
-// refuses every volume it holds, none of them whole, the damaged one
-// claimed damaged, and the job fails.
+// Each volume carries a recovery record and there is no PAR2; one article
+// of the first volume is served damaged. The graph rebuilds it from that
+// volume's record and the other volume's record finds its volume whole: the
+// member is delivered whole and nothing is asked for twice. Classic reads no
+// record and fails at unpack, delivering nothing.
 #[tokio::test]
-async fn a_rar5_set_with_recovery_records_and_a_damaged_article_ends_unrepaired_under_both_engines()
-{
+async fn a_rar5_set_with_recovery_records_and_a_damaged_article_is_repaired_from_the_record_under_graph_and_fails_under_classic()
+ {
     let body = body();
-    let set = recovery_record_store_set(MEMBER, &body, 2, 96);
+    let set = protected_store_set(MEMBER, &body, 2, 1);
     let scenario = Scenario::new(posts(set.clone())).damaged(0, 2);
     let (classic, graph) = (
         run(&scenario, Engine::Classic).await,
@@ -839,24 +838,381 @@ async fn a_rar5_set_with_recovery_records_and_a_damaged_article_ends_unrepaired_
     );
     assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
     assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
-    // Every volume is delivered as it stands, none whole: the job fails.
+    assert_delivers(&graph, MEMBER, &body);
+    let view = graph.graph();
+    assert_eq!(
+        view.rulings,
+        vec![
+            (
+                "rar_record".to_string(),
+                Some(RepairOutcome::Repaired { slices: 1 })
+            ),
+            ("rar_record".to_string(), Some(RepairOutcome::Clean)),
+        ]
+    );
+    assert_eq!(view.claims[&set[0].0], Claim::Complete);
+    assert_eq!(view.claims[&set[1].0], Claim::Complete);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(classic.refetched().is_empty(), "{:?}", classic.refetched());
+}
+
+// One volume, its record of one parity unit over four data units, with
+// articles in two of those units served damaged: the record cannot rebuild
+// them. The record rules the volume past repair rather than waiting, nothing
+// is written into it, and the job fails for the repair.
+#[tokio::test]
+async fn a_rar5_volume_damaged_past_what_its_recovery_record_covers_ends_impossible_not_stalled_under_graph()
+ {
+    let body = payload(60 * ARTICLE + 7, 55);
+    let set = protected_store_set(MEMBER, &body, 1, 1);
+    let scenario = Scenario::new(posts(set)).damaged(0, 2).damaged(0, 40);
+    let graph = run(&scenario, Engine::Graph).await;
     assert!(
         matches!(graph.status, Some(JobStatus::Failed { .. })),
         "{:?}",
         graph.status
     );
-    assert!(
-        graph.graph().delivery.whole.is_empty(),
-        "{:?}",
-        graph.graph().delivery
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert_eq!(
+        graph.graph().rulings,
+        vec![(
+            "rar_record".to_string(),
+            Some(RepairOutcome::Impossible {
+                damaged: 2,
+                reachable: 1
+            })
+        )]
     );
-    let view = graph.graph();
-    assert_eq!(view.claims[&set[0].0], Claim::Damaged);
-    assert_eq!(view.claims[&set[1].0], Claim::Complete);
-    assert_eq!(view.blocks_reachable, 0);
-    assert!(view.outcomes.is_empty(), "{:?}", view.outcomes);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert!(classic.refetched().is_empty(), "{:?}", classic.refetched());
+}
+
+// A recovery record in each volume beside a PAR2 set over both, one article
+// of the first volume served damaged. The record is due once its volume is
+// in, before the set has all of its volumes, so it repairs first; the set
+// then finds every volume whole and rules clean. One repair, nothing asked
+// for twice, the member whole.
+#[tokio::test]
+async fn a_rar5_volume_with_a_recovery_record_beside_par2_is_repaired_once_by_the_record_and_the_set_finds_it_whole()
+ {
+    let body = body();
+    let scenario = Scenario::new(with_par2(protected_store_set(MEMBER, &body, 2, 1))).damaged(0, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(&graph, MEMBER, &body);
+    let mut rulings = graph.graph().rulings.clone();
+    rulings.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        rulings,
+        vec![
+            ("par2".to_string(), Some(RepairOutcome::Clean)),
+            (
+                "rar_record".to_string(),
+                Some(RepairOutcome::Repaired { slices: 1 })
+            ),
+            ("rar_record".to_string(), Some(RepairOutcome::Clean)),
+        ]
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// The PAR2 set is posted ahead of the volumes and the damaged article is in
+// the last volume, so that volume's record and the set come due in the same
+// step. One of them repairs it; the other then finds it whole. One repair,
+// nothing asked for twice, the member whole.
+#[tokio::test]
+async fn a_rar5_record_and_par2_due_in_the_same_step_repair_the_volume_once() {
+    let body = body();
+    let mut posts = with_par2(protected_store_set(MEMBER, &body, 2, 1));
+    posts.rotate_right(2);
+    let last = posts.len() as u32 - 1;
+    let graph = run(&Scenario::new(posts).damaged(last, 2), Engine::Graph).await;
+    assert_delivers(&graph, MEMBER, &body);
+    let rulings = &graph.graph().rulings;
+    let repaired = rulings
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, Some(RepairOutcome::Repaired { .. })))
+        .count();
+    assert_eq!(repaired, 1, "{rulings:?}");
+    assert_eq!(
+        rulings
+            .iter()
+            .filter(|(_, outcome)| *outcome == Some(RepairOutcome::Clean))
+            .count(),
+        rulings.len() - 1,
+        "{rulings:?}"
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// One volume whose record of one parity unit cannot rebuild the two units
+// damaged in it, beside a PAR2 set that can. The set repairs the volume
+// whole and the job completes; the record never writes, ruling past repair
+// if it rules before the set and clean if after.
+#[tokio::test]
+async fn a_rar5_record_past_repair_beside_par2_that_repairs_the_volume_ends_complete() {
+    let body = payload(60 * ARTICLE + 7, 56);
+    let volumes = protected_store_set(MEMBER, &body, 1, 1);
+    let files: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posts = posts(volumes.clone());
+    posts.extend(par2_set("silver.horizon", &files, 8));
+    let scenario = Scenario::new(posts).damaged(0, 2).damaged(0, 40);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(&graph, MEMBER, &body);
+    let mut rulings = graph.graph().rulings.clone();
+    rulings.sort_by(|a, b| a.0.cmp(&b.0));
+    assert!(
+        matches!(
+            rulings[..],
+            [
+                (_, Some(RepairOutcome::Repaired { .. })),
+                (
+                    _,
+                    Some(RepairOutcome::Impossible { .. } | RepairOutcome::Clean)
+                )
+            ]
+        ) && rulings[0].0 == "par2"
+            && rulings[1].0 == "rar_record",
+        "{rulings:?}"
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// One volume with a recovery record and no PAR2, its end header alone
+// served damaged: the first body whose record ends on an article boundary,
+// so the damaged article holds nothing the record protects and none of the
+// record itself. The record finds what it protects whole and rules clean,
+// which proves only the bytes before its header: the end header stays
+// damaged and the store hears it lost. The member's bytes all came whole,
+// so the store extracts it and the job completes.
+#[tokio::test]
+async fn a_rar5_volume_damaged_only_past_what_its_recovery_record_protects_delivers_the_member_whole_under_graph()
+ {
+    let article = ARTICLE as u64;
+    let (body, set, past) = (0..(article * article) as usize)
+        .find_map(|extra| {
+            let body = payload(7 * ARTICLE + 13 + extra, 51);
+            let set = protected_store_set(MEMBER, &body, 1, 1);
+            let layout =
+                unrar_rs::locate_recovery_record(&mut std::io::Cursor::new(&set[0].1), None)
+                    .unwrap()
+                    .unwrap();
+            let end = layout.record_offset + layout.record_size;
+            (end % article == 0 && end < set[0].1.len() as u64)
+                .then(|| (body, set, (end / article) as u32))
+        })
+        .unwrap();
+    let volume = set[0].0.clone();
+    let graph = run(&Scenario::new(posts(set)).damaged(0, past), Engine::Graph).await;
+    assert_delivers(&graph, MEMBER, &body);
+    let view = graph.graph();
+    assert_eq!(
+        view.rulings,
+        vec![("rar_record".to_string(), Some(RepairOutcome::Clean))]
+    );
+    assert_eq!(view.claims[&volume], Claim::Damaged);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// Two volumes, each with a recovery record of one parity unit and no PAR2.
+// The first is damaged in one unit, within its record's reach; the second
+// in two, past it. The first record repairs its volume and vouches for
+// that volume only: the second volume's damage is its own record's to
+// judge, which rules it past repair, and the job fails for the repair with
+// the member withheld.
+#[tokio::test]
+async fn a_rar5_record_that_repairs_one_volume_vouches_for_no_other_volume_under_graph() {
+    let body = payload(120 * ARTICLE + 7, 57);
+    let set = protected_store_set(MEMBER, &body, 2, 1);
+    let scenario = Scenario::new(posts(set.clone()))
+        .damaged(0, 2)
+        .damaged(1, 2)
+        .damaged(1, 40);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    let view = graph.graph();
+    assert_eq!(
+        view.rulings,
+        vec![
+            (
+                "rar_record".to_string(),
+                Some(RepairOutcome::Repaired { slices: 1 })
+            ),
+            (
+                "rar_record".to_string(),
+                Some(RepairOutcome::Impossible {
+                    damaged: 2,
+                    reachable: 1
+                })
+            ),
+        ]
+    );
+    assert_eq!(view.claims[&set[0].0], Claim::Complete);
+    assert_eq!(view.claims[&set[1].0], Claim::Damaged);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// A RAR4 set whose volumes each carry a RAR3 recovery record, one article
+// of the first volume served damaged: the graph rebuilds the sector from
+// that volume's record and delivers the member whole. Classic reads no
+// record and fails at unpack.
+#[tokio::test]
+async fn a_rar4_set_with_recovery_records_and_a_damaged_article_is_repaired_from_the_record_under_graph_and_fails_under_classic()
+ {
+    let body = body();
+    let set = protected_rar4_store_set(MEMBER, &body, 2, 1);
+    let scenario = Scenario::new(posts(set)).damaged(0, 2);
+    let (classic, graph) = (
+        run(&scenario, Engine::Classic).await,
+        run(&scenario, Engine::Graph).await,
+    );
+    assert!(!classic.completed(), "{:?}", classic.status);
+    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
+    assert_delivers(&graph, MEMBER, &body);
+    assert_eq!(
+        graph.graph().rulings,
+        vec![
+            (
+                "rar_record".to_string(),
+                Some(RepairOutcome::Repaired { slices: 1 })
+            ),
+            ("rar_record".to_string(), Some(RepairOutcome::Clean)),
+        ]
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// A RAR4 `-hp` set whose volumes each carry a RAR3 recovery record, one
+// article of the first volume served damaged, under `scenario`'s
+// candidates: the store proves the password on the first enciphered
+// header, the record reads under it and rebuilds the sector, and the member
+// is delivered whole with nothing asked for again.
+async fn assert_sealed_rar4_repaired_from_its_record(scenario: impl Fn(Scenario) -> Scenario) {
+    let body = body();
+    let set = protected_sealed_rar4_store_set(MEMBER, &body, 2, 1, SECRET);
+    let graph = run(
+        &scenario(Scenario::new(posts(set)).damaged(0, 2)),
+        Engine::Graph,
+    )
+    .await;
+    assert_delivers(&graph, MEMBER, &body);
+    assert_eq!(
+        graph.graph().rulings,
+        vec![
+            (
+                "rar_record".to_string(),
+                Some(RepairOutcome::Repaired { slices: 1 })
+            ),
+            ("rar_record".to_string(), Some(RepairOutcome::Clean)),
+        ]
+    );
+    assert_volumes_complete(&graph);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+#[tokio::test]
+async fn a_rar4_hp_set_with_recovery_records_and_a_damaged_article_is_repaired_under_its_password_under_graph()
+ {
+    assert_sealed_rar4_repaired_from_its_record(|scenario| scenario.password(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_rar4_hp_set_with_recovery_records_is_repaired_under_the_right_candidate_after_a_wrong_one_under_graph()
+ {
+    assert_sealed_rar4_repaired_from_its_record(|scenario| {
+        scenario
+            .global_password("quill-ember-wrong")
+            .global_password(SECRET)
+    })
+    .await;
+}
+
+// No password: nothing proves a candidate, so the headers stay shut, the
+// record is never announced, and the job fails for the password with
+// nothing delivered.
+#[tokio::test]
+async fn a_rar4_hp_set_with_recovery_records_and_no_password_fails_for_the_password_under_graph() {
+    let body = body();
+    let set = protected_sealed_rar4_store_set(MEMBER, &body, 2, 1, SECRET);
+    let graph = run(&Scenario::new(posts(set)).damaged(0, 2), Engine::Graph).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    assert_eq!(kinds(&graph), ["rar_store"]);
+    assert!(
+        graph.graph().rulings.is_empty(),
+        "{:?}",
+        graph.graph().rulings
+    );
+    let delivery = &graph.graph().delivery;
+    assert!(delivery.whole.is_empty(), "{delivery:?}");
+    assert!(delivery.files.is_empty(), "{delivery:?}");
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// One RAR4 volume whose record of one parity sector cannot rebuild two
+// damaged sectors: the record rules past repair rather than waiting, and
+// the job fails for the repair.
+#[tokio::test]
+async fn a_rar4_volume_damaged_past_what_its_recovery_record_covers_ends_impossible_not_stalled_under_graph()
+ {
+    let body = payload(30 * ARTICLE + 7, 57);
+    let set = protected_rar4_store_set(MEMBER, &body, 1, 1);
+    let scenario = Scenario::new(posts(set)).damaged(0, 2).damaged(0, 20);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert!(
+        matches!(
+            graph.graph().rulings[..],
+            [(_, Some(RepairOutcome::Impossible { .. }))]
+        ),
+        "{:?}",
+        graph.graph().rulings
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// A RAR4 volume with its record beside a PAR2 set over both, one article
+// of the first volume served damaged: the record repairs first, the set
+// finds every volume whole.
+#[tokio::test]
+async fn a_rar4_volume_with_a_recovery_record_beside_par2_is_repaired_once_by_the_record_and_the_set_finds_it_whole()
+ {
+    let body = body();
+    let scenario =
+        Scenario::new(with_par2(protected_rar4_store_set(MEMBER, &body, 2, 1))).damaged(0, 2);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(&graph, MEMBER, &body);
+    let mut rulings = graph.graph().rulings.clone();
+    rulings.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        rulings,
+        vec![
+            ("par2".to_string(), Some(RepairOutcome::Clean)),
+            (
+                "rar_record".to_string(),
+                Some(RepairOutcome::Repaired { slices: 1 })
+            ),
+            ("rar_record".to_string(), Some(RepairOutcome::Clean)),
+        ]
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
 // More of the second volume lost than its PAR2 set can rebuild: the store

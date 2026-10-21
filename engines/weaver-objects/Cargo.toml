@@ -6,6 +6,11 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# The recovery record encoders, for other crates' tests. Never enabled in
+# a product build.
+test-support = []
+
 [dependencies]
 aws-lc-rs = { workspace = true }
 brotli = { workspace = true }

@@ -474,6 +474,9 @@ pub(super) struct GraphView {
     pub(super) claims: BTreeMap<String, Claim>,
     pub(super) blocks_reachable: u64,
     pub(super) outcomes: Vec<Option<RepairOutcome>>,
+    // What each recovery object last ruled, by the kind of object, in the
+    // order of `outcomes`.
+    pub(super) rulings: Vec<(String, Option<RepairOutcome>)>,
     // The kind of every object the tree held at any look, by its name.
     pub(super) kinds: BTreeSet<String>,
     // How many password candidates each node was offered, at the last look.
@@ -1175,6 +1178,10 @@ pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: 
         })
         .sum();
     view.outcomes = summary.iter().map(|set| set.outcome).collect();
+    view.rulings = summary
+        .iter()
+        .map(|set| (set.kind.to_string(), set.outcome))
+        .collect();
     let resident = tree
         .live()
         .into_iter()

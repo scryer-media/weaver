@@ -39,6 +39,7 @@ pub enum Kind {
     Par3,
     Sfv,
     RarRecovery,
+    RarRecord,
 }
 
 impl Kind {
@@ -75,6 +76,7 @@ impl fmt::Display for Kind {
             Kind::Par3 => "par3",
             Kind::Sfv => "sfv",
             Kind::RarRecovery => "rar_recovery",
+            Kind::RarRecord => "rar_record",
         };
         formatter.write_str(name)
     }

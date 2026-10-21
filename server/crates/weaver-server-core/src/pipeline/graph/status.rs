@@ -93,14 +93,7 @@ impl RootJob for GraphJob {
                 outcome: object.outcome,
             })
             .collect();
-        let unusable = self
-            .writer()
-            .unusable_recovery()
-            .iter()
-            .filter_map(|(node, member)| tree.namespace(*node)?.get(*member))
-            .map(|member| member.output_name.clone())
-            .collect();
-        RecoverySummary { sets, unusable }
+        RecoverySummary { sets }
     }
 
     fn repair(&mut self) -> Vec<RepairOutcome> {

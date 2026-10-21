@@ -68,9 +68,6 @@ pub(crate) struct FileState {
     pub(crate) has_file: bool,
     // Why it is a leaf, when something refused to own it.
     pub(crate) refused: Option<Why>,
-    // Its place among the members carrying recovery data no object here
-    // reads, which is the order the job found them in.
-    pub(crate) unusable_at: Option<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -376,7 +373,6 @@ fn rows_of(
                 undecided: member.undecided,
                 has_file: state.has_file,
                 refused: state.refused.map(|why| why_name(why).to_owned()),
-                unusable_at: state.unusable_at.map(|at| at as i64),
                 copy_of: member.copy_of.map(|into| i64::from(into.0)),
             });
         }
@@ -571,10 +567,6 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
         let state = FileState {
             has_file: row.has_file,
             refused,
-            unusable_at: row
-                .unusable_at
-                .map(|at| usize::try_from(at).map_err(|_| refuse("a recovery position")))
-                .transpose()?,
         };
         if state != FileState::default() {
             files.insert((node, member), state);
@@ -690,7 +682,7 @@ fn range(row: i64, start: i64, end: i64) -> Result<ByteRange, CheckpointError> {
     }
 }
 
-const KINDS: [Kind; 18] = [
+const KINDS: [Kind; 19] = [
     Kind::RarStore,
     Kind::SevenZipStore,
     Kind::Zip,
@@ -709,6 +701,7 @@ const KINDS: [Kind; 18] = [
     Kind::Par3,
     Kind::Sfv,
     Kind::RarRecovery,
+    Kind::RarRecord,
 ];
 
 // The kind a row names, by the name the kind displays as.

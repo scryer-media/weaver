@@ -2119,7 +2119,8 @@ impl Tree {
     ) -> Option<NodeId> {
         let found = self.nodes.get(&node)?;
         let record = found.namespace.get(member)?;
-        let (name, closed) = (record.name.clone(), record.closed);
+        let (name, closed, length) = (record.name.clone(), record.closed, record.length);
+        let front = found.namespace.first_bytes(member).to_vec();
         let taken = self.windows_on(node, member).into_iter().any(|window| {
             self.nodes
                 .get(&window)
@@ -2132,8 +2133,9 @@ impl Tree {
         let child = NodeId(self.next_node);
         let mut object = builder.build(kind, ObjectId(child.0))?;
         self.next_node += 1;
-        // A window's front is the range's, which has not passed yet.
-        object.bound(VolumeIndex(0), &name, &[], None);
+        // A window is bound under its member's front: what the member is
+        // tells the window how to read the range it sits on.
+        object.bound(VolumeIndex(0), &name, &front, length);
         let binding = Binding {
             parent: node,
             volumes: BTreeMap::from([(VolumeIndex(0), member)]),

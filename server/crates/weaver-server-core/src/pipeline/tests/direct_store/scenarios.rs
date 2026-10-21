@@ -742,12 +742,10 @@ fn header_encrypted_store_set_with_extra_member(
 // A RAR4 `-hp` volume: the archive header's `ENCRYPTED_HEADERS` flag and then
 // ciphertext.
 //
-// Deliberately not decryptable, and that costs nothing, because RAR4 `-hp` is
-// refused **at the flag** — the format carries no password-check value
-// anywhere, so there is nothing an admission gate could stand on and no
-// candidate can be proved before something is decrypted. What the bytes past
-// the flag are is exactly as irrelevant to this router as it is to a real
-// archive it has no key for.
+// Not decryptable: this router refuses RAR4 `-hp` at the flag, so the bytes
+// past it are never read. The graph's RAR store proves a candidate on the
+// first enciphered header's CRC instead, and its rows build sets that
+// decrypt.
 fn header_encrypted_rar4_set(volume_count: usize, body_bytes: usize) -> Vec<(String, Vec<u8>)> {
     (0..volume_count)
         .map(|volume| {

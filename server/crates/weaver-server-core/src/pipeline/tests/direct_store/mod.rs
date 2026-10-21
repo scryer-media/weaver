@@ -1077,6 +1077,97 @@ pub(in crate::pipeline::tests) fn single_member_rar4_store_set_numbered(
     payload: &[u8],
     volume_count: usize,
 ) -> Vec<(String, Vec<u8>)> {
+    rar4_store_set_with_records(member_name, payload, volume_count, |_| Vec::new())
+}
+
+// [`single_member_rar4_store_set_numbered`] with a RAR3 recovery record of
+// `slots` parity sectors in each volume over every byte before its header,
+// as `rar a -rr` writes one.
+pub(in crate::pipeline::tests) fn protected_rar4_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    slots: u32,
+) -> Vec<(String, Vec<u8>)> {
+    rar4_store_set_with_records(member_name, payload, volume_count, |protected| {
+        let mut record =
+            weaver_objects::rar_record::encode::rar3_header(protected.len() as u64, slots);
+        record.extend(weaver_objects::rar_record::encode::rar3(protected, slots));
+        record
+    })
+}
+
+// [`protected_rar4_store_set`] with every header past the main one
+// enciphered under `password`, as `rar a -hp -rr` writes it, the member's
+// data stored in the clear. Each volume's record is over its bytes before
+// its own header's salt.
+pub(in crate::pipeline::tests) fn protected_sealed_rar4_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    slots: u32,
+    password: &str,
+) -> Vec<(String, Vec<u8>)> {
+    protected_rar4_store_set(member_name, payload, volume_count, slots)
+        .into_iter()
+        .map(|(name, plain)| (name, seal_rar4_volume(&plain, slots, password)))
+        .collect()
+}
+
+// `plain` with the main header's ENCRYPTED_HEADERS flag set and every
+// header's CRC made whole, every one past the main as its salt and its
+// cipher; data areas are
+// copied, and the record is made again over what precedes it.
+fn seal_rar4_volume(plain: &[u8], slots: u32, password: &str) -> Vec<u8> {
+    use weaver_objects::rar_record::encode;
+    let size_at = |at: usize| usize::from(u16::from_le_bytes([plain[at + 5], plain[at + 6]]));
+    let main_end = TEST_RAR4_SIG.len() + size_at(TEST_RAR4_SIG.len());
+    let mut sealed = plain[..main_end].to_vec();
+    // The main header's flags, past its CRC and type: ENCRYPTED_HEADERS,
+    // and its CRC made whole over them.
+    let main = TEST_RAR4_SIG.len();
+    sealed[main + 3] |= 0x80;
+    let crc = (checksum::crc32(&sealed[main + 2..main_end]) & 0xffff) as u16;
+    sealed[main..main + 2].copy_from_slice(&crc.to_le_bytes());
+    let mut at = main_end;
+    let mut salt = 0u8;
+    while at < plain.len() {
+        let kind = plain[at + 2];
+        let flags = u16::from_le_bytes([plain[at + 3], plain[at + 4]]);
+        let header_end = at + size_at(at);
+        let data = match flags & 0x8000 {
+            0 => 0,
+            _ => u32::from_le_bytes(plain[at + 7..at + 11].try_into().unwrap()) as usize,
+        };
+        let (header, area) = match kind {
+            0x7a => (
+                encode::rar3_header(sealed.len() as u64, slots),
+                encode::rar3(&sealed, slots),
+            ),
+            _ => (
+                plain[at..header_end].to_vec(),
+                plain[header_end..header_end + data].to_vec(),
+            ),
+        };
+        let mut header = header;
+        let crc = (checksum::crc32(&header[2..]) & 0xffff) as u16;
+        header[..2].copy_from_slice(&crc.to_le_bytes());
+        salt += 1;
+        sealed.extend(encode::seal_rar3(&header, password, [salt; 8]));
+        sealed.extend(area);
+        at = header_end + data;
+    }
+    sealed
+}
+
+// A numbered RAR4 store set whose volumes each carry what `record` makes of
+// the bytes before it, between the member's part and the end header.
+fn rar4_store_set_with_records(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    record: impl Fn(&[u8]) -> Vec<u8>,
+) -> Vec<(String, Vec<u8>)> {
     let member_crc = checksum::crc32(payload);
     let chunk = payload.len().div_ceil(volume_count);
     (0..volume_count)
@@ -1108,6 +1199,8 @@ pub(in crate::pipeline::tests) fn single_member_rar4_store_set_numbered(
                 },
             ));
             bytes.extend_from_slice(part);
+            let record = record(&bytes);
+            bytes.extend(record);
             bytes.extend_from_slice(&build_test_rar4_end_header_numbered(
                 !is_last,
                 volume as u16,
@@ -1836,6 +1929,35 @@ pub(in crate::pipeline::tests) fn recovery_record_store_set(
     volume_count: usize,
     rr_bytes: usize,
 ) -> Vec<(String, Vec<u8>)> {
+    store_set_with_records(member_name, payload, volume_count, |_, volume| {
+        (0..rr_bytes)
+            .map(|index| ((index * 7 + volume * 13) % 256) as u8)
+            .collect()
+    })
+}
+
+// A store set whose volumes each carry a RAR5 recovery record of `parity`
+// units over every byte before its header, as `rar a -rr` writes one.
+pub(in crate::pipeline::tests) fn protected_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    parity: u16,
+) -> Vec<(String, Vec<u8>)> {
+    store_set_with_records(member_name, payload, volume_count, |protected, _| {
+        weaver_objects::rar_record::encode::rar5(protected, parity)
+    })
+}
+
+// A store set whose volumes each end in an `RR` service header, the record
+// `record` makes of the bytes before it and the volume's index, and the end
+// header.
+fn store_set_with_records(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    record: impl Fn(&[u8], usize) -> Vec<u8>,
+) -> Vec<(String, Vec<u8>)> {
     let member_crc = checksum::crc32(payload);
     let chunk = payload.len().div_ceil(volume_count);
 
@@ -1873,8 +1995,9 @@ pub(in crate::pipeline::tests) fn recovery_record_store_set(
                 }),
             ));
             bytes.extend_from_slice(part);
-            bytes.extend_from_slice(&build_test_rar_service_header("RR", rr_bytes as u64));
-            bytes.extend((0..rr_bytes).map(|index| ((index * 7 + volume * 13) % 256) as u8));
+            let record = record(&bytes, volume);
+            bytes.extend_from_slice(&build_test_rar_service_header("RR", record.len() as u64));
+            bytes.extend(record);
             bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
 
             (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)

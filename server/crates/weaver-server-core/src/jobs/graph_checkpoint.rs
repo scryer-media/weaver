@@ -73,7 +73,6 @@ pub(crate) struct MemberRow {
     pub(crate) undecided: bool,
     pub(crate) has_file: bool,
     pub(crate) refused: Option<String>,
-    pub(crate) unusable_at: Option<i64>,
     pub(crate) copy_of: Option<i64>,
 }
 
@@ -195,7 +194,7 @@ impl Row for MemberRow {
     const KEY: &'static [&'static str] = &["node_id", "member_id"];
     const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, length, \
          closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
-         given_up_volume, buried, undecided, has_file, refused, unusable_at, copy_of";
+         given_up_volume, buried, undecided, has_file, refused, copy_of";
 
     fn key(&self) -> (i64, i64) {
         (self.node, self.member)
@@ -225,7 +224,6 @@ impl Row for MemberRow {
             SqlArg::Bool(self.undecided),
             SqlArg::Bool(self.has_file),
             SqlArg::OptText(self.refused.clone()),
-            SqlArg::OptI64(self.unusable_at),
             SqlArg::OptI64(self.copy_of),
         ]
     }
@@ -586,7 +584,7 @@ async fn read_checkpoint(
         .fetch_all(
             "SELECT node_id, member_id, name, output_name, length, closed, bound_node_id, \
              owner_node_id, owner_volume, given_up_node_id, given_up_volume, buried, \
-             undecided, has_file, refused, unusable_at, copy_of \
+             undecided, has_file, refused, copy_of \
              FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
             &args,
         )
@@ -607,7 +605,6 @@ async fn read_checkpoint(
                 undecided: row.bool("undecided")?,
                 has_file: row.bool("has_file")?,
                 refused: row.opt_text("refused")?,
-                unusable_at: row.opt_i64("unusable_at")?,
                 copy_of: row.opt_i64("copy_of")?,
             })
         })
