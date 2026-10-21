@@ -72,9 +72,19 @@ pub(crate) fn is_local(ip: IpAddr) -> bool {
     }
 }
 
+/// Whether `ip` is on the internet (libtorrent `aux::is_global`): an IPv6
+/// address in 2000::/3, an IPv4 one neither local, multicast nor
+/// unspecified.
+pub(crate) fn is_global(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(a) => !(a.is_multicast() || a.is_unspecified() || is_local(ip)),
+        IpAddr::V6(a) => (a.octets()[0] & 0xe0) == 0x20,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_local;
+    use super::{is_global, is_local};
 
     // libtorrent `aux::is_local`.
     #[test]
@@ -107,6 +117,34 @@ mod tests {
             "ff0e::1",
         ] {
             assert!(!is_local(global.parse().unwrap()), "{global}");
+        }
+    }
+
+    // libtorrent `aux::is_global`.
+    #[test]
+    fn global_addresses_are_2000_slash_3_and_ipv4_neither_local_multicast_nor_unspecified() {
+        for global in [
+            "8.8.8.8",
+            "192.0.2.1",
+            "2001:db8::1",
+            "3fff::1",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(is_global(global.parse().unwrap()), "{global}");
+        }
+        for other in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "4000::1",
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(!is_global(other.parse().unwrap()), "{other}");
         }
     }
 }

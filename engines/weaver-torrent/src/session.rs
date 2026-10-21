@@ -26,6 +26,7 @@ use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
+    net::{Resolver, SystemResolver},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
 };
@@ -230,6 +231,9 @@ pub struct Session {
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) reqwest_client: reqwest::Client,
+    // Resolves web seeds' host names, so their addresses are known before
+    // they are asked: the socket factory's resolver, or the host's.
+    pub(crate) resolver: Arc<dyn Resolver>,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
     stopped_announces: StoppedAnnounces,
@@ -1128,6 +1132,11 @@ impl Session {
                     .is_some_and(|l| l.utp_socket.is_some()),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
+                resolver: opts
+                    .socket_factory
+                    .as_ref()
+                    .and_then(|f| f.resolver())
+                    .unwrap_or_else(|| Arc::new(SystemResolver)),
                 connector: stream_connector,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),

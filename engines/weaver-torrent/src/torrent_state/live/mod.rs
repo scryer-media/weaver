@@ -73,6 +73,7 @@ use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::core::{
     hash_id::Id20,
     lengths::{ChunkInfo, Lengths, ValidPieceIndex},
+    net::Resolver,
     spawn_utils::spawn_with_cancel,
     speed_estimator::SpeedEstimator,
     torrent_metainfo::ValidatedTorrentMetaV1Info,
@@ -437,6 +438,7 @@ impl TorrentStateLive {
                 continue;
             };
             let client = session.reqwest_client.clone();
+            let resolver = session.resolver.clone();
             self.spawn(
                 debug_span!(parent: self.shared.span.clone(), "web_seed", seed = ?link.handle()),
                 format!(
@@ -446,7 +448,7 @@ impl TorrentStateLive {
                 ),
                 aframe!(
                     self.clone()
-                        .task_manage_web_seed(link, client, rx, tx, permit, slot)
+                        .task_manage_web_seed(link, client, resolver, rx, tx, permit, slot)
                 ),
             );
         }
@@ -459,6 +461,7 @@ impl TorrentStateLive {
         self: Arc<Self>,
         link: SeedLink,
         client: reqwest::Client,
+        resolver: Arc<dyn Resolver>,
         rx: PeerRx,
         tx: PeerTx,
         permit: OwnedSemaphorePermit,
@@ -487,7 +490,7 @@ impl TorrentStateLive {
             .counters
             .outgoing_connection_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let connection = WebSeedConnection::new(client, &self.web_layout, &link);
+        let connection = WebSeedConnection::new(client, resolver, &self.web_layout, &link);
         let res = tokio::select! {
             r = handler.task_peer_chunk_requester() => r,
             r = connection.run(&handler, rx) => r,

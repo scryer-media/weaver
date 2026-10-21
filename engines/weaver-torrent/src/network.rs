@@ -88,7 +88,9 @@ pub trait SocketFactory: Send + Sync + 'static {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>>;
 
-    /// The resolver for DHT bootstrap hostnames and UDP tracker hostnames.
+    /// The resolver for DHT bootstrap hostnames and UDP tracker hostnames,
+    /// and for web seed hostnames, whose addresses are checked before the
+    /// HTTP client asks them.
     ///
     /// The default, `None`, uses the host's resolver ([`SystemResolver`]).
     /// HTTP tracker hostnames are resolved by the HTTP client; see
