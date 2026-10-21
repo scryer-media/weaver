@@ -1095,7 +1095,7 @@ fn fingerprint(pipeline: &Pipeline, requests: &BTreeMap<(u32, u32), usize>) -> S
 
 // The graph job as it stands; a finished job has left the pipeline, so the
 // last look before that is what the outcome keeps.
-fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
+pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
     let (Some(view), Some(job), Some(state)) = (
         view.as_mut(),
         pipeline.graph_jobs.get(&JOB),
