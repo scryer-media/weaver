@@ -16,5 +16,5 @@ mod e2e_session_stop;
 mod e2e_socket_factory;
 mod e2e_stream;
 mod e2e_tracker_announces;
-mod embedder_util;
+pub mod embedder_util;
 pub mod test_util;

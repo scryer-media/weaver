@@ -36,6 +36,9 @@ pub struct PeerStats {
     pub state: &'static str,
     pub conn_kind: Option<ConnectionKind>,
     pub client_name: Option<String>,
+    /// The peer went its request timeout without delivering a block, and has
+    /// not delivered one since.
+    pub snubbed: bool,
 }
 
 impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
@@ -74,6 +77,10 @@ impl From<&Peer> for PeerStats {
             client_name: match state {
                 PeerState::Live(l) => l.client_name.clone(),
                 _ => None,
+            },
+            snubbed: match state {
+                PeerState::Live(l) => l.is_snubbed(),
+                _ => false,
             },
         }
     }

@@ -24,11 +24,11 @@ use tokio_util::sync::CancellationToken;
 
 use tracing::{debug_span, error, info, trace, warn};
 
-use crate::dht::peer_store::PeerStore;
 use crate::dht::routing_table::RoutingTable;
 use crate::dht::{Dht, DhtConfig, DhtState};
 
-/// Configuration for DHT persistence (periodic dump of routing table and peer store).
+/// Configuration for DHT persistence (periodic dump of the routing tables). The
+/// peers announced to us are not kept: each lives 45 minutes at most.
 /// When provided, the DHT state will be serialized to disk periodically.
 pub struct DhtPersistenceConfig {
     /// How often to dump state. Defaults to 60s.
@@ -53,12 +53,11 @@ pub fn dht_listen_addr(port: Option<u16>, stored_port: Option<u16>, ipv4_only: b
 }
 
 #[derive(Serialize, Deserialize)]
-struct DhtSerialize<Table, PeerStore> {
+struct DhtSerialize<Table> {
     addr: SocketAddr,
     table: Table,
     // option for backwards compat
     table_v6: Option<Table>,
-    peer_store: Option<PeerStore>,
 }
 
 pub struct PersistentDht {
@@ -82,7 +81,6 @@ fn dump_dht(dht: &Dht, filename: &Path, tempfile_name: &Path) -> anyhow::Result<
                 addr,
                 table: v4,
                 table_v6: Some(v6),
-                peer_store: Some(&dht.peer_store),
             },
         )
     }) {
@@ -158,7 +156,7 @@ impl PersistentDht {
 
     /// Like [`PersistentDht::create_with_socket`], with the rest of the DHT's
     /// settings taken from `config`. The persisted state supplies `peer_id`, the
-    /// routing tables, `peer_store` and the listen address, so those fields of
+    /// routing tables and the listen address, so those fields of
     /// `config` are ignored; `port` and `ipv4_only` choose the listen address as
     /// in [`PersistentDht::create`].
     #[inline(never)]
@@ -184,9 +182,7 @@ impl PersistentDht {
             let de = match OpenOptions::new().read(true).open(&config_filename) {
                 Ok(dht_json) => {
                     let reader = BufReader::new(dht_json);
-                    match serde_json::from_reader::<_, DhtSerialize<RoutingTable, PeerStore>>(
-                        reader,
-                    ) {
+                    match serde_json::from_reader::<_, DhtSerialize<RoutingTable>>(reader) {
                         Ok(r) => {
                             info!(filename=?config_filename, "loaded DHT routing table from");
                             Some(r)
@@ -209,9 +205,9 @@ impl PersistentDht {
                     }
                 },
             };
-            let (stored_port, routing_table, peer_store) = de
-                .map(|de| (Some(de.addr.port()), Some(de.table), de.peer_store))
-                .unwrap_or((None, None, None));
+            let (stored_port, routing_table) = de
+                .map(|de| (Some(de.addr.port()), Some(de.table)))
+                .unwrap_or((None, None));
 
             let listen_addr = dht_listen_addr(port, stored_port, ipv4_only);
             let peer_id = routing_table.as_ref().map(|r| r.id());
@@ -221,7 +217,6 @@ impl PersistentDht {
                 routing_table,
                 routing_table_v6: None,
                 listen_addr: Some(listen_addr),
-                peer_store,
                 ..config
             };
             let dht = DhtState::with_config(dht_config).await?;

@@ -21,8 +21,8 @@
 //
 // ### Tasks (actors)
 // Peer adder task:
-// - spawns new peers as they become known. It pulls them from a queue. The queue is filled in by DHT and torrent trackers.
-//   Also gets updated when peers are reconnecting after errors.
+// - connects to the connect candidates in the peer list (PeerStates) as their reconnect time comes
+//   and slots free up. Trackers, DHT, PEX and incoming connections fill the list.
 //
 // Each peer has one main task "manage_peer". It's composed of 2 futures running as one task through tokio::select:
 // - "manage_peer" - this talks to the peer over network and calls callbacks on PeerHandler. The callbacks are not async,
@@ -34,10 +34,11 @@
 // State transitions:
 // - queued (initial state) -> connected
 // - connected -> live
-// - ANY STATE -> dead (on error)
+// - connecting/live -> queued or dead (on error: queued until it has failed max_failcount times
+//   in a row, then dead until someone names it again)
 // - ANY STATE -> not_needed (when we don't need to talk to the peer anymore)
 //
-// When the peer dies, it's rescheduled with exponential backoff.
+// A failed peer is reconnected (failcount + 1) * min_reconnect_time after its last failure.
 //
 // > NOTE: deadlock notice:
 // > peers and stateLocked are behind 2 different locks.
@@ -49,6 +50,8 @@
 pub mod peer;
 pub mod peers;
 pub mod stats;
+#[cfg(test)]
+mod tests;
 
 use std::{
     borrow::Cow,
@@ -82,17 +85,16 @@ use crate::peer_protocol::{
 };
 use anyhow::Context;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tokio::sync::{
-    Notify, OwnedSemaphorePermit, Semaphore,
-    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc::unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 
 use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
+    connection_slots::ConnectionSlot,
     file_ops::FileOps,
+    limits::LimitKind,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -101,19 +103,19 @@ use crate::{
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
-    torrent_state::{peer::Peer, utils::atomic_inc},
+    torrent_state::utils::atomic_inc,
     type_aliases::{BF, FilePriorities, FileStorage, PeerHandle},
 };
 
 use self::{
     peer::{
-        PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
+        InflightRequest, PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
         },
     },
-    peers::PeerStates,
+    peers::{IncomingRefused, PeerStates},
     stats::{atomic::AtomicStats, snapshot::StatsSnapshot},
 };
 
@@ -182,6 +184,9 @@ pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
     ConcurrencyLimitReached,
+    // Finished, with its upload closed: the torrent wants no peers.
+    NotWanted,
+    PeerListFull,
 }
 
 pub struct TorrentStateLive {
@@ -199,9 +204,6 @@ pub struct TorrentStateLive {
 
     // Limits how many active (occupying network resources) peers there are at a moment in time.
     peer_semaphore: Arc<Semaphore>,
-
-    // The queue for peer manager to connect to them.
-    peer_queue_tx: UnboundedSender<SocketAddr>,
 
     finished_notify: Notify,
     new_pieces_notify: Arc<Notify>,
@@ -236,7 +238,6 @@ impl TorrentStateLive {
         fatal_errors_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
         cancellation_token: CancellationToken,
     ) -> anyhow::Result<Arc<Self>> {
-        let (peer_queue_tx, peer_queue_rx) = unbounded_channel();
         let session = paused
             .shared
             .session
@@ -272,12 +273,7 @@ impl TorrentStateLive {
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
             metadata: paused.metadata.clone(),
-            peers: PeerStates {
-                session_stats: session_stats.peers.clone(),
-                stats: Default::default(),
-                states: Default::default(),
-                live_outgoing_peers: Default::default(),
-            },
+            peers: PeerStates::new(session_stats.peers.clone()),
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 file_priorities,
@@ -294,7 +290,6 @@ impl TorrentStateLive {
                 paused.shared.options.peer_limit.unwrap_or(128),
             )),
             new_pieces_notify: Arc::new(Notify::new()),
-            peer_queue_tx,
             finished_notify: Notify::new(),
             finished_at_start,
             down_speed_estimator,
@@ -341,7 +336,7 @@ impl TorrentStateLive {
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "peer_adder"),
             format!("[{}]peer_adder", state.shared.id),
-            state.clone().task_peer_adder(peer_queue_rx),
+            state.clone().task_peer_adder(),
         );
 
         state.spawn(
@@ -373,54 +368,46 @@ impl TorrentStateLive {
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
+        slot: ConnectionSlot,
     ) -> anyhow::Result<AddIncomingPeerResult> {
-        use dashmap::mapref::entry::Entry;
+        if !self.wants_peers() {
+            debug!(addr = %checked_peer.addr, "finished with upload closed, refusing incoming peer");
+            return Ok(AddIncomingPeerResult::NotWanted);
+        }
         let (tx, rx) = unbounded_channel();
         let permit = match self.peer_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                debug!("limit of live peers reached, dropping incoming peer");
-                self.peers.with_peer(checked_peer.addr, |p| {
-                    atomic_inc(&p.stats.counters.incoming_connections);
-                });
+                debug!("limit of live peers reached, keeping incoming peer for later");
+                if self.may_connect_to(checked_peer.addr) {
+                    self.peers
+                        .add_refused_incoming(checked_peer.addr, checked_peer.kind);
+                }
                 return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
             }
         };
 
-        let counters = match self.peers.states.entry(checked_peer.addr) {
-            Entry::Occupied(mut occ) => {
-                let peer = occ.get_mut();
-                if let Err(e) = peer.incoming_connection(
-                    checked_peer.handshake.peer_id,
-                    tx.clone(),
-                    &self.peers,
-                    checked_peer.kind,
-                ) {
-                    match e {
-                        peer::IncomingConnectionResult::AlreadyActive => {
-                            debug!(
-                                addr = %checked_peer.addr,
-                                kind = %checked_peer.kind,
-                                "peer already active, ignoring incoming connection"
-                            );
-                            return Ok(AddIncomingPeerResult::AlreadyActive);
-                        }
-                    }
-                }
-                peer.stats.counters.clone()
-            }
-            Entry::Vacant(vac) => {
-                atomic_inc(&self.peers.stats.seen);
-                let peer = Peer::new_live_for_incoming_connection(
-                    *vac.key(),
-                    checked_peer.handshake.peer_id,
-                    tx.clone(),
-                    &self.peers,
-                    checked_peer.kind,
+        let counters = match self.peers.add_incoming(
+            checked_peer.addr,
+            checked_peer.handshake.peer_id,
+            tx.clone(),
+            checked_peer.kind,
+        ) {
+            Ok(counters) => counters,
+            Err(IncomingRefused::AlreadyActive) => {
+                debug!(
+                    addr = %checked_peer.addr,
+                    kind = %checked_peer.kind,
+                    "peer already active, ignoring incoming connection"
                 );
-                let counters = peer.stats.counters.clone();
-                vac.insert(peer);
-                counters
+                return Ok(AddIncomingPeerResult::AlreadyActive);
+            }
+            Err(IncomingRefused::ListFull) => {
+                debug!(
+                    addr = %checked_peer.addr,
+                    "peer list holds only connected peers, dropping incoming peer"
+                );
+                return Ok(AddIncomingPeerResult::PeerListFull);
             }
         };
         atomic_inc(&counters.incoming_connections);
@@ -435,10 +422,14 @@ impl TorrentStateLive {
                 "[{}][addr={}]manage_incoming_peer",
                 self.shared.id, checked_peer.addr
             ),
-            aframe!(
-                self.clone()
-                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)
-            ),
+            aframe!(self.clone().task_manage_incoming_peer(
+                checked_peer,
+                counters,
+                tx,
+                rx,
+                permit,
+                slot
+            )),
         );
         Ok(AddIncomingPeerResult::Added)
     }
@@ -481,6 +472,7 @@ impl TorrentStateLive {
         tx: PeerTx,
         rx: PeerRx,
         permit: OwnedSemaphorePermit,
+        _slot: ConnectionSlot,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
             addr: checked_peer.addr,
@@ -533,10 +525,12 @@ impl TorrentStateLive {
     async fn task_manage_outgoing_peer(
         self: Arc<Self>,
         addr: SocketAddr,
+        rx: PeerRx,
+        tx: PeerTx,
         permit: OwnedSemaphorePermit,
+        _slot: ConnectionSlot,
     ) -> crate::Result<()> {
         let state = self;
-        let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
         let counters = state
             .peers
             .with_peer(addr, |p| p.stats.counters.clone())
@@ -604,66 +598,87 @@ impl TorrentStateLive {
         Ok(())
     }
 
-    async fn task_peer_adder(
-        self: Arc<Self>,
-        mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
-    ) -> crate::Result<()> {
+    async fn task_peer_adder(self: Arc<Self>) -> crate::Result<()> {
         let state = self;
         loop {
-            let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
-            if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
-                debug!(?addr, "ignoring peer as we are finished");
-                state.peers.mark_peer_not_needed(addr);
+            if !state.wants_peers() {
+                // Nothing to fetch and nothing to give: connect to no one until
+                // the peers are wanted again.
+                state.peers.candidates_changed().await;
                 continue;
             }
-
-            let session = state
+            state.peers.wait_for_candidate().await;
+            let slots = state
                 .shared
                 .session
                 .upgrade()
-                .ok_or(Error::SessionDestroyed)?;
-
-            if session.ipv4_only && addr.is_ipv6() {
-                debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
-                continue;
-            }
-
-            if addr.port() == 0 {
-                debug!(?addr, "skipping peer with port 0");
-                continue;
-            }
-
-            if session.blocklist.has(addr.ip()) {
-                session
-                    .stats
-                    .counters
-                    .blocked_outgoing
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(?addr, "blocked outgoing connection (by the blacklist)");
-                continue;
-            }
-
-            if session
-                .allowlist
-                .as_ref()
-                .is_some_and(|l| !l.has(addr.ip()))
-            {
-                session
-                    .stats
-                    .counters
-                    .blocked_outgoing
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(?addr, "blocked outgoing connection (by the allowlist)");
-                continue;
-            }
-
+                .ok_or(Error::SessionDestroyed)?
+                .connection_slots
+                .clone();
+            // The torrent's own cap first, so a torrent at it holds no place
+            // under the session's; then a place under the session's cap and
+            // a connect from its per-second budget, both shared with every
+            // torrent in turn.
             let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            let slot = slots.open().await?;
+            // The slots may have taken a while; connect to whoever is due now.
+            let Some((addr, rx, tx)) = state.peers.connect_next(tokio::time::Instant::now()) else {
+                continue;
+            };
+            slots.begin_connect().await;
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(
+                    state
+                        .clone()
+                        .task_manage_outgoing_peer(addr, rx, tx, permit, slot)
+                ),
             );
         }
+    }
+
+    // Whether we may open a connection to `addr`. The peer list holds no
+    // address we may not connect to.
+    fn may_connect_to(&self, addr: SocketAddr) -> bool {
+        let Some(session) = self.shared.session.upgrade() else {
+            return false;
+        };
+
+        if session.ipv4_only && addr.is_ipv6() {
+            debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
+            return false;
+        }
+
+        if addr.port() == 0 {
+            debug!(?addr, "skipping peer with port 0");
+            return false;
+        }
+
+        if session.blocklist.has(addr.ip()) {
+            session
+                .stats
+                .counters
+                .blocked_outgoing
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(?addr, "blocked outgoing connection (by the blacklist)");
+            return false;
+        }
+
+        if session
+            .allowlist
+            .as_ref()
+            .is_some_and(|l| !l.has(addr.ip()))
+        {
+            session
+                .stats
+                .counters
+                .blocked_outgoing
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(?addr, "blocked outgoing connection (by the allowlist)");
+            return false;
+        }
+        true
     }
 
     pub fn torrent(&self) -> &ManagedTorrentShared {
@@ -729,17 +744,11 @@ impl TorrentStateLive {
         self.peers.announce_have(index);
     }
 
-    pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
-        match self.peers.add_if_not_seen(addr) {
-            Some(handle) => handle,
-            None => return Ok(false),
-        };
-
-        self.peer_queue_tx
-            .send(addr)
-            .ok()
-            .ok_or(Error::TorrentIsNotLive)?;
-        Ok(true)
+    /// A tracker, DHT or PEX named `addr`.
+    pub(crate) fn add_peer(&self, addr: SocketAddr) {
+        if self.may_connect_to(addr) {
+            self.peers.add_peer(addr);
+        }
     }
 
     pub fn stats_snapshot(&self) -> StatsSnapshot {
@@ -877,6 +886,13 @@ impl TorrentStateLive {
             )
     }
 
+    // A torrent wants peers, outgoing and incoming, unless it has nothing
+    // left to fetch and its own upload is closed, so it has nothing to give.
+    fn wants_peers(&self) -> bool {
+        self.shared.options.ratelimits.get_upload_bps() != LimitKind::Closed
+            || !self.is_finished_and_no_active_streams()
+    }
+
     fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {
         if let Err(e) = self.files.on_piece_completed(id) {
             debug!(?id, "file storage errored in on_piece_completed(): {e:#}");
@@ -940,13 +956,7 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
-        self.peers
-            .states
-            .iter_mut()
-            .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
-            .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
-            .take_while(|r| r.is_ok())
-            .last();
+        self.peers.requeue_not_needed();
     }
 
     async fn task_send_pex_to_peer(
@@ -1089,12 +1099,14 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {
-        // The first message must be "bitfield", but if it's not sent,
-        // assume the bitfield is all zeroes and was sent.
-        if !matches!(&message, Message::Bitfield(..))
-            && !self.first_message_received.swap(true, Ordering::Relaxed)
-        {
-            self.on_bitfield_notify.notify_waiters();
+        if !self.first_message_received.swap(true, Ordering::Relaxed) {
+            // The connection works, so the failures before it no longer count.
+            self.state.peers.connection_delivered(self.addr);
+            // The first message must be "bitfield", but if it's not sent,
+            // assume the bitfield is all zeroes and was sent.
+            if !matches!(&message, Message::Bitfield(..)) {
+                self.on_bitfield_notify.notify_waiters();
+            }
         }
 
         match message {
@@ -1105,7 +1117,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Bitfield(b) => self
                 .on_bitfield(b.clone_to_owned(None))
                 .context("on_bitfield")?,
-            Message::Choke => self.on_i_am_choked(),
+            Message::Choke => self.on_i_am_choked().context("on_i_am_choked")?,
             Message::Unchoke => self.on_i_am_unchoked(),
             Message::Interested => self.on_peer_interested(),
             Message::Piece(piece) => self
@@ -1345,91 +1357,15 @@ impl PeerHandler {
             }
         };
 
-        let _error = match error {
-            Some(e) => e,
-            None => {
-                trace!("peer died without errors, not re-queueing");
-                pe.value_mut().set_state(PeerState::NotNeeded, peers);
-                return Ok(());
-            }
-        };
-
-        self.counters.errors.fetch_add(1, Ordering::Relaxed);
-
-        if self.state.is_finished_and_no_active_streams() {
-            debug!("torrent finished, not re-queueing");
-            pe.value_mut().set_state(PeerState::NotNeeded, peers);
-            return Ok(());
-        }
-
-        pe.value_mut().set_state(PeerState::Dead, peers);
-
-        if self.incoming {
-            // do not retry incoming peers
-            debug!(
-                peer = handle.to_string(),
-                "incoming peer died, not re-queueing"
-            );
-            return Ok(());
-        }
-
-        let backoff = pe.value_mut().stats.backoff.next();
-
-        // Prevent deadlocks.
-        drop(pe);
-
-        if let Some(dur) = backoff {
-            self.state.clone().spawn(
-                debug_span!(
-                    parent: self.state.shared.span.clone(),
-                    "wait_for_peer",
-                    peer = ?handle,
-                    duration = format!("{dur:?}")
-                ),
-                format!("[{}][addr={}]wait_for_peer", self.state.shared.id, handle),
-                async move {
-                    trace!("waiting to reconnect again");
-                    tokio::time::sleep(dur).await;
-                    trace!("finished waiting");
-                    let should_requeue = self
-                        .state
-                        .peers
-                        .with_peer_mut(handle, "dead_to_queued", |peer| {
-                            match peer.get_state() {
-                                PeerState::Dead => {
-                                    peer.set_state(PeerState::Queued, &self.state.peers);
-                                    true
-                                }
-                                // Peer reconnected (e.g. via incoming connection) while we were
-                                // waiting. No need to queue - it's already connected or queued.
-                                PeerState::Live(_)
-                                | PeerState::Connecting(_)
-                                | PeerState::Queued => {
-                                    trace!(
-                                        state = peer.get_state().name(),
-                                        "peer is no longer dead, skipping requeue"
-                                    );
-                                    false
-                                }
-                                // Don't need this peer anymore.
-                                PeerState::NotNeeded => false,
-                            }
-                        })
-                        .unwrap_or(false);
-                    if should_requeue {
-                        self.state
-                            .peer_queue_tx
-                            .send(handle)
-                            .ok()
-                            .ok_or(Error::TorrentIsNotLive)?;
-                    }
-                    Ok::<_, Error>(())
-                },
-            );
-        } else {
-            debug!("dropping peer, backoff exhausted");
-            self.state.peers.drop_peer(handle);
-        };
+        // A connection that ended in an error counts against the peer; one we
+        // closed ourselves does not, and leaves a peer we no longer need.
+        let failed_at = error.map(|_| {
+            self.counters.errors.fetch_add(1, Ordering::Relaxed);
+            tokio::time::Instant::now()
+        });
+        let needed = failed_at.is_some() && !self.state.is_finished_and_no_active_streams();
+        peers.connection_closed(pe.value_mut(), failed_at, needed);
+        trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
         Ok(())
     }
 
@@ -1464,7 +1400,11 @@ impl PeerHandler {
                 let result = pieces.acquire_admitted_piece(
                     AcquireRequest {
                         peer: self.addr,
-                        peer_avg_time: self.counters.average_piece_download_time(),
+                        peer_avg_time: if live.is_snubbed() {
+                            None
+                        } else {
+                            self.counters.average_piece_download_time()
+                        },
                         priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                         file_priorities,
                         file_infos: &self.state.metadata.file_infos,
@@ -1644,9 +1584,65 @@ impl PeerHandler {
         }
     }
 
-    // The job of this is to request chunks and also to keep peer alive.
+    // The job of this is to request chunks, time out the requests the peer
+    // does not answer, and also to keep peer alive.
     // The moment this ends, the peer is disconnected.
     async fn task_peer_chunk_requester(&self) -> crate::Result<()> {
+        tokio::select! {
+            r = self.request_chunks() => r,
+            r = self.time_out_requests() => r,
+        }
+    }
+
+    /// Returns the requests outstanding to this peer when it goes its request
+    /// timeout (LivePeerState::request_deadline) without delivering a block.
+    async fn time_out_requests(&self) -> crate::Result<()> {
+        self.wait_for_bitfield().await;
+        loop {
+            let Some(notify) = self.request_slots_changed() else {
+                return Ok(());
+            };
+            let changed = notify.notified();
+            let Some(deadline) = self
+                .state
+                .peers
+                .with_live(self.addr, |live| live.request_deadline())
+            else {
+                return Ok(());
+            };
+            let Some(deadline) = deadline else {
+                changed.await;
+                continue;
+            };
+            tokio::select! {
+                // A block that arrived moved the deadline.
+                biased;
+                _ = changed => {}
+                _ = tokio::time::sleep_until(deadline) => self.on_requests_timed_out()?,
+            }
+        }
+    }
+
+    fn on_requests_timed_out(&self) -> crate::Result<()> {
+        self.state
+            .peers
+            .with_live_mut(self.addr, "snub", |live| live.snub());
+        let timed_out = self.return_requests()?;
+        debug!(requests = timed_out.len(), "requests timed out");
+        for request in timed_out {
+            // The chunk is for whoever takes its piece next to fetch.
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::Cancel(Request {
+                    index: request.piece_index.get(),
+                    begin: request.offset,
+                    length: request.size,
+                })));
+        }
+        Ok(())
+    }
+
+    async fn request_chunks(&self) -> crate::Result<()> {
         let handle = self.addr;
         self.wait_for_bitfield().await;
 
@@ -1802,9 +1798,41 @@ impl PeerHandler {
         }
     }
 
-    fn on_i_am_choked(&self) {
+    fn on_i_am_choked(&self) -> crate::Result<()> {
         self.lock_flow_control("i_am_choked = true").i_am_choked = true;
+        // A peer that chokes us drops every request we sent it (BEP 3). We
+        // do not speak the fast extension (BEP 6), so no allowed-fast piece
+        // keeps its requests.
+        self.return_requests()?;
         self.notify_request_slots_changed();
+        Ok(())
+    }
+
+    /// Every request outstanding to this peer stops being in flight, and every
+    /// piece it owns goes back to the queue with the chunks it already
+    /// delivered, for any peer to take. One step under this peer's lock, as a
+    /// request is checked and added: the requester either finds the piece gone
+    /// or has its request taken here. Returns the requests taken.
+    fn return_requests(&self) -> crate::Result<Vec<InflightRequest>> {
+        let returned = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "return_requests", |live| {
+                let released = self
+                    .state
+                    .lock_write("return_requests")
+                    .get_pieces_mut()?
+                    .release_pieces_owned_by(self.addr);
+                Ok::<_, Error>((released, live.take_inflight_requests()))
+            })
+            .transpose()?;
+        let Some((released, taken)) = returned else {
+            return Ok(Vec::new());
+        };
+        if released > 0 {
+            self.state.new_pieces_notify.notify_waiters();
+        }
+        Ok(taken)
     }
 
     fn on_peer_interested(&self) {
@@ -2008,7 +2036,6 @@ impl PeerHandler {
 
                     // Per-peer piece counters.
                     counters.on_piece_completed(piece_len, full_piece_download_time);
-                    state.peers.reset_peer_backoff(addr);
 
                     trace!(piece = index, "successfully downloaded and verified");
 
@@ -2063,32 +2090,14 @@ impl PeerHandler {
     }
 
     fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) {
-        msg.dropped_peers()
-            .chain(msg.added_peers())
-            .for_each(|peer| {
-                self.state
-                    .add_peer_if_not_seen(peer.addr)
-                    .map_err(|error| {
-                        warn!(
-                            id = self.state.shared.id,
-                            info_hash = ?self.state.shared.info_hash,
-                            ?peer,
-                            "failed to add peer: {error:#}"
-                        );
-                        error
-                    })
-                    .ok();
-            });
+        // A dropped peer is one the sender lost; only the added ones are news.
+        for peer in msg.added_peers() {
+            self.state.add_peer(peer.addr);
+        }
     }
 
     fn is_choked(&self) -> bool {
         self.lock_flow_control("is_choked").i_am_choked
-    }
-
-    fn requested_inflight_count(&self) -> Option<usize> {
-        self.state
-            .peers
-            .with_live(self.addr, |live| live.requested_inflight_count())
     }
 
     fn can_send_request(&self) -> bool {
@@ -2101,8 +2110,12 @@ impl PeerHandler {
             return false;
         }
 
-        self.requested_inflight_count()
-            .is_some_and(|requested| requested < request_window)
+        self.state
+            .peers
+            .with_live(self.addr, |live| {
+                live.can_hold_another_request(request_window)
+            })
+            .unwrap_or(false)
     }
 
     fn lock_flow_control(

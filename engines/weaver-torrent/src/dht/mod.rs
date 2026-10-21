@@ -10,6 +10,7 @@ mod dht;
 mod error;
 mod peer_store;
 mod persistence;
+mod query_limiter;
 mod routing_table;
 mod utils;
 

@@ -299,7 +299,10 @@ impl ChunkTracker {
         self.have.as_slice()[id.get() as usize]
     }
 
-    pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {
+    /// Queues `index` again unless we have it. The chunks it already received
+    /// stay received, so whoever takes it next asks only for the rest. Returns
+    /// whether it was queued.
+    pub fn requeue_piece_if_not_have(&mut self, index: ValidPieceIndex) -> bool {
         if self
             .have
             .as_slice()
@@ -307,10 +310,17 @@ impl ChunkTracker {
             .map(|r| *r)
             .unwrap_or_default()
         {
+            return false;
+        }
+        self.queue_pieces.set(index.get() as usize, true);
+        true
+    }
+
+    pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {
+        if !self.requeue_piece_if_not_have(index) {
             return;
         }
         debug!("marking piece={} as broken", index);
-        self.queue_pieces.set(index.get() as usize, true);
         if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
             s.fill(false);
         }

@@ -18,8 +18,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use tokio::time::Instant;
 
 use crate::buffers::ByteBuf;
 use crate::core::lengths::{ChunkInfo, ValidPieceIndex};
@@ -61,7 +63,9 @@ where
 {
     /// The peer requesting a piece.
     pub peer: PeerHandle,
-    /// The peer's average piece download time (for steal calculations).
+    /// The peer's average piece download time (for steal calculations). None
+    /// for a peer that steals from no one: one with no piece downloaded yet,
+    /// or one that is snubbed.
     pub peer_avg_time: Option<Duration>,
     /// Priority pieces to check first (e.g., for streaming).
     pub priority_pieces: I,
@@ -263,10 +267,12 @@ impl PieceTracker {
         self.chunks.mark_piece_broken_if_not_have(piece);
     }
 
-    /// Release all pieces owned by a peer (on peer death).
+    /// Release all pieces owned by a peer: it died, choked us, or let its
+    /// requests time out.
     ///
-    /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED.
-    /// Returns the number of pieces released.
+    /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED, with
+    /// the chunks they already received, so the next owner asks only for the
+    /// rest. Returns the number of pieces released.
     pub fn release_pieces_owned_by(&mut self, peer: PeerHandle) -> usize {
         // Collect pieces to release (can't modify while iterating)
         let pieces_to_release: Vec<_> = self
@@ -279,7 +285,7 @@ impl PieceTracker {
         let count = pieces_to_release.len();
         for piece in pieces_to_release {
             self.inflight.remove(&piece);
-            self.chunks.mark_piece_broken_if_not_have(piece);
+            self.chunks.requeue_piece_if_not_have(piece);
         }
         count
     }
@@ -294,7 +300,9 @@ impl PieceTracker {
     /// Whether `peer` owns the in-flight `piece`. Only the owner requests a
     /// piece's chunks, so a peer whose piece was stolen stops requesting it.
     pub fn is_owned_by(&self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
-        self.inflight.get(&piece).is_some_and(|info| info.peer == peer)
+        self.inflight
+            .get(&piece)
+            .is_some_and(|info| info.peer == peer)
     }
 
     /// The chunks of `piece` its owner still has to request: those not yet
