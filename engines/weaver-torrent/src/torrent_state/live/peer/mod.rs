@@ -789,7 +789,9 @@ pub(crate) struct LivePeerState {
     // `peer_connection::is_outgoing`).
     outgoing: bool,
 
-    // This is used to track the pieces the peer has.
+    // The pieces the peer has. Empty until its first message, which makes
+    // them known: sized to the torrent from then on (libtorrent
+    // `peer_connection::m_have_piece` with `m_bitfield_received`).
     pub bitfield: BF,
 
     // Whether the bitfield above covers the whole torrent, i.e. the peer is a seeder.

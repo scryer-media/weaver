@@ -812,6 +812,108 @@ async fn a_have_at_or_past_the_piece_count_ends_the_connection() {
 }
 
 impl Harness {
+    /// A live torrent of eight four-chunk pieces, none of them had, and no
+    /// peers.
+    async fn eight_pieces(name: &str) -> Self {
+        let add = AddTorrentOptions {
+            storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+            ..Default::default()
+        };
+        Self::build_added(name, 8, 0x00, isolated_session_opts(false), add).await
+    }
+
+    /// The pieces `peer` has, as its bitfield's bytes.
+    fn pieces_of(&self, peer: &PeerHandler) -> Vec<u8> {
+        self.peers
+            .with_live(peer.addr, |live| live.bitfield.as_raw_slice().to_vec())
+            .unwrap()
+    }
+}
+
+// libtorrent `peer_connection::incoming_have`, `incoming_request` and
+// `incoming_piece` begin with `incoming_have_none` when no bitfield came:
+// it was omitted, which is the same as Have None. The peer's pieces are
+// known, as none, from its first message on, and what waits on them runs.
+#[tokio::test]
+async fn a_first_message_that_is_not_a_bitfield_makes_the_peers_pieces_known_as_none() {
+    let h = Harness::new("first_message_not_a_bitfield").await;
+    for (n, first) in [Message::Interested, Message::Unchoke, Message::KeepAlive]
+        .into_iter()
+        .enumerate()
+    {
+        let (peer, _rx) = h.new_peer(&format!("127.0.0.{}:6881", n + 1));
+        assert!(
+            futures::FutureExt::now_or_never(peer.wait_for_bitfield()).is_none(),
+            "known before the first message"
+        );
+        (&peer).on_received_message(first).await.unwrap();
+        assert_eq!(h.pieces_of(&peer), [0]);
+        assert!(futures::FutureExt::now_or_never(peer.wait_for_bitfield()).is_some());
+    }
+    assert_eq!(h.peers.availability.counts(), [0, 0]);
+}
+
+// libtorrent `incoming_interested` leaves the pieces at none until a HAVE
+// (`incoming_have`): the requester of a peer whose first message is
+// Interested runs, and asks for a piece the peer comes to have.
+#[tokio::test]
+async fn a_peer_whose_first_message_is_interested_is_asked_once_it_has_a_wanted_piece() {
+    let h = Harness::new("first_message_interested").await;
+    tokio::time::pause();
+    let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
+    (&peer)
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    peer.on_i_am_unchoked();
+    let mut requester: Task<'_> = Box::pin(peer.request_chunks());
+    assert!(waiting(&mut requester, &mut rx));
+    assert!(!h.interesting(&peer));
+
+    (&peer).on_received_message(Message::Have(1)).await.unwrap();
+    assert!(matches!(
+        next_queued(&mut requester, &mut rx).await,
+        WriterRequest::Message(Message::Interested)
+    ));
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
+        chunks(1, 0..CHUNKS_PER_PIECE)
+    );
+}
+
+// libtorrent `incoming_have` takes the omitted bitfield as Have None
+// before it sets the piece: a first HAVE of piece 7 leaves the peer with
+// piece 7 and nothing else.
+#[tokio::test]
+async fn a_peer_whose_first_message_is_a_have_has_that_piece_alone() {
+    let h = Harness::eight_pieces("first_message_have").await;
+    let (peer, _rx) = h.new_peer("127.0.0.1:6881");
+    (&peer).on_received_message(Message::Have(7)).await.unwrap();
+    assert_eq!(h.pieces_of(&peer), [0b0000_0001]);
+    assert_eq!(h.peers.availability.counts(), [0, 0, 0, 0, 0, 0, 0, 1]);
+    assert!(futures::FutureExt::now_or_never(peer.wait_for_bitfield()).is_some());
+}
+
+// libtorrent `peer_connection::incoming_bitfield` once the pieces are
+// known (`m_bitfield_received`): the pieces the peer was taken to have
+// leave the availability (`torrent::peer_lost`) and the bitfield replaces
+// them.
+#[tokio::test]
+async fn a_bitfield_after_a_first_have_replaces_the_pieces_it_made_known() {
+    let h = Harness::eight_pieces("bitfield_after_first_have").await;
+    let (peer, _rx) = h.new_peer("127.0.0.1:6881");
+    (&peer).on_received_message(Message::Have(7)).await.unwrap();
+
+    (&peer)
+        .on_received_message(Message::Bitfield(ByteBuf(&[0b0001_0000])))
+        .await
+        .unwrap();
+    assert_eq!(h.pieces_of(&peer), [0b0001_0000]);
+    assert_eq!(h.peers.availability.counts(), [0, 0, 0, 1, 0, 0, 0, 0]);
+}
+
+impl Harness {
     /// The peer set the fast bit in its handshake.
     fn speak_fast(&self, peer: &PeerHandler) {
         self.peers
@@ -4011,7 +4113,9 @@ async fn a_peer_that_only_uploads_goes_once_we_are_finished() {
     let (shook, mut shook_rx) = h.new_peer("127.0.0.2:6881");
     let (leech, mut leech_rx) = h.new_peer("127.0.0.3:6881");
     for peer in [&said, &shook, &leech] {
-        peer.on_bitfield(&bitfield_of(&[1])).unwrap();
+        peer.on_received_message(Message::Bitfield(ByteBuf(&bitfield_of(&[1]))))
+            .await
+            .unwrap();
     }
     let (seed, mut seed_rx) = h.peer("127.0.0.4:6881");
     (&said)
@@ -4068,7 +4172,10 @@ async fn a_peer_that_only_uploads_goes_once_we_are_finished() {
 async fn a_peer_that_only_uploads_goes_once_it_has_nothing_we_want() {
     let h = Harness::new("upload_only_uninteresting").await;
     let (peer, mut rx) = h.new_peer("127.0.0.1:6881");
-    peer.on_bitfield(&bitfield_of(&[1])).unwrap();
+    (&peer)
+        .on_received_message(Message::Bitfield(ByteBuf(&bitfield_of(&[1]))))
+        .await
+        .unwrap();
     (&peer)
         .on_received_message(Message::Extended(ExtendedMessage::UploadOnly(true)))
         .await
