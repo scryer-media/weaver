@@ -94,6 +94,7 @@ use crate::{
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     connection_slots::ConnectionSlot,
     file_ops::FileOps,
+    limits::LimitKind,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -183,6 +184,8 @@ pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
     ConcurrencyLimitReached,
+    // Finished, with its upload closed: the torrent wants no peers.
+    NotWanted,
 }
 
 pub struct TorrentStateLive {
@@ -377,6 +380,10 @@ impl TorrentStateLive {
         slot: ConnectionSlot,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
+        if !self.wants_peers() {
+            debug!(addr = %checked_peer.addr, "finished with upload closed, refusing incoming peer");
+            return Ok(AddIncomingPeerResult::NotWanted);
+        }
         let (tx, rx) = unbounded_channel();
         let permit = match self.peer_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -619,7 +626,7 @@ impl TorrentStateLive {
         let state = self;
         loop {
             let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
-            if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
+            if !state.wants_peers() {
                 debug!(?addr, "ignoring peer as we are finished");
                 state.peers.mark_peer_not_needed(addr);
                 continue;
@@ -892,6 +899,13 @@ impl TorrentStateLive {
             && !self.has_active_streams_unfinished_files(
                 &self.lock_read("is_finished_and_dont_need_peers"),
             )
+    }
+
+    // A torrent wants peers, outgoing and incoming, unless it has nothing
+    // left to fetch and its own upload is closed, so it has nothing to give.
+    fn wants_peers(&self) -> bool {
+        self.shared.options.ratelimits.get_upload_bps() != LimitKind::Closed
+            || !self.is_finished_and_no_active_streams()
     }
 
     fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {

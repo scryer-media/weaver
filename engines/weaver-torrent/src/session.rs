@@ -2442,4 +2442,16 @@ mod tests {
 
         session.stop().await;
     }
+
+    #[tokio::test]
+    async fn an_incoming_connection_to_a_finished_torrent_with_upload_closed_is_refused() {
+        let (_dir, session, handle) = seeding(200, crate::limits::LimitKind::Closed).await;
+        assert!(answer(&session, &handle).await.is_empty());
+
+        // With its upload open again, the finished torrent takes the peer.
+        handle.set_ratelimits(crate::limits::LimitsConfig::default());
+        assert!(is_handshake_for(&answer(&session, &handle).await, &handle));
+
+        session.stop().await;
+    }
 }
