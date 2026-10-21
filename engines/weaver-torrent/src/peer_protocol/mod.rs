@@ -455,6 +455,8 @@ pub enum SerializeError {
     NeedHolepunch,
     #[error("the peer takes no upload_only")]
     NeedUploadOnly,
+    #[error("the peer takes no lt_donthave")]
+    NeedDontHave,
 }
 
 impl From<std::io::Error> for SerializeError {

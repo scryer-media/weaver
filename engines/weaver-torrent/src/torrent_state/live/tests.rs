@@ -1004,6 +1004,61 @@ async fn have_all_and_have_none_are_bitfields_of_every_piece_and_of_none() {
     assert_eq!(h.peers.availability.counts(), [1, 1]);
 }
 
+fn dont_have(index: u32) -> Message<'static> {
+    Message::Extended(ExtendedMessage::DontHave(index))
+}
+
+// libtorrent `peer_connection::incoming_dont_have` into `torrent::peer_lost`:
+// a DONT_HAVE takes the piece out of the peer's pieces and the
+// availability; one for a piece the peer lacks, or past the last piece,
+// changes nothing.
+#[tokio::test]
+async fn a_dont_have_after_a_have_leaves_availability_as_before_the_have() {
+    let h = Harness::new("dont_have_after_have").await;
+    let (peer, _rx) = h.new_peer("127.0.0.1:6881");
+    let peer = &peer;
+    let before = h.peers.availability.counts();
+    peer.on_received_message(Message::Have(1)).await.unwrap();
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+    peer.on_received_message(dont_have(1)).await.unwrap();
+    assert_eq!(h.peers.availability.counts(), before);
+    for index in [1, 0, 2, u32::MAX] {
+        peer.on_received_message(dont_have(index)).await.unwrap();
+    }
+    assert_eq!(h.peers.availability.counts(), before);
+    let pieces = h.peers.with_live(peer.addr, |live| live.bitfield.clone());
+    assert!(pieces.unwrap().not_any());
+}
+
+// libtorrent `peer_connection::incoming_dont_have`: a seed that loses a
+// piece is a seed no longer (`torrent::set_seed`), by the same flag a HAVE
+// sets.
+#[tokio::test]
+async fn a_seeder_that_sends_dont_have_is_no_seeder() {
+    let h = Harness::new("dont_have_seeder").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    let seeder = || h.peers.with_live(peer.addr, |live| live.seeder).unwrap();
+    assert!(seeder());
+    peer.on_received_message(dont_have(0)).await.unwrap();
+    assert!(!seeder());
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+    peer.on_received_message(Message::Have(0)).await.unwrap();
+    assert!(seeder());
+}
+
+// libtorrent `bt_peer_connection::write_extensions` names lt_donthave in
+// `m`.
+#[tokio::test]
+async fn the_extended_handshake_offers_lt_donthave() {
+    let h = Harness::new("offers_lt_donthave").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    assert_eq!(
+        h.advertised(&peer).lt_donthave,
+        Some(extended::MY_EXTENDED_LT_DONTHAVE)
+    );
+}
+
 #[tokio::test]
 async fn a_fast_connection_opens_with_have_all_have_none_or_a_bitfield() {
     let seeding = Harness::seeding("opens_seeding").await;

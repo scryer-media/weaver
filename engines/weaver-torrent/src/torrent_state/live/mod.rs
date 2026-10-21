@@ -1803,6 +1803,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Extended(ExtendedMessage::UploadOnly(upload_only)) => {
                 self.on_upload_only(upload_only)
             }
+            Message::Extended(ExtendedMessage::DontHave(index)) => self.on_dont_have(index),
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.pex {
                     self.on_pex_message(pex)?;
@@ -2606,6 +2607,19 @@ impl PeerHandler {
         }
         self.on_bitfield_notify.notify_waiters();
         Ok(())
+    }
+
+    /// A DONT_HAVE names a piece the peer no longer has (libtorrent
+    /// `peer_connection::incoming_dont_have`); one past the last piece is
+    /// ignored.
+    fn on_dont_have(&self, index: u32) {
+        let Some(piece) = self.state.lengths.validate_piece_index(index) else {
+            trace!(index, "dont have names no piece of the torrent");
+            return;
+        };
+        trace!(index, "peer no longer has piece");
+        self.state.peers.peer_lost(self.addr, piece);
+        self.on_bitfield_notify.notify_waiters();
     }
 
     fn on_bitfield(&self, bitfield: &[u8]) -> anyhow::Result<()> {
