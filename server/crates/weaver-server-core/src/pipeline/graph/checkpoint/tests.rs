@@ -29,6 +29,7 @@ fn member(id: u32, name: &str) -> MemberRecord {
         given_up: None,
         buried: false,
         undecided: false,
+        copy_of: None,
     }
 }
 
@@ -64,8 +65,10 @@ fn full() -> Snapshot {
         member(0, "set.part1.rar"),
         member(1, "set.par2"),
         member(2, "set.r00"),
+        member(3, "set.part01.rar"),
     ];
     root.members[2].buried = true;
+    root.members[3].copy_of = Some(MemberId(0));
     root.members[0].bound_to = Some(ObjectId(1));
     root.members[0].owner = Some((NodeId(1), VolumeIndex(0)));
     root.members[0].closed = true;

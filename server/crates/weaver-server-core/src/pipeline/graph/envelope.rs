@@ -124,8 +124,9 @@ impl Envelopes {
     }
 
     // Keep `bytes` at `offset` of an envelope, replacing what they overlap:
-    // a repaired header replaces the damaged one. Repaired bytes behind what
-    // a run already read stop that run, since what it built on was wrong.
+    // a repaired header replaces the damaged one. Repaired bytes, or clean
+    // bytes over damaged ones whoever brings them, behind what a run
+    // already read stop that run, since what it built on was wrong.
     pub(crate) fn keep(
         &mut self,
         node: NodeId,
@@ -141,9 +142,14 @@ impl Envelopes {
         let range = ByteRange::at(offset, bytes.len() as u64);
         shelf.update(|state| {
             let kept = shelf.kept(state, envelope)?;
+            let mends = provenance.is_verified()
+                && kept
+                    .coverage
+                    .overlapping(range)
+                    .any(|run| run.provenance == Provenance::Damaged);
             kept.leaf.write(offset, bytes, None)?;
             kept.coverage.write(range, provenance);
-            if provenance == Provenance::Repaired && range.start < kept.reached {
+            if (provenance == Provenance::Repaired || mends) && range.start < kept.reached {
                 state.generation += 1;
             }
             Ok(())

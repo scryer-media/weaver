@@ -272,6 +272,27 @@ fn a_first_volume_joins_only_the_set_it_carries_on_into() {
     );
 }
 
+// A nameless RAR4 volume posted again goes where no free place takes it:
+// the one held place its neighbours link it to.
+#[test]
+fn a_nameless_volume_posted_again_is_the_held_volume_its_neighbours_link_it_to() {
+    // Each front is the whole volume, so it states the member it ends on.
+    let volumes = write(&items(), &split(Version::Rar4));
+    let mut object = store();
+    for (index, volume) in volumes.iter().enumerate() {
+        object.bound(
+            VolumeIndex(index as u32),
+            &format!("{:x}3c9e1f", index * 7 + 11),
+            volume,
+            None,
+        );
+    }
+    assert_eq!(
+        object.claim("d00d", &volumes[1], None),
+        Some(VolumeIndex(1))
+    );
+}
+
 #[test]
 fn directories_and_empty_files_are_announced_and_closed() {
     for version in [Version::Rar5, Version::Rar4] {

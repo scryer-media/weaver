@@ -329,9 +329,9 @@ impl NamespaceWriter {
                 recovery.absent(&mut absent);
             }
         }
-        // A name some member already has is that member's, bound or not.
+        // A name some posting already has is its member's, bound or not.
         if let Some(namespace) = tree.namespace(node) {
-            absent.retain(|(name, _)| namespace.members().all(|member| member.name != *name));
+            absent.retain(|(name, _)| namespace.records().all(|member| member.name != *name));
         }
         for (name, length) in absent {
             let mut effects = Vec::new();

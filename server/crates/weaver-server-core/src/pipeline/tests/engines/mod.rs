@@ -86,6 +86,7 @@ mod rar;
 mod rar_engine;
 mod rar_rev;
 mod refused_then_repaired;
+mod reposted;
 pub(in crate::pipeline::tests) mod restart;
 mod seek;
 mod sets;

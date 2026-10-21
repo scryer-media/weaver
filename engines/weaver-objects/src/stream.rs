@@ -214,7 +214,8 @@ impl<D: Decoder> Object for Stream<D> {
 
     // A piece of the set, when the volumes are pieces: its place is its
     // number counted from the first piece's, the format's number for a set
-    // known by names alone and else the first volume's own. A name is all
+    // known by names alone and else the first volume's own, whether that
+    // place is held or not: a piece posted again is that piece. A name is all
     // that places a piece here, so it never outvotes a front a format
     // names: that piece is the format's, wherever its name numbers it.
     fn claim(
@@ -231,8 +232,7 @@ impl<D: Decoder> Object for Stream<D> {
             Some(number) => piece.numbered(number),
             None => split::parse(&self.name)?,
         };
-        let index = piece.index_from(&first)?;
-        (!self.pieces.contains(&index)).then_some(VolumeIndex(index))
+        piece.index_from(&first).map(VolumeIndex)
     }
 
     // The object its bytes founded holds it now; the front it carried was

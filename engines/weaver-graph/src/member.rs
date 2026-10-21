@@ -8,7 +8,7 @@
 // provenance, and the name the tree's ledger gave each one to be written
 // under.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::deliver::Provenance;
 use crate::object::ObjectId;
@@ -200,6 +200,14 @@ pub struct Namespace {
     // recognises an obfuscated member by. Kept apart from the members so a
     // member record stays a plain value.
     first_bytes: BTreeMap<MemberId, Front>,
+    // Further postings of a member, each by the member it is: a volume
+    // posted again under a name of its own. A posting keeps its own record
+    // of what arrived under its name and whether it ended; everywhere else
+    // it is the member, and the namespace lists it nowhere.
+    copies: BTreeMap<MemberId, MemberId>,
+    // The members posted more than once whose own posting ended. Such a
+    // member closes once its own posting and every further one have.
+    ended: BTreeSet<MemberId>,
 }
 
 // What arrived of a member's first FIRST_BYTES, and where: bytes past a
@@ -255,16 +263,203 @@ impl Namespace {
         self.members.get_mut(&member)
     }
 
+    // The members, each once: a further posting of one is not listed.
     pub fn members(&self) -> impl Iterator<Item = &Member> {
+        self.members
+            .values()
+            .filter(|member| !self.copies.contains_key(&member.id))
+    }
+
+    // Every record, the members' and each further posting's own, which a
+    // checkpoint keeps.
+    pub fn records(&self) -> impl Iterator<Item = &Member> {
         self.members.values()
     }
 
     pub fn len(&self) -> usize {
-        self.members.len()
+        self.members.len() - self.copies.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
+        self.len() == 0
+    }
+
+    // The member a posting is: itself, or the member it was folded into.
+    pub fn resolve(&self, posting: MemberId) -> MemberId {
+        self.copies.get(&posting).copied().unwrap_or(posting)
+    }
+
+    // The member `copy` was folded into, when it was.
+    pub fn copy_of(&self, copy: MemberId) -> Option<MemberId> {
+        self.copies.get(&copy).copied()
+    }
+
+    // The further postings of the member, by their own records.
+    pub fn copies_of(&self, member: MemberId) -> impl Iterator<Item = &Member> + '_ {
+        self.copies
+            .iter()
+            .filter(move |(_, of)| **of == member)
+            .filter_map(|(copy, _)| self.members.get(copy))
+    }
+
+    // Every posting of the member: its own record, then its copies'.
+    pub fn postings(&self, member: MemberId) -> impl Iterator<Item = &Member> + '_ {
+        self.members
+            .get(&member)
+            .into_iter()
+            .chain(self.copies_of(member))
+    }
+
+    // Whether `copy` can fold into `into` as another posting of it: their
+    // fronts agree wherever both brought them clean, and both did somewhere,
+    // since a front that never came, or came damaged, says nothing. A
+    // posting that has further postings of its own does not fold, nor does
+    // one into itself.
+    pub fn folds(&self, copy: MemberId, into: MemberId) -> bool {
+        let (Some(one), Some(other)) = (self.members.get(&copy), self.members.get(&into)) else {
+            return false;
+        };
+        if copy == into
+            || self.copies.contains_key(&copy)
+            || self.copies.contains_key(&into)
+            || self.copies.values().any(|of| *of == copy)
+        {
+            return false;
+        }
+        let (front, held) = (self.first_bytes(copy), self.first_bytes(into));
+        let common = ByteRange::new(0, front.len().min(held.len()) as u64);
+        let mut clean = Coverage::new();
+        clean_within(&one.coverage, common, &mut clean);
+        let mut agreed = 0;
+        for run in other.coverage.overlapping(common) {
+            if !run.provenance.is_verified() {
+                continue;
+            }
+            for mine in clean.overlapping(run.range) {
+                let Some(shared) = mine.range.intersect(run.range) else {
+                    continue;
+                };
+                let (start, end) = (shared.start as usize, shared.end as usize);
+                if front[start..end] != held[start..end] {
+                    return false;
+                }
+                agreed += end - start;
+            }
+        }
+        agreed > 0
+    }
+
+    // `copy` is another posting of `into`: from now on its bytes are
+    // `into`'s, and it keeps only its own record of what arrived under its
+    // name. A member that closed before stays closed: what the copy brings
+    // after mends it, as a repair would.
+    pub fn fold(&mut self, copy: MemberId, into: MemberId) -> bool {
+        if !self.folds(copy, into) {
+            return false;
+        }
+        if self.members.get(&into).is_some_and(|record| record.closed) {
+            self.ended.insert(into);
+        }
+        self.copies.insert(copy, into);
+        true
+    }
+
+    // A fold a checkpoint recorded. Whether the member's own posting had
+    // ended is not kept: the restored job closes again every volume with
+    // nothing left to fetch, which ends that posting again.
+    pub fn restore_copy(&mut self, copy: MemberId, into: MemberId) -> bool {
+        let folds = copy != into
+            && self.members.contains_key(&copy)
+            && self.members.contains_key(&into)
+            && !self.copies.contains_key(&into);
+        if folds {
+            self.copies.insert(copy, into);
+        }
+        folds
+    }
+
+    // The posting brings nothing more. The member it is closes once every
+    // posting of it has: true when that is now.
+    pub fn end(&mut self, posting: MemberId) -> bool {
+        let member = self.resolve(posting);
+        match self.members.get_mut(&posting) {
+            Some(copy) if posting != member => copy.closed = true,
+            Some(_) => {
+                self.ended.insert(member);
+            }
+            None => return false,
+        }
+        let every = self.ended.contains(&member) && self.copies_of(member).all(|copy| copy.closed);
+        if self.copies_of(member).next().is_none() {
+            self.ended.remove(&member);
+        }
+        let Some(record) = self
+            .members
+            .get_mut(&member)
+            .filter(|record| !record.closed)
+        else {
+            return false;
+        };
+        record.closed = every;
+        every
+    }
+
+    // Bytes of `posting` arrived over `range` with `provenance`. The
+    // posting records them, and the member it is takes them except where
+    // they are damaged and another posting brought those bytes clean: a
+    // clean byte replaces a damaged one or a hole, whichever posting brings
+    // it, and a damaged byte never replaces a clean one. Returns the member
+    // and the parts of `range` it took, in order.
+    pub fn arrive(
+        &mut self,
+        posting: MemberId,
+        range: ByteRange,
+        provenance: Provenance,
+    ) -> (MemberId, Vec<ByteRange>) {
+        let member = self.resolve(posting);
+        let taken = if provenance.is_verified() {
+            vec![range]
+        } else {
+            gaps(range, &self.clean_elsewhere(posting, member, range))
+        };
+        if posting != member
+            && let Some(copy) = self.members.get_mut(&posting)
+        {
+            copy.coverage.write(range, provenance);
+        }
+        if let Some(record) = self.members.get_mut(&member) {
+            for part in &taken {
+                record.coverage.write(*part, provenance);
+            }
+        }
+        (member, taken)
+    }
+
+    // What of `range` a posting of the member other than `posting` brought
+    // clean. A further posting's own record says it of itself; the
+    // member's own posting is whatever the member holds clean that
+    // `posting` did not bring.
+    fn clean_elsewhere(&self, posting: MemberId, member: MemberId, range: ByteRange) -> Coverage {
+        let mut clean = Coverage::new();
+        for copy in self.copies_of(member).filter(|copy| copy.id != posting) {
+            clean_within(&copy.coverage, range, &mut clean);
+        }
+        if posting != member
+            && let (Some(record), Some(own)) =
+                (self.members.get(&member), self.members.get(&posting))
+        {
+            let mut held = Coverage::new();
+            clean_within(&record.coverage, range, &mut held);
+            let mut brought = Coverage::new();
+            clean_within(&own.coverage, range, &mut brought);
+            for run in brought.runs() {
+                held.erase(run.range);
+            }
+            for run in held.runs() {
+                clean.write(run.range, Provenance::Fresh);
+            }
+        }
+        clean
     }
 
     pub fn bind(&mut self, member: MemberId, object: ObjectId) {
@@ -312,11 +507,21 @@ impl Namespace {
             found.length = None;
             found.closed = false;
         }
+        self.ended.remove(&member);
         self.first_bytes.remove(&member);
     }
 
-    // The member is gone for good. Its name is the tree's to release.
+    // The member is gone for good, and its further postings with it. Its
+    // name is the tree's to release.
     pub fn remove(&mut self, member: MemberId) -> Option<Member> {
+        let copies: Vec<MemberId> = self.copies_of(member).map(|copy| copy.id).collect();
+        for copy in copies {
+            self.copies.remove(&copy);
+            self.first_bytes.remove(&copy);
+            self.members.remove(&copy);
+        }
+        self.copies.remove(&member);
+        self.ended.remove(&member);
         self.first_bytes.remove(&member);
         self.members.remove(&member)
     }
@@ -361,26 +566,51 @@ impl Namespace {
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<&Member> {
-        self.members.values().find(|member| member.name == name)
+        self.members().find(|member| member.name == name)
     }
 
     // Whether every byte that arrived for every member arrived verified.
     // Coverage is the one record of damage; completion reads it here.
     pub fn is_clean(&self) -> bool {
-        self.members
-            .values()
-            .all(|member| member.coverage.is_clean())
+        self.members().all(|member| member.coverage.is_clean())
     }
 
     // Every damaged range of every member, in member order.
     pub fn damaged_ranges(&self) -> impl Iterator<Item = (MemberId, ByteRange)> + '_ {
-        self.members.values().flat_map(|member| {
+        self.members().flat_map(|member| {
             member
                 .coverage
                 .damaged_ranges()
                 .map(move |range| (member.id, range))
         })
     }
+}
+
+// Record in `into` what of `range` arrived clean in `coverage`.
+fn clean_within(coverage: &Coverage, range: ByteRange, into: &mut Coverage) {
+    for run in coverage.overlapping(range) {
+        if run.provenance.is_verified()
+            && let Some(piece) = run.range.intersect(range)
+        {
+            into.write(piece, Provenance::Fresh);
+        }
+    }
+}
+
+// The parts of `range` that `covered` does not reach, in order.
+fn gaps(range: ByteRange, covered: &Coverage) -> Vec<ByteRange> {
+    let mut out = Vec::new();
+    let mut at = range.start;
+    for run in covered.overlapping(range) {
+        if run.range.start > at {
+            out.push(ByteRange::new(at, run.range.start));
+        }
+        at = at.max(run.range.end);
+    }
+    if at < range.end {
+        out.push(ByteRange::new(at, range.end));
+    }
+    out
 }
 
 #[cfg(test)]

@@ -330,9 +330,9 @@ impl Recovery for Par2 {
                 moved.insert(*key);
             }
         }
-        // A member a set bound under a name that does not answer to the
-        // description, even folded, is recognised: it takes the description's
-        // name and length.
+        // A member a set bound under a name none of its postings answers
+        // to the description with, even folded, is recognised: it takes the
+        // description's name and length.
         for state in self.sets.values() {
             let Some(index) = state.usable() else {
                 continue;
@@ -342,8 +342,8 @@ impl Recovery for Par2 {
                     continue;
                 };
                 let answers = namespace
-                    .get(*member)
-                    .is_some_and(|record| record.name.eq_ignore_ascii_case(&description.filename));
+                    .postings(*member)
+                    .any(|record| record.name.eq_ignore_ascii_case(&description.filename));
                 if !answers
                     && namespace
                         .recognise(*member, &description.filename, description.length)

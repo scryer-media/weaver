@@ -223,7 +223,11 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
         "a numbered volume takes its number until the last says its disk"
     );
     assert_eq!(zip.claim("beta.z03", b"", None), None);
-    assert_eq!(zip.claim("alpha.z02", b"", None), None);
+    assert_eq!(
+        zip.claim("alpha.z02", b"", None),
+        Some(VolumeIndex(1)),
+        "a volume posted again is that volume"
+    );
 
     let mut lone = Zip::new();
     lone.bound(VolumeIndex(0), "alpha.zip", &[], None);

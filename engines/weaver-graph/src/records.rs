@@ -71,6 +71,10 @@ pub struct MemberRecord {
     pub buried: bool,
     // Its first bytes have not decided an owner yet.
     pub undecided: bool,
+    // The member it is another posting of: its bytes are that member's,
+    // and it is listed nowhere.
+    #[serde(default)]
+    pub copy_of: Option<MemberId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -378,9 +378,10 @@ impl GraphJob {
     // will ask for, such as one whose opening article was lost before
     // anything could name it, holds nothing back. Recovery volumes are left
     // out: what a repair asks of them is the repair's. Root members are
-    // numbered as the volumes they are.
+    // numbered as the volumes they are; a further posting of a member is
+    // a volume of its own whose articles are the member's.
     fn payload_waiting(&self) -> bool {
-        self.namespace().members().any(|member| {
+        self.namespace().records().any(|member| {
             !self
                 .writer
                 .carries_recovery(&self.tree, NodeId::ROOT, member.id)

@@ -274,6 +274,7 @@ fn rows_with(root: &mut facts::Encoded, snapshot: &Snapshot) -> GraphCheckpoint 
                 has_file: state.has_file,
                 refused: state.refused.map(|why| why_name(why).to_owned()),
                 unusable_at: state.unusable_at.map(|at| at as i64),
+                copy_of: member.copy_of.map(|into| i64::from(into.0)),
             });
         }
         out.coverage
@@ -450,6 +451,14 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             given_up: row.given_up.map(id_pair).transpose()?,
             buried: row.buried,
             undecided: row.undecided,
+            copy_of: row
+                .copy_of
+                .map(|into| {
+                    u32::try_from(into)
+                        .map(MemberId)
+                        .map_err(|_| refuse("a member id"))
+                })
+                .transpose()?,
         };
         nodes
             .get_mut(&node)

@@ -531,7 +531,7 @@ impl Object for Zip {
             .same_set(&candidate)
             .then(|| candidate.slot(&self.names))??;
         let before_last = index == LAST || self.last_disk.is_none_or(|last| index < last);
-        (before_last && !self.bound.contains(&index)).then_some(VolumeIndex(index))
+        before_last.then_some(VolumeIndex(index))
     }
 
     fn facts(&self) -> Facts {

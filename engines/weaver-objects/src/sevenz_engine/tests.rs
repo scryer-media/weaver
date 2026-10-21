@@ -397,7 +397,11 @@ fn claim_names_the_volumes_of_its_own_set_only() {
         engine.claim("set.7z.1000", b"", None),
         Some(VolumeIndex(999))
     );
-    assert_eq!(engine.claim("set.7z.001", b"", None), None);
+    assert_eq!(
+        engine.claim("set.7z.0001", b"", None),
+        Some(VolumeIndex(0)),
+        "a piece posted again is that piece"
+    );
     assert_eq!(engine.claim("set.7z.000", b"", None), None);
     assert_eq!(engine.claim("other.7z.002", b"", None), None);
     assert_eq!(engine.claim("set.7z", b"", None), None);

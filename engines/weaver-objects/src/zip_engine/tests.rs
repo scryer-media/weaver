@@ -355,12 +355,19 @@ fn claim_names_the_volumes_of_its_own_set_with_the_last_after_them() {
         Some(VolumeIndex(u32::MAX)),
         "the last is after every numbered volume, whatever their count"
     );
-    assert_eq!(engine.claim("set.z01", b"", None), None);
+    assert_eq!(
+        engine.claim("set.z01", b"", None),
+        Some(VolumeIndex(0)),
+        "a volume posted again is that volume"
+    );
     assert_eq!(engine.claim("set.z00", b"", None), None);
     assert_eq!(engine.claim("other.z02", b"", None), None);
     assert_eq!(engine.claim("set.7z.002", b"", None), None);
     engine.bound(VolumeIndex(u32::MAX), "set.zip", &[], None);
-    assert_eq!(engine.claim("set.zip", b"", None), None);
+    assert_eq!(
+        engine.claim("set.zip", b"", None),
+        Some(VolumeIndex(u32::MAX))
+    );
     assert_eq!(
         engine.claim("set.z02", b"", None),
         Some(VolumeIndex(1)),

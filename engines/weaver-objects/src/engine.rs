@@ -70,11 +70,11 @@ pub trait SetName: Send + Sync + Sized + Serialize + DeserializeOwned {
     fn same_set(&self, other: &Self) -> bool;
 
     // The volume this name becomes beside the volumes of its set already
-    // bound, by index, or `None` when its place is taken. A name is its own
-    // number; a set whose last volume carries none says otherwise.
-    fn slot(&self, bound: &BTreeMap<u32, Self>) -> Option<u32> {
-        let index = self.index();
-        (!bound.contains_key(&index)).then_some(index)
+    // bound, by index, held or not: a volume posted again is that volume.
+    // A name is its own number; a set whose last volume carries none says
+    // otherwise.
+    fn slot(&self, _bound: &BTreeMap<u32, Self>) -> Option<u32> {
+        Some(self.index())
     }
 }
 
@@ -230,7 +230,8 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // not say the volume is not there; and only a volume that places
     // neither by the fronts it links to beside it, which guess wrong across
     // a volume not yet bound. A posted name is a label, which a recovery set
-    // may change later, so the front outranks it.
+    // may change later, so the front outranks it. A place bound already is
+    // answered all the same: the volume posted again is that volume.
     fn claim(
         &mut self,
         name: &str,
@@ -263,7 +264,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             (_, Some(named)) => named,
             (linked, None) => linked?,
         };
-        (!self.bound.contains(&index)).then_some(VolumeIndex(index))
+        Some(VolumeIndex(index))
     }
 
     fn reads_in_order(&self) -> bool {

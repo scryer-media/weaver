@@ -18,8 +18,9 @@
 //
 // Each run keeps whether its bytes are verified. Damaged bytes are recorded
 // so the count of what is in stays true, but they have no reference value:
-// a range holding any of them composes to nothing until their repair
-// replaces them, so no verdict is ever said over bytes known to be bad.
+// a range holding any of them composes to nothing until clean bytes replace
+// them, a repair's or another posting's, so no verdict is ever said over
+// bytes known to be bad.
 
 use unrar_rs::convert_crc32_to_mac;
 use weaver_graph::{ByteRange, Provenance, SliceVerdict};
@@ -47,11 +48,20 @@ impl Run {
 }
 
 impl CrcRuns {
-    // Record delivered bytes: a repair rewrites what it covers, anything
-    // else is a new run or a duplicate.
+    // Record delivered bytes: a repair rewrites what it covers, and so do
+    // clean bytes over damaged ones, whoever brings them; anything else is
+    // a new run or a duplicate.
     pub(crate) fn feed(&mut self, range: ByteRange, crc: u32, provenance: Provenance) {
+        let mends = provenance.is_verified()
+            && self
+                .runs
+                .iter()
+                .any(|run| !run.verified && run.start < range.end && range.start < run.end());
         match provenance {
             Provenance::Repaired => {
+                self.overwrite(range.start, range.len(), crc);
+            }
+            Provenance::Fresh if mends => {
                 self.overwrite(range.start, range.len(), crc);
             }
             Provenance::Fresh | Provenance::Damaged => {

@@ -43,6 +43,16 @@ use geometry::Geometry;
 use header::{SIGNATURE, Signature, Start};
 use map::Map;
 
+// The length of the container a first piece's signature header measures,
+// when the front is one: a front that measures what the set's first piece
+// measured is that piece.
+pub(crate) fn measured(first_bytes: &[u8]) -> Option<u64> {
+    match header::signature(first_bytes) {
+        Signature::Start(start) => Some(start.total()),
+        _ => None,
+    }
+}
+
 // The one envelope: container coordinates, for every byte that belongs to no
 // member. Bytes a volume carries past what the geometry gives it go to the
 // envelope after it, one per volume, which holds nothing.
@@ -744,9 +754,10 @@ impl Object for SevenZipStore {
     // Where it could take several, as a piece as long as the first can,
     // only the number its name carries, counted from the first piece's own,
     // can say which: a numbered piece takes that place whatever its length,
-    // which the store checks as it checks every volume's. A piece with no
-    // number takes the one free place its length fits exactly, and a piece
-    // no fact places is not claimed.
+    // and whether or not it is held, since a piece posted again is that
+    // piece; the store checks its length as it checks every volume's. A
+    // piece with no number takes the one free place its length fits
+    // exactly, and a piece no fact places is not claimed.
     fn claim(
         &mut self,
         name: &str,
@@ -755,9 +766,15 @@ impl Object for SevenZipStore {
     ) -> Option<VolumeIndex> {
         // A piece of a split set has no signature of its own; one whose
         // front a format names is that format's, a container of its own or
-        // a recovery volume, however long it is.
+        // a recovery volume, however long it is. The first piece is the one
+        // signed piece: a front whose signature measures the container the
+        // first piece measured is that piece posted again.
         if matches!(signed(first_bytes, length), Sniff::Object(_)) {
-            return None;
+            let again = matches!(
+                header::signature(first_bytes),
+                Signature::Start(start) if Some(start.total()) == self.measured
+            );
+            return again.then_some(VolumeIndex(0));
         }
         let first = self.lengths.get(&VolumeIndex(0)).copied()?;
         let geometry = Geometry::new(first, self.measured?)?;
@@ -766,8 +783,8 @@ impl Object for SevenZipStore {
         let numbered = split::parse(names.get(&VolumeIndex(0))?)
             .and_then(|first| split::parse(name)?.index_from(&first))
             .map(VolumeIndex);
-        if let Some(volume) = numbered.filter(free) {
-            return Some(volume);
+        if numbered.is_some() {
+            return numbered;
         }
         let mut places = (1..=geometry.last().0)
             .map(VolumeIndex)

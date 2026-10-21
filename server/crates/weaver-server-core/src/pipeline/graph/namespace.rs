@@ -340,6 +340,8 @@ impl NamespaceWriter {
         // them in order, and bytes it gave the owner before the bind, for
         // this member or for one the new object's parent has not decided
         // yet, are never overtaken by what the object makes of the rest.
+        // A member folded into another posting of it is handed over the
+        // same way, as that member's bytes.
         let bound: Vec<(NodeId, MemberId, NodeId)> = effects
             .iter()
             .filter_map(|effect| match effect {
@@ -352,12 +354,45 @@ impl NamespaceWriter {
                 _ => None,
             })
             .collect();
+        let folded: Vec<(NodeId, MemberId)> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Folded { node, copy, .. } => Some((*node, *copy)),
+                _ => None,
+            })
+            .collect();
         for effect in effects {
             self.apply(tree, builder, segments, effect, out)?;
         }
         for (node, member, child) in bound {
             self.hand_over(tree, builder, segments, (node, member), child, out)?;
         }
+        for (node, copy) in folded {
+            self.fold_over(tree, builder, segments, (node, copy), out)?;
+        }
+        Ok(())
+    }
+
+    // What a posting received before it folded into the member it repeats:
+    // held, or in its own file when it was a leaf first. It goes down as
+    // the member's bytes, each run with the provenance it arrived with, and
+    // the posting's file goes: it is never a file of its own.
+    fn fold_over(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, copy): (NodeId, MemberId),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        self.replay(tree, builder, segments, node, copy, ALL, out)?;
+        self.replay_file(tree, builder, segments, node, copy, out)?;
+        let files = self.files_mut(node);
+        files.refused.remove(&copy);
+        if let Some(leaf) = files.leaves.remove(&copy) {
+            leaf.remove()?;
+        }
+        self.caps.forget(node, copy);
         Ok(())
     }
 
@@ -667,6 +702,8 @@ impl NamespaceWriter {
                 // Handed what it received before, by `apply_each`.
                 self.bound(tree, *node, *member, *kind, *child);
             }
+            // Handed over as the member's, by `apply_each`.
+            Effect::Folded { .. } => {}
             Effect::Refused { node, member, why } | Effect::NeedsEngine { node, member, why } => {
                 self.refuse(tree, *node, *member, *why);
                 // The engine the refusal handed the member to took it over.

@@ -53,7 +53,7 @@ impl Tree {
                 .map(|object| object.facts())
                 .or_else(|| self.lent_facts(node).cloned()),
             members: namespace
-                .members()
+                .records()
                 .map(|member| MemberRecord {
                     member: member.id,
                     name: member.name.clone(),
@@ -68,10 +68,11 @@ impl Tree {
                         .get(&(node, member.id))
                         .is_some_and(Option::is_none),
                     undecided: found.undecided.contains(&member.id),
+                    copy_of: namespace.copy_of(member.id),
                 })
                 .collect(),
             coverage: namespace
-                .members()
+                .records()
                 .flat_map(|member| {
                     member.coverage.runs().map(|run| CoverageRecord {
                         member: member.id,
@@ -174,6 +175,17 @@ impl Tree {
             if member.undecided {
                 // Its front comes again with the replay.
                 node.undecided.insert(member.member);
+            }
+        }
+        for member in &record.members {
+            let Some(into) = member.copy_of else {
+                continue;
+            };
+            if member.undecided || member.owner.is_some() || member.bound_to.is_some() {
+                return Err(refuse("a further posting has an owner of its own"));
+            }
+            if !node.namespace.restore_copy(member.member, into) {
+                return Err(refuse("a further posting of a member it does not have"));
             }
         }
         for run in &record.coverage {

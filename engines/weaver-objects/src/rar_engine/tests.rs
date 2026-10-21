@@ -340,7 +340,11 @@ fn claim_names_the_volumes_of_its_own_set_only() {
         engine.claim("set.part10.rar", b"", None),
         Some(VolumeIndex(9))
     );
-    assert_eq!(engine.claim("set.part1.rar", b"", None), None);
+    assert_eq!(
+        engine.claim("set.part01.rar", b"", None),
+        Some(VolumeIndex(0)),
+        "a volume posted again is that volume"
+    );
     assert_eq!(engine.claim("other.part2.rar", b"", None), None);
     assert_eq!(engine.claim("set.r00", b"", None), None);
     assert_eq!(engine.claim("set.par2", b"", None), None);
@@ -351,7 +355,7 @@ fn claim_names_the_volumes_of_its_own_set_only() {
     // `.sNN` is numbered as `.rNN` is.
     assert_eq!(old.claim("set.s00", b"", None), Some(VolumeIndex(1)));
     assert_eq!(old.claim("set.part2.rar", b"", None), None);
-    assert_eq!(old.claim("set.rar", b"", None), None);
+    assert_eq!(old.claim("set.rar", b"", None), Some(VolumeIndex(0)));
 }
 
 // Names that number nothing of a RAR set: each volume is placed by what its
@@ -368,8 +372,8 @@ fn claim_places_a_nameless_volume_by_its_headers() {
     );
     assert_eq!(
         engine.claim("a1b2.103", &volumes[0], None),
-        None,
-        "its place is taken"
+        Some(VolumeIndex(0)),
+        "a volume posted again is that volume"
     );
     assert_eq!(
         engine.claim("a1b2.103", &one_volume(), None),

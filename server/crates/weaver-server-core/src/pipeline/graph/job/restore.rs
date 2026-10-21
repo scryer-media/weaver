@@ -294,7 +294,7 @@ fn same_post(tree: &Tree, files: &[RootFile]) -> Result<(), RestoreFailure> {
         return Err(RestoreFailure::Post(0));
     };
     match namespace
-        .members()
+        .records()
         .find(|member| member.id.0 as usize >= files.len())
     {
         Some(member) => Err(RestoreFailure::Post(member.id.0)),

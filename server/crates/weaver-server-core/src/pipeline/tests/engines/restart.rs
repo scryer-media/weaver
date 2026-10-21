@@ -19,6 +19,7 @@ use super::sfv::{crc, listing};
 use super::streams::{brotli, bzip2, gzip, members, tar, xz, zstd};
 use super::zip;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
@@ -72,11 +73,7 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
     let mut restarts = 0;
     let mut quiet = 0;
     loop {
-        while let Some(work) = pipeline
-            .jobs
-            .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
-        {
+        while let Some(work) = next_work(&mut pipeline, scenario) {
             let article = (
                 work.segment_id.file_id.file_index,
                 work.segment_id.segment_number,
@@ -151,6 +148,34 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
         in_memory,
         restarts,
     }
+}
+
+// The next article the download queue hands out: its next, or with
+// `together` the one whose turn comes first, a turn of each named post at
+// a time; the rest stay queued.
+fn next_work(pipeline: &mut Pipeline, scenario: &Scenario) -> Option<DownloadWork> {
+    let queue = &mut pipeline.jobs.get_mut(&JOB)?.download_queue;
+    if scenario.together.is_empty() {
+        return queue.pop();
+    }
+    let mut queued = Vec::new();
+    while let Some(work) = queue.pop() {
+        queued.push(work);
+    }
+    let turn = |work: &DownloadWork| {
+        let file = work.segment_id.file_id.file_index;
+        let at = scenario.together.iter().position(|named| *named == file);
+        (
+            work.segment_id.segment_number,
+            at.unwrap_or(scenario.together.len()),
+        )
+    };
+    let first = (0..queued.len()).min_by_key(|at| turn(&queued[*at]))?;
+    let next = queued.remove(first);
+    for work in queued {
+        queue.push(work);
+    }
+    Some(next)
 }
 
 // The pipeline goes down with what it held in memory, and a new one restores
@@ -320,11 +345,7 @@ async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
     let mut quiet = 0;
     let mut asked = 0usize;
     loop {
-        while let Some(work) = pipeline
-            .jobs
-            .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
-        {
+        while let Some(work) = next_work(&mut pipeline, scenario) {
             let article = (
                 work.segment_id.file_id.file_index,
                 work.segment_id.segment_number,

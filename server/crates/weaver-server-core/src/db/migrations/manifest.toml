@@ -795,3 +795,20 @@ kind = "sql"
 file = "migrations/0068_graph_facts_parts/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 69
+description = "a graph checkpoint keeps which member each further posting of one was folded into"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0069_graph_member_copy_of/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0069_graph_member_copy_of/postgres.sql"
+engine = "postgres"
+scope = "all"

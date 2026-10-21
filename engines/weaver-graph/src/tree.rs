@@ -151,6 +151,14 @@ pub enum Effect {
         kind: Kind,
         child: NodeId,
     },
+    // A member of `node`'s namespace is another posting of `into`, a volume
+    // an object holds already: its bytes are `into`'s from now on. What the
+    // owner held or wrote of it goes down as `into`'s, and it has no file.
+    Folded {
+        node: NodeId,
+        copy: MemberId,
+        into: MemberId,
+    },
     // A member was refused streaming for this reason and is a leaf now. The
     // object that owned it is retired, not gone: the owner materialises the
     // member's bytes through its inverse map, then buries it.
@@ -439,7 +447,8 @@ impl Tree {
         self.nodes.get(&node)?.binding.as_ref()?.window
     }
 
-    // Nothing more will arrive for a member of `node`'s namespace. It takes
+    // Nothing more will arrive for a posting of a member of `node`'s
+    // namespace. The member closes once every posting of it has: it takes
     // the length it reached when it declared none, the object it is bound
     // to hears that its volume is closed (at its hand-over, when the owner
     // still owes it the member's earlier bytes), and the owner closes its
@@ -447,20 +456,20 @@ impl Tree {
     pub fn close(
         &mut self,
         node: NodeId,
-        member: MemberId,
+        posting: MemberId,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
         let Some(found) = self.nodes.get_mut(&node) else {
             return;
         };
+        let member = found.namespace.resolve(posting);
+        if !found.namespace.end(posting) {
+            return;
+        }
         let Some(record) = found.namespace.get_mut(member) else {
             return;
         };
-        if record.closed {
-            return;
-        }
-        record.closed = true;
         let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
         record.length.get_or_insert(reached);
         if self.awaiting(node, member).is_none() {
@@ -920,8 +929,14 @@ impl Tree {
         self.nodes.get_mut(&node).map(|found| &mut found.namespace)
     }
 
+    // The object a member is a volume of, and which volume; a posting of a
+    // member is that member's.
     pub fn child_of(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
-        self.nodes.get(&node)?.children.get(&member).copied()
+        let found = self.nodes.get(&node)?;
+        found
+            .children
+            .get(&found.namespace.resolve(member))
+            .copied()
     }
 
     // Whether the member's first bytes have not yet decided its owner. Its
@@ -929,7 +944,7 @@ impl Tree {
     pub fn is_undecided(&self, node: NodeId, member: MemberId) -> bool {
         self.nodes
             .get(&node)
-            .is_some_and(|found| found.undecided.contains(&member))
+            .is_some_and(|found| found.undecided.contains(&found.namespace.resolve(member)))
     }
 
     // Whether damage at `range` of the member stops its front for good: it
@@ -1346,14 +1361,16 @@ impl Tree {
         Some(removed)
     }
 
-    // Bytes for a member of `node`'s namespace. For the root these are the
-    // source's deliveries; for any other node they are what its object
-    // emitted. The member's owner decides what they are; the tree only
-    // routes and records.
+    // Bytes for a posting of a member of `node`'s namespace. For the root
+    // these are the source's deliveries; for any other node they are what
+    // its object emitted. The member takes what the namespace says it
+    // takes of them: none of a damaged byte another posting brought clean.
+    // The member's owner decides what they are; the tree only routes and
+    // records.
     pub fn deliver(
         &mut self,
         node: NodeId,
-        member: MemberId,
+        posting: MemberId,
         offset: u64,
         bytes: Bytes,
         provenance: Provenance,
@@ -1364,9 +1381,45 @@ impl Tree {
         let Some(found) = self.nodes.get_mut(&node) else {
             return;
         };
-        if let Some(record) = found.namespace.get_mut(member) {
-            record.coverage.write(range, provenance);
+        // Clean bytes over damage, or where a member nothing more arrives
+        // for has none, replace what was there, whichever posting or repair
+        // brings them.
+        let mends = provenance.is_verified()
+            && found
+                .namespace
+                .get(found.namespace.resolve(posting))
+                .is_some_and(|record| {
+                    let damaged = record
+                        .coverage
+                        .overlapping(range)
+                        .any(|run| run.provenance == Provenance::Damaged);
+                    let missing = record.closed && !record.coverage.covered(range);
+                    damaged || missing
+                });
+        let (member, taken) = found.namespace.arrive(posting, range, provenance);
+        for part in taken {
+            let from = (part.start - offset) as usize;
+            let piece = bytes.slice(from..from + part.len() as usize);
+            let arrived = (part.start, piece, provenance);
+            self.take(node, member, arrived, mends, builder, effects);
         }
+    }
+
+    // What a member took of a delivery: kept at its front, handed to its
+    // owner or written as a leaf. A member that took clean bytes over
+    // damage is asked again who owns it when they reach its front.
+    fn take(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        (offset, bytes, provenance): (u64, Bytes, Provenance),
+        mends: bool,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(found) = self.nodes.get_mut(&node) else {
+            return;
+        };
         found.namespace.keep_first_bytes(member, offset, &bytes);
         // Bytes that landed in the member's contiguous front, whoever sent
         // them: an undecided member is asked who owns it each time, since
@@ -1376,6 +1429,15 @@ impl Tree {
         let undecided = found.undecided.contains(&member);
         if front && undecided {
             self.identify_again(node, member, builder, effects);
+            // A posting the offer folded is its member's from here, these
+            // bytes with it; what it held before goes down on `Folded`.
+            if self
+                .namespace(node)
+                .is_some_and(|namespace| namespace.copy_of(member).is_some())
+            {
+                self.deliver(node, member, offset, bytes, provenance, builder, effects);
+                return;
+            }
         }
         for window in self.windows_on(node, member) {
             self.deliver_window(window, offset, &bytes, provenance, builder, effects);
@@ -1419,8 +1481,8 @@ impl Tree {
                     provenance,
                 });
                 // Damage at the front may have hidden what the member is;
-                // a repair there lets it say, once its bytes are in its file.
-                if front && !undecided && provenance == Provenance::Repaired {
+                // clean bytes there let it say, once they are in its file.
+                if front && !undecided && mends {
                     self.identify_again(node, member, builder, effects);
                 }
             }
@@ -1529,7 +1591,8 @@ impl Tree {
     // object is giving up.
     fn unowned(&self, node: NodeId, member: MemberId) -> bool {
         self.nodes.get(&node).is_some_and(|found| {
-            found.namespace.get(member).is_some_and(Member::is_leaf)
+            found.namespace.copy_of(member).is_none()
+                && found.namespace.get(member).is_some_and(Member::is_leaf)
                 && !found.children.contains_key(&member)
                 && !found.undecided.contains(&member)
                 && !self.retired.contains_key(&(node, member))
@@ -1596,6 +1659,21 @@ impl Tree {
                 else {
                     continue;
                 };
+                // A place the object holds already: the member is another
+                // posting of the one there, or stays where its name put it.
+                let holder = self
+                    .nodes
+                    .get(&child)
+                    .and_then(|found| found.binding.as_ref())
+                    .and_then(|binding| binding.volumes.get(&place))
+                    .copied();
+                if holder.is_some_and(|into| {
+                    !self
+                        .namespace(node)
+                        .is_some_and(|namespace| namespace.folds(member, into))
+                }) {
+                    continue;
+                }
                 if let Some(found) = self.nodes.get_mut(&sibling) {
                     if let Some(binding) = found.binding.as_mut() {
                         binding.volumes.remove(&volume);
@@ -1615,7 +1693,12 @@ impl Tree {
                     from: sibling,
                     volume,
                 });
-                self.join(node, member, (child, place), (&name, &front), effects);
+                match holder {
+                    Some(into) => {
+                        self.fold(node, member, into, effects);
+                    }
+                    None => self.join(node, member, (child, place), (&name, &front), effects),
+                }
             }
             let empty = self
                 .nodes
@@ -1685,6 +1768,20 @@ impl Tree {
             }) else {
                 continue;
             };
+            // A volume the object holds already: the member is another
+            // posting of the one holding it, or none of the object's. The
+            // member it holds there already is asked of the others.
+            let holder = found
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.volumes.get(&volume))
+                .copied();
+            if let Some(into) = holder {
+                if into != member && self.fold(node, member, into, effects) {
+                    return true;
+                }
+                continue;
+            }
             match refused {
                 None => self.join(node, member, (*child, volume), (&name, prefix), effects),
                 // A volume of a refused set is refused with it. The object
@@ -1708,6 +1805,30 @@ impl Tree {
             return true;
         }
         false
+    }
+
+    // A member an object claims as a volume it holds already is another
+    // posting of the member holding it, when the namespace says so: it
+    // folds into that member, whose bytes its bytes are from now on, and
+    // leaves the ledger, since it is never a file. Whether it folded.
+    fn fold(
+        &mut self,
+        node: NodeId,
+        copy: MemberId,
+        into: MemberId,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(found) = self.nodes.get_mut(&node) else {
+            return false;
+        };
+        if !found.namespace.fold(copy, into) {
+            return false;
+        }
+        found.undecided.remove(&copy);
+        self.given.remove(&(node, copy));
+        self.names.release((node, copy));
+        effects.push(Effect::Folded { node, copy, into });
+        true
     }
 
     // A member becomes the volume of the object that claimed it.
@@ -2354,16 +2475,18 @@ impl Tree {
         let Some(found) = self.nodes.get_mut(&node) else {
             return;
         };
-        if let Some(record) = found.namespace.get_mut(member) {
-            record.coverage.write(range, Provenance::Damaged);
-        }
-        effects.push(Effect::Damaged {
-            node,
-            member,
-            range,
-        });
-        if let Some((child, volume)) = found.children.get(&member).copied() {
-            pending.push((child, volume, range));
+        // A posting's loss is the member's only where no other posting
+        // brought those bytes clean.
+        let (member, lost) = found.namespace.arrive(member, range, Provenance::Damaged);
+        for range in lost {
+            effects.push(Effect::Damaged {
+                node,
+                member,
+                range,
+            });
+            if let Some((child, volume)) = found.children.get(&member).copied() {
+                pending.push((child, volume, range));
+            }
         }
     }
 
@@ -2420,6 +2543,7 @@ mod tests {
     use super::*;
     use crate::deliver::{Delivery, RecoveryKind};
 
+    mod reposted;
     mod windows;
 
     const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";

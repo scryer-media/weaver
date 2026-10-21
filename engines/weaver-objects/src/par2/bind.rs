@@ -9,7 +9,9 @@
 // one, and two members that answer to one description both go unbound. A
 // member that answers in two sets is the first set's: the others count it
 // missing in their arithmetic and never write it. A member bound by its
-// content under another name takes the described name.
+// content under another name takes the described name. Each posting of a
+// member posted more than once answers for it: the member is every file
+// one of its postings is.
 
 use std::collections::BTreeMap;
 
@@ -86,18 +88,30 @@ pub(super) fn bind_sets(
 ) -> (Vec<BTreeMap<FileId, MemberId>>, Vec<(MemberId, Length)>) {
     let mut claims: Vec<BTreeMap<FileId, Vec<MemberId>>> = vec![BTreeMap::new(); indexes.len()];
     let mut unnamed = Vec::new();
-    for member in namespace.members() {
-        if member.bound_to == Some(own) {
+    for posting in namespace.records() {
+        let member = namespace.resolve(posting.id);
+        if namespace
+            .get(member)
+            .is_some_and(|record| record.bound_to == Some(own))
+        {
             continue;
         }
-        let candidate = Candidate::of(member, namespace.first_bytes(member.id));
+        let candidate = Candidate::of(posting, namespace.first_bytes(posting.id));
         let first = indexes
             .iter()
             .enumerate()
             .find_map(|(at, index)| Some((at, match_member(index, &candidate)?)));
         match first {
-            Some((at, file)) => claims[at].entry(file).or_default().push(member.id),
-            None => unnamed.extend(candidate.complete.map(|length| (member.id, length))),
+            Some((at, file)) => {
+                let claimants = claims[at].entry(file).or_default();
+                if !claimants.contains(&member) {
+                    claimants.push(member);
+                }
+            }
+            None if member == posting.id => {
+                unnamed.extend(candidate.complete.map(|length| (member, length)))
+            }
+            None => {}
         }
     }
     let bound = claims

@@ -214,16 +214,13 @@ impl RarStore {
             .filter(|_| named)
             .map(|wanted| VolumeIndex(wanted.index()))
             .filter(|index| !facts.is_some_and(|facts| misplaced(*index, facts)));
-        let index = match (facts.and_then(|facts| self.claim_by_headers(facts)), named) {
-            (Some(index), _) if stated => index,
-            (_, Some(named)) => named,
-            (linked, None) => linked?,
-        };
-        let taken = self
-            .volumes
-            .get(&index)
-            .is_some_and(|volume| volume.name.is_some());
-        (!taken).then_some(index)
+        // A position held already is answered all the same: the volume
+        // posted again is that volume.
+        match (facts.and_then(|facts| self.claim_by_headers(facts)), named) {
+            (Some(index), _) if stated => Some(index),
+            (_, Some(named)) => Some(named),
+            (linked, None) => linked,
+        }
     }
 
     // What a front states, read with the store's own keys.
@@ -274,6 +271,9 @@ pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
 // states none, a nameless RAR4 front, goes in the one free place beside the
 // held volumes where both its neighbours link to it: after the one whose
 // last member it continues, before the one that continues its last member.
+// Where no free place takes it, it is the one held place its neighbours
+// link it to, posted again; whether it is that volume its bytes say, which
+// the tree compares.
 pub(crate) fn place(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> Option<u32> {
     let this = Nameless { facts };
     let joins = |previous: &Held<'_>, index: u32| {
@@ -316,6 +316,9 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> O
         .collect();
     candidates.sort_unstable();
     candidates.dedup();
+    if candidates.is_empty() {
+        candidates = held.keys().copied().filter(|slot| fits(*slot)).collect();
+    }
     match candidates.as_slice() {
         [only] => Some(*only),
         _ => None,
