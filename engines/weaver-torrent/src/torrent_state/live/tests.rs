@@ -4616,6 +4616,43 @@ async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
     );
 }
 
+// libtorrent `bt_peer_connection::on_extended_handshake`: a peer's `yourip`
+// is its vote on our external address (`session_impl::set_external_address`),
+// one address to a family.
+#[tokio::test(start_paused = true)]
+async fn a_peers_yourip_is_its_vote_on_the_sessions_external_address() {
+    let h = Harness::new("yourip_votes").await;
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    let says = |s: &str| ExtendedHandshake {
+        yourip: Some(ip(s).into()),
+        ..Default::default()
+    };
+    let (first, _first_rx) = h.peer("198.51.100.1:6881");
+    let (second, _second_rx) = h.peer("198.51.100.2:6881");
+    let (third, _third_rx) = h.peer("198.51.100.3:6881");
+    let (v6, _v6_rx) = h.peer("[2001:db8::1]:6881");
+    // A loopback address, or one of the other family, is no vote.
+    (&first).on_extended_handshake(&says("127.0.0.1")).unwrap();
+    (&first)
+        .on_extended_handshake(&says("2001:db8::5"))
+        .unwrap();
+    assert_eq!(h._session.external_ips.get(), [] as [std::net::IpAddr; 0]);
+    (&first)
+        .on_extended_handshake(&says("203.0.113.5"))
+        .unwrap();
+    (&second)
+        .on_extended_handshake(&says("203.0.113.9"))
+        .unwrap();
+    (&third)
+        .on_extended_handshake(&says("203.0.113.5"))
+        .unwrap();
+    (&v6).on_extended_handshake(&says("2001:db8::5")).unwrap();
+    assert_eq!(
+        h._session.external_ips.get(),
+        [ip("203.0.113.5"), ip("2001:db8::5")]
+    );
+}
+
 // libtorrent `piece_picker::inc_refcount` and `dec_refcount`: a HAVE and a
 // peer leaving move the piece in the pick order before the next pick.
 #[tokio::test]

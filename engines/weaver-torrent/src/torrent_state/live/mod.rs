@@ -1899,13 +1899,24 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                     .task_send_pex_to_peer(self.addr, self.tx.clone()),
             );
         }
+        // `yourip`, our address as the peer sees it, is the peer's vote on
+        // our external address (libtorrent
+        // `bt_peer_connection::on_extended_handshake`, into
+        // `session_impl::set_external_address`).
+        if let Some(yourip) = hs.yourip
+            && let Some(session) = self.state.shared.session.upgrade()
+        {
+            session.external_ips.cast_vote(
+                yourip.0,
+                crate::session::external_ip::Voter::Peer(self.addr.ip()),
+                tokio::time::Instant::now(),
+            );
+        }
         // A peer that connected to us says where it listens: at the address
         // it connected from, on port `p`. Its own word on its address
         // (`ipv4`, `ipv6`) is never taken (libtorrent
         // `bt_peer_connection::on_extended_handshake`, which reads only `p`,
-        // into `peer_list::update_peer_port`). `yourip`, our address as the
-        // peer sees it, is a vote for `session_impl::set_external_address`;
-        // the session keeps no external address, so it is not read.
+        // into `peer_list::update_peer_port`).
         if self.incoming
             && let Some(port) = hs.port().filter(|&port| port != 0)
         {
