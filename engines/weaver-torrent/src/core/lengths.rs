@@ -214,6 +214,34 @@ impl Lengths {
             absolute_index,
         })
     }
+    /// The block a peer's request for `length` bytes at `begin` of the piece
+    /// names, when it is one a peer may ask for: inside the piece, not empty,
+    /// and no longer than a block, the smaller of the piece length and 16 KiB.
+    /// It need not be one of the piece's chunks (libtorrent
+    /// `peer_connection::incoming_request`, `torrent::block_size`).
+    pub fn requested_block(
+        &self,
+        piece_index: ValidPieceIndex,
+        begin: u32,
+        length: u32,
+    ) -> Option<ChunkInfo> {
+        let block_size = self.piece_length.min(CHUNK_SIZE);
+        if length == 0
+            || length > block_size
+            || u64::from(begin) + u64::from(length) > u64::from(self.piece_length(piece_index))
+        {
+            return None;
+        }
+        let chunk_index = begin / CHUNK_SIZE;
+        Some(ChunkInfo {
+            piece_index,
+            chunk_index,
+            absolute_index: self.chunks_per_piece * piece_index.get() + chunk_index,
+            size: length,
+            offset: begin,
+        })
+    }
+
     pub const fn chunk_range(&self, index: ValidPieceIndex) -> std::ops::Range<usize> {
         let start = index.0 * self.chunks_per_piece;
         let end = start + self.chunks_per_piece(index);
@@ -662,5 +690,40 @@ mod tests {
         assert_eq!(l.size_of_piece_in_file(3, 0, 10), 0);
         assert_eq!(l.size_of_piece_in_file(0, 10, 0), 0);
         assert_eq!(l.size_of_piece_in_file(0, 10, 5), 0);
+    }
+
+    // libtorrent `peer_connection::incoming_request`: any block inside the
+    // piece, not empty and no longer than `torrent::block_size()`.
+    #[test]
+    fn a_request_names_any_block_inside_the_piece_no_longer_than_a_block() {
+        let l = Lengths::new(40000, 20000).unwrap();
+        let (first, last) = (i(&l, 0), i(&l, 1));
+        let block = |p, begin, len| l.requested_block(p, begin, len).map(|c| (c.offset, c.size));
+
+        assert_eq!(block(first, 0, CHUNK_SIZE), Some((0, CHUNK_SIZE)));
+        assert_eq!(block(first, 1, CHUNK_SIZE), Some((1, CHUNK_SIZE)));
+        assert_eq!(block(last, 19990, 10), Some((19990, 10)));
+        assert_eq!(l.requested_block(first, 100, 7).unwrap().chunk_index, 0);
+        assert_eq!(
+            l.requested_block(first, CHUNK_SIZE + 1, 7)
+                .unwrap()
+                .chunk_index,
+            1
+        );
+
+        assert_eq!(block(first, 0, 0), None);
+        assert_eq!(block(first, 0, CHUNK_SIZE + 1), None);
+        assert_eq!(block(last, 19990, 11), None);
+        assert_eq!(block(last, 20000, 1), None);
+        assert_eq!(block(last, u32::MAX, 1), None);
+
+        // A piece shorter than 16 KiB is one block.
+        let small = Lengths::new(3000, 1000).unwrap();
+        assert!(small.requested_block(i(&small, 0), 0, 1000).is_some());
+        assert!(small.requested_block(i(&small, 0), 0, 1001).is_none());
+    }
+
+    fn i(l: &Lengths, index: u32) -> ValidPieceIndex {
+        l.validate_piece_index(index).unwrap()
     }
 }

@@ -1553,12 +1553,13 @@ impl PeerHandler {
         result
     }
 
-    /// The block of the torrent `request` names, if it names one.
+    /// The block of the torrent `request` names, if it names one a peer may
+    /// ask for.
     fn requested_chunk(&self, request: &Request) -> Option<ChunkInfo> {
         let piece_index = self.state.lengths.validate_piece_index(request.index)?;
         self.state
             .lengths
-            .chunk_info_from_received_data(piece_index, request.begin, request.length)
+            .requested_block(piece_index, request.begin, request.length)
     }
 
     fn on_download_request(&self, request: Request) -> anyhow::Result<()> {
@@ -1566,21 +1567,20 @@ impl PeerHandler {
             anyhow::bail!("upload disabled, but peer requested a piece")
         }
 
-        let Some(chunk_info) = self.requested_chunk(&request) else {
-            anyhow::bail!("received {request:?}, but it is not a valid chunk request");
+        // A request for a block that is not one, or of a piece we do not
+        // have, is dropped (libtorrent `peer_connection::incoming_request`).
+        let chunk_info = match self.requested_chunk(&request) {
+            Some(chunk) => self
+                .state
+                .lock_read("is_chunk_ready_to_upload")
+                .get_chunks()?
+                .is_chunk_ready_to_upload(&chunk)
+                .then_some(chunk),
+            None => None,
         };
-
-        if !self
-            .state
-            .lock_read("is_chunk_ready_to_upload")
-            .get_chunks()?
-            .is_chunk_ready_to_upload(&chunk_info)
-        {
-            anyhow::bail!(
-                "got request for a chunk that is not ready to upload. chunk {:?}",
-                chunk_info
-            );
-        }
+        let Some(chunk_info) = chunk_info else {
+            return self.on_invalid_request(request);
+        };
 
         // A peer that asks without having said it is interested is taken to
         // have said so.
@@ -1614,6 +1614,23 @@ impl PeerHandler {
         self.state
             .ratelimit_upload_tx
             .send((self.addr, self.tx.clone(), chunk_info))?;
+        Ok(())
+    }
+
+    /// The peer asked for what we cannot serve. The request is dropped: with
+    /// no fast extension there is no Reject to send.
+    fn on_invalid_request(&self, request: Request) -> anyhow::Result<()> {
+        let peer_chokes_us = self.is_choked();
+        let keep = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "invalid_request", |live| {
+                live.invalid_request(peer_chokes_us)
+            });
+        if keep == Some(false) {
+            anyhow::bail!("too many invalid requests while choked, the last {request:?}");
+        }
+        trace!(?request, "dropping a request we cannot serve");
         Ok(())
     }
 

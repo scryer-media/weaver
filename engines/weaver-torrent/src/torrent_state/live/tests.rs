@@ -1260,3 +1260,145 @@ mod v2 {
         assert!(peer.on_hash_request(request).is_err());
     }
 }
+
+// libtorrent `peer_connection::incoming_request`: a request is served when it
+// names any block inside a piece we have, no longer than a block.
+#[tokio::test]
+async fn a_request_for_any_block_inside_a_had_piece_is_served() {
+    let h = Harness::seeding("any_block_is_served").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    let unaligned = Request {
+        index: 0,
+        begin: 1,
+        length: 100,
+    };
+    let tail = Request {
+        index: 1,
+        begin: PIECE_LENGTH - 10,
+        length: 10,
+    };
+    for r in [unaligned, tail] {
+        peer.on_received_message(Message::Request(r)).await.unwrap();
+    }
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 1));
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(1, PIECE_LENGTH - 10));
+}
+
+/// A request for what the torrent of [`Harness::build`] with only piece 0
+/// had cannot serve: the request at position `n`, cycling through each way
+/// a request can be wrong.
+fn unservable(n: u32) -> Request {
+    let (index, begin, length) = match n % 5 {
+        0 => (1, 0, CHUNK_SIZE),       // a piece we do not have
+        1 => (0, 0, CHUNK_SIZE + 1),   // longer than a block
+        2 => (0, 0, 0),                // empty
+        3 => (0, PIECE_LENGTH - 1, 2), // past the end of the piece
+        _ => (PIECES, 0, CHUNK_SIZE),  // no such piece
+    };
+    Request {
+        index,
+        begin,
+        length,
+    }
+}
+
+#[tokio::test]
+async fn a_request_we_cannot_serve_is_dropped_and_the_peer_kept() {
+    let h = Harness::build(
+        "unservable_is_dropped",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+
+    for n in 0..5 {
+        peer.on_received_message(Message::Request(unservable(n)))
+            .await
+            .unwrap();
+    }
+    assert!(rx.is_empty());
+
+    peer.on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+}
+
+impl Harness {
+    /// The peer sends `count` requests we cannot serve, each kept.
+    async fn ask_unservable(&self, peer: &PeerHandler, count: u32) {
+        for n in 0..count {
+            peer.on_received_message(Message::Request(unservable(n)))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+// libtorrent `peer_connection::incoming_request`: a peer that is neither
+// interested nor unchoked is told it is choked every tenth request we cannot
+// serve, and disconnected at a tenth past 300 while it does not choke us.
+#[tokio::test]
+async fn a_choked_peer_asking_for_what_we_cannot_serve_is_reminded_then_disconnected() {
+    let h = Harness::build(
+        "unservable_reminded",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    assert!(h.choked(peer));
+
+    for _ in 0..31 {
+        h.ask_unservable(peer, 9).await;
+        assert!(rx.is_empty());
+        h.ask_unservable(peer, 1).await;
+        assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+    }
+
+    // At 310 the peer chokes us, so it was reminded again; once it unchokes
+    // us, the next tenth ends the connection.
+    peer.on_received_message(Message::Unchoke).await.unwrap();
+    h.ask_unservable(peer, 9).await;
+    assert!(
+        peer.on_received_message(Message::Request(unservable(0)))
+            .await
+            .is_err()
+    );
+}
+
+// libtorrent `peer_connection::send_choke`: choking the peer starts its count
+// of requests we cannot serve again.
+#[tokio::test]
+async fn choking_a_peer_starts_its_count_of_unservable_requests_again() {
+    let h = Harness::build(
+        "unservable_count_resets",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    h.ask_unservable(peer, 5).await;
+
+    peer.on_received_message(Message::NotInterested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+
+    h.ask_unservable(peer, 9).await;
+    assert!(rx.is_empty());
+    h.ask_unservable(peer, 1).await;
+    assert_eq!(next_sent(&mut rx).await, Sent::Choke);
+}
