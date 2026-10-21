@@ -191,22 +191,16 @@ impl<'a> FileOps<'a> {
         &self,
         piece: ValidPieceIndex,
         digest: PieceDigest,
-    ) -> anyhow::Result<(Option<bool>, Option<bool>)> {
+    ) -> (Option<bool>, Option<bool>) {
         let (sha1, blocks) = digest.finish();
-        let v1 = sha1
-            .map(|sha1| {
-                self.torrent.info().compare_hash(piece.get(), sha1).context(
-                    "bug: either torrent info broken or we have a bug - piece index invalid",
-                )
-            })
-            .transpose()?;
+        let v1 = sha1.and_then(|sha1| self.torrent.v1_hash_matches(piece, sha1));
         let v2 = blocks.and_then(|blocks| {
             self.metadata
                 .v2
                 .as_ref()?
                 .compare_hash(piece.get(), &blocks)
         });
-        Ok((v1, v2))
+        (v1, v2)
     }
 
     /// The pieces whose data is already there, hashed on `threads` threads
@@ -325,7 +319,7 @@ impl<'a> FileOps<'a> {
 
         // A piece whose v1 hash fails is not checked against v2: its data
         // is most likely missing (libtorrent `torrent::on_piece_hashed`).
-        let (v1, v2) = self.hashes_match(piece, digest)?;
+        let (v1, v2) = self.hashes_match(piece, digest);
         match Verdict::of(v1, v2.filter(|_| v1 != Some(false))) {
             Verdict::Passed => Ok(true),
             Verdict::Failed | Verdict::Unknown => Ok(false),
@@ -383,7 +377,7 @@ impl<'a> FileOps<'a> {
             absolute_offset = 0;
         }
 
-        let (v1, v2) = self.hashes_match(piece_index, h)?;
+        let (v1, v2) = self.hashes_match(piece_index, h);
         let verdict = Verdict::of(v1, v2);
         match verdict {
             Verdict::Passed => trace!("piece={} hash matches", piece_index),

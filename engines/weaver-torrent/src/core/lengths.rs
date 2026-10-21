@@ -77,18 +77,45 @@ impl ValidPieceIndex {
     }
 }
 
+/// The longest piece: the piece picker holds at most 2^15 - 1 blocks of a
+/// piece (libtorrent `file_storage::max_piece_size`).
+pub const MAX_PIECE_LENGTH: u32 = ((1 << 15) - 1) * CHUNK_SIZE;
+/// The most pieces a torrent has, and the most 16 KiB blocks a v2 file
+/// spans (libtorrent `file_storage::max_num_pieces`).
+pub const MAX_NUM_PIECES: u64 = (1 << 30) - 1;
+
 impl Lengths {
+    /// The layout of `total_length` bytes in pieces of `piece_length`,
+    /// refused when a piece index or a chunk index would not fit its u32
+    /// (libtorrent `parse_info_section`: `piece_length <= 0 ||
+    /// piece_length > file_storage::max_piece_size`, and
+    /// `total_size() / piece_length() > file_storage::max_num_pieces`).
     pub fn new(total_length: u64, piece_length: u32) -> crate::core::Result<Self> {
+        if piece_length == 0 || piece_length > MAX_PIECE_LENGTH {
+            return Err(Error::InvalidPieceLength(piece_length));
+        }
         if total_length == 0 {
             return Err(Error::BadTorrentZeroLength);
         }
-        let total_pieces = total_length.div_ceil(piece_length as u64) as u32;
+        if total_length / u64::from(piece_length) > MAX_NUM_PIECES {
+            return Err(Error::TooManyPieces);
+        }
+        // At most MAX_NUM_PIECES + 1, and a piece is at most `piece_length`.
+        let total_pieces = total_length.div_ceil(u64::from(piece_length)) as u32;
+        let last_piece_length = last_element_size(total_length, u64::from(piece_length)) as u32;
+        let chunks_per_piece = piece_length.div_ceil(CHUNK_SIZE);
+        // Chunks are counted across the torrent in a u32.
+        let total_chunks = u64::from(total_pieces - 1) * u64::from(chunks_per_piece)
+            + u64::from(last_piece_length.div_ceil(CHUNK_SIZE));
+        if total_chunks > u64::from(u32::MAX) {
+            return Err(Error::TooManyChunks);
+        }
         Ok(Self {
             piece_length,
             total_length,
-            chunks_per_piece: (piece_length as u64).div_ceil(CHUNK_SIZE as u64) as u32,
+            chunks_per_piece,
             last_piece_id: total_pieces - 1,
-            last_piece_length: last_element_size(total_length, piece_length as u64) as u32,
+            last_piece_length,
         })
     }
 
@@ -725,5 +752,63 @@ mod tests {
 
     fn i(l: &Lengths, index: u32) -> ValidPieceIndex {
         l.validate_piece_index(index).unwrap()
+    }
+
+    #[test]
+    fn a_piece_length_of_zero_or_past_libtorrents_cap_is_refused() {
+        for piece_length in [0, MAX_PIECE_LENGTH + 1, u32::MAX] {
+            assert!(
+                matches!(
+                    Lengths::new(1, piece_length),
+                    Err(Error::InvalidPieceLength(p)) if p == piece_length
+                ),
+                "{piece_length}"
+            );
+        }
+        let l = Lengths::new(u64::from(MAX_PIECE_LENGTH) + 1, MAX_PIECE_LENGTH).unwrap();
+        assert_eq!(l.default_chunks_per_piece(), (1 << 15) - 1);
+        assert_eq!(l.total_pieces(), 2);
+    }
+
+    #[test]
+    fn more_pieces_than_libtorrent_indexes_are_refused() {
+        assert!(matches!(
+            Lengths::new((MAX_NUM_PIECES + 1) * 16384, 16384),
+            Err(Error::TooManyPieces)
+        ));
+        assert!(matches!(
+            Lengths::new(u64::MAX, 1),
+            Err(Error::TooManyPieces)
+        ));
+        // The last piece may be short: MAX_NUM_PIECES whole pieces and a bit.
+        let l = Lengths::new(MAX_NUM_PIECES * 16384 + 1, 16384).unwrap();
+        assert_eq!(u64::from(l.total_pieces()), MAX_NUM_PIECES + 1);
+    }
+
+    #[test]
+    fn more_chunks_than_a_u32_counts_are_refused() {
+        // Under libtorrent's piece cap, but 2^32 chunks or more.
+        let chunks_per_piece = u64::from(MAX_PIECE_LENGTH / CHUNK_SIZE);
+        let fit = u64::from(u32::MAX) / chunks_per_piece;
+        let piece_length = u64::from(MAX_PIECE_LENGTH);
+        assert!(matches!(
+            Lengths::new((fit + 1) * piece_length, MAX_PIECE_LENGTH),
+            Err(Error::TooManyChunks)
+        ));
+        // A short last piece is counted by its own chunks.
+        let spare = u64::from(u32::MAX) - fit * chunks_per_piece;
+        let l = Lengths::new(
+            fit * piece_length + spare * u64::from(CHUNK_SIZE),
+            MAX_PIECE_LENGTH,
+        )
+        .unwrap();
+        assert_eq!(l.total_chunks(), u32::MAX);
+        assert!(matches!(
+            Lengths::new(
+                fit * piece_length + (spare + 1) * u64::from(CHUNK_SIZE),
+                MAX_PIECE_LENGTH
+            ),
+            Err(Error::TooManyChunks)
+        ));
     }
 }

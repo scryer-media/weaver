@@ -24,7 +24,7 @@ use tracing::debug;
 use crate::core::{
     Error, Id32, InfoHashes,
     hash_id::Id20,
-    lengths::Lengths,
+    lengths::{Lengths, MAX_NUM_PIECES, ValidPieceIndex},
     merkle::{self, BLOCK_SIZE},
     v2_tree::{FileTree, sanitize_component},
 };
@@ -640,10 +640,11 @@ impl V2File {
     }
 }
 
-/// A file may not span more 16 KiB blocks than this, nor a torrent more
-/// pieces (libtorrent `file_storage::max_num_pieces`).
-const MAX_NUM_PIECES: u64 = (1 << 30) - 1;
-/// The largest file a v2 tree indexes (libtorrent
+/// The most pieces a torrent is loaded with (libtorrent
+/// `load_torrent_limits::max_pieces`, the default of
+/// `settings_pack::max_piece_count`).
+const MAX_PIECE_COUNT: u32 = 0x200000;
+/// The largest file a torrent indexes (libtorrent
 /// `file_storage::max_file_size`).
 const MAX_FILE_SIZE: u64 = {
     let by_offset = (1u64 << 48) - 1;
@@ -682,6 +683,13 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
 
     pub fn lengths(&self) -> &Lengths {
         &self.lengths
+    }
+
+    /// Whether `piece`'s v1 hash is `hash`; `None` when the torrent has no
+    /// v1 hashes. Validation holds `pieces` to one hash for every piece, so
+    /// a torrent with v1 hashes has one for every valid index.
+    pub fn v1_hash_matches(&self, piece: ValidPieceIndex, hash: [u8; 20]) -> Option<bool> {
+        self.info.compare_hash(piece.get(), hash)
     }
 
     pub fn version(&self) -> TorrentVersion {
@@ -871,9 +879,22 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
         };
         let total_length = match &v2 {
             Some(files) => files.iter().map(|f| f.length).sum(),
-            None => self.iter_file_details_raw(encoding)?.map(|d| d.len).sum(),
+            None => v1_total_length(self.iter_file_details_raw(encoding)?.map(|d| d.len))?,
         };
         let lengths = Lengths::new(total_length, self.piece_length)?;
+        // libtorrent `parse_info_section`: `files.num_pieces() > max_pieces`.
+        if lengths.total_pieces() > MAX_PIECE_COUNT {
+            return Err(Error::TooManyPieces);
+        }
+        // libtorrent `parse_info_section`: `pieces.string_length() !=
+        // files.num_pieces() * 20`. Every piece of the torrent has its hash.
+        if let Some(pieces) = &self.pieces {
+            let expected = lengths.total_pieces() as usize * 20;
+            let got = pieces.as_ref().len();
+            if got != expected {
+                return Err(Error::InvalidPieceHashes { expected, got });
+            }
+        }
         let validated = ValidatedTorrentMetaV1Info {
             encoding,
             lengths,
@@ -995,6 +1016,23 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
             _ => Err(Error::BadTorrentBothSingleAndMultiFile),
         }
     }
+}
+
+/// The v1 listing's total length, each file and the running total held to
+/// what libtorrent indexes (`extract_single_file`: `file_size /
+/// default_block_size >= INT_MAX / 2 || file_size >
+/// file_storage::max_file_size`; `file_storage::add_file_borrow_impl`:
+/// `max_file_offset - m_total_size < file_size`).
+fn v1_total_length(lengths: impl IntoIterator<Item = u64>) -> crate::core::Result<u64> {
+    lengths.into_iter().try_fold(0u64, |total, length| {
+        if length / BLOCK_SIZE >= i32::MAX as u64 / 2
+            || length > MAX_FILE_SIZE
+            || MAX_FILE_OFFSET - total < length
+        {
+            return Err(Error::InvalidFileLength);
+        }
+        Ok(total + length)
+    })
 }
 
 /// A v2 file tree laid out over pieces: each file's rules checked, its path
@@ -1282,10 +1320,11 @@ mod tests {
     fn multi_file_info(
         files: Vec<TorrentMetaV1File<ByteBufOwned>>,
     ) -> TorrentMetaV1Info<ByteBufOwned> {
+        let total: u64 = files.iter().map(|f| f.length).sum();
         TorrentMetaV1Info {
             name: Some(b"hybrid"[..].into()),
             piece_length: 16384,
-            pieces: Some(Default::default()),
+            pieces: Some(vec![0; 20 * total.div_ceil(16384) as usize].into()),
             files: Some(files),
             ..Default::default()
         }
@@ -1346,6 +1385,124 @@ mod tests {
                 Err(Error::BadTorrentDuplicateFilenames)
             ));
         }
+    }
+
+    /// A single-file v1 info of `length` bytes in pieces of `piece_length`,
+    /// with `hashes` bytes of piece hashes.
+    fn single_file_info(
+        length: u64,
+        piece_length: u32,
+        hashes: usize,
+    ) -> TorrentMetaV1Info<ByteBufOwned> {
+        TorrentMetaV1Info {
+            name: Some(b"single"[..].into()),
+            length: Some(length),
+            piece_length,
+            pieces: Some(vec![0; hashes].into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_v1_piece_length_of_zero_or_past_libtorrents_cap_is_refused() {
+        // libtorrent test_torrents: missing_piece_len, invalid_piece_len,
+        // negative_piece_len.
+        for piece_length in [0, crate::core::lengths::MAX_PIECE_LENGTH + 1] {
+            assert!(matches!(
+                single_file_info(1, piece_length, 20).validate(),
+                Err(Error::InvalidPieceLength(p)) if p == piece_length
+            ));
+        }
+    }
+
+    #[test]
+    fn piece_hashes_not_twenty_bytes_a_piece_are_refused() {
+        // libtorrent test_torrents/unaligned_pieces.torrent.
+        let three_pieces = 2 * 16384 + 1;
+        for hashes in [0, 40, 59, 61, 80] {
+            assert!(
+                matches!(
+                    single_file_info(three_pieces, 16384, hashes).validate(),
+                    Err(Error::InvalidPieceHashes { expected: 60, got }) if got == hashes
+                ),
+                "{hashes}"
+            );
+        }
+        single_file_info(three_pieces, 16384, 60)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn more_pieces_than_libtorrent_loads_are_refused() {
+        // libtorrent test_torrents/many_pieces.torrent.
+        let too_many = (u64::from(MAX_PIECE_COUNT) + 1) * 16384;
+        assert!(matches!(
+            single_file_info(too_many, 16384, 0).validate(),
+            Err(Error::TooManyPieces)
+        ));
+        let most = u64::from(MAX_PIECE_COUNT) * 16384;
+        let hashes = 20 * MAX_PIECE_COUNT as usize;
+        let validated = single_file_info(most, 16384, hashes).validate().unwrap();
+        assert_eq!(validated.lengths().total_pieces(), MAX_PIECE_COUNT);
+    }
+
+    #[test]
+    fn a_v1_file_past_libtorrents_cap_is_refused() {
+        // libtorrent test_torrents/invalid_file_size.torrent. A file of
+        // `INT_MAX / 2` blocks is one block too many.
+        // The length is refused before the hashes are counted.
+        let piece_length = crate::core::lengths::MAX_PIECE_LENGTH;
+        let too_long = (i32::MAX as u64 / 2) * BLOCK_SIZE;
+        for length in [too_long, MAX_FILE_SIZE + 1, u64::MAX] {
+            assert!(
+                matches!(
+                    single_file_info(length, piece_length, 0).validate(),
+                    Err(Error::InvalidFileLength)
+                ),
+                "{length}"
+            );
+        }
+        let longest = too_long - 1;
+        let hashes = 20 * longest.div_ceil(u64::from(piece_length)) as usize;
+        single_file_info(longest, piece_length, hashes)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_v1_listing_past_libtorrents_last_offset_is_refused() {
+        // Each file is within the cap; together they pass the last byte
+        // libtorrent addresses, and lengths like these once wrapped the sum.
+        // The lengths are refused before the hashes are counted.
+        let info = |lengths: &[u64]| TorrentMetaV1Info::<ByteBufOwned> {
+            name: Some(b"multi"[..].into()),
+            piece_length: 16384,
+            pieces: Some(Default::default()),
+            files: Some(
+                lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &length)| file(&[&i.to_string()], length, None))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        assert!(matches!(
+            info(&[1 << 43; 32]).validate(),
+            Err(Error::InvalidFileLength)
+        ));
+        assert!(matches!(
+            info(&[1 << 43, u64::MAX - 1]).validate(),
+            Err(Error::InvalidFileLength)
+        ));
+        // One byte short of the last offset is the hashes' to judge.
+        let mut lengths = [1 << 43; 32];
+        lengths[31] -= 1;
+        assert!(matches!(
+            info(&lengths).validate(),
+            Err(Error::TooManyPieces)
+        ));
     }
 
     // The fixtures below are libtorrent's `test/test_torrents/<name>.torrent`
