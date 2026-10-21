@@ -861,6 +861,12 @@ pub(crate) struct LivePeerState {
     // upload_only message (libtorrent `peer_connection::m_upload_only`).
     upload_only: bool,
 
+    // When the peer says it last saw a complete copy, by the `complete_ago`
+    // of its extended handshake (libtorrent
+    // `peer_connection::m_last_seen_complete`). Only the swarm's status
+    // reads it; we never pass it on.
+    pub last_seen_complete: Option<Instant>,
+
     // The peers its PEX messages named and have not dropped since, at most
     // MAX_PEX_PEERS of each address family (libtorrent `ut_pex_plugin`'s
     // `m_peers`, `m_peers6`).
@@ -955,6 +961,7 @@ impl LivePeerState {
             supports_holepunch: false,
             supports_upload_only: false,
             upload_only: false,
+            last_seen_complete: None,
             pex_named: HashSet::new(),
             pex_arrivals: [None; PEX_FLOOD_MESSAGES],
             dht_port: None,

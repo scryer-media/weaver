@@ -11,7 +11,7 @@ use crate::bencode::BencodeValue;
 use crate::bencode::bencode_serialize_to_writer;
 use crate::buffers::ByteBuf;
 use crate::buffers::ByteBufT;
-use byteorder::WriteBytesExt;
+use byteorder::{BE, WriteBytesExt};
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use ut_holepunch::UtHolepunch;
@@ -38,6 +38,10 @@ use super::MY_EXTENDED_UT_METADATA;
 /// `bt_peer_connection::upload_only_msg` is 3, our ut_metadata's id).
 pub const MY_EXTENDED_UPLOAD_ONLY: u8 = 2;
 
+/// The id we name for lt_donthave (libtorrent
+/// `bt_peer_connection::dont_have_msg`).
+pub const MY_EXTENDED_LT_DONTHAVE: u8 = 7;
+
 // An extension we do not speak has no entry in `m` (libtorrent
 // `bt_peer_connection::write_handshake` lists the loaded plugins only).
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +54,8 @@ pub struct PeerExtendedMessageIds {
     pub ut_holepunch: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_only: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lt_donthave: Option<u8>,
 }
 
 impl PeerExtendedMessageIds {
@@ -59,6 +65,7 @@ impl PeerExtendedMessageIds {
             ut_pex: Some(MY_EXTENDED_UT_PEX),
             ut_holepunch: None,
             upload_only: Some(MY_EXTENDED_UPLOAD_ONLY),
+            lt_donthave: Some(MY_EXTENDED_LT_DONTHAVE),
         }
     }
 }
@@ -72,6 +79,9 @@ pub enum ExtendedMessage<ByteBuf: ByteBufT> {
     /// We only upload the torrent, or no longer only do: one byte, 1 or 0
     /// (libtorrent `bt_peer_connection::write_upload_only`).
     UploadOnly(bool),
+    /// The sender no longer has the piece of this index: four bytes, big
+    /// endian (libtorrent `bt_peer_connection::write_dont_have`).
+    DontHave(u32),
     Dyn(u8, BencodeValue<ByteBuf>),
 }
 
@@ -119,6 +129,13 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 out.write_u8(emsg_id)?;
                 out.write_u8(u8::from(*enabled))?;
             }
+            ExtendedMessage::DontHave(index) => {
+                let emsg_id = peer_extended_msg_ids()
+                    .lt_donthave
+                    .ok_or(SerializeError::NeedDontHave)?;
+                out.write_u8(emsg_id)?;
+                out.write_u32::<BE>(*index)?;
+            }
         }
         Ok(out.position() as usize)
     }
@@ -158,6 +175,18 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 _ => Err(MessageDeserializeError::IncorrectMsgLen {
                     received: buf.len() as u32 + 1,
                     expected: 2,
+                    msg_id,
+                }),
+            },
+            // A piece index, four bytes (libtorrent
+            // `bt_peer_connection::on_extended`, `dont_have_msg`).
+            MY_EXTENDED_LT_DONTHAVE => match buf.get_contiguous(buf.len()) {
+                Some(&[a, b, c, d]) => {
+                    Ok(ExtendedMessage::DontHave(u32::from_be_bytes([a, b, c, d])))
+                }
+                _ => Err(MessageDeserializeError::IncorrectMsgLen {
+                    received: buf.len() as u32 + 1,
+                    expected: 5,
                     msg_id,
                 }),
             },
@@ -306,6 +335,38 @@ mod tests {
             ExtendedMessage::UploadOnly(true)
         );
         for bad in [&[2][..], &[2, 1, 1]] {
+            assert!(matches!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])),
+                Err(MessageDeserializeError::IncorrectMsgLen { .. })
+            ));
+        }
+    }
+
+    // libtorrent `bt_peer_connection::write_dont_have` and `on_extended`:
+    // the id the peer named for lt_donthave, then the piece index in four
+    // bytes; read under our id, a message of another size is not one.
+    #[test]
+    fn dont_have_is_a_piece_index_under_the_peers_id() {
+        let mut buf = [0u8; 8];
+        let ids = || PeerExtendedMessageIds {
+            lt_donthave: Some(9),
+            ..Default::default()
+        };
+        let sz = ExtendedMessage::<ByteBuf>::DontHave(0x0102_0304)
+            .serialize(&mut buf, &ids)
+            .unwrap();
+        assert_eq!(buf[..sz], [9, 1, 2, 3, 4]);
+        let res = ExtendedMessage::<ByteBuf>::DontHave(1)
+            .serialize(&mut buf, &PeerExtendedMessageIds::default);
+        assert!(matches!(res, Err(SerializeError::NeedDontHave)));
+
+        let msg = ExtendedMessage::<ByteBuf>::DontHave(0x0102_0304);
+        let sz = msg
+            .serialize(&mut buf, &PeerExtendedMessageIds::my)
+            .unwrap();
+        let de = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf[..sz], &[])).unwrap();
+        assert_eq!(de, msg);
+        for bad in [&[7, 1, 2, 3][..], &[7, 1, 2, 3, 4, 5]] {
             assert!(matches!(
                 ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])),
                 Err(MessageDeserializeError::IncorrectMsgLen { .. })

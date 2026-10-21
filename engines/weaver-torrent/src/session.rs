@@ -103,6 +103,10 @@ use tokio_util::{
 };
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 
+pub(crate) mod external_ip;
+
+use external_ip::ExternalIps;
+
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
@@ -252,6 +256,8 @@ pub struct Session {
     identity: Identity,
     announce_port: Arc<AnnouncePort>,
     listen_addr: Option<SocketAddr>,
+    // Our address as the internet sees it, one for each family.
+    pub(crate) external_ips: Arc<ExternalIps>,
     // Our own addresses a private torrent's HTTP announces name.
     own_ips: AnnounceIps,
     dht: Option<Dht>,
@@ -307,21 +313,27 @@ pub struct Session {
 }
 
 /// Our own addresses as an announce names them (BEP 7 `ipv4=`/`ipv6=`),
-/// read when each announce goes out: the listen address, or for one that
-/// is unspecified, the addresses of the host's interfaces of the families
-/// it accepts (libtorrent `expand_unspecified_address`, re-run as the
-/// interfaces change), each neither local nor loopback
+/// read when each announce goes out: our external address of each family
+/// the listener accepts, then the listen address, or for one that is
+/// unspecified, the addresses of the host's interfaces of those families
+/// (libtorrent `expand_unspecified_address`, re-run as the interfaces
+/// change), each neither local nor loopback
 /// (`torrent::build_tracker_request`). A listener of a socket factory
 /// stands where libtorrent's proxy listen socket does: unspecified, it is
 /// never expanded, since the host's interfaces are not where peers reach
 /// it.
-fn own_ips(listen: Option<SocketAddr>, socket_factory: bool) -> AnnounceIps {
+fn own_ips(
+    listen: Option<SocketAddr>,
+    socket_factory: bool,
+    external: Arc<ExternalIps>,
+) -> AnnounceIps {
     let Some(listen) = listen else {
         return Arc::new(Vec::new);
     };
     if !listen.ip().is_unspecified() || socket_factory {
-        let ips = announced_ips(listen.ip(), std::iter::empty());
-        return Arc::new(move || ips.clone());
+        return Arc::new(move || {
+            announced_ips(listen.ip(), external.get().into_iter(), std::iter::empty())
+        });
     }
     Arc::new(move || {
         use network_interface::{NetworkInterface, NetworkInterfaceConfig};
@@ -334,6 +346,7 @@ fn own_ips(listen: Option<SocketAddr>, socket_factory: bool) -> AnnounceIps {
         };
         announced_ips(
             listen.ip(),
+            external.get().into_iter(),
             interfaces
                 .iter()
                 .flat_map(|nic| nic.addr.iter().map(|a| a.ip())),
@@ -341,20 +354,26 @@ fn own_ips(listen: Option<SocketAddr>, socket_factory: bool) -> AnnounceIps {
     })
 }
 
-/// The addresses of `listen`, or for one that is unspecified, of the
-/// `interfaces` of the families it accepts (an IPv6 one is dual-stack), that
-/// an announce may name: neither unspecified, local nor loopback.
-fn announced_ips(listen: IpAddr, interfaces: impl Iterator<Item = IpAddr>) -> Vec<IpAddr> {
+/// Of our `external` addresses and those of `listen`, or for one that is
+/// unspecified, of the `interfaces`, the ones of the families it accepts
+/// (an unspecified IPv6 one is dual-stack) that an announce may name:
+/// neither unspecified, local nor loopback.
+fn announced_ips(
+    listen: IpAddr,
+    external: impl Iterator<Item = IpAddr>,
+    interfaces: impl Iterator<Item = IpAddr>,
+) -> Vec<IpAddr> {
     use crate::torrent_state::live::peers::holepunch::is_local;
-    let ips: Vec<IpAddr> = if listen.is_unspecified() {
-        interfaces
-            .filter(|ip| listen.is_ipv6() || ip.is_ipv4())
-            .collect()
+    let accepts = |ip: &IpAddr| {
+        ip.is_ipv4() == listen.is_ipv4() || (listen.is_ipv6() && listen.is_unspecified())
+    };
+    let ips = external.chain(if listen.is_unspecified() {
+        interfaces.collect()
     } else {
         vec![listen]
-    };
+    });
     let mut named = Vec::new();
-    for ip in ips.into_iter().map(|ip| ip.to_canonical()) {
+    for ip in ips.filter(accepts).map(|ip| ip.to_canonical()) {
         if !ip.is_unspecified() && !ip.is_loopback() && !is_local(ip) && !named.contains(&ip) {
             named.push(ip);
         }
@@ -1228,6 +1247,7 @@ impl Session {
                 }
             };
 
+            let external_ips = Arc::new(ExternalIps::new(tokio::time::Instant::now()));
             let session = Arc::new(Self {
                 persistence,
                 bitv_factory,
@@ -1248,7 +1268,9 @@ impl Session {
                 own_ips: own_ips(
                     listen_result.as_ref().map(|l| l.addr),
                     opts.socket_factory.is_some(),
+                    external_ips.clone(),
                 ),
+                external_ips,
                 utp: listen_result
                     .as_ref()
                     .is_some_and(|l| l.utp_socket.is_some()),
@@ -1545,8 +1567,8 @@ impl Session {
 
     /// Keep the listen port mapped on the gateway over UPnP and over PCP /
     /// NAT-PMP at once (libtorrent `session_impl::start_upnp` and
-    /// `start_natpmp`), and announce the TCP port a mapper got
-    /// (`on_port_mapping`).
+    /// `start_natpmp`), announce the TCP port a mapper got, and count the
+    /// address the gateway gave as the router's vote (`on_port_mapping`).
     fn start_port_mapping(
         &self,
         requests: Vec<PortMapRequest>,
@@ -1577,6 +1599,7 @@ impl Session {
             Err(e) => debug!("no gateway for NAT-PMP / PCP: {e:#}"),
         }
         let announce_port = self.announce_port.clone();
+        let external_ips = self.external_ips.clone();
         self.spawn_port_mapper("port_mapping", async move {
             while let Some(event) = events.recv().await {
                 match &event.error {
@@ -1586,6 +1609,7 @@ impl Session {
                     }
                 }
                 announce_port.on_port_mapping(&event);
+                external_ips.on_port_mapping(&event, tokio::time::Instant::now());
             }
             Ok(())
         });
@@ -2767,13 +2791,13 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, sync::Arc};
 
     use bytes::Bytes;
     use tempfile::TempDir;
 
     use super::{
-        AddTorrent, AddTorrentOptions, AddTorrentResponse, Session, SessionOptions,
+        AddTorrent, AddTorrentOptions, AddTorrentResponse, ExternalIps, Session, SessionOptions,
         TorrentIdOrHash, is_bare_info_hash, merge_tracker_tiers, metainfo_tracker_tiers,
         torrent_file_from_info_bytes, torrent_from_bytes,
     };
@@ -2813,27 +2837,72 @@ mod tests {
             .into_iter()
             .map(ip)
         };
+        let none = std::iter::empty;
         // A listener on one address names it, whatever the interfaces.
         assert_eq!(
-            announced_ips(ip("203.0.113.9"), nics()),
+            announced_ips(ip("203.0.113.9"), none(), nics()),
             [ip("203.0.113.9")]
         );
-        assert_eq!(announced_ips(ip("10.0.0.2"), nics()), [] as [IpAddr; 0]);
-        assert_eq!(announced_ips(ip("::1"), nics()), [] as [IpAddr; 0]);
+        assert_eq!(
+            announced_ips(ip("10.0.0.2"), none(), nics()),
+            [] as [IpAddr; 0]
+        );
+        assert_eq!(announced_ips(ip("::1"), none(), nics()), [] as [IpAddr; 0]);
         // Unspecified: the interfaces of its families, neither local nor
         // loopback; an IPv6 listener takes IPv4 too.
-        assert_eq!(announced_ips(ip("0.0.0.0"), nics()), [ip("198.51.100.7")]);
         assert_eq!(
-            announced_ips(ip("::"), nics()),
+            announced_ips(ip("0.0.0.0"), none(), nics()),
+            [ip("198.51.100.7")]
+        );
+        assert_eq!(
+            announced_ips(ip("::"), none(), nics()),
             [ip("198.51.100.7"), ip("2001:db8::7"), ip("203.0.113.5")]
         );
         // A socket factory's unspecified listener is never expanded; no
         // listener names nothing.
+        let external = || Arc::new(ExternalIps::new(tokio::time::Instant::now()));
         let any: SocketAddr = "[::]:6881".parse().unwrap();
-        assert_eq!(own_ips(Some(any), true)(), [] as [IpAddr; 0]);
-        assert_eq!(own_ips(None, false)(), [] as [IpAddr; 0]);
+        assert_eq!(own_ips(Some(any), true, external())(), [] as [IpAddr; 0]);
+        assert_eq!(own_ips(None, false, external())(), [] as [IpAddr; 0]);
         let one: SocketAddr = "198.51.100.8:6881".parse().unwrap();
-        assert_eq!(own_ips(Some(one), true)(), [ip("198.51.100.8")]);
+        assert_eq!(own_ips(Some(one), true, external())(), [ip("198.51.100.8")]);
+    }
+
+    #[test]
+    fn an_announce_names_our_external_address_of_each_family_the_listener_takes() {
+        // libtorrent session_impl::set_external_address keeps one external
+        // address to a listen socket, and so to a family.
+        use super::external_ip::Voter;
+        use super::{announced_ips, own_ips};
+        use std::net::{IpAddr, SocketAddr};
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let now = tokio::time::Instant::now();
+        let external = Arc::new(ExternalIps::new(now));
+        external.cast_vote(ip("203.0.113.5"), Voter::Peer(ip("198.51.100.1")), now);
+        external.cast_vote(ip("2001:db8::5"), Voter::Peer(ip("2001:db8::1")), now);
+        let nics = || ["192.168.1.9", "198.51.100.7"].into_iter().map(ip);
+        assert_eq!(
+            announced_ips(ip("0.0.0.0"), external.get().into_iter(), nics()),
+            [ip("203.0.113.5"), ip("198.51.100.7")]
+        );
+        assert_eq!(
+            announced_ips(ip("::"), external.get().into_iter(), nics()),
+            [ip("203.0.113.5"), ip("2001:db8::5"), ip("198.51.100.7")]
+        );
+        // An address of ours named twice is named once.
+        let on_it: SocketAddr = "203.0.113.5:6881".parse().unwrap();
+        assert_eq!(
+            own_ips(Some(on_it), false, external.clone())(),
+            [ip("203.0.113.5")]
+        );
+        // The set is read as each announce goes out: a later address is in
+        // the next one.
+        let behind_nat: SocketAddr = "10.0.0.2:6881".parse().unwrap();
+        let later = Arc::new(ExternalIps::new(now));
+        let named = own_ips(Some(behind_nat), false, later.clone());
+        assert_eq!(named(), [] as [IpAddr; 0]);
+        later.cast_vote(ip("203.0.113.9"), Voter::Peer(ip("198.51.100.1")), now);
+        assert_eq!(named(), [ip("203.0.113.9")]);
     }
 
     #[test]

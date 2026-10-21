@@ -756,6 +756,20 @@ impl PeerStates {
         })
     }
 
+    /// The peer sent DONT_HAVE for `piece`: it leaves the peer's pieces and
+    /// the availability, and a seeder is one no longer (libtorrent
+    /// `peer_connection::incoming_dont_have`, `torrent::peer_lost`). One
+    /// for a piece the peer does not have changes nothing.
+    pub fn peer_lost(&self, handle: PeerHandle, piece: ValidPieceIndex) -> Option<()> {
+        self.with_live_mut(handle, "peer_lost", |live| {
+            if !live.bitfield.replace(piece.get_usize(), false) {
+                return;
+            }
+            self.availability.peer_lost(piece.get_usize());
+            self.update_seeder_flag(live);
+        })
+    }
+
     // Recompute the cached "this peer has the full torrent" flag after its bitfield
     // changed, keeping the aggregate seeder counters in sync. Must be called on every
     // bitfield change of a live peer.

@@ -1004,6 +1004,61 @@ async fn have_all_and_have_none_are_bitfields_of_every_piece_and_of_none() {
     assert_eq!(h.peers.availability.counts(), [1, 1]);
 }
 
+fn dont_have(index: u32) -> Message<'static> {
+    Message::Extended(ExtendedMessage::DontHave(index))
+}
+
+// libtorrent `peer_connection::incoming_dont_have` into `torrent::peer_lost`:
+// a DONT_HAVE takes the piece out of the peer's pieces and the
+// availability; one for a piece the peer lacks, or past the last piece,
+// changes nothing.
+#[tokio::test]
+async fn a_dont_have_after_a_have_leaves_availability_as_before_the_have() {
+    let h = Harness::new("dont_have_after_have").await;
+    let (peer, _rx) = h.new_peer("127.0.0.1:6881");
+    let peer = &peer;
+    let before = h.peers.availability.counts();
+    peer.on_received_message(Message::Have(1)).await.unwrap();
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+    peer.on_received_message(dont_have(1)).await.unwrap();
+    assert_eq!(h.peers.availability.counts(), before);
+    for index in [1, 0, 2, u32::MAX] {
+        peer.on_received_message(dont_have(index)).await.unwrap();
+    }
+    assert_eq!(h.peers.availability.counts(), before);
+    let pieces = h.peers.with_live(peer.addr, |live| live.bitfield.clone());
+    assert!(pieces.unwrap().not_any());
+}
+
+// libtorrent `peer_connection::incoming_dont_have`: a seed that loses a
+// piece is a seed no longer (`torrent::set_seed`), by the same flag a HAVE
+// sets.
+#[tokio::test]
+async fn a_seeder_that_sends_dont_have_is_no_seeder() {
+    let h = Harness::new("dont_have_seeder").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    let seeder = || h.peers.with_live(peer.addr, |live| live.seeder).unwrap();
+    assert!(seeder());
+    peer.on_received_message(dont_have(0)).await.unwrap();
+    assert!(!seeder());
+    assert_eq!(h.peers.availability.counts(), [0, 1]);
+    peer.on_received_message(Message::Have(0)).await.unwrap();
+    assert!(seeder());
+}
+
+// libtorrent `bt_peer_connection::write_extensions` names lt_donthave in
+// `m`.
+#[tokio::test]
+async fn the_extended_handshake_offers_lt_donthave() {
+    let h = Harness::new("offers_lt_donthave").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    assert_eq!(
+        h.advertised(&peer).lt_donthave,
+        Some(extended::MY_EXTENDED_LT_DONTHAVE)
+    );
+}
+
 #[tokio::test]
 async fn a_fast_connection_opens_with_have_all_have_none_or_a_bitfield() {
     let seeding = Harness::seeding("opens_seeding").await;
@@ -4614,6 +4669,135 @@ async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
         h.peers.pex_listed().into_keys().collect::<Vec<_>>(),
         [listen]
     );
+}
+
+// libtorrent `bt_peer_connection::on_extended_handshake`: a peer's `yourip`
+// is its vote on our external address (`session_impl::set_external_address`),
+// one address to a family.
+#[tokio::test(start_paused = true)]
+async fn a_peers_yourip_is_its_vote_on_the_sessions_external_address() {
+    let h = Harness::new("yourip_votes").await;
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    let says = |s: &str| ExtendedHandshake {
+        yourip: Some(ip(s).into()),
+        ..Default::default()
+    };
+    let (first, _first_rx) = h.peer("198.51.100.1:6881");
+    let (second, _second_rx) = h.peer("198.51.100.2:6881");
+    let (third, _third_rx) = h.peer("198.51.100.3:6881");
+    let (v6, _v6_rx) = h.peer("[2001:db8::1]:6881");
+    // A loopback address, or one of the other family, is no vote.
+    (&first).on_extended_handshake(&says("127.0.0.1")).unwrap();
+    (&first)
+        .on_extended_handshake(&says("2001:db8::5"))
+        .unwrap();
+    assert_eq!(h._session.external_ips.get(), [] as [std::net::IpAddr; 0]);
+    (&first)
+        .on_extended_handshake(&says("203.0.113.5"))
+        .unwrap();
+    (&second)
+        .on_extended_handshake(&says("203.0.113.9"))
+        .unwrap();
+    (&third)
+        .on_extended_handshake(&says("203.0.113.5"))
+        .unwrap();
+    (&v6).on_extended_handshake(&says("2001:db8::5")).unwrap();
+    assert_eq!(
+        h._session.external_ips.get(),
+        [ip("203.0.113.5"), ip("2001:db8::5")]
+    );
+}
+
+// libtorrent `bt_peer_connection::write_extensions` sends `complete_ago`,
+// the seconds since the torrent last saw a complete copy, -1 for never; a
+// seed sees its own (`torrent::time_since_complete`).
+#[tokio::test(start_paused = true)]
+async fn the_extended_handshake_says_how_long_ago_we_saw_a_complete_copy() {
+    let ours = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.complete_ago
+    };
+    let h = Harness::new("complete_ago_never").await;
+    let (peer, _rx) = h.new_peer("127.0.0.1:6881");
+    assert_eq!(h.complete_ago(), None);
+    assert_eq!(ours(&peer), Some(-1));
+
+    let seed = Harness::seeding("complete_ago_seed").await;
+    let (peer, _rx) = seed.new_peer("127.0.0.1:6881");
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(ours(&peer), Some(0));
+}
+
+// libtorrent `bt_peer_connection::on_extended_handshake` takes a peer's
+// `complete_ago` (`peer_connection::set_last_seen_complete`), a negative
+// one none, and `torrent::second_tick` keeps the latest of ours and the
+// peers' as the swarm's (`m_swarm_last_seen_complete`), for status only:
+// what we send is our own sighting (`torrent::time_since_complete`).
+#[tokio::test(start_paused = true)]
+async fn a_peers_complete_ago_is_the_swarms_status_never_what_we_send() {
+    let h = Harness::new("complete_ago_theirs").await;
+    let (first, _first_rx) = h.new_peer("127.0.0.1:6881");
+    let (second, _second_rx) = h.new_peer("127.0.0.2:6881");
+    let says = |ago| ExtendedHandshake {
+        complete_ago: Some(ago),
+        ..Default::default()
+    };
+    let ours = || {
+        let mut hs = ExtendedHandshake::new();
+        (&first).update_my_extended_handshake(&mut hs).unwrap();
+        hs.complete_ago
+    };
+    (&first).on_extended_handshake(&says(-1)).unwrap();
+    assert_eq!(h.swarm_complete_ago(), None);
+    (&first).on_extended_handshake(&says(30)).unwrap();
+    (&second).on_extended_handshake(&says(100)).unwrap();
+    assert_eq!(h.swarm_complete_ago(), Some(Duration::from_secs(30)));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(h.swarm_complete_ago(), Some(Duration::from_secs(40)));
+    assert_eq!(h.complete_ago(), None);
+    assert_eq!(ours(), Some(-1));
+
+    // A seed's own copy is the swarm's latest too.
+    let seed = Harness::seeding("complete_ago_theirs_seed").await;
+    let (peer, _rx) = seed.new_peer("127.0.0.1:6881");
+    (&peer).on_extended_handshake(&says(30)).unwrap();
+    assert_eq!(seed.swarm_complete_ago(), Some(Duration::ZERO));
+}
+
+// libtorrent `peer_connection::on_receive_data` and `incoming_have`: a seed
+// that has sent us data is a complete copy seen each time it sends; one
+// that has sent none is only its word.
+#[tokio::test(start_paused = true)]
+async fn a_seed_that_sent_us_data_is_a_complete_copy_seen() {
+    let h = Harness::new("complete_ago_seed_peer").await;
+    let (seed, mut rx) = h.peer("127.0.0.1:6881");
+    (&seed)
+        .on_received_message(Message::KeepAlive)
+        .await
+        .unwrap();
+    assert_eq!(h.complete_ago(), None);
+
+    let mut requester: Task<'_> = Box::pin(seed.request_chunks());
+    seed.on_i_am_unchoked();
+    let (index, begin) = *next_requests(&mut requester, &mut rx, 4)
+        .await
+        .first()
+        .unwrap();
+    let start = (index * PIECE_LENGTH + begin) as usize;
+    let block = &h.content[start..start + CHUNK_SIZE as usize];
+    (&seed)
+        .on_received_message(Message::Piece(Piece::from_data(index, begin, block)))
+        .await
+        .unwrap();
+    assert_eq!(h.complete_ago(), Some(Duration::ZERO));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(h.complete_ago(), Some(Duration::from_secs(10)));
+    (&seed)
+        .on_received_message(Message::KeepAlive)
+        .await
+        .unwrap();
+    assert_eq!(h.complete_ago(), Some(Duration::ZERO));
 }
 
 // libtorrent `piece_picker::inc_refcount` and `dec_refcount`: a HAVE and a

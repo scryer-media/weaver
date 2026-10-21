@@ -58,6 +58,11 @@ impl Availability {
         self.log(1, std::iter::once(piece));
     }
 
+    pub(super) fn peer_lost(&self, piece: usize) {
+        atomic_dec(&self.counts[piece]);
+        self.log(1, std::iter::once(piece));
+    }
+
     pub(super) fn add(&self, bitfield: &BS) {
         for piece in bitfield.iter_ones() {
             atomic_inc(&self.counts[piece]);
