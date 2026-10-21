@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use anyhow::Context;
 
-use crate::core::hash_id::{Id20, Id32};
+use crate::core::hash_id::{Id20, Id32, InfoHashes};
 
 /// A parsed magnet link.
 pub struct Magnet {
@@ -33,6 +33,15 @@ impl Magnet {
 
     pub fn as_id32(&self) -> Option<Id32> {
         self.id32
+    }
+
+    /// The hashes the link names: a btih alone may be a v2 torrent's
+    /// truncated hash, which its metadata settles.
+    pub fn info_hashes(&self) -> InfoHashes {
+        InfoHashes {
+            v1: self.id20,
+            v2: self.id32,
+        }
     }
     pub fn get_select_only(&self) -> Option<Vec<usize>> {
         self.select_only.clone()
@@ -96,13 +105,15 @@ impl Magnet {
                         let i = Id20::from_str(ih)?;
                         id20.replace(i);
                         info_hash_found = true;
-                    } else if let Some(ih) = value.as_ref().strip_prefix("urn:btmh:1220") {
+                    } else if let Some(ih) = value.as_ref().strip_prefix("urn:btmh:") {
+                        // A SHA-256 multihash in hex (libtorrent `parse_magnet_uri`).
+                        let ih = ih.strip_prefix("1220").context("btmh is not SHA-256")?;
+                        anyhow::ensure!(ih.len() == 64, "btmh is not 64 hex digits");
                         let i = Id32::from_str(ih)?;
                         id32.replace(i);
                         info_hash_found = true;
-                    } else {
-                        anyhow::bail!("expected xt to start with btih or btmh");
                     }
+                    // Any other xt names nothing a torrent is found by.
                 }
                 "tr" => trackers.push(value.into()),
                 "dn" if !value.is_empty() => name = Some(value.into_owned()),
@@ -216,6 +227,35 @@ mod tests {
                 .unwrap();
         let m = Magnet::parse(magnet).unwrap();
         assert!(m.as_id32() == Some(info_hash));
+    }
+
+    #[test]
+    fn v2_and_hybrid_links_parse_as_libtorrent_parses_them() {
+        // libtorrent test_magnet.cpp parse_v2_hash, parse_v2_short_hash,
+        // parse_v2_invalid_hash_prefix, parse_v2_invalid_hex_hash,
+        // parse_hybrid_uri.
+        let cd32 = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let cd20 = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let m = Magnet::parse(&format!("magnet:?xt=urn:btmh:1220{cd32}")).unwrap();
+        assert_eq!(m.info_hashes().v2.unwrap().as_string(), cd32);
+        assert_eq!(m.info_hashes().v1, None);
+        for bad in [
+            "magnet:?xt=urn:btmh:1220cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdccdcdcdcdcdcdcd",
+            "magnet:?xt=urn:btmh:1221cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            "magnet:?xt=urn:btmh:1220zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            assert!(Magnet::parse(bad).is_err(), "{bad}");
+        }
+        let m = Magnet::parse(&format!(
+            "magnet:?xt=urn:btmh:1220{cd32}&xt=urn:btih:{cd20}"
+        ))
+        .unwrap();
+        assert_eq!(m.info_hashes().v1.unwrap().as_string(), cd20);
+        assert_eq!(m.info_hashes().v2.unwrap().as_string(), cd32);
+        // An xt of another kind is passed over.
+        let m = Magnet::parse(&format!("magnet:?xt=urn:sha1:abc&xt=urn:btih:{cd20}")).unwrap();
+        assert_eq!(m.info_hashes().v1.unwrap().as_string(), cd20);
+        assert!(Magnet::parse("magnet:?xt=urn:sha1:abc").is_err());
     }
 
     #[test]

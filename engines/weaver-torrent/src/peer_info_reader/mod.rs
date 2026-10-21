@@ -11,7 +11,7 @@ use crate::bencode::from_bytes;
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::core::{
     constants::CHUNK_SIZE,
-    hash_id::Id20,
+    hash_id::{Id20, InfoHashes},
     lengths::{ChunkInfo, last_element_size},
     torrent_metainfo::TorrentMetaV1Info,
 };
@@ -23,7 +23,6 @@ use crate::peer_protocol::{
         ut_metadata::{UtMetadata, UtMetadataData},
     },
 };
-use crate::sha1w::{ISha1, Sha1};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc::UnboundedSender;
@@ -40,7 +39,7 @@ use crate::{
 pub(crate) async fn read_metainfo_from_peer(
     addr: SocketAddr,
     peer_id: Id20,
-    info_hash: Id20,
+    info_hashes: InfoHashes,
     peer_connection_options: Option<PeerConnectionOptions>,
     spawner: BlockingSpawner,
     connector: Arc<StreamConnector>,
@@ -52,7 +51,7 @@ pub(crate) async fn read_metainfo_from_peer(
     let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel::<WriterRequest>();
     let handler = Handler {
         addr,
-        info_hash,
+        info_hashes,
         writer_tx,
         result_tx: Mutex::new(Some(result_tx)),
         locked: RwLock::new(None),
@@ -60,7 +59,7 @@ pub(crate) async fn read_metainfo_from_peer(
     };
     let connection = PeerConnection::new(
         addr,
-        info_hash,
+        info_hashes,
         peer_id,
         handler,
         peer_connection_options,
@@ -117,7 +116,7 @@ impl HandlerLocked {
     fn record_piece(
         &mut self,
         d: &UtMetadataData<ByteBuf>,
-        info_hash: &Id20,
+        info_hashes: &InfoHashes,
     ) -> anyhow::Result<bool> {
         let piece = d.piece();
         if piece as usize >= self.total_pieces {
@@ -140,10 +139,7 @@ impl HandlerLocked {
         self.received_pieces[piece as usize] = true;
 
         if self.received_pieces.iter().all(|p| *p) {
-            // check metadata
-            let mut hash = Sha1::new();
-            hash.update(&self.buffer);
-            if hash.finish() != info_hash.0 {
+            if !info_hashes.matches_info(&self.buffer) {
                 anyhow::bail!("info checksum invalid");
             }
             Ok(true)
@@ -157,7 +153,7 @@ pub type TorrentAndInfoBytes = (TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned);
 
 struct Handler {
     addr: SocketAddr,
-    info_hash: Id20,
+    info_hashes: InfoHashes,
     writer_tx: UnboundedSender<WriterRequest>,
     result_tx: Mutex<
         Option<
@@ -197,7 +193,7 @@ impl PeerConnectionHandler for Handler {
                 .write()
                 .as_mut()
                 .unwrap()
-                .record_piece(&utdata, &self.info_hash)?;
+                .record_piece(&utdata, &self.info_hashes)?;
             if piece_ready {
                 let buf = Bytes::from(self.locked.write().take().unwrap().buffer);
                 let info = from_bytes::<TorrentMetaV1Info<ByteBuf>>(&buf)

@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::buffers::ByteBufOwned;
-use crate::core::hash_id::{Id20, Id32};
+use crate::core::hash_id::{Id20, Id32, InfoHashes};
 use crate::core::lengths::{Lengths, ValidPieceIndex};
 use crate::core::torrent_metainfo::TorrentMetaV1Owned;
 use crate::v2_hashes::V2Hashes;
@@ -149,6 +149,8 @@ pub struct TorrentMetadata {
     pub info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
     pub torrent_bytes: Bytes,
     pub info_bytes: Bytes,
+    /// The hashes of `info_bytes`: v1, v2 or both.
+    pub info_hashes: InfoHashes,
     pub file_infos: FileInfos,
     /// The v2 hashes of a v2 or hybrid torrent.
     pub(crate) v2: Option<V2Hashes>,
@@ -178,6 +180,7 @@ impl TorrentMetadata {
             .collect::<anyhow::Result<Vec<FileInfo>>>()?;
 
         Ok(Self {
+            info_hashes: info.info().check_info_bytes(&info_bytes)?,
             v2: V2Hashes::new(&info, layers),
             info,
             torrent_bytes,
@@ -224,7 +227,10 @@ impl TorrentMetadata {
 // of stuff, but it shouldn't access the state.
 pub struct ManagedTorrentShared {
     pub id: TorrentId,
+    /// The hash the torrent is known by, `info_hashes.best()`.
     pub info_hash: Id20,
+    /// Every hash the torrent answers to and announces under.
+    pub info_hashes: InfoHashes,
     pub(crate) spawner: BlockingSpawner,
     /// Every tracker in `tracker_tiers`.
     pub trackers: HashSet<url::Url>,
@@ -310,6 +316,11 @@ impl ManagedTorrent {
 
     pub fn info_hash(&self) -> Id20 {
         self.shared.info_hash
+    }
+
+    /// The torrent's v1 and v2 hashes.
+    pub fn info_hashes(&self) -> InfoHashes {
+        self.shared.info_hashes
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {

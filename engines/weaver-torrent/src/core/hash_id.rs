@@ -209,16 +209,18 @@ pub struct InfoHashes {
 }
 
 impl InfoHashes {
-    /// The 20-byte hash the torrent goes by on the wire, in trackers and
-    /// in the DHT: the v1 hash, else the truncated v2 hash (libtorrent
-    /// `info_hash_t::get_best`).
+    /// The 20-byte hash Weaver knows the torrent by: the v1 hash, else the
+    /// truncated v2 hash. libtorrent's `info_hash_t::get_best` prefers v2;
+    /// Weaver keeps v1 so that a hybrid keeps the identity it had when only
+    /// its v1 half was read.
     pub fn best(&self) -> Id20 {
         self.v1
             .or_else(|| self.v2.map(|v2| v2.truncate_for_dht()))
             .unwrap_or_default()
     }
 
-    /// Every 20-byte hash the torrent answers to: v1 and the truncated v2.
+    /// Every 20-byte hash the torrent answers to and announces under: v1
+    /// and the truncated v2 (libtorrent `info_hash_t::for_each`).
     pub fn ids20(&self) -> impl Iterator<Item = Id20> + use<> {
         self.v1
             .into_iter()
@@ -228,6 +230,54 @@ impl InfoHashes {
     /// Whether `id` is one of the 20-byte hashes the torrent answers to.
     pub fn answers_to(&self, id: Id20) -> bool {
         self.ids20().any(|own| own == id)
+    }
+
+    /// Whether the two name a torrent in common.
+    pub fn overlaps(&self, other: &InfoHashes) -> bool {
+        other.ids20().any(|id| self.answers_to(id))
+    }
+
+    /// Whether `id` is the truncated v2 hash, which a peer that speaks v2
+    /// greets with (libtorrent `bt_peer_connection::on_receive_handshake`).
+    pub fn is_v2(&self, id: Id20) -> bool {
+        self.v2.is_some_and(|v2| v2.truncate_for_dht() == id)
+    }
+
+    /// The hash to greet a peer with: the truncated v2 hash for a peer that
+    /// speaks v2, else v1, and the truncated v2 hash when there is no v1
+    /// (libtorrent `peer_connection::associated_info_hash`).
+    pub fn for_peer(&self, speaks_v2: bool) -> Id20 {
+        match (self.v1, self.v2) {
+            (Some(v1), _) if !speaks_v2 || self.v2.is_none() => v1,
+            (_, Some(v2)) => v2.truncate_for_dht(),
+            _ => Id20::default(),
+        }
+    }
+
+    /// Whether a peer greeted with `sent` may answer with `got`: the same
+    /// hash, or the truncated v2 hash, which moves a hybrid's connection to
+    /// v2 (libtorrent `bt_peer_connection::on_receive_handshake`).
+    pub fn accepts_answer(&self, sent: Id20, got: Id20) -> bool {
+        got == sent || self.is_v2(got)
+    }
+
+    /// Whether `info_bytes` are this torrent's info dict: its SHA-1 is the
+    /// v1 hash, or its SHA-256 truncated is (a v2 torrent found by a btih
+    /// link), and its SHA-256 is the v2 hash (libtorrent
+    /// `torrent::set_metadata`).
+    pub fn matches_info(&self, info_bytes: &[u8]) -> bool {
+        use crate::sha1w::{ISha1, ISha256, Sha1, Sha256};
+        let sha256 = || {
+            let mut h = Sha256::new();
+            h.update(info_bytes);
+            Id32::new(h.finish())
+        };
+        let v1 = self.v1.is_none_or(|v1| {
+            let mut h = Sha1::new();
+            h.update(info_bytes);
+            Id20::new(h.finish()) == v1 || sha256().truncate_for_dht() == v1
+        });
+        v1 && self.v2.is_none_or(|v2| sha256() == v2)
     }
 }
 
@@ -278,6 +328,63 @@ mod tests {
                 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
             ])
         );
+    }
+
+    // libtorrent test_torrents/v2_hybrid.torrent's info dict.
+    fn hybrid_info() -> (Vec<u8>, InfoHashes) {
+        let bytes = include_bytes!("../../resources/test/libtorrent/v2_hybrid.torrent");
+        let meta = crate::core::torrent_metainfo::torrent_from_bytes(bytes).unwrap();
+        (meta.info.raw_bytes.0.to_vec(), meta.info_hashes)
+    }
+
+    #[test]
+    fn an_info_dict_matches_as_libtorrent_accepts_metadata() {
+        // libtorrent torrent::set_metadata: SHA-1 against v1, or SHA-256
+        // truncated against v1, and SHA-256 against v2.
+        let (info, both) = hybrid_info();
+        let v1 = both.v1.unwrap();
+        let v2 = both.v2.unwrap();
+        let only = |v1, v2| InfoHashes { v1, v2 };
+        assert!(both.matches_info(&info));
+        assert!(only(Some(v1), None).matches_info(&info));
+        assert!(only(None, Some(v2)).matches_info(&info));
+        assert!(only(Some(v2.truncate_for_dht()), None).matches_info(&info));
+        let mut other = v2;
+        other.0[0] ^= 1;
+        assert!(!only(Some(v1), Some(other)).matches_info(&info));
+        assert!(!only(Some(other.truncate_for_dht()), None).matches_info(&info));
+        assert!(!both.matches_info(&info[1..]));
+    }
+
+    #[test]
+    fn a_peer_is_greeted_with_the_hash_of_the_protocol_it_speaks() {
+        // libtorrent peer_connection::associated_info_hash and
+        // bt_peer_connection::on_receive_handshake.
+        let (_, both) = hybrid_info();
+        let v1 = both.v1.unwrap();
+        let v2 = both.v2.unwrap().truncate_for_dht();
+        assert_eq!(both.for_peer(false), v1);
+        assert_eq!(both.for_peer(true), v2);
+        let v2_only = InfoHashes {
+            v1: None,
+            v2: both.v2,
+        };
+        assert_eq!(v2_only.for_peer(false), v2);
+        assert_eq!(v2_only.for_peer(true), v2);
+        let v1_only = InfoHashes {
+            v1: Some(v1),
+            v2: None,
+        };
+        assert_eq!(v1_only.for_peer(true), v1);
+
+        assert!(both.accepts_answer(v1, v1));
+        assert!(both.accepts_answer(v1, v2));
+        assert!(!both.accepts_answer(v2, v1));
+        assert!(!v1_only.accepts_answer(v1, v2));
+        assert!(both.is_v2(v2) && !both.is_v2(v1));
+        assert_eq!(both.ids20().collect::<Vec<_>>(), [v1, v2]);
+        assert!(v2_only.overlaps(&both) && v1_only.overlaps(&both));
+        assert!(!v1_only.overlaps(&v2_only));
     }
 
     #[test]

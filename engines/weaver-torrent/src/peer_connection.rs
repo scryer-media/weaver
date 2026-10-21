@@ -12,7 +12,11 @@ use std::{
 };
 
 use crate::buffers::{ByteBuf, ByteBufOwned};
-use crate::core::{hash_id::Id20, lengths::ChunkInfo, peer_id::try_decode_peer_id};
+use crate::core::{
+    hash_id::{Id20, InfoHashes},
+    lengths::ChunkInfo,
+    peer_id::try_decode_peer_id,
+};
 use crate::peer_protocol::{
     Handshake, MAX_MSG_LEN, Message,
     extended::{
@@ -114,7 +118,7 @@ mod optional_seconds {
 pub(crate) struct PeerConnection<H> {
     handler: H,
     addr: SocketAddr,
-    info_hash: Id20,
+    info_hashes: InfoHashes,
     peer_id: Id20,
     options: PeerConnectionOptions,
     spawner: BlockingSpawner,
@@ -144,7 +148,7 @@ struct ManagePeerArgs {
 impl<H: PeerConnectionHandler> PeerConnection<H> {
     pub fn new(
         addr: SocketAddr,
-        info_hash: Id20,
+        info_hashes: InfoHashes,
         peer_id: Id20,
         handler: H,
         options: Option<PeerConnectionOptions>,
@@ -154,7 +158,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         PeerConnection {
             handler,
             addr,
-            info_hash,
+            info_hashes,
             peer_id,
             spawner,
             options: options.unwrap_or_default(),
@@ -176,7 +180,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .read_write_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
 
-        if incoming.handshake.info_hash != self.info_hash {
+        // A peer greeting with the truncated v2 hash speaks v2 and is
+        // answered with it (libtorrent `bt_peer_connection::on_receive_handshake`).
+        let greeted = incoming.handshake.info_hash;
+        if !self.info_hashes.answers_to(greeted) {
             return Err(Error::WrongInfoHash);
         }
 
@@ -190,7 +197,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         );
 
         let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-        let my_handshake = Handshake::new(self.info_hash, self.peer_id);
+        let my_handshake = Handshake::new(
+            self.info_hashes.for_peer(self.info_hashes.is_v2(greeted)),
+            self.peer_id,
+        );
         let hlen = my_handshake.serialize_unchecked_len(&mut *write_buf);
         with_timeout(
             "writing handshake",
@@ -235,7 +245,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .unwrap_or_else(|| Duration::from_secs(10));
 
         let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-        let handshake = Handshake::new(self.info_hash, self.peer_id);
+        // Every peer is greeted as v1 first, which a hybrid's v2 peers
+        // answer too (libtorrent `peer_connection::associated_info_hash`).
+        let greeting = self.info_hashes.for_peer(false);
+        let handshake = Handshake::new(greeting, self.peer_id);
         let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
 
         // Connecting includes sending our handshake: an encrypted connection
@@ -245,7 +258,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connector
             .connect_and_send_handshake(
                 self.addr,
-                &self.info_hash,
+                &greeting,
                 &write_buf[..hsz],
                 connect_timeout,
                 rwtimeout,
@@ -263,7 +276,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 decoded_id=?try_decode_peer_id(h.peer_id),
                 "connected",
             );
-            if h.info_hash != self.info_hash {
+            if !self.info_hashes.accepts_answer(greeting, h.info_hash) {
                 return Err(Error::WrongInfoHash);
             }
 

@@ -23,6 +23,7 @@ use crate::bencode::bencode_serialize_to_writer;
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
+    hash_id::InfoHashes,
     magnet::Magnet,
     peer_id::generate_azereus_style,
     spawn_utils::spawn_with_cancel,
@@ -635,7 +636,7 @@ pub(crate) struct CheckedIncomingConnection {
 }
 
 struct InternalAddResult {
-    info_hash: Id20,
+    info_hashes: InfoHashes,
     metadata: Option<TorrentMetadata>,
     tracker_tiers: Vec<Vec<url::Url>>,
     name: Option<String>,
@@ -1125,7 +1126,7 @@ impl Session {
                     .read()
                     .torrents
                     .values()
-                    .map(|t| t.info_hash())
+                    .flat_map(|t| t.info_hashes().ids20())
                     .collect()
             },
         )
@@ -1148,7 +1149,7 @@ impl Session {
             .read()
             .torrents
             .iter()
-            .find(|(_, t)| t.info_hash() == h.info_hash)
+            .find(|(_, t)| t.info_hashes().answers_to(h.info_hash))
             .map(|(id, t)| (*id, t.clone()))
             .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
 
@@ -1323,9 +1324,6 @@ impl Session {
                 {
                     let magnet = Magnet::parse(&magnet)
                         .context("provided path is not a valid magnet URL")?;
-                    let info_hash = magnet
-                        .as_id20()
-                        .context("magnet link didn't contain a BTv1 infohash")?;
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
                         if opts.only_files.is_none() {
@@ -1334,7 +1332,7 @@ impl Session {
                     }
 
                     InternalAddResult {
-                        info_hash,
+                        info_hashes: magnet.info_hashes(),
                         // Each tracker of a magnet link is a tier of its own.
                         tracker_tiers: merge_tracker_tiers(
                             magnet
@@ -1378,7 +1376,7 @@ impl Session {
                     );
 
                     InternalAddResult {
-                        info_hash: torrent.meta.info_hash,
+                        info_hashes: torrent.meta.info_hashes,
                         metadata: Some(TorrentMetadata::from_torrent(
                             torrent.meta,
                             torrent.torrent_bytes,
@@ -1444,7 +1442,7 @@ impl Session {
         mut opts: AddTorrentOptions,
     ) -> anyhow::Result<AddTorrentResponse> {
         let InternalAddResult {
-            info_hash,
+            info_hashes,
             metadata,
             tracker_tiers,
             name,
@@ -1452,7 +1450,7 @@ impl Session {
 
         let make_peer_rx = |private: bool| {
             self.make_peer_rx(
-                info_hash,
+                info_hashes,
                 tracker_tiers.clone(),
                 !opts.paused && !opts.list_only,
                 opts.force_tracker_interval,
@@ -1479,7 +1477,7 @@ impl Session {
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
                     let resolved_magnet = self
-                        .resolve_magnet(info_hash, peers, &tracker_tiers, opts.peer_opts)
+                        .resolve_magnet(info_hashes, peers, &tracker_tiers, opts.peer_opts)
                         .await?;
 
                     seen_peers = resolved_magnet.seen_peers.clone();
@@ -1507,6 +1505,9 @@ impl Session {
         };
 
         trace!("Torrent metadata: {:#?}", &metadata.info.info());
+        // A magnet link names some of the hashes; the metadata has them all.
+        let info_hashes = metadata.info_hashes;
+        let info_hash = info_hashes.best();
 
         let only_files = compute_only_files(
             &metadata.info,
@@ -1576,7 +1577,7 @@ impl Session {
         let (managed_torrent, metadata) = {
             let mut g = self.db.write();
             if let Some((id, handle)) = g.torrents.iter().find_map(|(eid, t)| {
-                if t.info_hash() == info_hash || *eid == id {
+                if t.info_hashes().overlaps(&info_hashes) || *eid == id {
                     Some((*eid, t.clone()))
                 } else {
                     None
@@ -1592,6 +1593,7 @@ impl Session {
                 id,
                 span,
                 info_hash,
+                info_hashes,
                 trackers: tracker_tiers.iter().flatten().cloned().collect(),
                 tracker_tiers,
                 spawner: self.spawner.clone(),
@@ -1666,7 +1668,7 @@ impl Session {
         match id {
             TorrentIdOrHash::Id(id) => self.db.read().torrents.get(&id).cloned(),
             TorrentIdOrHash::Hash(id) => self.db.read().torrents.iter().find_map(|(_, v)| {
-                if v.info_hash() == id {
+                if v.info_hashes().answers_to(id) {
                     Some(v.clone())
                 } else {
                     None
@@ -1684,7 +1686,7 @@ impl Session {
                 .torrents
                 .values()
                 .find_map(|v| {
-                    if v.info_hash() == h {
+                    if v.info_hashes().answers_to(h) {
                         Some(v.id())
                     } else {
                         None
@@ -1779,7 +1781,7 @@ impl Session {
     ) -> Option<PeerSource> {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
-            t.info_hash(),
+            t.info_hashes(),
             t.shared().tracker_tiers.clone(),
             announce,
             t.shared().options.force_tracker_interval,
@@ -1801,10 +1803,12 @@ impl Session {
         merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), is_private)
     }
 
-    // Get a peer stream from both DHT and trackers.
+    // Get a peer stream from both DHT and trackers, under every hash the
+    // torrent goes by (libtorrent `torrent::dht_announce`, `lsd_announce`
+    // and `announce_with_tracker` each loop over `info_hash_t::for_each`).
     fn make_peer_rx(
         self: &Arc<Self>,
-        info_hash: Id20,
+        info_hashes: InfoHashes,
         tracker_tiers: Vec<Vec<url::Url>>,
         announce: bool,
         force_tracker_interval: Option<Duration>,
@@ -1815,7 +1819,10 @@ impl Session {
             None
         } else {
             self.dht.as_ref().map(|dht| {
-                dht.get_peers(info_hash, if announce { self.announce_port } else { None })
+                futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
+                    dht.get_peers(info_hash, if announce { self.announce_port } else { None })
+                        .boxed()
+                }))
             })
         };
 
@@ -1823,17 +1830,20 @@ impl Session {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
-                lsd.announce(info_hash, if announce { self.announce_port } else { None })
+                futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
+                    lsd.announce(info_hash, if announce { self.announce_port } else { None })
+                        .boxed()
+                }))
             })
         };
 
         let tracker_rx_stats = PeerRxTorrentInfo {
-            info_hash,
+            info_hashes,
             session: self.clone(),
             torrent: Default::default(),
         };
         let (tracker_rx, trackers) = TrackerComms::start_with_tiers(
-            info_hash,
+            info_hashes,
             self.peer_id,
             self.announce_tiers(tracker_tiers, is_private),
             Box::new(tracker_rx_stats),
@@ -1914,14 +1924,14 @@ impl Session {
 
     async fn resolve_magnet(
         self: &Arc<Self>,
-        info_hash: Id20,
+        info_hashes: InfoHashes,
         peer_rx: PeerStream,
         tracker_tiers: &[Vec<url::Url>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
             self.peer_id,
-            info_hash,
+            info_hashes,
             Default::default(),
             peer_rx,
             Some(self.merge_peer_opts(peer_opts)),
@@ -2045,7 +2055,7 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
 
 // Ad adapter for converting stats into the format that tracker_comms accepts.
 struct PeerRxTorrentInfo {
-    info_hash: Id20,
+    info_hashes: InfoHashes,
     session: Arc<Session>,
     // Kept once found, so the counters stay readable after the torrent is
     // removed from the session (for the `stopped` announce).
@@ -2060,7 +2070,7 @@ impl PeerRxTorrentInfo {
         let found = self.session.with_torrents(|torrents| {
             torrents
                 .map(|(_, t)| t)
-                .find(|t| t.info_hash() == self.info_hash)
+                .find(|t| t.info_hashes().overlaps(&self.info_hashes))
                 .cloned()
         })?;
         Some(self.torrent.get_or_init(|| found))
@@ -2072,7 +2082,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         let mt = match self.torrent() {
             Some(mt) => mt,
             None => {
-                trace!(info_hash=?self.info_hash, "can't find torrent in the session, using default stats");
+                trace!(info_hashes=?self.info_hashes, "can't find torrent in the session, using default stats");
                 return Default::default();
             }
         };
@@ -2134,9 +2144,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AddTorrent, AddTorrentOptions, Session, SessionOptions, is_bare_info_hash,
-        merge_tracker_tiers, metainfo_tracker_tiers, torrent_file_from_info_bytes,
-        torrent_from_bytes,
+        AddTorrent, AddTorrentOptions, AddTorrentResponse, Session, SessionOptions,
+        TorrentIdOrHash, is_bare_info_hash, merge_tracker_tiers, metainfo_tracker_tiers,
+        torrent_file_from_info_bytes, torrent_from_bytes,
     };
 
     fn url(s: &str) -> url::Url {
@@ -2404,15 +2414,20 @@ mod tests {
     // Returns what the session answers before it closes, up to its own
     // 68-byte handshake: empty when it refused the connection.
     async fn answer(session: &Session, handle: &super::ManagedTorrentHandle) -> Vec<u8> {
+        greet(session, handle.info_hash()).await
+    }
+
+    // Connects to the session and sends a handshake for `info_hash`; returns
+    // what [`answer`] returns.
+    async fn greet(session: &Session, info_hash: super::Id20) -> Vec<u8> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut stream = tokio::net::TcpStream::connect(session.listen_addr().unwrap())
             .await
             .unwrap();
         let mut handshake = [0u8; 68];
-        let len =
-            crate::peer_protocol::Handshake::new(handle.info_hash(), super::Id20::new([7; 20]))
-                .serialize_unchecked_len(&mut handshake);
+        let len = crate::peer_protocol::Handshake::new(info_hash, super::Id20::new([7; 20]))
+            .serialize_unchecked_len(&mut handshake);
         // A refused connection may be closed before or while this is written,
         // and reset after: either way nothing comes back.
         let _ = stream.write_all(&handshake[..len]).await;
@@ -2451,6 +2466,112 @@ mod tests {
         // With its upload open again, the finished torrent takes the peer.
         handle.set_ratelimits(crate::limits::LimitsConfig::default());
         assert!(is_handshake_for(&answer(&session, &handle).await, &handle));
+
+        session.stop().await;
+    }
+
+    // A session listening on loopback that seeds `torrent` from its payload.
+    async fn seeding_v2(
+        torrent: &crate::core::v2_test_torrent::TestTorrent,
+    ) -> (
+        TempDir,
+        std::sync::Arc<Session>,
+        super::ManagedTorrentHandle,
+    ) {
+        let dir = TempDir::with_prefix("v2_identity").unwrap();
+        for (name, data) in &torrent.files {
+            std::fs::write(dir.path().join(name), data).unwrap();
+        }
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.torrent_bytes()),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_completed().await.unwrap();
+        (dir, session, handle)
+    }
+
+    fn v2_torrent(hybrid: bool) -> crate::core::v2_test_torrent::TestTorrent {
+        use crate::core::v2_test_torrent::{TestTorrent, payload};
+        let mut torrent = TestTorrent::new(
+            vec![("a", payload(40000, 1)), ("b", payload(9000, 2))],
+            16384,
+        );
+        torrent.hybrid = hybrid;
+        torrent
+    }
+
+    // The info hash of a 68-byte handshake answer.
+    fn answered_hash(answer: &[u8]) -> Option<super::Id20> {
+        (answer.len() == 68).then(|| super::Id20::new(answer[28..48].try_into().unwrap()))
+    }
+
+    #[tokio::test]
+    async fn a_hybrid_answers_a_peer_with_the_hash_it_greeted_with() {
+        // libtorrent session_impl::find_torrent keys a hybrid under v1 and the
+        // truncated v2; bt_peer_connection::on_receive_handshake answers a
+        // peer greeting with the truncated v2 as a v2 peer.
+        let torrent = v2_torrent(true);
+        let (_dir, session, handle) = seeding_v2(&torrent).await;
+        let hashes = handle.info_hashes();
+        let v1 = hashes.v1.unwrap();
+        let v2 = hashes.v2.unwrap().truncate_for_dht();
+        assert_eq!(handle.info_hash(), v1);
+
+        assert_eq!(answered_hash(&greet(&session, v1).await), Some(v1));
+        assert_eq!(answered_hash(&greet(&session, v2).await), Some(v2));
+        assert!(greet(&session, super::Id20::new([9; 20])).await.is_empty());
+
+        for id in [v1, v2] {
+            assert_eq!(
+                session.get(TorrentIdOrHash::Hash(id)).map(|t| t.id()),
+                Some(handle.id())
+            );
+        }
+        let again = session
+            .add_torrent(AddTorrent::from_bytes(torrent.torrent_bytes()), None)
+            .await
+            .unwrap();
+        assert!(matches!(again, AddTorrentResponse::AlreadyManaged(id, _) if id == handle.id()));
+
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_v2_torrent_goes_by_its_truncated_hash() {
+        // libtorrent info_hash_t::get_best and peer_connection::associated_info_hash
+        // for a torrent without v1.
+        let (_dir, session, handle) = seeding_v2(&v2_torrent(false)).await;
+        let hashes = handle.info_hashes();
+        assert_eq!(hashes.v1, None);
+        let v2 = hashes.v2.unwrap().truncate_for_dht();
+        assert_eq!(handle.info_hash(), v2);
+        assert_eq!(answered_hash(&greet(&session, v2).await), Some(v2));
 
         session.stop().await;
     }

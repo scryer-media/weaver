@@ -494,7 +494,7 @@ impl TorrentStateLive {
         };
         let peer_connection = PeerConnection::new(
             checked_peer.addr,
-            self.shared.info_hash,
+            self.shared.info_hashes,
             self.shared.peer_id,
             &handler,
             Some(options),
@@ -557,7 +557,7 @@ impl TorrentStateLive {
         };
         let peer_connection = PeerConnection::new(
             addr,
-            state.shared.info_hash,
+            state.shared.info_hashes,
             state.shared.peer_id,
             &handler,
             Some(options),

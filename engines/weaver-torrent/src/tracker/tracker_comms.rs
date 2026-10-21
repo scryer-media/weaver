@@ -31,7 +31,7 @@ use tracing::trace;
 use tracing::trace_span;
 use url::Url;
 
-use crate::core::hash_id::Id20;
+use crate::core::hash_id::{Id20, InfoHashes};
 use crate::core::net::Resolver;
 use crate::tracker::tracker_comms_http;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
@@ -41,7 +41,7 @@ use crate::tracker::tracker_comms_udp::UdpTrackerClient;
 pub struct TrackerComms {
     info_hash: Id20,
     peer_id: Id20,
-    stats: Box<dyn TorrentStatsProvider>,
+    stats: Arc<dyn TorrentStatsProvider>,
     force_tracker_interval: Option<Duration>,
     tx: Sender,
     /// The `port` every announce carries (see [`announced_port`]).
@@ -160,7 +160,7 @@ impl std::fmt::Debug for SupportedTracker {
 /// Only one tracker of a tier is announced to at a time. When it fails, the
 /// next one in the tier is tried; the one that answers moves to the front of
 /// the tier and stays the tier's tracker while it keeps answering.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Tier {
     trackers: Vec<SupportedTracker>,
     current: usize,
@@ -593,7 +593,7 @@ impl TrackerComms {
     // TODO: fix too many args
     #[allow(clippy::too_many_arguments)]
     pub fn start(
-        info_hash: Id20,
+        info_hashes: InfoHashes,
         peer_id: Id20,
         trackers: HashSet<Url>,
         stats: Box<dyn TorrentStatsProvider>,
@@ -603,7 +603,7 @@ impl TrackerComms {
         udp_client: UdpTrackerClient,
     ) -> Option<TrackerTask> {
         Self::start_with_tiers(
-            info_hash,
+            info_hashes,
             peer_id,
             trackers.into_iter().map(|t| vec![t]).collect(),
             stats,
@@ -625,9 +625,14 @@ impl TrackerComms {
     /// and tracked by `stopped`. Each regular announce is recorded in the
     /// returned [`TrackerStatus`]. `listen_port` is the port peers reach this
     /// session on, None when it accepts no connections.
+    ///
+    /// Each of `info_hashes.ids20()` is announced on its own, with its own
+    /// events and failover: a hybrid under v1 and the truncated v2, a v2
+    /// torrent under the truncated v2 (libtorrent
+    /// `torrent::announce_with_tracker`, one announce per `protocol_version`).
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_tiers(
-        info_hash: Id20,
+        info_hashes: InfoHashes,
         peer_id: Id20,
         tiers: Vec<Vec<Url>>,
         stats: Box<dyn TorrentStatsProvider>,
@@ -652,7 +657,7 @@ impl TrackerComms {
             })
             .collect::<Vec<_>>();
         if tiers.is_empty() {
-            debug!(?info_hash, "trackers list is empty");
+            debug!(?info_hashes, "trackers list is empty");
             return None;
         }
 
@@ -666,33 +671,48 @@ impl TrackerComms {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(16);
 
-        let comms = Arc::new(Self {
-            info_hash,
-            peer_id,
-            stats,
-            force_tracker_interval: force_interval,
-            tx,
-            announce_port: announced_port(listen_port),
-            reqwest_client,
-            udp_client,
-            key: rand::random(),
-            started: Mutex::new(vec![None; tiers.len()]),
-            tracker_ids: Default::default(),
-            status: status.clone(),
-        });
-        let stop_on_drop = StopOnDrop {
-            comms: comms.clone(),
-            timeout: stopped.timeout(),
-            running: Some(stopped.register()),
-        };
+        let stats: Arc<dyn TorrentStatsProvider> = stats.into();
+        // One key for the torrent, whatever hash it announces under
+        // (libtorrent `torrent::tracker_key`).
+        let key = rand::random();
+        let comms = info_hashes
+            .ids20()
+            .map(|info_hash| {
+                Arc::new(Self {
+                    info_hash,
+                    peer_id,
+                    stats: stats.clone(),
+                    force_tracker_interval: force_interval,
+                    tx: tx.clone(),
+                    announce_port: announced_port(listen_port),
+                    reqwest_client: reqwest_client.clone(),
+                    udp_client: udp_client.clone(),
+                    key,
+                    started: Mutex::new(vec![None; tiers.len()]),
+                    tracker_ids: Default::default(),
+                    status: status.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(tx);
+        let stop_on_drop = comms
+            .iter()
+            .map(|comms| StopOnDrop {
+                comms: comms.clone(),
+                timeout: stopped.timeout(),
+                running: Some(stopped.register()),
+            })
+            .collect::<Vec<_>>();
 
         let s = async_stream::stream! {
             use futures::StreamExt;
             let _stop_on_drop = stop_on_drop;
             let mut futures = FuturesUnordered::new();
-            for (idx, tier) in tiers.into_iter().enumerate() {
-                let span = debug_span!(parent: None, "tracker_tier", tier = idx, info_hash = ?info_hash);
-                futures.push(comms.task_tier(idx, tier).instrument(span));
+            for comms in &comms {
+                for (idx, tier) in tiers.iter().cloned().enumerate() {
+                    let span = debug_span!(parent: None, "tracker_tier", tier = idx, info_hash = ?comms.info_hash);
+                    futures.push(comms.task_tier(idx, tier).instrument(span));
+                }
             }
             while !(futures.is_empty()) {
                 tokio::select! {
@@ -955,7 +975,7 @@ mod tests {
     };
 
     use crate::core::{
-        hash_id::Id20,
+        hash_id::{Id20, Id32, InfoHashes},
         net::{DatagramSocket, Resolver},
     };
     use futures::{FutureExt, StreamExt, future::BoxFuture};
@@ -1133,6 +1153,66 @@ mod tests {
         );
     }
 
+    fn v1_hash() -> InfoHashes {
+        InfoHashes {
+            v1: Some(Id20::new([1; 20])),
+            v2: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hybrid_announces_under_v1_and_the_truncated_v2() {
+        // libtorrent torrent::announce_with_tracker: one announce per
+        // protocol_version the torrent has, each with its own event, and
+        // torrent::tracker_key shared by both.
+        let (listener, url) = http_listener().await;
+        let hashes = InfoHashes {
+            v1: Some(Id20::new([b'a'; 20])),
+            v2: Some(Id32::new([b'b'; 32])),
+        };
+        let stopped = StoppedAnnounces::default();
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let mut peers = TrackerComms::start_with_tiers(
+            hashes,
+            Id20::new([2; 20]),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            Some(6881),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap()
+        .peers;
+        let mut announced = Vec::new();
+        while announced.len() < 2 {
+            tokio::select! {
+                _ = peers.next() => panic!("the tracker sent no peers"),
+                q = next_announce(&listener) => announced.push(q),
+            }
+        }
+        let mut hashes_sent = announced
+            .iter()
+            .map(|q| query_param(q, "info_hash").unwrap().to_owned())
+            .collect::<Vec<_>>();
+        hashes_sent.sort();
+        assert_eq!(hashes_sent, ["a".repeat(20), "b".repeat(20)]);
+        for q in &announced {
+            assert_eq!(query_param(q, "event"), Some("started"));
+        }
+        assert_eq!(
+            query_param(&announced[0], "key"),
+            query_param(&announced[1], "key")
+        );
+        drop(peers);
+        token.cancel();
+    }
+
     /// Stats the test drives by hand.
     struct ManualStats {
         stats: Mutex<TrackerCommsStats>,
@@ -1224,7 +1304,7 @@ mod tests {
         let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
         let stopped = StoppedAnnounces::default();
         let mut peers = TrackerComms::start_with_tiers(
-            Id20::new([1; 20]),
+            v1_hash(),
             Id20::new([2; 20]),
             vec![vec![tracker]],
             Box::new(stats.clone()),
@@ -1291,7 +1371,7 @@ mod tests {
         let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
         let stopped = StoppedAnnounces::default();
         let mut peers = TrackerComms::start_with_tiers(
-            Id20::new([1; 20]),
+            v1_hash(),
             Id20::new([2; 20]),
             vec![vec![url]],
             Box::new(stats.clone()),
@@ -1351,7 +1431,7 @@ mod tests {
         let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
         let stopped = StoppedAnnounces::default();
         let peers = TrackerComms::start_with_tiers(
-            Id20::new([1; 20]),
+            v1_hash(),
             Id20::new([2; 20]),
             vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]],
             Box::new(()),
@@ -1391,7 +1471,7 @@ mod tests {
             .unwrap();
         let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
         let task = TrackerComms::start_with_tiers(
-            Id20::new([1; 20]),
+            v1_hash(),
             Id20::new([2; 20]),
             tiers,
             Box::new(()),
