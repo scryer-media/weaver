@@ -480,4 +480,4 @@ impl PeerConnectionHandler for Handler {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

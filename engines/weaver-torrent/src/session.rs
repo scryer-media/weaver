@@ -1272,10 +1272,7 @@ impl Session {
         mut reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
-        let rwtimeout = self
-            .peer_opts
-            .read_write_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
+        let handshake_timeout = self.peer_opts.handshake_timeout();
 
         let incoming_ip = addr.ip();
         if self.blocklist.has(incoming_ip) {
@@ -1301,7 +1298,7 @@ impl Session {
             self.connector.encryption(),
             &mut reader,
             &mut writer,
-            rwtimeout,
+            handshake_timeout,
             || {
                 self.db
                     .read()
@@ -1316,7 +1313,7 @@ impl Session {
 
         let mut read_buf = ReadBuf::new();
         let h = read_buf
-            .read_handshake(&mut reader, rwtimeout)
+            .read_handshake(&mut reader, handshake_timeout)
             .await
             .context("error reading handshake")?;
         trace!("received handshake from {addr}: {:?}", h);
@@ -1482,6 +1479,7 @@ impl Session {
             keep_alive_interval: other
                 .keep_alive_interval
                 .or(self.peer_opts.keep_alive_interval),
+            handshake_timeout: other.handshake_timeout.or(self.peer_opts.handshake_timeout),
             max_request_window: other
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
@@ -3290,5 +3288,64 @@ mod tests {
             .await?;
         assert!(storage.log.file_contents(0) == t.content, "content differs");
         Ok(())
+    }
+
+    // An incoming peer's encryption handshake and BitTorrent handshake end
+    // at the handshake timeout, whatever the peer timeout (libtorrent
+    // `peer_connection::second_tick`).
+    #[tokio::test(start_paused = true)]
+    async fn an_incoming_peer_that_sends_no_handshake_ends_at_the_handshake_timeout() {
+        use crate::{
+            mse::EncryptionPolicy,
+            peer_connection::{DEFAULT_HANDSHAKE_TIMEOUT, PeerConnectionOptions},
+            peer_info_reader::tests::halves,
+            stream_connect::ConnectionKind,
+        };
+        for (encryption, step) in [
+            (EncryptionPolicy::Disabled, "error reading handshake"),
+            (
+                EncryptionPolicy::Require,
+                "error in the encryption handshake",
+            ),
+        ] {
+            let dir = TempDir::with_prefix("handshake_timeout").unwrap();
+            let session = Session::new_with_opts(
+                dir.path().into(),
+                SessionOptions {
+                    dht: None,
+                    persistence: None,
+                    disable_trackers: true,
+                    disable_local_service_discovery: true,
+                    encryption,
+                    connect: Some(super::ConnectionOptions {
+                        enable_tcp: true,
+                        peer_opts: Some(PeerConnectionOptions {
+                            read_write_timeout: Some(std::time::Duration::from_secs(120)),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let (ours, _theirs) = tokio::io::duplex(1 << 16);
+            let (reader, writer) = halves(ours);
+            let start = tokio::time::Instant::now();
+            let err = session
+                .clone()
+                .check_incoming_connection(
+                    "127.0.0.1:6881".parse().unwrap(),
+                    ConnectionKind::Tcp,
+                    reader,
+                    writer,
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(format!("{err:#}").contains(step), "{err:#}");
+            assert_eq!(start.elapsed(), DEFAULT_HANDSHAKE_TIMEOUT, "{encryption:?}");
+            session.stop().await;
+        }
     }
 }

@@ -52,7 +52,7 @@ const NO_TIMEOUT: Duration = Duration::MAX;
 
 /// Every dial reaches the test as the far end of an in-memory stream, so a
 /// conversation runs on the paused clock.
-struct Dialed(mpsc::UnboundedSender<(SocketAddr, DuplexStream)>);
+pub(crate) struct Dialed(pub(crate) mpsc::UnboundedSender<(SocketAddr, DuplexStream)>);
 
 impl SocketFactory for Dialed {
     fn connect_tcp<'a>(
@@ -83,7 +83,7 @@ impl SocketFactory for Dialed {
     }
 }
 
-fn halves(stream: DuplexStream) -> (BoxAsyncReadVectored, BoxAsyncWrite) {
+pub(crate) fn halves(stream: DuplexStream) -> (BoxAsyncReadVectored, BoxAsyncWrite) {
     let (read, write) = tokio::io::split(stream);
     (Box::new(read.into_vectored_compat()), Box::new(write))
 }
