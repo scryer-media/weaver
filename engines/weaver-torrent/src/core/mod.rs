@@ -17,6 +17,8 @@ pub mod peer_id;
 pub mod spawn_utils;
 pub mod speed_estimator;
 pub mod torrent_metainfo;
+#[cfg(test)]
+pub(crate) mod v2_test_torrent;
 pub mod v2_tree;
 pub use hash_id::{Id20, Id32, InfoHashes};
 

@@ -146,11 +146,7 @@ impl TorrentStateInitializing {
             .shared
             .spawner
             .block_in_place_with_semaphore(|| {
-                let fo = crate::file_ops::FileOps::new(
-                    &self.metadata.info,
-                    &self.files,
-                    &self.metadata.file_infos,
-                );
+                let fo = crate::file_ops::FileOps::new(&self.metadata, &self.files);
 
                 let mut to_validate = BF::from_boxed_slice(
                     vec![0u8; self.metadata.lengths().piece_bitfield_bytes()].into_boxed_slice(),
@@ -255,7 +251,7 @@ impl TorrentStateInitializing {
             .shared
             .spawner
             .block_in_place_with_semaphore(|| {
-                FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos)
+                FileOps::new(&self.metadata, &self.files)
                     .initial_check(&self.checked_bytes, &self.pause_requested)
             })
             .await?;

@@ -65,6 +65,7 @@ mod torrent_state;
 pub mod tracker;
 mod type_aliases;
 pub mod upnp;
+mod v2_hashes;
 mod vectored_traits;
 
 pub use error::{Error, Result};

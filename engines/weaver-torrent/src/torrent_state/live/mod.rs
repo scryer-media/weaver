@@ -93,7 +93,7 @@ use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     connection_slots::ConnectionSlot,
-    file_ops::FileOps,
+    file_ops::{FileOps, Verdict, inconsistent_hashes},
     limits::LimitKind,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
@@ -695,7 +695,7 @@ impl TorrentStateLive {
         self.shared.peer_id
     }
     pub(crate) fn file_ops(&self) -> FileOps<'_> {
-        FileOps::new(&self.metadata.info, &*self.files, &self.metadata.file_infos)
+        FileOps::new(&self.metadata, &*self.files)
     }
 
     pub(crate) fn lock_read(
@@ -1408,7 +1408,11 @@ impl PeerHandler {
                         priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                         file_priorities,
                         file_infos: &self.state.metadata.file_infos,
-                        peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
+                        // Only a piece that can be checked once it arrives.
+                        peer_has_piece: |p| {
+                            bf.get(p.get() as usize).map(|v| *v) == Some(true)
+                                && self.state.metadata.can_verify(p)
+                        },
                         can_steal: |p| {
                             self.state.per_piece_locks[p.get_usize()]
                                 .try_write()
@@ -2003,7 +2007,10 @@ impl PeerHandler {
                 .check_piece(chunk_info.piece_index)
                 .with_context(|| format!("error checking piece={index}"))?
             {
-                true => {
+                Verdict::Inconsistent => {
+                    return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
+                }
+                Verdict::Passed => {
                     {
                         let mut g = state.lock_write("mark_piece_downloaded");
                         g.get_pieces_mut()?
@@ -2043,7 +2050,7 @@ impl PeerHandler {
 
                     state.transmit_haves(chunk_info.piece_index);
                 }
-                false => {
+                Verdict::Failed | Verdict::Unknown => {
                     warn!(
                         id = state.shared.id,
                         info_hash = ?state.shared.info_hash,

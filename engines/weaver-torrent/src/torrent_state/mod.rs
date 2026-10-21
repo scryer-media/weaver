@@ -21,8 +21,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::buffers::ByteBufOwned;
-use crate::core::hash_id::Id20;
-use crate::core::lengths::Lengths;
+use crate::core::hash_id::{Id20, Id32};
+use crate::core::lengths::{Lengths, ValidPieceIndex};
+use crate::core::torrent_metainfo::TorrentMetaV1Owned;
+use crate::v2_hashes::V2Hashes;
 use anyhow::Context;
 use anyhow::bail;
 use arc_swap::ArcSwapOption;
@@ -148,13 +150,19 @@ pub struct TorrentMetadata {
     pub torrent_bytes: Bytes,
     pub info_bytes: Bytes,
     pub file_infos: FileInfos,
+    /// The v2 hashes of a v2 or hybrid torrent.
+    pub(crate) v2: Option<V2Hashes>,
 }
 
 impl TorrentMetadata {
+    /// `layers` are the piece layers the torrent carries, one entry per
+    /// file ([`ValidatedTorrentMetaV1Info::piece_layers`]); none for a
+    /// magnet link.
     pub(crate) fn new(
         info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
         torrent_bytes: Bytes,
         info_bytes: Bytes,
+        layers: Vec<Option<Vec<Id32>>>,
     ) -> anyhow::Result<Self> {
         let file_infos = info
             .iter_file_details_ext()
@@ -170,6 +178,7 @@ impl TorrentMetadata {
             .collect::<anyhow::Result<Vec<FileInfo>>>()?;
 
         Ok(Self {
+            v2: V2Hashes::new(&info, layers),
             info,
             torrent_bytes,
             info_bytes,
@@ -177,8 +186,34 @@ impl TorrentMetadata {
         })
     }
 
+    /// The metadata of a torrent file, with the piece layers it carries.
+    pub(crate) fn from_torrent(
+        meta: TorrentMetaV1Owned,
+        torrent_bytes: Bytes,
+    ) -> anyhow::Result<Self> {
+        let info = meta.info.data.validate()?;
+        let layers = match &meta.piece_layers {
+            Some(layers) => info.piece_layers(layers)?,
+            None => Vec::new(),
+        };
+        Self::new(info, torrent_bytes, meta.info.raw_bytes.0, layers)
+    }
+
     pub fn lengths(&self) -> &Lengths {
         self.info.lengths()
+    }
+
+    /// Whether a piece fetched now could be checked: always with v1
+    /// hashes, and with v2 alone once its file's piece layer is held.
+    /// libtorrent fetches such a piece anyway and holds it unverified until
+    /// `hash_picker::pick_hashes` brings the layer; Weaver fetches the
+    /// layer first, so a piece is never held without a verdict.
+    pub(crate) fn can_verify(&self, piece: ValidPieceIndex) -> bool {
+        self.info.info().has_v1_listing()
+            || self
+                .v2
+                .as_ref()
+                .is_some_and(|v2| v2.expected(piece.get()).is_some())
     }
 }
 

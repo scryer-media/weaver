@@ -1379,10 +1379,9 @@ impl Session {
 
                     InternalAddResult {
                         info_hash: torrent.meta.info_hash,
-                        metadata: Some(TorrentMetadata::new(
-                            torrent.meta.info.data.validate()?,
+                        metadata: Some(TorrentMetadata::from_torrent(
+                            torrent.meta,
                             torrent.torrent_bytes,
-                            torrent.meta.info.raw_bytes.0,
                         )?),
                         tracker_tiers,
                         name: None,
@@ -1944,6 +1943,7 @@ impl Session {
                         info,
                         torrent_file_from_info_bytes(info_bytes.as_ref(), tracker_tiers)?,
                         info_bytes.0,
+                        Vec::new(),
                     )?,
                     peer_rx: rx,
                     seen_peers: {
