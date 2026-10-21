@@ -47,6 +47,7 @@ mod listen;
 pub mod lsd;
 mod merge_streams;
 mod mse;
+pub mod natpmp;
 pub mod network;
 mod peer_connection;
 mod peer_info_reader;
