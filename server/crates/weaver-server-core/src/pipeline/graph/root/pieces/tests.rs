@@ -482,7 +482,8 @@ fn a_piece_that_fails_its_hash_waits_to_be_fetched_again() {
 
     assert!(job.failed(3, &mut RepairSlots::default(), 1).unwrap());
     assert_eq!(job.have().iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
-    assert_eq!(job.selection(), vec![1, 2]);
+    // The piece is fetched again at its files' own level: nothing is raised.
+    assert!(job.selection().is_empty());
     assert_eq!(job.file_have(), vec![1000, 2500 - 428, 700 - 596]);
     for (member, hole) in [(1, ByteRange::new(2072, 2500)), (2, ByteRange::new(0, 596))] {
         let record = job.namespace().get(MemberId(member)).unwrap();
@@ -558,7 +559,7 @@ fn a_check_of_every_piece_has_none_until_it_finds_them() {
     assert!(job.failed(3, &mut RepairSlots::default(), 1).unwrap());
     assert!(!job.unchecked());
     assert_eq!(job.have().iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
-    assert_eq!(job.selection(), vec![1, 2]);
+    assert!(job.selection().is_empty());
 }
 
 // A share that never arrived, or was lost, is not in hand: only an arrived
