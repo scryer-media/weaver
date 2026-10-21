@@ -271,14 +271,14 @@ fn number(field: &[u8]) -> Option<u64> {
                 value.checked_mul(256)?.checked_add(u64::from(byte))
             });
     }
-    let digits = field
+    let mut digits = field
         .iter()
         .skip_while(|&&byte| byte == b' ' || byte == 0)
         .take_while(|&&byte| byte != b' ' && byte != 0);
     // An empty field is zero, which old writers leave for an empty file.
-    digits.fold(Some(0u64), |value, &digit| {
+    digits.try_fold(0u64, |value, &digit| {
         (b'0'..=b'7').contains(&digit).then_some(())?;
-        value?.checked_mul(8)?.checked_add(u64::from(digit - b'0'))
+        value.checked_mul(8)?.checked_add(u64::from(digit - b'0'))
     })
 }
 

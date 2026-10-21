@@ -92,7 +92,10 @@ impl RootJob for Prepared {
     }
 }
 
-fn namespace(members: &[(&str, u64, &[(u64, u64, Provenance)])]) -> Namespace {
+// A member: its name, its length, and the runs it holds with how each came.
+type MemberRuns<'a> = (&'a str, u64, &'a [(u64, u64, Provenance)]);
+
+fn namespace(members: &[MemberRuns]) -> Namespace {
     let mut namespace = Namespace::new();
     for (name, length, runs) in members {
         let id = namespace.announce(name, Some(*length));

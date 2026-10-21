@@ -282,7 +282,7 @@ impl Walk {
                 let image = SparseImage::of(kept, closed);
                 return match RarArchive::parse_volume_header_encryption(image) {
                     Ok(encryption) => {
-                        self.locked = Some(encryption.clone());
+                        self.locked = Some(encryption);
                         Step::Locked(encryption)
                     }
                     Err(_) => Step::Broken(self.broken(kept, closed)),

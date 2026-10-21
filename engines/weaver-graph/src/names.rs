@@ -118,11 +118,14 @@ impl NameLedger {
     pub fn restore(&mut self, holder: Holder, position: Position, wanted: &str, held: &str) {
         let held = confined(held);
         let rank = (position, holder);
-        let name = if self.taken.contains_key(&held.to_ascii_lowercase()) {
-            self.place(holder, &rank, &confined(wanted), &mut Vec::new())
-        } else {
-            self.taken.insert(held.to_ascii_lowercase(), holder);
-            held
+        let name = match self.taken.entry(held.to_ascii_lowercase()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.place(holder, &rank, &confined(wanted), &mut Vec::new())
+            }
+            std::collections::hash_map::Entry::Vacant(free) => {
+                free.insert(holder);
+                held
+            }
         };
         self.entries.insert(
             holder,

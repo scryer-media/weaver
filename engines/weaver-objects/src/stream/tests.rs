@@ -138,7 +138,7 @@ impl Gate {
 impl Volumes for Gate {
     fn next(&self, after: Option<VolumeIndex>) -> std::io::Result<Option<VolumeIndex>> {
         let next = after.map_or(0, |after| after.0 as usize + 1);
-        Ok((next < 1).then(|| VolumeIndex(next as u32)))
+        Ok((next < 1).then_some(VolumeIndex(next as u32)))
     }
 
     fn len(&self, _volume: VolumeIndex) -> Option<u64> {
@@ -570,7 +570,8 @@ fn emitted<D: Decoder>(name: &str, bytes: Vec<u8>, piece: usize) -> Vec<usize> {
 fn a_run_hands_its_output_on_in_whole_chunks() {
     let plain = payload(7, 4 * super::run::CHUNK + 1_000);
     let chunks = plain.len().div_ceil(super::run::CHUNK);
-    let cases: [(&str, Vec<u8>, fn(&str, Vec<u8>, usize) -> Vec<usize>); 6] = [
+    type Case = (&'static str, Vec<u8>, fn(&str, Vec<u8>, usize) -> Vec<usize>);
+    let cases: [Case; 6] = [
         ("a.gz", gzip(&plain), emitted::<Gzip>),
         ("a.deflate", deflate(&plain), emitted::<Deflate>),
         ("a.bz2", bzip2(&plain), emitted::<Bzip2>),

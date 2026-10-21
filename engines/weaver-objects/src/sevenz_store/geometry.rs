@@ -65,7 +65,7 @@ impl Geometry {
 
     // A volume range in container coordinates, clipped to what the geometry
     // gives that volume. `None` for a volume beyond the set.
-    pub(super) fn to_container(&self, volume: VolumeIndex, range: ByteRange) -> Option<ByteRange> {
+    pub(super) fn to_container(self, volume: VolumeIndex, range: ByteRange) -> Option<ByteRange> {
         if volume.0 >= self.parts {
             return None;
         }
@@ -80,7 +80,7 @@ impl Geometry {
     }
 
     // A container range as volume ranges, in order.
-    pub(super) fn to_volumes(&self, range: ByteRange, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+    pub(super) fn to_volumes(self, range: ByteRange, out: &mut Vec<(VolumeIndex, ByteRange)>) {
         let mut cursor = range.start;
         while cursor < range.end {
             let index = (cursor / self.part).min(u64::from(self.parts - 1)) as u32;

@@ -132,7 +132,7 @@ pub(super) fn of(store: &RarStore) -> Facts {
             kept: volume.kept.clone(),
             headers: volume.walk.facts.clone(),
             ended: volume.walk.ended,
-            locked: volume.walk.locked.clone(),
+            locked: volume.walk.locked,
         })
         .collect();
     let entries = store

@@ -16,6 +16,7 @@
 
 pub(crate) mod durable;
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -142,11 +143,7 @@ impl Envelopes {
         let range = ByteRange::at(offset, bytes.len() as u64);
         shelf.update(|state| {
             let kept = shelf.kept(state, envelope)?;
-            let mends = provenance.is_verified()
-                && kept
-                    .coverage
-                    .overlapping(range)
-                    .any(|run| run.provenance == Provenance::Damaged);
+            let mends = provenance.is_verified() && kept.coverage.damaged(range);
             kept.leaf.write(offset, bytes, None)?;
             kept.coverage.write(range, provenance);
             if (provenance == Provenance::Repaired || mends) && range.start < kept.reached {
@@ -238,22 +235,21 @@ impl Shelf {
         state: &'a mut Shelved,
         envelope: u32,
     ) -> Result<&'a mut Kept, LeafError> {
-        if !state.kept.contains_key(&envelope) {
-            let name = format!(".weaver-chunks/graph-envelope-{}-{envelope}", self.node.0);
-            let mut leaf = Leaf::at(&self.dir, &name)?;
-            leaf.truncate()?;
-            state.kept.insert(
-                envelope,
-                Kept {
+        match state.kept.entry(envelope) {
+            Entry::Occupied(kept) => Ok(kept.into_mut()),
+            Entry::Vacant(free) => {
+                let name = format!(".weaver-chunks/graph-envelope-{}-{envelope}", self.node.0);
+                let mut leaf = Leaf::at(&self.dir, &name)?;
+                leaf.truncate()?;
+                Ok(free.insert(Kept {
                     leaf,
                     coverage: Coverage::new(),
                     closed: None,
                     settled: false,
                     reached: 0,
-                },
-            );
+                }))
+            }
         }
-        Ok(state.kept.get_mut(&envelope).expect("inserted above"))
     }
 
     // Append the bytes of `range` of an envelope to `into`, or nothing and

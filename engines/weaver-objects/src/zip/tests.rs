@@ -87,9 +87,12 @@ fn streamed(owner: &Owner) {
     assert_eq!(owner.held(), 0);
 }
 
+// A member as it ended: name, stated length, bytes, and whether it closed.
+type Ended = (String, Option<u64>, Vec<u8>, bool);
+
 // What one framing of a delivery made of the archive: every member as it
 // ended, in id order, and everything else said.
-fn transcript(frame: usize) -> (Vec<(String, Option<u64>, Vec<u8>, bool)>, Vec<Emit>) {
+fn transcript(frame: usize) -> (Vec<Ended>, Vec<Emit>) {
     let bytes = archive();
     let mut owner = Owner::single(Zip::new(), bytes.clone());
     owner.whole(frame);

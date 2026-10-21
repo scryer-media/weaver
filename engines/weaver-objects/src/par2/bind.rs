@@ -78,6 +78,9 @@ impl<'a> Candidate<'a> {
     }
 }
 
+// The members a set's index named, by file.
+type Bindings = BTreeMap<FileId, MemberId>;
+
 // The bindings of each set over the namespace, and each complete member no
 // set matched, with the length it has of its own: one whose front could not
 // name it, which a repair may still know by its slices or by elimination.
@@ -85,7 +88,7 @@ pub(super) fn bind_sets(
     indexes: &[&Par2FileSet],
     namespace: &Namespace,
     own: ObjectId,
-) -> (Vec<BTreeMap<FileId, MemberId>>, Vec<(MemberId, Length)>) {
+) -> (Vec<Bindings>, Vec<(MemberId, Length)>) {
     let mut claims: Vec<BTreeMap<FileId, Vec<MemberId>>> = vec![BTreeMap::new(); indexes.len()];
     let mut unnamed = Vec::new();
     for posting in namespace.records() {

@@ -339,7 +339,7 @@ impl Object for Par3 {
     ) -> Option<VolumeIndex> {
         (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
             && self.volumes.len() < MAX_CARRIERS)
-            .then(|| VolumeIndex(self.volumes.len() as u32))
+            .then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
     fn bound(&mut self, volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {

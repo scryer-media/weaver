@@ -375,7 +375,7 @@ fn stored_7z() -> (Vec<u8>, Vec<(&'static str, Vec<u8>)>) {
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
     writer.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
     for (name, bytes) in &members {
-        let mut entry = ArchiveEntry::new_file(*name);
+        let mut entry = ArchiveEntry::new_file(name);
         entry.size = bytes.len() as u64;
         writer
             .push_archive_entry(entry, Some(Cursor::new(bytes.clone())))

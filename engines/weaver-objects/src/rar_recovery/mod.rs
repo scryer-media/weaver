@@ -321,7 +321,7 @@ impl Object for RarRecovery {
         (rev && !self.revs.is_empty()
             && self.stem.is_some()
             && naming::recovery_stem(name) == self.stem)
-            .then(|| VolumeIndex(self.revs.len() as u32))
+            .then_some(VolumeIndex(self.revs.len() as u32))
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
