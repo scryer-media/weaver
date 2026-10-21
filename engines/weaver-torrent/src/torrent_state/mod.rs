@@ -368,7 +368,8 @@ pub(crate) struct RunCounters {
     pub corrupt_bytes: u64,
     /// Bytes of the blocks received during the run and not used.
     pub redundant_bytes: u64,
-    /// Bytes of the selected pieces still missing.
+    /// What the whole torrent still lacked as the run ended
+    /// (`ChunkTracker::bytes_left`).
     pub left_bytes: u64,
 }
 

@@ -1137,6 +1137,30 @@ fn a_checking_torrent_keeps_the_checkpoints_bytes() {
     assert_eq!(have, [1024, 2500]);
 }
 
+// The bytes in hand over the torrent's total leave padding out, as the total
+// and the session's progress do.
+#[test]
+fn padding_in_hand_is_not_progress() {
+    use crate::pipeline::graph::root::pieces::PieceFile;
+
+    let file = |name: &str, length, padding| PieceFile {
+        name: name.to_owned(),
+        length,
+        padding,
+    };
+    let layout = PieceLayout::new(
+        16,
+        vec![
+            file("a", 10, false),
+            file(".pad/6", 6, true),
+            file("b", 16, false),
+        ],
+    )
+    .unwrap();
+    assert_eq!(on_disk(Some(&layout), &[10, 6, 4]), 14);
+    assert_eq!(on_disk(None, &[]), 0);
+}
+
 // Turning torrents off closes their sessions and stops each torrent, and
 // refuses new ones; turning them on starts the tick, which takes them up.
 #[tokio::test(start_paused = true)]

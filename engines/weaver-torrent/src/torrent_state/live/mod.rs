@@ -340,7 +340,7 @@ impl TorrentStateLive {
         let finished_at_start = paused.chunk_tracker.get_hns().finished();
         let lengths = *paused.chunk_tracker.get_lengths();
         let super_seeding =
-            paused.shared.options.super_seeding && have_bytes == lengths.total_length();
+            paused.shared.options.super_seeding && paused.chunk_tracker.bytes_left() == 0;
         let peer_limit = paused.shared.options.peer_limit.unwrap_or(128);
 
         let (upload_turns, upload_turns_rx) = unbounded_channel::<PeerHandle>();
@@ -1207,7 +1207,7 @@ impl TorrentStateLive {
             downloaded_bytes: self.get_downloaded_bytes(),
             corrupt_bytes: self.get_failed_bytes(),
             redundant_bytes: self.get_redundant_bytes(),
-            left_bytes: chunk_tracker.get_hns().needed_bytes,
+            left_bytes: chunk_tracker.bytes_left(),
         });
 
         Ok(TorrentStatePaused {

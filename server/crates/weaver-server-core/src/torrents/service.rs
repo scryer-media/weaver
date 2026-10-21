@@ -2559,7 +2559,7 @@ impl TorrentService {
         let counters = &reading.counters;
         let record = &torrent.record;
         let total = torrent.total;
-        let have: u64 = reading.file_have.iter().sum();
+        let have = on_disk(torrent.layout.as_deref(), &reading.file_have);
         let rules = self.rules();
         let policy = settings.policy(record, &rules);
         let swarm = status::swarm(&torrent.announces(), now);
@@ -2801,6 +2801,20 @@ fn downloading(view: &TorrentView, now_ms: i64) -> Option<JobPhaseProgress> {
         estimated_remaining_ms: view.eta_seconds.map(|eta| eta.saturating_mul(1000)),
         started_at_epoch_ms: view.added_at_ms as f64,
         updated_at_epoch_ms: now_ms as f64,
+    })
+}
+
+// The bytes in hand of the files that go to disk: the progress over the
+// torrent's total, which leaves padding out as the session's own does
+// (libtorrent `file_progress::total_on_disk`).
+fn on_disk(layout: Option<&PieceLayout>, file_have: &[u64]) -> u64 {
+    layout.map_or(0, |layout| {
+        layout
+            .files()
+            .zip(file_have)
+            .filter(|(file, _)| !file.padding)
+            .map(|(_, have)| have)
+            .sum()
     })
 }
 

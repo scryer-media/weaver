@@ -814,8 +814,6 @@ mod tests {
         let lengths = Lengths::new(total_length, PIECE_LENGTH).unwrap();
         let bf_len = lengths.piece_bitfield_bytes();
         let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
-        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
-        selected[..num_pieces as usize].fill(true);
         let file_infos = vec![crate::file_info::FileInfo {
             relative_filename: "test.dat".into(),
             offset_in_torrent: 0,
@@ -823,6 +821,8 @@ mod tests {
             piece_range: 0..num_pieces,
             attrs: Default::default(),
         }];
+        let selected =
+            crate::chunk_tracker::compute_selected_bytes(&lengths, |_| true, &file_infos);
         ChunkTracker::new(have.into_dyn(), selected, lengths, &file_infos).unwrap()
     }
 
@@ -1512,7 +1512,7 @@ mod tests {
 
         pri(&mut tracker, &[(1, PiecePriority::Skip)]);
         assert_eq!(tracker.chunks().get_hns().needed_bytes, full - piece_len);
-        assert_eq!(tracker.chunks().get_hns().selected_bytes, full - piece_len);
+        assert_eq!(tracker.chunks().get_hns().wanted_bytes, full - piece_len);
         let mut drained = drain_for_peer(&mut tracker, all);
         drained.sort();
         assert_eq!(drained, vec![0, 2, 3]);

@@ -24,7 +24,7 @@ use crate::{
     api::TorrentIdOrHash,
     bitv::BitV,
     bitv_factory::BitVFactory,
-    chunk_tracker::{ChunkTracker, compute_selected_pieces},
+    chunk_tracker::{ChunkTracker, compute_selected_bytes},
     file_ops::FileOps,
     piece_priority::PiecePriority,
     type_aliases::{BF, FileStorage},
@@ -302,7 +302,7 @@ impl TorrentStateInitializing {
             None => self.resume_or_check(&*bitv_factory, id).await?,
         };
 
-        let selected_pieces = compute_selected_pieces(
+        let selected_bytes = compute_selected_bytes(
             self.metadata.lengths(),
             |idx| {
                 self.only_files
@@ -315,7 +315,7 @@ impl TorrentStateInitializing {
 
         let mut chunk_tracker = ChunkTracker::new(
             have_pieces.into_dyn(),
-            selected_pieces,
+            selected_bytes,
             *self.metadata.lengths(),
             &self.metadata.file_infos,
         )
@@ -337,10 +337,10 @@ impl TorrentStateInitializing {
 
         info!(
             torrent=?self.shared.id,
-            "Initial check results: have {}, needed {}, total selected {}",
+            "Initial check results: have {}, needed {}, total wanted {}",
             BinarySize(hns.have_bytes),
             BinarySize(hns.needed_bytes),
-            BinarySize(hns.selected_bytes)
+            BinarySize(hns.wanted_bytes)
         );
 
         // Ensure file lengths are correct, and reopen read-only.

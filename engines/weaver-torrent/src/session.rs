@@ -2750,7 +2750,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         // as a seed (libtorrent `torrent::bytes_left`). Once the pieces are
         // gone with the torrent, what its run recorded as it ended.
         let left_bytes = mt
-            .with_chunk_tracker(|c| c.get_lengths().total_length() - c.get_hns().have_bytes)
+            .with_chunk_tracker(|c| c.bytes_left())
             .ok()
             .or(last_run.map(|r| r.left_bytes));
         crate::tracker::TrackerCommsStats {
@@ -3521,10 +3521,15 @@ mod tests {
         assert!(!stats.finished_during_run);
         assert!(info.wait_until_completed().now_or_never().is_none());
 
-        // Paused, the pieces still say what the torrent lacks.
+        // Paused, the pieces still say what the torrent lacks, and so does
+        // what the run recorded as it ended.
         session.pause(&handle).await.unwrap();
         let (_, stats) = tracker_stats(&session, &handle);
         assert_eq!(stats.left_bytes, Some(PIECE as u64));
+        assert_eq!(
+            handle.shared().last_run.lock().map(|run| run.left_bytes),
+            Some(PIECE as u64)
+        );
         session.stop().await;
     }
 
