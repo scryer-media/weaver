@@ -74,8 +74,12 @@ const REQUEST_QUEUE_TIME: Duration = Duration::from_secs(3);
 // that is not snubbed.
 const MIN_REQUEST_QUEUE: usize = 2;
 // libtorrent `peer_connection::m_desired_queue_size`'s first value: the
-// requests outstanding to a peer before any block has arrived from it.
+// requests outstanding to a peer as slow start begins.
 const INITIAL_REQUEST_QUEUE: usize = 4;
+// libtorrent `peer_connection::second_tick`: slow start ends once the payload
+// a peer delivered in a second rose by no more than this over the second
+// before.
+const SLOW_START_SLACK: u64 = 5000;
 
 // libtorrent `settings_pack::piece_timeout`: with requests outstanding, how
 // long a peer may go without sending a block or being sent a request before
@@ -190,12 +194,13 @@ impl Trust {
     /// least, as failing costs more than passing earns; one more hash failure;
     /// and parole (libtorrent `torrent::penalize_peers`, with
     /// `use_parole_mode` at its default, on). Returns whether the peer is to
-    /// be banned: it has lost every point it can, or it sent the whole piece.
-    fn piece_failed(&mut self, sole_sender: bool) -> bool {
+    /// be banned: it has lost every point it can, or it is `bannable`, sent
+    /// the whole piece and may be banned for it.
+    fn piece_failed(&mut self, bannable: bool) -> bool {
         self.on_parole = true;
         self.points = self.points.saturating_sub(2).max(Self::MIN_POINTS);
         self.hashfails = self.hashfails.saturating_add(1);
-        self.points <= Self::MIN_POINTS || sole_sender
+        self.points <= Self::MIN_POINTS || bannable
     }
 }
 
@@ -238,6 +243,15 @@ pub(crate) fn ingest_bitfield(payload: &[u8], total_pieces: u32) -> anyhow::Resu
 /// is no seed, then one on parole, then the least payload it sent per second
 /// connected (libtorrent `compare_disconnect_peer` in `torrent.cpp`).
 pub(crate) type DisconnectRank = (bool, bool, Reverse<bool>, u64);
+
+/// Where a connection to a peer of `trust` stands before it has carried any
+/// payload, being opened or just opened: neither of us has shown interest,
+/// it is not known for a seed, and it sent nothing (libtorrent
+/// `torrent::attach_peer` ranks an incoming connection as it attaches, by
+/// the peer list's entry for its address).
+pub(crate) fn opening_rank(trust: Trust) -> DisconnectRank {
+    (false, false, Reverse(trust.on_parole()), 0)
+}
 
 #[derive(Debug)]
 pub(crate) struct Peer {
@@ -515,11 +529,11 @@ impl Peer {
         self.trust.piece_passed();
     }
 
-    /// A piece the peer sent a block of failed its hash check, and the peer
-    /// sent all of it when `sole_sender` holds. Returns whether the peer is
-    /// to be banned.
-    pub(crate) fn piece_failed(&mut self, sole_sender: bool) -> bool {
-        self.trust.piece_failed(sole_sender)
+    /// A piece the peer sent a block of failed its hash check; the peer
+    /// sent all of it and may be banned for that when `bannable` holds.
+    /// Returns whether the peer is to be banned.
+    pub(crate) fn piece_failed(&mut self, bannable: bool) -> bool {
+        self.trust.piece_failed(bannable)
     }
 
     /// The peer as a pause leaves it on the list: where it listens, its
@@ -553,9 +567,8 @@ impl Peer {
     /// Where the peer's connection stands when the torrent turns peers over;
     /// the lowest goes first. None when it has no connection.
     pub(crate) fn disconnect_rank(&self, now: Instant) -> Option<DisconnectRank> {
-        let parole = Reverse(self.trust.on_parole());
         Some(match &self.state {
-            PeerState::Connecting(_) => (false, false, parole, 0),
+            PeerState::Connecting(_) => opening_rank(self.trust),
             PeerState::Live(live) => {
                 let fetched = Transfer::of(&self.stats.counters)
                     .fetched
@@ -564,7 +577,7 @@ impl Peer {
                 (
                     live.interesting,
                     live.seeder,
-                    parole,
+                    Reverse(self.trust.on_parole()),
                     fetched / (seconds + 1),
                 )
             }
@@ -806,6 +819,9 @@ pub(crate) struct LivePeerState {
     // How long the peer takes to deliver a block, which sets its request timeout.
     block_time: BlockTime,
 
+    // While the peer is in slow start; None once it is over.
+    slow_start: Option<SlowStart>,
+
     // The peer went its request timeout without delivering a block. Until a
     // block it was asked for arrives, it may hold one request and takes no
     // piece from another peer.
@@ -923,6 +939,7 @@ impl LivePeerState {
             waiting_since: Instant::now(),
             last_piece: Instant::now(),
             block_time: BlockTime::default(),
+            slow_start: Some(SlowStart::new(now)),
             snubbed: false,
             request_slots_changed: Default::default(),
             upload_queue: Default::default(),
@@ -1089,25 +1106,29 @@ impl LivePeerState {
     }
 
     /// The peer went its request timeout without delivering a block. Its
-    /// requests stay outstanding.
+    /// requests stay outstanding, and its slow start is over (libtorrent
+    /// `peer_connection::snub_peer`).
     pub fn snub(&mut self) {
         self.snubbed = true;
+        self.slow_start = None;
     }
 
     /// How many requests to keep outstanding to the peer, at most `max`
     /// (libtorrent `peer_connection::update_desired_queue_size`): one while
-    /// it is snubbed; else the blocks it delivers in [`REQUEST_QUEUE_TIME`]
-    /// at the pace it has delivered them, at least [`MIN_REQUEST_QUEUE`];
-    /// [`INITIAL_REQUEST_QUEUE`] until a block has arrived.
+    /// it is snubbed; in slow start, one more than when it began for each
+    /// block it delivered; after, the blocks it delivers in
+    /// [`REQUEST_QUEUE_TIME`] at the pace it has delivered them. At least
+    /// [`MIN_REQUEST_QUEUE`] while it is not snubbed.
     pub fn desired_queue_size(&self, max: usize) -> usize {
         if self.snubbed {
             return 1;
         }
-        self.block_time
-            .blocks_in(REQUEST_QUEUE_TIME)
-            .unwrap_or(INITIAL_REQUEST_QUEUE)
-            .max(MIN_REQUEST_QUEUE)
-            .min(max)
+        match self.slow_start.and_then(|s| s.at(Instant::now())) {
+            Some(slow_start) => slow_start.queue,
+            None => self.block_time.blocks_in(REQUEST_QUEUE_TIME).unwrap_or(0),
+        }
+        .max(MIN_REQUEST_QUEUE)
+        .min(max)
     }
 
     /// Whether the peer may hold another request, at most `max` in all.
@@ -1159,6 +1180,15 @@ impl LivePeerState {
     /// a snub that is answered late leaves the peer snubbed (libtorrent
     /// `incoming_piece` unsnubs only within `request_timeout()`).
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
+        let now = Instant::now();
+        // Every block that arrives counts toward the peer's payload, and
+        // grows its queue while slow start lasts (libtorrent
+        // `peer_connection::incoming_piece`, before it asks whether the
+        // block was requested).
+        self.slow_start = self
+            .slow_start
+            .and_then(|s| s.at(now))
+            .map(|s| s.delivered(chunk.size));
         let answer = if self.inflight_requests.remove(chunk) {
             RemoveInflightRequestResult::Expected
         } else {
@@ -1167,7 +1197,6 @@ impl LivePeerState {
         if matches!(answer, RemoveInflightRequestResult::Unexpected) {
             return answer;
         }
-        let now = Instant::now();
         let waited = now - self.waiting_since;
         if matches!(answer, RemoveInflightRequestResult::Expected)
             && waited < self.block_time.request_timeout()
@@ -1485,6 +1514,8 @@ impl LivePeerState {
         }
         if !interesting {
             self.became_uninteresting = now;
+            // libtorrent `peer_connection::send_not_interested`.
+            self.slow_start = None;
         }
         self.interesting = interesting;
         true
@@ -1544,6 +1575,71 @@ pub(crate) enum RemoveInflightRequestResult {
     Expected,
     LateCanceled,
     Unexpected,
+}
+
+/// Slow start (libtorrent `peer_connection::m_slow_start`): the requests
+/// outstanding to a peer grow by one with each block it delivers, from
+/// [`INITIAL_REQUEST_QUEUE`], until a second's payload from it rises by no
+/// more than [`SLOW_START_SLACK`] over the second before's. The seconds are
+/// the peer's own, counted from when its connection went live (libtorrent
+/// `peer_connection::second_tick`).
+#[derive(Debug, Clone, Copy)]
+struct SlowStart {
+    queue: usize,
+    // When the second being counted began.
+    second: Instant,
+    // The payload the peer delivered in that second, and in the one before
+    // (libtorrent `statistics::last_payload_downloaded`,
+    // `peer_connection::m_downloaded_last_second`).
+    this_second: u64,
+    last_second: u64,
+}
+
+impl SlowStart {
+    const SECOND: Duration = Duration::from_secs(1);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            queue: INITIAL_REQUEST_QUEUE,
+            second: now,
+            this_second: 0,
+            last_second: 0,
+        }
+    }
+
+    /// Slow start as it stands at `now`, the seconds ended since counted;
+    /// None when one of them ended it: the peer had delivered payload the
+    /// second before, and no more than [`SLOW_START_SLACK`] less than in it.
+    fn at(self, now: Instant) -> Option<Self> {
+        let mut s = self;
+        while now >= s.second + Self::SECOND {
+            if s.last_second > 0 && s.last_second + SLOW_START_SLACK >= s.this_second {
+                return None;
+            }
+            if s.last_second == 0 && s.this_second == 0 {
+                // No payload, nor any in the seconds still to end: none of
+                // them ends slow start.
+                s.second += Duration::from_secs((now - s.second).as_secs());
+                break;
+            }
+            s = Self {
+                second: s.second + Self::SECOND,
+                this_second: 0,
+                last_second: s.this_second,
+                ..s
+            };
+        }
+        Some(s)
+    }
+
+    /// The peer delivered a block of `len` bytes: one more request for it.
+    fn delivered(self, len: u32) -> Self {
+        Self {
+            queue: self.queue + 1,
+            this_second: self.this_second + u64::from(len),
+            ..self
+        }
+    }
 }
 
 /// How long a peer takes to deliver a block we wait on: a running mean, and
@@ -1609,7 +1705,10 @@ mod tests {
         stats, unbounded_channel,
     };
     use crate::{
-        core::{hash_id::Id20, lengths::Lengths},
+        core::{
+            hash_id::Id20,
+            lengths::{ChunkInfo, Lengths},
+        },
         stream_connect::ConnectionKind,
     };
 
@@ -1847,5 +1946,100 @@ mod tests {
             trust.piece_failed(false);
         }
         assert_eq!(trust.hashfails(), u8::MAX);
+    }
+
+    // A connection gone live now.
+    fn live_now() -> LivePeerState {
+        let (tx, _rx) = unbounded_channel();
+        let counters = stats::atomic::PeerStats::default().counters;
+        LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters, true)
+    }
+
+    // Block `i` of a torrent of one piece of 64 blocks.
+    fn block(i: u32) -> ChunkInfo {
+        let lengths = Lengths::new(64 * 16384, 64 * 16384).unwrap();
+        let piece = lengths.validate_piece_index(0).unwrap();
+        lengths
+            .chunk_info_from_received_data(piece, i * 16384, 16384)
+            .unwrap()
+    }
+
+    // `live` is asked for `chunk`, which arrives `after` that.
+    async fn deliver(live: &mut LivePeerState, chunk: ChunkInfo, after: Duration) {
+        live.add_inflight_request(chunk);
+        tokio::time::advance(after).await;
+        live.remove_inflight_request(&chunk);
+    }
+
+    // libtorrent peer_connection::incoming_piece: in slow start each block
+    // that arrives grows the queue by one, from four
+    // (`m_desired_queue_size`); update_desired_queue_size holds it to the
+    // most allowed.
+    #[tokio::test(start_paused = true)]
+    async fn in_slow_start_the_queue_grows_by_one_per_block() {
+        let mut live = live_now();
+        assert_eq!(live.desired_queue_size(500), 4);
+        for i in 0..6 {
+            deliver(&mut live, block(i), Duration::from_millis(100)).await;
+            assert_eq!(live.desired_queue_size(500), 5 + i as usize);
+        }
+        assert_eq!(live.desired_queue_size(7), 7);
+    }
+
+    // libtorrent peer_connection::second_tick: slow start ends at the end of
+    // a second whose payload rose by no more than 5000 bytes over the
+    // second before's; update_desired_queue_size then sizes the queue to
+    // what the peer delivers in request_queue_time, 3 s.
+    #[tokio::test(start_paused = true)]
+    async fn slow_start_ends_when_the_rate_stops_rising_and_the_queue_follows_three_seconds() {
+        let mut live = live_now();
+        let quarter = Duration::from_millis(250);
+        // A block every quarter second: three in the first second, then four
+        // in the second, a rise of a block; four again in the third.
+        for i in 0..11 {
+            deliver(&mut live, block(i), quarter).await;
+        }
+        assert_eq!(live.desired_queue_size(500), 4 + 11);
+        tokio::time::advance(Duration::from_millis(249)).await;
+        assert_eq!(live.desired_queue_size(500), 4 + 11);
+
+        // The third second ends: twelve blocks in 3 s at a quarter second
+        // each, and no more growth.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(live.desired_queue_size(500), 12);
+        deliver(&mut live, block(11), quarter).await;
+        assert_eq!(live.desired_queue_size(500), 12);
+    }
+
+    // libtorrent snub_peer: a snub ends slow start and holds the queue to
+    // one; incoming_piece lifts it, and the queue follows the 3 s rule.
+    #[tokio::test(start_paused = true)]
+    async fn a_snub_holds_the_queue_to_one_and_lifting_it_restores_the_rule() {
+        let mut live = live_now();
+        let quarter = Duration::from_millis(250);
+        deliver(&mut live, block(0), quarter).await;
+        assert_eq!(live.desired_queue_size(500), 5);
+
+        live.add_inflight_request(block(1));
+        tokio::time::advance(quarter).await;
+        live.snub();
+        assert_eq!(live.desired_queue_size(500), 1);
+        tokio::time::advance(quarter).await;
+        live.remove_inflight_request(&block(1));
+
+        // Blocks of a quarter and half a second: 3 s holds eight.
+        assert!(!live.is_snubbed());
+        assert_eq!(live.desired_queue_size(500), 8);
+    }
+
+    // libtorrent send_not_interested ends slow start.
+    #[tokio::test(start_paused = true)]
+    async fn slow_start_ends_when_we_lose_interest() {
+        let mut live = live_now();
+        deliver(&mut live, block(0), Duration::from_millis(250)).await;
+        live.interest(true, Instant::now());
+        assert_eq!(live.desired_queue_size(500), 5);
+        live.interest(false, Instant::now());
+        assert_eq!(live.desired_queue_size(500), 12);
     }
 }

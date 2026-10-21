@@ -33,7 +33,7 @@ use crate::{
     buffers::ByteBuf,
     core::{
         hash_id::Id20,
-        lengths::Lengths,
+        lengths::{Lengths, ValidPieceIndex},
         magnet::Escaped,
         net::{HttpClients, HttpTarget, Resolver},
         torrent_metainfo::{WebSeed, WebSeedKind, escape_path},
@@ -42,11 +42,11 @@ use crate::{
     peer_protocol::{Handshake, Message, Piece, Request},
     stream_connect::ConnectionKind,
     torrent_state::TorrentMetadata,
-    type_aliases::PeerHandle,
+    type_aliases::{BF, PeerHandle},
 };
 
 use super::{
-    peer::PeerRx,
+    peer::{PeerRx, empty_bitfield},
     peers::holepunch::{is_global, is_local},
 };
 
@@ -127,13 +127,23 @@ struct Entry {
     disabled: bool,
     // Banned for sending bad data; not listed (`peer_info.banned`).
     banned: bool,
-    // The files the server answered an error status for (the bits cleared
-    // in libtorrent `web_seed_t::have_files`).
-    missing_files: HashSet<usize>,
+    // What the seed does not serve.
+    lacks: Lacks,
     // Where the server moved a file (libtorrent `web_seed_t::redirects`).
     redirects: HashMap<usize, Redirect>,
     // Ends the open connection to the seed.
     connection: Option<CancellationToken>,
+}
+
+/// What a seed does not serve, kept across its connections: the files the
+/// server answered an error status for or sent a bad copy of (the bits
+/// cleared in libtorrent `web_seed_t::have_files`), and the pieces spanning
+/// several files it sent bad data for (libtorrent
+/// `web_peer_connection::received_invalid_data`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Lacks {
+    files: HashSet<usize>,
+    pieces: HashSet<u32>,
 }
 
 /// Where a server moved a file.
@@ -206,7 +216,7 @@ impl WebSeeds {
             retry: None,
             disabled: false,
             banned: false,
-            missing_files: HashSet::new(),
+            lacks: Lacks::default(),
             redirects: HashMap::new(),
             connection: None,
         });
@@ -244,7 +254,7 @@ impl WebSeeds {
     /// The seeds to connect to at `now`. At most MAX_WEB_SEED_CONNECTIONS
     /// seeds count, connected ones among them: those not disabled, not
     /// waiting to retry and with a piece to give, which `interesting` tells
-    /// from the files a seed misses. Of those, a seed whose URL can never be
+    /// from what a seed lacks. Of those, a seed whose URL can never be
     /// fetched is removed or disabled, as is one `banned` names (libtorrent
     /// `torrent::maybe_connect_web_seeds`, `connect_to_url_seed`,
     /// `connect_web_seed`).
@@ -252,7 +262,7 @@ impl WebSeeds {
         &self,
         now: Instant,
         banned: impl Fn(PeerHandle) -> bool,
-        interesting: impl Fn(&HashSet<usize>) -> bool,
+        interesting: impl Fn(&Lacks) -> bool,
     ) -> Vec<Due> {
         let mut g = self.inner.lock();
         let mut limit = MAX_WEB_SEED_CONNECTIONS;
@@ -260,9 +270,7 @@ impl WebSeeds {
         let mut at = 0;
         while at < g.seeds.len() && limit > 0 {
             let entry = &mut g.seeds[at];
-            if entry.disabled
-                || entry.retry.is_some_and(|r| r > now)
-                || !interesting(&entry.missing_files)
+            if entry.disabled || entry.retry.is_some_and(|r| r > now) || !interesting(&entry.lacks)
             {
                 at += 1;
                 continue;
@@ -312,6 +320,27 @@ impl WebSeeds {
             seed: entry.seed.clone(),
             cancel,
         })
+    }
+
+    /// Seed `handle` sent the whole of `piece`, which failed its hash
+    /// check: it serves no more of what the piece lies in (see
+    /// [`Layout::failed`]). The pieces it serves now; None when `handle`
+    /// is no seed's.
+    pub fn piece_failed(
+        &self,
+        handle: PeerHandle,
+        piece: ValidPieceIndex,
+        layout: &Layout,
+    ) -> Option<BF> {
+        let mut g = self.inner.lock();
+        let entry = g.seeds.iter_mut().find(|e| handle_of(e.id) == handle)?;
+        layout.failed(piece, &mut entry.lacks);
+        debug!(
+            url = entry.seed.url,
+            piece = piece.get(),
+            "web seed sent a bad piece"
+        );
+        Some(layout.bitfield(&entry.lacks))
     }
 
     fn with_entry<R>(&self, id: u32, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
@@ -428,9 +457,9 @@ impl SeedLink {
         handle_of(self.id)
     }
 
-    fn missing_files(&self) -> HashSet<usize> {
+    fn lacks(&self) -> Lacks {
         self.seeds
-            .with_entry(self.id, |e| e.missing_files.clone())
+            .with_entry(self.id, |e| e.lacks.clone())
             .unwrap_or_default()
     }
 
@@ -473,7 +502,7 @@ impl SeedLink {
 
     fn file_missing(&self, file: usize) {
         self.seeds
-            .with_entry(self.id, |e| e.missing_files.insert(file));
+            .with_entry(self.id, |e| e.lacks.files.insert(file));
     }
 
     fn redirected(&self, file: usize, to: Redirect) {
@@ -529,14 +558,16 @@ impl Layout {
         }
     }
 
-    /// The pieces a seed missing `missing` files has: every piece but those
-    /// of a missing file that is no padding (libtorrent
-    /// `web_peer_connection::on_connected`).
-    pub fn bitfield(&self, missing: &HashSet<usize>) -> Vec<bool> {
+    /// The pieces a seed that lacks `lacks` has: every piece but those of a
+    /// file it lacks that is no padding, and those it lacks itself
+    /// (libtorrent `web_peer_connection::on_connected`,
+    /// `received_invalid_data`).
+    pub fn bitfield(&self, lacks: &Lacks) -> BF {
         let piece_len = u64::from(self.lengths.default_piece_length());
-        let mut have = vec![true; self.lengths.total_pieces() as usize];
+        let mut have = empty_bitfield(self.lengths.total_pieces());
+        have[..self.lengths.total_pieces() as usize].fill(true);
         for (i, f) in self.files.iter().enumerate() {
-            if f.pad || f.len == 0 || !missing.contains(&i) {
+            if f.pad || f.len == 0 || !lacks.files.contains(&i) {
                 continue;
             }
             let first = f.offset / piece_len;
@@ -544,7 +575,28 @@ impl Layout {
             #[allow(clippy::cast_possible_truncation)]
             have[first as usize..=last as usize].fill(false);
         }
+        for &piece in &lacks.pieces {
+            have.set(piece as usize, false);
+        }
         have
+    }
+
+    /// A seed that sent the whole of `piece`, which failed its hash check,
+    /// holds another copy of the piece's file than the torrent's when the
+    /// piece lies in one file, and lacks the file from then on; a piece
+    /// spanning several, it lacks alone (libtorrent
+    /// `web_peer_connection::received_invalid_data`). A pad file counts for
+    /// none: its zeros are not asked of the seed.
+    fn failed(&self, piece: ValidPieceIndex, lacks: &mut Lacks) {
+        let slices = self.slices(
+            self.lengths.piece_offset(piece),
+            u64::from(self.lengths.piece_length(piece)),
+        );
+        let mut files = slices.iter().filter(|s| !self.files[s.file].pad);
+        match (files.next(), files.next()) {
+            (Some(only), None) => lacks.files.insert(only.file),
+            _ => lacks.pieces.insert(piece.get()),
+        };
     }
 
     fn single_file(&self) -> bool {
@@ -664,13 +716,9 @@ impl<'a> WebSeedConnection<'a> {
                 false,
             )
             .map_err(anyhow)?;
-        let have = self.layout.bitfield(&self.link.missing_files());
-        let mut bitfield = vec![0u8; have.len().div_ceil(8)];
-        for (i, _) in have.iter().enumerate().filter(|(_, h)| **h) {
-            bitfield[i / 8] |= 0x80 >> (i % 8);
-        }
+        let have = self.layout.bitfield(&self.link.lacks());
         handler
-            .on_received_message(Message::Bitfield(ByteBuf(&bitfield)))
+            .on_received_message(Message::Bitfield(ByteBuf(have.as_raw_slice())))
             .await
             .map_err(anyhow)?;
         handler
@@ -1509,6 +1557,19 @@ mod tests {
         seeds.with_entry(0, |e| f(e)).unwrap()
     }
 
+    fn lacking(files: &[usize], pieces: &[u32]) -> Lacks {
+        Lacks {
+            files: files.iter().copied().collect(),
+            pieces: pieces.iter().copied().collect(),
+        }
+    }
+
+    // The pieces a seed that lacks `lacks` has, one bool each.
+    fn has(layout: &Layout, lacks: &Lacks) -> Vec<bool> {
+        let total = layout.lengths.total_pieces() as usize;
+        layout.bitfield(lacks)[..total].iter().by_vals().collect()
+    }
+
     // Runs the connection on `requests` until `until` blocks arrived, or
     // it ends.
     async fn drive(
@@ -1602,18 +1663,15 @@ mod tests {
         assert!(failed.is_err(), "{failed:?}");
         link.failed();
         let now = Instant::now();
-        assert_eq!(
-            entry(&seeds, |e| e.missing_files.clone()),
-            HashSet::from([2])
-        );
+        assert_eq!(entry(&seeds, |e| e.lacks.files.clone()), HashSet::from([2]));
         assert_eq!(
             entry(&seeds, |e| e.retry),
             Some(now + Duration::from_secs(120))
         );
         drop(link);
 
-        let interesting = |m: &HashSet<usize>| layout.bitfield(m).contains(&true);
-        assert_eq!(layout.bitfield(&HashSet::from([2])), [true, true, false]);
+        let interesting = |l: &Lacks| layout.bitfield(l).any();
+        assert_eq!(has(&layout, &lacking(&[2], &[])), [true, true, false]);
         let due = |at| seeds.due(at, |_| false, interesting).len();
         assert_eq!(due(now + Duration::from_secs(119)), 0);
         assert_eq!(due(now + Duration::from_secs(120)), 1);
@@ -1641,8 +1699,8 @@ mod tests {
                 Some(Instant::now() + URLSEED_WAIT_RETRY)
             );
             // The only file is lost: the seed has nothing to give.
-            let missing = entry(&seeds, |e| e.missing_files.clone());
-            assert!(!layout.bitfield(&missing).contains(&true));
+            let lacks = entry(&seeds, |e| e.lacks.clone());
+            assert!(!layout.bitfield(&lacks).any());
         }
     }
 
@@ -1791,10 +1849,7 @@ mod tests {
         let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
         let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
         assert!(drive(&conn, &Fake::default(), &requests, 1).await.is_err());
-        assert_eq!(
-            entry(&seeds, |e| e.missing_files.clone()),
-            HashSet::from([0])
-        );
+        assert_eq!(entry(&seeds, |e| e.lacks.files.clone()), HashSet::from([0]));
         assert!(!entry(&seeds, |e| e.disabled));
         assert!(entry(&seeds, |e| e.redirects.is_empty()));
         assert_eq!(targets(), ["/seed/f"]);
@@ -1908,7 +1963,7 @@ mod tests {
             let targets: Vec<_> = server.seen().into_iter().map(|h| h.target).collect();
             assert_eq!(targets, hops);
             assert!(!entry(&seeds, |e| e.disabled));
-            assert!(entry(&seeds, |e| e.missing_files.is_empty()));
+            assert!(entry(&seeds, |e| e.lacks.files.is_empty()));
             let moved = entry(&seeds, |e| e.redirects.get(&0).map(|r| r.url.clone()));
             assert_eq!(moved, ok.then(|| server.url(&format!("/r{MAX_REDIRECTS}"))));
         }
@@ -1932,7 +1987,7 @@ mod tests {
         assert!(failed.is_err());
         assert!(server.seen().is_empty());
         assert!(!entry(&seeds, |e| e.disabled));
-        assert!(entry(&seeds, |e| e.missing_files.is_empty()));
+        assert!(entry(&seeds, |e| e.lacks.files.is_empty()));
 
         let conn = WebSeedConnection::new(direct(), resolver(), ALL, &layout, &link);
         drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
@@ -1958,7 +2013,7 @@ mod tests {
         let failed = drive(&conn, &fake, &blocks(&layout, 0..1), 2).await;
         assert!(failed.is_err(), "{failed:?}");
         assert_eq!(fake.pieces.lock().len(), 1);
-        assert!(entry(&seeds, |e| e.missing_files.is_empty() && !e.disabled));
+        assert!(entry(&seeds, |e| e.lacks.files.is_empty() && !e.disabled));
     }
 
     // A response must answer the range asked for: one naming none disables
@@ -2194,10 +2249,77 @@ mod tests {
     // The connect policy's view of the seeds (libtorrent
     // `torrent::maybe_connect_web_seeds`, `connect_to_url_seed`,
     // `connect_web_seed`).
+    // A seed that sent the whole of a bad piece lying in one file holds
+    // another copy of that file: it lacks the file from then on, a pad file
+    // counting for none. One spanning several files it lacks alone. What it
+    // lacks is kept for its next connections, and a seed left nothing to
+    // serve is not due (libtorrent
+    // `web_peer_connection::received_invalid_data`, `on_connected`).
+    #[test]
+    fn a_bad_piece_loses_the_seed_its_file_or_itself() {
+        let bits = |have: BF, n: usize| have[..n].iter().by_vals().collect::<Vec<_>>();
+        let url = || WebSeed {
+            url: "http://h/".into(),
+            kind: WebSeedKind::Url,
+        };
+
+        // "a" fills piece 0 and starts piece 1, which a pad file ends.
+        let padded = layout(&[
+            ("a", 40000, false),
+            ("pad", 25536, true),
+            ("b", 30000, false),
+        ]);
+        let piece = |i| padded.lengths.validate_piece_index(i).unwrap();
+        let seeds = WebSeeds::new([url()]);
+        let have = seeds.piece_failed(handle_of(0), piece(1), &padded).unwrap();
+        assert_eq!(bits(have, 3), [false, false, true]);
+        assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[0], &[]));
+        assert_eq!(has(&padded, &lacking(&[0], &[])), [false, false, true]);
+        assert_eq!(
+            seeds
+                .due(Instant::now(), |_| false, |l| padded.bitfield(l).any())
+                .len(),
+            1
+        );
+        // A handle no seed has.
+        assert!(
+            seeds
+                .piece_failed(handle_of(1), piece(2), &padded)
+                .is_none()
+        );
+
+        // Piece 0 spans "x" and "y", piece 1 "y" and "z"; piece 2 is in "z".
+        let spans = layout(&[
+            ("x", 20000, false),
+            ("y", 20000, false),
+            ("z", 30000, false),
+        ]);
+        let piece = |i| spans.lengths.validate_piece_index(i).unwrap();
+        let seeds = WebSeeds::new([url()]);
+        let have = seeds.piece_failed(handle_of(0), piece(0), &spans).unwrap();
+        assert_eq!(bits(have, 3), [false, true, true]);
+        assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[], &[0]));
+        let have = seeds.piece_failed(handle_of(0), piece(2), &spans).unwrap();
+        assert_eq!(bits(have, 3), [false, false, false]);
+        assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[2], &[0]));
+        assert!(
+            seeds
+                .due(Instant::now(), |_| false, |l| spans.bitfield(l).any())
+                .is_empty()
+        );
+
+        // The only file of a torrent of one.
+        let single = layout(&[("f", 70000, false)]);
+        let seeds = WebSeeds::new([url()]);
+        let piece = single.lengths.validate_piece_index(1).unwrap();
+        let have = seeds.piece_failed(handle_of(0), piece, &single).unwrap();
+        assert!(!have.any());
+    }
+
     #[test]
     fn which_seeds_are_due() {
         let now = Instant::now();
-        let any = |_: &HashSet<usize>| true;
+        let any = |_: &Lacks| true;
         let seed = |url: &str| WebSeed {
             url: url.into(),
             kind: WebSeedKind::Url,

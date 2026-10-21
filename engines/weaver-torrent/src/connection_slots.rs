@@ -20,6 +20,11 @@ use tokio::{
 /// Mirrors libtorrent's `connections_limit`.
 pub(crate) const DEFAULT_CONNECTIONS_LIMIT: usize = 200;
 
+/// Incoming connections past `connections_limit` the session takes, each to
+/// replace a connection of a torrent that holds more than the incoming one's
+/// does. Mirrors libtorrent's `connections_slack`.
+pub(crate) const DEFAULT_CONNECTIONS_SLACK: usize = 10;
+
 /// Outgoing connects begun per second across the session. Mirrors
 /// libtorrent's `connection_speed`.
 pub(crate) const DEFAULT_CONNECTION_SPEED: NonZeroU32 = NonZeroU32::new(30).unwrap();
@@ -29,6 +34,9 @@ const WINDOW: Duration = Duration::from_secs(1);
 pub(crate) struct ConnectionSlots {
     limit: usize,
     open: Arc<Semaphore>,
+    // The places past the cap an incoming connection may take until it
+    // replaces another (libtorrent `connections_slack`).
+    slack: Arc<Semaphore>,
     connects: Mutex<ConnectWindow>,
     speed: NonZeroU32,
 }
@@ -39,18 +47,20 @@ struct ConnectWindow {
     left: u32,
 }
 
-/// One peer connection's place under the session cap, held from accept or
-/// connect until the connection ends; dropping it frees the place.
+/// One peer connection's place under the session cap, or in the slack past
+/// it, held from accept or connect until the connection ends; dropping it
+/// frees the place.
 pub(crate) struct ConnectionSlot {
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 
 impl ConnectionSlots {
-    pub(crate) fn new(limit: usize, speed: NonZeroU32) -> Self {
+    pub(crate) fn new(limit: usize, slack: usize, speed: NonZeroU32) -> Self {
         let limit = limit.min(Semaphore::MAX_PERMITS);
         Self {
             limit,
             open: Arc::new(Semaphore::new(limit)),
+            slack: Arc::new(Semaphore::new(slack.min(Semaphore::MAX_PERMITS))),
             connects: Mutex::new(ConnectWindow {
                 start: Instant::now(),
                 left: speed.get(),
@@ -59,11 +69,28 @@ impl ConnectionSlots {
         }
     }
 
-    /// A place for a connection the listener accepted, or None when the
-    /// session is at its cap and the connection is to be closed.
+    /// A free place under the cap, or None when the session is at it.
     pub(crate) fn try_open(&self) -> Option<ConnectionSlot> {
         let permit = self.open.clone().try_acquire_owned().ok()?;
-        Some(ConnectionSlot { _permit: permit })
+        Some(ConnectionSlot { permit })
+    }
+
+    /// A place for a connection the listener accepted: one under the cap, or
+    /// past it in the slack; None when the session holds `connections_limit
+    /// + connections_slack` and the connection is to be closed (libtorrent
+    /// `session_impl::incoming_connection`).
+    pub(crate) fn try_accept(&self) -> Option<ConnectionSlot> {
+        self.try_open().or_else(|| {
+            let permit = self.slack.clone().try_acquire_owned().ok()?;
+            Some(ConnectionSlot { permit })
+        })
+    }
+
+    /// Whether `slot` is one of the slack's, past the cap (libtorrent
+    /// `peer_connection::m_exceeded_limit`, set by
+    /// `session_impl::incoming_connection`).
+    pub(crate) fn exceeds_limit(&self, slot: &ConnectionSlot) -> bool {
+        Arc::ptr_eq(slot.permit.semaphore(), &self.slack)
     }
 
     /// How many more connections the session may open now (libtorrent
@@ -87,7 +114,7 @@ impl ConnectionSlots {
     /// A place for an outgoing connection, once one is free.
     pub(crate) async fn open(&self) -> Result<ConnectionSlot, AcquireError> {
         let permit = self.open.clone().acquire_owned().await?;
-        Ok(ConnectionSlot { _permit: permit })
+        Ok(ConnectionSlot { permit })
     }
 
     /// Returns when one more outgoing connect may begin: at most `speed`
@@ -122,7 +149,11 @@ mod tests {
     use super::{ConnectionSlot, ConnectionSlots, WINDOW};
 
     fn slots(limit: usize, speed: u32) -> Arc<ConnectionSlots> {
-        Arc::new(ConnectionSlots::new(limit, NonZeroU32::new(speed).unwrap()))
+        Arc::new(ConnectionSlots::new(
+            limit,
+            0,
+            NonZeroU32::new(speed).unwrap(),
+        ))
     }
 
     // A torrent's connect loop, one connection at a time: it takes a slot and

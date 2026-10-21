@@ -294,8 +294,9 @@ fn every_chunk() -> BTreeSet<(u32, u32)> {
 impl Harness {
     /// The unchoked `peer` is asked for every chunk, on the paused clock:
     /// the first piece's four at the depth of a peer no block has come from
-    /// yet; then the first of them arrives, at once, which makes room for the
-    /// rest. Returns the piece asked for first.
+    /// yet; then the peer is snubbed, which ends its slow start, and the
+    /// first of them arrives at once, which lifts the snub at a pace that
+    /// makes room for the rest. Returns the piece asked for first.
     async fn request_every_chunk(
         &self,
         peer: &PeerHandler,
@@ -305,6 +306,9 @@ impl Harness {
         let first = next_requests(task, rx, CHUNKS_PER_PIECE as usize).await;
         let (piece, _) = *first.first().unwrap();
         assert_eq!(first, chunks(piece, 0..CHUNKS_PER_PIECE));
+        self.peers
+            .with_live_mut(peer.addr, "test", |live| live.snub())
+            .unwrap();
         self.deliver(peer, (piece, 0)).await;
         let other = 1 - piece;
         assert_eq!(
@@ -316,9 +320,10 @@ impl Harness {
 }
 
 // libtorrent `peer_connection::update_desired_queue_size`: four requests
-// before any block arrives (`m_desired_queue_size`), then the blocks the
-// peer delivers in `request_queue_time` at its pace, between two and the
-// most outstanding; one while it is snubbed.
+// before any block arrives (`m_desired_queue_size`), one more for each block
+// in slow start (`incoming_piece`); once slow start is over (`snub_peer`,
+// `second_tick`), the blocks the peer delivers in `request_queue_time` at
+// its pace, between two and the most outstanding; one while it is snubbed.
 #[tokio::test]
 async fn the_request_depth_follows_the_pace_the_peer_delivers_at() {
     let h = Harness::new("request_depth_follows_pace").await;
@@ -348,9 +353,18 @@ async fn the_request_depth_follows_the_pace_the_peer_delivers_at() {
         .first()
         .unwrap();
 
-    // A block the moment it was asked for: every request we allow, and no
-    // more than the peer's `reqq`.
+    // A block in slow start: one more.
     h.deliver(&fast, (fast_piece, 0)).await;
+    assert_eq!(depth(&fast), 5);
+
+    // Snubbed: one, and slow start is over. A block the moment it was asked
+    // for lifts the snub: every request we allow, and no more than the
+    // peer's `reqq`.
+    h.peers
+        .with_live_mut(fast.addr, "test", |live| live.snub())
+        .unwrap();
+    assert_eq!(depth(&fast), 1);
+    h.deliver(&fast, (fast_piece, CHUNK_SIZE)).await;
     assert_eq!(depth(&fast), DEFAULT_PEER_REQUEST_WINDOW);
     let mut hs = ExtendedHandshake::new();
     hs.reqq = Some(5);
@@ -363,12 +377,13 @@ async fn the_request_depth_follows_the_pace_the_peer_delivers_at() {
         .unwrap();
     assert_eq!(depth(&fast), 1);
 
-    // A block a second: three seconds' worth.
+    // A block after a second, in slow start: one more.
     tokio::time::advance(Duration::from_secs(1)).await;
     h.deliver(&slow, (slow_piece, 0)).await;
-    assert_eq!(depth(&slow), 3);
+    assert_eq!(depth(&slow), 5);
 
-    // A block every two seconds: one and a half, so the least, two.
+    // None in the second after: slow start ends with it. A block every two
+    // seconds: one and a half in three, so the least, two.
     tokio::time::advance(Duration::from_secs(3)).await;
     h.deliver(&slow, (slow_piece, CHUNK_SIZE)).await;
     assert_eq!(depth(&slow), 2);
@@ -1240,13 +1255,18 @@ async fn a_peer_that_chokes_us_is_asked_only_for_its_allowed_fast_pieces() {
     assert!(rx.is_empty());
     assert_eq!(h.queued_pieces(), vec![0]);
 
-    // Unchoked, and a block arrives at once, which deepens the window: the
-    // rest is asked for.
+    // Unchoked, and each block that arrives deepens the window by one in
+    // slow start: the rest is asked for, two at a time.
     peer.on_i_am_unchoked();
     h.deliver(&peer, (1, 0)).await;
     assert_eq!(
-        next_requests(&mut requester, &mut rx, CHUNKS_PER_PIECE as usize).await,
-        chunks(0, 0..CHUNKS_PER_PIECE)
+        next_requests(&mut requester, &mut rx, 2).await,
+        chunks(0, 0..2)
+    );
+    h.deliver(&peer, (1, CHUNK_SIZE)).await;
+    assert_eq!(
+        next_requests(&mut requester, &mut rx, 2).await,
+        chunks(0, 2..4)
     );
 }
 
@@ -3638,6 +3658,140 @@ async fn a_session_at_its_connection_cutoff_turns_over_the_busiest_torrents_peer
     );
 }
 
+impl Harness {
+    /// The place the connection at `addr`, whose writer queue is `tx`, holds
+    /// under the torrent's cap and the session's, as its task would.
+    fn hold(&self, addr: SocketAddr, tx: &PeerTx) -> Held {
+        let permit = self.peer_semaphore.clone().try_acquire_owned().unwrap();
+        let slot = self._session.connection_slots.try_open().unwrap();
+        self.live.hold_place(addr, tx, permit, slot)
+    }
+
+    /// A connection from `addr` the listener took and checked, for this
+    /// torrent, with its place under the session's cap; and our end of it.
+    fn incoming(
+        &self,
+        addr: &str,
+    ) -> (
+        CheckedIncomingConnection,
+        crate::connection_slots::ConnectionSlot,
+        tokio::io::DuplexStream,
+    ) {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = crate::peer_info_reader::tests::halves(ours);
+        let checked = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: sock(addr),
+            reader,
+            writer,
+            read_buf: crate::read_buf::ReadBuf::new(),
+            handshake: Handshake::new(self.shared.info_hash, Id20::new([7; 20])),
+        };
+        let slot = self._session.connection_slots.try_accept().unwrap();
+        (checked, slot, theirs)
+    }
+
+    fn holds_place(&self, addr: &str) -> bool {
+        self.places.lock().contains_key(&sock(addr))
+    }
+}
+
+/// Whether the connection whose writer queue `rx` reads was asked to close.
+fn asked_to_close(rx: &mut PeerRx) -> bool {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|r| matches!(r, WriterRequest::Disconnect(Ok(()))))
+}
+
+// libtorrent `torrent::attach_peer`: at the torrent's cap, while more than
+// one in ten of its most connections are still connecting, the connect begun
+// longest ago gives way to an incoming connection.
+#[tokio::test]
+async fn an_incoming_connection_at_the_cap_replaces_the_oldest_connect_while_many_connect() {
+    let h = turnover_harness("displace_connect", 10, 200).await;
+    tokio::time::pause();
+    let mut held = Vec::new();
+    let mut connects = Vec::new();
+    for addr in ["203.0.113.1:6881", "203.0.113.2:6881"] {
+        h.peers.add_peer(sock(addr));
+        let (addr, rx, tx) = h.peers.connect_next(tokio::time::Instant::now()).unwrap();
+        held.push(h.hold(addr, &tx));
+        connects.push((addr, rx));
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let mut live = Vec::new();
+    for i in 1..=8 {
+        let (peer, rx) = h.new_peer(&format!("198.51.100.{i}:6881"));
+        held.push(h.hold(peer.addr, &peer.tx));
+        live.push(rx);
+    }
+
+    let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+    let [(oldest, oldest_rx), (newer, newer_rx)] = &mut connects[..] else {
+        unreachable!()
+    };
+    assert_eq!(*oldest, sock("203.0.113.1:6881"));
+    assert!(asked_to_close(oldest_rx));
+    assert!(!asked_to_close(newer_rx));
+    assert!(live.iter_mut().all(|rx| !asked_to_close(rx)));
+    assert!(!h.holds_place("203.0.113.1:6881"));
+    assert!(h.places.lock().contains_key(newer));
+    assert!(h.holds_place("192.0.2.1:6881"));
+    assert_eq!(h.connections(), (10, 10));
+}
+
+// libtorrent `torrent::attach_peer`, `find_lowest_ranking_peer`: at the
+// torrent's cap, with few connecting, an incoming connection replaces the
+// connection that ranks lowest when it ranks higher. Here a connection on
+// parole ranks lowest; the newcomer, never seen, is on none.
+#[tokio::test]
+async fn an_incoming_connection_at_the_cap_replaces_a_connection_that_ranks_lower() {
+    let h = turnover_harness("displace_lowest", 2, 200).await;
+    tokio::time::pause();
+    let (on_parole, mut on_parole_rx) = h.new_peer("203.0.113.1:6881");
+    h.peers
+        .with_peer_mut(on_parole.addr, "test", |p| p.piece_failed(false))
+        .unwrap();
+    let (kept, mut kept_rx) = h.new_peer("203.0.113.2:6881");
+    let _held = [
+        h.hold(on_parole.addr, &on_parole.tx),
+        h.hold(kept.addr, &kept.tx),
+    ];
+
+    let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+    assert!(asked_to_close(&mut on_parole_rx));
+    assert!(!asked_to_close(&mut kept_rx));
+    assert!(!h.holds_place("203.0.113.1:6881"));
+    assert!(h.holds_place("192.0.2.1:6881"));
+    assert_eq!(h.connections(), (2, 2));
+}
+
+// libtorrent `torrent::attach_peer`: an incoming connection that ranks no
+// higher than the lowest-ranked connection of a torrent at its cap is
+// refused, and every connection stays.
+#[tokio::test]
+async fn an_incoming_connection_at_the_cap_that_ranks_no_higher_is_refused() {
+    let h = turnover_harness("displace_none", 2, 200).await;
+    tokio::time::pause();
+    let (a, mut a_rx) = h.new_peer("203.0.113.1:6881");
+    let (b, mut b_rx) = h.new_peer("203.0.113.2:6881");
+    let _held = [h.hold(a.addr, &a.tx), h.hold(b.addr, &b.tx)];
+
+    let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(
+        added,
+        AddIncomingPeerResult::ConcurrencyLimitReached
+    ));
+    assert!(!asked_to_close(&mut a_rx));
+    assert!(!asked_to_close(&mut b_rx));
+    assert!(!h.holds_place("192.0.2.1:6881"));
+    assert_eq!(h.connections(), (2, 2));
+}
+
 /// Every dial reaches the test as [`Dialed`](crate::peer_info_reader::tests::Dialed)
 /// does; a datagram socket, which only the idle UDP tracker client holds,
 /// is bound on loopback.
@@ -4206,4 +4360,167 @@ async fn a_finish_between_the_check_and_the_wait_is_not_lost() {
     let after = h.finished_notify.notified();
     assert!(taken.now_or_never().is_some());
     assert!(after.now_or_never().is_none());
+}
+
+impl Harness {
+    /// A hybrid torrent of `files` live, each file padded to whole pieces,
+    /// none of its pieces had, and no peers.
+    async fn hybrid(name: &str, files: Vec<(&str, Vec<u8>)>) -> Self {
+        use crate::core::v2_test_torrent::TestTorrent as V2TestTorrent;
+
+        let mut torrent = V2TestTorrent::new(files, u64::from(PIECE_LENGTH));
+        torrent.hybrid = true;
+        let out = TempDir::with_prefix(name).unwrap();
+        let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+            .await
+            .unwrap();
+        let pieces = torrent.v1_payload().len() / PIECE_LENGTH as usize;
+        let have = BF::from_boxed_slice(vec![0u8; pieces.div_ceil(8)].into_boxed_slice());
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.torrent_bytes()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    initial_have: Some(have),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        Self {
+            live: handle.live().unwrap(),
+            content: torrent.v1_payload(),
+            _session: session,
+            _torrent: None,
+            _out: out,
+        }
+    }
+
+    /// A web seed of the torrent, connected and live with every piece of
+    /// the files it serves, the queue of what we send it, and its link,
+    /// whose hold keeps the torrent from connecting to the seed itself.
+    fn web_seed(&self) -> (PeerHandler, PeerRx, web_seed::SeedLink) {
+        use crate::core::torrent_metainfo::{WebSeed, WebSeedKind};
+
+        let seeds = &self.shared.web_seeds;
+        assert!(seeds.add(WebSeed {
+            url: "http://192.0.2.1/s/".into(),
+            kind: WebSeedKind::Url,
+        }));
+        // The torrent's metainfo names no seed: this one is the first.
+        let link = seeds.link(0).unwrap();
+        let addr = link.handle();
+        let (rx, tx) = self.peers.admit_web_seed(addr).unwrap();
+        let counters = self
+            .peers
+            .with_peer(addr, |p| p.stats.counters.clone())
+            .unwrap();
+        let handler = PeerHandler {
+            addr,
+            incoming: false,
+            on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
+            sent_dht_port: AtomicBool::new(false),
+            flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
+            state: self.live.clone(),
+            tx,
+            counters,
+            first_message_received: AtomicBool::new(true),
+            cancel_token: self.live.cancellation_token.child_token(),
+            client_name_and_version: String::new(),
+        };
+        (&handler)
+            .on_handshake(handshake(false), ConnectionKind::Tcp, false)
+            .unwrap();
+        let serves = self.web_layout.bitfield(&Default::default());
+        handler.on_bitfield(serves.as_raw_slice()).unwrap();
+        (handler, rx, link)
+    }
+
+    /// The pieces the peer has, one bool each.
+    fn has(&self, peer: &PeerHandler) -> Vec<bool> {
+        let total = self.lengths.total_pieces() as usize;
+        self.peers
+            .with_live(peer.addr, |live| {
+                live.bitfield[..total].iter().by_vals().collect()
+            })
+            .unwrap()
+    }
+}
+
+// libtorrent web_peer_connection::received_invalid_data: a web seed that
+// sent the whole of a piece lying in one file holds another copy of that
+// file, so it no longer has the file's pieces, and is not banned while it
+// has others (torrent::penalize_peers bans a known bad peer only when its
+// connection allows it). A pad file is no part of what the seed serves.
+#[tokio::test]
+async fn a_web_seed_that_fails_a_piece_loses_its_file_and_serves_the_rest() {
+    use crate::core::v2_test_torrent::payload;
+
+    // "a" fills piece 0 and starts piece 1, which a pad file ends; "b" is
+    // piece 2.
+    let h = Harness::hybrid(
+        "web_seed_loses_a_file",
+        vec![
+            ("a", payload(PIECE_LENGTH as usize + 1000, 1)),
+            ("b", payload(PIECE_LENGTH as usize, 2)),
+        ],
+    )
+    .await;
+    tokio::time::pause();
+    let (seed, mut rx, _link) = h.web_seed();
+    assert_eq!(h.has(&seed), [true, true, true]);
+
+    h.take(&seed, 1);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&seed, (1, chunk), chunk == 0).await.unwrap();
+    }
+
+    assert_eq!(h.missing_chunks(1), vec![0, 1, 2, 3]);
+    assert_eq!(h.trust(&seed), (-2, 1, true));
+    assert!(!h.banned(&seed) && !told_to_disconnect(&mut rx));
+    assert_eq!(h.has(&seed), [false, false, true]);
+    assert_eq!(h.shared.web_seeds.list().len(), 1);
+
+    // It goes on serving "b", and is asked for nothing of "a": what is
+    // left to take of it is piece 2, unless taking piece 1 took it first.
+    let left: Vec<u32> = std::iter::from_fn(|| seed.acquire_next_piece().unwrap())
+        .map(|p| p.get())
+        .collect();
+    assert!(left.iter().all(|&p| p == 2), "{left:?}");
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&seed, (2, chunk), false).await.unwrap();
+    }
+    assert!(h.missing_chunks(2).is_empty());
+    assert_eq!(h.trust(&seed), (-1, 1, false));
+}
+
+// libtorrent web_peer_connection::received_invalid_data: the seed of a
+// single-file torrent that sends a bad piece has nothing left to serve,
+// and is banned as any peer that sent a whole bad piece is.
+#[tokio::test]
+async fn the_web_seed_of_a_single_file_torrent_that_fails_a_piece_is_banned() {
+    let h = Harness::new("web_seed_single_file_banned").await;
+    tokio::time::pause();
+    let (seed, mut rx, link) = h.web_seed();
+    assert_eq!(h.has(&seed), [true, true]);
+
+    h.take(&seed, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&seed, (0, chunk), chunk == 2).await.unwrap();
+    }
+
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert!(h.banned(&seed));
+    assert!(told_to_disconnect(&mut rx));
+    drop(link);
+    let due = h.shared.web_seeds.due(
+        tokio::time::Instant::now(),
+        |handle| h.peers.is_banned(handle.ip()),
+        |lacks| h.web_layout.bitfield(lacks).any(),
+    );
+    assert!(due.is_empty());
 }
