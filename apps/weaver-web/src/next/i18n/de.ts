@@ -1596,7 +1596,6 @@ export const nextDe: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "Das weiche Upload-Kontingent darf nicht über dem harten liegen.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "Das Geschwindigkeitslimit ist zu groß.",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "Eine Bandbreitenaufteilung gibt Usenet 1 % bis 99 %.",
-  "next.refusal.TORRENT_ROUTE_LEGS": "Eine Torrent-Route hat genau einen Abschnitt.",
   "next.refusal.TORRENT_ROUTE_POOL": "Eine Torrent-Route kann keinen Pool nutzen.",
   "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "Die Rücksetzzeit des Kontingents liegt außerhalb des Bereichs.",
   "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "Der monatliche Rücksetztag muss zwischen 1 und 31 liegen.",

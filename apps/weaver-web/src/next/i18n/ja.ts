@@ -1596,7 +1596,6 @@ export const nextJa: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "アップロードのソフト上限はハード上限を超えられません。",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "速度制限が大きすぎます。",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "帯域の配分では Usenet に 1% から 99% を割り当てます。",
-  "next.refusal.TORRENT_ROUTE_LEGS": "トレント経路のレッグはちょうど 1 つです。",
   "next.refusal.TORRENT_ROUTE_POOL": "トレント経路ではプールを使えません。",
   "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "クォータのリセット時刻が範囲外です。",
   "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "毎月のリセット日は 1～31 にしてください。",

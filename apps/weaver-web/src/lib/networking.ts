@@ -61,7 +61,7 @@ export function routeInput(route: NetworkRoute) {
   })) };
 }
 /** Why a route cannot be saved, as a code the interface words for itself. */
-export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated" | "torrentLegs" | "torrentPool";
+export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated" | "torrentPool";
 /** The proxies a rung uses, a pool's members included. */
 export function rungProxyIds(rung: Rung, pools: ProxyPool[]): number[] {
   if (rung.kind === "PROXY") return rung.proxyId === null ? [] : [rung.proxyId];
@@ -70,9 +70,8 @@ export function rungProxyIds(rung: Rung, pools: ProxyPool[]): number[] {
 }
 export function routeProblem(route: NetworkRoute, known: { egresses?: Egress[]; pools?: ProxyPool[]; kind?: ConsumerKind } = {}): RouteProblem | null {
   if (!route.legs.length || route.legs.length > 8) return "legCount";
-  // A torrent route takes exactly one leg, and no pool on it.
+  // A torrent route takes no pool.
   const torrent = known.kind !== undefined && isTorrentConsumer(known.kind);
-  if (torrent && route.legs.length !== 1) return "torrentLegs";
   if (torrent && route.legs.some(leg => leg.path.kind === "LADDER" && leg.path.rungs.some(rung => rung.kind === "POOL"))) return "torrentPool";
   if (route.legs.some(l => !Number.isInteger(l.weight) || l.weight < 1 || l.weight > 100) || route.legs.reduce((sum,l) => sum+l.weight,0) !== 100) return "weights";
   for (const leg of route.legs) {

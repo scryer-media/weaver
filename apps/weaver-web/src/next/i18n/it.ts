@@ -1596,7 +1596,6 @@ export const nextIt: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "La quota upload morbida non può superare quella rigida.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "Il limite di velocità è troppo alto.",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "Una ripartizione della banda dà a usenet dall'1% al 99%.",
-  "next.refusal.TORRENT_ROUTE_LEGS": "Un percorso torrent ha esattamente una tratta.",
   "next.refusal.TORRENT_ROUTE_POOL": "Un percorso torrent non può usare un pool.",
   "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "L'ora di azzeramento della quota è fuori intervallo.",
   "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "Il giorno di azzeramento mensile deve essere compreso tra 1 e 31.",

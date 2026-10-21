@@ -621,8 +621,10 @@ fn a_wireguard_proxy_is_saved_on_only_one_path_per_egress() {
     );
 }
 
+// A torrent route's legs are failover in order: it runs on the first that is
+// up. Only a pool is refused.
 #[test]
-fn a_torrent_route_is_one_leg_without_a_pool() {
+fn a_torrent_route_may_have_several_legs_but_no_pool() {
     let db = Database::open_in_memory().unwrap();
     let pool = pool(&db);
     let ladder = |rungs: Vec<Rung>| RouteLeg {
@@ -658,9 +660,14 @@ fn a_torrent_route_is_one_leg_without_a_pool() {
         Consumer::Torrent(TorrentScope::Default),
         Consumer::Torrent(TorrentScope::Category(4)),
     ] {
+        db.save_proxy_routing_policy(consumer, &split).unwrap();
         assert_eq!(
-            refused(db.save_proxy_routing_policy(consumer, &split)),
-            "TORRENT_ROUTE_LEGS"
+            db.proxy_routing_policy(consumer)
+                .unwrap()
+                .route()
+                .legs
+                .len(),
+            2
         );
         assert_eq!(
             refused(db.save_proxy_routing_policy(consumer, &pooled)),

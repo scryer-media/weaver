@@ -60,7 +60,6 @@ pub enum NetworkRefusal {
     RouteChainTransport,
     RouteHasAdvancedLegs,
     RouteConsumerGone,
-    TorrentRouteLegs,
     TorrentRoutePool,
 
     // WireGuard sessions across every route.
@@ -190,7 +189,6 @@ impl NetworkRefusal {
             Self::RouteChainTransport => "ROUTE_CHAIN_TRANSPORT",
             Self::RouteHasAdvancedLegs => "ROUTE_HAS_ADVANCED_LEGS",
             Self::RouteConsumerGone => "ROUTE_CONSUMER_NOT_FOUND",
-            Self::TorrentRouteLegs => "TORRENT_ROUTE_LEGS",
             Self::TorrentRoutePool => "TORRENT_ROUTE_POOL",
 
             Self::WireGuardPathConflict { .. } => "WIREGUARD_PROXY_PATH_CONFLICT",
@@ -336,7 +334,6 @@ impl std::fmt::Display for NetworkRefusal {
                 "this route has advanced legs; edit it in Networking instead of replacing its legacy projection"
             }
             Self::RouteConsumerGone => "routing consumer no longer exists",
-            Self::TorrentRouteLegs => "a torrent route has exactly one leg",
             Self::TorrentRoutePool => "a torrent route cannot use a pool",
 
             Self::WireGuardPathConflict {

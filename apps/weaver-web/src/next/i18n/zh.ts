@@ -1596,7 +1596,6 @@ export const nextZh: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "上传软配额不能高于硬配额。",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "速度上限过大。",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "带宽分配给 Usenet 的比例为 1% 到 99%。",
-  "next.refusal.TORRENT_ROUTE_LEGS": "种子路由只能有一条线路。",
   "next.refusal.TORRENT_ROUTE_POOL": "种子路由不能使用代理池。",
   "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "配额重置时间超出范围。",
   "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "每月重置日必须在 1 到 31 之间。",

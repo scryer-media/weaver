@@ -1596,7 +1596,6 @@ export const nextEs: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "La cuota de subida flexible no puede superar a la estricta.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "El límite de velocidad es demasiado grande.",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "Un reparto del ancho de banda da a usenet del 1 % al 99 %.",
-  "next.refusal.TORRENT_ROUTE_LEGS": "Una ruta de torrents tiene exactamente un tramo.",
   "next.refusal.TORRENT_ROUTE_POOL": "Una ruta de torrents no puede usar un grupo.",
   "next.refusal.EGRESS_QUOTA_RESET_TIME_RANGE": "La hora de reinicio de la cuota está fuera de rango.",
   "next.refusal.EGRESS_QUOTA_RESET_DAY_RANGE": "El día de reinicio mensual debe estar entre 1 y 31.",

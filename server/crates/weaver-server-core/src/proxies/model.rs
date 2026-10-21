@@ -370,14 +370,12 @@ impl Consumer {
         matches!(self, Self::Torrent(_))
     }
 
-    // A torrent session dials through one path at a time, trying its rungs in
-    // order: it cannot spread over weighted legs or a pool.
+    // A torrent session dials through one path at a time: its route's first
+    // leg that is up, trying that leg's rungs in order. It cannot spread over
+    // a pool.
     pub fn validate_route(self, route: &super::Route) -> Result<(), super::NetworkRefusal> {
         if !matches!(self, Self::Torrent(_)) {
             return Ok(());
-        }
-        if route.legs.len() != 1 {
-            return Err(super::NetworkRefusal::TorrentRouteLegs);
         }
         let pooled = route.legs.iter().any(|leg| match &leg.path {
             super::LegPath::Direct => false,
