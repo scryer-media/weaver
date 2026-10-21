@@ -437,6 +437,7 @@ fn tracker_rules_crud() {
                 never_pause: true,
                 unpack: Some(false),
                 client: Some(Client::QBittorrent),
+                torrent_route: true,
             },
             1,
         )
@@ -450,6 +451,7 @@ fn tracker_rules_crud() {
                 never_pause: false,
                 unpack: None,
                 client: None,
+                torrent_route: false,
             },
             2,
         )
@@ -477,6 +479,7 @@ fn tracker_rules_crud() {
         never_pause: false,
         unpack: Some(true),
         client: Some(Client::Transmission),
+        torrent_route: false,
         ..first.clone()
     };
     assert!(db.update_tracker_rule(&changed, 4).unwrap());

@@ -970,3 +970,20 @@ kind = "sql"
 file = "migrations/0078_torrent_infohash_v2/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 79
+description = "a tracker rule may route its torrents through their own consumer"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0079_tracker_rule_route/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0079_tracker_rule_route/postgres.sql"
+engine = "postgres"
+scope = "all"

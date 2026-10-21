@@ -361,6 +361,7 @@ impl Consumer {
             Self::Outbound => "outbound".into(),
             Self::Torrent(TorrentScope::Default) => "torrent:default".into(),
             Self::Torrent(TorrentScope::Category(id)) => format!("torrent:category:{id}"),
+            Self::Torrent(TorrentScope::TrackerRule(id)) => format!("torrent:tracker:{id}"),
         }
     }
 
@@ -390,12 +391,14 @@ impl Consumer {
     }
 }
 
-// Which torrents a torrent consumer carries: every torrent whose category
-// has no route of its own, or one category's.
+// Which torrents a torrent consumer carries: every torrent whose tracker
+// rule and category have no route of their own, one category's, or one
+// tracker rule's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TorrentScope {
     Default,
     Category(u32),
+    TrackerRule(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -542,6 +542,42 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
     assert!(!rig.execute(&save("", "DELUGE")).await.errors.is_empty());
 }
 
+// A tracker rule keeps whether its torrents route through their own
+// consumer, and absent is off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_rule_keeps_whether_its_torrents_route_themselves() {
+    let rig = rig().await;
+    let save = |id: &str, route: &str| {
+        format!(
+            r#"mutation {{ saveTrackerRule({id} input: {{
+                hostPattern: "tracker.test"{route}
+            }}) {{ id torrentRoute }} }}"#
+        )
+    };
+
+    let response = rig.execute(&save("", ", torrentRoute: true")).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let saved = response.data.into_json().unwrap();
+    assert_eq!(saved["saveTrackerRule"][0]["torrentRoute"], true);
+    let id = saved["saveTrackerRule"][0]["id"].as_u64().unwrap();
+
+    for (route, read) in [
+        (", torrentRoute: false", false),
+        (", torrentRoute: true", true),
+        ("", false),
+    ] {
+        let response = rig.execute(&save(&format!("id: {id},"), route)).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let response = rig.execute("{ trackerRules { id torrentRoute } }").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let rules = response.data.into_json().unwrap();
+        assert_eq!(
+            rules["trackerRules"],
+            serde_json::json!([{ "id": id, "torrentRoute": read }])
+        );
+    }
+}
+
 // A torrent announcing to a host a tracker rule names takes the rule's
 // goals, and names the rule as their source until the rule is deleted. A
 // pattern that is no host, or one another rule has, is refused.

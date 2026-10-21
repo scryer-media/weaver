@@ -698,4 +698,52 @@ fn torrent_consumers_have_their_own_keys() {
         Consumer::Torrent(TorrentScope::Category(12)).key(),
         "torrent:category:12"
     );
+    assert_eq!(
+        Consumer::Torrent(TorrentScope::TrackerRule(5)).key(),
+        "torrent:tracker:5"
+    );
+}
+
+// A tracker rule that routes its torrents itself is a consumer, named by its
+// host pattern and holding one connection; a rule that does not is none.
+#[test]
+fn a_tracker_rule_with_its_own_route_is_a_consumer() {
+    use crate::settings::model::TrackerRule;
+
+    let db = Database::open_in_memory().unwrap();
+    let rule = |host_pattern: &str, torrent_route| TrackerRule {
+        id: 0,
+        host_pattern: host_pattern.into(),
+        seeding: None,
+        never_pause: false,
+        unpack: None,
+        client: None,
+        torrent_route,
+    };
+    let routed = db
+        .insert_tracker_rule(&rule("*.routed.test", true), 1)
+        .unwrap();
+    db.insert_tracker_rule(&rule("plain.test", false), 2)
+        .unwrap();
+
+    let torrents: Vec<_> = crate::proxies::ProxyRuntime::consumer_labels(&db)
+        .unwrap()
+        .into_iter()
+        .filter(|(consumer, _, _)| matches!(consumer, Consumer::Torrent(_)))
+        .collect();
+    assert_eq!(
+        torrents,
+        [
+            (
+                Consumer::Torrent(TorrentScope::Default),
+                "Default torrent".to_owned(),
+                1
+            ),
+            (
+                Consumer::Torrent(TorrentScope::TrackerRule(routed.id)),
+                "*.routed.test".to_owned(),
+                1
+            ),
+        ]
+    );
 }

@@ -575,6 +575,77 @@ async fn route_save_rejects_missing_consumers_without_persisting() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// A tracker rule that routes its torrents itself is listed by its host
+// pattern and takes a route of several legs; turned off, it is no consumer,
+// and a rule that is gone takes no route.
+#[tokio::test]
+async fn a_tracker_rule_with_its_own_route_is_listed_and_routed() {
+    let h = harness().await;
+    let save = |id: &str, route: bool| {
+        format!(
+            r#"mutation {{ saveTrackerRule({id} input: {{ hostPattern: "tracker.test", torrentRoute: {route} }}) {{ id }} }}"#
+        )
+    };
+    let response = h.execute(&save("", true)).await;
+    assert_no_errors(&response);
+    let id = response_data(&response)["saveTrackerRule"][0]["id"]
+        .as_u64()
+        .unwrap();
+    let listed = || async {
+        let response = h
+            .execute("{networkFlow{consumers{key id name kind cap}}}")
+            .await;
+        assert_no_errors(&response);
+        response_data(&response)["networkFlow"]["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|consumer| consumer["kind"] == "TORRENT_TRACKER")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed().await,
+        [serde_json::json!({
+            "key": format!("torrent:tracker:{id}"),
+            "id": id,
+            "name": "tracker.test",
+            "kind": "TORRENT_TRACKER",
+            "cap": 1,
+        })]
+    );
+
+    let legs =
+        "{egressId:0,weight:50,path:{direct:true}},{egressId:0,weight:50,path:{direct:true}}";
+    let response = h
+        .execute(&format!(
+            "mutation{{saveNetworkRoute(kind:TORRENT_TRACKER,id:{id},input:{{legs:[{legs}]}}){{consumer legs{{weight}}}}}}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["saveNetworkRoute"],
+        serde_json::json!({
+            "consumer": format!("torrent:tracker:{id}"),
+            "legs": [{"weight": 50}, {"weight": 50}],
+        })
+    );
+
+    let response = h.execute(&save(&format!("id: {id},"), false)).await;
+    assert_no_errors(&response);
+    assert!(listed().await.is_empty());
+
+    let response = h
+        .execute(&format!(
+            "mutation{{saveNetworkRoute(kind:TORRENT_TRACKER,id:{},input:{{legs:[{{egressId:0,weight:100,path:{{direct:true}}}}]}}){{consumer}}}}",
+            id + 1
+        ))
+        .await;
+    let (_, code, _) = refusal(&response);
+    assert_eq!(code, "ROUTE_CONSUMER_NOT_FOUND");
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 // A server or a feed made behind a kill switch is kept switched off behind a
 // route nothing can take, and a route saved for it under Networking opens it.
 #[tokio::test]

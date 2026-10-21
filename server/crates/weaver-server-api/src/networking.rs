@@ -973,6 +973,8 @@ pub enum NetworkConsumerKind {
     TorrentDefault,
     // One category's torrent route; the id is the category's.
     TorrentCategory,
+    // One tracker rule's torrent route; the id is the rule's.
+    TorrentTracker,
 }
 impl NetworkConsumerKind {
     pub(crate) fn consumer(self, id: u32) -> core::Consumer {
@@ -982,6 +984,7 @@ impl NetworkConsumerKind {
             Self::Outbound => core::Consumer::Outbound,
             Self::TorrentDefault => core::Consumer::Torrent(core::TorrentScope::Default),
             Self::TorrentCategory => core::Consumer::Torrent(core::TorrentScope::Category(id)),
+            Self::TorrentTracker => core::Consumer::Torrent(core::TorrentScope::TrackerRule(id)),
         }
     }
 }
@@ -1256,6 +1259,9 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                 }
                 core::Consumer::Torrent(core::TorrentScope::Category(id)) => {
                     (NetworkConsumerKind::TorrentCategory, id)
+                }
+                core::Consumer::Torrent(core::TorrentScope::TrackerRule(id)) => {
+                    (NetworkConsumerKind::TorrentTracker, id)
                 }
             };
             NetworkConsumerFlow {
@@ -1631,6 +1637,9 @@ impl NetworkingMutation {
                     .list_categories()?
                     .iter()
                     .any(|category| category.id == id),
+                core::Consumer::Torrent(core::TorrentScope::TrackerRule(id)) => {
+                    db.list_tracker_rules()?.iter().any(|rule| rule.id == id)
+                }
             };
             if !exists {
                 return Err(NetworkRefusal::RouteConsumerGone.into());

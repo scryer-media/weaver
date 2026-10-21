@@ -108,9 +108,13 @@ impl TorrentSettings {
         id.and_then(|id| self.categories.iter().find(|category| category.id == id))
     }
 
-    fn scope(&self, id: Option<u32>) -> TorrentScope {
-        match self.category(id) {
-            Some(category) if category.torrent_route => TorrentScope::Category(category.id),
+    // The scope whose route a torrent takes: its tracker rule's when the
+    // rule routes its torrents itself, else its category's when that does,
+    // else the default.
+    fn scope(&self, id: Option<u32>, rule: Option<&TrackerRule>) -> TorrentScope {
+        match (rule, self.category(id)) {
+            (Some(rule), _) if rule.torrent_route => TorrentScope::TrackerRule(rule.id),
+            (_, Some(category)) if category.torrent_route => TorrentScope::Category(category.id),
             _ => TorrentScope::Default,
         }
     }
@@ -1515,7 +1519,15 @@ impl TorrentService {
                     .map_err(|error| AddError::Invalid(format!("not a magnet: {error}")))?;
                 let hashes = magnet.info_hashes();
                 self.duplicate(hashes)?;
-                let scope = settings.scope(category.as_ref().map(|category| category.id));
+                let trackers: Vec<TrackerEntry> = magnet
+                    .trackers
+                    .iter()
+                    .filter_map(|url| tracker(0, url.as_bytes()))
+                    .collect();
+                let rules = self.rules();
+                let rule =
+                    tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
+                let scope = settings.scope(category.as_ref().map(|category| category.id), rule);
                 let plan = self
                     .inner
                     .sessions
@@ -1550,13 +1562,8 @@ impl TorrentService {
                     false,
                     None,
                 );
-                let trackers: Vec<TrackerEntry> = magnet
-                    .trackers
-                    .iter()
-                    .filter_map(|url| tracker(0, url.as_bytes()))
-                    .collect();
                 self.insert(&mut record, &[], &trackers)?;
-                let identity = identity_of(&record, &self.rules());
+                let identity = identity_of(&record, &rules);
                 let mut torrent = Live::new(record, TorrentCounters::default());
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
@@ -1788,7 +1795,10 @@ impl TorrentService {
         else {
             return;
         };
-        let scope = self.settings().scope(record.category_id);
+        let rules = self.rules();
+        let scope = self
+            .settings()
+            .scope(record.category_id, rule_of(&record, &rules));
         let plan = match self.inner.sessions.routes().plan(scope) {
             Ok(plan) => plan,
             Err(reason) => return self.held(job_id, None, Held::RouteDown(reason)).await,
@@ -1810,7 +1820,7 @@ impl TorrentService {
             .into_iter()
             .map(|tracker| tracker.url)
             .collect();
-        let identity = identity_of(&record, &self.rules());
+        let identity = identity_of(&record, &rules);
         self.spawn_resolve(job_id, session, uri, Some(trackers), identity);
     }
 
@@ -1841,7 +1851,7 @@ impl TorrentService {
                 .and_then(|policy| policy.max_upload_bps)
                 .map(|bps| u32::try_from(bps).unwrap_or(u32::MAX));
             (
-                settings.scope(torrent.record.category_id),
+                settings.scope(torrent.record.category_id, rule_of(&torrent.record, &rules)),
                 bytes,
                 layout,
                 intake,
@@ -2177,13 +2187,15 @@ impl TorrentService {
             ),
             None => None,
         };
+        let rules = self.rules();
         let moved = {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
-            let before = settings.scope(torrent.record.category_id);
+            let rule = rule_of(&torrent.record, &rules);
+            let before = settings.scope(torrent.record.category_id, rule);
             torrent.record.category_id = category_id;
             self.save_options(&torrent.record)?;
-            let moved = before != settings.scope(category_id);
+            let moved = before != settings.scope(category_id, rule);
             if moved {
                 self.detach(torrent).await;
                 torrent.route = None;
@@ -2352,6 +2364,7 @@ impl TorrentService {
     // whose route went down is held, and comes back when it is up.
     async fn follow_routes(&self) {
         let settings = self.settings();
+        let rules = self.rules();
         let mut reattach = Vec::new();
         let mut down: BTreeMap<RouteKey, String> = BTreeMap::new();
         let mut unresolved = Vec::new();
@@ -2364,7 +2377,8 @@ impl TorrentService {
                     }
                     continue;
                 }
-                let scope = settings.scope(torrent.record.category_id);
+                let scope =
+                    settings.scope(torrent.record.category_id, rule_of(&torrent.record, &rules));
                 match self.inner.sessions.routes().plan(scope) {
                     Ok(plan) => {
                         if let Some(reason) = &plan.down {
@@ -2566,6 +2580,12 @@ impl TorrentService {
                     .filter(|category| category.torrent_route)
                     .map(|category| TorrentScope::Category(category.id)),
             )
+            .chain(
+                self.rules()
+                    .iter()
+                    .filter(|rule| rule.torrent_route)
+                    .map(|rule| TorrentScope::TrackerRule(rule.id)),
+            )
             .filter_map(|scope| routes.plan(scope).ok())
             .map(|plan| plan.key)
             .collect();
@@ -2718,13 +2738,14 @@ impl TorrentService {
             .collect()
     }
 
-    /// The scope whose route a torrent added in `category` takes.
+    /// The scope whose route a torrent added in `category` takes before its
+    /// trackers are known.
     pub fn scope_of(&self, category: Option<&str>) -> TorrentScope {
         let settings = self.settings();
         let id = category
             .and_then(|name| resolve_category_config(&settings.categories, name))
             .map(|category| category.id);
-        settings.scope(id)
+        settings.scope(id, None)
     }
 }
 

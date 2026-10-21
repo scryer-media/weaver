@@ -1235,6 +1235,8 @@ pub struct TrackerRule {
     pub unpack: Option<bool>,
     /// The client its torrents name themselves as; absent is Weaver.
     pub client: Option<TorrentClientGql>,
+    /// Whether its torrents route through their own consumer.
+    pub torrent_route: bool,
 }
 
 impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
@@ -1246,6 +1248,7 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             never_pause: rule.never_pause,
             unpack: rule.unpack,
             client: rule.client.map(Into::into),
+            torrent_route: rule.torrent_route,
         }
     }
 }
@@ -1258,6 +1261,8 @@ pub struct TrackerRuleInput {
     pub never_pause: bool,
     pub unpack: Option<bool>,
     pub client: Option<TorrentClientGql>,
+    #[graphql(default)]
+    pub torrent_route: bool,
 }
 
 impl TrackerRuleInput {
@@ -1277,6 +1282,7 @@ impl TrackerRuleInput {
             never_pause: self.never_pause,
             unpack: self.unpack,
             client: self.client.map(Into::into),
+            torrent_route: self.torrent_route,
         })
     }
 }
