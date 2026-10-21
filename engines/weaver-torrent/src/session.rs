@@ -263,7 +263,7 @@ fn merge_two_optional_streams<T>(
 /// Options for adding new torrents to the session.
 //
 // Serialize/deserialize is for Tauri.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AddTorrentOptions {
     /// Start in paused state.
     #[serde(default)]
@@ -331,6 +331,45 @@ pub struct AddTorrentOptions {
     /// other piece is Normal. See [`PiecePriority`] and
     /// [`ManagedTorrent::set_piece_priorities`]. An index out of range is refused.
     pub piece_priorities: Option<Vec<(u32, PiecePriority)>>,
+
+    /// For a hybrid, verify a piece by its v2 hash alone, without SHA-1,
+    /// wherever its v2 block hashes are known; a piece whose v2 hashes are
+    /// not known yet is still verified by v1. No effect on a v1 or a v2
+    /// torrent (libtorrent `torrent_flags::disable_v1_hashes`). On by
+    /// default, where libtorrent's is off: hashing every byte of a hybrid
+    /// twice is a cost Weaver does not pay.
+    #[serde(default = "v1_hashes_disabled_by_default")]
+    pub disable_v1_hashes: bool,
+}
+
+const fn v1_hashes_disabled_by_default() -> bool {
+    true
+}
+
+impl Default for AddTorrentOptions {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            only_files_regex: None,
+            only_files: None,
+            overwrite: false,
+            list_only: false,
+            output_folder: None,
+            sub_folder: None,
+            peer_opts: None,
+            force_tracker_interval: None,
+            disable_trackers: false,
+            ratelimits: LimitsConfig::default(),
+            initial_peers: None,
+            peer_limit: None,
+            preferred_id: None,
+            storage_factory: None,
+            trackers: None,
+            initial_have: None,
+            piece_priorities: None,
+            disable_v1_hashes: v1_hashes_disabled_by_default(),
+        }
+    }
 }
 
 pub struct ListOnlyResponse {
@@ -1609,6 +1648,7 @@ impl Session {
                     ratelimits: Limits::new(opts.ratelimits),
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    disable_v1_hashes: opts.disable_v1_hashes,
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),

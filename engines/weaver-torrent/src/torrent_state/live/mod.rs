@@ -700,7 +700,11 @@ impl TorrentStateLive {
         self.shared.peer_id
     }
     pub(crate) fn file_ops(&self) -> FileOps<'_> {
-        FileOps::new(&self.metadata, &*self.files)
+        FileOps::new(
+            &self.metadata,
+            &*self.files,
+            self.shared.options.disable_v1_hashes,
+        )
     }
 
     pub(crate) fn lock_read(

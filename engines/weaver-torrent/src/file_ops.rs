@@ -145,20 +145,29 @@ pub(crate) struct FileOps<'a> {
     torrent: &'a ValidatedTorrentMetaV1Info<ByteBufOwned>,
     files: &'a dyn TorrentStorage,
     file_infos: &'a FileInfos,
+    disable_v1_hashes: bool,
 }
 
 impl<'a> FileOps<'a> {
-    pub fn new(metadata: &'a TorrentMetadata, files: &'a dyn TorrentStorage) -> Self {
+    /// `disable_v1_hashes` is [`AddTorrentOptions::disable_v1_hashes`](crate::AddTorrentOptions::disable_v1_hashes).
+    pub fn new(
+        metadata: &'a TorrentMetadata,
+        files: &'a dyn TorrentStorage,
+        disable_v1_hashes: bool,
+    ) -> Self {
         Self {
             metadata,
             torrent: &metadata.info,
             files,
             file_infos: &metadata.file_infos,
+            disable_v1_hashes,
         }
     }
 
-    /// A digest for `piece`: v1 when the torrent has v1 hashes, v2 when
-    /// what its blocks must hash to is known.
+    /// A digest for `piece`: v2 when what its blocks must hash to is
+    /// known, v1 when the torrent has v1 hashes, unless v1 hashes are
+    /// disabled and v2 is known (libtorrent `torrent::construct_storage`
+    /// and `torrent::start_checking`, `disable_v1_hashes`).
     fn digest(&self, piece: ValidPieceIndex) -> PieceDigest {
         let v2 = self.metadata.v2.as_ref().and_then(|v2| {
             v2.expected(piece.get())?;
@@ -169,8 +178,9 @@ impl<'a> FileOps<'a> {
                 blocks: Vec::new(),
             })
         });
+        let v1 = self.torrent.info().has_v1_listing() && !(self.disable_v1_hashes && v2.is_some());
         PieceDigest {
-            v1: self.torrent.info().has_v1_listing().then(Sha1::new),
+            v1: v1.then(Sha1::new),
             v2,
         }
     }
@@ -500,6 +510,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     use super::*;
+    use crate::AddTorrentOptions;
     use crate::core::v2_test_torrent::{TestTorrent, metadata, payload};
     use crate::torrent_state::ManagedTorrentShared;
 
@@ -564,9 +575,15 @@ mod tests {
         }
     }
 
-    fn check_all(metadata: &TorrentMetadata, payload: &[u8]) -> Vec<Verdict> {
+    /// Every piece checked as on completion, SHA-1 skipped where v2 is
+    /// known when `disable_v1_hashes`.
+    fn check_all(
+        metadata: &TorrentMetadata,
+        payload: &[u8],
+        disable_v1_hashes: bool,
+    ) -> Vec<Verdict> {
         let files = Files::new(metadata, payload);
-        let ops = FileOps::new(metadata, &files);
+        let ops = FileOps::new(metadata, &files, disable_v1_hashes);
         metadata
             .lengths()
             .iter_piece_infos()
@@ -574,9 +591,13 @@ mod tests {
             .collect()
     }
 
-    fn initial_check(metadata: &TorrentMetadata, payload: &[u8]) -> anyhow::Result<Vec<bool>> {
+    fn initial_check(
+        metadata: &TorrentMetadata,
+        payload: &[u8],
+        disable_v1_hashes: bool,
+    ) -> anyhow::Result<Vec<bool>> {
         let files = Files::new(metadata, payload);
-        let have = FileOps::new(metadata, &files).initial_check(
+        let have = FileOps::new(metadata, &files, disable_v1_hashes).initial_check(
             4,
             &AtomicU64::new(0),
             &AtomicBool::new(false),
@@ -624,19 +645,25 @@ mod tests {
         let metadata = metadata(&t.torrent_bytes());
         let mut payload = t.v1_payload();
         // Piece 0 passes only if a's padding is left out of its one block.
-        assert_eq!(check_all(&metadata, &payload), vec![Verdict::Passed; 5]);
-        assert_eq!(initial_check(&metadata, &payload).unwrap(), vec![true; 5]);
+        assert_eq!(
+            check_all(&metadata, &payload, true),
+            vec![Verdict::Passed; 5]
+        );
+        assert_eq!(
+            initial_check(&metadata, &payload, true).unwrap(),
+            vec![true; 5]
+        );
 
         // A byte flipped in b's third piece fails that piece alone.
         payload[3 * 32768 + 7] ^= 1;
-        let verdicts = check_all(&metadata, &payload);
+        let verdicts = check_all(&metadata, &payload, true);
         assert_eq!(verdicts[3], Verdict::Failed);
         assert_eq!(
             verdicts.iter().filter(|v| **v == Verdict::Passed).count(),
             4
         );
         assert_eq!(
-            initial_check(&metadata, &payload).unwrap(),
+            initial_check(&metadata, &payload, true).unwrap(),
             vec![true, true, true, false, true]
         );
     }
@@ -647,12 +674,12 @@ mod tests {
         t.layers = false;
         let metadata = metadata(&t.torrent_bytes());
         let payload = t.v1_payload();
-        let verdicts = check_all(&metadata, &payload);
+        let verdicts = check_all(&metadata, &payload, true);
         assert_eq!(verdicts[0], Verdict::Passed);
         assert_eq!(verdicts[1..], [Verdict::Unknown; 4]);
         // Not held, so fetched again; libtorrent would hold it unverified.
         assert_eq!(
-            initial_check(&metadata, &payload).unwrap(),
+            initial_check(&metadata, &payload, true).unwrap(),
             vec![true, false, false, false, false]
         );
         // And not fetched until the layer is held.
@@ -686,14 +713,20 @@ mod tests {
         real.layers = false;
         let metadata = metadata(&real.torrent_bytes());
         let payload = real.v1_payload();
-        assert_eq!(check_all(&metadata, &payload), vec![Verdict::Passed; 5]);
-        assert_eq!(initial_check(&metadata, &payload).unwrap(), vec![true; 5]);
+        assert_eq!(
+            check_all(&metadata, &payload, true),
+            vec![Verdict::Passed; 5]
+        );
+        assert_eq!(
+            initial_check(&metadata, &payload, true).unwrap(),
+            vec![true; 5]
+        );
         let lengths = metadata.lengths();
         assert!((0..5).all(|p| metadata.can_verify(lengths.validate_piece_index(p).unwrap())));
 
         let mut payload = payload;
         payload[2 * 32768] ^= 1;
-        assert_eq!(check_all(&metadata, &payload)[2], Verdict::Failed);
+        assert_eq!(check_all(&metadata, &payload, true)[2], Verdict::Failed);
     }
 
     #[test]
@@ -701,28 +734,33 @@ mod tests {
         // libtorrent test_transfer.cpp corrupt_v1_hashes: a hybrid with
         // wrong v1 hashes and right v2 hashes ends in
         // torrent_inconsistent_hashes. The check skips v2 for a piece
-        // whose v1 hash fails, so there it is only missing.
+        // whose v1 hash fails, so there it is only missing. Both digests
+        // are taken only with v1 hashes kept, libtorrent's default.
         let (real, other) = two_hybrids();
         let metadata = hybrid(&other, &real);
         let payload = real.v1_payload();
         assert_eq!(
-            check_all(&metadata, &payload),
+            check_all(&metadata, &payload, false),
             vec![Verdict::Inconsistent; 5]
         );
-        assert_eq!(initial_check(&metadata, &payload).unwrap(), vec![false; 5]);
+        assert_eq!(
+            initial_check(&metadata, &payload, false).unwrap(),
+            vec![false; 5]
+        );
     }
 
     #[test]
     fn a_hybrid_with_bad_v2_hashes_is_inconsistent_at_the_check() {
-        // libtorrent torrent::on_piece_hashed: v1 passes, v2 fails.
+        // libtorrent torrent::on_piece_hashed: v1 passes, v2 fails. With
+        // v1 hashes kept, libtorrent's default.
         let (real, other) = two_hybrids();
         let metadata = hybrid(&real, &other);
         let payload = real.v1_payload();
         assert_eq!(
-            check_all(&metadata, &payload),
+            check_all(&metadata, &payload, false),
             vec![Verdict::Inconsistent; 5]
         );
-        let err = initial_check(&metadata, &payload).unwrap_err();
+        let err = initial_check(&metadata, &payload, false).unwrap_err();
         assert!(
             format!("{err}").contains("v1 and v2 hashes do not describe the same data"),
             "{err}"
@@ -763,7 +801,7 @@ mod tests {
         for threads in [1, 2, 4, 64] {
             let files = Files::new(&metadata, &payload);
             let progress = AtomicU64::new(0);
-            let have = FileOps::new(&metadata, &files)
+            let have = FileOps::new(&metadata, &files, true)
                 .initial_check(threads, &progress, &AtomicBool::new(false))
                 .unwrap();
             assert!(
@@ -822,7 +860,7 @@ mod tests {
             .collect();
         assert!(expected.contains(&true) && expected.contains(&false));
         for threads in [1, 4, 64] {
-            let have = FileOps::new(&metadata, &files)
+            let have = FileOps::new(&metadata, &files, true)
                 .initial_check(threads, &AtomicU64::new(0), &AtomicBool::new(false))
                 .unwrap();
             let have: Vec<bool> = have.iter().by_vals().take(expected.len()).collect();
@@ -835,10 +873,79 @@ mod tests {
         let t = checking_torrent();
         let metadata = metadata(&t.torrent_bytes());
         let files = Files::new(&metadata, &t.v1_payload());
-        let err = FileOps::new(&metadata, &files)
+        let err = FileOps::new(&metadata, &files, true)
             .initial_check(4, &AtomicU64::new(0), &AtomicBool::new(true))
             .unwrap_err();
         assert!(format!("{err}").contains("initial check paused"), "{err}");
         assert_eq!(files.1.load(Ordering::Relaxed), 0);
+    }
+
+    /// Which pieces of `metadata` get a SHA-1 digest.
+    fn sha1_pieces(metadata: &TorrentMetadata, disable_v1_hashes: bool) -> Vec<bool> {
+        let files = Files(Vec::new(), AtomicU64::new(0));
+        let ops = FileOps::new(metadata, &files, disable_v1_hashes);
+        metadata
+            .lengths()
+            .iter_piece_infos()
+            .map(|p| ops.digest(p.piece_index).v1.is_some())
+            .collect()
+    }
+
+    #[test]
+    fn a_hybrid_piece_whose_v2_hashes_are_known_gets_no_sha1() {
+        // libtorrent `torrent_flags::disable_v1_hashes`: a hybrid verified
+        // by v2 alone, so wrong v1 hashes go unread (test_transfer.cpp
+        // corrupt_v1_hashes passes with the flag set).
+        let (real, other) = two_hybrids();
+        let metadata = metadata(&real.torrent_bytes());
+        assert_eq!(sha1_pieces(&metadata, true), vec![false; 5]);
+        assert_eq!(sha1_pieces(&metadata, false), vec![true; 5]);
+        assert!(AddTorrentOptions::default().disable_v1_hashes);
+
+        let bad_v1 = hybrid(&other, &real);
+        let payload = real.v1_payload();
+        assert_eq!(check_all(&bad_v1, &payload, true), vec![Verdict::Passed; 5]);
+        assert_eq!(
+            initial_check(&bad_v1, &payload, true).unwrap(),
+            vec![true; 5]
+        );
+    }
+
+    #[test]
+    fn a_hybrid_piece_whose_v2_hashes_are_not_known_still_gets_sha1() {
+        // Without its layer, file b's pieces are verified by v1; file a,
+        // one piece, is known by its root.
+        let (mut real, _) = two_hybrids();
+        real.layers = false;
+        let metadata = metadata(&real.torrent_bytes());
+        assert_eq!(
+            sha1_pieces(&metadata, true),
+            vec![false, true, true, true, true]
+        );
+        let payload = real.v1_payload();
+        assert_eq!(
+            check_all(&metadata, &payload, true),
+            vec![Verdict::Passed; 5]
+        );
+    }
+
+    #[test]
+    fn a_v1_piece_always_gets_sha1() {
+        let data = payload(40000, 7);
+        let pieces: Vec<u8> = data
+            .chunks(16384)
+            .flat_map(|piece| {
+                let mut h = Sha1::new();
+                h.update(piece);
+                h.finish()
+            })
+            .collect();
+        let mut torrent =
+            b"d4:infod6:lengthi40000e4:name1:x12:piece lengthi16384e6:pieces60:".to_vec();
+        torrent.extend(pieces);
+        torrent.extend(b"ee");
+        let metadata = metadata(&torrent);
+        assert_eq!(sha1_pieces(&metadata, true), vec![true; 3]);
+        assert_eq!(check_all(&metadata, &data, true), vec![Verdict::Passed; 3]);
     }
 }
