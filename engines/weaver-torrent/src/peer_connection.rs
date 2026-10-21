@@ -123,9 +123,26 @@ pub struct PeerConnectionOptions {
 /// dropped (`peer_connection::second_tick`).
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The read and write timeout when none is set.
+const DEFAULT_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl PeerConnectionOptions {
     pub(crate) fn handshake_timeout(&self) -> Duration {
         self.handshake_timeout.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT)
+    }
+
+    fn read_write_timeout(&self) -> Duration {
+        self.read_write_timeout
+            .unwrap_or(DEFAULT_READ_WRITE_TIMEOUT)
+    }
+
+    /// A keepalive goes out once nothing has been sent for half the read
+    /// timeout, so a peer that times out a silent connection as we do
+    /// hears from us in time (libtorrent `peer_connection::keep_alive`:
+    /// `timeout() / 2`, the `settings_pack::peer_timeout`).
+    fn keep_alive_interval(&self) -> Duration {
+        self.keep_alive_interval
+            .unwrap_or_else(|| self.read_write_timeout() / 2)
     }
 }
 
@@ -384,10 +401,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         use tokio::io::AsyncWriteExt;
 
-        let rwtimeout = self
-            .options
-            .read_write_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
+        let rwtimeout = self.options.read_write_timeout();
 
         let extended_handshake: RwLock<Option<PeerExtendedMessageIds>> = RwLock::new(None);
         let extended_handshake_ref = &extended_handshake;
@@ -412,10 +426,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         }
 
         let writer = async move {
-            let keep_alive_interval = self
-                .options
-                .keep_alive_interval
-                .unwrap_or_else(|| Duration::from_secs(120));
+            let keep_alive_interval = self.options.keep_alive_interval();
 
             if self.handler.should_send_bitfield() {
                 let len = self
@@ -712,6 +723,50 @@ mod tests {
                 "{encryption:?}: {result:?}"
             );
             assert_eq!(start.elapsed(), DEFAULT_HANDSHAKE_TIMEOUT, "{encryption:?}");
+        }
+    }
+
+    // libtorrent `peer_connection::keep_alive` sends a keepalive once
+    // nothing has gone out for half the peer timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_keepalive_goes_out_at_half_the_read_timeout_unless_set() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (read_write_timeout, keep_alive_interval, expected) in [
+            (Some(120), None, 60),
+            (None, None, 5),
+            (Some(120), Some(30), 30),
+        ] {
+            let (mut connection, mut dialed) = connection(EncryptionPolicy::Disabled).await;
+            connection.options = PeerConnectionOptions {
+                read_write_timeout: read_write_timeout.map(Duration::from_secs),
+                keep_alive_interval: keep_alive_interval.map(Duration::from_secs),
+                ..Default::default()
+            };
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(async move { connection.manage_peer_outgoing(rx).await });
+            let (_, mut peer) = dialed.recv().await.unwrap();
+            let mut theirs = [0; 68];
+            peer.read_exact(&mut theirs).await.unwrap();
+            let mut ours = [0; 68];
+            let len = Handshake::new(Id20::new(HASH), Id20::new([2; 20]))
+                .serialize_unchecked_len(&mut ours);
+            peer.write_all(&ours[..len]).await.unwrap();
+            // Whatever goes out first, the keepalive is the first empty frame.
+            let start = Instant::now();
+            loop {
+                let frame = peer.read_u32().await.unwrap();
+                if frame == 0 {
+                    break;
+                }
+                let mut body = vec![0; frame as usize];
+                peer.read_exact(&mut body).await.unwrap();
+            }
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(expected),
+                "{read_write_timeout:?} {keep_alive_interval:?}"
+            );
+            task.abort();
         }
     }
 
