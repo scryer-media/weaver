@@ -2021,14 +2021,22 @@ impl Session {
 
         let mut seen_peers = Vec::new();
 
-        let (metadata, peer_rx) = {
+        // The torrent's one peer list, from its first metadata connection to
+        // its last connection (libtorrent `torrent::m_peer_list`, which
+        // `torrent::set_metadata` keeps).
+        let peer_list = PeerList::resumed(
+            opts.initial_peers.iter().flatten().copied(),
+            opts.banned_peers.iter().copied(),
+        );
+
+        let (metadata, peer_rx, peer_list) = {
             match metadata {
                 Some(metadata) => {
                     let mut peer_rx = None;
                     if !opts.paused && !opts.list_only {
                         peer_rx = make_peer_rx(metadata.info.info().private);
                     }
-                    (metadata, peer_rx)
+                    (metadata, peer_rx, peer_list)
                 }
                 None => {
                     // Whether the torrent is private is known only once its
@@ -2041,37 +2049,28 @@ impl Session {
                             info_hashes,
                             &identity,
                             peers,
+                            peer_list,
                             &tracker_tiers,
                             opts.peer_opts,
                         )
                         .await?;
 
-                    seen_peers = resolved_magnet.seen_peers.clone();
+                    seen_peers = resolved_magnet.seen_peers;
                     let peer_rx = if resolved_magnet.metadata.info.info().private {
                         // A private torrent takes peers only from its own
-                        // trackers (BEP 27): drop the discovery used to fetch the
-                        // metadata, and the peers it found.
+                        // trackers from here on (BEP 27): drop the discovery
+                        // used to fetch the metadata.
                         drop(resolved_magnet.peer_rx);
                         make_peer_rx(true)
                     } else {
-                        // Add back seen_peers into the peer stream, as we consumed some peers
-                        // while resolving the magnet. They come from the list
-                        // the fetch kept, not from a new naming.
                         Some(PeerSource {
-                            peers: merge_streams(
-                                resolved_magnet.peer_rx,
-                                futures::stream::iter(
-                                    resolved_magnet
-                                        .seen_peers
-                                        .into_iter()
-                                        .map(|addr| (addr, PeerSourceFlag::ResumeData)),
-                                ),
-                            )
-                            .boxed(),
+                            peers: resolved_magnet.peer_rx,
                             trackers,
                         })
                     };
-                    (resolved_magnet.metadata, peer_rx)
+                    // The peers the fetch found stay on the list it wrote
+                    // into, with what their connections left there.
+                    (resolved_magnet.metadata, peer_rx, resolved_magnet.peers)
                 }
             }
         };
@@ -2200,10 +2199,7 @@ impl Session {
                 false,
                 checkpoint,
                 piece_priorities.clone(),
-                PeerList::resumed(
-                    opts.initial_peers.iter().flatten().copied(),
-                    opts.banned_peers.iter().copied(),
-                ),
+                peer_list,
             ));
             let handle = Arc::new(ManagedTorrent {
                 locked: RwLock::new(ManagedTorrentLocked {
@@ -2584,13 +2580,14 @@ impl Session {
         info_hashes: InfoHashes,
         identity: &Identity,
         peer_rx: PeerStream,
+        peer_list: PeerList,
         tracker_tiers: &[Vec<url::Url>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
             identity.peer_id,
             info_hashes,
-            Default::default(),
+            peer_list,
             peer_rx,
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
@@ -2603,6 +2600,7 @@ impl Session {
                 info_bytes,
                 rx,
                 seen,
+                peers,
             } => {
                 trace!(?info, "received result from DHT");
                 let info = info.validate()?;
@@ -2614,6 +2612,7 @@ impl Session {
                         Vec::new(),
                     )?,
                     peer_rx: rx,
+                    peers,
                     seen_peers: {
                         let seen = seen.into_iter().collect::<Vec<_>>();
                         for peer in &seen {
@@ -2674,6 +2673,8 @@ impl Session {
 pub(crate) struct ResolveMagnetResult {
     pub metadata: TorrentMetadata,
     pub peer_rx: PeerStream,
+    /// The torrent's peer list, as the metadata connections left it.
+    pub peers: PeerList,
     pub seen_peers: Vec<SocketAddr>,
 }
 
@@ -4058,6 +4059,84 @@ mod tests {
             assert_eq!(start.elapsed(), DEFAULT_HANDSHAKE_TIMEOUT, "{encryption:?}");
             session.stop().await;
         }
+    }
+
+    // libtorrent `torrent::set_metadata` keeps `m_peer_list`: the list a
+    // magnet's metadata connections write into is the one the torrent
+    // connects from for its whole life. Which handshake a peer last completed
+    // (`torrent_peer::pe_support`), learnt over a metadata connection, is the
+    // one the torrent's first connection to it sends
+    // (`bt_peer_connection::on_connected`).
+    #[tokio::test(start_paused = true)]
+    async fn memory_a_metadata_connection_leaves_is_read_by_the_torrents_connector_afterwards() {
+        use crate::{
+            mse::EncryptionPolicy,
+            peer_info_reader::tests::{Dialed, MockPeer, halves, metadata},
+            read_buf::ReadBuf,
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, isolated_session_opts},
+        };
+        use std::time::Duration;
+
+        let (info, hashes) = metadata(10);
+        let (tx, mut dials) = tokio::sync::mpsc::unbounded_channel();
+        let dir = TempDir::with_prefix("metadata_memory").unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                socket_factory: Some(Arc::new(Dialed(tx))),
+                encryption: EncryptionPolicy::Prefer,
+                connect: Some(super::ConnectionOptions {
+                    enable_tcp: true,
+                    peer_opts: None,
+                }),
+                ..isolated_session_opts(false)
+            },
+        )
+        .await
+        .unwrap();
+        let add = session.add_torrent(
+            AddTorrent::from_url(format!(
+                "magnet:?xt=urn:btih:{}",
+                hashes.v1.unwrap().as_string()
+            )),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                initial_peers: Some(vec!["127.0.0.1:6881".parse().unwrap()]),
+                ..Default::default()
+            }),
+        );
+        let peer = async {
+            // The peer speaks only plaintext: the first metadata
+            // connection's encrypted handshake is no BitTorrent one.
+            let (_, stream) = dials.recv().await.unwrap();
+            let (mut read, write) = halves(stream);
+            let refused = ReadBuf::new()
+                .read_handshake(&mut read, Duration::MAX)
+                .await;
+            assert!(refused.is_err());
+            drop((read, write));
+            // The next sends the plaintext one and gets the metadata.
+            let (_, stream) = dials.recv().await.unwrap();
+            let mut fetched = MockPeer::greet(stream, hashes).await;
+            fetched.send_extended_handshake(info.len() as u32).await;
+            let piece = fetched.next_request().await.unwrap();
+            fetched.send_piece(&info, piece).await;
+            // Then the torrent connects.
+            let (_, stream) = dials.recv().await.unwrap();
+            let (mut read, _write) = halves(stream);
+            let greeting = ReadBuf::new()
+                .read_handshake(&mut read, Duration::MAX)
+                .await;
+            (greeting.map(|h| h.info_hash), fetched)
+        };
+
+        let (added, (greeting, _fetched)) = tokio::join!(add, peer);
+        added.unwrap();
+        assert_eq!(greeting.unwrap(), hashes.v1.unwrap());
+        let stats = session.connector.stats().encryption.snapshot();
+        assert_eq!(stats.failures, 1, "{stats:?}");
+        session.stop().await;
     }
 
     // A session for the incoming-connection rule tests, with nothing that

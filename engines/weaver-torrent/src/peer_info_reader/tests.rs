@@ -46,14 +46,15 @@ use crate::{
     sha1w::{ISha1, Sha1},
     spawn_utils::BlockingSpawner,
     stream_connect::{StreamConnector, StreamConnectorArgs},
-    torrent_state::live::peers::PeerStates,
+    torrent_state::live::peers::{PeerList, PeerStates},
 };
 
 /// The mock peers wait on us, never on the clock.
 const NO_TIMEOUT: Duration = Duration::MAX;
 
 /// Every dial reaches the test as the far end of an in-memory stream, so a
-/// conversation runs on the paused clock.
+/// conversation runs on the paused clock. A datagram socket, which a
+/// session's idle UDP tracker client holds, is bound on loopback.
 pub(crate) struct Dialed(pub(crate) mpsc::UnboundedSender<(SocketAddr, DuplexStream)>);
 
 impl SocketFactory for Dialed {
@@ -81,7 +82,10 @@ impl SocketFactory for Dialed {
         &'a self,
         _addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+        Box::pin(async {
+            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+        })
     }
 }
 
@@ -107,7 +111,11 @@ pub(super) async fn connector() -> (
 
 /// A peer list the fetches' peers are not on, so nothing is remembered.
 fn no_peers() -> Arc<PeerStates> {
-    Arc::new(PeerStates::new(Default::default(), 0))
+    Arc::new(PeerStates::founded_on(
+        PeerList::default(),
+        Default::default(),
+        0,
+    ))
 }
 
 pub(super) fn addr(port: u16) -> SocketAddr {
@@ -124,7 +132,7 @@ fn hashes_of(info: &[u8]) -> InfoHashes {
 }
 
 /// An info dictionary of about `name_len` bytes, and its hashes.
-pub(super) fn metadata(name_len: usize) -> (Bytes, InfoHashes) {
+pub(crate) fn metadata(name_len: usize) -> (Bytes, InfoHashes) {
     let mut info = format!("d6:lengthi1e4:name{name_len}:").into_bytes();
     info.extend(std::iter::repeat_n(b'a', name_len));
     info.extend_from_slice(b"12:piece lengthi16384e6:pieces20:");
@@ -149,7 +157,7 @@ fn info_bytes(pieces: usize) -> Bytes {
 }
 
 /// The far end of a metadata fetch.
-pub(super) struct MockPeer {
+pub(crate) struct MockPeer {
     read: BoxAsyncReadVectored,
     write: BoxAsyncWrite,
     buf: ReadBuf,
@@ -157,7 +165,7 @@ pub(super) struct MockPeer {
 
 impl MockPeer {
     /// Reads our handshake and answers it, speaking the extension protocol.
-    pub(super) async fn greet(stream: DuplexStream, hashes: InfoHashes) -> Self {
+    pub(crate) async fn greet(stream: DuplexStream, hashes: InfoHashes) -> Self {
         let (mut read, mut write) = halves(stream);
         let mut buf = ReadBuf::new();
         buf.read_handshake(&mut read, NO_TIMEOUT).await.unwrap();
@@ -176,14 +184,14 @@ impl MockPeer {
         self.write.write_all(&out[..len]).await.unwrap();
     }
 
-    pub(super) async fn send_extended_handshake(&mut self, metadata_size: u32) {
+    pub(crate) async fn send_extended_handshake(&mut self, metadata_size: u32) {
         let mut handshake = ExtendedHandshake::new();
         handshake.metadata_size = Some(metadata_size);
         self.send(Message::Extended(ExtendedMessage::Handshake(handshake)))
             .await;
     }
 
-    pub(super) async fn send_piece(&mut self, metadata: &Bytes, piece: u32) {
+    pub(crate) async fn send_piece(&mut self, metadata: &Bytes, piece: u32) {
         let data = UtMetadata::Data(UtMetadataData::piece_of(metadata, piece).unwrap());
         self.send(Message::Extended(ExtendedMessage::UtMetadata(
             data.as_borrowed(),
@@ -200,7 +208,7 @@ impl MockPeer {
 
     /// The next metadata piece we ask for; other messages pass. None once
     /// we hang up.
-    pub(super) async fn next_request(&mut self) -> Option<u32> {
+    pub(crate) async fn next_request(&mut self) -> Option<u32> {
         loop {
             let msg = self
                 .buf
@@ -418,7 +426,7 @@ async fn two_peers_send_the_metadata_between_them() {
     let found = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
         hashes,
-        vec![addr(1), addr(2)],
+        PeerList::resumed([addr(1), addr(2)], []),
         futures::stream::pending(),
         None,
         connector,
@@ -475,7 +483,7 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
     let fetch = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
         hashes,
-        vec![addr(1)],
+        PeerList::resumed([addr(1)], []),
         futures::stream::pending(),
         None,
         connector.clone(),
