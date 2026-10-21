@@ -22,14 +22,14 @@ use weaver_server_core::proxies::{
     EgressBinding, LegPath, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::model::{Config, SharedConfig};
-use weaver_server_core::settings::{SeedingPolicy, TorrentConfig};
+use weaver_server_core::settings::{BlocklistSource, SeedingPolicy, TorrentConfig, TorrentLimit};
 use weaver_server_core::torrents::identity::IDENTITY;
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{
     JobEnv, SystemClock, TorrentService, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::sessions::{
-    OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
+    IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };
 use weaver_server_core::torrents::{TorrentFile, TorrentSource, TorrentState, status};
 use weaver_server_core::watch_folder::WatchFolderService;
@@ -61,6 +61,18 @@ impl Routes for Offline {
         _: &'life1 RoutePlan,
         _: usize,
     ) -> Pin<Box<dyn Future<Output = Result<OpenLeg, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Err("offline".to_owned()) })
+    }
+
+    fn fetch_blocklist<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: &'life1 reqwest::Url,
+    ) -> Pin<Box<dyn Future<Output = Result<IpRanges, String>> + Send + 'async_trait>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -175,7 +187,6 @@ async fn rig_from(
                 base_port: 0,
                 announce_port: None,
                 upnp: false,
-                max_peers_total: 100,
                 identity: IDENTITY,
             },
             db.clone(),
@@ -264,6 +275,16 @@ impl Rig {
 
     async fn post(&self, path: &str, form: &str) -> Reply {
         self.post_as(path, form, ADMIN).await
+    }
+
+    // The status of a `setPreferences` of `json`.
+    async fn set_preferences(&self, json: &str) -> StatusCode {
+        self.post(
+            "/api/v2/app/setPreferences",
+            &format!("json={}", url_encode(json)),
+        )
+        .await
+        .status
     }
 
     async fn post_as(&self, path: &str, form: &str, key: &str) -> Reply {
@@ -1242,12 +1263,22 @@ async fn preferences_read_and_apply_the_mapped_keys() {
         before["max_active_downloads"],
         TorrentConfig::default().max_active_downloads
     );
-    // The peer limit is each torrent's; there is no global one.
     assert_eq!(
         before["max_connec_per_torrent"],
         TorrentConfig::default().max_peers_total
     );
-    assert!(before.get("max_connec").is_none());
+    assert_eq!(before["max_connec"], 200);
+    assert_eq!(before["max_uploads"], 8);
+    assert_eq!(before["connection_speed"], 30);
+    assert_eq!(before["enable_multi_connections_from_same_ip"], false);
+    assert_eq!(before["bittorrent_protocol"], 1);
+    assert_eq!(
+        before["dht_bootstrap_nodes"],
+        "dht.transmissionbt.com:6881,dht.libtorrent.org:25401"
+    );
+    assert_eq!(before["ip_filter_enabled"], false);
+    assert_eq!(before["ip_filter_path"], "");
+    assert_eq!(before["stop_tracker_timeout"], 5);
 
     let json = r#"{"dl_limit":1048576,"up_limit":2048,"max_active_downloads":7,"listen_port":1}"#;
     let set = rig
@@ -1262,6 +1293,113 @@ async fn preferences_read_and_apply_the_mapped_keys() {
     assert_eq!(after["up_limit"], 2048);
     assert_eq!(after["max_active_downloads"], 7);
     assert_eq!(after["listen_port"], before["listen_port"]);
+
+    let json = r#"{"max_connec":400,"max_connec_per_torrent":80,"max_uploads":12,"connection_speed":50,"enable_multi_connections_from_same_ip":true,"bittorrent_protocol":0,"dht_bootstrap_nodes":" router.example:6881 ","ip_filter_enabled":true,"ip_filter_path":"/var/lib/weaver/level1.p2p","stop_tracker_timeout":0}"#;
+    assert_eq!(rig.set_preferences(json).await, StatusCode::OK);
+    let after = rig.get("/api/v2/app/preferences").await.json();
+    assert_eq!(
+        [
+            &after["max_connec"],
+            &after["max_connec_per_torrent"],
+            &after["max_uploads"],
+            &after["connection_speed"],
+            &after["stop_tracker_timeout"],
+            &after["bittorrent_protocol"],
+        ],
+        [
+            &json!(400),
+            &json!(80),
+            &json!(12),
+            &json!(50),
+            &json!(0),
+            &json!(0)
+        ]
+    );
+    assert_eq!(after["enable_multi_connections_from_same_ip"], true);
+    assert_eq!(after["dht_bootstrap_nodes"], "router.example:6881");
+    assert_eq!(after["ip_filter_enabled"], true);
+    assert_eq!(after["ip_filter_path"], "/var/lib/weaver/level1.p2p");
+    let saved = rig.config.read().await.torrent.clone();
+    assert_eq!(
+        saved.peer_protocol,
+        weaver_server_core::settings::TorrentPeerProtocol::Both
+    );
+
+    // qBittorrent's zero or less is no limit for connections and upload
+    // slots, and a negative stop tracker timeout is none.
+    let json = r#"{"max_connec":-1,"max_uploads":0,"stop_tracker_timeout":-1}"#;
+    assert_eq!(rig.set_preferences(json).await, StatusCode::OK);
+    let after = rig.get("/api/v2/app/preferences").await.json();
+    assert_eq!(after["max_connec"], -1);
+    assert_eq!(after["max_uploads"], -1);
+    assert_eq!(after["stop_tracker_timeout"], 0);
+    let saved = rig.config.read().await.torrent.clone();
+    assert_eq!(saved.connections_limit, TorrentLimit::Unlimited);
+    assert_eq!(saved.unchoke_slots_limit, TorrentLimit::Unlimited);
+
+    // Every other count is one at least, and a request with one that is not
+    // takes nothing.
+    for key in [
+        "max_active_downloads",
+        "max_connec_per_torrent",
+        "connection_speed",
+    ] {
+        for value in [0, -1] {
+            let json = format!(r#"{{"{key}":{value},"dl_limit":4096,"max_uploads":3}}"#);
+            assert_eq!(
+                rig.set_preferences(&json).await,
+                StatusCode::BAD_REQUEST,
+                "{json}"
+            );
+            assert_eq!(rig.config.read().await.torrent, saved, "{json}");
+            assert_eq!(
+                rig.config.read().await.bandwidth.download_bps,
+                Some(1_048_576)
+            );
+        }
+    }
+
+    // The switch and the path are two settings: either is taken alone, in
+    // either order, and a switched off filter keeps its path.
+    assert_eq!(
+        rig.set_preferences(r#"{"ip_filter_enabled":false}"#).await,
+        StatusCode::OK
+    );
+    let off = rig.config.read().await.torrent.clone();
+    assert!(!off.blocklist_enabled);
+    assert_eq!(off.blocklist.as_deref(), Some("/var/lib/weaver/level1.p2p"));
+    let after = rig.get("/api/v2/app/preferences").await.json();
+    assert_eq!(after["ip_filter_path"], "/var/lib/weaver/level1.p2p");
+
+    assert_eq!(
+        rig.set_preferences(r#"{"ip_filter_path":"/var/lib/weaver/level2.p2p"}"#)
+            .await,
+        StatusCode::OK
+    );
+    let path = rig.config.read().await.torrent.clone();
+    assert!(!path.blocklist_enabled);
+    assert_eq!(
+        path.blocklist.as_deref(),
+        Some("/var/lib/weaver/level2.p2p")
+    );
+
+    assert_eq!(
+        rig.set_preferences(r#"{"ip_filter_enabled":true}"#).await,
+        StatusCode::OK
+    );
+    let on = rig.config.read().await.torrent.clone();
+    assert!(on.blocklist_enabled);
+    assert_eq!(on.blocklist.as_deref(), Some("/var/lib/weaver/level2.p2p"));
+
+    // A Windows path is a path, not a URL of scheme `c`.
+    let json = r#"{"ip_filter_path":"C:\\lists\\level1.p2p"}"#;
+    assert_eq!(rig.set_preferences(json).await, StatusCode::OK);
+    let windows = rig.config.read().await.torrent.clone();
+    assert_eq!(windows.blocklist.as_deref(), Some(r"C:\lists\level1.p2p"));
+    assert_eq!(
+        windows.blocklist_source(),
+        Some(BlocklistSource::File(r"C:\lists\level1.p2p".into()))
+    );
 
     let path = rig.get("/api/v2/app/defaultSavePath").await;
     assert_eq!(path.body, rig.config.read().await.complete_dir());

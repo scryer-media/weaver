@@ -459,6 +459,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
 }
 
 type TorrentEncryption = "PREFER" | "REQUIRE";
+type TorrentPeerProtocol = "TCP" | "UTP" | "BOTH";
 
 interface TorrentConnection {
   enabled: boolean;
@@ -469,6 +470,15 @@ interface TorrentConnection {
   maxActiveDownloads: number;
   maxPeersTotal: number;
   unpack: boolean;
+  connectionsLimit: number | null;
+  unchokeSlotsLimit: number | null;
+  connectionSpeed: number;
+  allowMultipleConnectionsPerIp: boolean;
+  peerProtocol: TorrentPeerProtocol;
+  dhtBootstrapNodes: string;
+  blocklistEnabled: boolean;
+  blocklist: string | null;
+  stopTrackerTimeoutSecs: number;
 }
 
 interface TorrentForm {
@@ -485,7 +495,22 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   maxActiveDownloads: 3,
   maxPeersTotal: 100,
   unpack: true,
+  connectionsLimit: 200,
+  unchokeSlotsLimit: 8,
+  connectionSpeed: 30,
+  allowMultipleConnectionsPerIp: false,
+  peerProtocol: "TCP",
+  dhtBootstrapNodes: "dht.transmissionbt.com:6881,dht.libtorrent.org:25401",
+  blocklistEnabled: false,
+  blocklist: null,
+  stopTrackerTimeoutSecs: 5,
 };
+
+const PEER_PROTOCOLS: { value: TorrentPeerProtocol; label: string }[] = [
+  { value: "TCP", label: "next.torrents.peerProtocolTcp" },
+  { value: "UTP", label: "next.torrents.peerProtocolUtp" },
+  { value: "BOTH", label: "next.torrents.peerProtocolBoth" },
+];
 
 /** Option labels are translation keys, resolved when the panel renders. */
 const ENCRYPTIONS: { value: TorrentEncryption; label: string }[] = [
@@ -591,6 +616,17 @@ export function TorrentsPanel() {
               control: { kind: "toggle", value: values.torrent.enabled, onChange: (enabled) => patchTorrent({ enabled }) },
             },
             {
+              id: "peerProtocol",
+              label: t("next.torrents.peerProtocol"),
+              keywords: "tcp utp protocol",
+              control: {
+                kind: "segmented",
+                value: values.torrent.peerProtocol,
+                options: PEER_PROTOCOLS.map((option) => ({ ...option, label: t(option.label) })),
+                onChange: (peerProtocol) => patchTorrent({ peerProtocol: peerProtocol as TorrentPeerProtocol }),
+              },
+            },
+            {
               id: "basePort",
               label: t("next.torrents.basePort"),
               keywords: "port listen",
@@ -627,6 +663,83 @@ export function TorrentsPanel() {
               control: { kind: "toggle", value: values.torrent.upnp, onChange: (upnp) => patchTorrent({ upnp }) },
             },
             {
+              id: "connectionsLimit",
+              label: t("next.torrents.connectionsLimit"),
+              keywords: "peers connections limit",
+              control: {
+                kind: "custom",
+                control: (
+                  <GoalControl
+                    label={t("next.torrents.connectionsLimit")}
+                    value={values.torrent.connectionsLimit}
+                    fallback={DEFAULT_CONNECTION.connectionsLimit ?? 1}
+                    offLabel={t("next.networking.unlimited")}
+                    onChange={(next) =>
+                      patchTorrent({ connectionsLimit: next === null ? null : Math.max(1, Math.round(next)) })
+                    }
+                  />
+                ),
+              },
+            },
+            {
+              id: "maxPeersTotal",
+              label: t("next.torrents.maxPeers"),
+              keywords: "peers connections",
+              control: {
+                kind: "number",
+                value: values.torrent.maxPeersTotal,
+                min: 0,
+                onChange: (next) => patchTorrent({ maxPeersTotal: Math.max(0, Math.round(next)) }),
+              },
+            },
+            {
+              id: "unchokeSlotsLimit",
+              label: t("next.torrents.unchokeSlots"),
+              keywords: "upload slots unchoke",
+              control: {
+                kind: "custom",
+                control: (
+                  <GoalControl
+                    label={t("next.torrents.unchokeSlots")}
+                    value={values.torrent.unchokeSlotsLimit}
+                    fallback={DEFAULT_CONNECTION.unchokeSlotsLimit ?? 1}
+                    offLabel={t("next.networking.unlimited")}
+                    onChange={(next) =>
+                      patchTorrent({ unchokeSlotsLimit: next === null ? null : Math.max(1, Math.round(next)) })
+                    }
+                  />
+                ),
+              },
+            },
+            {
+              id: "blocklistEnabled",
+              label: t("next.torrents.blocklistEnabled"),
+              keywords: "ip filter blocklist",
+              control: {
+                kind: "toggle",
+                value: values.torrent.blocklistEnabled,
+                onChange: (blocklistEnabled) => patchTorrent({ blocklistEnabled }),
+              },
+            },
+            {
+              id: "blocklist",
+              label: t("next.torrents.blocklist"),
+              keywords: "ip filter blocklist path url",
+              control: {
+                kind: "text",
+                mono: true,
+                value: values.torrent.blocklist ?? "",
+                onChange: (next) => patchTorrent({ blocklist: next.trim() === "" ? null : next }),
+              },
+            },
+          ],
+        },
+        {
+          kind: "section",
+          id: "bittorrent",
+          title: t("next.torrents.bittorrent"),
+          fields: [
+            {
               id: "encryption",
               label: t("next.torrents.encryption"),
               control: {
@@ -647,21 +760,61 @@ export function TorrentsPanel() {
               },
             },
             {
-              id: "maxPeersTotal",
-              label: t("next.torrents.maxPeers"),
-              keywords: "peers connections",
-              control: {
-                kind: "number",
-                value: values.torrent.maxPeersTotal,
-                min: 0,
-                onChange: (next) => patchTorrent({ maxPeersTotal: Math.max(0, Math.round(next)) }),
-              },
-            },
-            {
               id: "unpack",
               label: t("next.torrents.unpack"),
               keywords: "unpack extract archive",
               control: { kind: "toggle", value: values.torrent.unpack, onChange: (unpack) => patchTorrent({ unpack }) },
+            },
+          ],
+        },
+        {
+          kind: "section",
+          id: "advanced",
+          title: t("next.torrents.advanced"),
+          fields: [
+            {
+              id: "connectionSpeed",
+              label: t("next.torrents.connectionSpeed"),
+              keywords: "connection speed outgoing",
+              control: {
+                kind: "number",
+                value: values.torrent.connectionSpeed,
+                min: 1,
+                onChange: (next) => patchTorrent({ connectionSpeed: Math.max(1, Math.round(next)) }),
+              },
+            },
+            {
+              id: "allowMultipleConnectionsPerIp",
+              label: t("next.torrents.multipleConnectionsPerIp"),
+              keywords: "ip connections",
+              control: {
+                kind: "toggle",
+                value: values.torrent.allowMultipleConnectionsPerIp,
+                onChange: (allowMultipleConnectionsPerIp) => patchTorrent({ allowMultipleConnectionsPerIp }),
+              },
+            },
+            {
+              id: "stopTrackerTimeoutSecs",
+              label: t("next.torrents.stopTrackerTimeout"),
+              keywords: "tracker stopped timeout",
+              control: {
+                kind: "number",
+                value: values.torrent.stopTrackerTimeoutSecs,
+                min: 0,
+                suffix: t("next.general.seconds"),
+                onChange: (next) => patchTorrent({ stopTrackerTimeoutSecs: Math.max(0, Math.round(next)) }),
+              },
+            },
+            {
+              id: "dhtBootstrapNodes",
+              label: t("next.torrents.dhtBootstrapNodes"),
+              keywords: "dht bootstrap nodes",
+              control: {
+                kind: "text",
+                mono: true,
+                value: values.torrent.dhtBootstrapNodes,
+                onChange: (dhtBootstrapNodes) => patchTorrent({ dhtBootstrapNodes }),
+              },
             },
           ],
         },

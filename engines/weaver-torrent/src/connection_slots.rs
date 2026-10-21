@@ -8,15 +8,22 @@
 //! Both halves serve waiters in arrival order. A torrent's connect loop waits
 //! for one connection at a time, so arrival order hands freed slots and each
 //! second's connects to the waiting torrents in turn.
+//!
+//! Both limits change on a running session (libtorrent
+//! `session_impl::update_connections_limit`, `update_connection_speed`). A
+//! lower cap closes no connection: each one past it gives its place up as it
+//! ends, and no new one opens until the session is under the cap.
 
 use std::{
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
+
+use parking_lot::Mutex as SyncMutex;
 
 use tokio::{
     sync::{AcquireError, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -39,16 +46,23 @@ pub(crate) const DEFAULT_CONNECTION_SPEED: NonZeroU32 = NonZeroU32::new(30).unwr
 const WINDOW: Duration = Duration::from_secs(1);
 
 pub(crate) struct ConnectionSlots {
-    limit: usize,
+    cap: Arc<SyncMutex<Cap>>,
     open: Arc<Semaphore>,
     // The places past the cap an incoming connection may take until it
     // replaces another (libtorrent `connections_slack`).
     slack: Arc<Semaphore>,
     connects: Mutex<ConnectWindow>,
-    speed: NonZeroU32,
+    speed: AtomicU32,
     // The callers of `begin_connect` not yet let begin, each holding the
     // slot of its connection.
     waiting: AtomicUsize,
+}
+
+// The cap, and the places past it that connections opened under a higher
+// one still hold: each is given up, not freed, as its connection ends.
+struct Cap {
+    limit: usize,
+    owed: usize,
 }
 
 // The one-second window connects are counted in, and how many it has left,
@@ -76,31 +90,90 @@ impl Drop for Waiting<'_> {
 
 /// One peer connection's place under the session cap, or in the slack past
 /// it, held from accept or connect until the connection ends; dropping it
-/// frees the place.
+/// frees the place, or gives it up when the cap was lowered past it.
 pub(crate) struct ConnectionSlot {
-    permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
+    // The cap of a place under it; none for one in the slack.
+    cap: Option<Arc<SyncMutex<Cap>>>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let Some(cap) = &self.cap else {
+            return;
+        };
+        // Under the cap's lock, so a lower cap counts this place either as
+        // freed or as owed, never as neither.
+        let mut cap = cap.lock();
+        let permit = self.permit.take();
+        if cap.owed > 0 {
+            cap.owed -= 1;
+            if let Some(permit) = permit {
+                permit.forget();
+            }
+        } else {
+            drop(permit);
+        }
+    }
 }
 
 impl ConnectionSlots {
     pub(crate) fn new(limit: usize, slack: usize, speed: NonZeroU32) -> Self {
         let limit = limit.min(Semaphore::MAX_PERMITS);
         Self {
-            limit,
+            cap: Arc::new(SyncMutex::new(Cap { limit, owed: 0 })),
             open: Arc::new(Semaphore::new(limit)),
             slack: Arc::new(Semaphore::new(slack.min(Semaphore::MAX_PERMITS))),
             connects: Mutex::new(ConnectWindow {
                 start: Instant::now(),
                 left: None,
             }),
-            speed,
+            speed: AtomicU32::new(speed.get()),
             waiting: AtomicUsize::new(0),
+        }
+    }
+
+    /// Hold the session to `limit` connections from now on (libtorrent
+    /// `session_impl::update_connections_limit`). Places freed above it are
+    /// handed out at once; places in use below it are given up as their
+    /// connections end.
+    pub(crate) fn set_limit(&self, limit: usize) {
+        let limit = limit.min(Semaphore::MAX_PERMITS);
+        let mut cap = self.cap.lock();
+        if limit >= cap.limit {
+            let more = limit - cap.limit;
+            let repaid = more.min(cap.owed);
+            cap.owed -= repaid;
+            self.open.add_permits(more - repaid);
+        } else {
+            let fewer = cap.limit - limit;
+            cap.owed += fewer - self.open.forget_permits(fewer);
+        }
+        cap.limit = limit;
+    }
+
+    /// Begin at most `speed` outgoing connects each second from the next
+    /// window on (libtorrent `connection_speed`).
+    pub(crate) fn set_speed(&self, speed: NonZeroU32) {
+        self.speed.store(speed.get(), Ordering::Relaxed);
+    }
+
+    /// The outgoing connects begun each second at most.
+    pub(crate) fn speed(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.speed.load(Ordering::Relaxed)).unwrap_or(NonZeroU32::MIN)
+    }
+
+    fn under_cap(&self, permit: OwnedSemaphorePermit) -> ConnectionSlot {
+        ConnectionSlot {
+            permit: Some(permit),
+            cap: Some(Arc::clone(&self.cap)),
         }
     }
 
     /// A free place under the cap, or None when the session is at it.
     pub(crate) fn try_open(&self) -> Option<ConnectionSlot> {
         let permit = self.open.clone().try_acquire_owned().ok()?;
-        Some(ConnectionSlot { permit })
+        Some(self.under_cap(permit))
     }
 
     /// A place for a connection the listener accepted: one under the cap, or
@@ -110,7 +183,10 @@ impl ConnectionSlots {
     pub(crate) fn try_accept(&self) -> Option<ConnectionSlot> {
         self.try_open().or_else(|| {
             let permit = self.slack.clone().try_acquire_owned().ok()?;
-            Some(ConnectionSlot { permit })
+            Some(ConnectionSlot {
+                permit: Some(permit),
+                cap: None,
+            })
         })
     }
 
@@ -118,7 +194,7 @@ impl ConnectionSlots {
     /// `peer_connection::m_exceeded_limit`, set by
     /// `session_impl::incoming_connection`).
     pub(crate) fn exceeds_limit(&self, slot: &ConnectionSlot) -> bool {
-        Arc::ptr_eq(slot.permit.semaphore(), &self.slack)
+        slot.cap.is_none()
     }
 
     /// How many more connections the session may open now (libtorrent
@@ -130,19 +206,20 @@ impl ConnectionSlots {
     /// The most connections the session may hold (libtorrent
     /// `connections_limit`).
     pub(crate) fn limit(&self) -> usize {
-        self.limit
+        self.cap.lock().limit
     }
 
     /// How many connections the session holds (libtorrent
     /// `session_impl::num_connections`).
     pub(crate) fn in_use(&self) -> usize {
-        self.limit - self.free()
+        let cap = self.cap.lock();
+        (cap.limit + cap.owed).saturating_sub(self.free())
     }
 
     /// A place for an outgoing connection, once one is free.
     pub(crate) async fn open(&self) -> Result<ConnectionSlot, AcquireError> {
         let permit = self.open.clone().acquire_owned().await?;
-        Ok(ConnectionSlot { permit })
+        Ok(self.under_cap(permit))
     }
 
     /// Returns when one more outgoing connect may begin, for a caller that
@@ -165,7 +242,7 @@ impl ConnectionSlots {
             }
             let left = window.left.get_or_insert_with(|| {
                 let free = self.free() + self.waiting.load(Ordering::Relaxed);
-                self.speed
+                self.speed()
                     .get()
                     .min(u32::try_from(free.div_ceil(2)).unwrap_or(u32::MAX))
             });
@@ -229,6 +306,65 @@ mod tests {
         assert!(slots.try_open().is_none(), "the freed slot is the waiter's");
         let _handed = waiter.await.unwrap();
         assert!(slots.try_open().is_none());
+    }
+
+    // libtorrent session_impl::update_connections_limit on a running
+    // session: a lower cap is reached as connections end, a higher one frees
+    // places at once.
+    #[tokio::test]
+    async fn a_changed_cap_holds_from_now_on() {
+        let slots = slots(3, 1000);
+        let mut held: Vec<_> = (0..3).map(|_| slots.try_open().unwrap()).collect();
+
+        slots.set_limit(1);
+        assert_eq!((slots.limit(), slots.in_use()), (1, 3));
+        held.pop();
+        assert!(slots.try_open().is_none(), "two held under a cap of 1");
+        held.pop();
+        assert!(slots.try_open().is_none(), "one held under a cap of 1");
+        assert_eq!(slots.in_use(), 1);
+
+        // Raised past what is owed: the rest is free at once.
+        slots.set_limit(3);
+        held.push(slots.try_open().unwrap());
+        held.push(slots.try_open().unwrap());
+        assert!(slots.try_open().is_none(), "three held under a cap of 3");
+
+        // Lowered, then raised before the connections end: only what is
+        // still owed is given up.
+        slots.set_limit(1);
+        slots.set_limit(2);
+        held.pop();
+        assert!(slots.try_open().is_none(), "two held under a cap of 2");
+        held.pop();
+        held.push(slots.try_open().unwrap());
+        assert!(slots.try_open().is_none(), "two held under a cap of 2");
+        assert_eq!((slots.limit(), slots.in_use()), (2, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_speed_holds_from_the_next_second() {
+        let slots = slots(1000, 1);
+        let start = Instant::now();
+        let (granted_tx, mut granted) = mpsc::unbounded_channel();
+        connect_loop(slots.clone(), 'a', granted_tx);
+        let mut open = vec![granted.recv().await.unwrap()];
+
+        slots.set_speed(NonZeroU32::new(3).unwrap());
+        tokio::task::yield_now().await;
+        assert!(
+            granted.try_recv().is_err(),
+            "a second connect in the first second"
+        );
+        for _ in 0..3 {
+            open.push(granted.recv().await.unwrap());
+        }
+        assert_eq!(Instant::now(), start + WINDOW);
+        tokio::task::yield_now().await;
+        assert!(
+            granted.try_recv().is_err(),
+            "a fourth connect in the second second"
+        );
     }
 
     #[tokio::test(start_paused = true)]

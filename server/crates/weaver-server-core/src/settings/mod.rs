@@ -12,9 +12,9 @@ mod schedules;
 pub mod service;
 
 pub use model::{
-    BufferPoolOverrides, Client, Config, DeliveryNamingOverrides, DirectStoreOverrides,
-    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SeedingAction,
-    SeedingGoalMode, SeedingPolicy, SharedConfig, TorrentConfig, TorrentEncryption,
-    resolve_seeding_policy,
+    BlocklistSource, BufferPoolOverrides, Client, Config, DeliveryNamingOverrides,
+    DirectStoreOverrides, DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
+    SeedingAction, SeedingGoalMode, SeedingPolicy, SharedConfig, TorrentConfig, TorrentEncryption,
+    TorrentLimit, TorrentPeerProtocol, resolve_seeding_policy,
 };
 pub use service::HARDWARE_PROFILE_SETTING;

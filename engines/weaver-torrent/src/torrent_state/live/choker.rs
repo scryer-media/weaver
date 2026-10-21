@@ -21,7 +21,10 @@ use std::{
     cmp::Reverse,
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -137,7 +140,8 @@ impl Held {
 }
 
 pub(crate) struct Choker {
-    slots: usize,
+    // Read under `held`'s lock, and changed under it.
+    slots: AtomicUsize,
     // Every slot decision is made under this lock, so peers turning
     // interested on several connections at once never take more than
     // `slots`.
@@ -154,17 +158,30 @@ impl Choker {
     /// A choker of `slots` upload slots.
     pub fn new(slots: usize) -> Self {
         Self {
-            slots,
+            slots: AtomicUsize::new(slots),
             held: Mutex::new(Held::default()),
             reshuffle: Notify::new(),
             rotation: Notify::new(),
         }
     }
 
+    /// The upload slots.
+    pub fn slots(&self) -> usize {
+        self.slots.load(Ordering::Relaxed)
+    }
+
+    /// Hand out `slots` upload slots from the next round on, which begins
+    /// now (libtorrent `session_impl::update_unchoke_limit`).
+    pub fn set_slots(&self, slots: usize) {
+        let _held = self.held.lock();
+        self.slots.store(slots, Ordering::Relaxed);
+        self.reshuffle.notify_one();
+    }
+
     // libtorrent `num_optimistic_unchoke_slots` at its default: one slot in
     // five and at least one, of a session that has any.
     fn optimistic_slots(&self) -> usize {
-        match self.slots {
+        match self.slots() {
             0 => 0,
             slots => (slots / 5).max(1),
         }
@@ -178,7 +195,7 @@ impl Choker {
     /// told so again. Only this peer is touched.
     pub fn peer_interested(&self, torrent: &TorrentStateLive, addr: SocketAddr) {
         let mut held = self.held.lock();
-        let free = self.slots > held.count();
+        let free = self.slots() > held.count();
         let now = Instant::now();
         let unchoked = torrent
             .peers
@@ -301,7 +318,7 @@ impl Choker {
             0 => self.optimistic_slots(),
             optimistic => optimistic,
         };
-        let regular = self.slots.saturating_sub(reserved);
+        let regular = self.slots().saturating_sub(reserved);
         for (place, (_, key, at)) in ranked.into_iter().enumerate() {
             let holds_optimistic = held.optimistic.contains(&key);
             if place < regular && holds_optimistic {
@@ -380,7 +397,7 @@ impl Choker {
         }
         held.optimistic = chosen;
 
-        if held.count() > self.slots {
+        if held.count() > self.slots() {
             self.reshuffle.notify_one();
         }
     }
@@ -405,5 +422,20 @@ fn rank(
         share_used,
         uploaded: Reverse(if choked { 0 } else { round.uploaded }),
         last_unchoke: live.last_unchoke(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Choker;
+
+    // libtorrent session_impl::update_unchoke_limit: a changed limit is
+    // handed out by a round that begins at once.
+    #[tokio::test]
+    async fn changed_slots_are_handed_out_by_a_round_that_begins_now() {
+        let choker = Choker::new(8);
+        choker.set_slots(usize::MAX);
+        assert_eq!(choker.slots(), usize::MAX);
+        choker.reshuffle_requested().await;
     }
 }

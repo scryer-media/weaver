@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -163,6 +164,10 @@ impl Config {
 
         if let Err(error) = self.watch_folder.validate() {
             errors.push(error);
+        }
+
+        if let Err(torrent) = self.torrent.validate() {
+            errors.extend(torrent);
         }
 
         if errors.is_empty() {
@@ -579,6 +584,88 @@ pub struct TorrentConfig {
     // Whether a torrent's archives are extracted, unless its category, its
     // tracker rule or the torrent itself says otherwise.
     pub unpack: bool,
+    // Peer connections each route's session holds at once, over all its
+    // torrents (libtorrent `connections_limit`).
+    pub connections_limit: TorrentLimit,
+    // Peers each route's session uploads to at once (libtorrent
+    // `unchoke_slots_limit`).
+    pub unchoke_slots_limit: TorrentLimit,
+    // Outgoing connects each route's session begins per second (libtorrent
+    // `connection_speed`).
+    pub connection_speed: NonZeroU32,
+    // Whether peers at one address may each hold a connection to a torrent
+    // (libtorrent `allow_multiple_connections_per_ip`).
+    pub allow_multiple_connections_per_ip: bool,
+    // The transports peers are reached and taken on.
+    pub peer_protocol: TorrentPeerProtocol,
+    // The DHT's bootstrap nodes, `host:port` separated by commas, as
+    // libtorrent's `dht_bootstrap_nodes` reads them.
+    pub dht_bootstrap_nodes: String,
+    // Whether the blocklist is applied (qBittorrent `IPFilteringEnabled`).
+    pub blocklist_enabled: bool,
+    // The list of address ranges no peer is taken from or dialed at: an
+    // http, https or file URL, or a path (qBittorrent `IPFilterFile`).
+    pub blocklist: Option<String>,
+    // How long a `stopped` announce may take; 0 sends none (libtorrent
+    // `stop_tracker_timeout`).
+    pub stop_tracker_timeout_secs: u32,
+}
+
+impl TorrentConfig {
+    // The bootstrap nodes as the DHT takes them (libtorrent
+    // `session_impl::update_dht_bootstrap_nodes`, `parse_comma_separated_string_port`).
+    pub fn dht_bootstrap_nodes(&self) -> Vec<String> {
+        self.dht_bootstrap_nodes
+            .split(',')
+            .map(str::trim)
+            .filter(|node| !node.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    // The blocklist sessions apply, while it is on and names one.
+    pub fn blocklist_source(&self) -> Option<BlocklistSource> {
+        let blocklist = self
+            .blocklist
+            .as_deref()
+            .filter(|_| self.blocklist_enabled)?;
+        Some(BlocklistSource::of(blocklist))
+    }
+
+    // The settings as they are kept, the bootstrap nodes as one list and a
+    // blank blocklist as none; or what is wrong with them.
+    pub fn checked(mut self) -> Result<Self, Vec<String>> {
+        self.dht_bootstrap_nodes = self.dht_bootstrap_nodes().join(",");
+        self.blocklist = self
+            .blocklist
+            .as_deref()
+            .map(str::trim)
+            .filter(|blocklist| !blocklist.is_empty())
+            .map(str::to_owned);
+        self.validate()?;
+        Ok(self)
+    }
+
+    // What is wrong with the session settings, if anything.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for node in self.dht_bootstrap_nodes() {
+            let port = node
+                .rsplit_once(':')
+                .filter(|(host, _)| !host.is_empty())
+                .and_then(|(_, port)| port.parse::<u16>().ok());
+            if port.is_none() {
+                errors.push(format!(
+                    "torrent.dht_bootstrap_nodes: {node} is not host:port"
+                ));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl Default for TorrentConfig {
@@ -593,7 +680,146 @@ impl Default for TorrentConfig {
             max_peers_total: 100,
             session_dir: None,
             unpack: true,
+            connections_limit: TorrentLimit::Count(NonZeroU32::new(200).unwrap()),
+            unchoke_slots_limit: TorrentLimit::Count(NonZeroU32::new(8).unwrap()),
+            connection_speed: NonZeroU32::new(30).unwrap(),
+            allow_multiple_connections_per_ip: false,
+            peer_protocol: TorrentPeerProtocol::Tcp,
+            // The routers the engine bootstraps from when told none.
+            dht_bootstrap_nodes: weaver_torrent::dht::DHT_BOOTSTRAP.join(","),
+            blocklist_enabled: false,
+            blocklist: None,
+            stop_tracker_timeout_secs: 5,
         }
+    }
+}
+
+// A count, or no limit at all, which libtorrent takes as a count of its own
+// (`session_impl::update_connections_limit`, `update_unchoke_limit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorrentLimit {
+    Unlimited,
+    Count(NonZeroU32),
+}
+
+impl TorrentLimit {
+    const UNLIMITED: &'static str = "unlimited";
+
+    pub const fn count(self) -> Option<NonZeroU32> {
+        match self {
+            Self::Unlimited => None,
+            Self::Count(count) => Some(count),
+        }
+    }
+
+    pub const fn of(count: Option<NonZeroU32>) -> Self {
+        match count {
+            None => Self::Unlimited,
+            Some(count) => Self::Count(count),
+        }
+    }
+}
+
+impl std::fmt::Display for TorrentLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlimited => f.write_str(Self::UNLIMITED),
+            Self::Count(count) => count.fmt(f),
+        }
+    }
+}
+
+impl std::str::FromStr for TorrentLimit {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == Self::UNLIMITED {
+            return Ok(Self::Unlimited);
+        }
+        value.parse().map(Self::Count)
+    }
+}
+
+impl Serialize for TorrentLimit {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unlimited => serializer.serialize_str(Self::UNLIMITED),
+            Self::Count(count) => serializer.serialize_u32(count.get()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TorrentLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Kept {
+            Count(NonZeroU32),
+            Word(String),
+        }
+        match Kept::deserialize(deserializer)? {
+            Kept::Count(count) => Ok(Self::Count(count)),
+            Kept::Word(word) => word.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+// Where a blocklist is read from. An http, https or file URL is one; anything
+// else, a Windows path among them, is a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlocklistSource {
+    Http(reqwest::Url),
+    File(PathBuf),
+}
+
+impl BlocklistSource {
+    pub fn of(blocklist: &str) -> Self {
+        match reqwest::Url::parse(blocklist) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => Self::Http(url),
+            Ok(url) if url.scheme() == "file" => {
+                Self::File(url.to_file_path().unwrap_or_else(|()| blocklist.into()))
+            }
+            _ => Self::File(blocklist.into()),
+        }
+    }
+}
+
+// The transports peers are reached and taken on (libtorrent
+// `enable_outgoing_tcp`, `enable_incoming_tcp`, `enable_outgoing_utp`,
+// `enable_incoming_utp`, set together as qBittorrent's `BTProtocol` does).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentPeerProtocol {
+    #[default]
+    Tcp,
+    Utp,
+    Both,
+}
+
+impl TorrentPeerProtocol {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Utp => "utp",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "tcp" => Some(Self::Tcp),
+            "utp" => Some(Self::Utp),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    pub const fn tcp(self) -> bool {
+        matches!(self, Self::Tcp | Self::Both)
+    }
+
+    pub const fn utp(self) -> bool {
+        matches!(self, Self::Utp | Self::Both)
     }
 }
 
@@ -939,12 +1165,177 @@ name = "tv"
             max_peers_total: 200,
             session_dir: Some(PathBuf::from("/var/lib/weaver/torrents")),
             unpack: false,
+            connections_limit: TorrentLimit::Unlimited,
+            unchoke_slots_limit: TorrentLimit::Count(NonZeroU32::new(20).unwrap()),
+            connection_speed: NonZeroU32::new(50).unwrap(),
+            allow_multiple_connections_per_ip: true,
+            peer_protocol: TorrentPeerProtocol::Both,
+            dht_bootstrap_nodes: "router.example:6881".to_owned(),
+            blocklist_enabled: true,
+            blocklist: Some("https://lists.example/level1.p2p".to_owned()),
+            stop_tracker_timeout_secs: 0,
         };
 
         let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
 
         assert_eq!(reparsed.seeding, config.seeding);
         assert_eq!(reparsed.torrent, config.torrent);
+    }
+
+    #[test]
+    fn torrent_session_settings_default_to_libtorrents() {
+        // libtorrent settings_pack.cpp, with peers over TCP alone as before.
+        let count = |count| TorrentLimit::Count(NonZeroU32::new(count).unwrap());
+        let torrent = TorrentConfig::default();
+        assert_eq!(torrent.connections_limit, count(200));
+        assert_eq!(torrent.unchoke_slots_limit, count(8));
+        assert_eq!(torrent.connection_speed.get(), 30);
+        assert!(!torrent.allow_multiple_connections_per_ip);
+        assert_eq!(torrent.peer_protocol, TorrentPeerProtocol::Tcp);
+        // The engine's own routers, as before the setting.
+        assert_eq!(
+            torrent.dht_bootstrap_nodes,
+            "dht.transmissionbt.com:6881,dht.libtorrent.org:25401"
+        );
+        assert!(!torrent.blocklist_enabled);
+        assert_eq!(torrent.blocklist, None);
+        assert_eq!(torrent.stop_tracker_timeout_secs, 5);
+        assert_eq!(torrent.validate(), Ok(()));
+
+        let config: Config = toml::from_str(
+            r#"
+data_dir = "/tmp/weaver-data"
+
+[torrent]
+enabled = true
+connections_limit = 80
+unchoke_slots_limit = "unlimited"
+peer_protocol = "utp"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.torrent.connections_limit, count(80));
+        assert_eq!(config.torrent.peer_protocol, TorrentPeerProtocol::Utp);
+        assert_eq!(config.torrent.unchoke_slots_limit, TorrentLimit::Unlimited);
+        assert_eq!(config.torrent.connection_speed.get(), 30);
+        assert_eq!(config.torrent.stop_tracker_timeout_secs, 5);
+
+        // A count is never zero.
+        let zero = toml::from_str::<Config>(
+            r#"
+data_dir = "/tmp/weaver-data"
+
+[torrent]
+connections_limit = 0
+"#,
+        );
+        assert!(zero.is_err());
+    }
+
+    #[test]
+    fn a_blocklist_is_a_url_or_a_path_and_applies_while_on() {
+        let source = |blocklist: &str| BlocklistSource::of(blocklist);
+        assert!(matches!(
+            source("https://lists.example/level1.p2p"),
+            BlocklistSource::Http(_)
+        ));
+        assert_eq!(
+            source("file:///var/lib/weaver/level1.p2p"),
+            BlocklistSource::File("/var/lib/weaver/level1.p2p".into())
+        );
+        // Every other scheme is a path, a Windows drive letter among them.
+        for path in [
+            r"C:\lists\level1.p2p",
+            "/var/lib/weaver/level1.p2p",
+            "lists/level1.p2p",
+        ] {
+            assert_eq!(source(path), BlocklistSource::File(path.into()), "{path}");
+        }
+
+        let named = TorrentConfig {
+            blocklist: Some("/var/lib/weaver/level1.p2p".to_owned()),
+            ..TorrentConfig::default()
+        };
+        assert_eq!(named.blocklist_source(), None, "off");
+        let on = TorrentConfig {
+            blocklist_enabled: true,
+            ..named
+        };
+        assert_eq!(
+            on.blocklist_source(),
+            Some(BlocklistSource::File("/var/lib/weaver/level1.p2p".into()))
+        );
+        let unnamed = TorrentConfig {
+            blocklist: None,
+            ..on
+        };
+        assert_eq!(unnamed.blocklist_source(), None, "on, naming none");
+    }
+
+    #[test]
+    fn checked_settings_keep_one_bootstrap_list_and_no_blank_blocklist() {
+        let checked = TorrentConfig {
+            dht_bootstrap_nodes: " a.example:6881 ,, b.example:25401 ".to_owned(),
+            blocklist: Some("  ".to_owned()),
+            ..TorrentConfig::default()
+        }
+        .checked()
+        .unwrap();
+        assert_eq!(
+            checked.dht_bootstrap_nodes,
+            "a.example:6881,b.example:25401"
+        );
+        assert_eq!(checked.blocklist, None);
+
+        let trimmed = TorrentConfig {
+            blocklist: Some(" /var/lib/weaver/level1.p2p ".to_owned()),
+            ..TorrentConfig::default()
+        }
+        .checked()
+        .unwrap();
+        assert_eq!(
+            trimmed.blocklist.as_deref(),
+            Some("/var/lib/weaver/level1.p2p")
+        );
+    }
+
+    #[test]
+    fn torrent_session_settings_out_of_range_are_refused() {
+        let refused = |torrent: TorrentConfig| torrent.validate().unwrap_err();
+        for torrent in [
+            TorrentConfig {
+                dht_bootstrap_nodes: "dht.libtorrent.org".to_owned(),
+                ..TorrentConfig::default()
+            },
+            TorrentConfig {
+                dht_bootstrap_nodes: "a.example:6881,:6881".to_owned(),
+                ..TorrentConfig::default()
+            },
+            TorrentConfig {
+                dht_bootstrap_nodes: "a.example:70000".to_owned(),
+                ..TorrentConfig::default()
+            },
+        ] {
+            assert_eq!(refused(torrent.clone()).len(), 1, "{torrent:?}");
+        }
+
+        let mut config = config_with_server();
+        config.torrent.dht_bootstrap_nodes = "dht.libtorrent.org".to_owned();
+        assert!(config.validate().is_err());
+
+        // No bootstrap nodes, no stopped announces, no limits and a
+        // blocklist path are all settings libtorrent takes.
+        let accepted = TorrentConfig {
+            dht_bootstrap_nodes: String::new(),
+            stop_tracker_timeout_secs: 0,
+            connections_limit: TorrentLimit::Unlimited,
+            unchoke_slots_limit: TorrentLimit::Unlimited,
+            blocklist_enabled: true,
+            blocklist: Some("lists/level1.p2p".to_owned()),
+            ..TorrentConfig::default()
+        };
+        assert_eq!(accepted.validate(), Ok(()));
+        assert!(accepted.dht_bootstrap_nodes().is_empty());
     }
 
     #[test]

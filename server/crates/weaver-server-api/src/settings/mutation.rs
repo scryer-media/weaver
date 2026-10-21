@@ -176,6 +176,9 @@ impl SettingsMutation {
             Some(update) => {
                 let mut torrent = config.read().await.torrent.clone();
                 update.apply(&mut torrent);
+                let torrent = torrent
+                    .checked()
+                    .map_err(|errors| async_graphql::Error::new(errors.join("; ")))?;
                 Some(torrent)
             }
             None => None,

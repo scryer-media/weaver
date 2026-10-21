@@ -114,7 +114,8 @@ impl IpRanges {
         Self::create_from_stream(&mut file).await
     }
 
-    async fn create_from_stream(reader: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Self> {
+    /// The ranges read from `reader`: a list as text, or gzipped.
+    pub async fn create_from_stream(reader: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Self> {
         let mut peek_bytes = [0u8; 2];
         let mut reader = tokio::io::BufReader::new(reader);
 

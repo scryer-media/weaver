@@ -9,24 +9,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+pub use weaver_torrent::IpRanges;
 use weaver_torrent::dht::DhtPersistenceConfig;
 use weaver_torrent::{
     ConnectionOptions, DhtSessionConfig, HttpClients, ListenerMode, ListenerOptions,
-    PeerConnectionOptions, Session, SessionOptions, SocketFactory,
+    PeerConnectionOptions, Session, SessionLimits, SessionOptions, SocketFactory,
 };
 
 use crate::StateError;
 use crate::persistence::Database;
 use crate::proxies::{
-    Consumer, EgressBinding, EgressHealth, EgressInterface, LegPath, NetworkRuntime, RouteLeg,
-    RoutingPolicy, SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope,
+    Consumer, EgressBinding, EgressHealth, EgressInterface, FetchOptions, LegPath, NetworkRuntime,
+    ProxyRuntime, RouteLeg, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope,
+    routed_fetch,
 };
-use crate::settings::TorrentEncryption;
+use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::ClientIdentity;
 use crate::torrents::net::{LegKind, LegSockets, Shape, tracker_client};
 use crate::torrents::rate::SessionRates;
@@ -122,12 +124,14 @@ pub trait Routes: Send + Sync {
     fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String>;
     /// Open `plan`'s leg for a session of at most `peers` peers.
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String>;
+    /// The blocklist at `url`, which every route's session shares.
+    async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String>;
 }
 
 /// Routes as the network runtime resolves them.
 pub struct NetworkRoutes {
     db: Database,
-    network: Arc<NetworkRuntime>,
+    proxies: Arc<ProxyRuntime>,
     timeout: Duration,
     identity: ClientIdentity,
 }
@@ -135,16 +139,20 @@ pub struct NetworkRoutes {
 impl NetworkRoutes {
     pub fn new(
         db: Database,
-        network: Arc<NetworkRuntime>,
+        proxies: Arc<ProxyRuntime>,
         timeout: Duration,
         identity: ClientIdentity,
     ) -> Self {
         Self {
             db,
-            network,
+            proxies,
             timeout,
             identity,
         }
+    }
+
+    fn network(&self) -> &NetworkRuntime {
+        &self.proxies.network
     }
 }
 
@@ -160,10 +168,10 @@ impl Routes for NetworkRoutes {
         consumer
             .validate_route(&route)
             .map_err(|refusal| refusal.to_string())?;
-        let interfaces = self.network.interfaces();
-        let quota_blocked = self.network.quota_blocked_egresses();
+        let interfaces = self.network().interfaces();
+        let quota_blocked = self.network().quota_blocked_egresses();
         let (position, down) = first_up(&route.legs, |leg| {
-            let Some(egress) = leg_egress(&self.network, leg.egress_id) else {
+            let Some(egress) = leg_egress(self.network(), leg.egress_id) else {
                 return Some(format!("egress {} is missing", leg.egress_id));
             };
             match interfaces.health(&egress, None) {
@@ -174,7 +182,7 @@ impl Routes for NetworkRoutes {
         })
         .ok_or("the route has no leg")?;
         let leg = &route.legs[position];
-        let egress = leg_egress(&self.network, leg.egress_id);
+        let egress = leg_egress(self.network(), leg.egress_id);
         Ok(RoutePlan {
             scope,
             leg: position,
@@ -182,7 +190,7 @@ impl Routes for NetworkRoutes {
             kind: egress.as_ref().map_or(LegKind::System, |egress| {
                 LegKind::of(&egress.binding, &leg.path)
             }),
-            key: leg_key(&self.network, leg.egress_id, &leg.path),
+            key: leg_key(self.network(), leg.egress_id, &leg.path),
             policy,
             down,
         })
@@ -200,7 +208,7 @@ impl Routes for NetworkRoutes {
         }
         let peers = u16::try_from(peers).unwrap_or(u16::MAX);
         let leg = self
-            .network
+            .network()
             .torrent_leg(plan.scope, plan.leg, peers, self.timeout)?;
         let bridge = match plan.kind {
             LegKind::Ladder => Some(leg.bridge()?),
@@ -216,6 +224,37 @@ impl Routes for NetworkRoutes {
             leg: Some(leg),
         })
     }
+
+    // Fetched once for every route, so on Default outbound, which carries
+    // what Weaver fetches that no one consumer does; bounded like a fetched
+    // torrent.
+    async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String> {
+        let options = FetchOptions {
+            label: "blocklist",
+            timeout: Duration::from_secs(60),
+            redirects: 10,
+            user_agent: self.identity.user_agent(),
+            https_only: false,
+            allow_private_network: self.proxies.allow_private_network(),
+        };
+        let response = routed_fetch(
+            &self.proxies,
+            Consumer::Outbound,
+            url,
+            &options,
+            |request, _, _| request,
+        )
+        .await?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        let limit = crate::security::RuntimeSecurityConfig::from_env_or_default_for_tests()
+            .nzb_decompressed_limit_bytes;
+        let body = crate::proxies::read_body(response, limit).await?;
+        IpRanges::create_from_stream(&mut std::io::Cursor::new(body))
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
 }
 
 /// What every session shares.
@@ -226,7 +265,6 @@ pub struct SessionEnv {
     pub base_port: u16,
     pub announce_port: Option<u16>,
     pub upnp: bool,
-    pub max_peers_total: u32,
     pub identity: ClientIdentity,
 }
 
@@ -243,7 +281,6 @@ impl SessionEnv {
             base_port: torrent.base_port,
             announce_port: torrent.announce_port,
             upnp: torrent.upnp,
-            max_peers_total: torrent.max_peers_total,
             identity: crate::torrents::identity::IDENTITY,
         }
     }
@@ -272,20 +309,59 @@ fn apply_encryption(options: &mut SessionOptions, policy: TorrentEncryption) {
     };
 }
 
-/// The options of a session on `leg`, listening on `port` when it listens.
+/// How a session takes and reaches peers: the transports `torrent` asks
+/// for. uTP rides the listener's socket, so a session that does not listen
+/// has none; one left with neither fails to build, and its route holds
+/// closed.
+fn transports(torrent: &TorrentConfig) -> (ListenerMode, bool) {
+    let protocol = torrent.peer_protocol;
+    let mode = match (protocol.tcp(), protocol.utp()) {
+        (true, true) => ListenerMode::TcpAndUtp,
+        (false, true) => ListenerMode::UtpOnly,
+        _ => ListenerMode::TcpOnly,
+    };
+    (mode, protocol.tcp())
+}
+
+/// The limits `torrent` holds a session to, no limit as libtorrent counts
+/// it: as many connections as files may be open
+/// (`session_impl::update_connections_limit`), and every peer unchoked
+/// (`session_impl::preemptive_unchoke`).
+pub fn session_limits(torrent: &TorrentConfig) -> SessionLimits {
+    let count = |limit: TorrentLimit, unlimited: usize| {
+        limit
+            .count()
+            .map_or(unlimited, |count| count.get() as usize)
+    };
+    SessionLimits {
+        connections_limit: count(
+            torrent.connections_limit,
+            crate::runtime::resource_limits::open_file_limit(),
+        ),
+        unchoke_slots_limit: count(torrent.unchoke_slots_limit, usize::MAX),
+        connection_speed: torrent.connection_speed,
+    }
+}
+
+/// The options of a session on `leg`, listening on `port` when it listens,
+/// under the torrent settings `torrent` and with `blocklist` loaded from
+/// them.
 pub fn session_options(
     env: &SessionEnv,
     leg: &OpenLeg,
     port: u16,
     dir: &Path,
     peers: usize,
-    encryption: TorrentEncryption,
+    torrent: &TorrentConfig,
+    blocklist: Option<Arc<IpRanges>>,
 ) -> SessionOptions {
     let shape = leg.shape;
     let listen_ip = leg.kind.listen_ip().unwrap_or_else(|| unspecified(binds));
+    let (mode, enable_tcp) = transports(torrent);
+    let limits = session_limits(torrent);
     let mut options = SessionOptions {
         dht: shape.dht.then(|| DhtSessionConfig {
-            bootstrap_addrs: None,
+            bootstrap_addrs: Some(torrent.dht_bootstrap_nodes()),
             port: Some(port),
             persistence: Some(DhtPersistenceConfig {
                 dump_interval: None,
@@ -298,7 +374,7 @@ pub fn session_options(
         persistence: None,
         identity: Some(env.identity.identity()),
         listen: shape.listen.then(|| ListenerOptions {
-            mode: ListenerMode::TcpOnly,
+            mode,
             listen_addr: SocketAddr::new(listen_ip, port),
             enable_upnp_port_forwarding: shape.upnp && env.upnp,
             announce_port: env.announce_port,
@@ -307,19 +383,27 @@ pub fn session_options(
         // Peers are dialed by the session's own sockets or by the leg's
         // factory, never by a proxy URL of the session's.
         connect: Some(ConnectionOptions {
-            enable_tcp: true,
+            enable_tcp,
             peer_opts: Some(PeerConnectionOptions {
                 read_write_timeout: Some(PEER_TIMEOUT),
                 ..PeerConnectionOptions::default()
             }),
         }),
         peer_limit: Some(peers.max(1)),
+        connections_limit: limits.connections_limit,
+        unchoke_slots_limit: limits.unchoke_slots_limit,
+        connection_speed: limits.connection_speed,
+        allow_multiple_connections_per_ip: torrent.allow_multiple_connections_per_ip,
+        tracker_stopped_timeout: Some(Duration::from_secs(
+            torrent.stop_tracker_timeout_secs.into(),
+        )),
+        blocklist,
         disable_local_service_discovery: !shape.own_sockets,
         socket_factory: leg.factory.clone(),
         http_client: Some(leg.http.clone()),
         ..SessionOptions::default()
     };
-    apply_encryption(&mut options, encryption);
+    apply_encryption(&mut options, torrent.encryption);
     options
 }
 
@@ -368,7 +452,11 @@ pub struct Sessions {
     slots: tokio::sync::Mutex<BTreeMap<RouteKey, Slot>>,
     // Read and written under the slots' lock.
     on: AtomicBool,
-    encryption: Mutex<TorrentEncryption>,
+    // The torrent settings, and the open sessions that take them as they
+    // change.
+    config: Mutex<Configured>,
+    // The blocklist the settings name, loaded once for every session.
+    blocklist: tokio::sync::Mutex<Option<(BlocklistSource, Arc<IpRanges>)>>,
     // Held while the stored port slots are read and written.
     port_slots: Arc<Mutex<()>>,
     // The torrents' download rate, laid over every open session.
@@ -383,7 +471,8 @@ impl Sessions {
             db,
             slots: tokio::sync::Mutex::new(BTreeMap::new()),
             on: AtomicBool::new(true),
-            encryption: Mutex::new(TorrentEncryption::default()),
+            config: Mutex::new(Configured::default()),
+            blocklist: tokio::sync::Mutex::new(None),
             port_slots: Arc::default(),
             rates: SessionRates::default(),
         }
@@ -394,19 +483,46 @@ impl Sessions {
         &self.rates
     }
 
-    /// The encryption sessions opened from now on ask of their peers.
-    pub fn set_encryption(&self, encryption: TorrentEncryption) {
-        *self
-            .encryption
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = encryption;
+    /// The torrent settings. The open sessions take the limits at once; the
+    /// transports, the DHT's bootstrap nodes, the blocklist, the stopped
+    /// announce timeout and connections per address are a session's from
+    /// when it opens, so each takes them when its route next opens.
+    pub fn set_config(&self, config: TorrentConfig) {
+        let mut configured = self.configured();
+        configured.torrent = config;
+        configured.lay_over();
     }
 
-    pub fn encryption(&self) -> TorrentEncryption {
-        *self
-            .encryption
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    pub fn config(&self) -> TorrentConfig {
+        self.configured().torrent.clone()
+    }
+
+    fn configured(&self) -> std::sync::MutexGuard<'_, Configured> {
+        self.config.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // The blocklist `torrent` names, loaded when it names another than the
+    // one loaded; a list that does not load fails the session.
+    async fn blocklist(&self, torrent: &TorrentConfig) -> Result<Option<Arc<IpRanges>>, String> {
+        let Some(source) = torrent.blocklist_source() else {
+            return Ok(None);
+        };
+        let mut loaded = self.blocklist.lock().await;
+        if let Some((from, list)) = loaded.as_ref()
+            && *from == source
+        {
+            return Ok(Some(Arc::clone(list)));
+        }
+        let list = match &source {
+            BlocklistSource::Http(url) => self.routes.fetch_blocklist(url).await,
+            BlocklistSource::File(path) => IpRanges::load_from_file(path)
+                .await
+                .map_err(|error| format!("{error:#}")),
+        }
+        .map_err(|error| format!("the blocklist did not load: {error}"))?;
+        let list = Arc::new(list);
+        *loaded = Some((source, Arc::clone(&list)));
+        Ok(Some(list))
     }
 
     // The route's port slot, read or taken off the async threads, and the
@@ -499,10 +615,11 @@ impl Sessions {
             return Err(SessionError::RouteDown(reason.clone()));
         }
         // The peer limit is each torrent's, whatever else is open.
-        let peers = self.env.max_peers_total as usize;
+        let peers = self.config().max_peers_total as usize;
         match self.build(plan, port_slot, peers).await {
             Ok((session, leg, port)) => {
                 self.rates.add(&session);
+                self.configured().add(&session);
                 slots.insert(
                     plan.key.clone(),
                     Slot::Open {
@@ -547,7 +664,9 @@ impl Sessions {
             announce_port: mapped.or(self.env.announce_port),
             ..self.env.clone()
         };
-        let options = session_options(&env, &leg, port, &dir, peers, self.encryption());
+        let torrent = self.config();
+        let blocklist = self.blocklist(&torrent).await?;
+        let options = session_options(&env, &leg, port, &dir, peers, &torrent, blocklist);
         Session::new_with_opts(dir.join("output"), options)
             .await
             .map(|session| (session, leg.leg, port))
@@ -593,6 +712,35 @@ impl Sessions {
     pub async fn stop_all(&self) {
         let mut slots = self.slots.lock().await;
         close_all(std::mem::take(&mut *slots)).await;
+    }
+}
+
+// The torrent settings, and the sessions open under them.
+#[derive(Default)]
+struct Configured {
+    torrent: TorrentConfig,
+    open: Vec<Weak<Session>>,
+}
+
+impl Configured {
+    // `session` opened, under settings that may have changed while it did.
+    fn add(&mut self, session: &Arc<Session>) {
+        self.open.push(Arc::downgrade(session));
+        self.lay_over();
+    }
+
+    // Every open session holds to the settings' limits.
+    fn lay_over(&mut self) {
+        let limits = session_limits(&self.torrent);
+        self.open.retain(|session| {
+            session.upgrade().is_some_and(|session| {
+                let open = !session.cancellation_token().is_cancelled();
+                if open && session.limits() != limits {
+                    session.set_limits(limits);
+                }
+                open
+            })
+        });
     }
 }
 

@@ -78,6 +78,7 @@ pub use crate::tracker::{AnnounceOk, LastAnnounce, TrackerAnnounce, TrackerStatu
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
+pub use ip_ranges::IpRanges;
 pub use listen::{ListenerMode, ListenerOptions};
 pub use mse::{Encryption, EncryptionPolicy, MseError};
 pub use network::{SocketFactory, StreamListener};
@@ -85,7 +86,7 @@ pub use peer_connection::PeerConnectionOptions;
 pub use piece_priority::PiecePriority;
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
-    SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
+    SUPPORTED_SCHEMES, Session, SessionLimits, SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::{ConnectionKind, ConnectionOptions};
 pub use torrent_state::{

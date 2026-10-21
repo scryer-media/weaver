@@ -1095,7 +1095,7 @@ impl StoppedAnnounces {
     /// `settings_pack::stop_tracker_timeout`).
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// `timeout` bounds each `stopped` announce.
+    /// `timeout` bounds each `stopped` announce; zero sends none.
     pub fn new(timeout: Duration) -> Self {
         Self {
             timeout,
@@ -1119,6 +1119,12 @@ impl StoppedAnnounces {
         self.running.send_modify(|r| *r += 1);
         RunningGuard(self.running.clone())
     }
+
+    // The tracker tasks and `stopped` announces that hold these settings.
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        *self.running.borrow()
+    }
 }
 
 struct RunningGuard(Arc<tokio::sync::watch::Sender<usize>>);
@@ -1131,7 +1137,9 @@ impl Drop for RunningGuard {
 
 /// Lives inside the peer stream. When the stream is dropped (the torrent was
 /// paused, removed or the session is stopping), every tracker that accepted
-/// `started` is sent `stopped` with the final counters.
+/// `started` is sent `stopped` with the final counters, unless the stopped
+/// announces may take no time at all: then none is sent (libtorrent
+/// `torrent::announce_with_tracker` with `stop_tracker_timeout <= 0`).
 struct StopOnDrop {
     comms: Arc<TrackerComms>,
     timeout: Duration,
@@ -1141,6 +1149,9 @@ struct StopOnDrop {
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         let running = self.running.take();
+        if self.timeout.is_zero() {
+            return;
+        }
         let trackers = self.comms.list.lock().stopped();
         if trackers.is_empty() {
             return;
@@ -2490,6 +2501,49 @@ mod tests {
         assert_eq!(query_param(&q, "left"), Some("0"));
 
         stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_zero_stopped_timeout_sends_no_stopped_announce() {
+        // libtorrent torrent::announce_with_tracker: with
+        // stop_tracker_timeout <= 0 the stopped event is not sent.
+        let (listener, url) = http_listener().await;
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let stopped = StoppedAnnounces::new(Duration::ZERO);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![url]],
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap()
+        .peers;
+
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+
+        // The stream's drop starts no `stopped` announce: the task it would
+        // spawn holds the count, and none does.
+        assert_eq!(stopped.running(), 1, "the tracker task is counted");
+        drop(peers);
+        assert_eq!(stopped.running(), 0, "a stopped announce was started");
         token.cancel();
     }
 

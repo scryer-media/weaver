@@ -295,7 +295,7 @@ pub struct Session {
     pub(crate) allow_multiple_connections_per_ip: bool,
     pub ratelimits: Limits,
 
-    pub blocklist: IpRanges,
+    pub blocklist: Arc<IpRanges>,
     pub allowlist: Option<IpRanges>,
 
     // Monitoring / tracing / logging
@@ -744,6 +744,19 @@ impl Default for DhtSessionConfig {
     }
 }
 
+/// The limits a running session takes as they change (libtorrent
+/// `session_impl::apply_settings` with `update_connections_limit`,
+/// `update_unchoke_limit` and `update_connection_speed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionLimits {
+    /// [`SessionOptions::connections_limit`].
+    pub connections_limit: usize,
+    /// [`SessionOptions::unchoke_slots_limit`].
+    pub unchoke_slots_limit: usize,
+    /// [`SessionOptions::connection_speed`].
+    pub connection_speed: NonZeroU32,
+}
+
 pub struct SessionOptions {
     /// DHT configuration. Set to None to disable DHT entirely.
     /// Defaults to DHT enabled with persistence.
@@ -795,7 +808,10 @@ pub struct SessionOptions {
 
     pub ratelimits: LimitsConfig,
 
-    pub blocklist_url: Option<String>,
+    /// The address ranges no peer is taken from or dialed at, loaded by
+    /// whoever builds the session, so that one list serves every session
+    /// that shares it.
+    pub blocklist: Option<Arc<IpRanges>>,
     pub allowlist_url: Option<String>,
 
     // The list of tracker URLs to always use for each torrent.
@@ -881,7 +897,7 @@ impl Default for SessionOptions {
             runtime_worker_threads: None,
             root_span: None,
             ratelimits: LimitsConfig::default(),
-            blocklist_url: None,
+            blocklist: None,
             allowlist_url: None,
             trackers: HashSet::new(),
             peer_limit: None,
@@ -1203,16 +1219,7 @@ impl Session {
                 .context("error creating stream connector")?,
             );
 
-            let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
-                info!(url = blocklist_url, "loading p2p blocklist");
-                let bl = IpRanges::load_from_url(&reqwest_client, &blocklist_url)
-                    .await
-                    .with_context(|| format!("error reading blocklist from {blocklist_url}"))?;
-                info!(len = bl.len(), "loaded blocklist");
-                bl
-            } else {
-                IpRanges::default()
-            };
+            let blocklist = opts.blocklist.unwrap_or_default();
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
@@ -1648,6 +1655,22 @@ impl Session {
 
     pub fn get_dht(&self) -> Option<&Dht> {
         self.dht.as_ref()
+    }
+
+    /// The limits the session holds to now.
+    pub fn limits(&self) -> SessionLimits {
+        SessionLimits {
+            connections_limit: self.connection_slots.limit(),
+            unchoke_slots_limit: self.choker.slots(),
+            connection_speed: self.connection_slots.speed(),
+        }
+    }
+
+    /// Hold the session to `limits` from now on.
+    pub fn set_limits(&self, limits: SessionLimits) {
+        self.connection_slots.set_limit(limits.connections_limit);
+        self.choker.set_slots(limits.unchoke_slots_limit);
+        self.connection_slots.set_speed(limits.connection_speed);
     }
 
     fn merge_peer_opts(&self, other: Option<PeerConnectionOptions>) -> PeerConnectionOptions {
@@ -4156,11 +4179,11 @@ mod tests {
         .unwrap()
     }
 
-    // Writes an IP list holding `range` into `dir`; returns its file URL.
-    fn ip_list(dir: &TempDir, name: &str, range: &str) -> String {
+    // Writes an IP list holding `range` into `dir`; returns its path.
+    fn ip_list(dir: &TempDir, name: &str, range: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);
         std::fs::write(&path, format!("test:{range}\n")).unwrap();
-        url::Url::from_file_path(path).unwrap().to_string()
+        path
     }
 
     // Hands the session an incoming connection from `addr` whose peer stays
@@ -4196,8 +4219,20 @@ mod tests {
         let session = quiet_session(
             &dir,
             SessionOptions {
-                blocklist_url: Some(ip_list(&dir, "block.txt", "10.0.0.1-10.0.0.1")),
-                allowlist_url: Some(ip_list(&dir, "allow.txt", "10.0.0.0-10.0.0.255")),
+                blocklist: Some(Arc::new(
+                    crate::IpRanges::load_from_file(ip_list(
+                        &dir,
+                        "block.txt",
+                        "10.0.0.1-10.0.0.1",
+                    ))
+                    .await
+                    .unwrap(),
+                )),
+                allowlist_url: Some(
+                    url::Url::from_file_path(ip_list(&dir, "allow.txt", "10.0.0.0-10.0.0.255"))
+                        .unwrap()
+                        .to_string(),
+                ),
                 ..Default::default()
             },
         )

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -30,7 +31,8 @@ use weaver_server_core::proxies::{Bandwidth, TorrentScope};
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
-    SeedingAction, SeedingPolicy, TorrentEncryption, resolve_seeding_policy,
+    SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentLimit,
+    TorrentPeerProtocol, resolve_seeding_policy,
 };
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, SeedingSource, TorrentService, TorrentSettings, TorrentView,
@@ -1188,6 +1190,19 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
             TorrentEncryption::Require => 1,
         },
         "max_connec_per_torrent": torrent.max_peers_total,
+        "max_connec": limit(torrent.connections_limit),
+        "max_uploads": limit(torrent.unchoke_slots_limit),
+        "connection_speed": torrent.connection_speed,
+        "enable_multi_connections_from_same_ip": torrent.allow_multiple_connections_per_ip,
+        "bittorrent_protocol": match torrent.peer_protocol {
+            TorrentPeerProtocol::Both => 0,
+            TorrentPeerProtocol::Tcp => 1,
+            TorrentPeerProtocol::Utp => 2,
+        },
+        "dht_bootstrap_nodes": torrent.dht_bootstrap_nodes,
+        "ip_filter_enabled": torrent.blocklist_enabled,
+        "ip_filter_path": torrent.blocklist.as_deref().unwrap_or_default(),
+        "stop_tracker_timeout": torrent.stop_tracker_timeout_secs,
         "max_ratio_enabled": seeding.is_some_and(|policy| policy.ratio_goal.is_some()),
         "max_ratio": seeding.and_then(|policy| policy.ratio_goal).map_or(-1.0, f64::from),
         "max_seeding_time_enabled": seeding.is_some_and(|policy| policy.seed_time_goal_minutes.is_some()),
@@ -1209,6 +1224,93 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
     )
 }
 
+// A limit as qBittorrent reports one, -1 for none.
+fn limit(limit: TorrentLimit) -> i64 {
+    limit.count().map_or(-1, |count| i64::from(count.get()))
+}
+
+// The torrent settings `changes` asks for over `current`, the keys as
+// qBittorrent's `AppController::setPreferencesAction` reads them. Every
+// count is one at least; for the connection and upload slot limits,
+// qBittorrent's zero or less is no limit (`SessionImpl::setMaxConnections`,
+// `setMaxUploads`), and a negative stop tracker timeout is none, as
+// libtorrent takes it (`torrent::announce_with_tracker`). Any other value is
+// refused, and with it the whole request.
+fn torrent_preferences(
+    current: &TorrentConfig,
+    changes: &Map<String, Value>,
+) -> Result<TorrentConfig, String> {
+    let mut torrent = current.clone();
+    let out_of_range = |name: &str| format!("{name} is out of range");
+    let number = |name: &str| -> Result<Option<i64>, String> {
+        changes
+            .get(name)
+            .map(|value| value.as_i64().ok_or_else(|| out_of_range(name)))
+            .transpose()
+    };
+    let positive = |name: &str, value: i64| {
+        u32::try_from(value)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| out_of_range(name))
+    };
+    let count = |name: &str| -> Result<Option<NonZeroU32>, String> {
+        number(name)?.map(|value| positive(name, value)).transpose()
+    };
+    let limit = |name: &str| -> Result<Option<TorrentLimit>, String> {
+        number(name)?
+            .map(|value| match value {
+                ..=0 => Ok(TorrentLimit::Unlimited),
+                value => positive(name, value).map(TorrentLimit::Count),
+            })
+            .transpose()
+    };
+    let flag = |name: &str| changes.get(name).and_then(Value::as_bool);
+    // Weaver has no seed queue, so only the download limit has a home.
+    if let Some(downloads) = count("max_active_downloads")? {
+        torrent.max_active_downloads = downloads.get();
+    }
+    if let Some(peers) = count("max_connec_per_torrent")? {
+        torrent.max_peers_total = peers.get();
+    }
+    if let Some(limit) = limit("max_connec")? {
+        torrent.connections_limit = limit;
+    }
+    if let Some(slots) = limit("max_uploads")? {
+        torrent.unchoke_slots_limit = slots;
+    }
+    if let Some(speed) = count("connection_speed")? {
+        torrent.connection_speed = speed;
+    }
+    if let Some(secs) = number("stop_tracker_timeout")? {
+        torrent.stop_tracker_timeout_secs =
+            u32::try_from(secs.max(0)).map_err(|_| out_of_range("stop_tracker_timeout"))?;
+    }
+    if let Some(allow) = flag("enable_multi_connections_from_same_ip") {
+        torrent.allow_multiple_connections_per_ip = allow;
+    }
+    if let Some(protocol) = changes.get("bittorrent_protocol") {
+        torrent.peer_protocol = match protocol.as_i64() {
+            Some(0) => TorrentPeerProtocol::Both,
+            Some(1) => TorrentPeerProtocol::Tcp,
+            Some(2) => TorrentPeerProtocol::Utp,
+            _ => return Err(out_of_range("bittorrent_protocol")),
+        };
+    }
+    if let Some(nodes) = changes.get("dht_bootstrap_nodes").and_then(Value::as_str) {
+        nodes.clone_into(&mut torrent.dht_bootstrap_nodes);
+    }
+    // The switch and the list are two settings, as qBittorrent keeps them
+    // (`SessionImpl::setIPFilteringEnabled`, `setIPFilterFile`).
+    if let Some(enabled) = flag("ip_filter_enabled") {
+        torrent.blocklist_enabled = enabled;
+    }
+    if let Some(path) = changes.get("ip_filter_path").and_then(Value::as_str) {
+        torrent.blocklist = Some(path.to_owned());
+    }
+    torrent.checked().map_err(|errors| errors.join("\n"))
+}
+
 async fn set_preferences(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let Some(Ok(Value::Object(changes))) = params.get("json").map(serde_json::from_str::<Value>)
     else {
@@ -1221,6 +1323,11 @@ async fn set_preferences(ctx: &TorrentFacadeContext, params: &Params) -> Respons
             .map(|value| u64::try_from(value).ok().filter(|value| *value > 0))
     };
     let inner = &ctx.inner;
+    let current = inner.config.read().await.torrent.clone();
+    let torrent = match torrent_preferences(&current, &changes) {
+        Ok(torrent) => torrent,
+        Err(error) => return text(StatusCode::BAD_REQUEST, error),
+    };
     let (download, upload) = (rate("dl_limit"), rate("up_limit"));
     if download.is_some() || upload.is_some() {
         let current = inner.config.read().await.bandwidth;
@@ -1240,15 +1347,7 @@ async fn set_preferences(ctx: &TorrentFacadeContext, params: &Params) -> Respons
             return internal(error);
         }
     }
-    // Weaver has no seed queue, so only the download limit has a home.
-    if let Some(downloads) = changes
-        .get("max_active_downloads")
-        .and_then(Value::as_i64)
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value > 0)
-    {
-        let mut torrent = inner.config.read().await.torrent.clone();
-        torrent.max_active_downloads = downloads;
+    if torrent != current {
         let db = inner.db.clone();
         let saved = torrent.clone();
         match tokio::task::spawn_blocking(move || db.save_torrent_config(&saved)).await {

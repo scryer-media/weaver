@@ -23,7 +23,7 @@ use weaver_server_core::torrents::identity::IDENTITY;
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
-    OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
+    IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };
 
 use super::*;
@@ -51,6 +51,18 @@ impl Routes for Offline {
         _: &'life1 RoutePlan,
         _: usize,
     ) -> Pin<Box<dyn Future<Output = Result<OpenLeg, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Err("offline".to_owned()) })
+    }
+
+    fn fetch_blocklist<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: &'life1 reqwest::Url,
+    ) -> Pin<Box<dyn Future<Output = Result<IpRanges, String>> + Send + 'async_trait>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -218,7 +230,6 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
                 base_port: 0,
                 announce_port: None,
                 upnp: false,
-                max_peers_total: 100,
                 identity: IDENTITY,
             },
             db.clone(),

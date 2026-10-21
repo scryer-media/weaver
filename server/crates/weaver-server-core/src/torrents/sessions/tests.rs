@@ -59,6 +59,9 @@ pub(crate) struct FakeRoutes {
     // The peer limit each leg was opened for, in order.
     pub(crate) peers: Mutex<Vec<usize>>,
     pub(crate) opened: AtomicUsize,
+    // The blocklist a fetch hands back, and the fetches made.
+    pub(crate) blocklist: Mutex<Option<String>>,
+    pub(crate) fetched: AtomicUsize,
 }
 
 fn scope_name(scope: TorrentScope) -> String {
@@ -131,6 +134,19 @@ impl Routes for FakeRoutes {
             leg: None,
         })
     }
+
+    async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String> {
+        self.fetched.fetch_add(1, Ordering::SeqCst);
+        let list = self
+            .blocklist
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| format!("{url} is unreachable"))?;
+        IpRanges::create_from_stream(&mut std::io::Cursor::new(list))
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 pub(crate) fn env(root: &Path) -> SessionEnv {
@@ -139,7 +155,6 @@ pub(crate) fn env(root: &Path) -> SessionEnv {
         base_port: 0,
         announce_port: None,
         upnp: false,
-        max_peers_total: 400,
         identity: IDENTITY,
     }
 }
@@ -283,19 +298,283 @@ fn a_host_without_ipv6_listens_on_every_ipv4_address() {
     );
 }
 
+fn count(count: u32) -> TorrentLimit {
+    TorrentLimit::Count(std::num::NonZeroU32::new(count).unwrap())
+}
+
+fn speed(speed: u32) -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(speed).unwrap()
+}
+
+// A session opens under the settings, and an open one takes the limits as
+// they change (libtorrent `session_impl::apply_settings`).
 #[tokio::test(flavor = "multi_thread")]
-async fn the_encryption_setting_reaches_the_sessions() {
+async fn the_torrent_settings_reach_the_sessions() {
     let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
     let sessions = Sessions::new(
-        Arc::new(FakeRoutes::default()),
+        routes.clone(),
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
-    sessions.set_encryption(crate::settings::TorrentEncryption::Require);
+    sessions.set_config(TorrentConfig {
+        connections_limit: count(321),
+        unchoke_slots_limit: TorrentLimit::Unlimited,
+        connection_speed: speed(7),
+        ..TorrentConfig::default()
+    });
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let session = sessions.session(&plan).await.unwrap();
     assert_eq!(
-        sessions.encryption(),
-        crate::settings::TorrentEncryption::Require
+        session.limits(),
+        SessionLimits {
+            connections_limit: 321,
+            unchoke_slots_limit: usize::MAX,
+            connection_speed: speed(7),
+        }
     );
+
+    sessions.set_config(TorrentConfig {
+        connections_limit: TorrentLimit::Unlimited,
+        unchoke_slots_limit: count(3),
+        connection_speed: speed(40),
+        ..TorrentConfig::default()
+    });
+    assert_eq!(
+        session.limits(),
+        SessionLimits {
+            connections_limit: crate::runtime::resource_limits::open_file_limit(),
+            unchoke_slots_limit: 3,
+            connection_speed: speed(40),
+        }
+    );
+    assert!(Arc::ptr_eq(
+        &session,
+        &sessions.session(&plan).await.unwrap()
+    ));
+    sessions.stop_all().await;
+}
+
+// A route whose session would have no way to reach a peer holds closed:
+// uTP alone over a leg that does not listen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_with_no_transport_holds_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(TorrentConfig {
+        peer_protocol: crate::settings::TorrentPeerProtocol::Utp,
+        ..TorrentConfig::default()
+    });
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    assert!(matches!(
+        sessions.session(&plan).await,
+        Err(SessionError::Build(_))
+    ));
+    let held = sessions.view(&plan.key).await.unwrap().held.unwrap();
+    assert!(held.contains("no way to connect to peers"), "{held}");
+    sessions.stop_all().await;
+}
+
+// A route whose blocklist does not load holds closed rather than open
+// without the filter asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_whose_blocklist_does_not_load_holds_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let missing = dir.path().join("missing.p2p");
+    sessions.set_config(TorrentConfig {
+        blocklist_enabled: true,
+        blocklist: Some(missing.display().to_string()),
+        ..TorrentConfig::default()
+    });
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    assert!(matches!(
+        sessions.session(&plan).await,
+        Err(SessionError::Build(_))
+    ));
+    let held = sessions.view(&plan.key).await.unwrap().held.unwrap();
+    assert!(held.contains("the blocklist did not load"), "{held}");
+
+    // Once it is there, the route opens on its next session.
+    std::fs::write(&missing, "test:10.0.0.1-10.0.0.1\n").unwrap();
+    let session = sessions.session(&plan).await.unwrap();
+    assert!(session.blocklist.has("10.0.0.1".parse().unwrap()));
+    sessions.stop_all().await;
+}
+
+// The blocklist is loaded once for the settings that name it, and every
+// route's session shares it; settings naming another load that one.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_route_shares_one_blocklist_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.route(TorrentScope::Default, 1);
+    routes.route(TorrentScope::Category(5), 2);
+    *routes.blocklist.lock().unwrap() = Some("test:10.0.0.1-10.0.0.1\n".to_owned());
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let named = TorrentConfig {
+        blocklist_enabled: true,
+        blocklist: Some("https://lists.example/level1.p2p".to_owned()),
+        ..TorrentConfig::default()
+    };
+    sessions.set_config(named.clone());
+    let first = routes.plan(TorrentScope::Default).unwrap();
+    let second = routes.plan(TorrentScope::Category(5)).unwrap();
+    let a = sessions.session(&first).await.unwrap();
+    let b = sessions.session(&second).await.unwrap();
+    assert!(!Arc::ptr_eq(&a, &b));
+    assert!(Arc::ptr_eq(&a.blocklist, &b.blocklist));
+    assert!(a.blocklist.has("10.0.0.1".parse().unwrap()));
+    assert_eq!(routes.fetched.load(Ordering::SeqCst), 1);
+
+    sessions.drop_route(&first.key).await;
+    sessions.set_config(TorrentConfig {
+        blocklist: Some("https://lists.example/level2.p2p".to_owned()),
+        ..named
+    });
+    sessions.session(&first).await.unwrap();
+    assert_eq!(routes.fetched.load(Ordering::SeqCst), 2);
+    sessions.stop_all().await;
+}
+
+#[test]
+fn the_built_session_options_carry_the_configured_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env(dir.path());
+    let torrent = TorrentConfig {
+        connections_limit: count(450),
+        unchoke_slots_limit: count(12),
+        connection_speed: speed(55),
+        allow_multiple_connections_per_ip: true,
+        dht_bootstrap_nodes: " router.example:6881, 192.0.2.9:25401 ,".to_owned(),
+        stop_tracker_timeout_secs: 0,
+        ..TorrentConfig::default()
+    };
+    let blocklist = Arc::new(IpRanges::default());
+    let options = session_options(
+        &env,
+        &leg(LegKind::System),
+        6881,
+        dir.path(),
+        75,
+        &torrent,
+        Some(Arc::clone(&blocklist)),
+    );
+    assert_eq!(options.connections_limit, 450);
+    assert_eq!(options.unchoke_slots_limit, 12);
+    assert_eq!(options.connection_speed.get(), 55);
+    assert!(options.allow_multiple_connections_per_ip);
+    assert_eq!(options.peer_limit, Some(75));
+    assert_eq!(
+        options.dht.as_ref().unwrap().bootstrap_addrs.as_deref(),
+        Some(
+            [
+                "router.example:6881".to_owned(),
+                "192.0.2.9:25401".to_owned()
+            ]
+            .as_slice()
+        )
+    );
+    assert!(Arc::ptr_eq(options.blocklist.as_ref().unwrap(), &blocklist));
+    assert_eq!(options.tracker_stopped_timeout, Some(Duration::ZERO));
+
+    // The defaults are libtorrent's, and peers go over TCP alone.
+    let defaults = session_options(
+        &env,
+        &leg(LegKind::System),
+        6881,
+        dir.path(),
+        75,
+        &TorrentConfig::default(),
+        None,
+    );
+    assert_eq!(defaults.connections_limit, 200);
+    assert_eq!(defaults.unchoke_slots_limit, 8);
+    assert_eq!(defaults.connection_speed.get(), 30);
+    assert!(!defaults.allow_multiple_connections_per_ip);
+    // The engine's own routers, as when it was told none.
+    assert_eq!(
+        defaults.dht.as_ref().unwrap().bootstrap_addrs.as_deref(),
+        Some(
+            weaver_torrent::dht::DHT_BOOTSTRAP
+                .iter()
+                .map(|node| (*node).to_owned())
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+    );
+    assert!(defaults.blocklist.is_none());
+    assert_eq!(
+        defaults.tracker_stopped_timeout,
+        Some(Duration::from_secs(5))
+    );
+    assert!(matches!(
+        defaults.listen.as_ref().unwrap().mode,
+        ListenerMode::TcpOnly
+    ));
+    assert!(defaults.connect.as_ref().unwrap().enable_tcp);
+}
+
+#[test]
+fn the_peer_protocol_picks_the_transports_the_leg_carries() {
+    use crate::settings::TorrentPeerProtocol;
+    let dir = tempfile::tempdir().unwrap();
+    let env = env(dir.path());
+    let tunnel = leg(LegKind::Ladder);
+    let built = |leg: &OpenLeg, protocol| {
+        let torrent = TorrentConfig {
+            peer_protocol: protocol,
+            ..TorrentConfig::default()
+        };
+        let options = session_options(&env, leg, 6881, dir.path(), 100, &torrent, None);
+        (
+            options.listen.map(|listen| listen.mode),
+            options.connect.unwrap().enable_tcp,
+        )
+    };
+    let system = leg(LegKind::System);
+    assert!(matches!(
+        built(&system, TorrentPeerProtocol::Tcp),
+        (Some(ListenerMode::TcpOnly), true)
+    ));
+    assert!(matches!(
+        built(&system, TorrentPeerProtocol::Utp),
+        (Some(ListenerMode::UtpOnly), false)
+    ));
+    assert!(matches!(
+        built(&system, TorrentPeerProtocol::Both),
+        (Some(ListenerMode::TcpAndUtp), true)
+    ));
+    // A leg that does not listen has no uTP to offer, whether its tunnel
+    // carries datagrams or not: it dials over TCP when that is asked for,
+    // and otherwise has no way to reach a peer.
+    let mut datagrams = leg(LegKind::Ladder);
+    datagrams.shape.datagrams = true;
+    for ladder in [&tunnel, &datagrams] {
+        assert!(!ladder.shape.listen);
+        assert!(matches!(
+            built(ladder, TorrentPeerProtocol::Both),
+            (None, true)
+        ));
+        assert!(matches!(
+            built(ladder, TorrentPeerProtocol::Utp),
+            (None, false)
+        ));
+    }
 }
 
 fn leg(kind: LegKind) -> OpenLeg {
@@ -321,7 +600,8 @@ fn session_options_follow_the_leg() {
         6881,
         dir.path(),
         100,
-        Default::default(),
+        &TorrentConfig::default(),
+        None,
     );
     assert!(system.dht.is_some());
     let listen = system.listen.as_ref().unwrap();
@@ -341,7 +621,8 @@ fn session_options_follow_the_leg() {
         6881,
         dir.path(),
         100,
-        Default::default(),
+        &TorrentConfig::default(),
+        None,
     );
     assert!(interface.dht.is_some());
     assert_eq!(interface.bind_device_name.as_deref(), Some("en1"));
@@ -354,7 +635,8 @@ fn session_options_follow_the_leg() {
         6882,
         dir.path(),
         100,
-        Default::default(),
+        &TorrentConfig::default(),
+        None,
     );
     assert!(source.dht.is_some());
     assert_eq!(
@@ -369,7 +651,8 @@ fn session_options_follow_the_leg() {
         6883,
         dir.path(),
         100,
-        Default::default(),
+        &TorrentConfig::default(),
+        None,
     );
     assert!(ladder.dht.is_none());
     assert!(ladder.listen.is_none());
@@ -381,7 +664,15 @@ fn session_options_follow_the_leg() {
     let mut tunnel = leg(LegKind::Ladder);
     tunnel.shape.dht = true;
     tunnel.shape.datagrams = true;
-    let tunnel = session_options(&env, &tunnel, 6884, dir.path(), 100, Default::default());
+    let tunnel = session_options(
+        &env,
+        &tunnel,
+        6884,
+        dir.path(),
+        100,
+        &TorrentConfig::default(),
+        None,
+    );
     assert_eq!(tunnel.dht.as_ref().and_then(|dht| dht.port), Some(6884));
     assert!(tunnel.listen.is_none());
     assert!(tunnel.disable_local_service_discovery);
@@ -392,7 +683,15 @@ fn a_peer_may_stay_quiet_for_two_minutes_on_any_leg() {
     let dir = tempfile::tempdir().unwrap();
     let env = env(dir.path());
     for kind in [LegKind::System, LegKind::Ladder] {
-        let options = session_options(&env, &leg(kind), 6881, dir.path(), 100, Default::default());
+        let options = session_options(
+            &env,
+            &leg(kind),
+            6881,
+            dir.path(),
+            100,
+            &TorrentConfig::default(),
+            None,
+        );
         let peer = options.connect.unwrap().peer_opts.unwrap();
         assert_eq!(peer.read_write_timeout, Some(Duration::from_secs(120)));
         assert_eq!(peer.connect_timeout, None);
@@ -557,6 +856,10 @@ async fn every_session_gets_the_whole_peer_limit() {
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
+    sessions.set_config(TorrentConfig {
+        max_peers_total: 400,
+        ..TorrentConfig::default()
+    });
     for scope in [TorrentScope::Default, TorrentScope::Category(5)] {
         sessions
             .session(&routes.plan(scope).unwrap())

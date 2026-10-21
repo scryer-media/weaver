@@ -9,7 +9,7 @@ use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
     DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SeedingAction,
-    SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption,
+    SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentPeerProtocol,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -301,6 +301,40 @@ impl Database {
             None => self.delete_setting("torrent.session_dir")?,
         }
         self.set_setting("torrent.unpack", &torrent.unpack.to_string())?;
+        for (key, value) in [
+            (
+                "torrent.connections_limit",
+                torrent.connections_limit.to_string(),
+            ),
+            (
+                "torrent.unchoke_slots_limit",
+                torrent.unchoke_slots_limit.to_string(),
+            ),
+            (
+                "torrent.connection_speed",
+                torrent.connection_speed.to_string(),
+            ),
+            (
+                "torrent.stop_tracker_timeout_secs",
+                torrent.stop_tracker_timeout_secs.to_string(),
+            ),
+            (
+                "torrent.blocklist_enabled",
+                torrent.blocklist_enabled.to_string(),
+            ),
+        ] {
+            self.set_setting(key, &value)?;
+        }
+        self.set_setting(
+            "torrent.allow_multiple_connections_per_ip",
+            &torrent.allow_multiple_connections_per_ip.to_string(),
+        )?;
+        self.set_setting("torrent.peer_protocol", torrent.peer_protocol.as_str())?;
+        self.set_setting("torrent.dht_bootstrap_nodes", &torrent.dht_bootstrap_nodes)?;
+        match torrent.blocklist.as_deref() {
+            Some(blocklist) => self.set_setting("torrent.blocklist", blocklist)?,
+            None => self.delete_setting("torrent.blocklist")?,
+        }
         Ok(())
     }
 
@@ -529,6 +563,30 @@ fn torrent_config_from_settings(
             .get("torrent.session_dir")
             .map(std::path::PathBuf::from),
         unpack: parsed_setting(settings, "torrent.unpack").unwrap_or(defaults.unpack),
+        connections_limit: parsed_setting(settings, "torrent.connections_limit")
+            .unwrap_or(defaults.connections_limit),
+        unchoke_slots_limit: parsed_setting(settings, "torrent.unchoke_slots_limit")
+            .unwrap_or(defaults.unchoke_slots_limit),
+        connection_speed: parsed_setting(settings, "torrent.connection_speed")
+            .unwrap_or(defaults.connection_speed),
+        allow_multiple_connections_per_ip: parsed_setting(
+            settings,
+            "torrent.allow_multiple_connections_per_ip",
+        )
+        .unwrap_or(defaults.allow_multiple_connections_per_ip),
+        peer_protocol: settings
+            .get("torrent.peer_protocol")
+            .and_then(|v| TorrentPeerProtocol::parse(v))
+            .unwrap_or(defaults.peer_protocol),
+        dht_bootstrap_nodes: settings
+            .get("torrent.dht_bootstrap_nodes")
+            .cloned()
+            .unwrap_or(defaults.dht_bootstrap_nodes),
+        blocklist_enabled: parsed_setting(settings, "torrent.blocklist_enabled")
+            .unwrap_or(defaults.blocklist_enabled),
+        blocklist: settings.get("torrent.blocklist").cloned(),
+        stop_tracker_timeout_secs: parsed_setting(settings, "torrent.stop_tracker_timeout_secs")
+            .unwrap_or(defaults.stop_tracker_timeout_secs),
     }
 }
 

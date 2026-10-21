@@ -865,3 +865,87 @@ async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
     assert!(!refused.errors.is_empty());
     assert_eq!(h.db.load_config().unwrap().seeding, None);
 }
+
+#[tokio::test]
+async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse_out_of_range() {
+    let h = TestHarness::new().await;
+    const FIELDS: &str = "connectionsLimit unchokeSlotsLimit connectionSpeed allowMultipleConnectionsPerIp peerProtocol dhtBootstrapNodes blocklistEnabled blocklist stopTrackerTimeoutSecs";
+    let defaults = h
+        .execute(&format!("{{ settings {{ torrent {{ {FIELDS} }} }} }}"))
+        .await;
+    assert_no_errors(&defaults);
+    let torrent = &response_data(&defaults)["settings"]["torrent"];
+    assert_eq!(torrent["connectionsLimit"], 200);
+    assert_eq!(torrent["unchokeSlotsLimit"], 8);
+    assert_eq!(torrent["connectionSpeed"], 30);
+    assert_eq!(torrent["allowMultipleConnectionsPerIp"], false);
+    assert_eq!(torrent["peerProtocol"], "TCP");
+    assert_eq!(
+        torrent["dhtBootstrapNodes"],
+        "dht.transmissionbt.com:6881,dht.libtorrent.org:25401"
+    );
+    assert_eq!(torrent["blocklistEnabled"], false);
+    assert!(torrent["blocklist"].is_null());
+    assert_eq!(torrent["stopTrackerTimeoutSecs"], 5);
+
+    let saved = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{
+                connectionsLimit: null, unchokeSlotsLimit: 16, connectionSpeed: 60,
+                allowMultipleConnectionsPerIp: true, peerProtocol: BOTH,
+                dhtBootstrapNodes: " router.example:6881 ,, 192.0.2.9:25401", blocklistEnabled: true,
+                blocklist: " C:\\lists\\level1.p2p ", stopTrackerTimeoutSecs: 0
+            }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&saved);
+    let torrent = &response_data(&saved)["updateSettings"]["torrent"];
+    assert!(torrent["connectionsLimit"].is_null(), "no limit");
+    assert_eq!(torrent["unchokeSlotsLimit"], 16);
+    assert_eq!(torrent["connectionSpeed"], 60);
+    assert_eq!(torrent["allowMultipleConnectionsPerIp"], true);
+    assert_eq!(torrent["peerProtocol"], "BOTH");
+    assert_eq!(
+        torrent["dhtBootstrapNodes"],
+        "router.example:6881,192.0.2.9:25401"
+    );
+    assert_eq!(torrent["blocklistEnabled"], true);
+    assert_eq!(torrent["blocklist"], r"C:\lists\level1.p2p");
+    assert_eq!(torrent["stopTrackerTimeoutSecs"], 0);
+    let stored = h.db.load_config().unwrap();
+    assert_eq!(stored.torrent, h.config.read().await.torrent);
+    assert_eq!(
+        stored.torrent.connections_limit,
+        weaver_server_core::settings::TorrentLimit::Unlimited
+    );
+
+    for input in [
+        "connectionsLimit: 0",
+        "unchokeSlotsLimit: 0",
+        "connectionSpeed: 0",
+        r#"dhtBootstrapNodes: "router.example""#,
+    ] {
+        let refused = h
+            .execute(&format!(
+                "mutation {{ updateSettings(input: {{ torrent: {{ {input} }} }}) {{ torrent {{ connectionsLimit }} }} }}"
+            ))
+            .await;
+        assert!(!refused.errors.is_empty(), "{input}");
+        assert_eq!(
+            h.db.load_config().unwrap().torrent,
+            stored.torrent,
+            "{input}"
+        );
+        assert_eq!(h.config.read().await.torrent, stored.torrent, "{input}");
+    }
+
+    // An empty blocklist clears it, and the switch stays as it was.
+    let cleared = h
+        .execute(r#"mutation { updateSettings(input: { torrent: { blocklist: "" } }) { torrent { blocklistEnabled blocklist } } }"#)
+        .await;
+    assert_no_errors(&cleared);
+    let torrent = &response_data(&cleared)["updateSettings"]["torrent"];
+    assert!(torrent["blocklist"].is_null());
+    assert_eq!(torrent["blocklistEnabled"], true);
+    assert_eq!(h.db.load_config().unwrap().torrent.blocklist, None);
+}

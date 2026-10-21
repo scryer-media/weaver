@@ -5078,6 +5078,12 @@ type TorrentPeerFlags {
 	holepunched: Boolean!
 }
 
+enum TorrentPeerProtocol {
+	TCP
+	UTP
+	BOTH
+}
+
 type TorrentSettings {
 	enabled: Boolean!
 	basePort: Int!
@@ -5088,6 +5094,24 @@ type TorrentSettings {
 	maxPeersTotal: Int!
 	sessionDir: String
 	unpack: Boolean!
+	"""
+	Null for no limit.
+	"""
+	connectionsLimit: Int
+	"""
+	Null for no limit.
+	"""
+	unchokeSlotsLimit: Int
+	connectionSpeed: Int!
+	allowMultipleConnectionsPerIp: Boolean!
+	peerProtocol: TorrentPeerProtocol!
+	dhtBootstrapNodes: String!
+	blocklistEnabled: Boolean!
+	"""
+	An http, https or file URL, or a path.
+	"""
+	blocklist: String
+	stopTrackerTimeoutSecs: Int!
 }
 
 input TorrentSettingsInput {
@@ -5100,6 +5124,24 @@ input TorrentSettingsInput {
 	maxPeersTotal: Int
 	sessionDir: String
 	unpack: Boolean
+	"""
+	Null for no limit.
+	"""
+	connectionsLimit: Int
+	"""
+	Null for no limit.
+	"""
+	unchokeSlotsLimit: Int
+	connectionSpeed: Int
+	allowMultipleConnectionsPerIp: Boolean
+	peerProtocol: TorrentPeerProtocol
+	dhtBootstrapNodes: String
+	blocklistEnabled: Boolean
+	"""
+	An http, https or file URL, or a path.
+	"""
+	blocklist: String
+	stopTrackerTimeoutSecs: Int
 }
 
 enum TorrentState {

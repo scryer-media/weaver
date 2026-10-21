@@ -1415,6 +1415,15 @@ const TORRENT_SETTINGS_FIELDS = `
       maxActiveDownloads
       maxPeersTotal
       unpack
+      connectionsLimit
+      unchokeSlotsLimit
+      connectionSpeed
+      allowMultipleConnectionsPerIp
+      peerProtocol
+      dhtBootstrapNodes
+      blocklistEnabled
+      blocklist
+      stopTrackerTimeoutSecs
     }
   }
   ${SEEDING_POLICY_FIELDS}

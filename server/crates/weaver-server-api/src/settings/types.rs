@@ -1345,6 +1345,36 @@ impl From<TorrentEncryptionGql> for weaver_server_core::settings::TorrentEncrypt
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentPeerProtocol")]
+pub enum TorrentPeerProtocolGql {
+    #[default]
+    Tcp,
+    Utp,
+    Both,
+}
+
+impl From<weaver_server_core::settings::TorrentPeerProtocol> for TorrentPeerProtocolGql {
+    fn from(value: weaver_server_core::settings::TorrentPeerProtocol) -> Self {
+        use weaver_server_core::settings::TorrentPeerProtocol;
+        match value {
+            TorrentPeerProtocol::Tcp => Self::Tcp,
+            TorrentPeerProtocol::Utp => Self::Utp,
+            TorrentPeerProtocol::Both => Self::Both,
+        }
+    }
+}
+
+impl From<TorrentPeerProtocolGql> for weaver_server_core::settings::TorrentPeerProtocol {
+    fn from(value: TorrentPeerProtocolGql) -> Self {
+        match value {
+            TorrentPeerProtocolGql::Tcp => Self::Tcp,
+            TorrentPeerProtocolGql::Utp => Self::Utp,
+            TorrentPeerProtocolGql::Both => Self::Both,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
 pub struct TorrentSettings {
     pub enabled: bool,
@@ -1356,6 +1386,18 @@ pub struct TorrentSettings {
     pub max_peers_total: u32,
     pub session_dir: Option<String>,
     pub unpack: bool,
+    /// Null for no limit.
+    pub connections_limit: Option<std::num::NonZeroU32>,
+    /// Null for no limit.
+    pub unchoke_slots_limit: Option<std::num::NonZeroU32>,
+    pub connection_speed: std::num::NonZeroU32,
+    pub allow_multiple_connections_per_ip: bool,
+    pub peer_protocol: TorrentPeerProtocolGql,
+    pub dht_bootstrap_nodes: String,
+    pub blocklist_enabled: bool,
+    /// An http, https or file URL, or a path.
+    pub blocklist: Option<String>,
+    pub stop_tracker_timeout_secs: u32,
 }
 
 impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
@@ -1373,6 +1415,15 @@ impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
                 .as_ref()
                 .map(|dir| dir.display().to_string()),
             unpack: value.unpack,
+            connections_limit: value.connections_limit.count(),
+            unchoke_slots_limit: value.unchoke_slots_limit.count(),
+            connection_speed: value.connection_speed,
+            allow_multiple_connections_per_ip: value.allow_multiple_connections_per_ip,
+            peer_protocol: value.peer_protocol.into(),
+            dht_bootstrap_nodes: value.dht_bootstrap_nodes.clone(),
+            blocklist_enabled: value.blocklist_enabled,
+            blocklist: value.blocklist.clone(),
+            stop_tracker_timeout_secs: value.stop_tracker_timeout_secs,
         }
     }
 }
@@ -1388,6 +1439,18 @@ pub struct TorrentSettingsInput {
     pub max_peers_total: Option<u32>,
     pub session_dir: MaybeUndefined<String>,
     pub unpack: Option<bool>,
+    /// Null for no limit.
+    pub connections_limit: MaybeUndefined<std::num::NonZeroU32>,
+    /// Null for no limit.
+    pub unchoke_slots_limit: MaybeUndefined<std::num::NonZeroU32>,
+    pub connection_speed: Option<std::num::NonZeroU32>,
+    pub allow_multiple_connections_per_ip: Option<bool>,
+    pub peer_protocol: Option<TorrentPeerProtocolGql>,
+    pub dht_bootstrap_nodes: Option<String>,
+    pub blocklist_enabled: Option<bool>,
+    /// An http, https or file URL, or a path.
+    pub blocklist: MaybeUndefined<String>,
+    pub stop_tracker_timeout_secs: Option<u32>,
 }
 
 impl TorrentSettingsInput {
@@ -1423,6 +1486,35 @@ impl TorrentSettingsInput {
         }
         if let Some(unpack) = self.unpack {
             torrent.unpack = unpack;
+        }
+        use weaver_server_core::settings::TorrentLimit;
+        let limit = |given: &MaybeUndefined<std::num::NonZeroU32>, limit: &mut TorrentLimit| {
+            if !given.is_undefined() {
+                *limit = TorrentLimit::of(given.value().copied());
+            }
+        };
+        limit(&self.connections_limit, &mut torrent.connections_limit);
+        limit(&self.unchoke_slots_limit, &mut torrent.unchoke_slots_limit);
+        if let Some(speed) = self.connection_speed {
+            torrent.connection_speed = speed;
+        }
+        if let Some(allow) = self.allow_multiple_connections_per_ip {
+            torrent.allow_multiple_connections_per_ip = allow;
+        }
+        if let Some(protocol) = self.peer_protocol {
+            torrent.peer_protocol = protocol.into();
+        }
+        if let Some(nodes) = &self.dht_bootstrap_nodes {
+            torrent.dht_bootstrap_nodes.clone_from(nodes);
+        }
+        if let Some(enabled) = self.blocklist_enabled {
+            torrent.blocklist_enabled = enabled;
+        }
+        if !self.blocklist.is_undefined() {
+            torrent.blocklist = self.blocklist.value().cloned();
+        }
+        if let Some(secs) = self.stop_tracker_timeout_secs {
+            torrent.stop_tracker_timeout_secs = secs;
         }
     }
 }

@@ -25,7 +25,7 @@ use weaver_server_core::torrents::identity::IDENTITY;
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
-    OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
+    IpRanges, OpenLeg, RouteKey, RoutePlan, Routes, SessionEnv, Sessions,
 };
 
 // A route that is always down: no torrent here reaches a network.
@@ -56,6 +56,18 @@ impl Routes for Offline {
     {
         Box::pin(async { Err("offline".to_owned()) })
     }
+
+    fn fetch_blocklist<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: &'life1 reqwest::Url,
+    ) -> Pin<Box<dyn Future<Output = Result<IpRanges, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Err("offline".to_owned()) })
+    }
 }
 
 struct Rig {
@@ -75,7 +87,6 @@ async fn rig() -> Rig {
             base_port: 0,
             announce_port: None,
             upnp: false,
-            max_peers_total: 100,
             identity: IDENTITY,
         },
         db.clone(),

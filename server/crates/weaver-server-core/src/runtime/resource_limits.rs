@@ -47,6 +47,32 @@ pub fn raise_open_file_limit() -> u64 {
     }
 }
 
+// The files the process may hold open, as libtorrent's `max_open_files`
+// reads them: the soft limit, 10,000,000 for none, and 1,024 when it cannot
+// be read; off Unix, 10,000.
+#[allow(clippy::unnecessary_cast)]
+pub fn open_file_limit() -> usize {
+    const NONE: usize = 10_000_000;
+    #[cfg(unix)]
+    // SAFETY: `rlimit` is an integer-only C struct, and `getrlimit` only
+    // writes the live stack value passed to it.
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return 1_024;
+        }
+        if limit.rlim_cur == libc::RLIM_INFINITY {
+            return NONE;
+        }
+        usize::try_from(limit.rlim_cur as u64).map_or(NONE, |files| files.min(NONE))
+    }
+
+    #[cfg(not(unix))]
+    {
+        10_000
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

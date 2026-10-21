@@ -284,13 +284,13 @@ impl TorrentService {
     pub async fn for_server(
         config: &Config,
         db: Database,
-        proxies: &crate::proxies::ProxyRuntime,
+        proxies: &Arc<crate::proxies::ProxyRuntime>,
         pipeline: &crate::pipeline::Pipeline,
         queue: SchedulerHandle,
     ) -> Result<Self, String> {
         let routes = NetworkRoutes::new(
             db.clone(),
-            Arc::clone(&proxies.network),
+            Arc::clone(proxies),
             ROUTE_TIMEOUT,
             crate::torrents::identity::IDENTITY,
         );
@@ -959,7 +959,7 @@ impl TorrentService {
         env: JobEnv,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        sessions.set_encryption(settings.torrent.encryption);
+        sessions.set_config(settings.torrent.clone());
         Self {
             inner: Arc::new(Inner {
                 db,
@@ -1078,9 +1078,7 @@ impl TorrentService {
     /// session and leaves each torrent stopped until they are turned on.
     pub async fn set_settings(&self, settings: TorrentSettings) {
         let on = settings.torrent.enabled;
-        self.inner
-            .sessions
-            .set_encryption(settings.torrent.encryption);
+        self.inner.sessions.set_config(settings.torrent.clone());
         let was = std::mem::replace(
             &mut *self
                 .inner
