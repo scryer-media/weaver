@@ -4,38 +4,17 @@
 // The article map out as facts and back, and what a restore asks of it: the
 // articles it may read back from disk, and the ones it found were not there.
 
+use std::collections::BTreeMap;
+use std::ops::Bound;
+
 use weaver_graph::{ByteRange, VolumeIndex};
 
-use super::{ArticleMap, Class, Move, State};
-use crate::pipeline::graph::root::facts::{ArticleFacts, ClassFacts, RootFactsError, VolumeFacts};
+use super::{ArticleMap, Class, Move, State, Volume};
+use crate::pipeline::graph::root::facts::{
+    ArticleFacts, CHUNK, Chunk, ClassFacts, RootFactsError, VolumeFacts, of_boundary, of_ordinal,
+};
 
 impl ArticleMap {
-    pub(crate) fn facts(&self) -> Vec<VolumeFacts> {
-        self.volumes
-            .iter()
-            .map(|volume| VolumeFacts {
-                articles: volume
-                    .articles
-                    .iter()
-                    .map(|article| (article.ordinal, article_facts(article.state)))
-                    .collect(),
-                known: volume
-                    .known
-                    .iter()
-                    .map(|(index, offset)| (*index as u64, *offset))
-                    .collect(),
-                ordered_only: volume.ordered_only,
-                segments: Vec::new(),
-                raised: volume
-                    .articles
-                    .iter()
-                    .filter(|article| article.state == State::Waiting)
-                    .filter_map(|article| Some((article.ordinal, class_facts(article.class)?)))
-                    .collect(),
-            })
-            .collect()
-    }
-
     // Lay the facts over a map made from the post. The post must be the one
     // they were taken from: the same files, the same articles.
     pub(crate) fn restore(&mut self, facts: &[VolumeFacts]) -> Result<(), RootFactsError> {
@@ -46,11 +25,11 @@ impl ArticleMap {
             if volume.articles.len() != facts.articles.len() {
                 return Err(RootFactsError::Mismatch("another number of articles"));
             }
-            for (article, (ordinal, state)) in volume.articles.iter_mut().zip(&facts.articles) {
-                if article.ordinal != *ordinal {
+            for (at, (ordinal, state)) in facts.articles.iter().enumerate() {
+                if volume.articles[at].ordinal != *ordinal {
                     return Err(RootFactsError::Mismatch("another article ordinal"));
                 }
-                article.state = match *state {
+                let state = match *state {
                     ArticleFacts::Waiting => State::Waiting,
                     ArticleFacts::Arrived(range) => State::Arrived(
                         range
@@ -59,14 +38,27 @@ impl ArticleMap {
                     ),
                     ArticleFacts::Lost { damaged } => State::Lost { damaged },
                 };
+                volume.set_state(at, state);
             }
             let last = volume.articles.len() as u64;
-            volume.known = facts
+            let known: BTreeMap<usize, u64> = facts
                 .known
                 .iter()
                 .filter(|(index, _)| *index <= last)
                 .map(|(index, offset)| (*index as usize, *offset))
                 .collect();
+            let gone: Vec<usize> = volume
+                .known
+                .keys()
+                .filter(|boundary| !known.contains_key(boundary))
+                .copied()
+                .collect();
+            for boundary in gone {
+                volume.unknow(boundary);
+            }
+            for (boundary, offset) in known {
+                volume.know(boundary, offset);
+            }
             volume.ordered_only = facts.ordered_only;
             // Raised again through the moves, so the queue built from the
             // post is reclassed as the one that went down was.
@@ -74,15 +66,14 @@ impl ArticleMap {
                 let Some(at) = volume.index(*ordinal) else {
                     return Err(RootFactsError::Mismatch("a raised article not in the post"));
                 };
-                let article = &mut volume.articles[at];
-                if article.state != State::Waiting {
+                if volume.articles[at].state != State::Waiting {
                     continue;
                 }
-                article.class = class(*raised);
+                volume.set_class(at, class(*raised));
                 self.moves.push(Move {
                     volume: VolumeIndex(index as u32),
                     ordinal: *ordinal,
-                    class: article.class,
+                    class: volume.articles[at].class,
                 });
             }
         }
@@ -115,7 +106,7 @@ impl ArticleMap {
         if let Some(index) = found.index(ordinal)
             && matches!(found.articles[index].state, State::Arrived(_))
         {
-            found.articles[index].state = State::Waiting;
+            found.set_state(index, State::Waiting);
         }
     }
 
@@ -143,6 +134,112 @@ impl ArticleMap {
     pub(crate) fn volume_count(&self) -> usize {
         self.volumes.len()
     }
+
+    // The generation of the volume's last change, and the chunks changed
+    // after `at`.
+    pub(crate) fn marked(&self, volume: usize) -> u64 {
+        self.volumes[volume].marks.at()
+    }
+
+    pub(crate) fn marked_since(&self, volume: usize, at: u64) -> impl Iterator<Item = Chunk> + '_ {
+        self.volumes[volume].marks.since(at)
+    }
+
+    // Every chunk the volume's facts can have something in.
+    pub(crate) fn chunks(&self, volume: usize) -> impl Iterator<Item = Chunk> + '_ {
+        let found = &self.volumes[volume];
+        let articles = found
+            .articles
+            .iter()
+            .map(|article| Chunk::Articles(of_ordinal(article.ordinal)));
+        let known = found
+            .known
+            .keys()
+            .map(|boundary| Chunk::Known(of_boundary(*boundary as u64)));
+        let segments = found
+            .starts
+            .values()
+            .filter_map(|held| held.last())
+            .map(|ordinal| Chunk::Segments(of_ordinal(*ordinal)))
+            .chain([Chunk::Segments(0)]);
+        articles.chain(known).chain(segments)
+    }
+
+    pub(crate) fn ordered_only(&self, volume: usize) -> bool {
+        self.volumes[volume].ordered_only
+    }
+
+    // The articles of one chunk, in ordinal order.
+    pub(crate) fn articles_in(&self, volume: usize, chunk: u32) -> Vec<(u32, ArticleFacts)> {
+        in_chunk(&self.volumes[volume], chunk)
+            .map(|article| (article.ordinal, article_facts(article.state)))
+            .collect()
+    }
+
+    // The waiting articles of one chunk raised above the ordinary class.
+    pub(crate) fn raised_in(&self, volume: usize, chunk: u32) -> Vec<(u32, ClassFacts)> {
+        in_chunk(&self.volumes[volume], chunk)
+            .filter(|article| article.state == State::Waiting)
+            .filter_map(|article| Some((article.ordinal, class_facts(article.class)?)))
+            .collect()
+    }
+
+    // The known boundaries of one chunk, by boundary index.
+    pub(crate) fn known_in(&self, volume: usize, chunk: u32) -> Vec<(u64, u64)> {
+        let first = chunk as usize * CHUNK as usize;
+        self.volumes[volume]
+            .known
+            .range(first..first + CHUNK as usize)
+            .map(|(index, offset)| (*index as u64, *offset))
+            .collect()
+    }
+
+    // The decoded offsets whose segments are the chunk's: from each start
+    // one of its articles holds up to the next start, and for the first
+    // chunk whatever lies before every start.
+    pub(crate) fn owned_by(&self, volume: usize, chunk: u32) -> Vec<(Bound<u64>, Bound<u64>)> {
+        let found = &self.volumes[volume];
+        let mut out = Vec::new();
+        if chunk == 0 {
+            let end = found
+                .starts
+                .keys()
+                .next()
+                .map_or(Bound::Unbounded, |start| Bound::Excluded(*start));
+            out.push((Bound::Unbounded, end));
+        }
+        for article in in_chunk(found, chunk) {
+            let State::Arrived(Some(range)) = article.state else {
+                continue;
+            };
+            let start = range.start;
+            if found.starts.get(&start).and_then(|held| held.last()) != Some(&article.ordinal) {
+                continue;
+            }
+            let end = found
+                .starts
+                .range((Bound::Excluded(start), Bound::Unbounded))
+                .next()
+                .map_or(Bound::Unbounded, |(next, _)| Bound::Excluded(*next));
+            out.push((Bound::Included(start), end));
+        }
+        out
+    }
+
+    // The chunk whose segments hold a segment starting at `offset`.
+    pub(crate) fn owner(&self, volume: usize, offset: u64) -> u32 {
+        self.volumes[volume].owner(offset)
+    }
+}
+
+fn in_chunk(volume: &Volume, chunk: u32) -> impl Iterator<Item = &super::Article> + '_ {
+    let first = chunk.saturating_mul(CHUNK);
+    let from = volume
+        .articles
+        .partition_point(|article| article.ordinal < first);
+    volume.articles[from..]
+        .iter()
+        .take_while(move |article| of_ordinal(article.ordinal) == chunk)
 }
 
 fn article_facts(state: State) -> ArticleFacts {

@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use weaver_graph::{ByteRange, MemberId, NodeId, Provenance, Segment, VolumeIndex};
 
+use super::facts::Marks;
 use crate::pipeline::graph::namespace::{Arrival, Segments};
 
 // A decoded article, as the decoder placed it.
@@ -66,6 +67,8 @@ impl Decoded {
 #[derive(Debug, Default)]
 pub(crate) struct Checksums {
     volumes: BTreeMap<VolumeIndex, BTreeMap<u64, Segment>>,
+    // The starts of the segments each change put in or took out.
+    marks: BTreeMap<VolumeIndex, Marks<u64>>,
 }
 
 impl Checksums {
@@ -74,6 +77,7 @@ impl Checksums {
     // every checksum its range overlaps.
     pub(crate) fn record(&mut self, volume: VolumeIndex, segments: &[Segment]) {
         let kept = self.volumes.entry(volume).or_default();
+        let marks = self.marks.entry(volume).or_default();
         for segment in segments {
             let stale: Vec<u64> = kept
                 .range(..segment.range.end)
@@ -83,8 +87,10 @@ impl Checksums {
                 .collect();
             for start in stale {
                 kept.remove(&start);
+                marks.mark(start);
             }
             kept.insert(segment.range.start, *segment);
+            marks.mark(segment.range.start);
         }
     }
 }

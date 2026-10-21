@@ -4,29 +4,49 @@
 // The decoder's checksums out as facts and back, and the check a restore
 // makes of bytes it reads back against them.
 
+use std::ops::Bound;
+
 use weaver_graph::{ByteRange, Segment, VolumeIndex};
 
 use super::Checksums;
 use crate::pipeline::graph::root::facts::VolumeFacts;
 
 impl Checksums {
-    pub(crate) fn facts(&self, volumes: &mut [VolumeFacts]) {
-        for (volume, kept) in &self.volumes {
-            let Some(facts) = volumes.get_mut(volume.0 as usize) else {
-                continue;
-            };
-            facts.segments = kept
-                .values()
-                .map(|segment| {
-                    (
-                        segment.range.start,
-                        segment.range.end,
-                        segment.crc32,
-                        segment.verified,
-                    )
-                })
-                .collect();
-        }
+    // The generation of the volume's last change, and the starts of the
+    // segments changed after `at`.
+    pub(crate) fn marked(&self, volume: VolumeIndex) -> u64 {
+        self.marks.get(&volume).map_or(0, |marks| marks.at())
+    }
+
+    pub(crate) fn marked_since(
+        &self,
+        volume: VolumeIndex,
+        at: u64,
+    ) -> impl Iterator<Item = u64> + '_ {
+        self.marks
+            .get(&volume)
+            .into_iter()
+            .flat_map(move |marks| marks.since(at))
+    }
+
+    // The segments starting in the offsets, as facts, in start order.
+    pub(crate) fn segments_in(
+        &self,
+        volume: VolumeIndex,
+        starts: (Bound<u64>, Bound<u64>),
+        out: &mut Vec<(u64, u64, u32, bool)>,
+    ) {
+        let Some(kept) = self.volumes.get(&volume) else {
+            return;
+        };
+        out.extend(kept.range(starts).map(|(_, segment)| {
+            (
+                segment.range.start,
+                segment.range.end,
+                segment.crc32,
+                segment.verified,
+            )
+        }));
     }
 
     pub(crate) fn restore(&mut self, volumes: &[VolumeFacts]) {

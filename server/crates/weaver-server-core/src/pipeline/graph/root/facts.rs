@@ -8,14 +8,16 @@
 // has the spec, and the names are only there to prove it is the same post.
 //
 // What grows with the post is kept as parts, a chunk of articles to a part,
-// so a step that changes one article encodes and writes one part.
+// so a step that changes one article encodes and writes one part. The root's
+// state marks the chunks each change touches, so an encoding reads again
+// only the chunks marked since it last read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
-    encode_parts,
+    ByteRange, Change, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
+    encode_changes, encode_parts, stamped,
 };
 
 use super::ArticleRoot;
@@ -85,18 +87,6 @@ pub(crate) enum RootFactsError {
 }
 
 impl ArticleRoot {
-    pub(crate) fn facts(&self, next_node: u32) -> RootFacts {
-        let mut volumes = self.map.facts();
-        self.checksums.facts(&mut volumes);
-        RootFacts {
-            next_node,
-            posted: self.posted.clone(),
-            volumes,
-            read_backs: 0,
-            reported: None,
-        }
-    }
-
     // The root at the state its facts describe, over the post's articles.
     // The post must be the one they were taken from: its files by name, as
     // the map checks them by their articles.
@@ -116,7 +106,56 @@ impl ArticleRoot {
 }
 
 // Articles to a part.
-const CHUNK: u32 = 16;
+pub(crate) const CHUNK: u32 = 16;
+
+// A chunk of one volume's facts: of its articles and their raised classes,
+// of its known boundaries, or of its segments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Chunk {
+    Articles(u32),
+    Known(u32),
+    Segments(u32),
+}
+
+// The keys a part of the root's state changed, each under the generation of
+// its latest change, which rises with every change: what was read whole at
+// generation `at` is brought up to date by reading again what changed since.
+#[derive(Debug)]
+pub(crate) struct Marks<K> {
+    at: u64,
+    latest: BTreeMap<K, u64>,
+    by_at: BTreeMap<u64, K>,
+}
+
+impl<K> Default for Marks<K> {
+    fn default() -> Self {
+        Self {
+            at: 0,
+            latest: BTreeMap::new(),
+            by_at: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Ord + Copy> Marks<K> {
+    pub(crate) fn mark(&mut self, key: K) {
+        self.at += 1;
+        if let Some(was) = self.latest.insert(key, self.at) {
+            self.by_at.remove(&was);
+        }
+        self.by_at.insert(self.at, key);
+    }
+
+    pub(crate) fn at(&self) -> u64 {
+        self.at
+    }
+
+    pub(crate) fn since(&self, at: u64) -> impl Iterator<Item = K> + '_ {
+        self.by_at
+            .range(at.saturating_add(1)..)
+            .map(|(_, key)| *key)
+    }
+}
 
 // The facts as they are encoded: kept from one checkpoint to the next, so a
 // part whose entries did not change keeps its bytes and is not encoded again.
@@ -127,6 +166,9 @@ pub(crate) struct Encoded {
     volumes: Vec<EncodedVolume>,
     read_backs: u64,
     reported: Option<RootPhase>,
+    // The stamp its parts were last taken at.
+    #[serde(skip)]
+    taken: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -141,52 +183,21 @@ struct EncodedVolume {
     segments: Shelf<Vec<(u64, u64, u32, bool)>>,
     // By ordinal.
     raised: Shelf<Vec<(u32, ClassFacts)>>,
+    // The generations of the root's map and checksums for the volume when
+    // this encoding last read them; `None` until it has read them whole.
+    #[serde(skip)]
+    read: Option<(u64, u64)>,
 }
 
-// Entries grouped by the chunk each lies in.
-fn chunked<T: Clone>(entries: &[T], chunk: impl Fn(&T) -> u32) -> BTreeMap<u32, Vec<T>> {
-    let mut out: BTreeMap<u32, Vec<T>> = BTreeMap::new();
-    for entry in entries {
-        out.entry(chunk(entry)).or_default().push(entry.clone());
-    }
-    out
-}
-
-fn of_ordinal(ordinal: u32) -> u32 {
+pub(crate) fn of_ordinal(ordinal: u32) -> u32 {
     ordinal / CHUNK
 }
 
-fn of_boundary(boundary: u64) -> u32 {
+pub(crate) fn of_boundary(boundary: u64) -> u32 {
     u32::try_from(boundary / u64::from(CHUNK)).unwrap_or(u32::MAX)
 }
 
 impl EncodedVolume {
-    fn refresh(&mut self, facts: &VolumeFacts) {
-        let starts: BTreeMap<u64, u32> = facts
-            .articles
-            .iter()
-            .filter_map(|(ordinal, article)| match article {
-                ArticleFacts::Arrived(Some((start, _))) => Some((*start, *ordinal)),
-                _ => None,
-            })
-            .collect();
-        self.articles.set(chunked(&facts.articles, |(ordinal, _)| {
-            of_ordinal(*ordinal)
-        }));
-        self.known.set(chunked(&facts.known, |(boundary, _)| {
-            of_boundary(*boundary)
-        }));
-        self.ordered_only = facts.ordered_only;
-        self.segments.set(chunked(&facts.segments, |(start, ..)| {
-            starts
-                .range(..=*start)
-                .next_back()
-                .map_or(0, |(_, ordinal)| of_ordinal(*ordinal))
-        }));
-        self.raised
-            .set(chunked(&facts.raised, |(ordinal, _)| of_ordinal(*ordinal)));
-    }
-
     fn facts(&self) -> VolumeFacts {
         fn joined<T: Clone + Serialize, K: Ord>(
             shelf: &Shelf<Vec<T>>,
@@ -236,18 +247,6 @@ impl Durable for Encoded {
 }
 
 impl Encoded {
-    fn refresh(&mut self, facts: &RootFacts) {
-        self.next_node = facts.next_node;
-        self.posted.set(facts.posted.clone());
-        self.volumes
-            .resize_with(facts.volumes.len(), EncodedVolume::default);
-        for (encoded, volume) in self.volumes.iter_mut().zip(&facts.volumes) {
-            encoded.refresh(volume);
-        }
-        self.read_backs = facts.read_backs;
-        self.reported = facts.reported;
-    }
-
     fn facts(&self) -> RootFacts {
         RootFacts {
             next_node: self.next_node,
@@ -259,15 +258,163 @@ impl Encoded {
     }
 }
 
-// The facts' version, bytes and parts, encoding again only the parts that
-// changed since `encoded` last encoded. Facts that do not encode are facts
-// nothing could restore, so they say so as unsupported, which a restore
-// refuses.
-pub(crate) fn encode(encoded: &mut Encoded, facts: &RootFacts) -> (u16, Vec<u8>, Vec<Part>) {
-    encoded.refresh(facts);
-    match encode_parts(encoded) {
-        Ok((bytes, parts)) => (RootFacts::VERSION, bytes, parts),
-        Err(_) => (Facts::UNSUPPORTED, Vec::new(), Vec::new()),
+// One encoding of the root's facts: the root row's version and bytes, and
+// its parts.
+pub(crate) struct Encoding {
+    pub(crate) version: u16,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) parts: Parts,
+}
+
+pub(crate) enum Parts {
+    // Every part the facts have.
+    All(Vec<Part>),
+    // The parts changed since the encoding before.
+    Changed(Vec<Change>),
+}
+
+fn some<T>(entries: Vec<T>) -> Option<Vec<T>> {
+    (!entries.is_empty()).then_some(entries)
+}
+
+// Each chunk read, kept where it holds anything.
+fn filled<T>(chunks: &[u32], read: impl Fn(u32) -> Vec<T>) -> Vec<(u32, Vec<T>)> {
+    chunks
+        .iter()
+        .filter_map(|chunk| Some((*chunk, some(read(*chunk))?)))
+        .collect()
+}
+
+impl ArticleRoot {
+    // The root's facts encoded into `encoded`, reading of the root only the
+    // chunks marked since `encoded` last read it, and all of it the first
+    // time. Facts that do not encode say so as unsupported, as `encode`
+    // does, and the next encoding reads the root whole again.
+    pub(crate) fn encode(
+        &self,
+        encoded: &mut Encoded,
+        next_node: u32,
+        read_backs: u64,
+        reported: Option<RootPhase>,
+    ) -> Encoding {
+        encoded.next_node = next_node;
+        encoded.read_backs = read_backs;
+        encoded.reported = reported;
+        let read = encoded.volumes.len() == self.map.volume_count()
+            && encoded.volumes.iter().all(|volume| volume.read.is_some());
+        let done = match read {
+            true => self.encode_changed(encoded),
+            false => self.encode_whole(encoded),
+        };
+        done.unwrap_or_else(|_| {
+            for volume in &mut encoded.volumes {
+                volume.read = None;
+            }
+            Encoding {
+                version: Facts::UNSUPPORTED,
+                bytes: Vec::new(),
+                parts: Parts::All(Vec::new()),
+            }
+        })
+    }
+
+    fn encode_whole(&self, encoded: &mut Encoded) -> Result<Encoding, String> {
+        encoded.posted.set(self.posted.clone());
+        encoded
+            .volumes
+            .resize_with(self.map.volume_count(), EncodedVolume::default);
+        for (index, volume) in encoded.volumes.iter_mut().enumerate() {
+            let read = self.marked(index);
+            let (mut articles, mut known, mut segments) = (Vec::new(), Vec::new(), Vec::new());
+            for chunk in self.map.chunks(index).collect::<BTreeSet<_>>() {
+                match chunk {
+                    Chunk::Articles(chunk) => articles.push(chunk),
+                    Chunk::Known(chunk) => known.push(chunk),
+                    Chunk::Segments(chunk) => segments.push(chunk),
+                }
+            }
+            volume.articles.set(filled(&articles, |chunk| {
+                self.map.articles_in(index, chunk)
+            }));
+            volume
+                .raised
+                .set(filled(&articles, |chunk| self.map.raised_in(index, chunk)));
+            volume
+                .known
+                .set(filled(&known, |chunk| self.map.known_in(index, chunk)));
+            volume
+                .segments
+                .set(filled(&segments, |chunk| self.segments_in(index, chunk)));
+            volume.ordered_only = self.map.ordered_only(index);
+            volume.read = Some(read);
+        }
+        encoded.taken = stamped();
+        let (bytes, parts) = encode_parts(encoded)?;
+        Ok(Encoding {
+            version: RootFacts::VERSION,
+            bytes,
+            parts: Parts::All(parts),
+        })
+    }
+
+    fn encode_changed(&self, encoded: &mut Encoded) -> Result<Encoding, String> {
+        for (index, volume) in encoded.volumes.iter_mut().enumerate() {
+            let now = self.marked(index);
+            volume.ordered_only = self.map.ordered_only(index);
+            let Some((map, sums)) = volume.read.filter(|read| *read != now) else {
+                continue;
+            };
+            let mut chunks: BTreeSet<Chunk> = self.map.marked_since(index, map).collect();
+            chunks.extend(
+                self.checksums
+                    .marked_since(VolumeIndex(index as u32), sums)
+                    .map(|offset| Chunk::Segments(self.map.owner(index, offset))),
+            );
+            for chunk in chunks {
+                match chunk {
+                    Chunk::Articles(chunk) => {
+                        volume
+                            .articles
+                            .put(chunk, some(self.map.articles_in(index, chunk)));
+                        volume
+                            .raised
+                            .put(chunk, some(self.map.raised_in(index, chunk)));
+                    }
+                    Chunk::Known(chunk) => volume
+                        .known
+                        .put(chunk, some(self.map.known_in(index, chunk))),
+                    Chunk::Segments(chunk) => volume
+                        .segments
+                        .put(chunk, some(self.segments_in(index, chunk))),
+                }
+            }
+            volume.read = Some(now);
+        }
+        let since = std::mem::replace(&mut encoded.taken, stamped());
+        let (bytes, changed) = encode_changes(encoded, since)?;
+        Ok(Encoding {
+            version: RootFacts::VERSION,
+            bytes,
+            parts: Parts::Changed(changed),
+        })
+    }
+
+    fn marked(&self, volume: usize) -> (u64, u64) {
+        (
+            self.map.marked(volume),
+            self.checksums.marked(VolumeIndex(volume as u32)),
+        )
+    }
+
+    // One chunk of a volume's segments, in start order.
+    fn segments_in(&self, volume: usize, chunk: u32) -> Vec<(u64, u64, u32, bool)> {
+        let mut out = Vec::new();
+        for starts in self.map.owned_by(volume, chunk) {
+            self.checksums
+                .segments_in(VolumeIndex(volume as u32), starts, &mut out);
+        }
+        out.sort_by_key(|(start, ..)| *start);
+        out
     }
 }
 

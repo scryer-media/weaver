@@ -118,7 +118,7 @@ impl Builder for Probes {
     }
 }
 
-fn file(name: &str, sizes: &[u32]) -> RootFile {
+pub(in crate::pipeline::graph) fn file(name: &str, sizes: &[u32]) -> RootFile {
     RootFile {
         name: name.to_string(),
         articles: sizes
@@ -131,7 +131,7 @@ fn file(name: &str, sizes: &[u32]) -> RootFile {
 
 // A job whose files go to a fresh directory, kept for as long as the
 // returned handle lives.
-fn job_with(
+pub(in crate::pipeline::graph) fn job_with(
     files: &[RootFile],
     wants: Vec<Seek>,
 ) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
@@ -158,7 +158,13 @@ fn job_with(
     (job, dir, answers)
 }
 
-fn decoded(volume: u32, ordinal: u32, offset: u64, bytes: &[u8], length: Option<u64>) -> Decoded {
+pub(in crate::pipeline::graph) fn decoded(
+    volume: u32,
+    ordinal: u32,
+    offset: u64,
+    bytes: &[u8],
+    length: Option<u64>,
+) -> Decoded {
     Decoded {
         volume: VolumeIndex(volume),
         ordinal,
@@ -747,6 +753,164 @@ fn a_uu_root_answers_only_for_its_front() {
     assert!(root.map.take_moves().is_empty());
 }
 
+type Held = std::collections::BTreeMap<u64, Arc<[u8]>>;
+
+fn held(parts: Vec<weaver_graph::Part>) -> Held {
+    parts
+        .into_iter()
+        .map(|part| (part.key, part.bytes))
+        .collect()
+}
+
+// The root encoded into `encoded`, its parts brought up to date in `held`,
+// and both the same as a fresh encoding of the whole root.
+fn encodes_whole(
+    root: &ArticleRoot,
+    encoded: &mut super::facts::Encoded,
+    held: &mut Held,
+    step: usize,
+) {
+    use super::facts::{Encoded, Parts};
+    let encoding = root.encode(encoded, 9, 2, Some(RootPhase::Done));
+    match encoding.parts {
+        Parts::All(parts) => *held = self::held(parts),
+        Parts::Changed(parts) => {
+            for part in parts {
+                match part.bytes {
+                    Some(bytes) => held.insert(part.key, bytes),
+                    None => held.remove(&part.key),
+                };
+            }
+        }
+    }
+    let whole = root.encode(&mut Encoded::default(), 9, 2, Some(RootPhase::Done));
+    assert_eq!(
+        (encoding.version, &encoding.bytes),
+        (whole.version, &whole.bytes),
+        "step {step}"
+    );
+    let Parts::All(parts) = whole.parts else {
+        panic!("a fresh encoding is whole");
+    };
+    assert_eq!(*held, self::held(parts), "step {step}");
+}
+
+fn with_segments(mut article: Decoded, segments: &[(u64, u64, u32)]) -> Decoded {
+    article.segments = segments
+        .iter()
+        .map(|(start, end, crc32)| weaver_graph::Segment {
+            range: ByteRange::new(*start, *end),
+            crc32: *crc32,
+            verified: false,
+        })
+        .collect();
+    article
+}
+
+// Reading only the chunks the root marked gives the encoding of the whole
+// root after every kind of change: arrivals out of order, one again at
+// another start, two at one start and one of them taken back, checksums
+// that replace others, losses, damage, raises, a length, and a volume
+// placed only in order.
+#[test]
+fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
+    let sizes = [70; 40];
+    let mut root = ArticleRoot::new(&[file("a.bin", &sizes), file("b.bin", &sizes)]);
+    let mut encoded = super::facts::Encoded::default();
+    let mut held = Held::new();
+    let a = VolumeIndex(0);
+    encodes_whole(&root, &mut encoded, &mut held, 0);
+    let steps: Vec<Box<dyn Fn(&mut ArticleRoot)>> = vec![
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 5, 300, &[1; 60], None),
+                &[(300, 330, 1), (330, 360, 2)],
+            ));
+        }),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 20, 1200, &[2; 60], None),
+                &[(1200, 1260, 3)],
+            ));
+        }),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 17, 1000, &[3; 60], None),
+                &[(1000, 1060, 4)],
+            ));
+        }),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 20, 1100, &[4; 60], None),
+                &[(1100, 1160, 5)],
+            ));
+        }),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 33, 300, &[5; 60], None),
+                &[(300, 360, 6)],
+            ));
+        }),
+        Box::new(move |root| root.map.lost(a, 2)),
+        Box::new(move |root| root.map.lost(a, 3)),
+        Box::new(|root| {
+            root.map.seek(
+                VolumeIndex(1),
+                ByteRange::new(0, 500),
+                Some(Class::Critical),
+            );
+        }),
+        Box::new(|root| {
+            root.damage();
+        }),
+        Box::new(move |root| root.map.unarrive(a, 33)),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(1, 0, 0, &[6; 60], Some(2_400)),
+                &[(0, 30, 7), (30, 60, 8)],
+            ));
+        }),
+        Box::new(|root| {
+            let mut article = decoded(1, 1, 60, &[7; 60], None);
+            article.positioned = false;
+            root.receive(article);
+        }),
+        Box::new(|root| {
+            root.map.sample();
+            root.map.parked(|_, ordinal| ordinal % 3 == 0);
+            root.map.queue(a, ByteRange::new(0, 2_000));
+        }),
+        Box::new(|root| root.map.arrived_before(|_, ordinal| ordinal % 2 == 0)),
+    ];
+    for (step, change) in steps.iter().enumerate() {
+        change(&mut root);
+        encodes_whole(&root, &mut encoded, &mut held, step + 1);
+    }
+}
+
+// One arrival costs an encoding the parts it touched, whatever the size of
+// the job.
+#[test]
+fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
+    use super::facts::{Encoded, Parts};
+    let changed = |articles: usize| {
+        let mut root = ArticleRoot::new(&[file("a.bin", &vec![70; articles])]);
+        let mut encoded = Encoded::default();
+        root.encode(&mut encoded, 9, 2, None);
+        root.receive(with_segments(
+            decoded(0, 5, 300, &[1; 60], None),
+            &[(300, 330, 1), (330, 360, 2)],
+        ));
+        let Parts::Changed(parts) = root.encode(&mut encoded, 9, 2, None).parts else {
+            panic!("an encoding after the first is of what changed");
+        };
+        parts
+    };
+    let small = changed(40);
+    assert!(!small.is_empty() && small.len() <= 3, "{small:?}");
+    assert_eq!(changed(400), small);
+}
+
 #[tokio::test]
 async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -783,15 +947,11 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
         let working_dir = insert_active_job(&mut pipeline, restored_id, lantern.clone()).await;
         stamp_graph(&pipeline.db, restored_id);
         let (admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
+        let pending = checkpoint::Pending::default();
+        assert!(pending.put(&admitted));
         pipeline
             .db
-            .save_graph_checkpoint(
-                restored_id,
-                Arc::new(crate::jobs::graph_checkpoint::Delta::between(
-                    None,
-                    &checkpoint::rows(&admitted.snapshot()),
-                )),
-            )
+            .save_graph_checkpoint(restored_id, Arc::new(pending.take().unwrap()))
             .unwrap();
         retire_pipeline_database(pipeline).await;
         working_dir
