@@ -18,7 +18,29 @@ pub type BS = bitvec::slice::BitSlice<u8, bitvec::order::Msb0>;
 pub type BF = bitvec::boxed::BitBox<u8, bitvec::order::Msb0>;
 
 pub type PeerHandle = SocketAddr;
-pub type PeerStream = BoxStream<'static, SocketAddr>;
+/// Each peer named to a torrent, with who named it.
+pub type PeerStream = BoxStream<'static, (SocketAddr, PeerSourceFlag)>;
+
+/// Who named a peer: one of libtorrent's `peer_source_flags_t`
+/// (`peer_info::tracker`, `dht`, `pex`, `lsd`, `resume_data`, `incoming`),
+/// which `torrent::add_peer` and `peer_list::update_peer` take with each
+/// naming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerSourceFlag {
+    /// A tracker's announce reply.
+    Tracker,
+    /// The DHT.
+    Dht,
+    /// A connected peer's PEX message.
+    Pex,
+    /// Local service discovery.
+    Lsd,
+    /// The torrent's own list: the peers it was added with, and those a
+    /// magnet's metadata fetch already took.
+    ResumeData,
+    /// The peer connected to us.
+    Incoming,
+}
 
 /// Where a torrent's live run gets its peers from, and the announce table of
 /// its trackers when it has any.

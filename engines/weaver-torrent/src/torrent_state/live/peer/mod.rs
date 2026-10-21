@@ -27,7 +27,7 @@ use tokio::time::Instant;
 use crate::peer_connection::WriterRequest;
 use crate::peer_protocol::extended::ut_pex::{PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo};
 use crate::stream_connect::{ConnectionKind, Transports};
-use crate::type_aliases::BF;
+use crate::type_aliases::{BF, PeerSourceFlag};
 
 use super::PeerStates;
 use super::choker::Transfer;
@@ -455,10 +455,15 @@ impl Peer {
         self.is_connect_candidate() && self.reconnect_at().is_none_or(|at| at <= now)
     }
 
-    /// Someone named the peer again: a failure is forgiven, which revives a
-    /// peer that had run out of them.
-    pub(crate) fn rediscovered(&mut self, counters: &PeerStates) {
-        self.failcount = self.failcount.saturating_sub(1);
+    /// `source` named the peer again. A tracker's naming forgives a failure,
+    /// since someone else is apparently able to connect to it, and no other
+    /// source is trusted for that; a peer that had run out of failures is a
+    /// candidate again only once it is under them (libtorrent
+    /// `peer_list::update_peer`, `is_connect_candidate`).
+    pub(crate) fn rediscovered(&mut self, source: PeerSourceFlag, counters: &PeerStates) {
+        if source == PeerSourceFlag::Tracker {
+            self.failcount = self.failcount.saturating_sub(1);
+        }
         if matches!(self.state, PeerState::Dead) {
             self.set_state(self.idle_state(counters), counters);
         }

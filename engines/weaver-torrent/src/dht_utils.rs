@@ -21,6 +21,7 @@ use crate::{
     spawn_utils::BlockingSpawner,
     stream_connect::StreamConnector,
     torrent_state::live::peers::{NextCandidate, PeerStates},
+    type_aliases::PeerSourceFlag,
 };
 
 #[derive(Debug)]
@@ -38,7 +39,9 @@ pub enum ReadMetainfoResult<Rx> {
     },
 }
 
-pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unpin>(
+pub async fn read_metainfo_from_peer_receiver<
+    A: Stream<Item = (SocketAddr, PeerSourceFlag)> + Unpin,
+>(
     peer_id: Id20,
     info_hashes: InfoHashes,
     initial_addrs: Vec<SocketAddr>,
@@ -92,7 +95,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
 /// `addrs_stream`, with the stream and every address seen. A peer that does
 /// not answer is a connection that failed: it is asked again when the peer
 /// list's reconnect time for it comes, until it has failed too often, and
-/// sooner when someone names it again (libtorrent `peer_list`; a magnet's
+/// sooner when a tracker names it again (libtorrent `peer_list`; a magnet's
 /// metadata comes from the torrent's ordinary connections). None once the
 /// stream has ended and no peer is left to ask.
 async fn first_answer<A, T, F, Fut>(
@@ -101,7 +104,7 @@ async fn first_answer<A, T, F, Fut>(
     ask: F,
 ) -> (Option<T>, A, HashSet<SocketAddr>)
 where
-    A: Stream<Item = SocketAddr> + Unpin,
+    A: Stream<Item = (SocketAddr, PeerSourceFlag)> + Unpin,
     F: Fn(SocketAddr) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
@@ -109,12 +112,12 @@ where
     // comes over a connection of its own, wherever its peer is.
     let peers = PeerStates::new(Default::default(), 0).allowing_multiple_connections_per_ip(true);
     let mut seen = HashSet::<SocketAddr>::new();
-    let mut name = |addr| {
+    let mut name = |addr, source| {
         seen.insert(addr);
-        peers.add_peer(addr);
+        peers.add_peer(addr, source);
     };
     for addr in initial_addrs {
-        name(addr);
+        name(addr, PeerSourceFlag::ResumeData);
     }
 
     let mut asking = FuturesUnordered::new();
@@ -142,7 +145,7 @@ where
                 }
             },
             next_addr = addrs.next(), if !addrs_completed => match next_addr {
-                Some(addr) => name(addr),
+                Some((addr, source)) => name(addr, source),
                 None => addrs_completed = true,
             },
             _ = peers.wait_for_candidate() => {}
@@ -217,7 +220,7 @@ mod tests {
     async fn a_peer_named_while_another_failed_is_asked_at_once() {
         let (asked, ask) = asker(1);
         let (tx, rx) = futures::channel::mpsc::unbounded();
-        tx.unbounded_send(addr(2)).unwrap();
+        tx.unbounded_send((addr(2), PeerSourceFlag::Dht)).unwrap();
         let (found, _, seen) = first_answer(vec![addr(1)], rx, ask).await;
 
         assert_eq!(seen, HashSet::from([addr(1), addr(2)]));
@@ -257,7 +260,9 @@ mod tests {
         let info_hash = Id20::from_str("cab507494d02ebb1178b38f2e9d7be299c86b862").unwrap();
         let dht = DhtBuilder::new().await.unwrap();
 
-        let peer_rx = dht.get_peers(info_hash, None);
+        let peer_rx = dht
+            .get_peers(info_hash, None)
+            .map(|addr| (addr, PeerSourceFlag::Dht));
         let peer_id = generate_peer_id(b"-xx1234-");
         match read_metainfo_from_peer_receiver(
             peer_id,

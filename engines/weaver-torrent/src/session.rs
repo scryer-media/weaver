@@ -80,7 +80,9 @@ use crate::{
         ManagedTorrentState, TorrentMetadata, TorrentStateLive,
         initializing::{TorrentStateInitializing, normalize_initial_have},
     },
-    type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerStream},
+    type_aliases::{
+        BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream,
+    },
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -2012,11 +2014,17 @@ impl Session {
                         make_peer_rx(true)
                     } else {
                         // Add back seen_peers into the peer stream, as we consumed some peers
-                        // while resolving the magnet.
+                        // while resolving the magnet. They come from the list
+                        // the fetch kept, not from a new naming.
                         Some(PeerSource {
                             peers: merge_streams(
                                 resolved_magnet.peer_rx,
-                                futures::stream::iter(resolved_magnet.seen_peers),
+                                futures::stream::iter(
+                                    resolved_magnet
+                                        .seen_peers
+                                        .into_iter()
+                                        .map(|addr| (addr, PeerSourceFlag::ResumeData)),
+                                ),
                             )
                             .boxed(),
                             trackers,
@@ -2439,12 +2447,18 @@ impl Session {
         } else {
             Some(futures::stream::iter(initial_peers))
         };
+        // Each peer goes with who named it (libtorrent `torrent::add_peer`'s
+        // `peer_source_flags_t`; a torrent's own peers are `resume_data`).
+        let named = |source| move |addr| (addr, source);
         merge_two_optional_streams(
             merge_two_optional_streams(
-                merge_two_optional_streams(dht_rx, tracker_rx),
-                initial_peers_rx,
+                merge_two_optional_streams(
+                    dht_rx.map(|s| s.map(named(PeerSourceFlag::Dht))),
+                    tracker_rx.map(|s| s.map(named(PeerSourceFlag::Tracker))),
+                ),
+                initial_peers_rx.map(|s| s.map(named(PeerSourceFlag::ResumeData))),
             ),
-            lsd_rx,
+            lsd_rx.map(|s| s.map(named(PeerSourceFlag::Lsd))),
         )
         .map(|peers| PeerSource { peers, trackers })
     }

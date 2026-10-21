@@ -3620,8 +3620,10 @@ async fn a_finished_torrent_still_dials_a_leecher_and_not_a_seed() {
 #[tokio::test]
 async fn a_local_peer_is_dialed_before_a_global_one() {
     let h = Harness::new("local_first").await;
-    h.peers.add_peer(sock("1.1.1.1:6881"));
-    h.peers.add_peer(sock("192.168.1.1:6881"));
+    h.peers
+        .add_peer(sock("1.1.1.1:6881"), PeerSourceFlag::Tracker);
+    h.peers
+        .add_peer(sock("192.168.1.1:6881"), PeerSourceFlag::Tracker);
     let now = tokio::time::Instant::now();
     let dialed: Vec<_> =
         std::iter::from_fn(|| h.peers.connect_next(now).map(|(addr, ..)| addr)).collect();
@@ -3735,7 +3737,8 @@ async fn a_torrent_at_its_connection_cutoff_turns_its_least_worth_peer_over() {
     h._session.turn_peers_over();
     assert!(!closed(&mut least_rx));
 
-    h.peers.add_peer(sock("203.0.113.1:6881"));
+    h.peers
+        .add_peer(sock("203.0.113.1:6881"), PeerSourceFlag::Tracker);
     h._session.turn_peers_over();
     assert!(closed(&mut least_rx));
     assert!(!closed(&mut kept_rx));
@@ -3751,7 +3754,8 @@ async fn a_session_at_its_connection_cutoff_turns_over_the_busiest_torrents_peer
         .map(|_| h._session.connection_slots.try_open().unwrap())
         .collect();
     let (_peer, mut rx) = h.peer("127.0.0.1:6881");
-    h.peers.add_peer(sock("203.0.113.1:6881"));
+    h.peers
+        .add_peer(sock("203.0.113.1:6881"), PeerSourceFlag::Tracker);
 
     h._session.turn_peers_over();
     assert!(
@@ -3814,7 +3818,7 @@ async fn an_incoming_connection_at_the_cap_replaces_the_oldest_connect_while_man
     let mut held = Vec::new();
     let mut connects = Vec::new();
     for addr in ["203.0.113.1:6881", "203.0.113.2:6881"] {
-        h.peers.add_peer(sock(addr));
+        h.peers.add_peer(sock(addr), PeerSourceFlag::Tracker);
         let (addr, rx, tx) = h.peers.connect_next(tokio::time::Instant::now()).unwrap();
         held.push(h.hold(addr, &tx));
         connects.push((addr, rx));

@@ -29,7 +29,7 @@ use crate::{
     peer_protocol::{Message, extended::ExtendedMessage},
     stream_connect::ConnectionKind,
     torrent_state::utils::{TimedExistence, atomic_inc},
-    type_aliases::{BF, PeerHandle},
+    type_aliases::{BF, PeerHandle, PeerSourceFlag},
 };
 
 use self::{
@@ -276,22 +276,24 @@ impl PeerStates {
         self.stats.snapshot()
     }
 
-    /// A tracker, DHT or PEX named `addr`: a known peer is named again, a new
-    /// one joins as a connect candidate.
-    pub fn add_peer(&self, addr: SocketAddr) {
+    /// `source` named `addr`: a known peer is named again, a new one joins
+    /// as a connect candidate (libtorrent `peer_list::add_peer`).
+    pub fn add_peer(&self, addr: SocketAddr, source: PeerSourceFlag) {
         self.admit(
             addr,
             Displace::EraseCandidates,
             None,
-            |peer| peer.rediscovered(self),
+            |peer| peer.rediscovered(source, self),
             || Some(Peer::new_with_outgoing_address(addr)),
         );
         self.candidates_changed.notify_one();
     }
 
     /// A peer connected to us while every slot was taken. The connection goes,
-    /// the peer stays: a known one is named again, and one we can connect back
-    /// to joins as a connect candidate.
+    /// the peer stays: a known one is named again, as incoming, which forgives
+    /// it no failure (libtorrent `peer_list::new_connection` leaves the
+    /// failcount), and one we can connect back to joins as a connect
+    /// candidate.
     pub fn add_refused_incoming(&self, addr: SocketAddr, kind: ConnectionKind) {
         self.admit(
             addr,
@@ -299,7 +301,7 @@ impl PeerStates {
             None,
             |peer| {
                 atomic_inc(&peer.stats.counters.incoming_connections);
-                peer.rediscovered(self);
+                peer.rediscovered(PeerSourceFlag::Incoming, self);
             },
             || {
                 listen_address(addr, kind).map(|listen| {
@@ -1173,7 +1175,7 @@ mod tests {
         let peers = make_peer_states();
         let a = peer_addr(1);
         let t0 = Instant::now();
-        peers.add_peer(a);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
         assert_eq!(peers.next_candidate(t0), NextCandidate::Due);
 
         let mut failed = t0;
@@ -1192,7 +1194,7 @@ mod tests {
     async fn the_connect_loop_wakes_when_the_reconnect_time_comes() {
         let peers = make_peer_states();
         let a = peer_addr(1);
-        peers.add_peer(a);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
         fail_at(&peers, a, Instant::now());
 
         let due = peers.wait_for_candidate();
@@ -1210,7 +1212,7 @@ mod tests {
         let due = peers.wait_for_candidate();
         tokio::pin!(due);
         assert!(futures::poll!(&mut due).is_pending());
-        peers.add_peer(peer_addr(1));
+        peers.add_peer(peer_addr(1), PeerSourceFlag::Tracker);
         assert!(futures::poll!(&mut due).is_ready());
     }
 
@@ -1218,7 +1220,7 @@ mod tests {
     fn a_peer_that_failed_max_failcount_times_is_dropped_as_a_candidate() {
         let peers = make_peer_states();
         let a = peer_addr(1);
-        peers.add_peer(a);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
         let last = fail_out(&peers, a, Instant::now());
 
         assert_eq!(state_of(&peers, a), Some("dead"));
@@ -1227,16 +1229,66 @@ mod tests {
         assert!(peers.connect_next(much_later).is_none());
     }
 
+    // Every source but the tracker's, each naming `addr` once.
+    fn name_by_every_other_source(peers: &PeerStates, addr: SocketAddr) {
+        for source in [
+            PeerSourceFlag::Dht,
+            PeerSourceFlag::Pex,
+            PeerSourceFlag::Lsd,
+            PeerSourceFlag::ResumeData,
+        ] {
+            peers.add_peer(addr, source);
+        }
+        peers.add_refused_incoming(addr, ConnectionKind::Utp);
+    }
+
+    // libtorrent `peer_list::update_peer`: "only trust this if it comes from
+    // the tracker". A tracker's naming takes a failure off the peer, which
+    // shortens its wait to reconnect; any other source's leaves both.
     #[test]
-    fn a_dropped_peer_is_revived_when_named_again() {
+    fn only_a_trackers_naming_forgives_a_failed_peer_a_failure() {
         let peers = make_peer_states();
         let a = peer_addr(1);
-        peers.add_peer(a);
+        peers.add_peer(a, PeerSourceFlag::Dht);
+        let t0 = Instant::now();
+        fail_at(&peers, a, t0);
+        let t1 = t0 + reconnect_wait(1);
+        fail_at(&peers, a, t1);
+        assert_eq!(
+            peers.next_candidate(t1),
+            NextCandidate::At(t1 + reconnect_wait(2))
+        );
+
+        name_by_every_other_source(&peers, a);
+        assert_eq!(state_of(&peers, a), Some("queued"));
+        assert_eq!(
+            peers.next_candidate(t1),
+            NextCandidate::At(t1 + reconnect_wait(2))
+        );
+
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        assert_eq!(
+            peers.next_candidate(t1),
+            NextCandidate::At(t1 + reconnect_wait(1))
+        );
+    }
+
+    // libtorrent `peer_list::update_peer` and `is_connect_candidate`: a peer
+    // at `max_failcount` is no candidate until a tracker's naming takes it
+    // under; the DHT, PEX or any other source naming it leaves it so.
+    #[test]
+    fn a_dropped_peer_is_revived_only_when_a_tracker_names_it_again() {
+        let peers = make_peer_states();
+        let a = peer_addr(1);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
         let last = fail_out(&peers, a, Instant::now());
         assert_eq!(state_of(&peers, a), Some("dead"));
 
-        // A tracker, DHT or PEX names it: one failure is forgiven.
-        peers.add_peer(a);
+        name_by_every_other_source(&peers, a);
+        assert_eq!(state_of(&peers, a), Some("dead"));
+        assert_eq!(peers.next_candidate(last), NextCandidate::None);
+
+        peers.add_peer(a, PeerSourceFlag::Tracker);
         assert_eq!(state_of(&peers, a), Some("queued"));
         assert_eq!(
             peers.next_candidate(last),
@@ -1248,7 +1300,7 @@ mod tests {
     fn a_dropped_peer_is_revived_when_it_connects_to_us() {
         let peers = make_peer_states();
         let a = peer_addr(1);
-        peers.add_peer(a);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
         fail_out(&peers, a, Instant::now());
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1262,7 +1314,7 @@ mod tests {
     fn failures_are_forgotten_once_a_connection_delivers() {
         let peers = make_peer_states();
         let a = peer_addr(1);
-        peers.add_peer(a);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
         let t0 = Instant::now();
         fail_at(&peers, a, t0);
         let t1 = t0 + reconnect_wait(1);
@@ -1294,7 +1346,7 @@ mod tests {
     fn a_connection_we_close_is_not_a_failure() {
         let peers = make_peer_states();
         let a = peer_addr(1);
-        peers.add_peer(a);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
         let t0 = Instant::now();
         peers
             .with_peer_mut(a, "test", |peer| {
@@ -1318,7 +1370,7 @@ mod tests {
     // Names `addr`, fails a connection to it at `at`, and lets it go: an
     // erase candidate that failed once.
     fn failed_once(peers: &PeerStates, addr: SocketAddr, at: Instant) {
-        peers.add_peer(addr);
+        peers.add_peer(addr, PeerSourceFlag::Tracker);
         fail_at(peers, addr, at);
         peers
             .with_peer_mut(addr, "test", |peer| peer.set_not_needed(peers))
@@ -1328,7 +1380,7 @@ mod tests {
     // Names `addr` and lets it go before any connection: no connect
     // candidate, and no erase candidate either, as it never failed.
     fn never_failed(peers: &PeerStates, addr: SocketAddr) {
-        peers.add_peer(addr);
+        peers.add_peer(addr, PeerSourceFlag::Tracker);
         peers
             .with_peer_mut(addr, "test", |peer| peer.set_not_needed(peers))
             .unwrap();
@@ -1357,7 +1409,7 @@ mod tests {
             peer_addr(3),
             peer_addr(4),
         );
-        peers.add_peer(most_failed);
+        peers.add_peer(most_failed, PeerSourceFlag::Tracker);
         fail_out(&peers, most_failed, t0);
         // It connected over TCP, from no port it listens on, and failed.
         let _closed_rx = connected_to_us(&peers, unconnectable).unwrap();
@@ -1379,7 +1431,7 @@ mod tests {
         let live = peer_addr(5);
         let _live_rx = connected_to_us(&peers, live).unwrap();
         for i in 6..MAX_PEERLIST_SIZE {
-            peers.add_peer(peer_addr(i));
+            peers.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
         }
         assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
 
@@ -1389,14 +1441,14 @@ mod tests {
             .enumerate()
         {
             assert!(state_of(&peers, erased).is_some());
-            peers.add_peer(newcomer(i));
+            peers.add_peer(newcomer(i), PeerSourceFlag::Tracker);
             assert_eq!(state_of(&peers, erased), None);
             assert_eq!(state_of(&peers, newcomer(i)), Some("queued"));
         }
 
         // No erase candidate is left: a named peer pushes out neither a peer
         // that never failed nor a connect candidate.
-        peers.add_peer(newcomer(4));
+        peers.add_peer(newcomer(4), PeerSourceFlag::Tracker);
         assert_eq!(state_of(&peers, newcomer(4)), None);
         assert_eq!(state_of(&peers, kept), Some("not needed"));
         assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
@@ -1419,7 +1471,7 @@ mod tests {
         failed_once(&peers, failed, t0);
         never_failed(&peers, kept);
         for i in 2..PEERLIST_LOW_WATERMARK + 5 {
-            peers.add_peer(peer_addr(i));
+            peers.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
         }
 
         assert!(peers.connect_next(t0).is_some());
@@ -1442,7 +1494,7 @@ mod tests {
         let mut next = failed.len();
         let mut fill_to = |listed: usize| {
             while peers.listed() < listed {
-                peers.add_peer(peer_addr(next));
+                peers.add_peer(peer_addr(next), PeerSourceFlag::Tracker);
                 next += 1;
             }
         };
@@ -1476,14 +1528,14 @@ mod tests {
         let queued = (2100..2999).map(peer_addr).collect::<Vec<_>>();
         let live = peer_addr(2999);
         for &addr in &most_failed {
-            peers.add_peer(addr);
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
             fail_out(&peers, addr, t0);
         }
         for &addr in &failed {
             failed_once(&peers, addr, t0);
         }
         for &addr in &queued {
-            peers.add_peer(addr);
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
         }
         let _live_rx = connected_to_us(&peers, live).unwrap();
         assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
@@ -1521,7 +1573,7 @@ mod tests {
             channels.push(rx);
         }
         let candidate = peer_addr(MAX_PEERLIST_SIZE - 1);
-        peers.add_peer(candidate);
+        peers.add_peer(candidate, PeerSourceFlag::Tracker);
 
         // An incoming peer holding a slot pushes out the one idle peer.
         let first = peer_addr(MAX_PEERLIST_SIZE);
@@ -1541,7 +1593,7 @@ mod tests {
                 .unwrap_err(),
             IncomingRefused::ListFull
         );
-        peers.add_peer(second);
+        peers.add_peer(second, PeerSourceFlag::Tracker);
         assert_eq!(state_of(&peers, second), None);
         assert_eq!(peers.states.len(), MAX_PEERLIST_SIZE);
         assert_eq!(peers.stats().live as usize, MAX_PEERLIST_SIZE);
@@ -1567,7 +1619,7 @@ mod tests {
         let (closed, mut closed_rx) = add_live_peer(&peers, "10.1.0.1:6881");
         let (erased, dropped, stranger) = (peer_addr(1), peer_addr(2), peer_addr(3));
         for addr in [erased, dropped] {
-            peers.add_peer(addr);
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
         }
         let senders: Senders = [closed, erased, dropped, stranger]
             .map(Some)
@@ -1602,9 +1654,9 @@ mod tests {
             if peers.listed() == MAX_PEERLIST_SIZE {
                 break;
             }
-            peers.add_peer(peer_addr(i));
+            peers.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
         }
-        peers.add_peer(peer_addr(MAX_PEERLIST_SIZE + 4));
+        peers.add_peer(peer_addr(MAX_PEERLIST_SIZE + 4), PeerSourceFlag::Tracker);
         assert_eq!(state_of(&peers, erased), None);
 
         let failed = read_back(&lengths, piece, &senders, zeros);
@@ -1632,7 +1684,7 @@ mod tests {
         let piece = lengths.validate_piece_index(0).unwrap();
         let peers = make_peer_states();
         let sender = peer_addr(1);
-        peers.add_peer(sender);
+        peers.add_peer(sender, PeerSourceFlag::Tracker);
         let senders: Senders = [sender; 4].map(Some).into_iter().collect();
         let filled = |byte: u8| {
             move |_, _: &ChunkInfo, buf: &mut [u8]| {
@@ -1660,13 +1712,13 @@ mod tests {
         let banned = peer_addr(1);
         peers.ban(banned);
         let failed = peer_addr(2);
-        peers.add_peer(failed);
+        peers.add_peer(failed, PeerSourceFlag::Tracker);
         fail_at(&peers, failed, t0);
         peers
             .with_peer_mut(failed, "test", |p| p.piece_failed(false))
             .unwrap();
         let connecting = peer_addr(3);
-        peers.add_peer(connecting);
+        peers.add_peer(connecting, PeerSourceFlag::Tracker);
         assert_eq!(
             peers.connect_next(t0).map(|(addr, ..)| addr),
             Some(connecting)
@@ -1675,7 +1727,7 @@ mod tests {
         let next =
             PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         assert!(next.is_banned(banned.ip()));
-        next.add_peer(banned);
+        next.add_peer(banned, PeerSourceFlag::Tracker);
         assert_eq!(state_of(&next, banned), None);
         let standing = |list: &PeerStates| {
             list.with_peer(failed, |p| (p.trust(), p.reconnect_at()))
@@ -1699,9 +1751,9 @@ mod tests {
         let t0 = Instant::now();
         let banned = peer_addr(1);
         let (live, mut live_rx) = add_live_peer(&peers, &at_port(banned, 50000).to_string());
-        peers.add_peer(banned);
+        peers.add_peer(banned, PeerSourceFlag::Tracker);
         let other = peer_addr(2);
-        peers.add_peer(other);
+        peers.add_peer(other, PeerSourceFlag::Tracker);
 
         peers.ban(live);
 
@@ -1724,8 +1776,8 @@ mod tests {
         assert_eq!(state_of(&peers, live), Some("dead"));
 
         // Named again or connecting from any port, the address is turned away.
-        peers.add_peer(banned);
-        peers.add_peer(at_port(banned, 6882));
+        peers.add_peer(banned, PeerSourceFlag::Tracker);
+        peers.add_peer(at_port(banned, 6882), PeerSourceFlag::Tracker);
         peers.add_refused_incoming(at_port(banned, 6883), ConnectionKind::Utp);
         assert_eq!(state_of(&peers, banned), Some("dead"));
         assert_eq!(state_of(&peers, at_port(banned, 6882)), None);
@@ -1767,13 +1819,14 @@ mod tests {
         });
         assert_eq!(incoming, Some(1));
 
-        // A known peer that connects is named again, which revives it.
+        // A known peer that connects is named again, as incoming, which
+        // forgives no failure: a dropped one stays dropped.
         let known = peer_addr(2);
-        peers.add_peer(known);
+        peers.add_peer(known, PeerSourceFlag::Tracker);
         fail_out(&peers, known, t0);
         assert_eq!(state_of(&peers, known), Some("dead"));
         peers.add_refused_incoming(known, ConnectionKind::Tcp);
-        assert_eq!(state_of(&peers, known), Some("queued"));
+        assert_eq!(state_of(&peers, known), Some("dead"));
 
         // An unknown TCP peer connects from an ephemeral port: there is no
         // address to connect back to.
@@ -1793,8 +1846,8 @@ mod tests {
         let t0 = Instant::now();
         let fresh = peer_addr(1);
         let failed = peer_addr(2);
-        peers.add_peer(fresh);
-        peers.add_peer(failed);
+        peers.add_peer(fresh, PeerSourceFlag::Tracker);
+        peers.add_peer(failed, PeerSourceFlag::Tracker);
         let last = fail_out(&peers, failed, t0);
         assert_eq!(state_of(&peers, failed), Some("dead"));
 
@@ -1912,7 +1965,7 @@ mod tests {
     fn a_connection_from_a_peer_we_dial_is_settled_by_listen_port() {
         let peers = make_peer_states();
         let dialed = peer_addr(1);
-        peers.add_peer(dialed);
+        peers.add_peer(dialed, PeerSourceFlag::Tracker);
         let (_, mut dialing, _) = peers.connect_next(Instant::now()).unwrap();
 
         // Our port is the lower: our connection stays, theirs is refused.
@@ -1950,8 +2003,8 @@ mod tests {
         let peers = make_peer_states();
         let t0 = Instant::now();
         let listening = peer_addr(1);
-        peers.add_peer(listening);
-        peers.add_peer(peer_addr(2));
+        peers.add_peer(listening, PeerSourceFlag::Tracker);
+        peers.add_peer(peer_addr(2), PeerSourceFlag::Tracker);
         let from = at_port(listening, 50000);
         let _rx = incoming(&peers, from, OUR_PORT).unwrap();
         assert_eq!(peers.connect_candidates(), 1);
@@ -1982,8 +2035,8 @@ mod tests {
         let peers = make_peer_states().allowing_multiple_connections_per_ip(true);
         let t0 = Instant::now();
         let a = peer_addr(1);
-        peers.add_peer(a);
-        peers.add_peer(at_port(a, 6882));
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        peers.add_peer(at_port(a, 6882), PeerSourceFlag::Tracker);
         let _rx = incoming(&peers, at_port(a, 50000), OUR_PORT).unwrap();
         assert!(incoming(&peers, at_port(a, 50001), OUR_PORT).is_ok());
         assert!(peers.connect_next(t0).is_some());

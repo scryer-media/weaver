@@ -111,7 +111,7 @@ use crate::{
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
     torrent_state::utils::atomic_inc,
-    type_aliases::{FileStorage, PeerHandle},
+    type_aliases::{FileStorage, PeerHandle, PeerSourceFlag},
 };
 
 use self::{
@@ -1068,10 +1068,10 @@ impl TorrentStateLive {
         }
     }
 
-    /// A tracker, DHT or PEX named `addr`.
-    pub(crate) fn add_peer(&self, addr: SocketAddr) {
+    /// `source` named `addr` (libtorrent `torrent::add_peer`).
+    pub(crate) fn add_peer(&self, addr: SocketAddr, source: PeerSourceFlag) {
         if self.may_connect_to(addr) {
-            self.peers.add_peer(addr);
+            self.peers.add_peer(addr, source);
         }
     }
 
@@ -3289,7 +3289,7 @@ impl PeerHandler {
             .transpose()?
             .unwrap_or_default();
         for peer in news {
-            self.state.add_peer(peer.addr);
+            self.state.add_peer(peer.addr, PeerSourceFlag::Pex);
             self.state.peers.pex_flags(peer.addr, peer.flags);
         }
         Ok(())
