@@ -32,6 +32,7 @@ mod bitv_factory;
 pub mod buffers;
 mod chunk_tracker;
 pub mod clone_to_owned;
+mod connection_slots;
 pub mod core;
 mod create_torrent_file;
 pub mod dht;

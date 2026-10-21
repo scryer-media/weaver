@@ -10,6 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Read,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -39,6 +40,7 @@ use crate::{
     api::TorrentIdOrHash,
     api_error::WithStatus,
     bitv_factory::{BitVFactory, NonPersistentBitVFactory},
+    connection_slots::{ConnectionSlots, DEFAULT_CONNECTION_SPEED, DEFAULT_CONNECTIONS_LIMIT},
     create_torrent,
     create_torrent_file::CreateTorrentResult,
     dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
@@ -150,6 +152,7 @@ pub struct Session {
 
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
+    pub(crate) connection_slots: Arc<ConnectionSlots>,
     pub ratelimits: Limits,
 
     pub blocklist: IpRanges,
@@ -523,6 +526,16 @@ pub struct SessionOptions {
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
 
+    /// Peer connections, incoming and outgoing, the session holds open at
+    /// once across all its torrents. Outgoing connects wait for a free place;
+    /// an incoming connection past it is closed. Defaults to 200.
+    pub connections_limit: usize,
+
+    /// Outgoing connects the session begins per second across all its
+    /// torrents, handed to the torrents that want peers in turn. Defaults
+    /// to 30.
+    pub connection_speed: NonZeroU32,
+
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
 
@@ -573,6 +586,8 @@ impl Default for SessionOptions {
             allowlist_url: None,
             trackers: HashSet::new(),
             peer_limit: None,
+            connections_limit: DEFAULT_CONNECTIONS_LIMIT,
+            connection_speed: DEFAULT_CONNECTION_SPEED,
             disable_local_service_discovery: false,
             ipv4_only: false,
             client_name_and_version: None,
@@ -947,6 +962,10 @@ impl Session {
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
                 udp_tracker_client,
+                connection_slots: Arc::new(ConnectionSlots::new(
+                    opts.connections_limit,
+                    opts.connection_speed,
+                )),
                 ratelimits: Limits::new(opts.ratelimits),
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
@@ -1167,9 +1186,15 @@ impl Session {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
                             let session = session.upgrade().context("session is dead")?;
+                            // Dropping the halves closes a connection past the session's cap.
+                            let Some(slot) = session.connection_slots.try_open() else {
+                                debug!(%addr, "at the session's connection limit, closing incoming connection");
+                                continue;
+                            };
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
                                 session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
+                                    .map_ok(|(live, checked)| (live, checked, slot))
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
@@ -1186,9 +1211,9 @@ impl Session {
                         }
                     }
                 },
-                Some(Ok((live, checked))) = futs.next(), if !futs.is_empty() => {
+                Some(Ok((live, checked, slot))) = futs.next(), if !futs.is_empty() => {
                     let (addr, kind) = (checked.addr, checked.kind);
-                    if let Err(e) = live.add_incoming_peer(checked) {
+                    if let Err(e) = live.add_incoming_peer(checked, slot) {
                         warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
                     }
                 },
@@ -2307,5 +2332,126 @@ mod tests {
         // Any other shape: no fingerprint to carry over.
         let id = Id20::new([b'M'; 20]);
         assert_eq!(dht_identity(Some(&id)), (Some(Vec::new()), None));
+    }
+
+    // A session listening on loopback that seeds a finished one-piece
+    // torrent whose own upload limit is `upload`.
+    async fn seeding(
+        connections_limit: usize,
+        upload: crate::limits::LimitKind,
+    ) -> (
+        TempDir,
+        std::sync::Arc<Session>,
+        super::ManagedTorrentHandle,
+    ) {
+        let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
+            1,
+            16384,
+            Some("connection_slots"),
+        );
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(16384),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                connections_limit,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ratelimits: crate::limits::LimitsConfig {
+                        upload_bps: upload,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_completed().await.unwrap();
+        (dir, session, handle)
+    }
+
+    // Connects to the session and sends a handshake for `handle`'s torrent.
+    // Returns what the session answers before it closes, up to its own
+    // 68-byte handshake: empty when it refused the connection.
+    async fn answer(session: &Session, handle: &super::ManagedTorrentHandle) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(session.listen_addr().unwrap())
+            .await
+            .unwrap();
+        let mut handshake = [0u8; 68];
+        let len =
+            crate::peer_protocol::Handshake::new(handle.info_hash(), super::Id20::new([7; 20]))
+                .serialize_unchecked_len(&mut handshake);
+        // A refused connection may be closed before or while this is written,
+        // and reset after: either way nothing comes back.
+        let _ = stream.write_all(&handshake[..len]).await;
+        let mut answer = Vec::new();
+        let _ = (&mut stream).take(68).read_to_end(&mut answer).await;
+        answer
+    }
+
+    fn is_handshake_for(answer: &[u8], handle: &super::ManagedTorrentHandle) -> bool {
+        answer.len() == 68
+            && &answer[1..20] == b"BitTorrent protocol"
+            && answer[28..48] == handle.info_hash().0
+    }
+
+    #[tokio::test]
+    async fn an_incoming_connection_past_the_session_cap_is_closed() {
+        let (_dir, session, handle) = seeding(1, crate::limits::LimitKind::Unlimited).await;
+
+        // The one place under the cap is taken: the listener closes the
+        // connection it accepts without reading the handshake.
+        let held = session.connection_slots.try_open().unwrap();
+        assert!(answer(&session, &handle).await.is_empty());
+
+        // Freed, the same connection is taken and answered.
+        drop(held);
+        assert!(is_handshake_for(&answer(&session, &handle).await, &handle));
+
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_incoming_connection_to_a_finished_torrent_with_upload_closed_is_refused() {
+        let (_dir, session, handle) = seeding(200, crate::limits::LimitKind::Closed).await;
+        assert!(answer(&session, &handle).await.is_empty());
+
+        // With its upload open again, the finished torrent takes the peer.
+        handle.set_ratelimits(crate::limits::LimitsConfig::default());
+        assert!(is_handshake_for(&answer(&session, &handle).await, &handle));
+
+        session.stop().await;
     }
 }

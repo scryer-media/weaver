@@ -94,7 +94,9 @@ use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
+    connection_slots::ConnectionSlot,
     file_ops::FileOps,
+    limits::LimitKind,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -184,6 +186,8 @@ pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
     ConcurrencyLimitReached,
+    // Finished, with its upload closed: the torrent wants no peers.
+    NotWanted,
 }
 
 pub struct TorrentStateLive {
@@ -375,8 +379,13 @@ impl TorrentStateLive {
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
+        slot: ConnectionSlot,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
+        if !self.wants_peers() {
+            debug!(addr = %checked_peer.addr, "finished with upload closed, refusing incoming peer");
+            return Ok(AddIncomingPeerResult::NotWanted);
+        }
         let (tx, rx) = unbounded_channel();
         let permit = match self.peer_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -437,10 +446,14 @@ impl TorrentStateLive {
                 "[{}][addr={}]manage_incoming_peer",
                 self.shared.id, checked_peer.addr
             ),
-            aframe!(
-                self.clone()
-                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)
-            ),
+            aframe!(self.clone().task_manage_incoming_peer(
+                checked_peer,
+                counters,
+                tx,
+                rx,
+                permit,
+                slot
+            )),
         );
         Ok(AddIncomingPeerResult::Added)
     }
@@ -483,6 +496,7 @@ impl TorrentStateLive {
         tx: PeerTx,
         rx: PeerRx,
         permit: OwnedSemaphorePermit,
+        _slot: ConnectionSlot,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
             addr: checked_peer.addr,
@@ -536,6 +550,7 @@ impl TorrentStateLive {
         self: Arc<Self>,
         addr: SocketAddr,
         permit: OwnedSemaphorePermit,
+        _slot: ConnectionSlot,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -613,7 +628,7 @@ impl TorrentStateLive {
         let state = self;
         loop {
             let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
-            if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
+            if !state.wants_peers() {
                 debug!(?addr, "ignoring peer as we are finished");
                 state.peers.mark_peer_not_needed(addr);
                 continue;
@@ -624,6 +639,7 @@ impl TorrentStateLive {
                 .session
                 .upgrade()
                 .ok_or(Error::SessionDestroyed)?;
+            let slots = session.connection_slots.clone();
 
             if session.ipv4_only && addr.is_ipv6() {
                 debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
@@ -659,11 +675,19 @@ impl TorrentStateLive {
                 continue;
             }
 
+            drop(session);
+
+            // The torrent's own cap first, so a torrent at it holds no place
+            // under the session's; then a place under the session's cap and
+            // a connect from its per-second budget, both shared with every
+            // torrent in turn.
             let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            let slot = slots.open().await?;
+            slots.begin_connect().await;
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(state.clone().task_manage_outgoing_peer(addr, permit, slot)),
             );
         }
     }
@@ -877,6 +901,13 @@ impl TorrentStateLive {
             && !self.has_active_streams_unfinished_files(
                 &self.lock_read("is_finished_and_dont_need_peers"),
             )
+    }
+
+    // A torrent wants peers, outgoing and incoming, unless it has nothing
+    // left to fetch and its own upload is closed, so it has nothing to give.
+    fn wants_peers(&self) -> bool {
+        self.shared.options.ratelimits.get_upload_bps() != LimitKind::Closed
+            || !self.is_finished_and_no_active_streams()
     }
 
     fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {
